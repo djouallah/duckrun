@@ -1,5 +1,5 @@
 
-![Duckrun](duckrun.png)
+<img src="duckrun.png" width="400" alt="Duckrun">
 
 Simple  task runner for Microsoft Fabric Python notebook, powered by DuckDB and Delta_rs.
 
