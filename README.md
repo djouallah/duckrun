@@ -3,6 +3,11 @@
 
 Simple  task runner for Microsoft Fabric Python notebook, powered by DuckDB and Delta_rs.
 
+
+## Known Limitation
+
+Support only Lakehouse with schema, Workspace and lakehouse names should not contains space
+
 ## Installation
 
 ```bash
@@ -119,32 +124,7 @@ lakehouse.sql("SELECT * FROM my_table LIMIT 10").show()
 df = lakehouse.sql("SELECT COUNT(*) FROM sales").df()
 ```
 
-## Real-World Example
 
-```python
-import duckrun as dr
-
-lakehouse = dr.connect(
-    workspace="Analytics",
-    lakehouse_name="Sales", 
-    schema="dbo",
-    sql_folder="./etl"
-)
-
-# Daily pipeline
-daily = [
-    ('download_files', (api_url, local_path)),
-    ('staging_orders', 'overwrite', {'run_date': '2024-06-01'}),
-    ('staging_customers', 'overwrite', {'run_date': '2024-06-01'}),
-    ('fact_sales', 'append'),
-    ('dim_customer', 'overwrite')
-]
-
-lakehouse.run(daily)
-
-# Check results
-lakehouse.sql("SELECT COUNT(*) FROM fact_sales").show()
-```
 
 ## Remote SQL Files
 
