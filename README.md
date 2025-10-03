@@ -1,5 +1,7 @@
 # 🦆 Duckrun
 
+![Duckrun](duckrun.png)
+
 Simple  task runner for Microsoft Fabric Python notebook, powered by DuckDB and Delta_rs.
 
 ## Installation
