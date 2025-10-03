@@ -1,6 +1,6 @@
 # 🦆 Duckrun
 
-Simple lakehouse task runner for Microsoft Fabric, powered by DuckDB.
+Simple  task runner for Microsoft Fabric Python notebook, powered by DuckDB and Delta_rs.
 
 ## Installation
 
@@ -157,6 +157,10 @@ lakehouse = dr.connect(
     sql_folder="https://raw.githubusercontent.com/user/repo/main/sql"
 )
 ```
+
+## Real-Life Usage
+
+For a complete, production-style example, see [fabric_demo](https://github.com/djouallah/fabric_demo).
 
 ## License
 
