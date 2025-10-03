@@ -101,8 +101,8 @@ Use `__` to create variants of the same table:
 
 ```python
 pipeline = [
-    ('sales__initial', 'overwrite', {}),    # writes to 'sales' table
-    ('sales__incremental', 'append', {}),   # appends to 'sales' table
+    ('sales__initial', 'overwrite'),    # writes to 'sales' table
+    ('sales__incremental', 'append'),   # appends to 'sales' table
 ]
 ```
 
