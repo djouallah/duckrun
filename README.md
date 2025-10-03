@@ -40,6 +40,10 @@ pipeline = [
 lakehouse.run(pipeline)
 ```
 
+## Early Exit
+
+In a pipeline run, if a task fails, the pipeline will stop without running the subsequent tasks.
+
 ## How It Works
 
 Duckrun runs two types of tasks:
