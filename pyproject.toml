@@ -5,8 +5,9 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.1.0"
+version = "0.1.1"
 description = "Lakehouse task runner powered by DuckDB for Microsoft Fabric"
+readme = "README.md"
 license = "MIT"
 requires-python = ">=3.9"
 
