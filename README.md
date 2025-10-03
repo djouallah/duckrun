@@ -1,4 +1,3 @@
-# 🦆 Duckrun
 
 ![Duckrun](duckrun.png)
 
