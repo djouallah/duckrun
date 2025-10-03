@@ -8,10 +8,7 @@ Simple lakehouse task runner for Microsoft Fabric, powered by DuckDB.
 pip install duckrun
 ```
 
-For local development (enables Azure CLI authentication):
-```bash
-pip install duckrun[local]
-```
+
 
 ## Quick Start
 
@@ -50,7 +47,8 @@ Create a file `sql_folder/function_name.py` with a function matching the name:
 # sql_folder/load_data.py
 def load_data(url, path):
     # your code here
-    return result
+    # IMPORTANT: Must return 1 for success, 0 for failure
+    return 1
 ```
 
 ### 2. SQL Tasks  
@@ -73,8 +71,11 @@ WHERE date >= '2024-01-01'
 - `append` - Add to existing table
 - `ignore` - Create only if doesn't exist
 
-## SQL Parameters
+## Task Files
 
+The `sql_folder` can contain a mixture of both `.sql` and `.py` files. This allows you to combine SQL transformations and Python logic in your pipelines.
+
+### SQL Files
 Your SQL files automatically have access to:
 - `$ws` - workspace name
 - `$lh` - lakehouse name
