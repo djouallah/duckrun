@@ -64,44 +64,44 @@ class Duckrun:
     def _attach_lakehouse(self):
         self._create_onelake_secret()
         try:
-            # Exclude Iceberg metadata folders when scanning for Delta tables
+            # Use expensive list operation but filter for _delta_log folders only
+            # This avoids parsing JSON content that causes Iceberg metadata issues
+            print(f"Scanning for Delta tables in {self.schema}... (this may take a moment)")
+            
             list_tables_query = f"""
-                SELECT DISTINCT(split_part(file, '_delta_log', 1)) as tables
-                FROM glob ("abfss://{self.workspace}@onelake.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Tables/*/*/_delta_log/*.json")
-                WHERE file NOT LIKE '%/metadata/%'
+                SELECT DISTINCT
+                    regexp_extract(file, 'Tables/{self.schema}/([^/]+)/_delta_log', 1) as table_name
+                FROM glob("abfss://{self.workspace}@onelake.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Tables/{self.schema}/**")
+                WHERE file LIKE '%/_delta_log/%'
+                  AND file NOT LIKE '%/metadata/%'
                   AND file NOT LIKE '%/iceberg/%'
-                  AND split_part(file, '_delta_log', 1) NOT LIKE '%/metadata'
-                  AND split_part(file, '_delta_log', 1) NOT LIKE '%/iceberg'
+                  AND regexp_extract(file, 'Tables/{self.schema}/([^/]+)/_delta_log', 1) IS NOT NULL
             """
+            
             list_tables_df = self.con.sql(list_tables_query).df()
-            list_tables = list_tables_df['tables'].tolist() if not list_tables_df.empty else []
-
-            if not list_tables:
-                print(f"No Delta tables found in {self.lakehouse_name}.Lakehouse/Tables.")
+            
+            if list_tables_df.empty:
+                print(f"No Delta tables found in {self.lakehouse_name}.Lakehouse/Tables/{self.schema}.")
                 return
+            
+            table_names = list_tables_df['table_name'].tolist()
 
-            print(f"Found {len(list_tables)} Delta tables. Attaching as views...")
+            print(f"Found {len(table_names)} Delta tables. Attaching as views...")
 
-            for table_path in list_tables:
-                parts = table_path.strip("/").split("/")
-                if len(parts) >= 2:
-                    potential_schema = parts[-2]
-                    table = parts[-1]
-                    
-                    # Skip Iceberg-related folders
-                    if table in ('metadata', 'iceberg') or potential_schema in ('metadata', 'iceberg'):
-                        continue
-                        
-                    if potential_schema == self.schema:
-                        try:
-                            self.con.sql(f"""
-                                CREATE OR REPLACE VIEW {table}
-                                AS SELECT * FROM delta_scan('{self.table_base_url}{self.schema}/{table}');
-                            """)
-                            print(f"  ✓ Attached: {table}")
-                        except Exception as e:
-                            print(f"  ⚠ Skipped {table}: {str(e)[:100]}")
-                            continue
+            for table in table_names:
+                # Skip Iceberg-related folders and empty names
+                if not table or table in ('metadata', 'iceberg'):
+                    continue
+                
+                try:
+                    self.con.sql(f"""
+                        CREATE OR REPLACE VIEW {table}
+                        AS SELECT * FROM delta_scan('{self.table_base_url}{self.schema}/{table}');
+                    """)
+                    print(f"  ✓ Attached: {table}")
+                except Exception as e:
+                    print(f"  ⚠ Skipped {table}: {str(e)[:100]}")
+                    continue
             
             print("\nAttached tables (views) in DuckDB:")
             self.con.sql("SELECT name FROM (SHOW ALL TABLES) WHERE database='memory'").show()
