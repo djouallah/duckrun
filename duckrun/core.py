@@ -16,23 +16,21 @@ class Duckrun:
         SQL:    ('table_name', 'mode', {params})
     
     Usage:
+        # For pipelines:
         dr = Duckrun.connect(workspace, lakehouse, schema, sql_folder)
-        
-        pipeline = [
-            ('download', (urls, paths, depth)),
-            ('staging', 'overwrite', {'run_date': '2024-06-01'}),
-            ('transform', 'append')
-        ]
-        
         dr.run(pipeline)
+        
+        # For data exploration only:
+        dr = Duckrun.connect(workspace, lakehouse, schema)
+        dr.sql("SELECT * FROM table").show()
     """
 
     def __init__(self, workspace: str, lakehouse_name: str, schema: str, 
-                 sql_folder: str, compaction_threshold: int = 10):
+                 sql_folder: Optional[str] = None, compaction_threshold: int = 10):
         self.workspace = workspace
         self.lakehouse_name = lakehouse_name
         self.schema = schema
-        self.sql_folder = sql_folder.strip()
+        self.sql_folder = sql_folder.strip() if sql_folder else None
         self.compaction_threshold = compaction_threshold
         self.table_base_url = f'abfss://{workspace}@onelake.dfs.fabric.microsoft.com/{lakehouse_name}.Lakehouse/Tables/'
         self.con = duckdb.connect()
@@ -41,7 +39,7 @@ class Duckrun:
 
     @classmethod
     def connect(cls, workspace: str, lakehouse_name: str, schema: str, 
-                sql_folder: str, compaction_threshold: int = 10):
+                sql_folder: Optional[str] = None, compaction_threshold: int = 100):
         """Create and connect to lakehouse"""
         print("Connecting to Lakehouse...")
         return cls(workspace, lakehouse_name, schema, sql_folder, compaction_threshold)
@@ -114,6 +112,9 @@ class Duckrun:
         return name.split('__', 1)[0] if '__' in name else name
 
     def _read_sql_file(self, table_name: str, params: Optional[Dict] = None) -> Optional[str]:
+        if self.sql_folder is None:
+            raise RuntimeError("sql_folder is not configured. Cannot read SQL files.")
+        
         is_url = self.sql_folder.startswith("http")
         if is_url:
             url = f"{self.sql_folder.rstrip('/')}/{table_name}.sql".strip()
@@ -159,6 +160,9 @@ class Duckrun:
         return content
 
     def _load_py_function(self, name: str) -> Optional[Callable]:
+        if self.sql_folder is None:
+            raise RuntimeError("sql_folder is not configured. Cannot load Python functions.")
+        
         is_url = self.sql_folder.startswith("http")
         try:
             if is_url:
@@ -267,6 +271,9 @@ class Duckrun:
             ]
             dr.run(pipeline)
         """
+        if self.sql_folder is None:
+            raise RuntimeError("sql_folder is not configured. Cannot run pipelines. Set sql_folder when creating connection.")
+        
         for i, task in enumerate(pipeline, 1):
             print(f"\n{'='*60}")
             print(f"Task {i}/{len(pipeline)}: {task[0]}")
