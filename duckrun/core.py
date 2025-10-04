@@ -6,6 +6,99 @@ from deltalake import DeltaTable, write_deltalake
 from typing import List, Tuple, Union, Optional, Callable, Dict, Any
 from string import Template
 
+
+class DeltaWriter:
+    """Spark-style write API for Delta Lake"""
+    
+    def __init__(self, relation, duckrun_instance):
+        self.relation = relation
+        self.duckrun = duckrun_instance
+        self._format = None
+        self._mode = "overwrite"
+    
+    def format(self, format_type: str):
+        """Set output format (only 'delta' supported)"""
+        if format_type.lower() != "delta":
+            raise ValueError(f"Only 'delta' format is supported, got '{format_type}'")
+        self._format = "delta"
+        return self
+    
+    def mode(self, write_mode: str):
+        """Set write mode: 'overwrite' or 'append'"""
+        if write_mode not in {"overwrite", "append"}:
+            raise ValueError(f"Mode must be 'overwrite' or 'append', got '{write_mode}'")
+        self._mode = write_mode
+        return self
+    
+    def saveAsTable(self, table_name: str):
+        """Save query result as Delta table"""
+        if self._format != "delta":
+            raise RuntimeError("Must call .format('delta') before saveAsTable()")
+        
+        # Parse schema.table or use default schema
+        if "." in table_name:
+            schema, table = table_name.split(".", 1)
+        else:
+            schema = self.duckrun.schema
+            table = table_name
+        
+        # Ensure OneLake secret is created
+        self.duckrun._create_onelake_secret()
+        
+        # Build path
+        path = f"{self.duckrun.table_base_url}{schema}/{table}"
+        
+        # Execute query and get result
+        df = self.relation.record_batch()
+        
+        print(f"Writing to Delta table: {schema}.{table} (mode={self._mode})")
+        
+        # Write to Delta
+        write_deltalake(path, df, mode=self._mode)
+        
+        # Create or replace view in DuckDB
+        self.duckrun.con.sql(f"DROP VIEW IF EXISTS {table}")
+        self.duckrun.con.sql(f"""
+            CREATE OR REPLACE VIEW {table}
+            AS SELECT * FROM delta_scan('{path}')
+        """)
+        
+        # Optimize if needed
+        dt = DeltaTable(path)
+        
+        if self._mode == "overwrite":
+            dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
+            dt.cleanup_metadata()
+            print(f"✅ Table {schema}.{table} created/overwritten")
+        else:  # append
+            file_count = len(dt.file_uris())
+            if file_count > self.duckrun.compaction_threshold:
+                print(f"Compacting {schema}.{table} ({file_count} files)")
+                dt.optimize.compact()
+                dt.vacuum(dry_run=False)
+                dt.cleanup_metadata()
+            print(f"✅ Data appended to {schema}.{table}")
+        
+        return table
+
+
+class QueryResult:
+    """Wrapper for DuckDB relation with write API"""
+    
+    def __init__(self, relation, duckrun_instance):
+        self.relation = relation
+        self.duckrun = duckrun_instance
+    
+    @property
+    def write(self):
+        """Access write API"""
+        return DeltaWriter(self.relation, self.duckrun)
+    
+    def __getattr__(self, name):
+        """Delegate all other methods to underlying DuckDB relation"""
+        return getattr(self.relation, name)
+
+
 class Duckrun:
     """
     Lakehouse task runner with clean tuple-based API.
@@ -20,9 +113,10 @@ class Duckrun:
         dr = Duckrun.connect(workspace, lakehouse, schema, sql_folder)
         dr.run(pipeline)
         
-        # For data exploration only:
+        # For data exploration with Spark-style API:
         dr = Duckrun.connect(workspace, lakehouse, schema)
         dr.sql("SELECT * FROM table").show()
+        dr.sql("SELECT 43").write.format("delta").mode("append").saveAsTable("aemo.test")
     """
 
     def __init__(self, workspace: str, lakehouse_name: str, schema: str, 
@@ -312,13 +406,19 @@ class Duckrun:
 
     def sql(self, query: str):
         """
-        Execute raw SQL query.
+        Execute raw SQL query with Spark-style write API.
         
         Example:
+            # Traditional DuckDB style
             dr.sql("SELECT * FROM table").show()
             df = dr.sql("SELECT * FROM table").df()
+            
+            # New Spark-style write API
+            dr.sql("SELECT 43 as value").write.format("delta").mode("append").saveAsTable("aemo.test")
+            dr.sql("SELECT * FROM source").write.format("delta").mode("overwrite").saveAsTable("target")
         """
-        return self.con.sql(query)
+        relation = self.con.sql(query)
+        return QueryResult(relation, self)
 
     def get_connection(self):
         """Get underlying DuckDB connection"""
