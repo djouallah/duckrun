@@ -19,14 +19,14 @@ pip install duckrun
 ## Quick Start
 
 ```python
-import duckrun as dr
+import duckrun
 
-# Connect to your Fabric lakehouse
-lakehouse = dr.connect(
+# Connect to your Fabric lakehouse (using `con` pattern)
+con = duckrun.connect(
     workspace="my_workspace",
     lakehouse_name="my_lakehouse", 
     schema="dbo",
-    sql_folder="./sql"  # folder containing your .sql and .py files
+    sql_folder="./sql"  # optional: folder containing your .sql and .py files (only needed for pipeline tasks)
 )
 
 # Define your pipeline
@@ -37,8 +37,10 @@ pipeline = [
 ]
 
 # Run it
-lakehouse.run(pipeline)
+con.run(pipeline)
 ```
+
+Note: the `sql/` folder is optional — if all you want to do is explore data with SQL (for example by calling `con.sql(...)`), you don't need to provide a `sql_folder`.
 
 ## Early Exit
 
@@ -122,11 +124,13 @@ Both write to the same `sales` table, but use different SQL files.
 
 ```python
 # Run queries
-lakehouse.sql("SELECT * FROM my_table LIMIT 10").show()
+con.sql("SELECT * FROM my_table LIMIT 10").show()
 
 # Get as DataFrame
-df = lakehouse.sql("SELECT COUNT(*) FROM sales").df()
+df = con.sql("SELECT COUNT(*) FROM sales").df()
 ```
+
+Explanation: DuckDB is connected to the lakehouse through `con`, so it is aware of the tables in that lakehouse (including tables created by your pipelines). That means you can query those tables directly with `con.sql(...)` just like any other DuckDB query. If you don't provide a `sql_folder`, you can still use `con.sql(...)` to explore existing tables.
 
 
 
@@ -135,7 +139,7 @@ df = lakehouse.sql("SELECT COUNT(*) FROM sales").df()
 You can load SQL/Python files from a URL:
 
 ```python
-lakehouse = dr.connect(
+con = duckrun.connect(
     workspace="Analytics",
     lakehouse_name="Sales", 
     schema="dbo",
