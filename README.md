@@ -1,12 +1,14 @@
-
 <img src="duckrun.png" width="400" alt="Duckrun">
 
-Simple  task runner for Microsoft Fabric Python notebook, powered by DuckDB and Delta_rs.
+Simple task runner for Microsoft Fabric Python notebooks, powered by DuckDB and Delta Lake.
 
+## Important Notes
 
-## Known Limitation
+**Requirements:**
+- Lakehouse must have a schema (e.g., `dbo`, `sales`, `analytics`)
+- Workspace and lakehouse names cannot contain spaces
 
-Support only Lakehouse with schema, Workspace and lakehouse names should not contains space
+**Why no spaces?** Duckrun uses simple name-based paths instead of GUIDs. This keeps the code clean and readable, which is perfect for data engineering workspaces where naming conventions are already well-established. Just use underscores or hyphens instead: `my_workspace` or `my-lakehouse`.
 
 ## Installation
 
@@ -14,59 +16,100 @@ Support only Lakehouse with schema, Workspace and lakehouse names should not con
 pip install duckrun
 ```
 
-
-
 ## Quick Start
 
 ```python
 import duckrun
 
-# Connect to your Fabric lakehouse (using `con` pattern)
+# Connect to your Fabric lakehouse
+con = duckrun.connect(
+    workspace="my_workspace",
+    lakehouse_name="my_lakehouse", 
+    schema="dbo"
+)
+
+# Explore data
+con.sql("SELECT * FROM my_table LIMIT 10").show()
+
+# Write to Delta tables (Spark-style API)
+con.sql("SELECT * FROM source").write.mode("overwrite").saveAsTable("target")
+```
+
+That's it! No `sql_folder` needed for data exploration.
+
+## Two Ways to Use Duckrun
+
+### 1. Data Exploration (Spark-Style API)
+
+Perfect for ad-hoc analysis and interactive notebooks:
+
+```python
+con = duckrun.connect("workspace", "lakehouse", "dbo")
+
+# Query existing tables
+con.sql("SELECT * FROM sales WHERE year = 2024").show()
+
+# Get DataFrame
+df = con.sql("SELECT COUNT(*) FROM orders").df()
+
+# Write results to Delta tables
+con.sql("""
+    SELECT 
+        customer_id,
+        SUM(amount) as total
+    FROM orders
+    GROUP BY customer_id
+""").write.mode("overwrite").saveAsTable("customer_totals")
+
+# Append mode
+con.sql("SELECT * FROM new_orders").write.mode("append").saveAsTable("orders")
+```
+
+**Note:** `.format("delta")` is optional - Delta is the default format!
+
+### 2. Pipeline Orchestration
+
+For production workflows with reusable SQL and Python tasks:
+
+```python
 con = duckrun.connect(
     workspace="my_workspace",
     lakehouse_name="my_lakehouse", 
     schema="dbo",
-    sql_folder="./sql"  # optional: folder containing your .sql and .py files (only needed for pipeline tasks)
+    sql_folder="./sql"  # folder with .sql and .py files
 )
 
-# Define your pipeline
+# Define pipeline
 pipeline = [
-    ('load_data', (url, path)),           # Python task
-    ('clean_data', 'overwrite'),          # SQL task  
-    ('aggregate', 'append')               # SQL task
+    ('download_data', (url, path)),    # Python task
+    ('clean_data', 'overwrite'),       # SQL task  
+    ('aggregate', 'append')            # SQL task
 ]
 
 # Run it
 con.run(pipeline)
 ```
 
-Note: the `sql/` folder is optional — if all you want to do is explore data with SQL (for example by calling `con.sql(...)`), you don't need to provide a `sql_folder`.
+## Pipeline Tasks
 
-## Early Exit
+### Python Tasks
 
-In a pipeline run, if a task fails, the pipeline will stop without running the subsequent tasks.
+**Format:** `('function_name', (arg1, arg2, ...))`
 
-## How It Works
-
-Duckrun runs two types of tasks:
-
-### 1. Python Tasks
-Format: `('function_name', (arg1, arg2, ...))`
-
-Create a file `sql_folder/function_name.py` with a function matching the name:
+Create `sql_folder/function_name.py`:
 
 ```python
-# sql_folder/load_data.py
-def load_data(url, path):
+# sql_folder/download_data.py
+def download_data(url, path):
     # your code here
-    # IMPORTANT: Must return 1 for success, 0 for failure
-    return 1
+    return 1  # 1 = success, 0 = failure
 ```
 
-### 2. SQL Tasks  
-Format: `('table_name', 'mode')` or `('table_name', 'mode', {params})`
+### SQL Tasks
 
-Create a file `sql_folder/table_name.sql`:
+**Format:** `('table_name', 'mode')` or `('table_name', 'mode', {params})`
+
+Create `sql_folder/table_name.sql`:
 
 ```sql
 -- sql_folder/clean_data.sql
@@ -78,22 +121,19 @@ FROM raw_data
 WHERE date >= '2024-01-01'
 ```
 
-**Modes:**
+**Write Modes:**
 - `overwrite` - Replace table completely
-- `append` - Add to existing table
+- `append` - Add to existing table  
 - `ignore` - Create only if doesn't exist
 
-## Task Files
+### Parameterized SQL
 
-The `sql_folder` can contain a mixture of both `.sql` and `.py` files. This allows you to combine SQL transformations and Python logic in your pipelines.
-
-### SQL Files
-Your SQL files automatically have access to:
+Built-in parameters (always available):
 - `$ws` - workspace name
 - `$lh` - lakehouse name
 - `$schema` - schema name
 
-Pass custom parameters:
+Custom parameters:
 
 ```python
 pipeline = [
@@ -107,36 +147,24 @@ SELECT * FROM transactions
 WHERE date BETWEEN '$start_date' AND '$end_date'
 ```
 
-## Table Name Convention
+## Advanced Features
 
-Use `__` to create variants of the same table:
+### Table Name Variants
+
+Use `__` to create multiple versions of the same table:
 
 ```python
 pipeline = [
-    ('sales__initial', 'overwrite'),    # writes to 'sales' table
-    ('sales__incremental', 'append'),   # appends to 'sales' table
+    ('sales__initial', 'overwrite'),     # writes to 'sales'
+    ('sales__incremental', 'append'),    # appends to 'sales'
 ]
 ```
 
-Both write to the same `sales` table, but use different SQL files.
+Both tasks write to the `sales` table but use different SQL files (`sales__initial.sql` and `sales__incremental.sql`).
 
-## Query Data
+### Remote SQL Files
 
-```python
-# Run queries
-con.sql("SELECT * FROM my_table LIMIT 10").show()
-
-# Get as DataFrame
-df = con.sql("SELECT COUNT(*) FROM sales").df()
-```
-
-Explanation: DuckDB is connected to the lakehouse through `con`, so it is aware of the tables in that lakehouse (including tables created by your pipelines). That means you can query those tables directly with `con.sql(...)` just like any other DuckDB query. If you don't provide a `sql_folder`, you can still use `con.sql(...)` to explore existing tables.
-
-
-
-## Remote SQL Files
-
-You can load SQL/Python files from a URL:
+Load tasks from GitHub or any URL:
 
 ```python
 con = duckrun.connect(
@@ -147,9 +175,111 @@ con = duckrun.connect(
 )
 ```
 
-## Real-Life Usage
+### Early Exit on Failure
 
-For a complete, production-style example, see [fabric_demo](https://github.com/djouallah/fabric_demo).
+**Pipelines automatically stop when any task fails** - subsequent tasks won't run.
+
+For **SQL tasks**, failure is automatic:
+- If the query has a syntax error or runtime error, the task fails
+- The pipeline stops immediately
+
+For **Python tasks**, you control success/failure by returning:
+- `1` = Success → pipeline continues to next task
+- `0` = Failure → pipeline stops, remaining tasks are skipped
+
+Example:
+
+```python
+# sql_folder/download_data.py
+def download_data(url, path):
+    try:
+        response = requests.get(url)
+        response.raise_for_status()
+        # save data...
+        return 1  # Success - pipeline continues
+    except Exception as e:
+        print(f"Download failed: {e}")
+        return 0  # Failure - pipeline stops here
+```
+
+```python
+pipeline = [
+    ('download_data', (url, path)),     # If returns 0, stops here
+    ('clean_data', 'overwrite'),        # Won't run if download failed
+    ('aggregate', 'append')             # Won't run if download failed
+]
+
+success = con.run(pipeline)  # Returns True only if ALL tasks succeed
+```
+
+This prevents downstream tasks from processing incomplete or corrupted data.
+
+### Delta Lake Optimization
+
+Duckrun automatically:
+- Compacts small files when file count exceeds threshold (default: 100)
+- Vacuums old versions on overwrite
+- Cleans up metadata
+
+Customize compaction threshold:
+
+```python
+con = duckrun.connect(
+    workspace="workspace",
+    lakehouse_name="lakehouse",
+    schema="dbo",
+    compaction_threshold=50  # compact after 50 files
+)
+```
+
+## Complete Example
+
+```python
+import duckrun
+
+# Connect
+con = duckrun.connect("Analytics", "Sales", "dbo", "./sql")
+
+# Pipeline with mixed tasks
+pipeline = [
+    # Download raw data (Python)
+    ('fetch_api_data', ('https://api.example.com/sales', 'raw')),
+    
+    # Clean and transform (SQL)
+    ('clean_sales', 'overwrite'),
+    
+    # Aggregate by region (SQL with params)
+    ('regional_summary', 'overwrite', {'min_amount': 1000}),
+    
+    # Append to history (SQL)
+    ('sales_history', 'append')
+]
+
+# Run
+success = con.run(pipeline)
+
+# Explore results
+con.sql("SELECT * FROM regional_summary").show()
+
+# Export to new table
+con.sql("""
+    SELECT region, SUM(total) as grand_total
+    FROM regional_summary
+    GROUP BY region
+""").write.mode("overwrite").saveAsTable("region_totals")
+```
+
+## How It Works
+
+1. **Connection**: Duckrun connects to your Fabric lakehouse using OneLake and Azure authentication
+2. **Table Discovery**: Automatically scans for Delta tables in your schema and creates DuckDB views
+3. **Query Execution**: Run SQL queries directly against Delta tables using DuckDB's speed
+4. **Write Operations**: Results are written back as Delta tables with automatic optimization
+5. **Pipelines**: Orchestrate complex workflows with reusable SQL and Python tasks
+
+## Real-World Example
+
+For a complete production example, see [fabric_demo](https://github.com/djouallah/fabric_demo).
 
 ## License
 
