@@ -13,7 +13,7 @@ class DeltaWriter:
     def __init__(self, relation, duckrun_instance):
         self.relation = relation
         self.duckrun = duckrun_instance
-        self._format = None
+        self._format = "delta"  # Default to delta format
         self._mode = "overwrite"
     
     def format(self, format_type: str):
@@ -32,8 +32,9 @@ class DeltaWriter:
     
     def saveAsTable(self, table_name: str):
         """Save query result as Delta table"""
+        # Format defaults to "delta", so no need to check
         if self._format != "delta":
-            raise RuntimeError("Must call .format('delta') before saveAsTable()")
+            raise RuntimeError(f"Only 'delta' format is supported, got '{self._format}'")
         
         # Parse schema.table or use default schema
         if "." in table_name:
@@ -116,7 +117,7 @@ class Duckrun:
         # For data exploration with Spark-style API:
         dr = Duckrun.connect(workspace, lakehouse, schema)
         dr.sql("SELECT * FROM table").show()
-        dr.sql("SELECT 43").write.format("delta").mode("append").saveAsTable("aemo.test")
+        dr.sql("SELECT 43").write.mode("append").saveAsTable("test")
     """
 
     def __init__(self, workspace: str, lakehouse_name: str, schema: str, 
@@ -413,9 +414,9 @@ class Duckrun:
             dr.sql("SELECT * FROM table").show()
             df = dr.sql("SELECT * FROM table").df()
             
-            # New Spark-style write API
-            dr.sql("SELECT 43 as value").write.format("delta").mode("append").saveAsTable("aemo.test")
-            dr.sql("SELECT * FROM source").write.format("delta").mode("overwrite").saveAsTable("target")
+            # New Spark-style write API (format is optional, defaults to delta)
+            dr.sql("SELECT 43 as value").write.mode("append").saveAsTable("test")
+            dr.sql("SELECT * FROM source").write.mode("overwrite").saveAsTable("target")
         """
         relation = self.con.sql(query)
         return QueryResult(relation, self)

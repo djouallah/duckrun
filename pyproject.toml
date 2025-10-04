@@ -1,14 +1,16 @@
-
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.1.5"
+version = "0.1.5.1"
 description = "Lakehouse task runner powered by DuckDB for Microsoft Fabric"
 readme = "README.md"
 license = "MIT"
+authors = [
+    {name = "mim"}
+]
 requires-python = ">=3.9"
 dependencies = [
     "duckdb>=1.2.0",
@@ -20,4 +22,3 @@ dependencies = [
 Homepage = "https://github.com/djouallah/duckrun"
 Repository = "https://github.com/djouallah/duckrun"
 Issues = "https://github.com/djouallah/duckrun/issues"
-
