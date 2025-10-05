@@ -4,10 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.1.5.6"
+version = "0.1.6"
 description = "Lakehouse task runner powered by DuckDB for Microsoft Fabric"
 readme = "README.md"
-license = "MIT"
+license = {text = "MIT"}
 authors = [
     {name = "mim"}
 ]
@@ -15,10 +15,22 @@ requires-python = ">=3.9"
 dependencies = [
     "duckdb>=1.2.0",
     "deltalake>=0.18.2",
-    "requests>=2.28.0"
+    "requests>=2.28.0",
+    "obstore>=0.2.0"
+]
+
+[project.optional-dependencies]
+local = [
+    "azure-identity>=1.12.0"
 ]
 
 [project.urls]
 Homepage = "https://github.com/djouallah/duckrun"
 Repository = "https://github.com/djouallah/duckrun"
 Issues = "https://github.com/djouallah/duckrun/issues"
+
+[tool.setuptools]
+packages = ["duckrun"]
+
+[tool.setuptools.package-data]
+duckrun = ["py.typed"]

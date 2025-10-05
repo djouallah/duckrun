@@ -5,6 +5,8 @@ import importlib.util
 from deltalake import DeltaTable, write_deltalake
 from typing import List, Tuple, Union, Optional, Callable, Dict, Any
 from string import Template
+import obstore as obs
+from obstore.store import AzureStore
 
 
 class DeltaWriter:
@@ -13,7 +15,7 @@ class DeltaWriter:
     def __init__(self, relation, duckrun_instance):
         self.relation = relation
         self.duckrun = duckrun_instance
-        self._format = "delta"  # Default to delta format
+        self._format = "delta"
         self._mode = "overwrite"
     
     def format(self, format_type: str):
@@ -32,46 +34,35 @@ class DeltaWriter:
     
     def saveAsTable(self, table_name: str):
         """Save query result as Delta table"""
-        # Format defaults to "delta", so no need to check
         if self._format != "delta":
             raise RuntimeError(f"Only 'delta' format is supported, got '{self._format}'")
         
-        # Parse schema.table or use default schema
         if "." in table_name:
             schema, table = table_name.split(".", 1)
         else:
             schema = self.duckrun.schema
             table = table_name
         
-        # Ensure OneLake secret is created
         self.duckrun._create_onelake_secret()
-        
-        # Build path
         path = f"{self.duckrun.table_base_url}{schema}/{table}"
-        
-        # Execute query and get result
         df = self.relation.record_batch()
         
         print(f"Writing to Delta table: {schema}.{table} (mode={self._mode})")
-        
-        # Write to Delta
         write_deltalake(path, df, mode=self._mode)
         
-        # Create or replace view in DuckDB
         self.duckrun.con.sql(f"DROP VIEW IF EXISTS {table}")
         self.duckrun.con.sql(f"""
             CREATE OR REPLACE VIEW {table}
             AS SELECT * FROM delta_scan('{path}')
         """)
         
-        # Optimize if needed
         dt = DeltaTable(path)
         
         if self._mode == "overwrite":
             dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
             dt.cleanup_metadata()
             print(f"✅ Table {schema}.{table} created/overwritten")
-        else:  # append
+        else:
             file_count = len(dt.file_uris())
             if file_count > self.duckrun.compaction_threshold:
                 print(f"Compacting {schema}.{table} ({file_count} files)")
@@ -148,31 +139,19 @@ class Duckrun:
         
         Schema defaults to "dbo" if not specified. When no schema is provided,
         all tables across all schemas will be listed, but operations will use "dbo".
-        
-        Examples:
-            dr = Duckrun.connect("myworkspace/mylakehouse.lakehouse/bronze")
-            dr = Duckrun.connect("myworkspace/mylakehouse.lakehouse")  # lists all, uses dbo
-            dr = Duckrun.connect("myworkspace", "mylakehouse", "bronze")
-            dr = Duckrun.connect("myworkspace", "mylakehouse")  # lists all, uses dbo
-            dr = Duckrun.connect("ws/lh.lakehouse", sql_folder="./sql")
         """
         print("Connecting to Lakehouse...")
         
         scan_all_schemas = False
         
-        # Check if using compact format: "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
         if workspace and "/" in workspace and lakehouse_name is None:
             parts = workspace.split("/")
             if len(parts) == 2:
-                # Format: "ws/lh.lakehouse" (schema will use default)
                 workspace, lakehouse_name = parts
                 scan_all_schemas = True
                 print(f"ℹ️  No schema specified. Using default schema 'dbo' for operations.")
-                print(f"   Scanning all schemas for table discovery...")
-                print(f"   ⚠️  WARNING: Scanning all schemas can be slow for large lakehouses!")
-                print(f"   💡 For better performance, specify a schema: {workspace}/{lakehouse_name}.lakehouse/schema\n")
+                print(f"   Scanning all schemas for table discovery...\n")
             elif len(parts) == 3:
-                # Format: "ws/lh.lakehouse/schema"
                 workspace, lakehouse_name, schema = parts
             else:
                 raise ValueError(
@@ -180,20 +159,14 @@ class Duckrun:
                     "Expected format: 'workspace/lakehouse.lakehouse' or 'workspace/lakehouse.lakehouse/schema'"
                 )
             
-            # Remove .lakehouse suffix if present
             if lakehouse_name.endswith(".lakehouse"):
                 lakehouse_name = lakehouse_name[:-10]
         elif lakehouse_name is not None:
-            # Traditional format used, check if schema was explicitly provided
-            # If schema is still "dbo" (default), scan all schemas
             if schema == "dbo":
                 scan_all_schemas = True
                 print(f"ℹ️  No schema specified. Using default schema 'dbo' for operations.")
-                print(f"   Scanning all schemas for table discovery...")
-                print(f"   ⚠️  WARNING: Scanning all schemas can be slow for large lakehouses!")
-                print(f"   💡 For better performance, specify a schema explicitly.\n")
+                print(f"   Scanning all schemas for table discovery...\n")
         
-        # Validate all required parameters are present
         if not workspace or not lakehouse_name:
             raise ValueError(
                 "Missing required parameters. Use either:\n"
@@ -220,62 +193,82 @@ class Duckrun:
             os.environ["AZURE_STORAGE_TOKEN"] = token.token
             self.con.sql("CREATE OR REPLACE PERSISTENT SECRET onelake (TYPE azure, PROVIDER credential_chain, CHAIN 'cli', ACCOUNT_NAME 'onelake')")
 
+    def _discover_tables_fast(self) -> List[Tuple[str, str]]:
+        """
+        Fast Delta table discovery using obstore with list_with_delimiter.
+        Only lists directories, not files - super fast!
+        
+        Returns:
+            List of tuples: [(schema, table_name), ...]
+        """
+        token = self._get_storage_token()
+        if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
+            print("Getting Azure token for table discovery...")
+            from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
+            credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
+            token_obj = credential.get_token("https://storage.azure.com/.default")
+            token = token_obj.token
+            os.environ["AZURE_STORAGE_TOKEN"] = token
+        
+        url = f"abfss://{self.workspace}@onelake.dfs.fabric.microsoft.com/"
+        store = AzureStore.from_url(url, bearer_token=token)
+        
+        base_path = f"{self.lakehouse_name}.Lakehouse/Tables/"
+        tables_found = []
+        
+        if self.scan_all_schemas:
+            # Discover all schemas first
+            print("🔍 Discovering schemas...")
+            schemas_result = obs.list_with_delimiter(store, prefix=base_path)
+            schemas = [
+                prefix.rstrip('/').split('/')[-1] 
+                for prefix in schemas_result['common_prefixes']
+            ]
+            print(f"   Found {len(schemas)} schemas: {', '.join(schemas)}\n")
+            
+            # Discover tables in each schema
+            print("🔍 Discovering tables...")
+            for schema_name in schemas:
+                schema_path = f"{base_path}{schema_name}/"
+                result = obs.list_with_delimiter(store, prefix=schema_path)
+                
+                for table_prefix in result['common_prefixes']:
+                    table_name = table_prefix.rstrip('/').split('/')[-1]
+                    # Skip non-table directories
+                    if table_name not in ('metadata', 'iceberg'):
+                        tables_found.append((schema_name, table_name))
+        else:
+            # Scan specific schema only
+            print(f"🔍 Discovering tables in schema '{self.schema}'...")
+            schema_path = f"{base_path}{self.schema}/"
+            result = obs.list_with_delimiter(store, prefix=schema_path)
+            
+            for table_prefix in result['common_prefixes']:
+                table_name = table_prefix.rstrip('/').split('/')[-1]
+                if table_name not in ('metadata', 'iceberg'):
+                    tables_found.append((self.schema, table_name))
+        
+        return tables_found
+
     def _attach_lakehouse(self):
+        """Attach lakehouse tables as DuckDB views using fast discovery"""
         self._create_onelake_secret()
+        
         try:
-            if self.scan_all_schemas:
-                # Scan all schemas
-                print(f"⚠️  Scanning for Delta tables across all schemas...")
-                print(f"   This may take a while for large lakehouses with many schemas/tables.")
-                
-                list_tables_query = f"""
-                    SELECT DISTINCT
-                        regexp_extract(file, 'Tables/([^/]+)/([^/]+)/_delta_log', 1) as schema_name,
-                        regexp_extract(file, 'Tables/([^/]+)/([^/]+)/_delta_log', 2) as table_name
-                    FROM glob("abfss://{self.workspace}@onelake.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Tables/**")
-                    WHERE file LIKE '%/_delta_log/%'
-                      AND file NOT LIKE '%/metadata/%'
-                      AND file NOT LIKE '%/iceberg/%'
-                      AND regexp_extract(file, 'Tables/([^/]+)/([^/]+)/_delta_log', 1) IS NOT NULL
-                      AND regexp_extract(file, 'Tables/([^/]+)/([^/]+)/_delta_log', 2) IS NOT NULL
-                    ORDER BY schema_name, table_name
-                """
-            else:
-                # Scan specific schema only
-                print(f"Scanning for Delta tables in {self.schema}... (this may take a moment)")
-                
-                list_tables_query = f"""
-                    SELECT DISTINCT
-                        '{self.schema}' as schema_name,
-                        regexp_extract(file, 'Tables/{self.schema}/([^/]+)/_delta_log', 1) as table_name
-                    FROM glob("abfss://{self.workspace}@onelake.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Tables/{self.schema}/**")
-                    WHERE file LIKE '%/_delta_log/%'
-                      AND file NOT LIKE '%/metadata/%'
-                      AND file NOT LIKE '%/iceberg/%'
-                      AND regexp_extract(file, 'Tables/{self.schema}/([^/]+)/_delta_log', 1) IS NOT NULL
-                """
+            tables = self._discover_tables_fast()
             
-            list_tables_df = self.con.sql(list_tables_query).df()
-            
-            if list_tables_df.empty:
+            if not tables:
                 if self.scan_all_schemas:
                     print(f"No Delta tables found in {self.lakehouse_name}.Lakehouse/Tables/")
                 else:
                     print(f"No Delta tables found in {self.lakehouse_name}.Lakehouse/Tables/{self.schema}/")
                 return
             
-            print(f"Found {len(list_tables_df)} Delta tables. Attaching as views...\n")
-
-            for _, row in list_tables_df.iterrows():
-                schema_name = row['schema_name']
-                table_name = row['table_name']
-                
-                # Skip Iceberg-related folders and empty names
-                if not table_name or table_name in ('metadata', 'iceberg'):
-                    continue
-                
+            print(f"\n📊 Found {len(tables)} Delta tables. Attaching as views...\n")
+            
+            attached_count = 0
+            for schema_name, table_name in tables:
                 try:
-                    # Create view with schema prefix to avoid conflicts
                     view_name = f"{schema_name}_{table_name}" if self.scan_all_schemas else table_name
                     
                     self.con.sql(f"""
@@ -283,19 +276,24 @@ class Duckrun:
                         AS SELECT * FROM delta_scan('{self.table_base_url}{schema_name}/{table_name}');
                     """)
                     print(f"  ✓ Attached: {schema_name}.{table_name} → {view_name}")
+                    attached_count += 1
                 except Exception as e:
                     print(f"  ⚠ Skipped {schema_name}.{table_name}: {str(e)[:100]}")
                     continue
             
-            print("\nAttached tables (views) in DuckDB:")
+            print(f"\n{'='*60}")
+            print(f"✅ Successfully attached {attached_count}/{len(tables)} tables")
+            print(f"{'='*60}\n")
+            
+            print("Available views in DuckDB:")
             self.con.sql("SELECT name FROM (SHOW ALL TABLES) WHERE database='memory' ORDER BY name").show()
             
             if self.scan_all_schemas:
-                print(f"\nNote: Tables are prefixed with schema (e.g., dbo_tablename)")
-                print(f"      Default schema for operations: {self.schema}")
+                print(f"\n💡 Note: Tables are prefixed with schema (e.g., dbo_tablename)")
+                print(f"   Default schema for operations: {self.schema}\n")
                 
         except Exception as e:
-            print(f"Error attaching lakehouse: {e}")
+            print(f"❌ Error attaching lakehouse: {e}")
             print("Continuing without pre-attached tables.")
 
     def _normalize_table_name(self, name: str) -> str:
@@ -329,7 +327,6 @@ class Duckrun:
             print(f"SQL file is empty: {table_name}.sql")
             return None
 
-        # Auto-inject common params, merge with user params
         full_params = {
             'ws': self.workspace,
             'lh': self.lakehouse_name,
@@ -452,18 +449,9 @@ class Duckrun:
         
         Returns:
             True if all tasks succeeded
-            
-        Example:
-            pipeline = [
-                ('download', (urls, paths, depth)),
-                ('staging', 'overwrite', {'run_date': '2024-06-01'}),
-                ('transform', 'append'),  # {} optional!
-                ('calendar', 'ignore')     # {} optional!
-            ]
-            dr.run(pipeline)
         """
         if self.sql_folder is None:
-            raise RuntimeError("sql_folder is not configured. Cannot run pipelines. Set sql_folder when creating connection.")
+            raise RuntimeError("sql_folder is not configured. Cannot run pipelines.")
         
         for i, task in enumerate(pipeline, 1):
             print(f"\n{'='*60}")
@@ -472,18 +460,14 @@ class Duckrun:
             
             try:
                 if len(task) == 2:
-                    # Could be Python: ('name', (args,)) or SQL: ('table', 'mode')
                     name, second = task
                     if isinstance(second, str) and second in {'overwrite', 'append', 'ignore'}:
-                        # SQL task without params: ('table', 'mode')
                         self._run_sql(name, second, {})
                     else:
-                        # Python task: ('name', (args,))
                         args = second if isinstance(second, (tuple, list)) else (second,)
                         self._run_python(name, tuple(args))
                     
                 elif len(task) == 3:
-                    # SQL task with params: ('table', 'mode', {params})
                     table, mode, params = task
                     if not isinstance(params, dict):
                         raise ValueError(f"Expected dict for params, got {type(params)}")
@@ -506,13 +490,9 @@ class Duckrun:
         Execute raw SQL query with Spark-style write API.
         
         Example:
-            # Traditional DuckDB style
             dr.sql("SELECT * FROM table").show()
             df = dr.sql("SELECT * FROM table").df()
-            
-            # New Spark-style write API (format is optional, defaults to delta)
             dr.sql("SELECT 43 as value").write.mode("append").saveAsTable("test")
-            dr.sql("SELECT * FROM source").write.mode("overwrite").saveAsTable("target")
         """
         relation = self.con.sql(query)
         return QueryResult(relation, self)
