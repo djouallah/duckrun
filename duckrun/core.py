@@ -309,9 +309,6 @@ class Duckrun:
             print(f"✅ Successfully attached {attached_count}/{len(tables)} tables")
             print(f"{'='*60}\n")
             
-            print("Available views in DuckDB:")
-            self.con.sql("SELECT name FROM (SHOW ALL TABLES) WHERE database='memory' ORDER BY name").show()
-            
             if self.scan_all_schemas:
                 print(f"\n💡 Note: Tables are prefixed with schema (e.g., dbo_tablename)")
                 print(f"   Default schema for operations: {self.schema}\n")
