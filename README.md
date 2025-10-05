@@ -15,6 +15,11 @@ Simple task runner for Microsoft Fabric Python notebooks, powered by DuckDB and 
 ```bash
 pip install duckrun
 ```
+for local usage, Note: When running locally, your internet speed will be the main bottleneck.
+
+```bash
+pip install duckrun[local]
+```
 
 ## Quick Start
 
