@@ -1,0 +1,7 @@
+{
+  "project": "OneLake File Upload Test",
+  "version": "1.0",
+  "created": "2025-10-05",
+  "description": "Test file for duckrun copy method",
+  "features": ["file upload", "azure integration", "onelake files"]
+}
