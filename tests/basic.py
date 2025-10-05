@@ -4,9 +4,14 @@ Basic test script for duckrun package
 Converted from basic.ipynb notebook
 """
 
+import sys
+import os
 import time
-import duckrun
 from psutil import *
+
+# Add the parent directory to Python path to use local package
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import duckrun
 
 def main():
     # Start total execution timer
@@ -80,7 +85,7 @@ def main():
     # Test with different connection (timed)
     print("   5a. Testing secondary connection...")
     secondary_conn_start = time.time()
-    con2 = duckrun.connect("temp/temp.lakehouse")
+    con2 = duckrun.connect("temp/power.lakehouse/dbo")
     secondary_conn_time = time.time() - secondary_conn_start
     print(f"      ✅ Secondary connection in {secondary_conn_time:.3f} seconds")
     
