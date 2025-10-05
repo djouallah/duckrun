@@ -1,6 +1,6 @@
 <img src="https://raw.githubusercontent.com/djouallah/duckrun/main/duckrun.png" width="400" alt="Duckrun">
 
-Simple task runner for Microsoft Fabric Python notebooks, powered by DuckDB and Delta Lake.
+A helper package for stuff that made my life easier when working with Fabric Python notebooks. Just the things that actually made sense to me - nothing fancy
 
 ## Important Notes
 
@@ -9,6 +9,10 @@ Simple task runner for Microsoft Fabric Python notebooks, powered by DuckDB and 
 - Workspace and lakehouse names cannot contain spaces
 
 **Why no spaces?** Duckrun uses simple name-based paths instead of GUIDs. This keeps the code clean and readable, which is perfect for data engineering workspaces where naming conventions are already well-established. Just use underscores or hyphens instead: `my_workspace` or `my-lakehouse`.
+
+## What It Does
+
+It does orchestration, arbitrary SQL statements, and file manipulation. That's it - just stuff I encounter in my daily workflow when working with Fabric notebooks.
 
 ## Installation
 
@@ -81,7 +85,7 @@ con.sql("SELECT * FROM dbo_customers").show()
 con.sql("SELECT * FROM bronze_raw_data").show()
 ```
 
-## Two Ways to Use Duckrun
+## Three Ways to Use Duckrun
 
 ### 1. Data Exploration (Spark-Style API)
 
