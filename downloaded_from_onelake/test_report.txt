@@ -1,0 +1,17 @@
+OneLake File Upload Test Report
+==============================
+
+This file was created to test the new duckrun copy() method.
+
+Test Details:
+- Date: October 5, 2025
+- Method: copy() 
+- Target: OneLake Files section
+- Expected: Files should appear in Fabric OneLake
+
+Files uploaded:
+1. employees.csv - Sample employee data
+2. metadata.json - Project metadata
+3. test_report.txt - This report
+
+Status: Testing in progress...
