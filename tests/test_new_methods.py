@@ -97,10 +97,10 @@ def test_duckrun_methods():
             print(f"❌ Copy method failed: {e}")
             return False
         
-        # Step 4: Test download_from_files method
-        print("\n🔧 Step 4: Testing download_from_files method...")
+        # Step 4: Test download method
+        print("\n🔧 Step 4: Testing download method...")
         try:
-            success = con.download_from_files("test_upload_folder", test_download_dir, overwrite=False)
+            success = con.download("test_upload_folder", test_download_dir, overwrite=False)
             print(f"Download result: {success}")
             
             if success:
@@ -173,9 +173,9 @@ def test_method_imports():
             assert hasattr(con, 'copy'), "copy method not found"
             print("✅ copy method exists")
             
-            # Test that download_from_files method exists
-            assert hasattr(con, 'download_from_files'), "download_from_files method not found"
-            print("✅ download_from_files method exists")
+            # Test that download method exists
+            assert hasattr(con, 'download'), "download method not found"
+            print("✅ download method exists")
             
             # Test method signatures using inspect
             import inspect
@@ -183,8 +183,8 @@ def test_method_imports():
             copy_sig = inspect.signature(con.copy)
             print(f"✅ copy signature: {copy_sig}")
             
-            download_sig = inspect.signature(con.download_from_files)
-            print(f"✅ download_from_files signature: {download_sig}")
+            download_sig = inspect.signature(con.download)
+            print(f"✅ download signature: {download_sig}")
             
             # Verify copy method requires remote_folder (no default)
             copy_params = copy_sig.parameters
@@ -231,7 +231,7 @@ if __name__ == "__main__":
         
         if functionality_ok:
             print("\n🎉 ALL TESTS COMPLETED SUCCESSFULLY!")
-            print("The new copy() and download_from_files() methods are ready to use!")
+            print("The new copy() and download() methods are ready to use!")
         else:
             print("\n⚠ Functionality tests had issues (likely due to authentication)")
             print("But the methods are correctly implemented and should work with proper Azure auth")

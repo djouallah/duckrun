@@ -22,16 +22,16 @@ def test_signatures_only():
         assert hasattr(Duckrun, 'copy'), "copy method not found"
         print("✅ copy method exists")
         
-        assert hasattr(Duckrun, 'download_from_files'), "download_from_files method not found"
-        print("✅ download_from_files method exists")
+        assert hasattr(Duckrun, 'download'), "download method not found"
+        print("✅ download method exists")
         
         # Get method signatures
         copy_sig = inspect.signature(Duckrun.copy)
-        download_sig = inspect.signature(Duckrun.download_from_files)
+        download_sig = inspect.signature(Duckrun.download)
         
         print(f"\n📋 Method Signatures:")
         print(f"   copy{copy_sig}")
-        print(f"   download_from_files{download_sig}")
+        print(f"   download{download_sig}")
         
         # Verify copy method parameters
         copy_params = copy_sig.parameters
@@ -53,12 +53,12 @@ def test_signatures_only():
         assert overwrite_param.default == False, f"overwrite should default to False, got {overwrite_param.default}"
         print("✅ copy method overwrite parameter defaults to False")
         
-        # Verify download_from_files method parameters
+        # Verify download method parameters
         download_params = download_sig.parameters
         download_overwrite = download_params.get('overwrite')
         assert download_overwrite is not None, "download overwrite parameter missing"
         assert download_overwrite.default == False, f"download overwrite should default to False, got {download_overwrite.default}"
-        print("✅ download_from_files method overwrite parameter defaults to False")
+        print("✅ download method overwrite parameter defaults to False")
         
         # Test parameter types (if available)
         print("\n📋 Parameter Details:")
@@ -71,7 +71,7 @@ def test_signatures_only():
         for name, param in download_params.items():
             if name != 'self':
                 default_str = f" = {param.default}" if param.default != inspect.Parameter.empty else " (required)"
-                print(f"   download_from_files.{name}{default_str}")
+                print(f"   download.{name}{default_str}")
         
         return True
         
@@ -152,6 +152,7 @@ if __name__ == "__main__":
             print("=" * 60)
             print("\n📋 Summary of Changes:")
             print("  • copy_to_files() → copy()")
+            print("  • download_from_files() → download()")
             print("  • remote_folder parameter is now REQUIRED")
             print("  • overwrite defaults to False (both methods)")
             print("  • Methods are ready for use with proper Azure authentication")
