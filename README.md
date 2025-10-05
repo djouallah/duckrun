@@ -1,4 +1,4 @@
-<img src="duckrun.png" width="400" alt="Duckrun">
+<img src="https://raw.githubusercontent.com/djouallah/duckrun/main/duckrun.png" width="400" alt="Duckrun">
 
 Simple task runner for Microsoft Fabric Python notebooks, powered by DuckDB and Delta Lake.
 
@@ -21,10 +21,11 @@ pip install duckrun
 ```python
 import duckrun
 
-# Connect to your Fabric lakehouse
+# Connect to your Fabric lakehouse with a specific schema
 con = duckrun.connect("my_workspace/my_lakehouse.lakehouse/dbo")
 
-# Schema defaults to 'dbo' if not specified
+# Schema defaults to 'dbo' if not specified (scans all schemas)
+# ⚠️ WARNING: Scanning all schemas can be slow for large lakehouses!
 con = duckrun.connect("my_workspace/my_lakehouse.lakehouse")
 
 # Explore data
@@ -39,17 +40,37 @@ That's it! No `sql_folder` needed for data exploration.
 ## Connection Format
 
 ```python
-# With schema
+# With schema (recommended for better performance)
 con = duckrun.connect("workspace/lakehouse.lakehouse/schema")
 
-# Without schema (uses 'dbo' by default)
+# Without schema (defaults to 'dbo', scans all schemas)
+# ⚠️ This can be slow for large lakehouses!
 con = duckrun.connect("workspace/lakehouse.lakehouse")
 
 # With options
 con = duckrun.connect("workspace/lakehouse.lakehouse/dbo", sql_folder="./sql")
 ```
 
-**Note:** When schema is not specified, Duckrun defaults to `dbo`. Multi-schema scanning will be added in a future update.
+### Multi-Schema Support
+
+When you don't specify a schema, Duckrun will:
+- **Default to `dbo`** for write operations
+- **Scan all schemas** to discover and attach all Delta tables
+- **Prefix table names** with schema to avoid conflicts (e.g., `dbo_customers`, `bronze_raw_data`)
+
+**Performance Note:** Scanning all schemas requires listing all files in the lakehouse, which can be slow for large lakehouses with many tables. For better performance, always specify a schema when possible.
+
+```python
+# Fast: scans only 'dbo' schema
+con = duckrun.connect("workspace/lakehouse.lakehouse/dbo")
+
+# Slower: scans all schemas
+con = duckrun.connect("workspace/lakehouse.lakehouse")
+
+# Query tables from different schemas (when scanning all)
+con.sql("SELECT * FROM dbo_customers").show()
+con.sql("SELECT * FROM bronze_raw_data").show()
+```
 
 ## Two Ways to Use Duckrun
 
@@ -245,7 +266,7 @@ con = duckrun.connect(
 ```python
 import duckrun
 
-# Connect
+# Connect (specify schema for best performance)
 con = duckrun.connect("Analytics/Sales.lakehouse/dbo", sql_folder="./sql")
 
 # Pipeline with mixed tasks
@@ -280,7 +301,7 @@ con.sql("""
 ## How It Works
 
 1. **Connection**: Duckrun connects to your Fabric lakehouse using OneLake and Azure authentication
-2. **Table Discovery**: Automatically scans for Delta tables in your schema and creates DuckDB views
+2. **Table Discovery**: Automatically scans for Delta tables in your schema (or all schemas) and creates DuckDB views
 3. **Query Execution**: Run SQL queries directly against Delta tables using DuckDB's speed
 4. **Write Operations**: Results are written back as Delta tables with automatic optimization
 5. **Pipelines**: Orchestrate complex workflows with reusable SQL and Python tasks
