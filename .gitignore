@@ -39,3 +39,9 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Test artifacts (exclude temporary test files and downloads)
+tests/test_onelake_upload/
+tests/quick_test/
+tests/downloaded_*/
+tests/temp_*/
