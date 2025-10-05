@@ -9,7 +9,7 @@ import os
 import time
 from psutil import *
 
-# Add the parent directory to Python path to use local package
+# Add the parent directory to Python path to use local package source
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import duckrun
 
