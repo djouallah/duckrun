@@ -127,24 +127,47 @@ class Duckrun:
         self._attach_lakehouse()
 
     @classmethod
-    def connect(cls, workspace: Union[str, None] = None, lakehouse_name: Optional[str] = None, 
-                schema: str = "dbo", sql_folder: Optional[str] = None, 
+    def connect(cls, workspace: Union[str, None] = None, lakehouse_name: Optional[str] = None,
+                schema: str = "dbo", sql_folder: Optional[str] = None,
                 compaction_threshold: int = 100):
         """
         Create and connect to lakehouse.
         
         Supports two formats:
-        1. Compact: connect("ws/lh.lakehouse/schema") or connect("ws/lh.lakehouse")
-        2. Traditional: connect("ws", "lh", "schema") or connect("ws", "lh")
+        1. Compact: connect("ws/lh.lakehouse/schema", sql_folder=...) or connect("ws/lh.lakehouse")
+        2. Traditional: connect("ws", "lh", "schema", sql_folder) or connect("ws", "lh")
         
-        Schema defaults to "dbo" if not specified. When no schema is provided,
-        all tables across all schemas will be listed, but operations will use "dbo".
+        Args:
+            workspace: Workspace name or full path "ws/lh.lakehouse/schema"
+            lakehouse_name: Lakehouse name (optional if using compact format)
+            schema: Schema name (defaults to "dbo")
+            sql_folder: Optional path or URL to SQL files folder
+            compaction_threshold: File count threshold for compaction
+        
+        Examples:
+            # Compact format (second param treated as sql_folder if it's a URL/path string)
+            dr = Duckrun.connect("temp/power.lakehouse/wa", "https://github.com/.../sql/")
+            dr = Duckrun.connect("ws/lh.lakehouse/schema", "./sql")
+            dr = Duckrun.connect("ws/lh.lakehouse/schema")  # no SQL folder
+            
+            # Traditional format
+            dr = Duckrun.connect("ws", "lh", "schema", "./sql")
+            dr = Duckrun.connect("ws", "lh", "schema")
         """
         print("Connecting to Lakehouse...")
         
         scan_all_schemas = False
         
-        if workspace and "/" in workspace and lakehouse_name is None:
+        # Check if using compact format: "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
+        # If second param looks like a path/URL and not a lakehouse name, treat it as sql_folder
+        if workspace and "/" in workspace and (lakehouse_name is None or 
+            (isinstance(lakehouse_name, str) and ('/' in lakehouse_name or lakehouse_name.startswith('http') or lakehouse_name.startswith('.')))):
+            
+            # If lakehouse_name looks like a sql_folder, shift it
+            if lakehouse_name and ('/' in lakehouse_name or lakehouse_name.startswith('http') or lakehouse_name.startswith('.')):
+                sql_folder = lakehouse_name
+                lakehouse_name = None
+            
             parts = workspace.split("/")
             if len(parts) == 2:
                 workspace, lakehouse_name = parts
@@ -162,6 +185,7 @@ class Duckrun:
             if lakehouse_name.endswith(".lakehouse"):
                 lakehouse_name = lakehouse_name[:-10]
         elif lakehouse_name is not None:
+            # Traditional format - check if schema was explicitly provided
             if schema == "dbo":
                 scan_all_schemas = True
                 print(f"ℹ️  No schema specified. Using default schema 'dbo' for operations.")
@@ -170,10 +194,10 @@ class Duckrun:
         if not workspace or not lakehouse_name:
             raise ValueError(
                 "Missing required parameters. Use either:\n"
-                "  connect('workspace/lakehouse.lakehouse/schema')\n"
-                "  connect('workspace/lakehouse.lakehouse')  # defaults to dbo, lists all\n"
-                "  connect('workspace', 'lakehouse', 'schema')\n"
-                "  connect('workspace', 'lakehouse')  # defaults to dbo, lists all"
+                "  connect('workspace/lakehouse.lakehouse/schema', 'sql_folder')\n"
+                "  connect('workspace/lakehouse.lakehouse')  # defaults to dbo\n"
+                "  connect('workspace', 'lakehouse', 'schema', 'sql_folder')\n"
+                "  connect('workspace', 'lakehouse')  # defaults to dbo"
             )
         
         return cls(workspace, lakehouse_name, schema, sql_folder, compaction_threshold, scan_all_schemas)
