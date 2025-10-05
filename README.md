@@ -38,6 +38,10 @@ con.sql("SELECT * FROM my_table LIMIT 10").show()
 
 # Write to Delta tables (Spark-style API)
 con.sql("SELECT * FROM source").write.mode("overwrite").saveAsTable("target")
+
+# Upload/download files to/from OneLake Files
+con.copy("./local_folder", "target_folder")  # Upload files
+con.download("target_folder", "./downloaded")  # Download files
 ```
 
 That's it! No `sql_folder` needed for data exploration.
@@ -107,7 +111,38 @@ con.sql("SELECT * FROM new_orders").write.mode("append").saveAsTable("orders")
 
 **Note:** `.format("delta")` is optional - Delta is the default format!
 
-### 2. Pipeline Orchestration
+### 2. File Management (OneLake Files)
+
+Upload and download files to/from OneLake Files section (not Delta tables):
+
+```python
+con = duckrun.connect("workspace/lakehouse.lakehouse/dbo")
+
+# Upload files to OneLake Files (remote_folder is required)
+con.copy("./local_data", "uploaded_data")
+
+# Upload only specific file types
+con.copy("./reports", "daily_reports", ['.csv', '.parquet'])
+
+# Upload with overwrite enabled (default is False for safety)
+con.copy("./backup", "backups", overwrite=True)
+
+# Download files from OneLake Files
+con.download("uploaded_data", "./downloaded")
+
+# Download only CSV files from a specific folder
+con.download("daily_reports", "./reports", ['.csv'])
+```
+
+**Key Features:**
+- ✅ **Files go to OneLake Files section** (not Delta Tables)
+- ✅ **`remote_folder` parameter is required** for uploads (prevents accidental uploads)  
+- ✅ **`overwrite=False` by default** (safer - prevents accidental overwrites)
+- ✅ **File extension filtering** (e.g., only `.csv` or `.parquet` files)
+- ✅ **Preserves folder structure** during upload/download
+- ✅ **Progress reporting** with file sizes and upload status
+
+### 3. Pipeline Orchestration
 
 For production workflows with reusable SQL and Python tasks:
 
@@ -266,6 +301,63 @@ con = duckrun.connect(
 )
 ```
 
+## File Management API Reference
+
+### `copy(local_folder, remote_folder, file_extensions=None, overwrite=False)`
+
+Upload files from a local folder to OneLake Files section.
+
+**Parameters:**
+- `local_folder` (str): Path to local folder containing files to upload
+- `remote_folder` (str): **Required** target folder path in OneLake Files  
+- `file_extensions` (list, optional): Filter by file extensions (e.g., `['.csv', '.parquet']`)
+- `overwrite` (bool, optional): Whether to overwrite existing files (default: False)
+
+**Returns:** `True` if all files uploaded successfully, `False` otherwise
+
+**Examples:**
+```python
+# Upload all files to a target folder
+con.copy("./data", "processed_data")
+
+# Upload only CSV and Parquet files
+con.copy("./reports", "monthly_reports", ['.csv', '.parquet'])
+
+# Upload with overwrite enabled
+con.copy("./backup", "daily_backup", overwrite=True)
+```
+
+### `download(remote_folder="", local_folder="./downloaded_files", file_extensions=None, overwrite=False)`
+
+Download files from OneLake Files section to a local folder.
+
+**Parameters:**
+- `remote_folder` (str, optional): Source folder path in OneLake Files (default: root)
+- `local_folder` (str, optional): Local destination folder (default: "./downloaded_files")  
+- `file_extensions` (list, optional): Filter by file extensions (e.g., `['.csv', '.json']`)
+- `overwrite` (bool, optional): Whether to overwrite existing local files (default: False)
+
+**Returns:** `True` if all files downloaded successfully, `False` otherwise
+
+**Examples:**
+```python
+# Download all files from OneLake Files root
+con.download()
+
+# Download from specific folder
+con.download("processed_data", "./local_data")
+
+# Download only JSON files
+con.download("config", "./configs", ['.json'])
+```
+
+**Important Notes:**
+- Files are uploaded/downloaded to/from the **OneLake Files section**, not Delta Tables
+- The `remote_folder` parameter is **required** for uploads to prevent accidental uploads
+- Both methods default to `overwrite=False` for safety
+- Folder structure is preserved during upload/download operations
+- Progress is reported with file names, sizes, and upload/download status
+
 ## Complete Example
 
 ```python
@@ -274,7 +366,10 @@ import duckrun
 # Connect (specify schema for best performance)
 con = duckrun.connect("Analytics/Sales.lakehouse/dbo", sql_folder="./sql")
 
-# Pipeline with mixed tasks
+# 1. Upload raw data files to OneLake Files
+con.copy("./raw_data", "raw_uploads", ['.csv', '.json'])
+
+# 2. Pipeline with mixed tasks
 pipeline = [
     # Download raw data (Python)
     ('fetch_api_data', ('https://api.example.com/sales', 'raw')),
@@ -289,19 +384,29 @@ pipeline = [
     ('sales_history', 'append')
 ]
 
-# Run
+# Run pipeline
 success = con.run(pipeline)
 
-# Explore results
+# 3. Explore results using DuckDB
 con.sql("SELECT * FROM regional_summary").show()
 
-# Export to new table
+# 4. Export to new Delta table
 con.sql("""
     SELECT region, SUM(total) as grand_total
     FROM regional_summary
     GROUP BY region
 """).write.mode("overwrite").saveAsTable("region_totals")
+
+# 5. Download processed files for external systems
+con.download("processed_reports", "./exports", ['.csv'])
 ```
+
+**This example demonstrates:**
+- 📁 **File uploads** to OneLake Files section
+- 🔄 **Pipeline orchestration** with SQL and Python tasks  
+- ⚡ **Fast data exploration** with DuckDB
+- 💾 **Delta table creation** with Spark-style API
+- 📤 **File downloads** from OneLake Files
 
 ## How It Works
 

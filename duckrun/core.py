@@ -624,9 +624,9 @@ class Duckrun:
         
         return failed_count == 0
 
-    def download_from_files(self, remote_folder: str = "", local_folder: str = "./downloaded_files",
-                           file_extensions: Optional[List[str]] = None,
-                           overwrite: bool = False) -> bool:
+    def download(self, remote_folder: str = "", local_folder: str = "./downloaded_files",
+                 file_extensions: Optional[List[str]] = None,
+                 overwrite: bool = False) -> bool:
         """
         Download files from OneLake Files section to a local folder.
         
