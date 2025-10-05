@@ -143,7 +143,7 @@ def test_real_upload():
         print("\n📥 Testing download from OneLake...")
         download_dir = "downloaded_from_onelake"
         
-        success_download = con.download_from_files("duckrun_test_files", download_dir)
+        success_download = con.download("duckrun_test_files", download_dir)
         
         if success_download:
             print("✅ Files downloaded successfully!")

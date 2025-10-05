@@ -1,0 +1,7 @@
+Quick Test File
+===============
+
+This file was uploaded using duckrun.copy() method.
+Time: October 5, 2025
+
+If you can see this file in OneLake Files, the upload worked!
