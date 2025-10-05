@@ -61,19 +61,20 @@ con.copy("./data", "csv_files", ['.csv'])
 con.copy("./backup", "backups", overwrite=True)
 ```
 
-### `download_from_files()` Method  
+### `download()` Method  
 Download files from OneLake Files section to local folder:
 ```python
 # Download all files from a folder
-con.download_from_files("target_folder", "./local_download")
+con.download("target_folder", "./local_download")
 
 # Download only specific file types
-con.download_from_files("csv_files", "./csv_data", ['.csv'])
+con.download("csv_files", "./csv_data", ['.csv'])
 ```
 
 ## Key Changes
 
 - ✅ `copy_to_files()` → `copy()`
+- ✅ `download_from_files()` → `download()`
 - ✅ `remote_folder` parameter is now **REQUIRED**
 - ✅ `overwrite` defaults to **False** (safer)
 - ✅ Files go to **OneLake Files** section (not Tables)
