@@ -22,11 +22,10 @@ pip install duckrun
 import duckrun
 
 # Connect to your Fabric lakehouse
-con = duckrun.connect(
-    workspace="my_workspace",
-    lakehouse_name="my_lakehouse", 
-    schema="dbo"
-)
+con = duckrun.connect("my_workspace/my_lakehouse.lakehouse/dbo")
+
+# Schema defaults to 'dbo' if not specified
+con = duckrun.connect("my_workspace/my_lakehouse.lakehouse")
 
 # Explore data
 con.sql("SELECT * FROM my_table LIMIT 10").show()
@@ -37,6 +36,21 @@ con.sql("SELECT * FROM source").write.mode("overwrite").saveAsTable("target")
 
 That's it! No `sql_folder` needed for data exploration.
 
+## Connection Format
+
+```python
+# With schema
+con = duckrun.connect("workspace/lakehouse.lakehouse/schema")
+
+# Without schema (uses 'dbo' by default)
+con = duckrun.connect("workspace/lakehouse.lakehouse")
+
+# With options
+con = duckrun.connect("workspace/lakehouse.lakehouse/dbo", sql_folder="./sql")
+```
+
+**Note:** When schema is not specified, Duckrun defaults to `dbo`. Multi-schema scanning will be added in a future update.
+
 ## Two Ways to Use Duckrun
 
 ### 1. Data Exploration (Spark-Style API)
@@ -44,7 +58,7 @@ That's it! No `sql_folder` needed for data exploration.
 Perfect for ad-hoc analysis and interactive notebooks:
 
 ```python
-con = duckrun.connect("workspace", "lakehouse", "dbo")
+con = duckrun.connect("workspace/lakehouse.lakehouse/dbo")
 
 # Query existing tables
 con.sql("SELECT * FROM sales WHERE year = 2024").show()
@@ -73,9 +87,7 @@ For production workflows with reusable SQL and Python tasks:
 
 ```python
 con = duckrun.connect(
-    workspace="my_workspace",
-    lakehouse_name="my_lakehouse", 
-    schema="dbo",
+    "my_workspace/my_lakehouse.lakehouse/dbo",
     sql_folder="./sql"  # folder with .sql and .py files
 )
 
@@ -168,9 +180,7 @@ Load tasks from GitHub or any URL:
 
 ```python
 con = duckrun.connect(
-    workspace="Analytics",
-    lakehouse_name="Sales", 
-    schema="dbo",
+    "Analytics/Sales.lakehouse/dbo",
     sql_folder="https://raw.githubusercontent.com/user/repo/main/sql"
 )
 ```
@@ -225,9 +235,7 @@ Customize compaction threshold:
 
 ```python
 con = duckrun.connect(
-    workspace="workspace",
-    lakehouse_name="lakehouse",
-    schema="dbo",
+    "workspace/lakehouse.lakehouse/dbo",
     compaction_threshold=50  # compact after 50 files
 )
 ```
@@ -238,7 +246,7 @@ con = duckrun.connect(
 import duckrun
 
 # Connect
-con = duckrun.connect("Analytics", "Sales", "dbo", "./sql")
+con = duckrun.connect("Analytics/Sales.lakehouse/dbo", sql_folder="./sql")
 
 # Pipeline with mixed tasks
 pipeline = [
