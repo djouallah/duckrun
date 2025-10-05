@@ -133,14 +133,12 @@ class Duckrun:
         """
         Create and connect to lakehouse.
         
-        Supports two formats:
-        1. Compact: connect("ws/lh.lakehouse/schema", sql_folder=...) or connect("ws/lh.lakehouse")
-        2. Traditional: connect("ws", "lh", "schema", sql_folder) or connect("ws", "lh")
+        Uses compact format: connect("ws/lh.lakehouse/schema", sql_folder=...) or connect("ws/lh.lakehouse")
         
         Args:
-            workspace: Workspace name or full path "ws/lh.lakehouse/schema"
-            lakehouse_name: Lakehouse name (optional if using compact format)
-            schema: Schema name (defaults to "dbo")
+            workspace: Full path "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
+            lakehouse_name: Optional SQL folder path or URL (treated as sql_folder if it's a path/URL)
+            schema: Not used (schema is extracted from workspace path)
             sql_folder: Optional path or URL to SQL files folder
             compaction_threshold: File count threshold for compaction
         
@@ -149,55 +147,47 @@ class Duckrun:
             dr = Duckrun.connect("temp/power.lakehouse/wa", "https://github.com/.../sql/")
             dr = Duckrun.connect("ws/lh.lakehouse/schema", "./sql")
             dr = Duckrun.connect("ws/lh.lakehouse/schema")  # no SQL folder
-            
-            # Traditional format
-            dr = Duckrun.connect("ws", "lh", "schema", "./sql")
-            dr = Duckrun.connect("ws", "lh", "schema")
+            dr = Duckrun.connect("ws/lh.lakehouse")  # defaults to dbo schema
         """
         print("Connecting to Lakehouse...")
         
         scan_all_schemas = False
         
-        # Check if using compact format: "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
-        # If second param looks like a path/URL and not a lakehouse name, treat it as sql_folder
-        if workspace and "/" in workspace and (lakehouse_name is None or 
-            (isinstance(lakehouse_name, str) and ('/' in lakehouse_name or lakehouse_name.startswith('http') or lakehouse_name.startswith('.')))):
-            
-            # If lakehouse_name looks like a sql_folder, shift it
-            if lakehouse_name and ('/' in lakehouse_name or lakehouse_name.startswith('http') or lakehouse_name.startswith('.')):
-                sql_folder = lakehouse_name
-                lakehouse_name = None
-            
-            parts = workspace.split("/")
-            if len(parts) == 2:
-                workspace, lakehouse_name = parts
-                scan_all_schemas = True
-                print(f"ℹ️  No schema specified. Using default schema 'dbo' for operations.")
-                print(f"   Scanning all schemas for table discovery...\n")
-            elif len(parts) == 3:
-                workspace, lakehouse_name, schema = parts
-            else:
-                raise ValueError(
-                    f"Invalid connection string format: '{workspace}'. "
-                    "Expected format: 'workspace/lakehouse.lakehouse' or 'workspace/lakehouse.lakehouse/schema'"
-                )
-            
-            if lakehouse_name.endswith(".lakehouse"):
-                lakehouse_name = lakehouse_name[:-10]
-        elif lakehouse_name is not None:
-            # Traditional format - check if schema was explicitly provided
-            if schema == "dbo":
-                scan_all_schemas = True
-                print(f"ℹ️  No schema specified. Using default schema 'dbo' for operations.")
-                print(f"   Scanning all schemas for table discovery...\n")
+        # Only support compact format: "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
+        if not workspace or "/" not in workspace:
+            raise ValueError(
+                "Invalid connection string format. "
+                "Expected format: 'workspace/lakehouse.lakehouse/schema' or 'workspace/lakehouse.lakehouse'"
+            )
+        
+        # If lakehouse_name looks like a sql_folder, shift it
+        if lakehouse_name and ('/' in lakehouse_name or lakehouse_name.startswith('http') or lakehouse_name.startswith('.')):
+            sql_folder = lakehouse_name
+            lakehouse_name = None
+        
+        parts = workspace.split("/")
+        if len(parts) == 2:
+            workspace, lakehouse_name = parts
+            scan_all_schemas = True
+            schema = "dbo"
+            print(f"ℹ️  No schema specified. Using default schema 'dbo' for operations.")
+            print(f"   Scanning all schemas for table discovery...\n")
+        elif len(parts) == 3:
+            workspace, lakehouse_name, schema = parts
+        else:
+            raise ValueError(
+                f"Invalid connection string format: '{workspace}'. "
+                "Expected format: 'workspace/lakehouse.lakehouse' or 'workspace/lakehouse.lakehouse/schema'"
+            )
+        
+        if lakehouse_name.endswith(".lakehouse"):
+            lakehouse_name = lakehouse_name[:-10]
         
         if not workspace or not lakehouse_name:
             raise ValueError(
-                "Missing required parameters. Use either:\n"
+                "Missing required parameters. Use compact format:\n"
                 "  connect('workspace/lakehouse.lakehouse/schema', 'sql_folder')\n"
-                "  connect('workspace/lakehouse.lakehouse')  # defaults to dbo\n"
-                "  connect('workspace', 'lakehouse', 'schema', 'sql_folder')\n"
-                "  connect('workspace', 'lakehouse')  # defaults to dbo"
+                "  connect('workspace/lakehouse.lakehouse')  # defaults to dbo"
             )
         
         return cls(workspace, lakehouse_name, schema, sql_folder, compaction_threshold, scan_all_schemas)
@@ -210,7 +200,7 @@ class Duckrun:
         if token != "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
             self.con.sql(f"CREATE OR REPLACE SECRET onelake (TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}')")
         else:
-            print("Please login to Azure CLI")
+            print("Authenticating with Azure (trying CLI, will fallback to browser if needed)...")
             from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
             credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
             token = credential.get_token("https://storage.azure.com/.default")
@@ -227,7 +217,7 @@ class Duckrun:
         """
         token = self._get_storage_token()
         if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-            print("Getting Azure token for table discovery...")
+            print("Authenticating with Azure for table discovery (trying CLI, will fallback to browser if needed)...")
             from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
             credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
             token_obj = credential.get_token("https://storage.azure.com/.default")
@@ -542,7 +532,7 @@ class Duckrun:
         # Get Azure token
         token = self._get_storage_token()
         if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-            print("Getting Azure token for file upload...")
+            print("Authenticating with Azure for file upload (trying CLI, will fallback to browser if needed)...")
             from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
             credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
             token_obj = credential.get_token("https://storage.azure.com/.default")
@@ -649,7 +639,7 @@ class Duckrun:
         # Get Azure token
         token = self._get_storage_token()
         if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-            print("Getting Azure token for file download...")
+            print("Authenticating with Azure for file download (trying CLI, will fallback to browser if needed)...")
             from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
             credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
             token_obj = credential.get_token("https://storage.azure.com/.default")
