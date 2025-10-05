@@ -162,6 +162,9 @@ class Duckrun:
                 # Format: "ws/lh.lakehouse" (schema will use default)
                 workspace, lakehouse_name = parts
                 # schema already has default value "dbo"
+                print(f"ℹ️  No schema specified. Using default schema 'dbo'.")
+                print(f"   To specify a schema, use: {workspace}/{lakehouse_name}.lakehouse/schema")
+                print(f"   Note: Scanning all schemas will be added in a future update.\n")
             elif len(parts) == 3:
                 # Format: "ws/lh.lakehouse/schema"
                 workspace, lakehouse_name, schema = parts
