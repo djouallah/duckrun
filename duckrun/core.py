@@ -111,16 +111,17 @@ class Duckrun:
     
     Usage:
         # For pipelines:
-        dr = Duckrun.connect(workspace, lakehouse, schema, sql_folder)
+        dr = Duckrun.connect("workspace/lakehouse.lakehouse/schema", sql_folder="./sql")
+        dr = Duckrun.connect("workspace/lakehouse.lakehouse")  # defaults to dbo schema
         dr.run(pipeline)
         
         # For data exploration with Spark-style API:
-        dr = Duckrun.connect(workspace, lakehouse, schema)
+        dr = Duckrun.connect("workspace/lakehouse.lakehouse")
         dr.sql("SELECT * FROM table").show()
         dr.sql("SELECT 43").write.mode("append").saveAsTable("test")
     """
 
-    def __init__(self, workspace: str, lakehouse_name: str, schema: str, 
+    def __init__(self, workspace: str, lakehouse_name: str, schema: str = "dbo", 
                  sql_folder: Optional[str] = None, compaction_threshold: int = 10):
         self.workspace = workspace
         self.lakehouse_name = lakehouse_name
@@ -133,10 +134,57 @@ class Duckrun:
         self._attach_lakehouse()
 
     @classmethod
-    def connect(cls, workspace: str, lakehouse_name: str, schema: str, 
-                sql_folder: Optional[str] = None, compaction_threshold: int = 100):
-        """Create and connect to lakehouse"""
+    def connect(cls, workspace: Union[str, None] = None, lakehouse_name: Optional[str] = None, 
+                schema: str = "dbo", sql_folder: Optional[str] = None, 
+                compaction_threshold: int = 100):
+        """
+        Create and connect to lakehouse.
+        
+        Supports two formats:
+        1. Compact: connect("ws/lh.lakehouse/schema") or connect("ws/lh.lakehouse")
+        2. Traditional: connect("ws", "lh", "schema") or connect("ws", "lh")
+        
+        Schema defaults to "dbo" if not specified.
+        
+        Examples:
+            dr = Duckrun.connect("myworkspace/mylakehouse.lakehouse/bronze")
+            dr = Duckrun.connect("myworkspace/mylakehouse.lakehouse")  # uses dbo
+            dr = Duckrun.connect("myworkspace", "mylakehouse", "bronze")
+            dr = Duckrun.connect("myworkspace", "mylakehouse")  # uses dbo
+            dr = Duckrun.connect("ws/lh.lakehouse", sql_folder="./sql")
+        """
         print("Connecting to Lakehouse...")
+        
+        # Check if using compact format: "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
+        if workspace and "/" in workspace and lakehouse_name is None:
+            parts = workspace.split("/")
+            if len(parts) == 2:
+                # Format: "ws/lh.lakehouse" (schema will use default)
+                workspace, lakehouse_name = parts
+                # schema already has default value "dbo"
+            elif len(parts) == 3:
+                # Format: "ws/lh.lakehouse/schema"
+                workspace, lakehouse_name, schema = parts
+            else:
+                raise ValueError(
+                    f"Invalid connection string format: '{workspace}'. "
+                    "Expected format: 'workspace/lakehouse.lakehouse' or 'workspace/lakehouse.lakehouse/schema'"
+                )
+            
+            # Remove .lakehouse suffix if present
+            if lakehouse_name.endswith(".lakehouse"):
+                lakehouse_name = lakehouse_name[:-10]
+        
+        # Validate all required parameters are present
+        if not workspace or not lakehouse_name:
+            raise ValueError(
+                "Missing required parameters. Use either:\n"
+                "  connect('workspace/lakehouse.lakehouse/schema')\n"
+                "  connect('workspace/lakehouse.lakehouse')  # defaults to dbo\n"
+                "  connect('workspace', 'lakehouse', 'schema')\n"
+                "  connect('workspace', 'lakehouse')  # defaults to dbo"
+            )
+        
         return cls(workspace, lakehouse_name, schema, sql_folder, compaction_threshold)
 
     def _get_storage_token(self):
