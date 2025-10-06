@@ -453,6 +453,7 @@ class Duckrun:
         
         Returns:
             True if all tasks succeeded
+            False if any task failed (exception) or Python task returned 0 (early exit)
         """
         if self.sql_folder is None:
             raise RuntimeError("sql_folder is not configured. Cannot run pipelines.")
@@ -463,22 +464,33 @@ class Duckrun:
             print('='*60)
             
             try:
+                result = None
+                
                 if len(task) == 2:
                     name, second = task
                     if isinstance(second, str) and second in {'overwrite', 'append', 'ignore'}:
-                        self._run_sql(name, second, {})
+                        result = self._run_sql(name, second, {})
                     else:
                         args = second if isinstance(second, (tuple, list)) else (second,)
-                        self._run_python(name, tuple(args))
+                        result = self._run_python(name, tuple(args))
                     
                 elif len(task) == 3:
                     table, mode, params = task
                     if not isinstance(params, dict):
                         raise ValueError(f"Expected dict for params, got {type(params)}")
-                    self._run_sql(table, mode, params)
+                    result = self._run_sql(table, mode, params)
                     
                 else:
                     raise ValueError(f"Invalid task format: {task}")
+                
+                # Check if Python task returned 0 (early exit condition)
+                # Only check for Python tasks as SQL tasks return table names (strings) and only stop on exceptions
+                if (len(task) == 2 and 
+                    not isinstance(task[1], str) and 
+                    result == 0):
+                    print(f"\n⏹️  Python task {i} returned 0 - stopping pipeline execution")
+                    print(f"   Remaining tasks ({len(pipeline) - i}) will not be executed")
+                    return False
                     
             except Exception as e:
                 print(f"\n❌ Task {i} failed: {e}")
