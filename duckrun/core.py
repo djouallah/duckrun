@@ -8,6 +8,9 @@ from string import Template
 import obstore as obs
 from obstore.store import AzureStore
 
+# Row Group configuration for optimal Delta Lake performance
+RG = 8_000_000
+
 
 class DeltaWriter:
     """Spark-style write API for Delta Lake"""
@@ -48,7 +51,7 @@ class DeltaWriter:
         df = self.relation.record_batch()
         
         print(f"Writing to Delta table: {schema}.{table} (mode={self._mode})")
-        write_deltalake(path, df, mode=self._mode)
+        write_deltalake(path, df, mode=self._mode, max_rows_per_file=RG, max_rows_per_group=RG, min_rows_per_group=RG)
         
         self.duckrun.con.sql(f"DROP VIEW IF EXISTS {table}")
         self.duckrun.con.sql(f"""
@@ -406,7 +409,7 @@ class Duckrun:
         if mode == 'overwrite':
             self.con.sql(f"DROP VIEW IF EXISTS {normalized_table}")
             df = self.con.sql(sql).record_batch()
-            write_deltalake(path, df, mode='overwrite')
+            write_deltalake(path, df, mode='overwrite', max_rows_per_file=RG, max_rows_per_group=RG, min_rows_per_group=RG)
             self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
             dt = DeltaTable(path)
             dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
@@ -414,7 +417,7 @@ class Duckrun:
 
         elif mode == 'append':
             df = self.con.sql(sql).record_batch()
-            write_deltalake(path, df, mode='append')
+            write_deltalake(path, df, mode='append', max_rows_per_file=RG, max_rows_per_group=RG, min_rows_per_group=RG)
             self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
             dt = DeltaTable(path)
             if len(dt.file_uris()) > self.compaction_threshold:
@@ -431,7 +434,7 @@ class Duckrun:
                 print(f"Table {normalized_table} doesn't exist. Creating...")
                 self.con.sql(f"DROP VIEW IF EXISTS {normalized_table}")
                 df = self.con.sql(sql).record_batch()
-                write_deltalake(path, df, mode='overwrite')
+                write_deltalake(path, df, mode='overwrite', max_rows_per_file=RG, max_rows_per_group=RG, min_rows_per_group=RG)
                 self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
                 dt = DeltaTable(path)
                 dt.vacuum(dry_run=False)

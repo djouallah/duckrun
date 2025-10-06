@@ -14,7 +14,7 @@ authors = [
 requires-python = ">=3.9"
 dependencies = [
     "duckdb>=1.2.0",
-    "deltalake>=0.18.2",
+    "deltalake<=0.18.2",
     "requests>=2.28.0",
     "obstore>=0.2.0"
 ]
