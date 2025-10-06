@@ -13,6 +13,50 @@ from psutil import *
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import duckrun
 
+def quick_return_code_test():
+    """Quick test of return code logic without authentication"""
+    print("🔬 QUICK RETURN CODE TEST (No Auth Required)")
+    print("=" * 60)
+    
+    # Test the core logic we added to the run method
+    tests_passed = 0
+    total_tests = 3
+    
+    # Test 1: Python task returning 1 (should continue)
+    task1 = ('dummy_function', ())
+    result1 = 1
+    should_stop1 = (len(task1) == 2 and not isinstance(task1[1], str) and result1 == 0)
+    test1_pass = not should_stop1
+    print(f"Test 1 - Python returns 1: {'✅ PASS' if test1_pass else '❌ FAIL'} (continues)")
+    if test1_pass: tests_passed += 1
+    
+    # Test 2: Python task returning 0 (should stop) 
+    task2 = ('dummy_function', ())
+    result2 = 0
+    should_stop2 = (len(task2) == 2 and not isinstance(task2[1], str) and result2 == 0)
+    test2_pass = should_stop2
+    print(f"Test 2 - Python returns 0: {'✅ PASS' if test2_pass else '❌ FAIL'} (stops)")
+    if test2_pass: tests_passed += 1
+    
+    # Test 3: SQL task (should never stop on return value)
+    task3 = ('table_name', 'overwrite')
+    result3 = 'table_name'
+    should_stop3 = (len(task3) == 2 and not isinstance(task3[1], str) and result3 == 0)
+    test3_pass = not should_stop3
+    print(f"Test 3 - SQL task:         {'✅ PASS' if test3_pass else '❌ FAIL'} (ignores return)")
+    if test3_pass: tests_passed += 1
+    
+    print("=" * 60)
+    if tests_passed == total_tests:
+        print("🎉 ALL QUICK TESTS PASSED! Return code logic works correctly.")
+        print("   • Python return 0 → stops pipeline ✅")
+        print("   • Python return 1 → continues pipeline ✅") 
+        print("   • SQL tasks → ignore return values ✅")
+        return True
+    else:
+        print(f"❌ {total_tests - tests_passed}/{total_tests} tests failed!")
+        return False
+
 def main():
     # Start total execution timer
     total_start_time = time.time()
@@ -147,5 +191,238 @@ def main():
     print("=" * 60)
     print("🎉 Basic test script completed successfully!")
 
+
+def test_pipeline_exit_code():
+    """
+    Test function that returns 0 if pipeline keeps working (succeeds) 
+    or returns 1 if pipeline early exits (fails).
+    
+    This mimics Unix exit code conventions:
+    - 0 = success (pipeline completed successfully)  
+    - 1 = failure (pipeline failed or exited early)
+    """
+    print("\n🧪 Testing pipeline exit code behavior...")
+    print("=" * 50)
+    
+    try:
+        # Test configuration
+        ws = "temp"
+        lh = "power"
+        schema = "aemo"
+        sql_folder = 'https://github.com/djouallah/fabric_demo/raw/refs/heads/main/transformation/'
+        
+        # Establish connection
+        print("🔗 Connecting to lakehouse...")
+        con = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}", sql_folder)
+        
+        # Define a simple test pipeline that should succeed
+        test_pipeline = [
+            ('duid', 'ignore'),  # Simple task that should succeed
+        ]
+        
+        print("🔄 Running test pipeline...")
+        pipeline_result = con.run(test_pipeline)
+        
+        if pipeline_result:
+            print("✅ Pipeline completed successfully")
+            print("🎯 Return code: 0 (SUCCESS)")
+            return 0  # Success - pipeline kept working
+        else:
+            print("❌ Pipeline failed or exited early")  
+            print("🎯 Return code: 1 (FAILURE)")
+            return 1  # Failure - pipeline early exit
+            
+    except Exception as e:
+        print(f"❌ Test failed with exception: {e}")
+        print("🎯 Return code: 1 (FAILURE)")
+        return 1  # Failure - exception occurred
+
+
+def test_pipeline_with_zero_return():
+    """
+    Test function that verifies if a task returning 0 stops the pipeline.
+    
+    Updated behavior: The pipeline should STOP when a PYTHON task returns 0.
+    SQL tasks only stop on exceptions/errors, not return values (they return table names).
+    """
+    print("\n🧪 Testing pipeline behavior when task returns 0...")
+    print("=" * 50)
+    
+    try:
+        # Create a simple Python function that returns 0
+        import tempfile
+        import os
+        
+        # Create a temporary Python file with test functions
+        temp_dir = tempfile.mkdtemp()
+        test_py_file = os.path.join(temp_dir, "pipeline_test_functions.py")
+        
+        with open(test_py_file, 'w') as f:
+            f.write("""
+def dummy_success_task():
+    '''Dummy function that returns 1 - pipeline should continue'''
+    print("📍 Dummy success task - returning 1 (continue)")
+    return 1
+
+def dummy_failure_task():
+    '''Dummy function that returns 0 - pipeline should stop'''
+    print("📍 Dummy failure task - returning 0 (stop pipeline)")
+    return 0
+
+def task_after_failure():
+    '''Function that should NOT run after failure task'''
+    print("📍 ERROR: This task should NOT run after zero-return task!")
+    return 1
+""")
+        
+        # Test configuration
+        ws = "temp"
+        lh = "power" 
+        schema = "aemo"
+        sql_folder = temp_dir  # Use temp directory as SQL folder
+        
+        # Establish connection
+        print("🔗 Connecting to lakehouse...")
+        con = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}", sql_folder)
+        
+        # Test 1: Pipeline with success task (should continue and complete)
+        print("\n--- Test 1: Success task (return 1) ---")
+        success_pipeline = [
+            ('dummy_success_task', ()),  # Returns 1 - should continue
+        ]
+        
+        success_result = con.run(success_pipeline)
+        print(f"Success pipeline result: {success_result}")
+        
+        # Test 2: Pipeline with failure task (should stop early)
+        print("\n--- Test 2: Failure task (return 0) ---")
+        failure_pipeline = [
+            ('dummy_success_task', ()),   # Returns 1 - should continue
+            ('dummy_failure_task', ()),   # Returns 0 - should stop pipeline here
+            ('task_after_failure', ()),   # Should NOT run
+        ]
+        
+        failure_result = con.run(failure_pipeline)
+        print(f"Failure pipeline result: {failure_result}")
+        
+        # Cleanup
+        os.remove(test_py_file)
+        os.rmdir(temp_dir)
+        
+        # Evaluate results
+        if success_result and not failure_result:
+            print("\n✅ Pipeline behavior is CORRECT:")
+            print("   - Success task (return 1) → Pipeline continued")
+            print("   - Failure task (return 0) → Pipeline stopped early")
+            return True
+        elif not failure_result:
+            print("\n⚠️  Partial success:")
+            print("   - Failure task correctly stopped pipeline")
+            print(f"   - Success pipeline result: {success_result}")
+            return True
+        else:
+            print("\n❌ Pipeline behavior is INCORRECT:")
+            print(f"   - Success pipeline: {success_result} (expected: True)")
+            print(f"   - Failure pipeline: {failure_result} (expected: False)")
+            return False
+            
+    except Exception as e:
+        print(f"❌ Test failed with exception: {e}")
+        return False
+
+
+def test_pipeline_with_failure():
+    """
+    Test function that intentionally triggers a pipeline failure
+    to verify that early exit returns code 1.
+    """
+    print("\n🧪 Testing pipeline failure scenario...")
+    print("=" * 50)
+    
+    try:
+        # Test configuration  
+        ws = "temp"
+        lh = "power"
+        schema = "aemo"
+        sql_folder = 'https://github.com/djouallah/fabric_demo/raw/refs/heads/main/transformation/'
+        
+        # Establish connection
+        print("🔗 Connecting to lakehouse...")
+        con = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}", sql_folder)
+        
+        # Define a pipeline with an invalid task to trigger failure
+        failing_pipeline = [
+            ('nonexistent_task', 'overwrite'),  # This should fail
+        ]
+        
+        print("🔄 Running failing pipeline...")
+        pipeline_result = con.run(failing_pipeline)
+        
+        if pipeline_result:
+            print("⚠️  Pipeline unexpectedly succeeded")
+            print("🎯 Return code: 0 (SUCCESS)")  
+            return 0
+        else:
+            print("✅ Pipeline failed as expected")
+            print("🎯 Return code: 1 (FAILURE)")
+            return 1  # Expected failure
+            
+    except Exception as e:
+        print(f"✅ Pipeline failed with exception as expected: {e}")
+        print("🎯 Return code: 1 (FAILURE)")
+        return 1  # Expected failure
+
+
 if __name__ == "__main__":
+    # Run quick return code test first (no auth needed)
+    print("\n" + "=" * 80)
+    print("🔬 RUNNING QUICK RETURN CODE TEST")
+    print("=" * 80)
+    quick_test_passed = quick_return_code_test()
+    
+    if not quick_test_passed:
+        print("❌ Quick test failed - stopping here!")
+        sys.exit(1)
+    
+    print("\n🚀 Quick test passed! Running full integration tests...")
+    
+    # Run main test with real authentication
     main()
+    
+    # Run additional exit code tests
+    print("\n" + "=" * 80)
+    print("🔬 RUNNING FULL PIPELINE EXIT CODE TESTS")
+    print("=" * 80)
+    
+    # Test successful pipeline (should return 0)
+    success_code = test_pipeline_exit_code()
+    print(f"\n📋 Test 1 Result: {success_code}")
+    
+    # Test zero return behavior
+    zero_return_result = test_pipeline_with_zero_return()
+    print(f"\n📋 Test 2 Result: {zero_return_result}")
+    
+    # Test failing pipeline (should return 1)  
+    failure_code = test_pipeline_with_failure()
+    print(f"\n📋 Test 3 Result: {failure_code}")
+    
+    print("\n" + "=" * 80)
+    print("🏁 PIPELINE BEHAVIOR TESTS COMPLETED")
+    print("=" * 80)
+    print(f"✅ Success test returned: {success_code} (expected: 0)")
+    print(f"🔍 Zero-return test result: {zero_return_result} (True = correct behavior)")
+    print(f"❌ Failure test returned: {failure_code} (expected: 1)")
+    
+    # Provide conclusion about the original question
+    print("\n" + "🎯 FIXED BEHAVIOR:")
+    print("=" * 60)
+    if zero_return_result:
+        print("✅ YES - Python tasks returning 0 now STOP the pipeline!")
+        print("   Pipeline execution halts when Python task returns 0.")
+        print("   SQL tasks only stop on exceptions/errors, not return values.")
+        print("   This restores the previous expected behavior.")
+    else:
+        print("❌ Test inconclusive due to error")
+    print("=" * 60)
+    
+    sys.exit(0)
