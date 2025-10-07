@@ -354,7 +354,13 @@ class Duckrun:
             attached_count = 0
             for schema_name, table_name in tables:
                 try:
-                    view_name = f"{schema_name}_{table_name}" if self.scan_all_schemas else table_name
+                    if self.scan_all_schemas:
+                        # Create proper schema.table structure in DuckDB
+                        self.con.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+                        view_name = f"{schema_name}.{table_name}"
+                    else:
+                        # Single schema mode - use just table name
+                        view_name = table_name
                     
                     self.con.sql(f"""
                         CREATE OR REPLACE VIEW {view_name}
@@ -371,7 +377,7 @@ class Duckrun:
             print(f"{'='*60}\n")
             
             if self.scan_all_schemas:
-                print(f"\n💡 Note: Tables are prefixed with schema (e.g., dbo_tablename)")
+                print(f"\n💡 Note: Tables use schema.table format (e.g., aemo.calendar, dbo.results)")
                 print(f"   Default schema for operations: {self.schema}\n")
                 
         except Exception as e:
