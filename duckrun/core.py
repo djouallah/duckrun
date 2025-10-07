@@ -12,6 +12,36 @@ from obstore.store import AzureStore
 RG = 8_000_000
 
 
+def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=None):
+    """
+    Build arguments for write_deltalake based on requirements:
+    - If schema_mode='merge': use rust engine (no row group params)
+    - Otherwise: use pyarrow engine with row group optimization
+    """
+    args = {
+        'table_or_uri': path,
+        'data': df,
+        'mode': mode
+    }
+    
+    # Add partition_by if specified
+    if partition_by:
+        args['partition_by'] = partition_by
+    
+    # Engine selection based on schema_mode
+    if schema_mode == 'merge':
+        # Use rust engine for schema merging (no row group params supported)
+        args['schema_mode'] = 'merge'
+        args['engine'] = 'rust'
+    else:
+        # Use pyarrow engine with row group optimization (default)
+        args['max_rows_per_file'] = RG
+        args['max_rows_per_group'] = RG
+        args['min_rows_per_group'] = RG
+    
+    return args
+
+
 class DeltaWriter:
     """Spark-style write API for Delta Lake"""
     
@@ -20,6 +50,8 @@ class DeltaWriter:
         self.duckrun = duckrun_instance
         self._format = "delta"
         self._mode = "overwrite"
+        self._schema_mode = None
+        self._partition_by = None
     
     def format(self, format_type: str):
         """Set output format (only 'delta' supported)"""
@@ -33,6 +65,27 @@ class DeltaWriter:
         if write_mode not in {"overwrite", "append"}:
             raise ValueError(f"Mode must be 'overwrite' or 'append', got '{write_mode}'")
         self._mode = write_mode
+        return self
+    
+    def option(self, key: str, value):
+        """Set write option (Spark-compatible)"""
+        if key == "mergeSchema":
+            if str(value).lower() in ("true", "1"):
+                self._schema_mode = "merge"
+            else:
+                self._schema_mode = None
+        else:
+            raise ValueError(f"Unsupported option: {key}")
+        return self
+    
+    def partitionBy(self, *columns):
+        """Set partition columns (Spark-compatible)"""
+        if len(columns) == 1 and isinstance(columns[0], (list, tuple)):
+            # Handle partitionBy(["col1", "col2"]) case
+            self._partition_by = list(columns[0])
+        else:
+            # Handle partitionBy("col1", "col2") case
+            self._partition_by = list(columns)
         return self
     
     def saveAsTable(self, table_name: str):
@@ -50,8 +103,18 @@ class DeltaWriter:
         path = f"{self.duckrun.table_base_url}{schema}/{table}"
         df = self.relation.record_batch()
         
-        print(f"Writing to Delta table: {schema}.{table} (mode={self._mode})")
-        write_deltalake(path, df, mode=self._mode, max_rows_per_file=RG, max_rows_per_group=RG, min_rows_per_group=RG)
+        # Build write arguments based on schema_mode and partition_by
+        write_args = _build_write_deltalake_args(
+            path, df, self._mode, 
+            schema_mode=self._schema_mode,
+            partition_by=self._partition_by
+        )
+        
+        engine_info = f" (engine=rust, schema_mode=merge)" if self._schema_mode == 'merge' else " (engine=pyarrow)"
+        partition_info = f" partitioned by {self._partition_by}" if self._partition_by else ""
+        print(f"Writing to Delta table: {schema}.{table} (mode={self._mode}){engine_info}{partition_info}")
+        
+        write_deltalake(**write_args)
         
         self.duckrun.con.sql(f"DROP VIEW IF EXISTS {table}")
         self.duckrun.con.sql(f"""
@@ -113,6 +176,21 @@ class Duckrun:
         dr = Duckrun.connect("workspace/lakehouse.lakehouse")
         dr.sql("SELECT * FROM table").show()
         dr.sql("SELECT 43").write.mode("append").saveAsTable("test")
+        
+        # Schema evolution and partitioning (exact Spark API):
+        dr.sql("SELECT * FROM source").write.mode("append").option("mergeSchema", "true").partitionBy("region").saveAsTable("sales")
+        
+        # Pipeline formats:
+        pipeline = [
+            # SQL with parameters only
+            ('table_name', 'mode', {'param1': 'value1'}),
+            
+            # SQL with Delta options (4-tuple format)
+            ('table_name', 'mode', {'param1': 'value1'}, {'mergeSchema': 'true', 'partitionBy': ['region']}),
+            
+            # Python task
+            ('process_data', ('table_name',))
+        ]
     """
 
     def __init__(self, workspace: str, lakehouse_name: str, schema: str = "dbo", 
@@ -392,7 +470,7 @@ class Duckrun:
         print(f"✅ Python '{name}' completed")
         return result
 
-    def _run_sql(self, table: str, mode: str, params: Dict) -> str:
+    def _run_sql(self, table: str, mode: str, params: Dict, delta_options: Dict = None) -> str:
         """Execute SQL task, write to Delta, return normalized table name"""
         self._create_onelake_secret()
         
@@ -406,10 +484,23 @@ class Duckrun:
         normalized_table = self._normalize_table_name(table)
         path = f"{self.table_base_url}{self.schema}/{normalized_table}"
 
+        # Extract Delta Lake specific options from delta_options
+        delta_options = delta_options or {}
+        merge_schema = delta_options.get('mergeSchema')
+        schema_mode = 'merge' if str(merge_schema).lower() in ('true', '1') else None
+        partition_by = delta_options.get('partitionBy') or delta_options.get('partition_by')
+
         if mode == 'overwrite':
             self.con.sql(f"DROP VIEW IF EXISTS {normalized_table}")
             df = self.con.sql(sql).record_batch()
-            write_deltalake(path, df, mode='overwrite', max_rows_per_file=RG, max_rows_per_group=RG, min_rows_per_group=RG)
+            
+            write_args = _build_write_deltalake_args(
+                path, df, 'overwrite', 
+                schema_mode=schema_mode, 
+                partition_by=partition_by
+            )
+            write_deltalake(**write_args)
+            
             self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
             dt = DeltaTable(path)
             dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
@@ -417,7 +508,14 @@ class Duckrun:
 
         elif mode == 'append':
             df = self.con.sql(sql).record_batch()
-            write_deltalake(path, df, mode='append', max_rows_per_file=RG, max_rows_per_group=RG, min_rows_per_group=RG)
+            
+            write_args = _build_write_deltalake_args(
+                path, df, 'append', 
+                schema_mode=schema_mode, 
+                partition_by=partition_by
+            )
+            write_deltalake(**write_args)
+            
             self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
             dt = DeltaTable(path)
             if len(dt.file_uris()) > self.compaction_threshold:
@@ -434,13 +532,22 @@ class Duckrun:
                 print(f"Table {normalized_table} doesn't exist. Creating...")
                 self.con.sql(f"DROP VIEW IF EXISTS {normalized_table}")
                 df = self.con.sql(sql).record_batch()
-                write_deltalake(path, df, mode='overwrite', max_rows_per_file=RG, max_rows_per_group=RG, min_rows_per_group=RG)
+                
+                write_args = _build_write_deltalake_args(
+                    path, df, 'overwrite', 
+                    schema_mode=schema_mode, 
+                    partition_by=partition_by
+                )
+                write_deltalake(**write_args)
+                
                 self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
                 dt = DeltaTable(path)
                 dt.vacuum(dry_run=False)
                 dt.cleanup_metadata()
 
-        print(f"✅ SQL '{table}' → '{normalized_table}' ({mode})")
+        engine_info = f" (engine=rust, schema_mode=merge)" if schema_mode == 'merge' else " (engine=pyarrow)"
+        partition_info = f" partitioned by {partition_by}" if partition_by else ""
+        print(f"✅ SQL '{table}' → '{normalized_table}' ({mode}){engine_info}{partition_info}")
         return normalized_table
 
     def run(self, pipeline: List[Tuple]) -> bool:
@@ -449,7 +556,8 @@ class Duckrun:
         
         Task formats:
             - Python: ('function_name', (arg1, arg2, ...))
-            - SQL:    ('table_name', 'mode') or ('table_name', 'mode', {params})
+            - SQL:    ('table_name', 'mode') or ('table_name', 'mode', {sql_params})
+            - SQL with Delta options: ('table_name', 'mode', {sql_params}, {delta_options})
         
         Returns:
             True if all tasks succeeded
@@ -469,7 +577,7 @@ class Duckrun:
                 if len(task) == 2:
                     name, second = task
                     if isinstance(second, str) and second in {'overwrite', 'append', 'ignore'}:
-                        result = self._run_sql(name, second, {})
+                        result = self._run_sql(name, second, {}, {})
                     else:
                         args = second if isinstance(second, (tuple, list)) else (second,)
                         result = self._run_python(name, tuple(args))
@@ -478,7 +586,15 @@ class Duckrun:
                     table, mode, params = task
                     if not isinstance(params, dict):
                         raise ValueError(f"Expected dict for params, got {type(params)}")
-                    result = self._run_sql(table, mode, params)
+                    result = self._run_sql(table, mode, params, {})
+                    
+                elif len(task) == 4:
+                    table, mode, params, delta_options = task
+                    if not isinstance(params, dict):
+                        raise ValueError(f"Expected dict for SQL params, got {type(params)}")
+                    if not isinstance(delta_options, dict):
+                        raise ValueError(f"Expected dict for Delta options, got {type(delta_options)}")
+                    result = self._run_sql(table, mode, params, delta_options)
                     
                 else:
                     raise ValueError(f"Invalid task format: {task}")

@@ -8,6 +8,8 @@ A helper package for stuff that made my life easier when working with Fabric Pyt
 - Lakehouse must have a schema (e.g., `dbo`, `sales`, `analytics`)
 - Workspace and lakehouse names cannot contain spaces
 
+**Delta Lake Version:** This package uses an older version of deltalake to maintain row size control capabilities, which is crucial for Power BI performance optimization. The newer Rust-based deltalake versions don't yet support the row group size parameters that are essential for optimal DirectLake performance.
+
 **Why no spaces?** Duckrun uses simple name-based paths instead of GUIDs. This keeps the code clean and readable, which is perfect for data engineering workspaces where naming conventions are already well-established. Just use underscores or hyphens instead: `my_workspace` or `my-lakehouse`.
 
 ## What It Does
@@ -111,6 +113,22 @@ con.sql("""
 
 # Append mode
 con.sql("SELECT * FROM new_orders").write.mode("append").saveAsTable("orders")
+
+# Schema evolution and partitioning (exact Spark API compatibility)
+con.sql("""
+    SELECT 
+        customer_id,
+        order_date,
+        region,
+        product_category,
+        sales_amount,
+        new_column_added_later  -- This column might not exist in target table
+    FROM source_table
+""").write \
+    .mode("append") \
+    .option("mergeSchema", "true") \
+    .partitionBy("region", "product_category") \
+    .saveAsTable("sales_partitioned")
 ```
 
 **Note:** `.format("delta")` is optional - Delta is the default format!
@@ -184,7 +202,10 @@ def download_data(url, path):
 
 ### SQL Tasks
 
-**Format:** `('table_name', 'mode')` or `('table_name', 'mode', {params})`
+**Formats:**
+- `('table_name', 'mode')` - Simple SQL with no parameters
+- `('table_name', 'mode', {params})` - SQL with template parameters  
+- `('table_name', 'mode', {params}, {delta_options})` - SQL with Delta Lake options
 
 Create `sql_folder/table_name.sql`:
 
@@ -224,7 +245,65 @@ SELECT * FROM transactions
 WHERE date BETWEEN '$start_date' AND '$end_date'
 ```
 
+### Delta Lake Options (Schema Evolution & Partitioning)
+
+Use the 4-tuple format for advanced Delta Lake features:
+
+```python
+pipeline = [
+    # SQL with empty params but Delta options
+    ('evolving_table', 'append', {}, {'mergeSchema': 'true'}),
+    
+    # SQL with both params AND Delta options
+    ('sales_data', 'append', 
+     {'region': 'North America'}, 
+     {'mergeSchema': 'true', 'partitionBy': ['region', 'year']}),
+     
+    # Partitioning without schema merging
+    ('time_series', 'overwrite', 
+     {'start_date': '2024-01-01'}, 
+     {'partitionBy': ['year', 'month']})
+]
+```
+
+**Available Delta Options:**
+- `mergeSchema: 'true'` - Automatically handle schema evolution (new columns)
+- `partitionBy: ['col1', 'col2']` - Partition data by specified columns
+
 ## Advanced Features
+
+### Schema Evolution & Partitioning
+
+Handle evolving schemas and optimize query performance with partitioning:
+
+```python
+# Using Spark-style API
+con.sql("""
+    SELECT 
+        customer_id,
+        region,
+        product_category,
+        sales_amount,
+        -- New column that might not exist in target table
+        discount_percentage
+    FROM raw_sales
+""").write \
+    .mode("append") \
+    .option("mergeSchema", "true") \
+    .partitionBy("region", "product_category") \
+    .saveAsTable("sales_partitioned")
+
+# Using pipeline format
+pipeline = [
+    ('sales_summary', 'append', 
+     {'batch_date': '2024-10-07'}, 
+     {'mergeSchema': 'true', 'partitionBy': ['region', 'year']})
+]
+```
+
+**Benefits:**
+- 🔄 **Schema Evolution**: Automatically handles new columns without breaking existing queries
+- ⚡ **Query Performance**: Partitioning improves performance for filtered queries
 
 ### Table Name Variants
 
@@ -384,8 +463,8 @@ pipeline = [
     # Aggregate by region (SQL with params)
     ('regional_summary', 'overwrite', {'min_amount': 1000}),
     
-    # Append to history (SQL)
-    ('sales_history', 'append')
+    # Append to history with schema evolution (SQL with Delta options)
+    ('sales_history', 'append', {}, {'mergeSchema': 'true', 'partitionBy': ['year', 'region']})
 ]
 
 # Run pipeline
@@ -410,7 +489,62 @@ con.download("processed_reports", "./exports", ['.csv'])
 - 🔄 **Pipeline orchestration** with SQL and Python tasks  
 - ⚡ **Fast data exploration** with DuckDB
 - 💾 **Delta table creation** with Spark-style API
-- 📤 **File downloads** from OneLake Files
+- � **Schema evolution** and partitioning
+- �📤 **File downloads** from OneLake Files
+
+## Schema Evolution & Partitioning Guide
+
+### When to Use Schema Evolution
+
+Use `mergeSchema: 'true'` when:
+- Adding new columns to existing tables
+- Source data schema changes over time  
+- Working with evolving data pipelines
+- Need backward compatibility
+
+### When to Use Partitioning
+
+Use `partitionBy` when:
+- Queries frequently filter by specific columns (dates, regions, categories)
+- Tables are large and need performance optimization
+- Want to organize data logically for maintenance
+
+### Best Practices
+
+```python
+# ✅ Good: Partition by commonly filtered columns
+.partitionBy("year", "region")  # Often filtered: WHERE year = 2024 AND region = 'US'
+
+# ❌ Avoid: High cardinality partitions  
+.partitionBy("customer_id")  # Creates too many small partitions
+
+# ✅ Good: Schema evolution for append operations
+.mode("append").option("mergeSchema", "true")
+
+# ✅ Good: Combined approach for data lakes
+pipeline = [
+    ('daily_sales', 'append', 
+     {'batch_date': '2024-10-07'}, 
+     {'mergeSchema': 'true', 'partitionBy': ['year', 'month', 'region']})
+]
+```
+
+### Task Format Reference
+
+```python
+# 2-tuple: Simple SQL/Python
+('task_name', 'mode')                    # SQL: no params, no Delta options
+('function_name', (args))                # Python: function with arguments
+
+# 3-tuple: SQL with parameters  
+('task_name', 'mode', {'param': 'value'})
+
+# 4-tuple: SQL with parameters AND Delta options
+('task_name', 'mode', {'param': 'value'}, {'mergeSchema': 'true', 'partitionBy': ['col']})
+
+# 4-tuple: Empty parameters but Delta options
+('task_name', 'mode', {}, {'mergeSchema': 'true'})
+```
 
 ## How It Works
 
