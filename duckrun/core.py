@@ -195,21 +195,22 @@ class Duckrun:
 
     def __init__(self, workspace: str, lakehouse_name: str, schema: str = "dbo", 
                  sql_folder: Optional[str] = None, compaction_threshold: int = 10,
-                 scan_all_schemas: bool = False):
+                 scan_all_schemas: bool = False, storage_account: str = "onelake"):
         self.workspace = workspace
         self.lakehouse_name = lakehouse_name
         self.schema = schema
         self.sql_folder = sql_folder.strip() if sql_folder else None
         self.compaction_threshold = compaction_threshold
         self.scan_all_schemas = scan_all_schemas
-        self.table_base_url = f'abfss://{workspace}@onelake.dfs.fabric.microsoft.com/{lakehouse_name}.Lakehouse/Tables/'
+        self.storage_account = storage_account
+        self.table_base_url = f'abfss://{workspace}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_name}.Lakehouse/Tables/'
         self.con = duckdb.connect()
         self.con.sql("SET preserve_insertion_order = false")
         self._attach_lakehouse()
 
     @classmethod
     def connect(cls, connection_string: str, sql_folder: Optional[str] = None,
-                compaction_threshold: int = 100):
+                compaction_threshold: int = 100, storage_account: str = "onelake"):
         """
         Create and connect to lakehouse.
         
@@ -219,11 +220,13 @@ class Duckrun:
             connection_string: OneLake path "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
             sql_folder: Optional path or URL to SQL files folder
             compaction_threshold: File count threshold for compaction
+            storage_account: Storage account name (default: "onelake")
         
         Examples:
             dr = Duckrun.connect("ws/lh.lakehouse/schema", sql_folder="./sql")
             dr = Duckrun.connect("ws/lh.lakehouse/schema")  # no SQL folder
             dr = Duckrun.connect("ws/lh.lakehouse")  # defaults to dbo schema
+            dr = Duckrun.connect("ws/lh.lakehouse", storage_account="xxx-onelake")  # custom storage
         """
         print("Connecting to Lakehouse...")
         
@@ -261,7 +264,7 @@ class Duckrun:
                 "  connect('workspace/lakehouse.lakehouse')  # defaults to dbo"
             )
         
-        return cls(workspace, lakehouse_name, schema, sql_folder, compaction_threshold, scan_all_schemas)
+        return cls(workspace, lakehouse_name, schema, sql_folder, compaction_threshold, scan_all_schemas, storage_account)
 
     def _get_storage_token(self):
         return os.environ.get("AZURE_STORAGE_TOKEN", "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE")
@@ -295,7 +298,7 @@ class Duckrun:
             token = token_obj.token
             os.environ["AZURE_STORAGE_TOKEN"] = token
         
-        url = f"abfss://{self.workspace}@onelake.dfs.fabric.microsoft.com/"
+        url = f"abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/"
         store = AzureStore.from_url(url, bearer_token=token)
         
         base_path = f"{self.lakehouse_name}.Lakehouse/Tables/"
@@ -418,7 +421,8 @@ class Duckrun:
         full_params = {
             'ws': self.workspace,
             'lh': self.lakehouse_name,
-            'schema': self.schema
+            'schema': self.schema,
+            'storage_account': self.storage_account
         }
         if params:
             full_params.update(params)
@@ -667,7 +671,7 @@ class Duckrun:
             os.environ["AZURE_STORAGE_TOKEN"] = token
         
         # Setup OneLake Files URL (not Tables)
-        files_base_url = f'abfss://{self.workspace}@onelake.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Files/'
+        files_base_url = f'abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Files/'
         store = AzureStore.from_url(files_base_url, bearer_token=token)
         
         # Collect files to upload
@@ -774,7 +778,7 @@ class Duckrun:
             os.environ["AZURE_STORAGE_TOKEN"] = token
         
         # Setup OneLake Files URL (not Tables)
-        files_base_url = f'abfss://{self.workspace}@onelake.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Files/'
+        files_base_url = f'abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Files/'
         store = AzureStore.from_url(files_base_url, bearer_token=token)
         
         # Create local directory
