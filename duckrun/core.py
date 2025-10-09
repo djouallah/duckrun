@@ -100,8 +100,6 @@ class Duckrun:
             workspace, lakehouse_name = parts
             scan_all_schemas = True
             schema = "dbo"
-            print(f"ℹ️  No schema specified. Using default schema 'dbo' for operations.")
-            print(f"   Scanning all schemas for table discovery...\n")
         elif len(parts) == 3:
             workspace, lakehouse_name, schema = parts
         else:
@@ -162,16 +160,13 @@ class Duckrun:
         
         if self.scan_all_schemas:
             # Discover all schemas first
-            print("🔍 Discovering schemas...")
             schemas_result = obs.list_with_delimiter(store, prefix=base_path)
             schemas = [
                 prefix.rstrip('/').split('/')[-1] 
                 for prefix in schemas_result['common_prefixes']
             ]
-            print(f"   Found {len(schemas)} schemas: {', '.join(schemas)}\n")
             
             # Discover tables in each schema
-            print("🔍 Discovering tables...")
             for schema_name in schemas:
                 schema_path = f"{base_path}{schema_name}/"
                 result = obs.list_with_delimiter(store, prefix=schema_path)
@@ -208,9 +203,22 @@ class Duckrun:
                     print(f"No Delta tables found in {self.lakehouse_name}.Lakehouse/Tables/{self.schema}/")
                 return
             
-            print(f"\n📊 Found {len(tables)} Delta tables. Attaching as views...\n")
+            # Group tables by schema for display
+            schema_tables = {}
+            for schema_name, table_name in tables:
+                if schema_name not in schema_tables:
+                    schema_tables[schema_name] = []
+                schema_tables[schema_name].append(table_name)
+            
+            # Display tables by schema
+            print(f"\n📊 Found {len(tables)} tables:")
+            for schema_name in sorted(schema_tables.keys()):
+                table_list = sorted(schema_tables[schema_name])
+                print(f"   {schema_name}: {', '.join(table_list)}")
             
             attached_count = 0
+            skipped_tables = []
+            
             for schema_name, table_name in tables:
                 try:
                     if self.scan_all_schemas:
@@ -225,19 +233,16 @@ class Duckrun:
                         CREATE OR REPLACE VIEW {view_name}
                         AS SELECT * FROM delta_scan('{self.table_base_url}{schema_name}/{table_name}');
                     """)
-                    print(f"  ✓ Attached: {schema_name}.{table_name} → {view_name}")
                     attached_count += 1
                 except Exception as e:
-                    print(f"  ⚠ Skipped {schema_name}.{table_name}: {str(e)[:100]}")
+                    skipped_tables.append(f"{schema_name}.{table_name}")
                     continue
             
             print(f"\n{'='*60}")
-            print(f"✅ Successfully attached {attached_count}/{len(tables)} tables")
+            print(f"✅ Ready - {attached_count}/{len(tables)} tables available")
+            if skipped_tables:
+                print(f"⚠ Skipped {len(skipped_tables)} tables: {', '.join(skipped_tables[:3])}{'...' if len(skipped_tables) > 3 else ''}")
             print(f"{'='*60}\n")
-            
-            if self.scan_all_schemas:
-                print(f"\n💡 Note: Tables use schema.table format (e.g., aemo.calendar, dbo.results)")
-                print(f"   Default schema for operations: {self.schema}\n")
                 
         except Exception as e:
             print(f"❌ Error attaching lakehouse: {e}")

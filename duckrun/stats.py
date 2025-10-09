@@ -21,33 +21,39 @@ def _table_exists(duckrun_instance, schema_name: str, table_name: str) -> bool:
 
 
 def _schema_exists(duckrun_instance, schema_name: str) -> bool:
-    """Check if a schema exists by trying to show its tables."""
+    """Check if a schema exists by querying information_schema."""
     try:
-        # For main schema, just show tables
+        # For main schema, always exists
         if schema_name == "main":
-            query = "SHOW TABLES"
+            return True
         else:
-            query = f"SHOW TABLES FROM {schema_name}"
-        duckrun_instance.con.execute(query)
-        return True
+            # Use information_schema which works in DuckDB 1.2.2
+            query = f"SELECT 1 FROM information_schema.schemata WHERE schema_name = '{schema_name}' LIMIT 1"
+            result = duckrun_instance.con.execute(query).fetchall()
+            return len(result) > 0
     except:
         return False
 
 
 def _get_existing_tables_in_schema(duckrun_instance, schema_name: str) -> list:
-    """Get all existing tables in a schema by showing tables, excluding temporary tables."""
+    """Get all existing tables in a schema using information_schema, excluding temporary tables."""
     try:
-        # For main schema, just show tables
+        # For main schema, use SHOW TABLES
         if schema_name == "main":
             query = "SHOW TABLES"
+            result = duckrun_instance.con.execute(query).fetchall()
+            if result:
+                tables = [row[0] for row in result]
+                filtered_tables = [tbl for tbl in tables if not tbl.startswith('tbl_')]
+                return filtered_tables
         else:
-            query = f"SHOW TABLES FROM {schema_name}"
-        result = duckrun_instance.con.execute(query).fetchall()
-        if result:
-            # Filter out temporary tables created by stats processing (tbl_0, tbl_1, etc.)
-            tables = [row[0] for row in result]
-            filtered_tables = [tbl for tbl in tables if not tbl.startswith('tbl_')]
-            return filtered_tables
+            # Use information_schema which works in DuckDB 1.2.2
+            query = f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema_name}'"
+            result = duckrun_instance.con.execute(query).fetchall()
+            if result:
+                tables = [row[0] for row in result]
+                filtered_tables = [tbl for tbl in tables if not tbl.startswith('tbl_')]
+                return filtered_tables
         return []
     except:
         return []
@@ -218,7 +224,7 @@ def get_stats(duckrun_instance, source: str):
         WHERE tbl IS NOT NULL
         GROUP BY tbl
         ORDER BY total_rows DESC
-    ''').fetch_arrow_table()
+    ''').df()
     
     return final_result
 

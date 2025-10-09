@@ -282,7 +282,7 @@ def main():
         stats_aemo_scada = conn.get_stats('test.summary')
         print(f"      [OK] Stats for 'test.summary' table:")
         if len(stats_aemo_scada) > 0:
-            first_row = stats_aemo_scada.to_pylist()[0]
+            first_row = stats_aemo_scada.iloc[0]
             print(f"      [INFO] Total rows: {first_row.get('total_rows', 'N/A')}, Files: {first_row.get('num_files', 'N/A')}")
         
         stats_schema_table_time = time.time() - stats_schema_table_start
@@ -296,10 +296,10 @@ def main():
     try:
         # Test entire schema stats
         stats_aemo = conn.get_stats('test')
-        print(f"      [OK] Stats for entire 'aemo' schema:")
+        print(f"      [OK] Stats for entire 'test' schema:")
         print(f"      [INFO] Found {len(stats_aemo)} tables in schema")
         if len(stats_aemo) > 0:
-            table_names = [row['tbl'] for row in stats_aemo.to_pylist()]
+            table_names = stats_aemo['tbl'].tolist()
             print(f"      [INFO] Tables: {', '.join(table_names[:5])}{'...' if len(table_names) > 5 else ''}")
         
         stats_schema_time = time.time() - stats_schema_start
@@ -323,6 +323,68 @@ def main():
     stats_time = time.time() - stats_start
     print(f"[OK] Statistics operations completed in {stats_time:.2f} seconds")
     print()
+    
+    # Step 7e: Additional connection test
+    print("   7e. Testing new connection to tmp/tmp.lakehouse...")
+    tmp_conn_start = time.time()
+    try:
+        con = duckrun.connect("tmp/tmp.lakehouse")
+        
+        # Check DuckDB version first
+        print("      [INFO] Checking DuckDB version...")
+        try:
+            version_result = con.sql("SELECT version()")
+            version_data = version_result.fetchall()
+            if version_data:
+                version_info = version_data[0][0]  # First row, first column
+                print(f"      [INFO] DuckDB version: {version_info}")
+        except Exception as v_error:
+            print(f"      [INFO] Could not get DuckDB version: {v_error}")
+        
+        # Check available tables in default schema (dbo)
+        print("      [INFO] Checking available tables in default schema (dbo)...")
+        try:
+            tables_result = con.sql("SHOW TABLES")
+            table_data = tables_result.fetchall()
+            if table_data:
+                table_names = [row[0] for row in table_data]
+                print(f"      [INFO] Tables in dbo schema: {table_names}")
+            else:
+                print("      [INFO] No tables found in dbo schema")
+        except Exception as table_error:
+            print(f"      [INFO] Could not list tables in dbo: {table_error}")
+        
+        # Check tables in test schema using information_schema
+        print("      [INFO] Checking available tables in test schema...")
+        try:
+            test_tables_result = con.sql("SELECT table_name FROM information_schema.tables WHERE table_schema = 'test'")
+            test_table_data = test_tables_result.fetchall()
+            if test_table_data:
+                test_table_names = [row[0] for row in test_table_data]
+                print(f"      [INFO] Tables in test schema: {test_table_names}")
+                
+                # Use the first table from test schema for stats
+                first_test_table = f"test.{test_table_names[0]}"
+                print(f"      [INFO] Getting stats for table '{first_test_table}':")
+                print(con.get_stats(first_test_table))
+            else:
+                print("      [INFO] No tables found in test schema")
+        except Exception as test_error:
+            print(f"      [INFO] Could not list tables in test schema: {test_error}")
+        
+        # Now try the original request - getting stats for 'test' (the schema)
+        print("      [INFO] Getting stats for 'test' schema (original request):")
+        try:
+            print(con.get_stats('test'))
+        except Exception as test_schema_error:
+            print(f"      [INFO] Failed to get stats for 'test' schema: {test_schema_error}")
+        
+        con.close()
+        tmp_conn_time = time.time() - tmp_conn_start
+        print(f"      [OK] Tmp connection test completed in {tmp_conn_time:.3f} seconds")
+    except Exception as e:
+        tmp_conn_time = time.time() - tmp_conn_start
+        print(f"      [FAIL] Tmp connection test failed in {tmp_conn_time:.3f} seconds: {e}")
     
     # Step 8: Close connections
     print("🔌 Step 8: Closing connections...")
