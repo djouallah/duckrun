@@ -71,10 +71,9 @@ def main():
     # please don't use a workspace name, Lakehouse and semantic_model with an empty space, 
     # or the same name of the lakehouse recently deleted
     nbr_days_download = int(30 * 2 ** ((cpu_count() - 2) / 2))  # or just input your numbers
-    lh = 'power' 
-    schema = 'aemo'
-    semantic_model = "directlake_on_onelake" 
-    ws = "temp"
+    lh = 'tmp' 
+    schema = 'test'
+    ws = "tmp"
     Nbr_threads = (cpu_count()*2)+1
     
     # SQL folder configuration
@@ -89,7 +88,7 @@ def main():
     # Step 2: Establish connection (timed)
     print("[CONN] Step 2: Establishing lakehouse connection...")
     connection_start = time.time()
-    con = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}", sql_folder)
+    conn = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}", sql_folder)
     connection_time = time.time() - connection_start
     print(f"[OK] Connection established in {connection_time:.2f} seconds")
     print()
@@ -100,9 +99,9 @@ def main():
     
     nightly =[
               
-              ('scrapingv2', (["https://nemweb.com.au/Reports/Current/Daily_Reports/"],["Reports/Current/Daily_Reports/"],2,ws,lh,Nbr_threads)),
-              ('price','append', {}, {'mergeSchema': 'true', 'partitionBy': ['YEAR']}),
-              ('scada','append'),
+              ('scrapingv2', (["https://nemweb.com.au/Reports/Current/Daily_Reports/"],["Reports/Current/Daily_Reports/"],1,ws,lh,Nbr_threads)),
+              ('price','append'),
+              ('scada','append',{'partitionBy': ['YEAR']}),
               ('download_excel',("raw/", ws,lh)),
               ('duid','overwrite'),
               ('calendar','ignore'),
@@ -110,20 +109,41 @@ def main():
               ('summary__backfill','overwrite')
          ]
     
+
+    intraday = [
+              ('scrapingv2', (["http://nemweb.com.au/Reports/Current/DispatchIS_Reports/","http://nemweb.com.au/Reports/Current/Dispatch_SCADA/" ],
+                            ["Reports/Current/DispatchIS_Reports/","Reports/Current/Dispatch_SCADA/"],
+                             2, ws,lh,Nbr_threads)),
+              ('price_today','append'),
+              ('scada_today','append'),
+              ('duid','ignore'),
+              ('summary__incremental', 'append')
+             ]
+    
     pipeline_config_time = time.time() - pipeline_config_start
     print(f"[OK] Pipeline configuration completed in {pipeline_config_time:.3f} seconds")
     print(f"   - Pipeline tasks: {len(nightly)} tasks configured")
     print()
 
-    # Step 4: Execute nightly pipeline (timed)
+    # Step 4a: Execute nightly pipeline (timed)
     print("🔄 Step 4: Executing nightly data pipeline...")
     pipeline_start = time.time()
-    result = con.run(nightly)
+    result = conn.run(nightly)
     pipeline_time = time.time() - pipeline_start
     print(f"[OK] Pipeline execution completed in {pipeline_time:.2f} seconds")
     print(f"   - Pipeline result: {result}")
     print()
     
+
+    # Step 4a: Execute intraday pipeline (timed)
+    print("🔄 Step 4: Executing intraday data pipeline...")
+    pipeline_start = time.time()
+    result = conn.run(intraday)
+    pipeline_time = time.time() - pipeline_start
+    print(f"[OK] Pipeline execution completed in {pipeline_time:.2f} seconds")
+    print(f"   - Pipeline result: {result}")
+    print()
+
     # Step 5: Additional test operations
     print("[TEST] Step 5: Running additional test operations...")
     additional_start = time.time()
@@ -131,16 +151,16 @@ def main():
     # Test with different connection (timed)
     print("   5a. Testing secondary connection...")
     secondary_conn_start = time.time()
-    con2 = duckrun.connect("temp/power.lakehouse/dbo")
+    conn2 = duckrun.connect(f"{ws}/{lh}.lakehouse/dbo")
     secondary_conn_time = time.time() - secondary_conn_start
     print(f"      [OK] Secondary connection in {secondary_conn_time:.3f} seconds")
     
     # Test CSV loading and table creation (timed)
     print("   5b. Testing CSV loading and table operations...")
     csv_ops_start = time.time()
-    con2.sql("""FROM read_csv_auto('https://data.wa.aemo.com.au/datafiles/post-facilities/facilities.csv')
+    conn2.sql("""FROM read_csv_auto('https://data.wa.aemo.com.au/datafiles/post-facilities/facilities.csv')
            """).write.mode("overwrite").saveAsTable("wa.base")
-    con2.sql("FROM base").show(max_width=120)
+    conn2.sql("FROM wa.base").show(max_width=120)
     csv_ops_time = time.time() - csv_ops_start
     print(f"      [OK] CSV operations completed in {csv_ops_time:.3f} seconds")
     
@@ -149,7 +169,7 @@ def main():
     spark_api_start = time.time()
     try:
         # Create test data with schema evolution and partitioning columns
-        result = con2.sql("""
+        result = conn2.sql("""
             SELECT 
                 'North America' as region,
                 'Electronics' as product_category,
@@ -168,7 +188,7 @@ def main():
             .saveAsTable("sales_partitioned")
         
         # Verify the table was created and show sample data
-        con2.sql("SELECT * FROM sales_partitioned LIMIT 3").show(max_width=120)
+        conn2.sql("SELECT * FROM sales_partitioned LIMIT 3").show(max_width=120)
         
         spark_api_time = time.time() - spark_api_start
         print(f"      [OK] Spark-style API with mergeSchema + partitioning completed in {spark_api_time:.3f} seconds")
@@ -181,8 +201,8 @@ def main():
     direct_spark_start = time.time()
     try:
         # Test Spark-style API directly on scada table with schema merging and partitioning
-        # Use con (original connection) which has the scada table from the pipeline
-        con.sql("FROM scada LIMIT 1000") \
+        # Use conn (original connection) which has the scada table from the pipeline
+        conn.sql("FROM scada_today LIMIT 1000") \
             .write \
             .mode("append") \
             .option("mergeSchema", "true") \
@@ -190,7 +210,7 @@ def main():
             .saveAsTable("test.waa")
         
         # Verify the table was created using the same connection
-        row_count = con.sql("SELECT COUNT(*) as cnt FROM test_waa").fetchone()[0]
+        row_count = conn.sql("SELECT COUNT(*) as cnt FROM test.waa").fetchone()[0]
         
         direct_spark_time = time.time() - direct_spark_start
         print(f"      [OK] Direct Spark API test completed in {direct_spark_time:.3f} seconds")
@@ -211,7 +231,7 @@ def main():
     print("   6a. Testing copy operation...")
     copy_start = time.time()
     try:
-        con.copy(r"C:\lakehouse\default\Files\calendar", "xxx")
+        conn.copy(r"C:\lakehouse\default\Files\calendar", "xxx")
         copy_time = time.time() - copy_start
         print(f"      [OK] Copy operation completed in {copy_time:.3f} seconds")
     except Exception as e:
@@ -222,7 +242,7 @@ def main():
     print("   6b. Testing download operation...")
     download_start = time.time()
     try:
-        con.download("xxx", r"C:\lakehouse\default\Files\calendar", overwrite=True)
+        conn.download("xxx", r"C:\lakehouse\default\Files\calendar", overwrite=True)
         download_time = time.time() - download_start
         print(f"      [OK] Download operation completed in {download_time:.3f} seconds")
     except Exception as e:
@@ -231,6 +251,84 @@ def main():
     
     file_ops_time = time.time() - file_ops_start
     print(f"[OK] File operations completed in {file_ops_time:.2f} seconds")
+    print()
+    
+    # Step 7: Delta Lake statistics testing (timed)
+    print("📈 Step 7: Testing Delta Lake statistics...")
+    stats_start = time.time()
+    
+    # Test get_stats with different patterns (timed)
+    print("   7a. Testing get_stats on single table...")
+    stats_single_start = time.time()
+    try:
+        # Test single table stats in current schema
+        stats_price = conn.get_stats('price_today')
+        print(f"      [OK] Stats for 'price' table:")
+        print(f"      [INFO] Columns: {list(stats_price.column_names)}")
+        if len(stats_price) > 0:
+            first_row = stats_price.to_pylist()[0]
+            print(f"      [INFO] Total rows: {first_row.get('total_rows', 'N/A')}, Files: {first_row.get('num_files', 'N/A')}")
+        
+        stats_single_time = time.time() - stats_single_start
+        print(f"      [OK] Single table stats completed in {stats_single_time:.3f} seconds")
+    except Exception as e:
+        stats_single_time = time.time() - stats_single_start
+        print(f"      [FAIL] Single table stats failed in {stats_single_time:.3f} seconds: {e}")
+    
+    print("   7b. Testing get_stats on schema.table...")
+    stats_schema_table_start = time.time()
+    try:
+        # Test schema.table format
+        stats_aemo_scada = conn.get_stats('test.summary')
+        print(f"      [OK] Stats for 'test.summary' table:")
+        if len(stats_aemo_scada) > 0:
+            first_row = stats_aemo_scada.to_pylist()[0]
+            print(f"      [INFO] Total rows: {first_row.get('total_rows', 'N/A')}, Files: {first_row.get('num_files', 'N/A')}")
+        
+        stats_schema_table_time = time.time() - stats_schema_table_start
+        print(f"      [OK] Schema.table stats completed in {stats_schema_table_time:.3f} seconds")
+    except Exception as e:
+        stats_schema_table_time = time.time() - stats_schema_table_start
+        print(f"      [FAIL] Schema.table stats failed in {stats_schema_table_time:.3f} seconds: {e}")
+    
+    print("   7c. Testing get_stats on entire schema...")
+    stats_schema_start = time.time()
+    try:
+        # Test entire schema stats
+        stats_aemo = conn.get_stats('test')
+        print(f"      [OK] Stats for entire 'aemo' schema:")
+        print(f"      [INFO] Found {len(stats_aemo)} tables in schema")
+        if len(stats_aemo) > 0:
+            table_names = [row['tbl'] for row in stats_aemo.to_pylist()]
+            print(f"      [INFO] Tables: {', '.join(table_names[:5])}{'...' if len(table_names) > 5 else ''}")
+        
+        stats_schema_time = time.time() - stats_schema_start
+        print(f"      [OK] Schema stats completed in {stats_schema_time:.3f} seconds")
+    except Exception as e:
+        stats_schema_time = time.time() - stats_schema_start
+        print(f"      [FAIL] Schema stats failed in {stats_schema_time:.3f} seconds: {e}")
+    
+    print("   7d. Testing get_stats on summary table specifically...")
+    stats_summary_start = time.time()
+    try:
+        # Test summary table stats specifically
+        print(conn.get_stats('summary'))
+        
+        stats_summary_time = time.time() - stats_summary_start
+        print(f"      [OK] Summary table stats completed in {stats_summary_time:.3f} seconds")
+    except Exception as e:
+        stats_summary_time = time.time() - stats_summary_start
+        print(f"      [FAIL] Summary table stats failed in {stats_summary_time:.3f} seconds: {e}")
+    
+    stats_time = time.time() - stats_start
+    print(f"[OK] Statistics operations completed in {stats_time:.2f} seconds")
+    print()
+    
+    # Step 8: Close connections
+    print("🔌 Step 8: Closing connections...")
+    conn.close()
+    conn2.close()
+    print("[OK] All connections closed successfully")
     print()
     
     # Final summary with total time
@@ -245,6 +343,7 @@ def main():
     print(f"🔄 Pipeline execution: {pipeline_time:.2f} seconds")
     print(f"[TEST] Additional operations: {additional_time:.2f} seconds")
     print(f"📁 File operations: {file_ops_time:.2f} seconds")
+    print(f"📈 Statistics operations: {stats_time:.2f} seconds")
     print("=" * 60)
     print("[SUCCESS] Basic test script completed successfully!")
 

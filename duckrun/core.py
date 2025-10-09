@@ -7,155 +7,11 @@ from typing import List, Tuple, Union, Optional, Callable, Dict, Any
 from string import Template
 import obstore as obs
 from obstore.store import AzureStore
-
-# Row Group configuration for optimal Delta Lake performance
-RG = 8_000_000
-
-
-def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=None):
-    """
-    Build arguments for write_deltalake based on requirements:
-    - If schema_mode='merge': use rust engine (no row group params)
-    - Otherwise: use pyarrow engine with row group optimization
-    """
-    args = {
-        'table_or_uri': path,
-        'data': df,
-        'mode': mode
-    }
-    
-    # Add partition_by if specified
-    if partition_by:
-        args['partition_by'] = partition_by
-    
-    # Engine selection based on schema_mode
-    if schema_mode == 'merge':
-        # Use rust engine for schema merging (no row group params supported)
-        args['schema_mode'] = 'merge'
-        args['engine'] = 'rust'
-    else:
-        # Use pyarrow engine with row group optimization (default)
-        args['max_rows_per_file'] = RG
-        args['max_rows_per_group'] = RG
-        args['min_rows_per_group'] = RG
-    
-    return args
-
-
-class DeltaWriter:
-    """Spark-style write API for Delta Lake"""
-    
-    def __init__(self, relation, duckrun_instance):
-        self.relation = relation
-        self.duckrun = duckrun_instance
-        self._format = "delta"
-        self._mode = "overwrite"
-        self._schema_mode = None
-        self._partition_by = None
-    
-    def format(self, format_type: str):
-        """Set output format (only 'delta' supported)"""
-        if format_type.lower() != "delta":
-            raise ValueError(f"Only 'delta' format is supported, got '{format_type}'")
-        self._format = "delta"
-        return self
-    
-    def mode(self, write_mode: str):
-        """Set write mode: 'overwrite' or 'append'"""
-        if write_mode not in {"overwrite", "append"}:
-            raise ValueError(f"Mode must be 'overwrite' or 'append', got '{write_mode}'")
-        self._mode = write_mode
-        return self
-    
-    def option(self, key: str, value):
-        """Set write option (Spark-compatible)"""
-        if key == "mergeSchema":
-            if str(value).lower() in ("true", "1"):
-                self._schema_mode = "merge"
-            else:
-                self._schema_mode = None
-        else:
-            raise ValueError(f"Unsupported option: {key}")
-        return self
-    
-    def partitionBy(self, *columns):
-        """Set partition columns (Spark-compatible)"""
-        if len(columns) == 1 and isinstance(columns[0], (list, tuple)):
-            # Handle partitionBy(["col1", "col2"]) case
-            self._partition_by = list(columns[0])
-        else:
-            # Handle partitionBy("col1", "col2") case
-            self._partition_by = list(columns)
-        return self
-    
-    def saveAsTable(self, table_name: str):
-        """Save query result as Delta table"""
-        if self._format != "delta":
-            raise RuntimeError(f"Only 'delta' format is supported, got '{self._format}'")
-        
-        if "." in table_name:
-            schema, table = table_name.split(".", 1)
-        else:
-            schema = self.duckrun.schema
-            table = table_name
-        
-        self.duckrun._create_onelake_secret()
-        path = f"{self.duckrun.table_base_url}{schema}/{table}"
-        df = self.relation.record_batch()
-        
-        # Build write arguments based on schema_mode and partition_by
-        write_args = _build_write_deltalake_args(
-            path, df, self._mode, 
-            schema_mode=self._schema_mode,
-            partition_by=self._partition_by
-        )
-        
-        engine_info = f" (engine=rust, schema_mode=merge)" if self._schema_mode == 'merge' else " (engine=pyarrow)"
-        partition_info = f" partitioned by {self._partition_by}" if self._partition_by else ""
-        print(f"Writing to Delta table: {schema}.{table} (mode={self._mode}){engine_info}{partition_info}")
-        
-        write_deltalake(**write_args)
-        
-        self.duckrun.con.sql(f"DROP VIEW IF EXISTS {table}")
-        self.duckrun.con.sql(f"""
-            CREATE OR REPLACE VIEW {table}
-            AS SELECT * FROM delta_scan('{path}')
-        """)
-        
-        dt = DeltaTable(path)
-        
-        if self._mode == "overwrite":
-            dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
-            dt.cleanup_metadata()
-            print(f"✅ Table {schema}.{table} created/overwritten")
-        else:
-            file_count = len(dt.file_uris())
-            if file_count > self.duckrun.compaction_threshold:
-                print(f"Compacting {schema}.{table} ({file_count} files)")
-                dt.optimize.compact()
-                dt.vacuum(dry_run=False)
-                dt.cleanup_metadata()
-            print(f"✅ Data appended to {schema}.{table}")
-        
-        return table
-
-
-class QueryResult:
-    """Wrapper for DuckDB relation with write API"""
-    
-    def __init__(self, relation, duckrun_instance):
-        self.relation = relation
-        self.duckrun = duckrun_instance
-    
-    @property
-    def write(self):
-        """Access write API"""
-        return DeltaWriter(self.relation, self.duckrun)
-    
-    def __getattr__(self, name):
-        """Delegate all other methods to underlying DuckDB relation"""
-        return getattr(self.relation, name)
-
+from datetime import datetime
+from .stats import get_stats as _get_stats
+from .runner import run as _run
+from .files import copy as _copy, download as _download
+from .writer import QueryResult
 
 class Duckrun:
     """
@@ -387,179 +243,6 @@ class Duckrun:
             print(f"❌ Error attaching lakehouse: {e}")
             print("Continuing without pre-attached tables.")
 
-    def _normalize_table_name(self, name: str) -> str:
-        """Extract base table name before first '__'"""
-        return name.split('__', 1)[0] if '__' in name else name
-
-    def _read_sql_file(self, table_name: str, params: Optional[Dict] = None) -> Optional[str]:
-        if self.sql_folder is None:
-            raise RuntimeError("sql_folder is not configured. Cannot read SQL files.")
-        
-        is_url = self.sql_folder.startswith("http")
-        if is_url:
-            url = f"{self.sql_folder.rstrip('/')}/{table_name}.sql".strip()
-            try:
-                resp = requests.get(url)
-                resp.raise_for_status()
-                content = resp.text
-            except Exception as e:
-                print(f"Failed to fetch SQL from {url}: {e}")
-                return None
-        else:
-            path = os.path.join(self.sql_folder, f"{table_name}.sql")
-            try:
-                with open(path, 'r') as f:
-                    content = f.read()
-            except Exception as e:
-                print(f"Failed to read SQL file {path}: {e}")
-                return None
-
-        if not content.strip():
-            print(f"SQL file is empty: {table_name}.sql")
-            return None
-
-        full_params = {
-            'ws': self.workspace,
-            'lh': self.lakehouse_name,
-            'schema': self.schema,
-            'storage_account': self.storage_account
-        }
-        if params:
-            full_params.update(params)
-
-        try:
-            template = Template(content)
-            content = template.substitute(full_params)
-        except KeyError as e:
-            print(f"Missing parameter in SQL file: ${e}")
-            return None
-        except Exception as e:
-            print(f"Error during SQL template substitution: {e}")
-            return None
-
-        return content
-
-    def _load_py_function(self, name: str) -> Optional[Callable]:
-        if self.sql_folder is None:
-            raise RuntimeError("sql_folder is not configured. Cannot load Python functions.")
-        
-        is_url = self.sql_folder.startswith("http")
-        try:
-            if is_url:
-                url = f"{self.sql_folder.rstrip('/')}/{name}.py".strip()
-                resp = requests.get(url)
-                resp.raise_for_status()
-                code = resp.text
-                namespace = {}
-                exec(code, namespace)
-                func = namespace.get(name)
-                return func if callable(func) else None
-            else:
-                path = os.path.join(self.sql_folder, f"{name}.py")
-                if not os.path.isfile(path):
-                    print(f"Python file not found: {path}")
-                    return None
-                spec = importlib.util.spec_from_file_location(name, path)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                func = getattr(mod, name, None)
-                return func if callable(func) else None
-        except Exception as e:
-            print(f"Error loading Python function '{name}': {e}")
-            return None
-
-    def _run_python(self, name: str, args: tuple) -> Any:
-        """Execute Python task, return result"""
-        self._create_onelake_secret()
-        func = self._load_py_function(name)
-        if not func:
-            raise RuntimeError(f"Python function '{name}' not found")
-        
-        print(f"Running Python: {name}{args}")
-        result = func(*args)
-        print(f"✅ Python '{name}' completed")
-        return result
-
-    def _run_sql(self, table: str, mode: str, params: Dict, delta_options: Dict = None) -> str:
-        """Execute SQL task, write to Delta, return normalized table name"""
-        self._create_onelake_secret()
-        
-        if mode not in {'overwrite', 'append', 'ignore'}:
-            raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
-
-        sql = self._read_sql_file(table, params)
-        if sql is None:
-            raise RuntimeError(f"Failed to read SQL file for '{table}'")
-
-        normalized_table = self._normalize_table_name(table)
-        path = f"{self.table_base_url}{self.schema}/{normalized_table}"
-
-        # Extract Delta Lake specific options from delta_options
-        delta_options = delta_options or {}
-        merge_schema = delta_options.get('mergeSchema')
-        schema_mode = 'merge' if str(merge_schema).lower() in ('true', '1') else None
-        partition_by = delta_options.get('partitionBy') or delta_options.get('partition_by')
-
-        if mode == 'overwrite':
-            self.con.sql(f"DROP VIEW IF EXISTS {normalized_table}")
-            df = self.con.sql(sql).record_batch()
-            
-            write_args = _build_write_deltalake_args(
-                path, df, 'overwrite', 
-                schema_mode=schema_mode, 
-                partition_by=partition_by
-            )
-            write_deltalake(**write_args)
-            
-            self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
-            dt = DeltaTable(path)
-            dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
-            dt.cleanup_metadata()
-
-        elif mode == 'append':
-            df = self.con.sql(sql).record_batch()
-            
-            write_args = _build_write_deltalake_args(
-                path, df, 'append', 
-                schema_mode=schema_mode, 
-                partition_by=partition_by
-            )
-            write_deltalake(**write_args)
-            
-            self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
-            dt = DeltaTable(path)
-            if len(dt.file_uris()) > self.compaction_threshold:
-                print(f"Compacting {normalized_table} ({len(dt.file_uris())} files)")
-                dt.optimize.compact()
-                dt.vacuum(dry_run=False)
-                dt.cleanup_metadata()
-
-        elif mode == 'ignore':
-            try:
-                DeltaTable(path)
-                print(f"Table {normalized_table} exists. Skipping (mode='ignore')")
-            except Exception:
-                print(f"Table {normalized_table} doesn't exist. Creating...")
-                self.con.sql(f"DROP VIEW IF EXISTS {normalized_table}")
-                df = self.con.sql(sql).record_batch()
-                
-                write_args = _build_write_deltalake_args(
-                    path, df, 'overwrite', 
-                    schema_mode=schema_mode, 
-                    partition_by=partition_by
-                )
-                write_deltalake(**write_args)
-                
-                self.con.sql(f"CREATE OR REPLACE VIEW {normalized_table} AS SELECT * FROM delta_scan('{path}')")
-                dt = DeltaTable(path)
-                dt.vacuum(dry_run=False)
-                dt.cleanup_metadata()
-
-        engine_info = f" (engine=rust, schema_mode=merge)" if schema_mode == 'merge' else " (engine=pyarrow)"
-        partition_info = f" partitioned by {partition_by}" if partition_by else ""
-        print(f"✅ SQL '{table}' → '{normalized_table}' ({mode}){engine_info}{partition_info}")
-        return normalized_table
-
     def run(self, pipeline: List[Tuple]) -> bool:
         """
         Execute pipeline of tasks.
@@ -573,59 +256,7 @@ class Duckrun:
             True if all tasks succeeded
             False if any task failed (exception) or Python task returned 0 (early exit)
         """
-        if self.sql_folder is None:
-            raise RuntimeError("sql_folder is not configured. Cannot run pipelines.")
-        
-        for i, task in enumerate(pipeline, 1):
-            print(f"\n{'='*60}")
-            print(f"Task {i}/{len(pipeline)}: {task[0]}")
-            print('='*60)
-            
-            try:
-                result = None
-                
-                if len(task) == 2:
-                    name, second = task
-                    if isinstance(second, str) and second in {'overwrite', 'append', 'ignore'}:
-                        result = self._run_sql(name, second, {}, {})
-                    else:
-                        args = second if isinstance(second, (tuple, list)) else (second,)
-                        result = self._run_python(name, tuple(args))
-                    
-                elif len(task) == 3:
-                    table, mode, params = task
-                    if not isinstance(params, dict):
-                        raise ValueError(f"Expected dict for params, got {type(params)}")
-                    result = self._run_sql(table, mode, params, {})
-                    
-                elif len(task) == 4:
-                    table, mode, params, delta_options = task
-                    if not isinstance(params, dict):
-                        raise ValueError(f"Expected dict for SQL params, got {type(params)}")
-                    if not isinstance(delta_options, dict):
-                        raise ValueError(f"Expected dict for Delta options, got {type(delta_options)}")
-                    result = self._run_sql(table, mode, params, delta_options)
-                    
-                else:
-                    raise ValueError(f"Invalid task format: {task}")
-                
-                # Check if Python task returned 0 (early exit condition)
-                # Only check for Python tasks as SQL tasks return table names (strings) and only stop on exceptions
-                if (len(task) == 2 and 
-                    not isinstance(task[1], str) and 
-                    result == 0):
-                    print(f"\n⏹️  Python task {i} returned 0 - stopping pipeline execution")
-                    print(f"   Remaining tasks ({len(pipeline) - i}) will not be executed")
-                    return False
-                    
-            except Exception as e:
-                print(f"\n❌ Task {i} failed: {e}")
-                return False
-
-        print(f"\n{'='*60}")
-        print("✅ All tasks completed successfully")
-        print('='*60)
-        return True
+        return _run(self, pipeline)
 
     def copy(self, local_folder: str, remote_folder: str, 
              file_extensions: Optional[List[str]] = None, 
@@ -652,98 +283,7 @@ class Duckrun:
             # Upload with overwrite enabled
             dr.copy("./backup", "backups", overwrite=True)
         """
-        if not os.path.exists(local_folder):
-            print(f"❌ Local folder not found: {local_folder}")
-            return False
-            
-        if not os.path.isdir(local_folder):
-            print(f"❌ Path is not a directory: {local_folder}")
-            return False
-            
-        # Get Azure token
-        token = self._get_storage_token()
-        if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-            print("Authenticating with Azure for file upload (trying CLI, will fallback to browser if needed)...")
-            from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-            credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-            token_obj = credential.get_token("https://storage.azure.com/.default")
-            token = token_obj.token
-            os.environ["AZURE_STORAGE_TOKEN"] = token
-        
-        # Setup OneLake Files URL (not Tables)
-        files_base_url = f'abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Files/'
-        store = AzureStore.from_url(files_base_url, bearer_token=token)
-        
-        # Collect files to upload
-        files_to_upload = []
-        for root, dirs, files in os.walk(local_folder):
-            for file in files:
-                local_file_path = os.path.join(root, file)
-                
-                # Filter by extensions if specified
-                if file_extensions:
-                    _, ext = os.path.splitext(file)
-                    if ext.lower() not in [e.lower() for e in file_extensions]:
-                        continue
-                
-                # Calculate relative path from local_folder
-                rel_path = os.path.relpath(local_file_path, local_folder)
-                
-                # Build remote path in OneLake Files (remote_folder is now mandatory)
-                remote_path = f"{remote_folder.strip('/')}/{rel_path}".replace("\\", "/")
-                
-                files_to_upload.append((local_file_path, remote_path))
-        
-        if not files_to_upload:
-            print(f"No files found to upload in {local_folder}")
-            if file_extensions:
-                print(f"  (filtered by extensions: {file_extensions})")
-            return True
-        
-        print(f"📁 Uploading {len(files_to_upload)} files from '{local_folder}' to OneLake Files...")
-        print(f"   Target folder: {remote_folder}")
-        
-        uploaded_count = 0
-        failed_count = 0
-        
-        for local_path, remote_path in files_to_upload:
-            try:
-                # Check if file exists (if not overwriting)
-                if not overwrite:
-                    try:
-                        obs.head(store, remote_path)
-                        print(f"  ⏭ Skipped (exists): {remote_path}")
-                        continue
-                    except Exception:
-                        # File doesn't exist, proceed with upload
-                        pass
-                
-                # Read local file
-                with open(local_path, 'rb') as f:
-                    file_data = f.read()
-                
-                # Upload to OneLake Files
-                obs.put(store, remote_path, file_data)
-                
-                file_size = len(file_data)
-                size_mb = file_size / (1024 * 1024) if file_size > 1024*1024 else file_size / 1024
-                size_unit = "MB" if file_size > 1024*1024 else "KB"
-                
-                print(f"  ✓ Uploaded: {local_path} → {remote_path} ({size_mb:.1f} {size_unit})")
-                uploaded_count += 1
-                
-            except Exception as e:
-                print(f"  ❌ Failed: {local_path} → {remote_path} | Error: {str(e)[:100]}")
-                failed_count += 1
-        
-        print(f"\n{'='*60}")
-        if failed_count == 0:
-            print(f"✅ Successfully uploaded all {uploaded_count} files to OneLake Files")
-        else:
-            print(f"⚠ Uploaded {uploaded_count} files, {failed_count} failed")
-        print(f"{'='*60}")
-        
-        return failed_count == 0
+        return _copy(self, local_folder, remote_folder, file_extensions, overwrite)
 
     def download(self, remote_folder: str = "", local_folder: str = "./downloaded_files",
                  file_extensions: Optional[List[str]] = None,
@@ -762,110 +302,12 @@ class Duckrun:
             
         Examples:
             # Download all files from OneLake Files root
-            dr.download_from_files()
+            dr.download()
             
             # Download only CSV files from a specific subfolder
-            dr.download_from_files("daily_reports", "./reports", ['.csv'])
+            dr.download("daily_reports", "./reports", ['.csv'])
         """
-        # Get Azure token
-        token = self._get_storage_token()
-        if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-            print("Authenticating with Azure for file download (trying CLI, will fallback to browser if needed)...")
-            from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-            credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-            token_obj = credential.get_token("https://storage.azure.com/.default")
-            token = token_obj.token
-            os.environ["AZURE_STORAGE_TOKEN"] = token
-        
-        # Setup OneLake Files URL (not Tables)
-        files_base_url = f'abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/{self.lakehouse_name}.Lakehouse/Files/'
-        store = AzureStore.from_url(files_base_url, bearer_token=token)
-        
-        # Create local directory
-        os.makedirs(local_folder, exist_ok=True)
-        
-        # List files in OneLake Files
-        print(f"📁 Discovering files in OneLake Files...")
-        if remote_folder:
-            print(f"   Source folder: {remote_folder}")
-            prefix = f"{remote_folder.strip('/')}/"
-        else:
-            prefix = ""
-        
-        try:
-            list_stream = obs.list(store, prefix=prefix)
-            files_to_download = []
-            
-            for batch in list_stream:
-                for obj in batch:
-                    remote_path = obj["path"]
-                    
-                    # Filter by extensions if specified
-                    if file_extensions:
-                        _, ext = os.path.splitext(remote_path)
-                        if ext.lower() not in [e.lower() for e in file_extensions]:
-                            continue
-                    
-                    # Calculate local path
-                    if remote_folder:
-                        rel_path = os.path.relpath(remote_path, remote_folder.strip('/'))
-                    else:
-                        rel_path = remote_path
-                    
-                    local_path = os.path.join(local_folder, rel_path).replace('/', os.sep)
-                    files_to_download.append((remote_path, local_path))
-            
-            if not files_to_download:
-                print(f"No files found to download")
-                if file_extensions:
-                    print(f"  (filtered by extensions: {file_extensions})")
-                return True
-            
-            print(f"📥 Downloading {len(files_to_download)} files to '{local_folder}'...")
-            
-            downloaded_count = 0
-            failed_count = 0
-            
-            for remote_path, local_path in files_to_download:
-                try:
-                    # Check if local file exists (if not overwriting)
-                    if not overwrite and os.path.exists(local_path):
-                        print(f"  ⏭ Skipped (exists): {local_path}")
-                        continue
-                    
-                    # Ensure local directory exists
-                    os.makedirs(os.path.dirname(local_path), exist_ok=True)
-                    
-                    # Download file
-                    data = obs.get(store, remote_path).bytes()
-                    
-                    # Write to local file
-                    with open(local_path, 'wb') as f:
-                        f.write(data)
-                    
-                    file_size = len(data)
-                    size_mb = file_size / (1024 * 1024) if file_size > 1024*1024 else file_size / 1024
-                    size_unit = "MB" if file_size > 1024*1024 else "KB"
-                    
-                    print(f"  ✓ Downloaded: {remote_path} → {local_path} ({size_mb:.1f} {size_unit})")
-                    downloaded_count += 1
-                    
-                except Exception as e:
-                    print(f"  ❌ Failed: {remote_path} → {local_path} | Error: {str(e)[:100]}")
-                    failed_count += 1
-            
-            print(f"\n{'='*60}")
-            if failed_count == 0:
-                print(f"✅ Successfully downloaded all {downloaded_count} files from OneLake Files")
-            else:
-                print(f"⚠ Downloaded {downloaded_count} files, {failed_count} failed")
-            print(f"{'='*60}")
-            
-            return failed_count == 0
-            
-        except Exception as e:
-            print(f"❌ Error listing files from OneLake: {e}")
-            return False
+        return _download(self, remote_folder, local_folder, file_extensions, overwrite)
 
     def sql(self, query: str):
         """
@@ -882,6 +324,34 @@ class Duckrun:
     def get_connection(self):
         """Get underlying DuckDB connection"""
         return self.con
+
+    def get_stats(self, source: str):
+        """
+        Get comprehensive statistics for Delta Lake tables.
+        
+        Args:
+            source: Can be one of:
+                   - Table name: 'table_name' (uses current schema)
+                   - Schema.table: 'schema.table_name' (specific table in schema)
+                   - Schema only: 'schema' (all tables in schema)
+        
+        Returns:
+            Arrow table with statistics including total rows, file count, row groups, 
+            average row group size, file sizes, VORDER status, and timestamp
+        
+        Examples:
+            con = duckrun.connect("tmp/data.lakehouse/aemo")
+            
+            # Single table in current schema
+            stats = con.get_stats('price')
+            
+            # Specific table in different schema
+            stats = con.get_stats('aemo.price')
+            
+            # All tables in a schema
+            stats = con.get_stats('aemo')
+        """
+        return _get_stats(self, source)
 
     def close(self):
         """Close DuckDB connection"""
