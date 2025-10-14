@@ -61,10 +61,20 @@ class Duckrun:
         self.scan_all_schemas = scan_all_schemas
         self.storage_account = storage_account
         
-        # Construct proper ABFSS URLs using GUIDs
-        # Both Tables and Files use lakehouse GUID directly (no .Lakehouse suffix)
-        self.table_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/'
-        self.files_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_id}/Files/'
+        # Construct proper ABFSS URLs
+        import re
+        guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+        # If lakehouse_id is a GUID, use as-is
+        if guid_pattern.match(lakehouse_id):
+            lakehouse_url_part = lakehouse_id
+        else:
+            # If workspace name has no spaces, always append .lakehouse unless already present
+            if " " not in workspace_id and not lakehouse_id.endswith('.lakehouse'):
+                lakehouse_url_part = f'{lakehouse_id}.lakehouse'
+            else:
+                lakehouse_url_part = lakehouse_id
+        self.table_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_url_part}/Tables/'
+        self.files_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_url_part}/Files/'
         
         # Keep legacy properties for backward compatibility
         self.workspace = workspace_id  
@@ -326,7 +336,19 @@ class Duckrun:
         url = f"abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/"
         store = AzureStore.from_url(url, bearer_token=token)
         
-        base_path = f"{self.lakehouse_name}/Tables/"
+        # Use the same lakehouse URL part logic as in __init__ to ensure .lakehouse suffix is added when needed
+        import re
+        guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+        if guid_pattern.match(self.lakehouse_id):
+            lakehouse_url_part = self.lakehouse_id
+        else:
+            # If workspace name has no spaces, always append .lakehouse unless already present
+            if " " not in self.workspace_id and not self.lakehouse_id.endswith('.lakehouse'):
+                lakehouse_url_part = f'{self.lakehouse_id}.lakehouse'
+            else:
+                lakehouse_url_part = self.lakehouse_id
+        
+        base_path = f"{lakehouse_url_part}/Tables/"
         tables_found = []
         
         if self.scan_all_schemas:
