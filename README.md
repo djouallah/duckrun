@@ -6,11 +6,9 @@ A helper package for stuff that made my life easier when working with Fabric Pyt
 
 **Requirements:**
 - Lakehouse must have a schema (e.g., `dbo`, `sales`, `analytics`)
-- Workspace and lakehouse names cannot contain spaces
+- **Workspace and lakehouse names with spaces are now fully supported!** ✅
 
 **Delta Lake Version:** This package uses an older version of deltalake to maintain row size control capabilities, which is crucial for Power BI performance optimization. The newer Rust-based deltalake versions don't yet support the row group size parameters that are essential for optimal DirectLake performance.
-
-**Why no spaces?** Duckrun uses simple name-based paths instead of GUIDs. This keeps the code clean and readable, which is perfect for data engineering workspaces where naming conventions are already well-established. Just use underscores or hyphens instead: `my_workspace` or `my-lakehouse`.
 
 ## What It Does
 
@@ -32,20 +30,28 @@ pip install duckrun[local]
 ```python
 import duckrun
 
-# Connect to your Fabric lakehouse with a specific schema
-con = duckrun.connect("my_workspace/my_lakehouse.lakehouse/dbo")
+# 1. Workspace Management (list and create lakehouses)
+ws = duckrun.connect("My Workspace")
+lakehouses = ws.list_lakehouses()  # Returns list of lakehouse names
+ws.create_lakehouse_if_not_exists("New Lakehouse")
+
+# 2. Connect to lakehouse with a specific schema
+con = duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo")
+
+# Works with workspace names containing spaces!
+con = duckrun.connect("Data Analytics/Sales Data.lakehouse/analytics")
 
 # Schema defaults to 'dbo' if not specified (scans all schemas)
 # ⚠️ WARNING: Scanning all schemas can be slow for large lakehouses!
-con = duckrun.connect("my_workspace/my_lakehouse.lakehouse")
+con = duckrun.connect("My Workspace/My Lakehouse.lakehouse")
 
-# Explore data
+# 3. Explore data
 con.sql("SELECT * FROM my_table LIMIT 10").show()
 
-# Write to Delta tables (Spark-style API)
+# 4. Write to Delta tables (Spark-style API)
 con.sql("SELECT * FROM source").write.mode("overwrite").saveAsTable("target")
 
-# Upload/download files to/from OneLake Files
+# 5. Upload/download files to/from OneLake Files
 con.copy("./local_folder", "target_folder")  # Upload files
 con.download("target_folder", "./downloaded")  # Download files
 ```
@@ -55,15 +61,23 @@ That's it! No `sql_folder` needed for data exploration.
 ## Connection Format
 
 ```python
-# With schema (recommended for better performance)
-con = duckrun.connect("workspace/lakehouse.lakehouse/schema")
+# Workspace management (list and create lakehouses)
+ws = duckrun.connect("My Workspace")
+ws.list_lakehouses()  # Returns: ['lakehouse1', 'lakehouse2', ...]
+ws.create_lakehouse_if_not_exists("New Lakehouse")
+
+# Lakehouse connection with schema (recommended for best performance)
+con = duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo")
+
+# Supports workspace names with spaces!
+con = duckrun.connect("Data Analytics/Sales Data.lakehouse/analytics")
 
 # Without schema (defaults to 'dbo', scans all schemas)
 # ⚠️ This can be slow for large lakehouses!
-con = duckrun.connect("workspace/lakehouse.lakehouse")
+con = duckrun.connect("My Workspace/My Lakehouse.lakehouse")
 
-# With options
-con = duckrun.connect("workspace/lakehouse.lakehouse/dbo", sql_folder="./sql")
+# With SQL folder for pipeline orchestration
+con = duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo", sql_folder="./sql")
 ```
 
 ### Multi-Schema Support
