@@ -702,7 +702,11 @@ class WorkspaceConnection:
             try:
                 import notebookutils  # type: ignore
                 token = notebookutils.credentials.getToken("pbi")
-                workspace_id = notebookutils.runtime.context.get("workspaceId")
+                # Always resolve workspace name to ID, even in notebook environment
+                workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
+                if not workspace_id:
+                    print(f"Workspace '{self.workspace_name}' not found")
+                    return []
             except ImportError:
                 # Fallback to azure-identity
                 print("Getting authentication token...")
@@ -749,7 +753,11 @@ class WorkspaceConnection:
             try:
                 import notebookutils  # type: ignore
                 token = notebookutils.credentials.getToken("pbi")
-                workspace_id = notebookutils.runtime.context.get("workspaceId")
+                # Always resolve workspace name to ID, even in notebook environment
+                workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
+                if not workspace_id:
+                    print(f"Workspace '{self.workspace_name}' not found")
+                    return False
             except ImportError:
                 # Fallback to azure-identity
                 print("Getting authentication token...")
