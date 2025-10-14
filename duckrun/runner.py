@@ -110,11 +110,39 @@ def run(duckrun_instance, pipeline: List[Tuple]) -> bool:
 
 
 def _run_python(duckrun_instance, name: str, args: tuple) -> Any:
-    """Execute Python task, return result"""
+    """
+    Execute Python task, return result.
+    
+    Automatically substitutes workspace/lakehouse names in args with their resolved IDs
+    to prevent URL encoding issues with names containing spaces.
+    """
     duckrun_instance._create_onelake_secret()
     func = _load_py_function(duckrun_instance, name)
     if not func:
         raise RuntimeError(f"Python function '{name}' not found")
+    
+    # Get original and resolved names
+    original_workspace = duckrun_instance.workspace
+    original_lakehouse = duckrun_instance.lakehouse_name
+    resolved_workspace = duckrun_instance.workspace_id
+    resolved_lakehouse = duckrun_instance.lakehouse_id
+    
+    # Substitute workspace/lakehouse names in args if they differ
+    # This prevents URL encoding issues when names contain spaces
+    substituted_args = []
+    needs_substitution = (original_workspace != resolved_workspace or 
+                         original_lakehouse != resolved_lakehouse)
+    
+    if needs_substitution:
+        for arg in args:
+            if arg == original_workspace:
+                substituted_args.append(resolved_workspace)
+            elif arg == original_lakehouse:
+                substituted_args.append(resolved_lakehouse)
+            else:
+                substituted_args.append(arg)
+        args = tuple(substituted_args)
+        print(f"📝 Auto-substituted workspace/lakehouse names in args for URL compatibility")
     
     print(f"Running Python: {name}{args}")
     result = func(*args)

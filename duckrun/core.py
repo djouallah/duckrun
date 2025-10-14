@@ -441,6 +441,26 @@ class Duckrun:
             print(f"❌ Error attaching lakehouse: {e}")
             print("Continuing without pre-attached tables.")
 
+    def get_workspace_id(self) -> str:
+        """
+        Get the workspace ID (GUID or name without spaces).
+        Use this when passing workspace parameter to Python functions.
+        
+        Returns:
+            Workspace ID - either a GUID or workspace name without spaces
+        """
+        return self.workspace_id
+    
+    def get_lakehouse_id(self) -> str:
+        """
+        Get the lakehouse ID (GUID or name).
+        Use this when passing lakehouse parameter to Python functions.
+        
+        Returns:
+            Lakehouse ID - either a GUID or lakehouse name
+        """
+        return self.lakehouse_id
+
     def run(self, pipeline: List[Tuple]) -> bool:
         """
         Execute pipeline of tasks.
