@@ -49,17 +49,27 @@ class Duckrun:
         ]
     """
 
-    def __init__(self, workspace: str, lakehouse_name: str, schema: str = "dbo", 
+    def __init__(self, workspace_id: str, lakehouse_id: str, schema: str = "dbo", 
                  sql_folder: Optional[str] = None, compaction_threshold: int = 10,
                  scan_all_schemas: bool = False, storage_account: str = "onelake"):
-        self.workspace = workspace
-        self.lakehouse_name = lakehouse_name
+        # Store GUIDs for internal use
+        self.workspace_id = workspace_id
+        self.lakehouse_id = lakehouse_id
         self.schema = schema
         self.sql_folder = sql_folder.strip() if sql_folder else None
         self.compaction_threshold = compaction_threshold
         self.scan_all_schemas = scan_all_schemas
         self.storage_account = storage_account
-        self.table_base_url = f'abfss://{workspace}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_name}.Lakehouse/Tables/'
+        
+        # Construct proper ABFSS URLs using GUIDs
+        # Both Tables and Files use lakehouse GUID directly (no .Lakehouse suffix)
+        self.table_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_id}/Tables/'
+        self.files_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_id}/Files/'
+        
+        # Keep legacy properties for backward compatibility
+        self.workspace = workspace_id  
+        self.lakehouse_name = lakehouse_id
+        
         self.con = duckdb.connect()
         self.con.sql("SET preserve_insertion_order = false")
         self._attach_lakehouse()
@@ -68,57 +78,218 @@ class Duckrun:
     def connect(cls, connection_string: str, sql_folder: Optional[str] = None,
                 compaction_threshold: int = 100, storage_account: str = "onelake"):
         """
-        Create and connect to lakehouse.
+        Create and connect to lakehouse or workspace.
         
-        Uses compact format: connect("ws/lh.lakehouse/schema") or connect("ws/lh.lakehouse")
+        Smart detection based on connection string format:
+        - "workspace" → workspace management only
+        - "ws/lh.lakehouse/schema" → full lakehouse connection  
+        - "ws/lh.lakehouse" → lakehouse connection (defaults to dbo schema)
         
         Args:
-            connection_string: OneLake path "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
-            sql_folder: Optional path or URL to SQL files folder
+            connection_string: OneLake path or workspace name
+            sql_folder: Optional path or URL to SQL files folder  
             compaction_threshold: File count threshold for compaction
             storage_account: Storage account name (default: "onelake")
         
         Examples:
-            dr = Duckrun.connect("ws/lh.lakehouse/schema", sql_folder="./sql")
-            dr = Duckrun.connect("ws/lh.lakehouse/schema")  # no SQL folder
-            dr = Duckrun.connect("ws/lh.lakehouse")  # defaults to dbo schema
-            dr = Duckrun.connect("ws/lh.lakehouse", storage_account="xxx-onelake")  # custom storage
+            # Workspace management only (supports spaces in names)
+            ws = Duckrun.connect("My Workspace Name")
+            ws.list_lakehouses()
+            ws.create_lakehouse_if_not_exists("New Lakehouse")
+            
+            # Full lakehouse connections (supports spaces in names)
+            dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse/schema", sql_folder="./sql")
+            dr = Duckrun.connect("Data Workspace/Sales Data.lakehouse/analytics")  # spaces supported
+            dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse")  # defaults to dbo schema
+            dr = Duckrun.connect("workspace/lakehouse.lakehouse", storage_account="xxx-onelake")  # custom storage
+            
+        Note:
+            Internally resolves friendly names (with spaces) to GUIDs and constructs proper ABFSS URLs:
+            "My Workspace/My Lakehouse.lakehouse/schema" becomes
+            "abfss://workspace_guid@onelake.dfs.fabric.microsoft.com/lakehouse_guid/Tables/schema"
         """
+        
+        # Check if it's a workspace-only connection (no "/" means workspace name only)
+        if "/" not in connection_string:
+            print(f"Connecting to workspace '{connection_string}' for management operations...")
+            return WorkspaceConnection(connection_string)
+        
         print("Connecting to Lakehouse...")
         
         scan_all_schemas = False
         
-        # Only support compact format: "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"
-        if not connection_string or "/" not in connection_string:
-            raise ValueError(
-                "Invalid connection string format. "
-                "Expected format: 'workspace/lakehouse.lakehouse/schema' or 'workspace/lakehouse.lakehouse'"
-            )
-        
+        # Parse lakehouse connection string: "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"  
+        # Support workspace and lakehouse names with spaces
         parts = connection_string.split("/")
         if len(parts) == 2:
-            workspace, lakehouse_name = parts
+            workspace_name, lakehouse_name = parts
             scan_all_schemas = True
             schema = "dbo"
         elif len(parts) == 3:
-            workspace, lakehouse_name, schema = parts
+            workspace_name, lakehouse_name, schema = parts
         else:
             raise ValueError(
                 f"Invalid connection string format: '{connection_string}'. "
-                "Expected format: 'workspace/lakehouse.lakehouse' or 'workspace/lakehouse.lakehouse/schema'"
+                "Expected formats:\n"
+                "  'workspace name' (workspace management only)\n"
+                "  'workspace name/lakehouse name.lakehouse' (lakehouse with dbo schema)\n"
+                "  'workspace name/lakehouse name.lakehouse/schema' (lakehouse with specific schema)"
             )
         
         if lakehouse_name.endswith(".lakehouse"):
             lakehouse_name = lakehouse_name[:-10]
         
-        if not workspace or not lakehouse_name:
+        if not workspace_name or not lakehouse_name:
             raise ValueError(
-                "Missing required parameters. Use compact format:\n"
-                "  connect('workspace/lakehouse.lakehouse/schema', 'sql_folder')\n"
-                "  connect('workspace/lakehouse.lakehouse')  # defaults to dbo"
+                "Missing required parameters. Use one of these formats:\n"
+                "  connect('workspace name')  # workspace management\n"
+                "  connect('workspace name/lakehouse name.lakehouse/schema')  # full lakehouse\n"
+                "  connect('workspace name/lakehouse name.lakehouse')  # defaults to dbo"
             )
         
-        return cls(workspace, lakehouse_name, schema, sql_folder, compaction_threshold, scan_all_schemas, storage_account)
+        # Resolve friendly names to GUIDs and construct proper ABFSS path
+        workspace_id, lakehouse_id = cls._resolve_names_to_guids(workspace_name, lakehouse_name)
+        
+        return cls(workspace_id, lakehouse_id, schema, sql_folder, compaction_threshold, scan_all_schemas, storage_account)
+
+    @classmethod
+    def _resolve_names_to_guids(cls, workspace_name: str, lakehouse_name: str) -> tuple[str, str]:
+        """
+        Resolve friendly workspace and lakehouse names to their GUIDs.
+        
+        Optimization: If names don't contain spaces, use them directly (no API calls needed).
+        Only resolve to GUIDs when names contain spaces or are already GUIDs.
+        
+        Args:
+            workspace_name: Display name of the workspace (can contain spaces)
+            lakehouse_name: Display name of the lakehouse (can contain spaces)
+            
+        Returns:
+            Tuple of (workspace_id, lakehouse_id) - either resolved GUIDs or original names
+        """
+        
+        # Check if names are already GUIDs first
+        import re
+        guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+        
+        if guid_pattern.match(workspace_name) and guid_pattern.match(lakehouse_name):
+            print(f"✅ Names are already GUIDs: workspace={workspace_name}, lakehouse={lakehouse_name}")
+            return workspace_name, lakehouse_name
+        
+        # Optimization: If workspace name has no spaces, use both names directly (old behavior)
+        # Note: Lakehouse names cannot contain spaces in Microsoft Fabric, only workspace names can
+        if " " not in workspace_name:
+            print(f"✅ Using names directly (workspace has no spaces): workspace={workspace_name}, lakehouse={lakehouse_name}")
+            return workspace_name, lakehouse_name
+        
+        # Workspace name contains spaces - need to resolve both to GUIDs for proper ABFSS URLs
+        print(f"🔍 Resolving '{workspace_name}' workspace and '{lakehouse_name}' lakehouse to GUIDs (workspace has spaces)...")
+        
+        try:
+            # Get authentication token (try notebook environment first, then azure-identity)
+            try:
+                import notebookutils  # type: ignore
+                token = notebookutils.credentials.getToken("pbi")
+                current_workspace_id = notebookutils.runtime.context.get("workspaceId")
+            except ImportError:
+                current_workspace_id = None
+                # Fallback to azure-identity for external environments
+                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
+                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
+                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
+                token = token_obj.token
+            
+            # Resolve workspace name to ID 
+            if current_workspace_id:
+                # In notebook environment, we could use current workspace ID
+                # but we should validate it matches the requested workspace name
+                workspace_id = cls._resolve_workspace_id_by_name(token, workspace_name)
+                if not workspace_id:
+                    # Fallback to current workspace if name resolution fails
+                    print(f"⚠️ Could not validate workspace name '{workspace_name}', using current workspace")
+                    workspace_id = current_workspace_id
+            else:
+                # External environment - must resolve by name
+                workspace_id = cls._resolve_workspace_id_by_name(token, workspace_name)
+                if not workspace_id:
+                    raise ValueError(f"Workspace '{workspace_name}' not found")
+            
+            # Resolve lakehouse name to ID (required for ABFSS URLs with spaces)
+            lakehouse_id = cls._resolve_lakehouse_id_by_name(token, workspace_id, lakehouse_name)
+            if not lakehouse_id:
+                raise ValueError(f"Lakehouse '{lakehouse_name}' not found in workspace '{workspace_name}'")
+            
+            print(f"✅ Resolved: {workspace_name} → {workspace_id}, {lakehouse_name} → {lakehouse_id}")
+            return workspace_id, lakehouse_id
+            
+        except Exception as e:
+            print(f"❌ Failed to resolve names to GUIDs: {e}")
+            print(f"❌ Cannot use friendly names with spaces '{workspace_name}'/'{lakehouse_name}' in ABFSS URLs without GUID resolution")
+            print("❌ Microsoft Fabric requires actual workspace and lakehouse GUIDs for ABFSS access when names contain spaces")
+            raise ValueError(
+                f"Unable to resolve workspace '{workspace_name}' and lakehouse '{lakehouse_name}' to GUIDs. "
+                f"ABFSS URLs require actual GUIDs when names contain spaces. "
+                f"Please ensure you have proper authentication and the workspace/lakehouse names are correct."
+            )
+
+    @classmethod  
+    def _resolve_workspace_id_by_name(cls, token: str, workspace_name: str) -> Optional[str]:
+        """Get workspace ID from display name"""
+        try:
+            import requests
+            url = "https://api.fabric.microsoft.com/v1/workspaces"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            workspaces = response.json().get("value", [])
+            for workspace in workspaces:
+                if workspace.get("displayName") == workspace_name:
+                    return workspace.get("id")
+            
+            return None
+        except Exception:
+            return None
+    
+    @classmethod
+    def _resolve_lakehouse_id_by_name(cls, token: str, workspace_id: str, lakehouse_name: str) -> Optional[str]:
+        """Get lakehouse ID from display name within a workspace"""
+        try:
+            import requests
+            url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            lakehouses = response.json().get("value", [])
+            for lakehouse in lakehouses:
+                if lakehouse.get("displayName") == lakehouse_name:
+                    return lakehouse.get("id")
+            
+            return None
+        except Exception:
+            return None
+
+    @classmethod
+    def connect_workspace(cls, workspace_name: str):
+        """
+        Connect to a workspace without a specific lakehouse.
+        Used for lakehouse management operations.
+        
+        Args:
+            workspace_name: Name of the workspace
+            
+        Returns:
+            WorkspaceConnection object with lakehouse management methods
+            
+        Example:
+            con = duckrun.connect_workspace("MyWorkspace")
+            con.list_lakehouses()
+            con.create_lakehouse_if_not_exists("newlakehouse")
+        """
+        return WorkspaceConnection(workspace_name)
 
     def _get_storage_token(self):
         return os.environ.get("AZURE_STORAGE_TOKEN", "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE")
@@ -155,7 +326,7 @@ class Duckrun:
         url = f"abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/"
         store = AzureStore.from_url(url, bearer_token=token)
         
-        base_path = f"{self.lakehouse_name}.Lakehouse/Tables/"
+        base_path = f"{self.lakehouse_name}/Tables/"
         tables_found = []
         
         if self.scan_all_schemas:
@@ -198,9 +369,9 @@ class Duckrun:
             
             if not tables:
                 if self.scan_all_schemas:
-                    print(f"No Delta tables found in {self.lakehouse_name}.Lakehouse/Tables/")
+                    print(f"No Delta tables found in {self.lakehouse_name}/Tables/")
                 else:
-                    print(f"No Delta tables found in {self.lakehouse_name}.Lakehouse/Tables/{self.schema}/")
+                    print(f"No Delta tables found in {self.lakehouse_name}/Tables/{self.schema}/")
                 return
             
             # Group tables by schema for display
@@ -358,8 +529,268 @@ class Duckrun:
         """
         return _get_stats(self, source)
 
+    def list_lakehouses(self) -> List[str]:
+        """
+        List all lakehouses in the current workspace.
+        
+        Returns:
+            List of lakehouse names
+        """
+        try:
+            # Try to get token from notebook environment first
+            try:
+                import notebookutils  # type: ignore
+                token = notebookutils.credentials.getToken("pbi")
+                workspace_id = notebookutils.runtime.context.get("workspaceId")
+            except ImportError:
+                # Fallback to azure-identity
+                print("Getting authentication token...")
+                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
+                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
+                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
+                token = token_obj.token
+                
+                # Get workspace ID by name
+                workspace_id = self._get_workspace_id_by_name(token, self.workspace)
+                if not workspace_id:
+                    print(f"Workspace '{self.workspace}' not found")
+                    return []
+            
+            # List lakehouses
+            url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            lakehouses = response.json().get("value", [])
+            lakehouse_names = [lh.get("displayName", "") for lh in lakehouses]
+            
+            print(f"Found {len(lakehouse_names)} lakehouses: {lakehouse_names}")
+            return lakehouse_names
+            
+        except Exception as e:
+            print(f"Error listing lakehouses: {e}")
+            return []
+
+    def create_lakehouse_if_not_exists(self, lakehouse_name: str) -> bool:
+        """
+        Create a lakehouse if it doesn't already exist.
+        
+        Args:
+            lakehouse_name: Name of the lakehouse to create
+            
+        Returns:
+            True if lakehouse exists or was created successfully, False otherwise
+        """
+        try:
+            # Try to get token from notebook environment first
+            try:
+                import notebookutils  # type: ignore
+                token = notebookutils.credentials.getToken("pbi")
+                workspace_id = notebookutils.runtime.context.get("workspaceId")
+            except ImportError:
+                # Fallback to azure-identity
+                print("Getting authentication token...")
+                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
+                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
+                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
+                token = token_obj.token
+                
+                # Get workspace ID by name
+                workspace_id = self._get_workspace_id_by_name(token, self.workspace)
+                if not workspace_id:
+                    print(f"Workspace '{self.workspace}' not found")
+                    return False
+            
+            # Check if lakehouse already exists
+            url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            lakehouses = response.json().get("value", [])
+            existing_names = [lh.get("displayName", "") for lh in lakehouses]
+            
+            if lakehouse_name in existing_names:
+                print(f"Lakehouse '{lakehouse_name}' already exists")
+                return True
+            
+            # Create lakehouse
+            print(f"Creating lakehouse '{lakehouse_name}'...")
+            payload = {
+                "displayName": lakehouse_name,
+                "description": f"Lakehouse {lakehouse_name} created via duckrun"
+            }
+            
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            
+            print(f"✅ Lakehouse '{lakehouse_name}' created successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error creating lakehouse '{lakehouse_name}': {e}")
+            return False
+
+    def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
+        """Helper method to get workspace ID from name"""
+        try:
+            url = "https://api.fabric.microsoft.com/v1/workspaces"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            workspaces = response.json().get("value", [])
+            for workspace in workspaces:
+                if workspace.get("displayName") == workspace_name:
+                    return workspace.get("id")
+            
+            return None
+            
+        except Exception:
+            return None
+
     def close(self):
         """Close DuckDB connection"""
         if self.con:
             self.con.close()
             print("Connection closed")
+
+
+class WorkspaceConnection:
+    """
+    Simple workspace connection for lakehouse management operations.
+    """
+    
+    def __init__(self, workspace_name: str):
+        self.workspace_name = workspace_name
+    
+    def list_lakehouses(self) -> List[str]:
+        """
+        List all lakehouses in the workspace.
+        
+        Returns:
+            List of lakehouse names
+        """
+        try:
+            # Try to get token from notebook environment first
+            try:
+                import notebookutils  # type: ignore
+                token = notebookutils.credentials.getToken("pbi")
+                workspace_id = notebookutils.runtime.context.get("workspaceId")
+            except ImportError:
+                # Fallback to azure-identity
+                print("Getting authentication token...")
+                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
+                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
+                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
+                token = token_obj.token
+                
+                # Get workspace ID by name
+                workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
+                if not workspace_id:
+                    print(f"Workspace '{self.workspace_name}' not found")
+                    return []
+            
+            # List lakehouses
+            url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            lakehouses = response.json().get("value", [])
+            lakehouse_names = [lh.get("displayName", "") for lh in lakehouses]
+            
+            print(f"Found {len(lakehouse_names)} lakehouses: {lakehouse_names}")
+            return lakehouse_names
+            
+        except Exception as e:
+            print(f"Error listing lakehouses: {e}")
+            return []
+
+    def create_lakehouse_if_not_exists(self, lakehouse_name: str) -> bool:
+        """
+        Create a lakehouse if it doesn't already exist.
+        
+        Args:
+            lakehouse_name: Name of the lakehouse to create
+            
+        Returns:
+            True if lakehouse exists or was created successfully, False otherwise
+        """
+        try:
+            # Try to get token from notebook environment first
+            try:
+                import notebookutils  # type: ignore
+                token = notebookutils.credentials.getToken("pbi")
+                workspace_id = notebookutils.runtime.context.get("workspaceId")
+            except ImportError:
+                # Fallback to azure-identity
+                print("Getting authentication token...")
+                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
+                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
+                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
+                token = token_obj.token
+                
+                # Get workspace ID by name
+                workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
+                if not workspace_id:
+                    print(f"Workspace '{self.workspace_name}' not found")
+                    return False
+            
+            # Check if lakehouse already exists
+            url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            lakehouses = response.json().get("value", [])
+            existing_names = [lh.get("displayName", "") for lh in lakehouses]
+            
+            if lakehouse_name in existing_names:
+                print(f"Lakehouse '{lakehouse_name}' already exists")
+                return True
+            
+            # Create lakehouse
+            print(f"Creating lakehouse '{lakehouse_name}'...")
+            payload = {
+                "displayName": lakehouse_name,
+                "description": f"Lakehouse {lakehouse_name} created via duckrun",
+                "creationPayload": {
+                    "enableSchemas": True
+                }
+            }
+            
+            response = requests.post(url, headers=headers, json=payload)
+            response.raise_for_status()
+            
+            print(f"✅ Lakehouse '{lakehouse_name}' created successfully")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Error creating lakehouse '{lakehouse_name}': {e}")
+            return False
+    
+    def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
+        """Helper method to get workspace ID from name"""
+        try:
+            url = "https://api.fabric.microsoft.com/v1/workspaces"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            workspaces = response.json().get("value", [])
+            for workspace in workspaces:
+                if workspace.get("displayName") == workspace_name:
+                    return workspace.get("id")
+            
+            return None
+            
+        except Exception:
+            return None

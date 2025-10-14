@@ -235,11 +235,28 @@ def _read_sql_file(duckrun_instance, table_name: str, params: Optional[Dict] = N
         print(f"SQL file is empty: {table_name}.sql")
         return None
 
+    import re
+    # Determine if lakehouse_name is a GUID
+    guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+    lakehouse_is_guid = bool(guid_pattern.match(duckrun_instance.lakehouse_name))
+
+    # Smart substitution for ${lh}.Lakehouse
+    # If template contains ${lh}.Lakehouse, replace with correct value
+    if '${lh}.Lakehouse' in content:
+        if lakehouse_is_guid:
+            # If GUID, use just the GUID
+            content = content.replace('${lh}.Lakehouse', duckrun_instance.lakehouse_name)
+        else:
+            # If not GUID, use legacy format
+            content = content.replace('${lh}.Lakehouse', f'{duckrun_instance.lakehouse_name}.Lakehouse')
+
     full_params = {
         'ws': duckrun_instance.workspace,
         'lh': duckrun_instance.lakehouse_name,
         'schema': duckrun_instance.schema,
-        'storage_account': duckrun_instance.storage_account
+        'storage_account': duckrun_instance.storage_account,
+        'tables_url': duckrun_instance.table_base_url,
+        'files_url': duckrun_instance.files_base_url
     }
     if params:
         full_params.update(params)
@@ -247,6 +264,10 @@ def _read_sql_file(duckrun_instance, table_name: str, params: Optional[Dict] = N
     try:
         template = Template(content)
         content = template.substitute(full_params)
+        # After substitution, remove .Lakehouse if it follows a GUID in any ABFSS URL
+        import re
+        # Pattern: GUID.Lakehouse or GUID.lakehouse (in URLs)
+        content = re.sub(r'([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.(Lakehouse|lakehouse)', r'\1', content)
     except KeyError as e:
         print(f"Missing parameter in SQL file: ${e}")
         return None

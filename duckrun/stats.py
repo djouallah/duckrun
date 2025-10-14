@@ -142,8 +142,8 @@ def get_stats(duckrun_instance, source: str):
     print(f"Processing {len(list_tables)} tables: {list_tables}")
     
     for idx, tbl in enumerate(list_tables):
-        # Construct lakehouse path using ABFSS URL
-        table_path = f"abfss://{duckrun_instance.workspace}@{duckrun_instance.storage_account}.dfs.fabric.microsoft.com/{duckrun_instance.lakehouse_name}.Lakehouse/Tables/{schema_name}/{tbl}"
+        # Construct lakehouse path using correct ABFSS URL format (no .Lakehouse suffix)
+        table_path = f"{duckrun_instance.table_base_url}{schema_name}/{tbl}"
         
         try:
             dt = DeltaTable(table_path)

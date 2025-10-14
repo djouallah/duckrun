@@ -51,8 +51,8 @@ def copy(duckrun_instance, local_folder: str, remote_folder: str,
         token = token_obj.token
         os.environ["AZURE_STORAGE_TOKEN"] = token
     
-    # Setup OneLake Files URL (not Tables)
-    files_base_url = f'abfss://{duckrun_instance.workspace}@{duckrun_instance.storage_account}.dfs.fabric.microsoft.com/{duckrun_instance.lakehouse_name}.Lakehouse/Files/'
+    # Setup OneLake Files URL (use correct format without .Lakehouse suffix)
+    files_base_url = duckrun_instance.files_base_url
     store = AzureStore.from_url(files_base_url, bearer_token=token)
     
     # Collect files to upload
@@ -160,8 +160,8 @@ def download(duckrun_instance, remote_folder: str = "", local_folder: str = "./d
         token = token_obj.token
         os.environ["AZURE_STORAGE_TOKEN"] = token
     
-    # Setup OneLake Files URL (not Tables)
-    files_base_url = f'abfss://{duckrun_instance.workspace}@{duckrun_instance.storage_account}.dfs.fabric.microsoft.com/{duckrun_instance.lakehouse_name}.Lakehouse/Files/'
+    # Setup OneLake Files URL (use correct format without .Lakehouse suffix)
+    files_base_url = duckrun_instance.files_base_url
     store = AzureStore.from_url(files_base_url, bearer_token=token)
     
     # Create local directory

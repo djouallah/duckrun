@@ -70,11 +70,11 @@ def main():
     # Configuration parameters
     # please don't use a workspace name, Lakehouse and semantic_model with an empty space, 
     # or the same name of the lakehouse recently deleted
-    nbr_days_download = int(30 * 2 ** ((cpu_count() - 2) / 2))  # or just input your numbers
-    lh = 'tmp' 
-    schema = 'test'
-    ws = "tmp"
+    ws = "tmp new"
+    lh = 'tmpd' 
+    schema = 'test1'
     Nbr_threads = (cpu_count()*2)+1
+    nbr_days_download = int(30 * 2 ** ((cpu_count() - 2) / 2))  # or just input your numbers
     
     # SQL folder configuration
     sql_folder = 'https://github.com/djouallah/fabric_demo/raw/refs/heads/main/transformation/'
@@ -85,16 +85,62 @@ def main():
     print(f"   - Threads: {Nbr_threads}, Days to download: {nbr_days_download}")
     print()
     
-    # Step 2: Establish connection (timed)
-    print("[CONN] Step 2: Establishing lakehouse connection...")
+    # Step 2: Connect to workspace and manage lakehouses (timed)
+    print("[WORKSPACE] Step 2: Connecting to workspace and managing lakehouses...")
+    workspace_mgmt_start = time.time()
+    
+    # Test workspace connection (timed)
+    print("   2a. Connecting to workspace...")
+    workspace_conn_start = time.time()
+    try:
+        workspace_conn = duckrun.connect(ws)
+        workspace_conn_time = time.time() - workspace_conn_start
+        print(f"      [OK] Workspace connection established in {workspace_conn_time:.3f} seconds")
+    except Exception as e:
+        workspace_conn_time = time.time() - workspace_conn_start
+        print(f"      [FAIL] Workspace connection failed in {workspace_conn_time:.3f} seconds: {e}")
+        raise e
+    
+    # Test list lakehouses (timed)
+    print("   2b. Listing existing lakehouses...")
+    list_start = time.time()
+    try:
+        lakehouses = workspace_conn.list_lakehouses()
+        list_time = time.time() - list_start
+        print(f"      [OK] List lakehouses completed in {list_time:.3f} seconds")
+        print(f"      [INFO] Found {len(lakehouses)} lakehouses: {lakehouses}")
+    except Exception as e:
+        list_time = time.time() - list_start
+        print(f"      [FAIL] List lakehouses failed in {list_time:.3f} seconds: {e}")
+        raise e
+    
+    # Test create lakehouse if not exists (timed)
+    print(f"   2c. Creating lakehouse '{lh}' if it doesn't exist...")
+    create_start = time.time()
+    try:
+        create_result = workspace_conn.create_lakehouse_if_not_exists(lh)
+        create_time = time.time() - create_start
+        print(f"      [OK] Create lakehouse completed in {create_time:.3f} seconds")
+        print(f"      [INFO] Create result: {create_result}")
+    except Exception as e:
+        create_time = time.time() - create_start
+        print(f"      [FAIL] Create lakehouse failed in {create_time:.3f} seconds: {e}")
+        raise e
+    
+    workspace_mgmt_time = time.time() - workspace_mgmt_start
+    print(f"[OK] Workspace management completed in {workspace_mgmt_time:.2f} seconds")
+    print()
+    
+    # Step 3: Establish lakehouse connection (timed)
+    print("[CONN] Step 3: Establishing lakehouse connection...")
     connection_start = time.time()
     conn = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}", sql_folder)
     connection_time = time.time() - connection_start
     print(f"[OK] Connection established in {connection_time:.2f} seconds")
     print()
     
-    # Step 3: Define pipeline configuration (timed)
-    print("⚙️ Step 3: Configuring intraday pipeline...")
+    # Step 4: Define pipeline configuration (timed)
+    print("⚙️ Step 4: Configuring intraday pipeline...")
     pipeline_config_start = time.time()
     
     nightly =[
@@ -125,8 +171,8 @@ def main():
     print(f"   - Pipeline tasks: {len(nightly)} tasks configured")
     print()
 
-    # Step 4a: Execute nightly pipeline (timed)
-    print("🔄 Step 4: Executing nightly data pipeline...")
+    # Step 5a: Execute nightly pipeline (timed)
+    print("🔄 Step 5a: Executing nightly data pipeline...")
     pipeline_start = time.time()
     result = conn.run(nightly)
     pipeline_time = time.time() - pipeline_start
@@ -135,8 +181,8 @@ def main():
     print()
     
 
-    # Step 4a: Execute intraday pipeline (timed)
-    print("🔄 Step 4: Executing intraday data pipeline...")
+    # Step 5b: Execute intraday pipeline (timed)
+    print("🔄 Step 5b: Executing intraday data pipeline...")
     pipeline_start = time.time()
     result = conn.run(intraday)
     pipeline_time = time.time() - pipeline_start
@@ -144,19 +190,19 @@ def main():
     print(f"   - Pipeline result: {result}")
     print()
 
-    # Step 5: Additional test operations
-    print("[TEST] Step 5: Running additional test operations...")
+    # Step 6: Additional test operations
+    print("[TEST] Step 6: Running additional test operations...")
     additional_start = time.time()
     
     # Test with different connection (timed)
-    print("   5a. Testing secondary connection...")
+    print("   6a. Testing secondary connection...")
     secondary_conn_start = time.time()
     conn2 = duckrun.connect(f"{ws}/{lh}.lakehouse/dbo")
     secondary_conn_time = time.time() - secondary_conn_start
     print(f"      [OK] Secondary connection in {secondary_conn_time:.3f} seconds")
     
     # Test CSV loading and table creation (timed)
-    print("   5b. Testing CSV loading and table operations...")
+    print("   6b. Testing CSV loading and table operations...")
     csv_ops_start = time.time()
     conn2.sql("""FROM read_csv_auto('https://data.wa.aemo.com.au/datafiles/post-facilities/facilities.csv')
            """).write.mode("overwrite").saveAsTable("wa.base")
@@ -165,7 +211,7 @@ def main():
     print(f"      [OK] CSV operations completed in {csv_ops_time:.3f} seconds")
     
     # Test Spark-style API with schema merging and partitioning (timed)
-    print("   5c. Testing Spark-style API with mergeSchema and partitioning...")
+    print("   6c. Testing Spark-style API with mergeSchema and partitioning...")
     spark_api_start = time.time()
     try:
         # Create test data with schema evolution and partitioning columns
@@ -197,7 +243,7 @@ def main():
         print(f"      [FAIL] Spark-style API test failed in {spark_api_time:.3f} seconds: {e}")
     
     # Test direct Spark-style API on existing table with partitioning (timed)
-    print("   5d. Testing direct Spark-style API on scada table...")
+    print("   6d. Testing direct Spark-style API on scada table...")
     direct_spark_start = time.time()
     try:
         # Test Spark-style API directly on scada table with schema merging and partitioning
@@ -223,12 +269,12 @@ def main():
     print(f"[OK] Additional operations completed in {additional_time:.2f} seconds")
     print()
     
-    # Step 6: File operations testing (timed)
-    print("📁 Step 6: Testing file operations...")
+    # Step 7: File operations testing (timed)
+    print("📁 Step 7: Testing file operations...")
     file_ops_start = time.time()
     
     # Test copy operation (timed)
-    print("   6a. Testing copy operation...")
+    print("   7a. Testing copy operation...")
     copy_start = time.time()
     try:
         conn.copy(r"C:\lakehouse\default\Files\calendar", "xxx")
@@ -239,7 +285,7 @@ def main():
         print(f"      [FAIL] Copy operation failed in {copy_time:.3f} seconds: {e}")
     
     # Test download operation (timed)
-    print("   6b. Testing download operation...")
+    print("   7b. Testing download operation...")
     download_start = time.time()
     try:
         conn.download("xxx", r"C:\lakehouse\default\Files\calendar", overwrite=True)
@@ -253,12 +299,12 @@ def main():
     print(f"[OK] File operations completed in {file_ops_time:.2f} seconds")
     print()
     
-    # Step 7: Delta Lake statistics testing (timed)
-    print("📈 Step 7: Testing Delta Lake statistics...")
+    # Step 8: Delta Lake statistics testing (timed)
+    print("📈 Step 8: Testing Delta Lake statistics...")
     stats_start = time.time()
     
     # Test get_stats with different patterns (timed)
-    print("   7a. Testing get_stats on single table...")
+    print("   8a. Testing get_stats on single table...")
     stats_single_start = time.time()
     try:
         # Test single table stats in current schema
@@ -275,7 +321,7 @@ def main():
         stats_single_time = time.time() - stats_single_start
         print(f"      [FAIL] Single table stats failed in {stats_single_time:.3f} seconds: {e}")
     
-    print("   7b. Testing get_stats on schema.table...")
+    print("   8b. Testing get_stats on schema.table...")
     stats_schema_table_start = time.time()
     try:
         # Test schema.table format
@@ -291,7 +337,7 @@ def main():
         stats_schema_table_time = time.time() - stats_schema_table_start
         print(f"      [FAIL] Schema.table stats failed in {stats_schema_table_time:.3f} seconds: {e}")
     
-    print("   7c. Testing get_stats on entire schema...")
+    print("   8c. Testing get_stats on entire schema...")
     stats_schema_start = time.time()
     try:
         # Test entire schema stats
@@ -308,7 +354,7 @@ def main():
         stats_schema_time = time.time() - stats_schema_start
         print(f"      [FAIL] Schema stats failed in {stats_schema_time:.3f} seconds: {e}")
     
-    print("   7d. Testing get_stats on summary table specifically...")
+    print("   8d. Testing get_stats on summary table specifically...")
     stats_summary_start = time.time()
     try:
         # Test summary table stats specifically
@@ -324,11 +370,11 @@ def main():
     print(f"[OK] Statistics operations completed in {stats_time:.2f} seconds")
     print()
     
-    # Step 7e: Additional connection test
-    print("   7e. Testing new connection to tmp/tmp.lakehouse...")
+    # Step 8e: Additional connection test
+    print("   8e. Testing new connection to tmp/tmp.lakehouse...")
     tmp_conn_start = time.time()
     try:
-        con = duckrun.connect("tmp/tmp.lakehouse")
+        con = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}")
         
         # Check DuckDB version first
         print("      [INFO] Checking DuckDB version...")
@@ -386,8 +432,8 @@ def main():
         tmp_conn_time = time.time() - tmp_conn_start
         print(f"      [FAIL] Tmp connection test failed in {tmp_conn_time:.3f} seconds: {e}")
     
-    # Step 8: Close connections
-    print("🔌 Step 8: Closing connections...")
+    # Step 9: Close connections
+    print("🔌 Step 9: Closing connections...")
     conn.close()
     conn2.close()
     print("[OK] All connections closed successfully")
@@ -400,6 +446,7 @@ def main():
     print("=" * 60)
     print(f"⏱️  Total execution time: {total_time:.2f} seconds ({total_time/60:.2f} minutes)")
     print(f"[INFO] Configuration setup: {config_time:.3f} seconds")
+    print(f"[WORKSPACE] Workspace management: {workspace_mgmt_time:.2f} seconds")
     print(f"[CONN] Lakehouse connection: {connection_time:.2f} seconds")
     print(f"⚙️  Pipeline configuration: {pipeline_config_time:.3f} seconds")
     print(f"🔄 Pipeline execution: {pipeline_time:.2f} seconds")
