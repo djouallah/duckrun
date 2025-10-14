@@ -751,7 +751,6 @@ class WorkspaceConnection:
             lakehouses = response.json().get("value", [])
             lakehouse_names = [lh.get("displayName", "") for lh in lakehouses]
             
-            print(f"Found {len(lakehouse_names)} lakehouses: {lakehouse_names}")
             return lakehouse_names
             
         except Exception as e:
