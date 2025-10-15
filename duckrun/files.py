@@ -41,15 +41,15 @@ def copy(duckrun_instance, local_folder: str, remote_folder: str,
         print(f"❌ Path is not a directory: {local_folder}")
         return False
         
-    # Get Azure token
+    # Get Azure token using enhanced auth system
+    from .auth import get_token
     token = duckrun_instance._get_storage_token()
     if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-        print("Authenticating with Azure for file upload (trying CLI, will fallback to browser if needed)...")
-        from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-        credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-        token_obj = credential.get_token("https://storage.azure.com/.default")
-        token = token_obj.token
-        os.environ["AZURE_STORAGE_TOKEN"] = token
+        print("Authenticating with Azure for file upload (detecting environment automatically)...")
+        token = get_token()
+        if not token:
+            print("❌ Failed to authenticate for file upload")
+            return False
     
     # Setup OneLake Files URL (use correct format without .Lakehouse suffix)
     files_base_url = duckrun_instance.files_base_url
@@ -150,15 +150,15 @@ def download(duckrun_instance, remote_folder: str = "", local_folder: str = "./d
         # Download only CSV files from a specific subfolder
         dr.download("daily_reports", "./reports", ['.csv'])
     """
-    # Get Azure token
+    # Get Azure token using enhanced auth system
+    from .auth import get_token
     token = duckrun_instance._get_storage_token()
     if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-        print("Authenticating with Azure for file download (trying CLI, will fallback to browser if needed)...")
-        from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-        credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-        token_obj = credential.get_token("https://storage.azure.com/.default")
-        token = token_obj.token
-        os.environ["AZURE_STORAGE_TOKEN"] = token
+        print("Authenticating with Azure for file download (detecting environment automatically)...")
+        token = get_token()
+        if not token:
+            print("❌ Failed to authenticate for file download")
+            return False
     
     # Setup OneLake Files URL (use correct format without .Lakehouse suffix)
     files_base_url = duckrun_instance.files_base_url

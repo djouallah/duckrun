@@ -6,7 +6,8 @@ A helper package for stuff that made my life easier when working with Fabric Pyt
 
 **Requirements:**
 - Lakehouse must have a schema (e.g., `dbo`, `sales`, `analytics`)
-- **Workspace and lakehouse names with spaces are now fully supported!** ✅
+- **Workspace names with spaces are fully supported!** ✅
+
 
 **Delta Lake Version:** This package uses an older version of deltalake to maintain row size control capabilities, which is crucial for Power BI performance optimization. The newer Rust-based deltalake versions don't yet support the row group size parameters that are essential for optimal DirectLake performance.
 
@@ -27,23 +28,40 @@ pip install duckrun[local]
 
 ## Quick Start
 
+### Simple Example for New Users
+
+```python
+import duckrun
+
+# Connect to a workspace and manage lakehouses
+con = duckrun.connect('My Workspace')
+con.list_lakehouses()                           # See what lakehouses exist
+con.create_lakehouse_if_not_exists('data')      # Create if needed
+
+# Connect to a specific lakehouse and query data
+con = duckrun.connect("My Workspace/data.lakehouse/dbo")
+con.sql("SELECT * FROM my_table LIMIT 10").show()
+```
+
+### Full Feature Overview
+
 ```python
 import duckrun
 
 # 1. Workspace Management (list and create lakehouses)
 ws = duckrun.connect("My Workspace")
 lakehouses = ws.list_lakehouses()  # Returns list of lakehouse names
-ws.create_lakehouse_if_not_exists("New Lakehouse")
+ws.create_lakehouse_if_not_exists("New_Lakehouse")
 
 # 2. Connect to lakehouse with a specific schema
-con = duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo")
+con = duckrun.connect("My Workspace/MyLakehouse.lakehouse/dbo")
 
-# Works with workspace names containing spaces!
-con = duckrun.connect("Data Analytics/Sales Data.lakehouse/analytics")
+# Workspace names with spaces are supported!
+con = duckrun.connect("Data Analytics/SalesData.lakehouse/analytics")
 
 # Schema defaults to 'dbo' if not specified (scans all schemas)
 # ⚠️ WARNING: Scanning all schemas can be slow for large lakehouses!
-con = duckrun.connect("My Workspace/My Lakehouse.lakehouse")
+con = duckrun.connect("My Workspace/My_Lakehouse.lakehouse")
 
 # 3. Explore data
 con.sql("SELECT * FROM my_table LIMIT 10").show()

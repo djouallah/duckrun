@@ -147,7 +147,20 @@ def get_stats(duckrun_instance, source: str):
         
         try:
             dt = DeltaTable(table_path)
-            xx = dt.get_add_actions(flatten=True).to_pydict()
+            add_actions = dt.get_add_actions(flatten=True)
+            
+            # Convert to dict - compatible with both old and new deltalake versions
+            # Try to_pydict() first (old versions), fall back to to_pylist() (new versions)
+            try:
+                xx = add_actions.to_pydict()
+            except AttributeError:
+                # New version with arro3: use to_pylist() and convert to dict of lists
+                records = add_actions.to_pylist()
+                if records:
+                    # Convert list of dicts to dict of lists
+                    xx = {key: [record[key] for record in records] for key in records[0].keys()}
+                else:
+                    xx = {}
             
             # Check if VORDER exists
             vorder = 'tags.VORDER' in xx.keys()

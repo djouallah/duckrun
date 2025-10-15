@@ -82,6 +82,15 @@ class Duckrun:
         
         self.con = duckdb.connect()
         self.con.sql("SET preserve_insertion_order = false")
+        
+        # Configure Azure transport for Colab (fixes SSL cert issues)
+        try:
+            import google.colab  # type: ignore
+            self.con.sql("SET azure_transport_option_type = 'curl'")
+            print("🔧 Colab detected - using curl transport for Azure")
+        except ImportError:
+            pass  # Not in Colab, use default transport
+        
         self._attach_lakehouse()
 
     @classmethod
@@ -196,18 +205,19 @@ class Duckrun:
         print(f"🔍 Resolving '{workspace_name}' workspace and '{lakehouse_name}' lakehouse to GUIDs (workspace has spaces)...")
         
         try:
-            # Get authentication token (try notebook environment first, then azure-identity)
+            # Get authentication token using enhanced auth system
+            from .auth import get_fabric_api_token
+            token = get_fabric_api_token()
+            if not token:
+                raise ValueError("Failed to obtain Fabric API token")
+                
+            # Try to get current workspace ID if in notebook environment
+            current_workspace_id = None
             try:
                 import notebookutils  # type: ignore
-                token = notebookutils.credentials.getToken("pbi")
                 current_workspace_id = notebookutils.runtime.context.get("workspaceId")
             except ImportError:
-                current_workspace_id = None
-                # Fallback to azure-identity for external environments
-                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
-                token = token_obj.token
+                pass  # Not in notebook environment
             
             # Resolve workspace name to ID 
             if current_workspace_id:
@@ -302,19 +312,23 @@ class Duckrun:
         return WorkspaceConnection(workspace_name)
 
     def _get_storage_token(self):
-        return os.environ.get("AZURE_STORAGE_TOKEN", "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE")
+        from .auth import get_storage_token
+        return get_storage_token()
 
     def _create_onelake_secret(self):
         token = self._get_storage_token()
         if token != "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
             self.con.sql(f"CREATE OR REPLACE SECRET onelake (TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}')")
         else:
-            print("Authenticating with Azure (trying CLI, will fallback to browser if needed)...")
-            from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-            credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-            token = credential.get_token("https://storage.azure.com/.default")
-            os.environ["AZURE_STORAGE_TOKEN"] = token.token
-            self.con.sql("CREATE OR REPLACE PERSISTENT SECRET onelake (TYPE azure, PROVIDER credential_chain, CHAIN 'cli', ACCOUNT_NAME 'onelake')")
+            # Enhanced authentication - try all methods
+            from .auth import get_token
+            token = get_token()
+            if token:
+                os.environ["AZURE_STORAGE_TOKEN"] = token
+                self.con.sql(f"CREATE OR REPLACE SECRET onelake (TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}')")
+            else:
+                # Final fallback to persistent secret
+                self.con.sql("CREATE OR REPLACE PERSISTENT SECRET onelake (TYPE azure, PROVIDER credential_chain, CHAIN 'cli', ACCOUNT_NAME 'onelake')")
 
     def _discover_tables_fast(self) -> List[Tuple[str, str]]:
         """
@@ -326,12 +340,12 @@ class Duckrun:
         """
         token = self._get_storage_token()
         if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-            print("Authenticating with Azure for table discovery (trying CLI, will fallback to browser if needed)...")
-            from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-            credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-            token_obj = credential.get_token("https://storage.azure.com/.default")
-            token = token_obj.token
-            os.environ["AZURE_STORAGE_TOKEN"] = token
+            print("Authenticating with Azure for table discovery (detecting environment automatically)...")
+            from .auth import get_token
+            token = get_token()
+            if not token:
+                print("❌ Failed to authenticate for table discovery")
+                return []
         
         url = f"abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/"
         store = AzureStore.from_url(url, bearer_token=token)
@@ -579,19 +593,22 @@ class Duckrun:
             List of lakehouse names
         """
         try:
-            # Try to get token from notebook environment first
+            # Get authentication token using enhanced auth system
+            from .auth import get_fabric_api_token
+            token = get_fabric_api_token()
+            if not token:
+                print("❌ Failed to authenticate for listing lakehouses")
+                return []
+            
+            # Try to get current workspace ID if in notebook environment
+            workspace_id = None
             try:
                 import notebookutils  # type: ignore
-                token = notebookutils.credentials.getToken("pbi")
                 workspace_id = notebookutils.runtime.context.get("workspaceId")
             except ImportError:
-                # Fallback to azure-identity
-                print("Getting authentication token...")
-                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
-                token = token_obj.token
-                
+                pass  # Not in notebook environment
+            
+            if not workspace_id:
                 # Get workspace ID by name
                 workspace_id = self._get_workspace_id_by_name(token, self.workspace)
                 if not workspace_id:
@@ -626,19 +643,22 @@ class Duckrun:
             True if lakehouse exists or was created successfully, False otherwise
         """
         try:
-            # Try to get token from notebook environment first
+            # Get authentication token using enhanced auth system
+            from .auth import get_fabric_api_token
+            token = get_fabric_api_token()
+            if not token:
+                print("❌ Failed to authenticate for lakehouse creation")
+                return False
+            
+            # Try to get current workspace ID if in notebook environment
+            workspace_id = None
             try:
                 import notebookutils  # type: ignore
-                token = notebookutils.credentials.getToken("pbi")
                 workspace_id = notebookutils.runtime.context.get("workspaceId")
             except ImportError:
-                # Fallback to azure-identity
-                print("Getting authentication token...")
-                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
-                token = token_obj.token
-                
+                pass  # Not in notebook environment
+            
+            if not workspace_id:
                 # Get workspace ID by name
                 workspace_id = self._get_workspace_id_by_name(token, self.workspace)
                 if not workspace_id:
@@ -675,6 +695,45 @@ class Duckrun:
         except Exception as e:
             print(f"❌ Error creating lakehouse '{lakehouse_name}': {e}")
             return False
+
+    def deploy(self, bim_url: str, dataset_name: Optional[str] = None, 
+               wait_seconds: int = 5) -> int:
+        """
+        Deploy a semantic model from a BIM file using DirectLake mode.
+        
+        Args:
+            bim_url: URL to the BIM file (e.g., GitHub raw URL)
+            dataset_name: Name for the semantic model (default: lakehouse_schema)
+            wait_seconds: Seconds to wait for permission propagation (default: 5)
+        
+        Returns:
+            1 for success, 0 for failure
+        
+        Examples:
+            dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo")
+            
+            # Deploy with auto-generated name
+            dr.deploy("https://raw.githubusercontent.com/.../model.bim")
+            
+            # Deploy with custom name
+            dr.deploy("https://raw.githubusercontent.com/.../model.bim", 
+                     dataset_name="Sales Model")
+        """
+        from .semantic_model import deploy_semantic_model
+        
+        # Auto-generate dataset name if not provided
+        if dataset_name is None:
+            dataset_name = f"{self.lakehouse_name}_{self.schema}"
+        
+        # Call the deployment function (DirectLake only)
+        return deploy_semantic_model(
+            workspace_name=self.workspace,
+            lakehouse_name=self.lakehouse_name,
+            schema_name=self.schema,
+            dataset_name=dataset_name,
+            bim_url=bim_url,
+            wait_seconds=wait_seconds
+        )
 
     def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
         """Helper method to get workspace ID from name"""
@@ -718,28 +777,18 @@ class WorkspaceConnection:
             List of lakehouse names
         """
         try:
-            # Try to get token from notebook environment first
-            try:
-                import notebookutils  # type: ignore
-                token = notebookutils.credentials.getToken("pbi")
-                # Always resolve workspace name to ID, even in notebook environment
-                workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
-                if not workspace_id:
-                    print(f"Workspace '{self.workspace_name}' not found")
-                    return []
-            except ImportError:
-                # Fallback to azure-identity
-                print("Getting authentication token...")
-                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
-                token = token_obj.token
-                
-                # Get workspace ID by name
-                workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
-                if not workspace_id:
-                    print(f"Workspace '{self.workspace_name}' not found")
-                    return []
+            # Get authentication token using enhanced auth system
+            from .auth import get_fabric_api_token
+            token = get_fabric_api_token()
+            if not token:
+                print("❌ Failed to authenticate for listing lakehouses")
+                return []
+            
+            # Always resolve workspace name to ID, even in notebook environment
+            workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
+            if not workspace_id:
+                print(f"Workspace '{self.workspace_name}' not found")
+                return []
             
             # List lakehouses
             url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"
@@ -768,28 +817,18 @@ class WorkspaceConnection:
             True if lakehouse exists or was created successfully, False otherwise
         """
         try:
-            # Try to get token from notebook environment first
-            try:
-                import notebookutils  # type: ignore
-                token = notebookutils.credentials.getToken("pbi")
-                # Always resolve workspace name to ID, even in notebook environment
-                workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
-                if not workspace_id:
-                    print(f"Workspace '{self.workspace_name}' not found")
-                    return False
-            except ImportError:
-                # Fallback to azure-identity
-                print("Getting authentication token...")
-                from azure.identity import AzureCliCredential, InteractiveBrowserCredential, ChainedTokenCredential
-                credential = ChainedTokenCredential(AzureCliCredential(), InteractiveBrowserCredential())
-                token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
-                token = token_obj.token
-                
-                # Get workspace ID by name
-                workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
-                if not workspace_id:
-                    print(f"Workspace '{self.workspace_name}' not found")
-                    return False
+            # Get authentication token using enhanced auth system
+            from .auth import get_fabric_api_token
+            token = get_fabric_api_token()
+            if not token:
+                print("❌ Failed to authenticate for lakehouse creation")
+                return False
+            
+            # Always resolve workspace name to ID, even in notebook environment
+            workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
+            if not workspace_id:
+                print(f"Workspace '{self.workspace_name}' not found")
+                return False
             
             # Check if lakehouse already exists
             url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"

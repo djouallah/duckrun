@@ -57,7 +57,7 @@ def quick_return_code_test():
         print(f"[FAIL] {total_tests - tests_passed}/{total_tests} tests failed!")
         return False
 
-def test_workspace_name_scenarios():
+def test_workspace_name_scenarios(ws, lh, schema):
     """Test both workspace naming scenarios - with and without spaces"""
     print("\n[TEST] WORKSPACE NAME SCENARIOS TEST")
     print("=" * 60)
@@ -69,23 +69,19 @@ def test_workspace_name_scenarios():
     tests_passed = 0
     total_tests = 2
     
-    # Test 1: Workspace without spaces (e.g., 'tmp')
-    print("\n[Test 1] Workspace without spaces: 'tmp/data.lakehouse/aemo'")
+    # Test 1: Workspace without spaces (use provided ws variable)
+    print(f"\n[Test 1] Workspace without spaces: '{ws}/{lh}.lakehouse/{schema}'")
     test1_start = time.time()
     try:
-        ws_no_space = "tmp"
-        lh = "data"
-        schema = "aemo"
-        
         # First connect to workspace to ensure lakehouse exists
-        workspace_conn = duckrun.connect(ws_no_space)
+        workspace_conn = duckrun.connect(ws)
         workspace_conn.create_lakehouse_if_not_exists(lh)
         
         # Now test the lakehouse connection
-        conn1 = duckrun.connect(f"{ws_no_space}/{lh}.lakehouse/{schema}")
+        conn1 = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}")
         test1_time = time.time() - test1_start
         print(f"   ✅ [PASS] Connection successful in {test1_time:.2f}s")
-        print(f"   URL format used: {ws_no_space}/{lh}.lakehouse (name directly, no GUID resolution)")
+        print(f"   URL format used: {ws}/{lh}.lakehouse (name directly, no GUID resolution)")
         tests_passed += 1
     except Exception as e:
         test1_time = time.time() - test1_start
@@ -97,8 +93,6 @@ def test_workspace_name_scenarios():
     test2_start = time.time()
     try:
         ws_with_space = "tmp new"
-        lh = "data"
-        schema = "aemo"
         
         # First connect to workspace to ensure lakehouse exists
         workspace_conn = duckrun.connect(ws_with_space)
@@ -141,12 +135,14 @@ def main():
     print("[INFO] Step 1: Setting up configuration parameters...")
     config_start = time.time()
     
+    # Get shared configuration from global scope
+    ws = globals().get('ws', 'tmp')
+    lh = globals().get('lh', 'data')
+    schema = globals().get('schema', 'aemo')
+    
     # Configuration parameters
     # please don't use a workspace name, Lakehouse and semantic_model with an empty space, 
     # or the same name of the lakehouse recently deleted
-    ws = "tmp"
-    lh = 'data' 
-    schema = 'aemo'
     Nbr_threads = (cpu_count()*2)+1
     nbr_days_download = int(30 * 2 ** ((cpu_count() - 2) / 2))  # or just input your numbers
     
@@ -361,9 +357,9 @@ def main():
         # Test single table stats in current schema
         stats_price = conn.get_stats('price_today')
         print(f"      [OK] Stats for 'price' table:")
-        print(f"      [INFO] Columns: {list(stats_price.column_names)}")
+        print(f"      [INFO] Columns: {list(stats_price.columns)}")
         if len(stats_price) > 0:
-            first_row = stats_price.to_pylist()[0]
+            first_row = stats_price.iloc[0]
             print(f"      [INFO] Total rows: {first_row.get('total_rows', 'N/A')}, Files: {first_row.get('num_files', 'N/A')}")
         
         stats_single_time = time.time() - stats_single_start
@@ -472,7 +468,7 @@ def main():
         # Now try the original request - getting stats for 'test' (the schema)
         print("      [INFO] Getting stats for 'test' schema (original request):")
         try:
-            print(con.get_stats('test'))
+            print(con.get_stats('aemo'))
         except Exception as test_schema_error:
             print(f"      [INFO] Failed to get stats for 'test' schema: {test_schema_error}")
         
@@ -483,8 +479,52 @@ def main():
         tmp_conn_time = time.time() - tmp_conn_start
         print(f"      [FAIL] Tmp connection test failed in {tmp_conn_time:.3f} seconds: {e}")
     
-    # Step 9: Close connections
-    print("🔌 Step 9: Closing connections...")
+    # Step 9: Semantic Model Deployment Testing (timed)
+    print("🚀 Step 9: Testing semantic model deployment...")
+    deploy_start = time.time()
+    
+    print("   9a. Testing deploy() method with DirectLake...")
+    deploy_test_start = time.time()
+    try:
+        # Use a sample BIM file URL (you'll need to replace with an actual BIM file)
+        bim_url = "https://raw.githubusercontent.com/djouallah/fabric_demo/refs/heads/main/semantic_model/directlake.bim"
+        
+        # Test deployment with auto-generated dataset name
+        print(f"      [INFO] Deploying semantic model from: {bim_url}")
+        print(f"      [INFO] Target: {ws}/{lh} (schema: {schema})")
+        print(f"      [INFO] Mode: DirectLake (connects to OneLake Delta tables)")
+        
+        # Call the deploy method
+        result = conn.deploy(bim_url, dataset_name=f"{lh}_{schema}_test")
+        
+        deploy_test_time = time.time() - deploy_test_start
+        
+        if result == 1:
+            print(f"      [OK] Semantic model deployment completed successfully in {deploy_test_time:.2f} seconds")
+            print(f"      [INFO] Dataset created: {lh}_{schema}_test")
+            print(f"      [INFO] Connection mode: DirectLake")
+        else:
+            print(f"      [WARN] Deployment returned status {result} in {deploy_test_time:.2f} seconds")
+            
+    except FileNotFoundError as e:
+        deploy_test_time = time.time() - deploy_test_start
+        print(f"      [SKIP] BIM file not found - skipping deployment test in {deploy_test_time:.3f} seconds")
+        print(f"      [INFO] To test deployment, provide a valid BIM file URL")
+        print(f"      [INFO] Error: {e}")
+    except Exception as e:
+        deploy_test_time = time.time() - deploy_test_start
+        print(f"      [FAIL] Semantic model deployment failed in {deploy_test_time:.3f} seconds: {e}")
+        print(f"      [INFO] This test requires:")
+        print(f"      [INFO]   - Valid BIM file URL")
+        print(f"      [INFO]   - Proper Fabric authentication")
+        print(f"      [INFO]   - Delta tables in the specified schema")
+    
+    deploy_time = time.time() - deploy_start
+    print(f"[OK] Semantic model deployment test completed in {deploy_time:.2f} seconds")
+    print()
+    
+    # Step 10: Close connections
+    print("🔌 Step 10: Closing connections...")
     conn.close()
     conn2.close()
     print("[OK] All connections closed successfully")
@@ -504,6 +544,7 @@ def main():
     print(f"[TEST] Additional operations: {additional_time:.2f} seconds")
     print(f"📁 File operations: {file_ops_time:.2f} seconds")
     print(f"📈 Statistics operations: {stats_time:.2f} seconds")
+    print(f"🚀 Semantic model deployment: {deploy_time:.2f} seconds")
     print("=" * 60)
     print("[SUCCESS] Basic test script completed successfully!")
 
@@ -512,6 +553,11 @@ def main():
 
 
 if __name__ == "__main__":
+    # Configuration parameters - defined once at the top
+    ws = "tmp"
+    lh = 'data' 
+    schema = 'aemo'
+    
     # Run quick return code test first (no auth needed)
     print("\n" + "=" * 80)
     print("🔬 RUNNING QUICK RETURN CODE TEST")
@@ -522,11 +568,11 @@ if __name__ == "__main__":
         print("[FAIL] Quick test failed - stopping here!")
         sys.exit(1)
     
-    # Run workspace name scenarios test
+    # Run workspace name scenarios test with shared variables
     print("\n" + "=" * 80)
     print("🔬 RUNNING WORKSPACE NAME SCENARIOS TEST")
     print("=" * 80)
-    workspace_test_passed = test_workspace_name_scenarios()
+    workspace_test_passed = test_workspace_name_scenarios(ws, lh, schema)
     
     if not workspace_test_passed:
         print("[FAIL] Workspace name scenarios test failed - stopping here!")

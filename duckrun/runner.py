@@ -15,7 +15,7 @@ def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=N
     """
     Build arguments for write_deltalake based on requirements:
     - If schema_mode='merge': use rust engine (no row group params)
-    - Otherwise: use pyarrow engine with row group optimization
+    - Otherwise: use pyarrow engine with row group optimization (if supported)
     """
     args = {
         'table_or_uri': path,
@@ -33,10 +33,17 @@ def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=N
         args['schema_mode'] = 'merge'
         args['engine'] = 'rust'
     else:
-        # Use pyarrow engine with row group optimization (default)
-        args['max_rows_per_file'] = RG
-        args['max_rows_per_group'] = RG
-        args['min_rows_per_group'] = RG
+        # Try to use pyarrow engine with row group optimization
+        # Check if row group parameters are supported by inspecting function signature
+        import inspect
+        sig = inspect.signature(write_deltalake)
+        
+        if 'max_rows_per_file' in sig.parameters:
+            # Older deltalake version - use row group optimization
+            args['max_rows_per_file'] = RG
+            args['max_rows_per_group'] = RG
+            args['min_rows_per_group'] = RG
+        # For newer versions, just use default parameters
     
     return args
 

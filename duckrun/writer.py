@@ -1,18 +1,36 @@
 """
 Delta Lake writer functionality for duckrun - Spark-style write API
 """
-from deltalake import DeltaTable, write_deltalake
+from deltalake import DeltaTable, write_deltalake, __version__ as deltalake_version
 
 
 # Row Group configuration for optimal Delta Lake performance
 RG = 8_000_000
 
+# Check deltalake version once at module load
+# Version 0.18.x and 0.19.x support engine parameter and row group optimization
+# Version 0.20+ removed these features (rust only, no row groups)
+_DELTALAKE_VERSION = tuple(map(int, deltalake_version.split('.')[:2]))
+_IS_OLD_DELTALAKE = _DELTALAKE_VERSION < (0, 20)
+
 
 def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=None):
     """
-    Build arguments for write_deltalake based on requirements:
-    - If schema_mode='merge': use rust engine (no row group params)
-    - Otherwise: use pyarrow engine with row group optimization
+    Build arguments for write_deltalake based on requirements and version:
+    
+    deltalake 0.18.2 - 0.19.x:
+    - Has 'engine' parameter (defaults to 'pyarrow')
+    - Has max_rows_per_file/max_rows_per_group/min_rows_per_group for optimization
+    - When mergeSchema=True: must set schema_mode='merge' + engine='rust', NO row group params
+    - When mergeSchema=False: use row group params, DON'T set engine (pyarrow is default)
+    
+    deltalake 0.20+:
+    - Does NOT have 'engine' parameter (everything is rust, pyarrow deprecated)
+    - Does NOT have max_rows_per_file (row group optimization removed)
+    - When mergeSchema=True: must set schema_mode='merge'
+    - When mergeSchema=False: just write normally (no special params)
+    
+    Uses version detection for simpler logic.
     """
     args = {
         'table_or_uri': path,
@@ -24,16 +42,24 @@ def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=N
     if partition_by:
         args['partition_by'] = partition_by
     
-    # Engine selection based on schema_mode
     if schema_mode == 'merge':
-        # Use rust engine for schema merging (no row group params supported)
+        # Schema merging mode - must explicitly set schema_mode='merge'
         args['schema_mode'] = 'merge'
-        args['engine'] = 'rust'
+        
+        if _IS_OLD_DELTALAKE:
+            # deltalake 0.18.2-0.19.x: must also set engine='rust' for schema merging
+            # Do NOT use row group params (they conflict with rust engine)
+            args['engine'] = 'rust'
+        # For version 0.20+: just schema_mode='merge' is enough, rust is default
     else:
-        # Use pyarrow engine with row group optimization (default)
-        args['max_rows_per_file'] = RG
-        args['max_rows_per_group'] = RG
-        args['min_rows_per_group'] = RG
+        # Normal write mode (no schema merging)
+        if _IS_OLD_DELTALAKE:
+            # deltalake 0.18.2-0.19.x: use row group optimization
+            # DON'T set engine parameter - pyarrow is the default and works with row groups
+            args['max_rows_per_file'] = RG
+            args['max_rows_per_group'] = RG
+            args['min_rows_per_group'] = RG
+        # For version 0.20+: no optimization available (rust by default, no row group params supported)
     
     return args
 
@@ -106,7 +132,18 @@ class DeltaWriter:
             partition_by=self._partition_by
         )
         
-        engine_info = f" (engine=rust, schema_mode=merge)" if self._schema_mode == 'merge' else " (engine=pyarrow)"
+        # Prepare info message based on version and settings
+        if self._schema_mode == 'merge':
+            if _IS_OLD_DELTALAKE:
+                engine_info = " (engine=rust, schema_mode=merge)"
+            else:
+                engine_info = " (schema_mode=merge, rust by default)"
+        else:
+            if _IS_OLD_DELTALAKE:
+                engine_info = " (engine=pyarrow, optimized row groups)"
+            else:
+                engine_info = " (engine=rust by default)"
+        
         partition_info = f" partitioned by {self._partition_by}" if self._partition_by else ""
         print(f"Writing to Delta table: {schema}.{table} (mode={self._mode}){engine_info}{partition_info}")
         
