@@ -123,6 +123,12 @@ def get_fabric_api_token() -> Optional[str]:
     Returns:
         Fabric API token string or None if authentication fails
     """
+    # Check if we already have a cached Fabric API token
+    fabric_token_env = os.environ.get("FABRIC_API_TOKEN")
+    if fabric_token_env:
+        print("✅ Using cached Fabric API token")
+        return fabric_token_env
+    
     print("🔐 Getting Fabric API token...")
     
     # Try Fabric notebook environment first
@@ -130,6 +136,7 @@ def get_fabric_api_token() -> Optional[str]:
         import notebookutils  # type: ignore
         print("📓 Microsoft Fabric notebook detected - using notebookutils")
         token = notebookutils.credentials.getToken("pbi")
+        os.environ["FABRIC_API_TOKEN"] = token
         print("✅ Fabric API token obtained!")
         return token
     except ImportError:
@@ -158,6 +165,7 @@ def get_fabric_api_token() -> Optional[str]:
                 print("🔐 Trying Azure CLI for Fabric API...")
                 credential = AzureCliCredential()
                 token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
+                os.environ["FABRIC_API_TOKEN"] = token_obj.token
                 print("✅ Fabric API token obtained via Azure CLI!")
                 return token_obj.token
             except Exception as cli_error:
@@ -167,6 +175,7 @@ def get_fabric_api_token() -> Optional[str]:
                 credential = InteractiveBrowserCredential()
         
         token_obj = credential.get_token("https://api.fabric.microsoft.com/.default")
+        os.environ["FABRIC_API_TOKEN"] = token_obj.token
         print("✅ Fabric API token obtained!")
         return token_obj.token
         

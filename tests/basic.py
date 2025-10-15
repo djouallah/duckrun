@@ -489,19 +489,20 @@ def main():
         # Use a sample BIM file URL (you'll need to replace with an actual BIM file)
         bim_url = "https://raw.githubusercontent.com/djouallah/fabric_demo/refs/heads/main/semantic_model/directlake.bim"
         
-        # Test deployment with auto-generated dataset name
+        # Test deployment with simple dataset name 'colab'
         print(f"      [INFO] Deploying semantic model from: {bim_url}")
         print(f"      [INFO] Target: {ws}/{lh} (schema: {schema})")
+        print(f"      [INFO] Dataset name: 'colab'")
         print(f"      [INFO] Mode: DirectLake (connects to OneLake Delta tables)")
         
-        # Call the deploy method
-        result = conn.deploy(bim_url, dataset_name=f"{lh}_{schema}_test")
+        # Call the deploy method - simple test case
+        result = conn.deploy(bim_url, 'colab')
         
         deploy_test_time = time.time() - deploy_test_start
         
         if result == 1:
             print(f"      [OK] Semantic model deployment completed successfully in {deploy_test_time:.2f} seconds")
-            print(f"      [INFO] Dataset created: {lh}_{schema}_test")
+            print(f"      [INFO] Dataset created: colab")
             print(f"      [INFO] Connection mode: DirectLake")
         else:
             print(f"      [WARN] Deployment returned status {result} in {deploy_test_time:.2f} seconds")

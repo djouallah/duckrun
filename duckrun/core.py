@@ -727,8 +727,8 @@ class Duckrun:
         
         # Call the deployment function (DirectLake only)
         return deploy_semantic_model(
-            workspace_name=self.workspace,
-            lakehouse_name=self.lakehouse_name,
+            workspace_name_or_id=self.workspace,
+            lakehouse_name_or_id=self.lakehouse_name,
             schema_name=self.schema,
             dataset_name=dataset_name,
             bim_url=bim_url,

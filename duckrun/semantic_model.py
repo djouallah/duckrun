@@ -43,31 +43,66 @@ class FabricRestClient:
         return response
 
 
-def get_workspace_id(workspace_name, client):
-    """Get workspace ID by name"""
+def get_workspace_id(workspace_name_or_id, client):
+    """Get workspace ID by name or validate if already a GUID"""
+    import re
+    
+    # Check if input is already a GUID
+    guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+    if guid_pattern.match(workspace_name_or_id):
+        # It's already a GUID, verify it exists
+        try:
+            response = client.get(f"/v1/workspaces/{workspace_name_or_id}")
+            workspace_name = response.json().get('displayName', workspace_name_or_id)
+            print(f"✓ Found workspace: {workspace_name}")
+            return workspace_name_or_id
+        except:
+            raise ValueError(f"Workspace with ID '{workspace_name_or_id}' not found")
+    
+    # It's a name, search for it
     response = client.get("/v1/workspaces")
     workspaces = response.json().get('value', [])
     
-    workspace_match = next((ws for ws in workspaces if ws.get('displayName') == workspace_name), None)
+    workspace_match = next((ws for ws in workspaces if ws.get('displayName') == workspace_name_or_id), None)
     if not workspace_match:
-        raise ValueError(f"Workspace '{workspace_name}' not found")
+        raise ValueError(f"Workspace '{workspace_name_or_id}' not found")
     
     workspace_id = workspace_match['id']
-    print(f"✓ Found workspace: {workspace_name}")
+    print(f"✓ Found workspace: {workspace_name_or_id}")
     return workspace_id
 
 
-def get_lakehouse_id(lakehouse_name, workspace_id, client):
-    """Get lakehouse ID by name"""
+def get_lakehouse_id(lakehouse_name_or_id, workspace_id, client):
+    """Get lakehouse ID by name or validate if already a GUID"""
+    import re
+    
+    # Check if input is already a GUID
+    guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+    if guid_pattern.match(lakehouse_name_or_id):
+        # It's already a GUID, verify it exists
+        try:
+            response = client.get(f"/v1/workspaces/{workspace_id}/lakehouses")
+            items = response.json().get('value', [])
+            lakehouse_match = next((item for item in items if item.get('id') == lakehouse_name_or_id), None)
+            if lakehouse_match:
+                lakehouse_name = lakehouse_match.get('displayName', lakehouse_name_or_id)
+                print(f"✓ Found lakehouse: {lakehouse_name}")
+                return lakehouse_name_or_id
+            else:
+                raise ValueError(f"Lakehouse with ID '{lakehouse_name_or_id}' not found")
+        except Exception as e:
+            raise ValueError(f"Lakehouse with ID '{lakehouse_name_or_id}' not found: {e}")
+    
+    # It's a name, search for it
     response = client.get(f"/v1/workspaces/{workspace_id}/lakehouses")
     items = response.json().get('value', [])
     
-    lakehouse_match = next((item for item in items if item.get('displayName') == lakehouse_name), None)
+    lakehouse_match = next((item for item in items if item.get('displayName') == lakehouse_name_or_id), None)
     if not lakehouse_match:
-        raise ValueError(f"Lakehouse '{lakehouse_name}' not found")
+        raise ValueError(f"Lakehouse '{lakehouse_name_or_id}' not found")
     
     lakehouse_id = lakehouse_match['id']
-    print(f"✓ Found lakehouse: {lakehouse_name}")
+    print(f"✓ Found lakehouse: {lakehouse_name_or_id}")
     return lakehouse_id
 
 
@@ -94,9 +129,12 @@ def check_dataset_exists(dataset_name, workspace_id, client):
         return False
 
 
-def refresh_dataset(dataset_name, workspace_id, client):
-    """Refresh a dataset and monitor progress"""
-    dataset_id = get_dataset_id(dataset_name, workspace_id, client)
+def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None):
+    """Refresh a dataset and monitor progress using Power BI API"""
+    
+    # If dataset_id not provided, look it up by name
+    if not dataset_id:
+        dataset_id = get_dataset_id(dataset_name, workspace_id, client)
     
     payload = {
         "type": "full",
@@ -106,39 +144,46 @@ def refresh_dataset(dataset_name, workspace_id, client):
         "objects": []
     }
     
-    response = client.post(
-        f"/v1/workspaces/{workspace_id}/semanticModels/{dataset_id}/refreshes",
-        json=payload
-    )
+    # Use Power BI API for refresh (not Fabric API)
+    powerbi_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/refreshes"
+    headers = client._get_headers()
+    
+    response = requests.post(powerbi_url, headers=headers, json=payload)
     
     if response.status_code in [200, 202]:
         print(f"✓ Refresh initiated")
         
-        refresh_id = response.json().get('id')
-        if refresh_id:
-            print("   Monitoring refresh progress...")
-            max_attempts = 60
-            for attempt in range(max_attempts):
-                time.sleep(5)
+        # For 202, get the refresh_id from the Location header
+        if response.status_code == 202:
+            location = response.headers.get('Location')
+            if location:
+                refresh_id = location.split('/')[-1]
+                print("   Monitoring refresh progress...")
+                max_attempts = 60
+                for attempt in range(max_attempts):
+                    time.sleep(5)
+                    
+                    # Check refresh status using Power BI API
+                    status_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/refreshes/{refresh_id}"
+                    status_response = requests.get(status_url, headers=headers)
+                    status_response.raise_for_status()
+                    status = status_response.json().get('status')
+                    
+                    if status == 'Completed':
+                        print(f"✓ Refresh completed successfully")
+                        return
+                    elif status == 'Failed':
+                        error = status_response.json().get('serviceExceptionJson', '')
+                        raise Exception(f"Refresh failed: {error}")
+                    elif status == 'Cancelled':
+                        raise Exception("Refresh was cancelled")
+                    
+                    if attempt % 6 == 0:
+                        print(f"   Status: {status}...")
                 
-                status_response = client.get(
-                    f"/v1/workspaces/{workspace_id}/semanticModels/{dataset_id}/refreshes/{refresh_id}"
-                )
-                status = status_response.json().get('status')
-                
-                if status == 'Completed':
-                    print(f"✓ Refresh completed successfully")
-                    return
-                elif status == 'Failed':
-                    error = status_response.json().get('error', {})
-                    raise Exception(f"Refresh failed: {error.get('message', 'Unknown error')}")
-                elif status == 'Cancelled':
-                    raise Exception("Refresh was cancelled")
-                
-                if attempt % 6 == 0:
-                    print(f"   Status: {status}...")
-            
-            raise Exception(f"Refresh timed out")
+                raise Exception(f"Refresh timed out")
+    else:
+        response.raise_for_status()
 
 
 def download_bim_from_github(url):
@@ -211,7 +256,7 @@ def update_bim_for_directlake(bim_content, workspace_id, lakehouse_id, schema_na
 
 
 def create_dataset_from_bim(dataset_name, bim_content, workspace_id, client):
-    """Create semantic model from BIM using Fabric REST API"""
+    """Create semantic model from BIM using Fabric REST API and return the dataset ID"""
     # Convert to base64
     bim_json = json.dumps(bim_content, indent=2)
     bim_base64 = base64.b64encode(bim_json.encode('utf-8')).decode('utf-8')
@@ -245,7 +290,7 @@ def create_dataset_from_bim(dataset_name, bim_content, workspace_id, client):
     
     print(f"✓ Semantic model created")
     
-    # Handle long-running operation
+    # Handle long-running operation and return the dataset ID
     if response.status_code == 202:
         operation_id = response.headers.get('x-ms-operation-id')
         print(f"   Waiting for operation to complete...")
@@ -253,27 +298,48 @@ def create_dataset_from_bim(dataset_name, bim_content, workspace_id, client):
         max_attempts = 30
         for attempt in range(max_attempts):
             time.sleep(2)
+            
+            # Get operation result (not just status)
+            result_response = client.get(f"/v1/operations/{operation_id}/result")
+            
+            # Check if operation is complete by getting the status
             status_response = client.get(f"/v1/operations/{operation_id}")
             status = status_response.json().get('status')
             
             if status == 'Succeeded':
                 print(f"✓ Operation completed")
-                break
+                # Return the created dataset ID from the result
+                result_data = result_response.json()
+                dataset_id = result_data.get('id')
+                if dataset_id:
+                    return dataset_id
+                else:
+                    # Fallback: search for the dataset by name
+                    return get_dataset_id(dataset_name, workspace_id, client)
             elif status == 'Failed':
                 error = status_response.json().get('error', {})
                 raise Exception(f"Operation failed: {error.get('message')}")
             elif attempt == max_attempts - 1:
                 raise Exception(f"Operation timed out")
+    
+    # For non-async responses (status 200/201)
+    result_data = response.json()
+    dataset_id = result_data.get('id')
+    if dataset_id:
+        return dataset_id
+    else:
+        # Fallback: search for the dataset by name
+        return get_dataset_id(dataset_name, workspace_id, client)
 
 
-def deploy_semantic_model(workspace_name, lakehouse_name, schema_name, dataset_name, 
+def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_name, dataset_name, 
                          bim_url, wait_seconds=5):
     """
     Deploy a semantic model using DirectLake mode.
     
     Args:
-        workspace_name: Name of the target workspace
-        lakehouse_name: Name of the lakehouse
+        workspace_name_or_id: Name or GUID of the target workspace
+        lakehouse_name_or_id: Name or GUID of the lakehouse
         schema_name: Schema name (e.g., 'dbo', 'staging')
         dataset_name: Name for the semantic model
         bim_url: URL to the BIM file
@@ -295,7 +361,7 @@ def deploy_semantic_model(workspace_name, lakehouse_name, schema_name, dataset_n
     try:
         # Step 1: Get workspace ID
         print("\n[Step 1/6] Getting workspace information...")
-        workspace_id = get_workspace_id(workspace_name, client)
+        workspace_id = get_workspace_id(workspace_name_or_id, client)
         
         # Step 2: Check if dataset exists
         print(f"\n[Step 2/6] Checking if dataset '{dataset_name}' exists...")
@@ -320,7 +386,7 @@ def deploy_semantic_model(workspace_name, lakehouse_name, schema_name, dataset_n
         
         # Step 3: Get lakehouse ID
         print(f"\n[Step 3/6] Finding lakehouse...")
-        lakehouse_id = get_lakehouse_id(lakehouse_name, workspace_id, client)
+        lakehouse_id = get_lakehouse_id(lakehouse_name_or_id, workspace_id, client)
         
         # Step 4: Download and update BIM
         print("\n[Step 4/6] Downloading and configuring BIM file...")
@@ -330,24 +396,25 @@ def deploy_semantic_model(workspace_name, lakehouse_name, schema_name, dataset_n
         modified_bim['name'] = dataset_name
         modified_bim['id'] = dataset_name
         
-        # Step 5: Deploy
+        # Step 5: Deploy and get the dataset ID
         print("\n[Step 5/6] Deploying semantic model...")
-        create_dataset_from_bim(dataset_name, modified_bim, workspace_id, client)
+        dataset_id = create_dataset_from_bim(dataset_name, modified_bim, workspace_id, client)
+        print(f"   Dataset ID: {dataset_id}")
         
         if wait_seconds > 0:
-            print(f"   Waiting {wait_seconds} seconds for permissions...")
+            print(f"   Waiting {wait_seconds} seconds before refresh...")
             time.sleep(wait_seconds)
         
-        # Step 6: Refresh
+        # Step 6: Refresh using the dataset ID returned from creation
         print("\n[Step 6/6] Refreshing semantic model...")
-        refresh_dataset(dataset_name, workspace_id, client)
+        refresh_dataset(dataset_name, workspace_id, client, dataset_id=dataset_id)
         
         print("\n" + "=" * 70)
         print("🎉 Deployment Completed!")
         print("=" * 70)
         print(f"Dataset: {dataset_name}")
-        print(f"Workspace: {workspace_name}")
-        print(f"Lakehouse: {lakehouse_name}")
+        print(f"Workspace: {workspace_name_or_id}")
+        print(f"Lakehouse: {lakehouse_name_or_id}")
         print(f"Schema: {schema_name}")
         print("=" * 70)
         
@@ -359,8 +426,8 @@ def deploy_semantic_model(workspace_name, lakehouse_name, schema_name, dataset_n
         print("=" * 70)
         print(f"Error: {str(e)}")
         print("\n💡 Troubleshooting:")
-        print(f"  - Verify workspace '{workspace_name}' exists")
-        print(f"  - Verify lakehouse '{lakehouse_name}' exists")
+        print(f"  - Verify workspace '{workspace_name_or_id}' exists")
+        print(f"  - Verify lakehouse '{lakehouse_name_or_id}' exists")
         print(f"  - Ensure tables exist in '{schema_name}' schema")
         print(f"  - Check tables are in Delta format")
         print("=" * 70)
