@@ -400,6 +400,37 @@ success = con.run(pipeline)  # Returns True only if ALL tasks succeed
 
 This prevents downstream tasks from processing incomplete or corrupted data.
 
+### Semantic Model Deployment
+
+Deploy Power BI semantic models directly from BIM files using DirectLake mode:
+
+```python
+# Connect to lakehouse
+con = duckrun.connect("Analytics/Sales.lakehouse/dbo")
+
+# Deploy with auto-generated name (lakehouse_schema)
+con.deploy("https://raw.githubusercontent.com/user/repo/main/model.bim")
+
+# Deploy with custom name
+con.deploy(
+    "https://raw.githubusercontent.com/user/repo/main/sales_model.bim",
+    dataset_name="Sales Analytics Model",
+    wait_seconds=10  # Wait for permission propagation
+)
+```
+
+**Features:**
+- 🚀 **DirectLake Mode**: Deploys semantic models with DirectLake connection
+- 🔄 **Automatic Configuration**: Auto-configures workspace, lakehouse, and schema connections
+- 📦 **BIM from URL**: Load model definitions from GitHub or any accessible URL
+- ⏱️ **Permission Handling**: Configurable wait time for permission propagation
+
+**Use Cases:**
+- Deploy semantic models as part of CI/CD pipelines
+- Version control your semantic models in Git
+- Automated model deployment across environments
+- Streamline DirectLake model creation
+
 ### Delta Lake Optimization
 
 Duckrun automatically:
@@ -514,6 +545,12 @@ con.sql("""
 
 # 5. Download processed files for external systems
 con.download("processed_reports", "./exports", ['.csv'])
+
+# 6. Deploy semantic model for Power BI
+con.deploy(
+    "https://raw.githubusercontent.com/user/repo/main/sales_model.bim",
+    dataset_name="Sales Analytics"
+)
 ```
 
 **This example demonstrates:**
@@ -521,8 +558,9 @@ con.download("processed_reports", "./exports", ['.csv'])
 - 🔄 **Pipeline orchestration** with SQL and Python tasks  
 - ⚡ **Fast data exploration** with DuckDB
 - 💾 **Delta table creation** with Spark-style API
-- � **Schema evolution** and partitioning
-- �📤 **File downloads** from OneLake Files
+- 🔀 **Schema evolution** and partitioning
+- 📤 **File downloads** from OneLake Files
+- 📊 **Semantic model deployment** with DirectLake
 
 ## Schema Evolution & Partitioning Guide
 
