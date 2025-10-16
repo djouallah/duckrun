@@ -4,6 +4,7 @@ Delta Lake table statistics functionality for duckrun
 import duckdb
 from deltalake import DeltaTable
 from datetime import datetime
+import pyarrow as pa
 
 
 def _table_exists(duckrun_instance, schema_name: str, table_name: str) -> bool:
@@ -149,17 +150,23 @@ def get_stats(duckrun_instance, source: str):
             dt = DeltaTable(table_path)
             add_actions = dt.get_add_actions(flatten=True)
             
-            # Convert to dict - compatible with both old and new deltalake versions
-            # Try to_pydict() first (old versions), fall back to to_pylist() (new versions)
+            # Convert RecordBatch to dict - works with both PyArrow (deltalake 0.18.2) and arro3 (newer versions)
+            # Strategy: Use duck typing - try direct conversion first, then manual extraction
+            # This works because both PyArrow and arro3 RecordBatches have schema and column() methods
+            
             try:
+                # Old deltalake (0.18.2): PyArrow RecordBatch has to_pydict() directly
                 xx = add_actions.to_pydict()
             except AttributeError:
-                # New version with arro3: use to_pylist() and convert to dict of lists
-                records = add_actions.to_pylist()
-                if records:
-                    # Convert list of dicts to dict of lists
-                    xx = {key: [record[key] for record in records] for key in records[0].keys()}
+                # New deltalake with arro3: Use schema and column() methods
+                # This is the universal approach that works with both PyArrow and arro3
+                if hasattr(add_actions, 'schema') and hasattr(add_actions, 'column'):
+                    # Extract columns manually and create PyArrow table
+                    arrow_table = pa.table({name: add_actions.column(name) for name in add_actions.schema.names})
+                    xx = arrow_table.to_pydict()
                 else:
+                    # Fallback: empty dict (shouldn't happen)
+                    print(f"Warning: Could not convert RecordBatch for table '{tbl}': Unexpected type {type(add_actions)}")
                     xx = {}
             
             # Check if VORDER exists

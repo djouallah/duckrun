@@ -125,6 +125,53 @@ def test_workspace_name_scenarios(ws, lh, schema):
         print(f"[FAIL] {total_tests - tests_passed}/{total_tests} scenarios failed!")
         return False
 
+
+def test_semantic_model_features(ws, lh, schema):
+    """Test semantic model download and deploy features"""
+    print("\n[TEST] Testing semantic model features...")
+    
+    try:
+        # Test 1: Connect to workspace
+        print("\n1. Testing workspace connection...")
+        con = duckrun.connect(ws)
+        print("   ✓ Workspace connection successful")
+        
+        # Test 2: Download BIM (just check method exists)
+        print("\n2. Testing download_bim method exists...")
+        if hasattr(con, 'download_bim'):
+            print("   ✓ download_bim method available")
+        else:
+            print("   ✗ download_bim method not found")
+            return False
+        
+        # Test 3: Connect to lakehouse and check deploy method
+        print("\n3. Testing lakehouse connection and deploy method...")
+        dr = duckrun.connect(f"{ws}/{lh}.lakehouse/{schema}")
+        if hasattr(dr, 'deploy'):
+            print("   ✓ deploy method available")
+        else:
+            print("   ✗ deploy method not found")
+            return False
+        
+        # Test 4: Check deploy_semantic_model function exists
+        print("\n4. Testing deploy_semantic_model function...")
+        import duckrun.semantic_model as sm
+        if hasattr(sm, 'deploy_semantic_model'):
+            print("   ✓ deploy_semantic_model function available")
+        else:
+            print("   ✗ deploy_semantic_model function not found")
+            return False
+        
+        print("\n✅ All semantic model feature tests passed!")
+        return True
+        
+    except Exception as e:
+        print(f"\n❌ Semantic model test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     # Start total execution timer
     total_start_time = time.time()
@@ -577,6 +624,16 @@ if __name__ == "__main__":
     
     if not workspace_test_passed:
         print("[FAIL] Workspace name scenarios test failed - stopping here!")
+        sys.exit(1)
+    
+    # Run semantic model tests
+    print("\n" + "=" * 80)
+    print("🔬 RUNNING SEMANTIC MODEL TESTS")
+    print("=" * 80)
+    semantic_model_test_passed = test_semantic_model_features(ws, lh, schema)
+    
+    if not semantic_model_test_passed:
+        print("[FAIL] Semantic model tests failed!")
         sys.exit(1)
     
     print("\n[RUN] All preliminary tests passed! Running full integration tests...")

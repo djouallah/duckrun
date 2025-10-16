@@ -2,6 +2,8 @@ import duckdb
 import requests
 import os
 import importlib.util
+import json
+import time
 from deltalake import DeltaTable, write_deltalake
 from typing import List, Tuple, Union, Optional, Callable, Dict, Any
 from string import Template
@@ -702,8 +704,11 @@ class Duckrun:
         Deploy a semantic model from a BIM file using DirectLake mode.
         
         Args:
-            bim_url: URL to the BIM file (e.g., GitHub raw URL)
-            dataset_name: Name for the semantic model (default: lakehouse_schema)
+            bim_url: Can be:
+                - URL: "https://raw.githubusercontent.com/.../model.bim"
+                - Local file: "model.bim"
+                - Workspace/Model: "workspace_name/model_name"
+            dataset_name: Name for the semantic model (default: source model name if workspace/model format, else lakehouse_schema)
             wait_seconds: Seconds to wait for permission propagation (default: 5)
         
         Returns:
@@ -712,18 +717,28 @@ class Duckrun:
         Examples:
             dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo")
             
-            # Deploy with auto-generated name
-            dr.deploy("https://raw.githubusercontent.com/.../model.bim")
+            # Deploy from workspace/model (uses same name by default)
+            dr.deploy("Source Workspace/Source Model")  # Creates "Source Model"
             
             # Deploy with custom name
-            dr.deploy("https://raw.githubusercontent.com/.../model.bim", 
-                     dataset_name="Sales Model")
+            dr.deploy("Source Workspace/Source Model", dataset_name="Sales Model Copy")
+            
+            # Deploy from URL or local file
+            dr.deploy("https://raw.githubusercontent.com/.../model.bim", dataset_name="My Model")
         """
         from .semantic_model import deploy_semantic_model
         
         # Auto-generate dataset name if not provided
         if dataset_name is None:
-            dataset_name = f"{self.lakehouse_name}_{self.schema}"
+            # If using workspace/model format, use the model name
+            if "/" in bim_url and not bim_url.startswith(('http://', 'https://')):
+                parts = bim_url.split("/")
+                if len(parts) == 2:
+                    dataset_name = parts[1]  # Use the model name
+                else:
+                    dataset_name = f"{self.lakehouse_name}_{self.schema}"
+            else:
+                dataset_name = f"{self.lakehouse_name}_{self.schema}"
         
         # Call the deployment function (DirectLake only)
         return deploy_semantic_model(
@@ -731,7 +746,7 @@ class Duckrun:
             lakehouse_name_or_id=self.lakehouse_name,
             schema_name=self.schema,
             dataset_name=dataset_name,
-            bim_url=bim_url,
+            bim_url_or_path=bim_url,
             wait_seconds=wait_seconds
         )
 
@@ -863,6 +878,145 @@ class WorkspaceConnection:
         except Exception as e:
             print(f"❌ Error creating lakehouse '{lakehouse_name}': {e}")
             return False
+    
+    def download_bim(self, semantic_model_name: str, output_path: Optional[str] = None) -> Optional[str]:
+        """
+        Download a semantic model as a BIM (Business Intelligence Model) file.
+        
+        Args:
+            semantic_model_name: Name of the semantic model to download
+            output_path: Optional path to save the BIM file. If not provided, returns the BIM content as JSON string
+            
+        Returns:
+            BIM content as JSON string if output_path is None, or the file path if saved successfully
+            
+        Example:
+            con = duckrun.connect("My Workspace")
+            # Get BIM content as string
+            bim_content = con.download_bim("Sales Model")
+            # Or save to file
+            con.download_bim("Sales Model", "sales_model.bim")
+        """
+        try:
+            # Get authentication token
+            from .auth import get_fabric_api_token
+            token = get_fabric_api_token()
+            if not token:
+                print("❌ Failed to authenticate for downloading semantic model")
+                return None
+            
+            # Resolve workspace name to ID
+            workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
+            if not workspace_id:
+                print(f"❌ Workspace '{self.workspace_name}' not found")
+                return None
+            
+            # Get semantic model ID
+            print(f"🔍 Looking for semantic model '{semantic_model_name}'...")
+            url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/semanticModels"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            models = response.json().get("value", [])
+            model = next((m for m in models if m.get("displayName") == semantic_model_name), None)
+            
+            if not model:
+                print(f"❌ Semantic model '{semantic_model_name}' not found in workspace '{self.workspace_name}'")
+                return None
+            
+            model_id = model.get("id")
+            print(f"✓ Found semantic model: {semantic_model_name} (ID: {model_id})")
+            
+            # Get the model definition using the generic items API
+            print("📥 Downloading BIM definition...")
+            definition_url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/items/{model_id}/getDefinition"
+            
+            # POST request to get definition with TMSL format (which includes model.bim)
+            # Note: format parameter should be in query string, not body
+            response = requests.post(f"{definition_url}?format=TMSL", headers=headers)
+            response.raise_for_status()
+            
+            # Handle long-running operation if needed
+            if response.status_code == 202:
+                operation_id = response.headers.get('x-ms-operation-id')
+                print(f"   Waiting for operation to complete...")
+                
+                max_attempts = 30
+                for attempt in range(max_attempts):
+                    time.sleep(2)
+                    
+                    # Get operation result
+                    result_url = f"https://api.fabric.microsoft.com/v1/operations/{operation_id}/result"
+                    result_response = requests.get(result_url, headers=headers)
+                    
+                    # Check operation status
+                    status_url = f"https://api.fabric.microsoft.com/v1/operations/{operation_id}"
+                    status_response = requests.get(status_url, headers=headers)
+                    status = status_response.json().get('status')
+                    
+                    if status == 'Succeeded':
+                        result_data = result_response.json()
+                        break
+                    elif status == 'Failed':
+                        error = status_response.json().get('error', {})
+                        print(f"❌ Operation failed: {error.get('message')}")
+                        return None
+                    elif attempt == max_attempts - 1:
+                        print("❌ Operation timed out")
+                        return None
+            else:
+                result_data = response.json()
+            
+            # Extract BIM content from definition
+            definition = result_data.get('definition', {})
+            parts = definition.get('parts', [])
+            
+            # Debug: show what parts we have
+            if not parts:
+                print("❌ No definition parts found in response")
+                print(f"   Result data keys: {list(result_data.keys())}")
+                print(f"   Definition keys: {list(definition.keys()) if definition else 'None'}")
+                return None
+            
+            print(f"   Found {len(parts)} definition parts:")
+            for part in parts:
+                print(f"     - {part.get('path', 'unknown')}")
+            
+            bim_part = next((p for p in parts if p.get('path', '').endswith('.bim')), None)
+            if not bim_part:
+                print("❌ No BIM file found in semantic model definition")
+                print(f"   Looking for files ending with '.bim', found: {[p.get('path') for p in parts]}")
+                return None
+            
+            # Decode the BIM content (it's base64 encoded)
+            import base64
+            bim_payload = bim_part.get('payload', '')
+            bim_content = base64.b64decode(bim_payload).decode('utf-8')
+            bim_json = json.loads(bim_content)
+            
+            # Format as pretty JSON
+            bim_formatted = json.dumps(bim_json, indent=2)
+            
+            print(f"✓ BIM file downloaded successfully")
+            print(f"  - Tables: {len(bim_json.get('model', {}).get('tables', []))}")
+            print(f"  - Relationships: {len(bim_json.get('model', {}).get('relationships', []))}")
+            
+            # Save to file or return content
+            if output_path:
+                with open(output_path, 'w', encoding='utf-8') as f:
+                    f.write(bim_formatted)
+                print(f"✓ Saved to: {output_path}")
+                return output_path
+            else:
+                return bim_formatted
+                
+        except Exception as e:
+            print(f"❌ Error downloading semantic model: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
     
     def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
         """Helper method to get workspace ID from name"""
