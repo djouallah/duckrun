@@ -94,6 +94,7 @@ class Duckrun:
             pass  # Not in Colab, use default transport
         
         self._attach_lakehouse()
+        self._register_lookup_functions()
 
     @classmethod
     def connect(cls, connection_string: str, sql_folder: Optional[str] = None,
@@ -132,10 +133,7 @@ class Duckrun:
         
         # Check if it's a workspace-only connection (no "/" means workspace name only)
         if "/" not in connection_string:
-            print(f"Connecting to workspace '{connection_string}' for management operations...")
             return WorkspaceConnection(connection_string)
-        
-        print("Connecting to Lakehouse...")
         
         scan_all_schemas = False
         
@@ -194,17 +192,14 @@ class Duckrun:
         guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
         
         if guid_pattern.match(workspace_name) and guid_pattern.match(lakehouse_name):
-            print(f"✅ Names are already GUIDs: workspace={workspace_name}, lakehouse={lakehouse_name}")
             return workspace_name, lakehouse_name
         
         # Optimization: If workspace name has no spaces, use both names directly (old behavior)
         # Note: Lakehouse names cannot contain spaces in Microsoft Fabric, only workspace names can
         if " " not in workspace_name:
-            print(f"✅ Using names directly (workspace has no spaces): workspace={workspace_name}, lakehouse={lakehouse_name}")
             return workspace_name, lakehouse_name
         
         # Workspace name contains spaces - need to resolve both to GUIDs for proper ABFSS URLs
-        print(f"🔍 Resolving '{workspace_name}' workspace and '{lakehouse_name}' lakehouse to GUIDs (workspace has spaces)...")
         
         try:
             # Get authentication token using enhanced auth system
@@ -241,7 +236,6 @@ class Duckrun:
             if not lakehouse_id:
                 raise ValueError(f"Lakehouse '{lakehouse_name}' not found in workspace '{workspace_name}'")
             
-            print(f"✅ Resolved: {workspace_name} → {workspace_id}, {lakehouse_name} → {lakehouse_id}")
             return workspace_id, lakehouse_id
             
         except Exception as e:
@@ -387,7 +381,6 @@ class Duckrun:
                         tables_found.append((schema_name, table_name))
         else:
             # Scan specific schema only
-            print(f"🔍 Discovering tables in schema '{self.schema}'...")
             schema_path = f"{base_path}{self.schema}/"
             result = obs.list_with_delimiter(store, prefix=schema_path)
             
@@ -406,10 +399,6 @@ class Duckrun:
             tables = self._discover_tables_fast()
             
             if not tables:
-                if self.scan_all_schemas:
-                    print(f"No Delta tables found in {self.lakehouse_name}/Tables/")
-                else:
-                    print(f"No Delta tables found in {self.lakehouse_name}/Tables/{self.schema}/")
                 return
             
             # Group tables by schema for display
@@ -418,12 +407,6 @@ class Duckrun:
                 if schema_name not in schema_tables:
                     schema_tables[schema_name] = []
                 schema_tables[schema_name].append(table_name)
-            
-            # Display tables by schema
-            print(f"\n📊 Found {len(tables)} tables:")
-            for schema_name in sorted(schema_tables.keys()):
-                table_list = sorted(schema_tables[schema_name])
-                print(f"   {schema_name}: {', '.join(table_list)}")
             
             attached_count = 0
             skipped_tables = []
@@ -446,16 +429,153 @@ class Duckrun:
                 except Exception as e:
                     skipped_tables.append(f"{schema_name}.{table_name}")
                     continue
-            
-            print(f"\n{'='*60}")
-            print(f"✅ Ready - {attached_count}/{len(tables)} tables available")
-            if skipped_tables:
-                print(f"⚠ Skipped {len(skipped_tables)} tables: {', '.join(skipped_tables[:3])}{'...' if len(skipped_tables) > 3 else ''}")
-            print(f"{'='*60}\n")
                 
         except Exception as e:
             print(f"❌ Error attaching lakehouse: {e}")
-            print("Continuing without pre-attached tables.")
+
+    def _register_lookup_functions(self):
+        """
+        Register Fabric API lookup functions as DuckDB UDFs.
+        Allows SQL queries to resolve workspace/lakehouse names from IDs and vice versa.
+        
+        Functions registered:
+        - get_workspace_name(workspace_id) -> str
+        - get_lakehouse_name(workspace_id, lakehouse_id) -> str
+        - get_workspace_id_from_name(workspace_name) -> str
+        - get_lakehouse_id_from_name(workspace_id, lakehouse_name) -> str
+        """
+        # Cache to avoid repeated API calls
+        self._name_cache = {
+            'workspace_id_to_name': {},
+            'workspace_name_to_id': {},
+            'lakehouse_id_to_name': {},
+            'lakehouse_name_to_id': {}
+        }
+        
+        def get_workspace_name(workspace_id: str) -> str:
+            """Get workspace display name from workspace ID (GUID)"""
+            if workspace_id in self._name_cache['workspace_id_to_name']:
+                return self._name_cache['workspace_id_to_name'][workspace_id]
+            
+            try:
+                from .auth import get_fabric_api_token
+                token = get_fabric_api_token()
+                if not token:
+                    return None
+                
+                url = "https://api.fabric.microsoft.com/v1/workspaces"
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+                
+                workspaces = response.json().get("value", [])
+                for workspace in workspaces:
+                    if workspace.get("id") == workspace_id:
+                        name = workspace.get("displayName", "")
+                        self._name_cache['workspace_id_to_name'][workspace_id] = name
+                        self._name_cache['workspace_name_to_id'][name] = workspace_id
+                        return name
+                
+                return None
+            except Exception as e:
+                return None
+        
+        def get_lakehouse_name(workspace_id: str, lakehouse_id: str) -> str:
+            """Get lakehouse display name from workspace ID and lakehouse ID (GUIDs)"""
+            cache_key = f"{workspace_id}/{lakehouse_id}"
+            if cache_key in self._name_cache['lakehouse_id_to_name']:
+                return self._name_cache['lakehouse_id_to_name'][cache_key]
+            
+            try:
+                from .auth import get_fabric_api_token
+                token = get_fabric_api_token()
+                if not token:
+                    return None
+                
+                url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+                
+                lakehouses = response.json().get("value", [])
+                for lakehouse in lakehouses:
+                    if lakehouse.get("id") == lakehouse_id:
+                        name = lakehouse.get("displayName", "")
+                        self._name_cache['lakehouse_id_to_name'][cache_key] = name
+                        lh_cache_key = f"{workspace_id}/{name}"
+                        self._name_cache['lakehouse_name_to_id'][lh_cache_key] = lakehouse_id
+                        return name
+                
+                return None
+            except Exception as e:
+                return None
+        
+        def get_workspace_id_from_name(workspace_name: str) -> str:
+            """Get workspace ID (GUID) from workspace display name"""
+            if workspace_name in self._name_cache['workspace_name_to_id']:
+                return self._name_cache['workspace_name_to_id'][workspace_name]
+            
+            try:
+                from .auth import get_fabric_api_token
+                token = get_fabric_api_token()
+                if not token:
+                    return None
+                
+                url = "https://api.fabric.microsoft.com/v1/workspaces"
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+                
+                workspaces = response.json().get("value", [])
+                for workspace in workspaces:
+                    if workspace.get("displayName") == workspace_name:
+                        workspace_id = workspace.get("id", "")
+                        self._name_cache['workspace_name_to_id'][workspace_name] = workspace_id
+                        self._name_cache['workspace_id_to_name'][workspace_id] = workspace_name
+                        return workspace_id
+                
+                return None
+            except Exception as e:
+                return None
+        
+        def get_lakehouse_id_from_name(workspace_id: str, lakehouse_name: str) -> str:
+            """Get lakehouse ID (GUID) from workspace ID and lakehouse display name"""
+            cache_key = f"{workspace_id}/{lakehouse_name}"
+            if cache_key in self._name_cache['lakehouse_name_to_id']:
+                return self._name_cache['lakehouse_name_to_id'][cache_key]
+            
+            try:
+                from .auth import get_fabric_api_token
+                token = get_fabric_api_token()
+                if not token:
+                    return None
+                
+                url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/lakehouses"
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                response = requests.get(url, headers=headers)
+                response.raise_for_status()
+                
+                lakehouses = response.json().get("value", [])
+                for lakehouse in lakehouses:
+                    if lakehouse.get("displayName") == lakehouse_name:
+                        lakehouse_id = lakehouse.get("id", "")
+                        self._name_cache['lakehouse_name_to_id'][cache_key] = lakehouse_id
+                        id_cache_key = f"{workspace_id}/{lakehouse_id}"
+                        self._name_cache['lakehouse_id_to_name'][id_cache_key] = lakehouse_name
+                        return lakehouse_id
+                
+                return None
+            except Exception as e:
+                return None
+        
+        # Register functions in DuckDB
+        try:
+            self.con.create_function("get_workspace_name", get_workspace_name)
+            self.con.create_function("get_lakehouse_name", get_lakehouse_name)
+            self.con.create_function("get_workspace_id_from_name", get_workspace_id_from_name)
+            self.con.create_function("get_lakehouse_id_from_name", get_lakehouse_id_from_name)
+        except Exception as e:
+            print(f"⚠️  Warning: Could not register lookup functions: {e}")
 
     def get_workspace_id(self) -> str:
         """
