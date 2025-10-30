@@ -2,7 +2,7 @@
 
 from duckrun.core import Duckrun
 
-__version__ = "0.2.9.dev5"
+__version__ = "0.2.14.dev2"
 
 # Expose unified connect method at module level
 connect = Duckrun.connect

@@ -20,7 +20,6 @@ def get_token() -> Optional[str]:
     # Check if we already have a cached token
     token_env = os.environ.get("AZURE_STORAGE_TOKEN")
     if token_env and token_env != "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-        print("✅ Using existing Azure Storage token")
         return token_env
 
     print("🔐 Starting Azure authentication...")
@@ -38,21 +37,16 @@ def get_token() -> Optional[str]:
     except Exception as e:
         print(f"⚠️ Fabric notebook authentication failed: {e}")
 
-    # Detect environment type for fallback authentication
+    # Try local/VS Code authentication (Azure CLI + browser)
+    print("🖥️ Trying local authentication (Azure CLI + browser fallback)...")
+    token = _get_local_token()
+    if token:
+        return token
+    
+    # If local auth failed, fall back to device code flow
+    print("🔐 Falling back to device code flow for remote/headless environment...")
     try:
-        # Check if we're in Google Colab first
-        try:
-            import google.colab
-            print("🚀 Google Colab detected - using device code flow")
-            return _get_device_code_token()
-        except ImportError:
-            pass
-
-        # For all other environments (including VS Code), try Azure CLI first
-        # This includes local development, VS Code notebooks, etc.
-        print("🖥️ Local/VS Code environment detected - trying Azure CLI first, then browser fallback")
-        return _get_local_token()
-
+        return _get_device_code_token()
     except Exception as e:
         print(f"❌ Authentication failed: {e}")
         print("💡 Try refreshing and running again, or check your Azure permissions")

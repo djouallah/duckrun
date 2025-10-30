@@ -53,7 +53,8 @@ class Duckrun:
 
     def __init__(self, workspace_id: str, lakehouse_id: str, schema: str = "dbo", 
                  sql_folder: Optional[str] = None, compaction_threshold: int = 10,
-                 scan_all_schemas: bool = False, storage_account: str = "onelake"):
+                 scan_all_schemas: bool = False, storage_account: str = "onelake",
+                 token_only: bool = False):
         # Store GUIDs for internal use
         self.workspace_id = workspace_id
         self.lakehouse_id = lakehouse_id
@@ -62,6 +63,7 @@ class Duckrun:
         self.compaction_threshold = compaction_threshold
         self.scan_all_schemas = scan_all_schemas
         self.storage_account = storage_account
+        self.token_only = token_only
         
         # Construct proper ABFSS URLs
         import re
@@ -93,12 +95,19 @@ class Duckrun:
         except ImportError:
             pass  # Not in Colab, use default transport
         
-        self._attach_lakehouse()
-        self._register_lookup_functions()
+        # Only attach lakehouse and register functions if not token_only mode
+        if not token_only:
+            self._attach_lakehouse()
+            self._register_lookup_functions()
+        else:
+            # In token_only mode, just create the secret for authentication
+            self._create_onelake_secret()
+            print("✓ Token authenticated (fast mode - tables not listed)")
 
     @classmethod
     def connect(cls, connection_string: str, sql_folder: Optional[str] = None,
-                compaction_threshold: int = 100, storage_account: str = "onelake"):
+                compaction_threshold: int = 100, storage_account: str = "onelake",
+                token_only: bool = False):
         """
         Create and connect to lakehouse or workspace.
         
@@ -112,6 +121,7 @@ class Duckrun:
             sql_folder: Optional path or URL to SQL files folder  
             compaction_threshold: File count threshold for compaction
             storage_account: Storage account name (default: "onelake")
+            token_only: If True, only authenticate without listing tables (faster connection)
         
         Examples:
             # Workspace management only (supports spaces in names)
@@ -124,6 +134,9 @@ class Duckrun:
             dr = Duckrun.connect("Data Workspace/Sales Data.lakehouse/analytics")  # spaces supported
             dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse")  # defaults to dbo schema
             dr = Duckrun.connect("workspace/lakehouse.lakehouse", storage_account="xxx-onelake")  # custom storage
+            
+            # Fast connection without table listing (token only)
+            dr = Duckrun.connect("workspace/lakehouse.lakehouse", token_only=True)
             
         Note:
             Internally resolves friendly names (with spaces) to GUIDs and constructs proper ABFSS URLs:
@@ -169,7 +182,7 @@ class Duckrun:
         # Resolve friendly names to GUIDs and construct proper ABFSS path
         workspace_id, lakehouse_id = cls._resolve_names_to_guids(workspace_name, lakehouse_name)
         
-        return cls(workspace_id, lakehouse_id, schema, sql_folder, compaction_threshold, scan_all_schemas, storage_account)
+        return cls(workspace_id, lakehouse_id, schema, sql_folder, compaction_threshold, scan_all_schemas, storage_account, token_only)
 
     @classmethod
     def _resolve_names_to_guids(cls, workspace_name: str, lakehouse_name: str) -> tuple[str, str]:
@@ -401,15 +414,8 @@ class Duckrun:
             if not tables:
                 return
             
-            # Group tables by schema for display
-            schema_tables = {}
-            for schema_name, table_name in tables:
-                if schema_name not in schema_tables:
-                    schema_tables[schema_name] = []
-                schema_tables[schema_name].append(table_name)
-            
-            attached_count = 0
-            skipped_tables = []
+            # Collect table names for display
+            table_names = []
             
             for schema_name, table_name in tables:
                 try:
@@ -417,18 +423,22 @@ class Duckrun:
                         # Create proper schema.table structure in DuckDB
                         self.con.sql(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
                         view_name = f"{schema_name}.{table_name}"
+                        table_names.append(view_name)
                     else:
                         # Single schema mode - use just table name
                         view_name = table_name
+                        table_names.append(table_name)
                     
                     self.con.sql(f"""
                         CREATE OR REPLACE VIEW {view_name}
                         AS SELECT * FROM delta_scan('{self.table_base_url}{schema_name}/{table_name}');
                     """)
-                    attached_count += 1
                 except Exception as e:
-                    skipped_tables.append(f"{schema_name}.{table_name}")
                     continue
+            
+            # Print discovered tables as comma-separated list
+            if table_names:
+                print(", ".join(table_names))
                 
         except Exception as e:
             print(f"❌ Error attaching lakehouse: {e}")
@@ -570,31 +580,104 @@ class Duckrun:
         
         # Register functions in DuckDB
         try:
-            self.con.create_function("get_workspace_name", get_workspace_name)
-            self.con.create_function("get_lakehouse_name", get_lakehouse_name)
-            self.con.create_function("get_workspace_id_from_name", get_workspace_id_from_name)
-            self.con.create_function("get_lakehouse_id_from_name", get_lakehouse_id_from_name)
+            self.con.create_function("get_workspace_name", get_workspace_name, null_handling='SPECIAL')
+            self.con.create_function("get_lakehouse_name", get_lakehouse_name, null_handling='SPECIAL')
+            self.con.create_function("get_workspace_id_from_name", get_workspace_id_from_name, null_handling='SPECIAL')
+            self.con.create_function("get_lakehouse_id_from_name", get_lakehouse_id_from_name, null_handling='SPECIAL')
         except Exception as e:
             print(f"⚠️  Warning: Could not register lookup functions: {e}")
 
-    def get_workspace_id(self) -> str:
+    def get_workspace_id(self, force: bool = False) -> str:
         """
         Get the workspace ID (GUID or name without spaces).
         Use this when passing workspace parameter to Python functions.
         
+        Args:
+            force: If True, always resolve to actual GUID via API. If False, returns stored value (default: False)
+        
         Returns:
             Workspace ID - either a GUID or workspace name without spaces
         """
+        if not force:
+            return self.workspace_id
+        
+        # Force resolution to GUID
+        import re
+        guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+        
+        # If already a GUID, return it
+        if guid_pattern.match(self.workspace_id):
+            return self.workspace_id
+        
+        # Try to get from notebook context first (fastest)
+        try:
+            import notebookutils  # type: ignore
+            workspace_guid = notebookutils.runtime.context.get("workspaceId")
+            if workspace_guid:
+                return workspace_guid
+        except ImportError:
+            pass
+        
+        # Resolve via API
+        try:
+            from .auth import get_fabric_api_token
+            token = get_fabric_api_token()
+            if token:
+                resolved_id = self._resolve_workspace_id_by_name(token, self.workspace_id)
+                if resolved_id:
+                    return resolved_id
+        except Exception:
+            pass
+        
+        # Fallback to original value
         return self.workspace_id
     
-    def get_lakehouse_id(self) -> str:
+    def get_lakehouse_id(self, force: bool = False) -> str:
         """
         Get the lakehouse ID (GUID or name).
         Use this when passing lakehouse parameter to Python functions.
         
+        Args:
+            force: If True, always resolve to actual GUID via API. If False, returns stored value (default: False)
+        
         Returns:
             Lakehouse ID - either a GUID or lakehouse name
         """
+        if not force:
+            return self.lakehouse_id
+        
+        # Force resolution to GUID
+        import re
+        guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+        
+        # If already a GUID, return it
+        if guid_pattern.match(self.lakehouse_id):
+            return self.lakehouse_id
+        
+        # Try to get from notebook context first (fastest)
+        try:
+            import notebookutils  # type: ignore
+            lakehouse_guid = notebookutils.lakehouse.get("id")
+            if lakehouse_guid:
+                return lakehouse_guid
+        except (ImportError, Exception):
+            pass
+        
+        # Resolve via API
+        try:
+            from .auth import get_fabric_api_token
+            token = get_fabric_api_token()
+            if token:
+                # First get workspace GUID
+                workspace_guid = self.get_workspace_id(force=True)
+                # Then resolve lakehouse name to ID
+                resolved_id = self._resolve_lakehouse_id_by_name(token, workspace_guid, self.lakehouse_id)
+                if resolved_id:
+                    return resolved_id
+        except Exception:
+            pass
+        
+        # Fallback to original value
         return self.lakehouse_id
 
     def run(self, pipeline: List[Tuple]) -> bool:
