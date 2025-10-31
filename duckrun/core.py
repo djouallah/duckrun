@@ -4,11 +4,8 @@ import os
 import importlib.util
 import json
 import time
-from deltalake import DeltaTable, write_deltalake
 from typing import List, Tuple, Union, Optional, Callable, Dict, Any
 from string import Template
-import obstore as obs
-from obstore.store import AzureStore
 from datetime import datetime
 from .stats import get_stats as _get_stats
 from .runner import run as _run
@@ -17,7 +14,8 @@ from .writer import QueryResult
 
 class Duckrun:
     """
-    Lakehouse task runner with clean tuple-based API.
+    OneLake task runner with clean tuple-based API.
+    Supports lakehouses, warehouses, databases, and other OneLake items.
     Powered by DuckDB for fast data processing.
     
     Task formats:
@@ -29,6 +27,10 @@ class Duckrun:
         dr = Duckrun.connect("workspace/lakehouse.lakehouse/schema", sql_folder="./sql")
         dr = Duckrun.connect("workspace/lakehouse.lakehouse")  # defaults to dbo schema, lists all tables
         dr.run(pipeline)
+        
+        # For other OneLake items:
+        dr = Duckrun.connect("SNOWFLAKE/ONELAKEUSEAST.SnowflakeDatabase")
+        dr = Duckrun.connect("workspace/warehouse.Warehouse")
         
         # For data exploration with Spark-style API:
         dr = Duckrun.connect("workspace/lakehouse.lakehouse")
@@ -65,24 +67,53 @@ class Duckrun:
         self.storage_account = storage_account
         self.token_only = token_only
         
-        # Construct proper ABFSS URLs
+        # Store both full name (with .ItemType) and display name (without .ItemType) for backward compatibility
+        # lakehouse_id: Full name with suffix for API calls (e.g., "data.Lakehouse")
+        # lakehouse_display_name: Name only without suffix for user code/templates (e.g., "data")
+        self.lakehouse_id = lakehouse_id
+        
+        # Extract display name (remove .ItemType suffix if present)
         import re
-        guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
-        # If lakehouse_id is a GUID, use as-is
-        if guid_pattern.match(lakehouse_id):
-            lakehouse_url_part = lakehouse_id
-        else:
-            # If workspace name has no spaces, always append .lakehouse unless already present
-            if " " not in workspace_id and not lakehouse_id.endswith('.lakehouse'):
-                lakehouse_url_part = f'{lakehouse_id}.lakehouse'
+        # Check if lakehouse_id has .ItemType suffix
+        if not re.match(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', lakehouse_id, re.IGNORECASE):
+            # Friendly name - extract base name without suffix
+            for suffix in ['.Lakehouse', '.Warehouse', '.Database', '.SnowflakeDatabase']:
+                if lakehouse_id.endswith(suffix):
+                    self.lakehouse_display_name = lakehouse_id[:-len(suffix)]
+                    break
             else:
-                lakehouse_url_part = lakehouse_id
-        self.table_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_url_part}/Tables/'
-        self.files_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{lakehouse_url_part}/Files/'
+                self.lakehouse_display_name = lakehouse_id
+        else:
+            # GUID - use as is
+            self.lakehouse_display_name = lakehouse_id
+        
+        # Construct proper ABFSS URLs
+        # Format: abfss://{workspace}@{storage_account}.dfs.fabric.microsoft.com/{item}/Tables/
+        # where {workspace} and {item} can be:
+        #   - Names with .lakehouse suffix (lakehouse optimization when no spaces in workspace)
+        #   - GUIDs (when resolved via API for non-lakehouse items or items with spaces)
+        guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+        
+        # Determine the item URL part for ABFSS
+        if guid_pattern.match(lakehouse_id):
+            # Already a GUID - use as-is (from API resolution)
+            item_url_part = lakehouse_id
+        else:
+            # Friendly name - use as-is (already includes .ItemType suffix from connect())
+            item_url_part = lakehouse_id
+        
+        self.table_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{item_url_part}/Tables/'
+        self.files_base_url = f'abfss://{workspace_id}@{storage_account}.dfs.fabric.microsoft.com/{item_url_part}/Files/'
         
         # Keep legacy properties for backward compatibility
         self.workspace = workspace_id  
-        self.lakehouse_name = lakehouse_id
+        self.lakehouse_name = self.lakehouse_display_name  # Use display name (without suffix) for backward compatibility
+        
+        # Store display name without suffix for backward compatibility with user Python functions
+        # Extract base name by removing .ItemType suffix if present
+        import re
+        suffix_pattern = re.compile(r'\.(Lakehouse|Warehouse|Database|SnowflakeDatabase)$', re.IGNORECASE)
+        self.lakehouse_display_name = suffix_pattern.sub('', lakehouse_id)
         
         self.con = duckdb.connect()
         self.con.sql("SET preserve_insertion_order = false")
@@ -109,12 +140,15 @@ class Duckrun:
                 compaction_threshold: int = 100, storage_account: str = "onelake",
                 token_only: bool = False):
         """
-        Create and connect to lakehouse or workspace.
+        Create and connect to OneLake items (lakehouse, warehouse, database, etc.) or workspace.
         
         Smart detection based on connection string format:
         - "workspace" → workspace management only
-        - "ws/lh.lakehouse/schema" → full lakehouse connection  
-        - "ws/lh.lakehouse" → lakehouse connection (defaults to dbo schema)
+        - "ws/item.lakehouse/schema" → lakehouse connection with specific schema
+        - "ws/item.lakehouse" → lakehouse connection (defaults to dbo schema)
+        - "ws/item.warehouse" → warehouse connection
+        - "ws/item.database" → database connection
+        - "ws/item.snowflakedatabase" → Snowflake database connection
         
         Args:
             connection_string: OneLake path or workspace name
@@ -129,19 +163,26 @@ class Duckrun:
             ws.list_lakehouses()
             ws.create_lakehouse_if_not_exists("New Lakehouse")
             
-            # Full lakehouse connections (supports spaces in names)
+            # Lakehouse connections (supports spaces in names)
             dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse/schema", sql_folder="./sql")
             dr = Duckrun.connect("Data Workspace/Sales Data.lakehouse/analytics")  # spaces supported
             dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse")  # defaults to dbo schema
             dr = Duckrun.connect("workspace/lakehouse.lakehouse", storage_account="xxx-onelake")  # custom storage
             
+            # Warehouse and database connections (always uses API to resolve GUIDs)
+            dr = Duckrun.connect("SNOWFLAKE/ONELAKEUSEAST.SnowflakeDatabase")
+            dr = Duckrun.connect("My Workspace/My Warehouse.Warehouse")
+            dr = Duckrun.connect("workspace/database.Database")
+            
             # Fast connection without table listing (token only)
             dr = Duckrun.connect("workspace/lakehouse.lakehouse", token_only=True)
             
         Note:
-            Internally resolves friendly names (with spaces) to GUIDs and constructs proper ABFSS URLs:
-            "My Workspace/My Lakehouse.lakehouse/schema" becomes
-            "abfss://workspace_guid@onelake.dfs.fabric.microsoft.com/lakehouse_guid/Tables/schema"
+            - Lakehouse items without spaces in workspace name use optimization (no API calls)
+            - Non-lakehouse items always resolve to GUIDs via Fabric API
+            - Internally constructs proper ABFSS URLs:
+              "My Workspace/My Item.lakehouse/schema" → 
+              "abfss://workspace_guid@onelake.dfs.fabric.microsoft.com/item_guid/Tables/schema"
         """
         
         # Check if it's a workspace-only connection (no "/" means workspace name only)
@@ -150,70 +191,94 @@ class Duckrun:
         
         scan_all_schemas = False
         
-        # Parse lakehouse connection string: "ws/lh.lakehouse/schema" or "ws/lh.lakehouse"  
-        # Support workspace and lakehouse names with spaces
+        # Parse connection string: "ws/item_name.item_type/schema" or "ws/item_name.item_type"  
+        # Support workspace and item names with spaces
+        # Item types: .lakehouse, .Lakehouse, .warehouse, .Warehouse, .database, .Database, .snowflakedatabase, .SnowflakeDatabase
         parts = connection_string.split("/")
         if len(parts) == 2:
-            workspace_name, lakehouse_name = parts
+            workspace_name, item_name_with_type = parts
             scan_all_schemas = True
             schema = "dbo"
         elif len(parts) == 3:
-            workspace_name, lakehouse_name, schema = parts
+            workspace_name, item_name_with_type, schema = parts
         else:
             raise ValueError(
                 f"Invalid connection string format: '{connection_string}'. "
                 "Expected formats:\n"
                 "  'workspace name' (workspace management only)\n"
-                "  'workspace name/lakehouse name.lakehouse' (lakehouse with dbo schema)\n"
-                "  'workspace name/lakehouse name.lakehouse/schema' (lakehouse with specific schema)"
+                "  'workspace name/item name.item_type' (item with dbo schema)\n"
+                "  'workspace name/item name.item_type/schema' (item with specific schema)\n"
+                "Supported item types: .lakehouse, .warehouse, .database, .snowflakedatabase (case-insensitive)"
             )
         
-        if lakehouse_name.endswith(".lakehouse"):
-            lakehouse_name = lakehouse_name[:-10]
+        # Extract item type and name
+        item_type = None
+        item_name = item_name_with_type
         
-        if not workspace_name or not lakehouse_name:
+        # Check for known item types (case-insensitive)
+        item_type_map = {
+            '.lakehouse': 'Lakehouse',
+            '.warehouse': 'Warehouse', 
+            '.database': 'Database',
+            '.snowflakedatabase': 'SnowflakeDatabase'
+        }
+        
+        # Parse item type and normalize the suffix to proper case
+        item_name_normalized = item_name_with_type
+        for suffix, mapped_type in item_type_map.items():
+            if item_name_with_type.lower().endswith(suffix):
+                item_type = mapped_type
+                item_name = item_name_with_type[:-len(suffix)]
+                # Normalize to proper case: ItemName.ItemType (e.g., data.Lakehouse)
+                item_name_normalized = f"{item_name}.{mapped_type}"
+                break
+        
+        if not workspace_name or not item_name:
             raise ValueError(
                 "Missing required parameters. Use one of these formats:\n"
                 "  connect('workspace name')  # workspace management\n"
-                "  connect('workspace name/lakehouse name.lakehouse/schema')  # full lakehouse\n"
-                "  connect('workspace name/lakehouse name.lakehouse')  # defaults to dbo"
+                "  connect('workspace name/item name.item_type/schema')  # full item connection\n"
+                "  connect('workspace name/item name.item_type')  # defaults to dbo"
             )
         
-        # Resolve friendly names to GUIDs and construct proper ABFSS path
-        workspace_id, lakehouse_id = cls._resolve_names_to_guids(workspace_name, lakehouse_name)
+        # Per OneLake API docs: Can use friendly names if no spaces/special characters
+        # Otherwise must resolve to GUIDs
+        # Check for spaces or special characters that would require GUID resolution
+        has_special_chars = " " in workspace_name or " " in item_name
         
-        return cls(workspace_id, lakehouse_id, schema, sql_folder, compaction_threshold, scan_all_schemas, storage_account, token_only)
+        if has_special_chars:
+            # Names have spaces/special chars: resolve to GUIDs via API
+            workspace_id, item_id = cls._resolve_names_to_guids(workspace_name, item_name, item_type)
+        else:
+            # No spaces/special chars: use friendly names directly (works for all item types)
+            # Use normalized name with proper case for API compatibility
+            workspace_id = workspace_name
+            item_id = item_name_normalized  # Use normalized with proper case
+        
+        return cls(workspace_id, item_id, schema, sql_folder, compaction_threshold, scan_all_schemas, storage_account, token_only)
 
     @classmethod
-    def _resolve_names_to_guids(cls, workspace_name: str, lakehouse_name: str) -> tuple[str, str]:
+    def _resolve_names_to_guids(cls, workspace_name: str, item_name: str, item_type: Optional[str] = 'Lakehouse') -> tuple[str, str]:
         """
-        Resolve friendly workspace and lakehouse names to their GUIDs.
-        
-        Optimization: If names don't contain spaces, use them directly (no API calls needed).
-        Only resolve to GUIDs when names contain spaces or are already GUIDs.
+        Resolve friendly workspace and item names to their GUIDs.
         
         Args:
             workspace_name: Display name of the workspace (can contain spaces)
-            lakehouse_name: Display name of the lakehouse (can contain spaces)
+            item_name: Display name of the item (can contain spaces)
+            item_type: Type of item - 'Lakehouse', 'Warehouse', 'Database', 'SnowflakeDatabase', etc.
             
         Returns:
-            Tuple of (workspace_id, lakehouse_id) - either resolved GUIDs or original names
+            Tuple of (workspace_id, item_id) - resolved GUIDs
         """
         
         # Check if names are already GUIDs first
         import re
         guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
         
-        if guid_pattern.match(workspace_name) and guid_pattern.match(lakehouse_name):
-            return workspace_name, lakehouse_name
+        if guid_pattern.match(workspace_name) and guid_pattern.match(item_name):
+            return workspace_name, item_name
         
-        # Optimization: If workspace name has no spaces, use both names directly (old behavior)
-        # Note: Lakehouse names cannot contain spaces in Microsoft Fabric, only workspace names can
-        if " " not in workspace_name:
-            return workspace_name, lakehouse_name
-        
-        # Workspace name contains spaces - need to resolve both to GUIDs for proper ABFSS URLs
-        
+        # Need to resolve to GUIDs via API
         try:
             # Get authentication token using enhanced auth system
             from .auth import get_fabric_api_token
@@ -231,8 +296,7 @@ class Duckrun:
             
             # Resolve workspace name to ID 
             if current_workspace_id:
-                # In notebook environment, we could use current workspace ID
-                # but we should validate it matches the requested workspace name
+                # In notebook environment, validate it matches the requested workspace name
                 workspace_id = cls._resolve_workspace_id_by_name(token, workspace_name)
                 if not workspace_id:
                     # Fallback to current workspace if name resolution fails
@@ -244,21 +308,26 @@ class Duckrun:
                 if not workspace_id:
                     raise ValueError(f"Workspace '{workspace_name}' not found")
             
-            # Resolve lakehouse name to ID (required for ABFSS URLs with spaces)
-            lakehouse_id = cls._resolve_lakehouse_id_by_name(token, workspace_id, lakehouse_name)
-            if not lakehouse_id:
-                raise ValueError(f"Lakehouse '{lakehouse_name}' not found in workspace '{workspace_name}'")
+            # Resolve item name to ID based on item type
+            if item_type == 'Lakehouse':
+                item_id = cls._resolve_lakehouse_id_by_name(token, workspace_id, item_name)
+            else:
+                # Use generic item resolver for non-lakehouse items
+                item_id = cls._resolve_item_id_by_name(token, workspace_id, item_name, item_type)
             
-            return workspace_id, lakehouse_id
+            if not item_id:
+                raise ValueError(f"{item_type} '{item_name}' not found in workspace '{workspace_name}'")
+            
+            return workspace_id, item_id
             
         except Exception as e:
             print(f"❌ Failed to resolve names to GUIDs: {e}")
-            print(f"❌ Cannot use friendly names with spaces '{workspace_name}'/'{lakehouse_name}' in ABFSS URLs without GUID resolution")
-            print("❌ Microsoft Fabric requires actual workspace and lakehouse GUIDs for ABFSS access when names contain spaces")
+            print(f"❌ Cannot resolve '{workspace_name}'/'{item_name}' ({item_type}) to GUIDs")
+            print("❌ Microsoft Fabric requires actual workspace and item GUIDs for ABFSS access")
             raise ValueError(
-                f"Unable to resolve workspace '{workspace_name}' and lakehouse '{lakehouse_name}' to GUIDs. "
-                f"ABFSS URLs require actual GUIDs when names contain spaces. "
-                f"Please ensure you have proper authentication and the workspace/lakehouse names are correct."
+                f"Unable to resolve workspace '{workspace_name}' and {item_type.lower()} '{item_name}' to GUIDs. "
+                f"ABFSS URLs require actual GUIDs. "
+                f"Please ensure you have proper authentication and the workspace/item names are correct."
             )
 
     @classmethod  
@@ -299,6 +368,58 @@ class Duckrun:
             
             return None
         except Exception:
+            return None
+    
+    @classmethod
+    def _resolve_item_id_by_name(cls, token: str, workspace_id: str, item_name: str, item_type: str) -> Optional[str]:
+        """
+        Get item ID from display name within a workspace using generic items API.
+        Works for any item type: Warehouse, Database, SnowflakeDatabase, etc.
+        
+        Args:
+            token: Fabric API authentication token
+            workspace_id: Workspace GUID
+            item_name: Display name of the item
+            item_type: Type of item (e.g., 'Warehouse', 'Database', 'SnowflakeDatabase')
+            
+        Returns:
+            Item GUID if found, None otherwise
+        """
+        try:
+            import requests
+            # Use generic items API with type filter
+            url = f"https://api.fabric.microsoft.com/v1/workspaces/{workspace_id}/items"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            # Add type filter as query parameter
+            params = {"type": item_type}
+            
+            print(f"   Searching for {item_type} '{item_name}' in workspace {workspace_id}")
+            print(f"   API URL: {url}?type={item_type}")
+            
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            
+            result = response.json()
+            items = result.get("value", [])
+            
+            print(f"   Found {len(items)} items of type {item_type}")
+            if items:
+                print(f"   Available items: {[item.get('displayName') for item in items]}")
+            
+            for item in items:
+                if item.get("displayName") == item_name:
+                    item_id = item.get("id")
+                    print(f"   Found matching item: {item_name} -> {item_id}")
+                    return item_id
+            
+            print(f"   Item '{item_name}' not found in the list")
+            return None
+        except Exception as e:
+            print(f"   Error resolving {item_type} item: {e}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"   Response status: {e.response.status_code}")
+                print(f"   Response body: {e.response.text}")
             return None
 
     @classmethod
@@ -341,77 +462,138 @@ class Duckrun:
 
     def _discover_tables_fast(self) -> List[Tuple[str, str]]:
         """
-        Fast Delta table discovery using obstore with list_with_delimiter.
-        Only lists directories, not files - super fast!
+        Fast table discovery using OneLake Delta Table API (Unity Catalog compatible).
+        Uses: https://learn.microsoft.com/en-us/fabric/onelake/table-apis/delta-table-apis-overview
         
         Returns:
             List of tuples: [(schema, table_name), ...]
         """
-        token = self._get_storage_token()
-        if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
-            print("Authenticating with Azure for table discovery (detecting environment automatically)...")
-            from .auth import get_token
-            token = get_token()
-            if not token:
-                print("❌ Failed to authenticate for table discovery")
-                return []
-        
-        url = f"abfss://{self.workspace}@{self.storage_account}.dfs.fabric.microsoft.com/"
-        store = AzureStore.from_url(url, bearer_token=token)
-        
-        # Use the same lakehouse URL part logic as in __init__ to ensure .lakehouse suffix is added when needed
-        import re
-        guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
-        if guid_pattern.match(self.lakehouse_id):
-            lakehouse_url_part = self.lakehouse_id
-        else:
-            # If workspace name has no spaces, always append .lakehouse unless already present
-            if " " not in self.workspace_id and not self.lakehouse_id.endswith('.lakehouse'):
-                lakehouse_url_part = f'{self.lakehouse_id}.lakehouse'
+        try:
+            # Get storage token for OneLake
+            token = self._get_storage_token()
+            if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
+                print("Authenticating with Azure for table discovery...")
+                from .auth import get_token
+                token = get_token()
+                if not token:
+                    print("❌ Failed to authenticate for table discovery")
+                    return []
+            
+            # OneLake Delta Table API endpoint (Unity Catalog compatible)
+            base_url = "https://onelake.table.fabric.microsoft.com/delta"
+            
+            # Determine workspace/item identifier for API
+            # Per docs: Can use friendly names (WorkspaceName/ItemName.ItemType) if no special characters
+            # Otherwise must use GUIDs (WorkspaceID/ItemID)
+            import re
+            guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+            
+            # Check if we're using GUIDs or friendly names
+            if guid_pattern.match(self.workspace_id) and guid_pattern.match(self.lakehouse_id):
+                # Using GUIDs - use them directly in API
+                workspace_identifier = self.workspace_id
+                item_identifier = self.lakehouse_id
+                catalog_name = self.lakehouse_id
             else:
-                lakehouse_url_part = self.lakehouse_id
-        
-        base_path = f"{lakehouse_url_part}/Tables/"
-        tables_found = []
-        
-        if self.scan_all_schemas:
-            # Discover all schemas first
-            schemas_result = obs.list_with_delimiter(store, prefix=base_path)
-            schemas = [
-                prefix.rstrip('/').split('/')[-1] 
-                for prefix in schemas_result['common_prefixes']
-            ]
+                # Using friendly names - lakehouse_id already includes .ItemType suffix
+                workspace_identifier = self.workspace_id
+                item_identifier = self.lakehouse_id
+                catalog_name = self.lakehouse_id
             
-            # Discover tables in each schema
-            for schema_name in schemas:
-                schema_path = f"{base_path}{schema_name}/"
-                result = obs.list_with_delimiter(store, prefix=schema_path)
+            print(f"🔍 Discovering tables via OneLake Delta Table API...")
+            print(f"   Using identifier: {workspace_identifier}/{item_identifier}")
+            
+            tables_found = []
+            
+            if self.scan_all_schemas:
+                # First, list all schemas
+                schemas_url = f"{base_url}/{workspace_identifier}/{item_identifier}/api/2.1/unity-catalog/schemas"
+                params = {"catalog_name": catalog_name}
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
                 
-                for table_prefix in result['common_prefixes']:
-                    table_name = table_prefix.rstrip('/').split('/')[-1]
-                    # Skip non-table directories
-                    if table_name not in ('metadata', 'iceberg'):
-                        tables_found.append((schema_name, table_name))
-        else:
-            # Scan specific schema only
-            schema_path = f"{base_path}{self.schema}/"
-            result = obs.list_with_delimiter(store, prefix=schema_path)
+                schemas_response = requests.get(schemas_url, headers=headers, params=params)
+                
+                if schemas_response.status_code == 200:
+                    schemas_result = schemas_response.json()
+                    schemas = schemas_result.get("schemas", [])
+                    schema_names = [s.get("name") for s in schemas if s.get("name")]
+                    
+                    print(f"   Found {len(schema_names)} schemas: {schema_names}")
+                    
+                    # Get tables from each schema
+                    for schema_name in schema_names:
+                        tables_url = f"{base_url}/{workspace_identifier}/{item_identifier}/api/2.1/unity-catalog/tables"
+                        tables_params = {
+                            "catalog_name": catalog_name,
+                            "schema_name": schema_name
+                        }
+                        
+                        tables_response = requests.get(tables_url, headers=headers, params=tables_params)
+                        
+                        if tables_response.status_code == 200:
+                            tables_result = tables_response.json()
+                            tables = tables_result.get("tables", [])
+                            
+                            for table in tables:
+                                table_name = table.get("name", "")
+                                if table_name:
+                                    tables_found.append((schema_name, table_name))
+                            
+                            if tables:
+                                print(f"   Schema '{schema_name}': {len(tables)} tables")
+                else:
+                    print(f"   Failed to list schemas: {schemas_response.status_code}")
+                    if schemas_response.status_code != 404:
+                        print(f"   Response: {schemas_response.text[:300]}")
+            else:
+                # Single schema mode - list tables in specific schema
+                tables_url = f"{base_url}/{workspace_identifier}/{item_identifier}/api/2.1/unity-catalog/tables"
+                params = {
+                    "catalog_name": catalog_name,
+                    "schema_name": self.schema
+                }
+                headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+                
+                print(f"   Listing tables in schema: {self.schema}")
+                tables_response = requests.get(tables_url, headers=headers, params=params)
+                
+                if tables_response.status_code == 200:
+                    tables_result = tables_response.json()
+                    tables = tables_result.get("tables", [])
+                    
+                    for table in tables:
+                        table_name = table.get("name", "")
+                        if table_name:
+                            tables_found.append((self.schema, table_name))
+                    
+                    print(f"   Found {len(tables)} tables")
+                elif tables_response.status_code == 404:
+                    print(f"   Schema '{self.schema}' not found or has no tables")
+                else:
+                    print(f"   Failed to list tables: {tables_response.status_code}")
+                    print(f"   Response: {tables_response.text[:300]}")
             
-            for table_prefix in result['common_prefixes']:
-                table_name = table_prefix.rstrip('/').split('/')[-1]
-                if table_name not in ('metadata', 'iceberg'):
-                    tables_found.append((self.schema, table_name))
-        
-        return tables_found
+            return tables_found
+            
+        except Exception as e:
+            print(f"❌ Error during table discovery: {e}")
+            import traceback
+            traceback.print_exc()
+            return []
 
     def _attach_lakehouse(self):
         """Attach lakehouse tables as DuckDB views using fast discovery"""
+        print(f"🔌 Attaching tables from schema: {self.schema if not self.scan_all_schemas else 'all schemas'}")
         self._create_onelake_secret()
         
         try:
             tables = self._discover_tables_fast()
             
             if not tables:
+                if self.scan_all_schemas:
+                    print(f"⚠️  No tables found in any schema")
+                else:
+                    print(f"⚠️  No tables found in {self.schema} schema")
                 return
             
             # Collect table names for display
@@ -434,6 +616,7 @@ class Duckrun:
                         AS SELECT * FROM delta_scan('{self.table_base_url}{schema_name}/{table_name}');
                     """)
                 except Exception as e:
+                    print(f"⚠️  Failed to attach table {schema_name}.{table_name}: {e}")
                     continue
             
             # Print discovered tables as comma-separated list
@@ -442,6 +625,8 @@ class Duckrun:
                 
         except Exception as e:
             print(f"❌ Error attaching lakehouse: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _register_lookup_functions(self):
         """
@@ -632,16 +817,16 @@ class Duckrun:
         # Fallback to original value
         return self.workspace_id
     
-    def get_lakehouse_id(self, force: bool = False) -> str:
+    def get_item_id(self, force: bool = False) -> str:
         """
-        Get the lakehouse ID (GUID or name).
-        Use this when passing lakehouse parameter to Python functions.
+        Get the item ID (GUID or name) - works for lakehouses, warehouses, databases, etc.
+        Use this when passing lakehouse/item parameter to Python functions.
         
         Args:
             force: If True, always resolve to actual GUID via API. If False, returns stored value (default: False)
         
         Returns:
-            Lakehouse ID - either a GUID or lakehouse name
+            Item ID - either a GUID or item name (supports all OneLake item types)
         """
         if not force:
             return self.lakehouse_id
@@ -654,14 +839,24 @@ class Duckrun:
         if guid_pattern.match(self.lakehouse_id):
             return self.lakehouse_id
         
-        # Try to get from notebook context first (fastest)
-        try:
-            import notebookutils  # type: ignore
-            lakehouse_guid = notebookutils.lakehouse.get("id")
-            if lakehouse_guid:
-                return lakehouse_guid
-        except (ImportError, Exception):
-            pass
+        # Detect item type from lakehouse_id (e.g., "data.Lakehouse" -> Lakehouse)
+        item_type = None
+        item_name = self.lakehouse_id
+        for suffix in ['.Lakehouse', '.Warehouse', '.Database', '.SnowflakeDatabase']:
+            if self.lakehouse_id.endswith(suffix):
+                item_type = suffix[1:]  # Remove the leading dot
+                item_name = self.lakehouse_id[:-len(suffix)]
+                break
+        
+        # Try to get from notebook context first (only works for lakehouses)
+        if item_type == 'Lakehouse' or item_type is None:
+            try:
+                import notebookutils  # type: ignore
+                lakehouse_guid = notebookutils.lakehouse.get("id")
+                if lakehouse_guid:
+                    return lakehouse_guid
+            except (ImportError, Exception):
+                pass
         
         # Resolve via API
         try:
@@ -670,8 +865,15 @@ class Duckrun:
             if token:
                 # First get workspace GUID
                 workspace_guid = self.get_workspace_id(force=True)
-                # Then resolve lakehouse name to ID
-                resolved_id = self._resolve_lakehouse_id_by_name(token, workspace_guid, self.lakehouse_id)
+                
+                # Use appropriate resolver based on item type
+                if item_type == 'Lakehouse' or item_type is None:
+                    # Use lakehouse-specific API
+                    resolved_id = self._resolve_lakehouse_id_by_name(token, workspace_guid, item_name if item_name else self.lakehouse_id)
+                else:
+                    # Use generic items API for warehouses, databases, etc.
+                    resolved_id = self._resolve_item_id_by_name(token, workspace_guid, item_name, item_type)
+                
                 if resolved_id:
                     return resolved_id
         except Exception:
@@ -679,6 +881,13 @@ class Duckrun:
         
         # Fallback to original value
         return self.lakehouse_id
+    
+    def get_lakehouse_id(self, force: bool = False) -> str:
+        """
+        Deprecated: Use get_item_id() instead.
+        Backward compatibility alias for get_item_id().
+        """
+        return self.get_item_id(force)
 
     def run(self, pipeline: List[Tuple]) -> bool:
         """

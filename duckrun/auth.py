@@ -2,7 +2,19 @@
 Enhanced authentication module for duckrun - supports multiple notebook environments
 """
 import os
+import sys
 from typing import Optional, Tuple
+
+
+def safe_print(message: str):
+    """Print message with safe encoding handling for Windows"""
+    try:
+        print(message)
+    except UnicodeEncodeError:
+        # Fallback: remove emojis and special chars
+        import re
+        clean_message = re.sub(r'[^\x00-\x7F]+', '', message)
+        print(clean_message)
 
 
 def get_token() -> Optional[str]:

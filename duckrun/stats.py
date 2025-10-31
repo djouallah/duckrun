@@ -142,7 +142,9 @@ def get_stats(duckrun_instance, source: str):
     
     print(f"Processing {len(list_tables)} tables: {list_tables}")
     
+    successful_tables = []
     for idx, tbl in enumerate(list_tables):
+        print(f"[{idx+1}/{len(list_tables)}] Processing table '{tbl}'...")
         # Construct lakehouse path using correct ABFSS URL format (no .Lakehouse suffix)
         table_path = f"{duckrun_instance.table_base_url}{schema_name}/{tbl}"
         
@@ -210,23 +212,82 @@ def get_stats(duckrun_instance, source: str):
                 ''')
             
         except Exception as e:
-            print(f"Warning: Could not process table '{tbl}': {e}")
-            # Create empty temp table for failed tables
-            con.execute(f'''
-                CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
-                SELECT 
-                    '{tbl}' as tbl,
-                    'error' as file_name,
-                    0 as num_rows,
-                    0 as num_row_groups,
-                    0 as size,
-                    false as vorder,
-                    '{timestamp}' as timestamp
-                WHERE false
-            ''')
+            error_msg = str(e)
+            print(f"Warning: Could not process table '{tbl}' using DeltaTable API: {e}")
+            
+            # Fallback: Use DuckDB's delta_scan with filename parameter
+            if "Invalid JSON" in error_msg or "MetadataValue" in error_msg:
+                print(f"   Detected JSON parsing issue - falling back to DuckDB delta_scan")
+            else:
+                print(f"   Falling back to DuckDB delta_scan")
+            
+            try:
+                # First get the list of actual parquet files using delta_scan
+                file_list_result = con.execute(f'''
+                    SELECT DISTINCT filename 
+                    FROM delta_scan('{table_path}', filename=1)
+                ''').fetchall()
+                
+                if not file_list_result:
+                    # Empty table
+                    con.execute(f'''
+                        CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
+                        SELECT 
+                            '{tbl}' as tbl,
+                            'empty' as file_name,
+                            0 as num_rows,
+                            0 as num_row_groups,
+                            0 as size,
+                            false as vorder,
+                            '{timestamp}' as timestamp
+                        WHERE false
+                    ''')
+                else:
+                    # Extract just the filename (not the full path) from delta_scan results
+                    # delta_scan returns full ABFSS paths, we need to extract just the filename part
+                    filenames = []
+                    for row in file_list_result:
+                        full_path = row[0]
+                        # Extract just the filename from the full ABFSS path
+                        if '/' in full_path:
+                            filename = full_path.split('/')[-1]
+                        else:
+                            filename = full_path
+                        filenames.append(table_path + "/" + filename)
+                    
+                    # Use parquet_file_metadata to get actual parquet stats
+                    con.execute(f'''
+                        CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
+                        SELECT 
+                            '{tbl}' as tbl,
+                            file_name,
+                            num_rows,
+                            num_row_groups,
+                            0 as size,
+                            false as vorder,
+                            '{timestamp}' as timestamp
+                        FROM parquet_file_metadata({filenames})
+                    ''')
+                
+                print(f"   ✓ Successfully processed '{tbl}' using DuckDB fallback with parquet metadata")
+            except Exception as fallback_error:
+                print(f"   ✗ DuckDB fallback also failed for '{tbl}': {fallback_error}")
+                print(f"   ⏭️  Skipping table '{tbl}'")
+                continue
+        
+        # Mark this table as successfully processed
+        successful_tables.append(idx)
     
-    # Union all temp tables
-    union_parts = [f'SELECT * FROM tbl_{i}' for i in range(len(list_tables))]
+    # Only union tables that were successfully processed
+    if not successful_tables:
+        # No tables were processed successfully - return empty dataframe
+        print("⚠️  No tables could be processed successfully")
+        import pandas as pd
+        return pd.DataFrame(columns=['tbl', 'total_rows', 'num_files', 'num_row_group', 
+                                     'average_row_group', 'file_size_MB', 'vorder', 'timestamp'])
+    
+    # Union all successfully processed temp tables
+    union_parts = [f'SELECT * FROM tbl_{i}' for i in successful_tables]
     union_query = ' UNION ALL '.join(union_parts)
     
     # Generate final summary

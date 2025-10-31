@@ -172,6 +172,80 @@ def test_semantic_model_features(ws, lh, schema):
         return False
 
 
+def test_snowflake_connection():
+    """Test connection to Snowflake database and get_item_id"""
+    print("\n[TEST] Testing Snowflake database connection and get_item_id...")
+    print("=" * 60)
+    
+    try:
+        # Connect to Snowflake database
+        print("\n1. Connecting to snowflake/ONELAKEUSEAST.SnowflakeDatabase...")
+        connection_string = "snowflake/ONELAKEUSEAST.SnowflakeDatabase"
+        
+        dr = duckrun.connect(connection_string)
+        print("   ✓ Connection successful!")
+        
+        # Display connection info
+        print("\n2. Connection Information:")
+        print(f"   - Workspace ID: {dr.workspace_id}")
+        print(f"   - Item ID (lakehouse_id): {dr.lakehouse_id}")
+        print(f"   - Schema: {dr.schema}")
+        print(f"   - Display Name: {dr.lakehouse_display_name}")
+        
+        # Test get_item_id without force
+        print(f"\n3. Testing get_item_id() without force...")
+        item_id = dr.get_item_id(force=False)
+        print(f"   ✓ get_item_id(force=False) returned: {item_id}")
+        
+        # Test get_item_id with force (will try to resolve to GUID)
+        print(f"\n4. Testing get_item_id(force=True) - will resolve to GUID...")
+        try:
+            item_id_forced = dr.get_item_id(force=True)
+            print(f"   ✓ get_item_id(force=True) returned: {item_id_forced}")
+            
+            # Check if it's a GUID format
+            import re
+            guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+            if guid_pattern.match(item_id_forced):
+                print(f"   ✓ Result is a valid GUID format")
+            else:
+                print(f"   ℹ Result is not a GUID (may be friendly name): {item_id_forced}")
+        except Exception as e:
+            print(f"   ⚠️ get_item_id(force=True) encountered an issue: {e}")
+            print(f"   This may be expected if API resolution is not available")
+        
+        # Test get_workspace_id
+        print(f"\n5. Testing get_workspace_id()...")
+        workspace_id = dr.get_workspace_id(force=False)
+        print(f"   ✓ get_workspace_id(force=False) returned: {workspace_id}")
+        
+        try:
+            workspace_id_forced = dr.get_workspace_id(force=True)
+            print(f"   ✓ get_workspace_id(force=True) returned: {workspace_id_forced}")
+        except Exception as e:
+            print(f"   ⚠️ get_workspace_id(force=True) encountered an issue: {e}")
+        
+        # Test table_base_url
+        print(f"\n6. Checking ABFSS URLs...")
+        print(f"   - Table base URL: {dr.table_base_url}")
+        print(f"   - Files base URL: {dr.files_base_url}")
+        
+        # Close connection
+        print(f"\n7. Closing connection...")
+        dr.close()
+        print("   ✓ Connection closed successfully")
+        
+        # Summary
+        print("\n✅ All Snowflake connection tests passed!")
+        return True
+        
+    except Exception as e:
+        print(f"\n❌ Snowflake connection test failed: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def main():
     # Start total execution timer
     total_start_time = time.time()
@@ -266,7 +340,10 @@ def main():
                              2, ws,lh,Nbr_threads)),
               ('price_today','append'),
               ('scada_today','append'),
+              ('download_excel',("raw/", ws,lh)),
               ('duid','ignore'),
+              ('calendar','ignore'),
+              ('mstdatetime','ignore'),
               ('summary__incremental', 'append')
              ]
     
@@ -634,6 +711,16 @@ if __name__ == "__main__":
     
     if not semantic_model_test_passed:
         print("[FAIL] Semantic model tests failed!")
+        sys.exit(1)
+    
+    # Run Snowflake connection tests
+    print("\n" + "=" * 80)
+    print("🔬 RUNNING SNOWFLAKE CONNECTION TESTS")
+    print("=" * 80)
+    snowflake_test_passed = test_snowflake_connection()
+    
+    if not snowflake_test_passed:
+        print("[FAIL] Snowflake connection tests failed!")
         sys.exit(1)
     
     print("\n[RUN] All preliminary tests passed! Running full integration tests...")

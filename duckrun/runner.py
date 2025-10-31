@@ -130,9 +130,12 @@ def _run_python(duckrun_instance, name: str, args: tuple) -> Any:
     
     # Get original and resolved names
     original_workspace = duckrun_instance.workspace
-    original_lakehouse = duckrun_instance.lakehouse_name
+    original_lakehouse = duckrun_instance.lakehouse_display_name  # Base name without suffix (e.g., "data")
     resolved_workspace = duckrun_instance.workspace_id
-    resolved_lakehouse = duckrun_instance.lakehouse_id
+    
+    # Always pass base lakehouse name (without .Lakehouse suffix) to user functions
+    # User functions expect just the name like "data", not "data.Lakehouse"
+    resolved_lakehouse = duckrun_instance.lakehouse_display_name
     
     # Substitute workspace/lakehouse names in args if they differ
     # This prevents URL encoding issues when names contain spaces
@@ -149,7 +152,7 @@ def _run_python(duckrun_instance, name: str, args: tuple) -> Any:
             else:
                 substituted_args.append(arg)
         args = tuple(substituted_args)
-        print(f"📝 Auto-substituted workspace/lakehouse names in args for URL compatibility")
+        print(f"📝 Auto-substituted workspace/lakehouse names in args")
     
     print(f"Running Python: {name}{args}")
     result = func(*args)
@@ -282,12 +285,17 @@ def _read_sql_file(duckrun_instance, table_name: str, params: Optional[Dict] = N
             # If GUID, use just the GUID
             content = content.replace('${lh}.Lakehouse', duckrun_instance.lakehouse_name)
         else:
-            # If not GUID, use legacy format
-            content = content.replace('${lh}.Lakehouse', f'{duckrun_instance.lakehouse_name}.Lakehouse')
+            # If not GUID, check if lakehouse_name already has .ItemType suffix
+            if duckrun_instance.lakehouse_name.endswith(('.Lakehouse', '.Warehouse', '.Database', '.SnowflakeDatabase')):
+                # Already has suffix - use as is
+                content = content.replace('${lh}.Lakehouse', duckrun_instance.lakehouse_name)
+            else:
+                # No suffix - add .Lakehouse for legacy format
+                content = content.replace('${lh}.Lakehouse', f'{duckrun_instance.lakehouse_name}.Lakehouse')
 
     full_params = {
         'ws': duckrun_instance.workspace,
-        'lh': duckrun_instance.lakehouse_name,
+        'lh': duckrun_instance.lakehouse_display_name,  # Use display name (without suffix) for backward compat
         'schema': duckrun_instance.schema,
         'storage_account': duckrun_instance.storage_account,
         'tables_url': duckrun_instance.table_base_url,
