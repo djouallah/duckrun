@@ -45,3 +45,6 @@ tests/test_onelake_upload/
 tests/quick_test/
 tests/downloaded_*/
 tests/temp_*/
+
+# Confidential test files
+tests/basic.py
