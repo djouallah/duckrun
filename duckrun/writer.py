@@ -3,6 +3,20 @@ Delta Lake writer functionality for duckrun - Spark-style write API
 """
 from deltalake import DeltaTable, write_deltalake, __version__ as deltalake_version
 
+# Try to import WriterProperties for Rust engine (available in 0.18.2+)
+try:
+    from deltalake.writer import WriterProperties
+    _HAS_WRITER_PROPERTIES = True
+except ImportError:
+    _HAS_WRITER_PROPERTIES = False
+
+# Try to import PyArrow dataset for old PyArrow engine
+try:
+    import pyarrow.dataset as ds
+    _HAS_PYARROW_DATASET = True
+except ImportError:
+    _HAS_PYARROW_DATASET = False
+
 
 # Row Group configuration for optimal Delta Lake performance
 RG = 8_000_000
@@ -23,12 +37,14 @@ def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=N
     - Has max_rows_per_file/max_rows_per_group/min_rows_per_group for optimization
     - When mergeSchema=True: must set schema_mode='merge' + engine='rust', NO row group params
     - When mergeSchema=False: use row group params, DON'T set engine (pyarrow is default)
+    - COMPRESSION: Defaults to ZSTD via writer_properties (rust) or file_options (pyarrow)
     
     deltalake 0.20+:
     - Does NOT have 'engine' parameter (everything is rust, pyarrow deprecated)
     - Does NOT have max_rows_per_file (row group optimization removed)
     - When mergeSchema=True: must set schema_mode='merge'
     - When mergeSchema=False: just write normally (no special params)
+    - COMPRESSION: Defaults to ZSTD via writer_properties (rust only)
     
     Uses version detection for simpler logic.
     """
@@ -50,7 +66,13 @@ def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=N
             # deltalake 0.18.2-0.19.x: must also set engine='rust' for schema merging
             # Do NOT use row group params (they conflict with rust engine)
             args['engine'] = 'rust'
-        # For version 0.20+: just schema_mode='merge' is enough, rust is default
+            # Set ZSTD compression for Rust engine
+            if _HAS_WRITER_PROPERTIES:
+                args['writer_properties'] = WriterProperties(compression='ZSTD')
+        else:
+            # Version 0.20+: rust is default, just add compression
+            if _HAS_WRITER_PROPERTIES:
+                args['writer_properties'] = WriterProperties(compression='ZSTD')
     else:
         # Normal write mode (no schema merging)
         if _IS_OLD_DELTALAKE:
@@ -59,7 +81,14 @@ def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=N
             args['max_rows_per_file'] = RG
             args['max_rows_per_group'] = RG
             args['min_rows_per_group'] = RG
-        # For version 0.20+: no optimization available (rust by default, no row group params supported)
+            # Set ZSTD compression for PyArrow engine
+            if _HAS_PYARROW_DATASET:
+                args['file_options'] = ds.ParquetFileFormat().make_write_options(compression='ZSTD')
+        else:
+            # Version 0.20+: no optimization available (rust by default, no row group params supported)
+            # Set ZSTD compression for Rust engine
+            if _HAS_WRITER_PROPERTIES:
+                args['writer_properties'] = WriterProperties(compression='ZSTD')
     
     return args
 
@@ -135,14 +164,14 @@ class DeltaWriter:
         # Prepare info message based on version and settings
         if self._schema_mode == 'merge':
             if _IS_OLD_DELTALAKE:
-                engine_info = " (engine=rust, schema_mode=merge)"
+                engine_info = " (engine=rust, schema_mode=merge, compression=ZSTD)"
             else:
-                engine_info = " (schema_mode=merge, rust by default)"
+                engine_info = " (schema_mode=merge, rust by default, compression=ZSTD)"
         else:
             if _IS_OLD_DELTALAKE:
-                engine_info = " (engine=pyarrow, optimized row groups)"
+                engine_info = " (engine=pyarrow, optimized row groups, compression=ZSTD)"
             else:
-                engine_info = " (engine=rust by default)"
+                engine_info = " (engine=rust by default, compression=ZSTD)"
         
         partition_info = f" partitioned by {self._partition_by}" if self._partition_by else ""
         print(f"Writing to Delta table: {schema}.{table} (mode={self._mode}){engine_info}{partition_info}")

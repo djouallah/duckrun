@@ -193,22 +193,26 @@ def get_stats(duckrun_instance, source: str):
                         0 as num_row_groups,
                         0 as size,
                         {vorder} as vorder,
+                        '' as compression,
                         '{timestamp}' as timestamp
                     WHERE false
                 ''')
             else:
-                # Get parquet metadata and create temp table
+                # Get parquet metadata and create temp table with compression info
                 con.execute(f'''
                     CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
                     SELECT 
                         '{tbl}' as tbl,
-                        file_name,
-                        num_rows,
-                        num_row_groups,
+                        fm.file_name,
+                        fm.num_rows,
+                        fm.num_row_groups,
                         CEIL({total_size}/(1024*1024)) as size,
                         {vorder} as vorder,
+                        COALESCE(STRING_AGG(DISTINCT pm.compression, ', ' ORDER BY pm.compression), 'UNCOMPRESSED') as compression,
                         '{timestamp}' as timestamp
-                    FROM parquet_file_metadata({delta})
+                    FROM parquet_file_metadata({delta}) fm
+                    LEFT JOIN parquet_metadata({delta}) pm ON fm.file_name = pm.file_name
+                    GROUP BY fm.file_name, fm.num_rows, fm.num_row_groups
                 ''')
             
         except Exception as e:
@@ -239,6 +243,7 @@ def get_stats(duckrun_instance, source: str):
                             0 as num_row_groups,
                             0 as size,
                             false as vorder,
+                            '' as compression,
                             '{timestamp}' as timestamp
                         WHERE false
                     ''')
@@ -255,18 +260,21 @@ def get_stats(duckrun_instance, source: str):
                             filename = full_path
                         filenames.append(table_path + "/" + filename)
                     
-                    # Use parquet_file_metadata to get actual parquet stats
+                    # Use parquet_file_metadata to get actual parquet stats with compression
                     con.execute(f'''
                         CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
                         SELECT 
                             '{tbl}' as tbl,
-                            file_name,
-                            num_rows,
-                            num_row_groups,
+                            fm.file_name,
+                            fm.num_rows,
+                            fm.num_row_groups,
                             0 as size,
                             false as vorder,
+                            COALESCE(STRING_AGG(DISTINCT pm.compression, ', ' ORDER BY pm.compression), 'UNCOMPRESSED') as compression,
                             '{timestamp}' as timestamp
-                        FROM parquet_file_metadata({filenames})
+                        FROM parquet_file_metadata({filenames}) fm
+                        LEFT JOIN parquet_metadata({filenames}) pm ON fm.file_name = pm.file_name
+                        GROUP BY fm.file_name, fm.num_rows, fm.num_row_groups
                     ''')
                 
                 print(f"   ✓ Successfully processed '{tbl}' using DuckDB fallback with parquet metadata")
@@ -284,7 +292,7 @@ def get_stats(duckrun_instance, source: str):
         print("⚠️  No tables could be processed successfully")
         import pandas as pd
         return pd.DataFrame(columns=['tbl', 'total_rows', 'num_files', 'num_row_group', 
-                                     'average_row_group', 'file_size_MB', 'vorder', 'timestamp'])
+                                     'average_row_group', 'file_size_MB', 'vorder', 'compression', 'timestamp'])
     
     # Union all successfully processed temp tables
     union_parts = [f'SELECT * FROM tbl_{i}' for i in successful_tables]
@@ -300,6 +308,7 @@ def get_stats(duckrun_instance, source: str):
             CAST(CEIL(SUM(num_rows)::DOUBLE / NULLIF(SUM(num_row_groups), 0)) AS INTEGER) as average_row_group,
             MIN(size) as file_size_MB,
             ANY_VALUE(vorder) as vorder,
+            STRING_AGG(DISTINCT compression, ', ' ORDER BY compression) as compression,
             ANY_VALUE(timestamp) as timestamp
         FROM ({union_query})
         WHERE tbl IS NOT NULL
