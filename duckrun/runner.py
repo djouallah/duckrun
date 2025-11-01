@@ -7,45 +7,7 @@ import importlib.util
 from typing import List, Tuple, Dict, Optional, Callable, Any
 from string import Template
 from deltalake import DeltaTable, write_deltalake
-# Row Group configuration for optimal Delta Lake performance
-RG = 8_000_000
-
-
-def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=None):
-    """
-    Build arguments for write_deltalake based on requirements:
-    - If schema_mode='merge': use rust engine (no row group params)
-    - Otherwise: use pyarrow engine with row group optimization (if supported)
-    """
-    args = {
-        'table_or_uri': path,
-        'data': df,
-        'mode': mode
-    }
-    
-    # Add partition_by if specified
-    if partition_by:
-        args['partition_by'] = partition_by
-    
-    # Engine selection based on schema_mode
-    if schema_mode == 'merge':
-        # Use rust engine for schema merging (no row group params supported)
-        args['schema_mode'] = 'merge'
-        args['engine'] = 'rust'
-    else:
-        # Try to use pyarrow engine with row group optimization
-        # Check if row group parameters are supported by inspecting function signature
-        import inspect
-        sig = inspect.signature(write_deltalake)
-        
-        if 'max_rows_per_file' in sig.parameters:
-            # Older deltalake version - use row group optimization
-            args['max_rows_per_file'] = RG
-            args['max_rows_per_group'] = RG
-            args['min_rows_per_group'] = RG
-        # For newer versions, just use default parameters
-    
-    return args
+from .writer import _build_write_deltalake_args
 
 
 def run(duckrun_instance, pipeline: List[Tuple]) -> bool:
