@@ -1179,7 +1179,7 @@ class Duckrun(WorkspaceOperationsMixin):
             return False
 
     def deploy(self, bim_url: str, dataset_name: Optional[str] = None, 
-               wait_seconds: int = 5) -> int:
+               wait_seconds: int = 5, refresh: str = "full") -> int:
         """
         Deploy a semantic model from a BIM file using DirectLake mode.
         
@@ -1190,6 +1190,9 @@ class Duckrun(WorkspaceOperationsMixin):
                 - Workspace/Model: "workspace_name/model_name"
             dataset_name: Name for the semantic model (default: schema name)
             wait_seconds: Seconds to wait for permission propagation (default: 5)
+            refresh: Refresh strategy:
+                - "full": Clear values and process full refresh (default)
+                - "ignore": Skip refresh entirely
         
         Returns:
             1 for success, 0 for failure
@@ -1205,6 +1208,9 @@ class Duckrun(WorkspaceOperationsMixin):
             
             # Deploy with custom name
             dr.deploy("https://github.com/.../model.bim", dataset_name="Sales Model")
+            
+            # Deploy without refresh
+            dr.deploy("https://github.com/.../model.bim", refresh="ignore")
         """
         from .semantic_model import deploy_semantic_model
         
@@ -1227,7 +1233,8 @@ class Duckrun(WorkspaceOperationsMixin):
             schema_name=self.schema,
             dataset_name=dataset_name,
             bim_url_or_path=bim_url,
-            wait_seconds=wait_seconds
+            wait_seconds=wait_seconds,
+            refresh=refresh
         )
 
     def close(self):

@@ -129,15 +129,20 @@ def check_dataset_exists(dataset_name, workspace_id, client):
         return False
 
 
-def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None):
+def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None, refresh="full"):
     """Refresh a dataset and monitor progress using Power BI API
     
-    For DirectLake models, performs a two-step refresh:
-    1. clearValues - Purges data from memory
-    2. full - Reframes data from Delta tables
+    For DirectLake models, performs refresh based on refresh parameter:
+    - refresh="full": Two-step refresh (clearValues + full reframe)
+    - refresh="ignore": Skip refresh entirely
     
     If a refresh is already in progress, waits for it to complete before starting a new one.
     """
+    
+    # Skip refresh entirely if refresh is "ignore"
+    if refresh == "ignore":
+        print("   Ignoring refresh - skipping refresh")
+        return
     
     # If dataset_id not provided, look it up by name
     if not dataset_id:
@@ -539,7 +544,7 @@ def create_dataset_from_bim(dataset_name, bim_content, workspace_id, client):
 
 
 def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_name, dataset_name, 
-                         bim_url_or_path, wait_seconds=5):
+                         bim_url_or_path, wait_seconds=5, refresh="full"):
     """
     Deploy a semantic model using DirectLake mode.
     
@@ -550,6 +555,9 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         dataset_name: Name for the semantic model
         bim_url_or_path: URL to the BIM file or local file path (e.g., 'model.bim' or 'https://...')
         wait_seconds: Seconds to wait before refresh (default: 5)
+        refresh: Refresh strategy (default: "full")
+            - "full": Clear values and process full refresh
+            - "ignore": Skip refresh entirely
     
     Returns:
         1 for success, 0 for failure
@@ -562,6 +570,9 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         # Using a local file
         dr.deploy("./my_model.bim")
         dr.deploy("C:/path/to/model.bim")
+        
+        # Deploy without refresh
+        dr.deploy("./my_model.bim", refresh="ignore")
     """
     print("=" * 70)
     print("Semantic Model Deployment (DirectLake)")
@@ -586,7 +597,7 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
                 time.sleep(wait_seconds)
             
             print("\n[Step 3/3] Refreshing existing semantic model...")
-            refresh_dataset(dataset_name, workspace_id, client)
+            refresh_dataset(dataset_name, workspace_id, client, refresh=refresh)
             
             print("\n" + "=" * 70)
             print("🎉 Refresh Completed!")
@@ -618,7 +629,7 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         
         # Step 6: Refresh using the dataset ID returned from creation
         print("\n[Step 6/6] Refreshing semantic model...")
-        refresh_dataset(dataset_name, workspace_id, client, dataset_id=dataset_id)
+        refresh_dataset(dataset_name, workspace_id, client, dataset_id=dataset_id, refresh=refresh)
         
         print("\n" + "=" * 70)
         print("🎉 Deployment Completed!")
@@ -645,7 +656,7 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         return 0
 
 
-def copy_model(ws_source, model_name, destination, new_model_name=None, wait_seconds=5):
+def copy_model(ws_source, model_name, destination, new_model_name=None, wait_seconds=5, refresh="full"):
     """
     Copy a semantic model from one workspace to another.
     
@@ -658,6 +669,9 @@ def copy_model(ws_source, model_name, destination, new_model_name=None, wait_sec
         destination: Destination in format "workspace/lakehouse.lakehouse/schema"
         new_model_name: Name for the new semantic model (default: same as source)
         wait_seconds: Seconds to wait before refresh (default: 5)
+        refresh: Refresh strategy (default: "full")
+            - "full": Clear values and process full refresh
+            - "ignore": Skip refresh entirely
     
     Returns:
         1 for success, 0 for failure
@@ -669,6 +683,9 @@ def copy_model(ws_source, model_name, destination, new_model_name=None, wait_sec
         # Copy to different workspace with new name
         copy_model("Source WS", "Production Model", "Target WS/Data Lake.lakehouse/analytics", 
                    new_model_name="Production Model - Copy")
+        
+        # Copy without refresh
+        copy_model("Source WS", "Model", "Target WS/LH.lakehouse/dbo", refresh="ignore")
         
         # Using the connect pattern
         import duckrun
@@ -796,7 +813,8 @@ def copy_model(ws_source, model_name, destination, new_model_name=None, wait_sec
             schema_name=schema,
             dataset_name=new_model_name,
             bim_url_or_path=temp_bim_path,
-            wait_seconds=wait_seconds
+            wait_seconds=wait_seconds,
+            refresh=refresh
         )
         
         # Clean up temp file
