@@ -60,13 +60,14 @@ def _get_existing_tables_in_schema(duckrun_instance, schema_name: str) -> list:
         return []
 
 
-def get_stats(duckrun_instance, source: str):
+def get_stats(duckrun_instance, source: str = None):
     """
     Get comprehensive statistics for Delta Lake tables.
     
     Args:
         duckrun_instance: The Duckrun connection instance
-        source: Can be one of:
+        source: Optional. Can be one of:
+               - None: Use all tables in the connection's schema (default)
                - Table name: 'table_name' (uses main schema in DuckDB)
                - Schema.table: 'schema.table_name' (specific table in schema, if multi-schema)
                - Schema only: 'schema' (all tables in schema, if multi-schema)
@@ -77,6 +78,9 @@ def get_stats(duckrun_instance, source: str):
     
     Examples:
         con = duckrun.connect("tmp/data.lakehouse/test")
+        
+        # All tables in the connection's schema
+        stats = con.get_stats()
         
         # Single table in main schema (DuckDB uses 'main', not 'test')
         stats = con.get_stats('price_today')
@@ -92,6 +96,10 @@ def get_stats(duckrun_instance, source: str):
     # DuckDB always uses 'main' as the default schema, regardless of connection URL schema
     duckdb_schema = "main"
     url_schema = duckrun_instance.schema  # This is from the connection URL path
+    
+    # If source is not provided, default to all tables in the connection's schema
+    if source is None:
+        source = url_schema
     
     # Parse the source and validate existence
     if '.' in source:

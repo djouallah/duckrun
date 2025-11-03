@@ -12,7 +12,71 @@ from .runner import run as _run
 from .files import copy as _copy, download as _download
 from .writer import QueryResult
 
-class Duckrun:
+
+class WorkspaceOperationsMixin:
+    """
+    Mixin class for workspace-level operations that work for both
+    full Duckrun connections and workspace-only connections.
+    """
+    
+    def import_notebook_from_web(self, url: str, 
+                                  notebook_name: Optional[str] = None,
+                                  overwrite: bool = False) -> dict:
+        """
+        Import a Jupyter notebook from a web URL into the workspace.
+        
+        Args:
+            url: URL to the notebook file (e.g., GitHub raw URL). Required.
+            notebook_name: Name for the imported notebook. Optional - derived from URL if not provided.
+            overwrite: Whether to overwrite if notebook already exists (default: False)
+            
+        Returns:
+            Dictionary with import result
+            
+        Examples:
+            con = duckrun.connect("workspace/lakehouse.lakehouse")
+            result = con.import_notebook_from_web(
+                url="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
+            )
+            
+            ws = duckrun.connect("workspace")
+            result = ws.import_notebook_from_web(
+                url="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
+            )
+        """
+        from .notebook import import_notebook_from_web as _import_notebook_from_web
+        
+        # Get workspace name from either self.workspace or self.workspace_name
+        workspace_name = getattr(self, 'workspace', None) or getattr(self, 'workspace_name', None)
+        
+        return _import_notebook_from_web(
+            url=url,
+            notebook_name=notebook_name,
+            overwrite=overwrite,
+            workspace_name=workspace_name
+        )
+    
+    def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
+        """Helper method to get workspace ID from name"""
+        try:
+            url = "https://api.fabric.microsoft.com/v1/workspaces"
+            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            
+            response = requests.get(url, headers=headers)
+            response.raise_for_status()
+            
+            workspaces = response.json().get("value", [])
+            for workspace in workspaces:
+                if workspace.get("displayName") == workspace_name:
+                    return workspace.get("id")
+            
+            return None
+            
+        except Exception:
+            return None
+
+
+class Duckrun(WorkspaceOperationsMixin):
     """
     OneLake task runner with clean tuple-based API.
     Supports lakehouses, warehouses, databases, and other OneLake items.
@@ -971,12 +1035,13 @@ class Duckrun:
         """Get underlying DuckDB connection"""
         return self.con
 
-    def get_stats(self, source: str):
+    def get_stats(self, source: str = None):
         """
         Get comprehensive statistics for Delta Lake tables.
         
         Args:
-            source: Can be one of:
+            source: Optional. Can be one of:
+                   - None: Use all tables in the connection's schema (default)
                    - Table name: 'table_name' (uses current schema)
                    - Schema.table: 'schema.table_name' (specific table in schema)
                    - Schema only: 'schema' (all tables in schema)
@@ -987,6 +1052,9 @@ class Duckrun:
         
         Examples:
             con = duckrun.connect("tmp/data.lakehouse/aemo")
+            
+            # All tables in current schema (aemo)
+            stats = con.get_stats()
             
             # Single table in current schema
             stats = con.get_stats('price')
@@ -1120,7 +1188,7 @@ class Duckrun:
                 - URL: "https://raw.githubusercontent.com/.../model.bim"
                 - Local file: "model.bim"
                 - Workspace/Model: "workspace_name/model_name"
-            dataset_name: Name for the semantic model (default: source model name if workspace/model format, else lakehouse_schema)
+            dataset_name: Name for the semantic model (default: schema name)
             wait_seconds: Seconds to wait for permission propagation (default: 5)
         
         Returns:
@@ -1129,14 +1197,14 @@ class Duckrun:
         Examples:
             dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo")
             
+            # Deploy with schema name as dataset name (dbo)
+            dr.deploy("https://github.com/.../model.bim")
+            
             # Deploy from workspace/model (uses same name by default)
             dr.deploy("Source Workspace/Source Model")  # Creates "Source Model"
             
             # Deploy with custom name
-            dr.deploy("Source Workspace/Source Model", dataset_name="Sales Model Copy")
-            
-            # Deploy from URL or local file
-            dr.deploy("https://raw.githubusercontent.com/.../model.bim", dataset_name="My Model")
+            dr.deploy("https://github.com/.../model.bim", dataset_name="Sales Model")
         """
         from .semantic_model import deploy_semantic_model
         
@@ -1148,9 +1216,9 @@ class Duckrun:
                 if len(parts) == 2:
                     dataset_name = parts[1]  # Use the model name
                 else:
-                    dataset_name = f"{self.lakehouse_name}_{self.schema}"
+                    dataset_name = self.schema  # Use schema name
             else:
-                dataset_name = f"{self.lakehouse_name}_{self.schema}"
+                dataset_name = self.schema  # Use schema name
         
         # Call the deployment function (DirectLake only)
         return deploy_semantic_model(
@@ -1162,25 +1230,6 @@ class Duckrun:
             wait_seconds=wait_seconds
         )
 
-    def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
-        """Helper method to get workspace ID from name"""
-        try:
-            url = "https://api.fabric.microsoft.com/v1/workspaces"
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            
-            workspaces = response.json().get("value", [])
-            for workspace in workspaces:
-                if workspace.get("displayName") == workspace_name:
-                    return workspace.get("id")
-            
-            return None
-            
-        except Exception:
-            return None
-
     def close(self):
         """Close DuckDB connection"""
         if self.con:
@@ -1188,7 +1237,7 @@ class Duckrun:
             print("Connection closed")
 
 
-class WorkspaceConnection:
+class WorkspaceConnection(WorkspaceOperationsMixin):
     """
     Simple workspace connection for lakehouse management operations.
     """
@@ -1428,23 +1477,4 @@ class WorkspaceConnection:
             print(f"❌ Error downloading semantic model: {e}")
             import traceback
             traceback.print_exc()
-            return None
-    
-    def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
-        """Helper method to get workspace ID from name"""
-        try:
-            url = "https://api.fabric.microsoft.com/v1/workspaces"
-            headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-            
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
-            
-            workspaces = response.json().get("value", [])
-            for workspace in workspaces:
-                if workspace.get("displayName") == workspace_name:
-                    return workspace.get("id")
-            
-            return None
-            
-        except Exception:
             return None

@@ -130,13 +130,119 @@ def check_dataset_exists(dataset_name, workspace_id, client):
 
 
 def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None):
-    """Refresh a dataset and monitor progress using Power BI API"""
+    """Refresh a dataset and monitor progress using Power BI API
+    
+    For DirectLake models, performs a two-step refresh:
+    1. clearValues - Purges data from memory
+    2. full - Reframes data from Delta tables
+    
+    If a refresh is already in progress, waits for it to complete before starting a new one.
+    """
     
     # If dataset_id not provided, look it up by name
     if not dataset_id:
         dataset_id = get_dataset_id(dataset_name, workspace_id, client)
     
-    payload = {
+    # Use Power BI API for refresh (not Fabric API)
+    powerbi_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/refreshes"
+    headers = client._get_headers()
+    
+    # Check for in-progress refreshes
+    print("   Checking for in-progress refreshes...")
+    try:
+        status_response = requests.get(f"{powerbi_url}?$top=1", headers=headers)
+        if status_response.status_code == 200:
+            refreshes = status_response.json().get('value', [])
+            if refreshes:
+                latest_refresh = refreshes[0]
+                status = latest_refresh.get('status')
+                if status in ['InProgress', 'Unknown']:
+                    refresh_id = latest_refresh.get('requestId')
+                    print(f"   ⚠️  Found in-progress refresh (ID: {refresh_id})")
+                    print(f"   Waiting for current refresh to complete...")
+                    
+                    # Wait for the in-progress refresh to complete
+                    max_wait_attempts = 60
+                    for attempt in range(max_wait_attempts):
+                        time.sleep(5)
+                        check_response = requests.get(f"{powerbi_url}/{refresh_id}", headers=headers)
+                        if check_response.status_code == 200:
+                            current_status = check_response.json().get('status')
+                            
+                            if current_status == 'Completed':
+                                print(f"   ✓ Previous refresh completed")
+                                break
+                            elif current_status == 'Failed':
+                                print(f"   ⚠️  Previous refresh failed, continuing with new refresh")
+                                break
+                            elif current_status == 'Cancelled':
+                                print(f"   ⚠️  Previous refresh was cancelled, continuing with new refresh")
+                                break
+                            
+                            if attempt % 6 == 0:
+                                print(f"   Still waiting... (status: {current_status})")
+                    else:
+                        print(f"   ⚠️  Timeout waiting for previous refresh, will attempt new refresh anyway")
+    except Exception as e:
+        print(f"   ⚠️  Could not check refresh status: {e}")
+        print(f"   Continuing with refresh attempt...")
+    
+    # Step 1: clearValues - Purge data from memory
+    print("   Step 1: Clearing values from memory...")
+    clearvalues_payload = {
+        "type": "clearValues",
+        "commitMode": "transactional",
+        "maxParallelism": 10,
+        "retryCount": 2,
+        "objects": []
+    }
+    
+    response = requests.post(powerbi_url, headers=headers, json=clearvalues_payload)
+    
+    if response.status_code in [200, 202]:
+        # For 202, monitor the clearValues operation
+        if response.status_code == 202:
+            location = response.headers.get('Location')
+            if location:
+                clear_refresh_id = location.split('/')[-1]
+                print("   ✓ Clear values initiated, monitoring progress...")
+                
+                max_attempts = 60
+                for attempt in range(max_attempts):
+                    time.sleep(2)
+                    
+                    status_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/refreshes/{clear_refresh_id}"
+                    status_response = requests.get(status_url, headers=headers)
+                    status_response.raise_for_status()
+                    status = status_response.json().get('status')
+                    
+                    if status == 'Completed':
+                        print(f"   ✓ Clear values completed")
+                        break
+                    elif status == 'Failed':
+                        error = status_response.json().get('serviceExceptionJson', '')
+                        raise Exception(f"Clear values failed: {error}")
+                    elif status == 'Cancelled':
+                        raise Exception("Clear values was cancelled")
+                    
+                    if attempt % 10 == 0 and attempt > 0:
+                        print(f"   Clear values status: {status}...")
+                else:
+                    raise Exception(f"Clear values timed out")
+        else:
+            print("   ✓ Clear values completed")
+    else:
+        # Provide detailed error message
+        try:
+            error_details = response.json()
+            error_message = error_details.get('error', {}).get('message', response.text)
+            raise Exception(f"Clear values failed with status {response.status_code}: {error_message}")
+        except (json.JSONDecodeError, ValueError):
+            response.raise_for_status()
+    
+    # Step 2: full refresh - Reframe data from Delta tables
+    print("   Step 2: Full refresh to reframe data...")
+    full_payload = {
         "type": "full",
         "commitMode": "transactional",
         "maxParallelism": 10,
@@ -144,14 +250,10 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None):
         "objects": []
     }
     
-    # Use Power BI API for refresh (not Fabric API)
-    powerbi_url = f"https://api.powerbi.com/v1.0/myorg/datasets/{dataset_id}/refreshes"
-    headers = client._get_headers()
-    
-    response = requests.post(powerbi_url, headers=headers, json=payload)
+    response = requests.post(powerbi_url, headers=headers, json=full_payload)
     
     if response.status_code in [200, 202]:
-        print(f"✓ Refresh initiated")
+        print(f"   ✓ Refresh initiated")
         
         # For 202, get the refresh_id from the Location header
         if response.status_code == 202:
@@ -183,7 +285,13 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None):
                 
                 raise Exception(f"Refresh timed out")
     else:
-        response.raise_for_status()
+        # Provide detailed error message
+        try:
+            error_details = response.json()
+            error_message = error_details.get('error', {}).get('message', response.text)
+            raise Exception(f"Refresh request failed with status {response.status_code}: {error_message}")
+        except (json.JSONDecodeError, ValueError):
+            response.raise_for_status()
 
 
 def download_bim_from_github(url_or_path):
@@ -471,13 +579,13 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         dataset_exists = check_dataset_exists(dataset_name, workspace_id, client)
         
         if dataset_exists:
-            print(f"\n✓ Dataset exists - refreshing...")
+            print(f"✓ Dataset '{dataset_name}' already exists - skipping deployment")
             
             if wait_seconds > 0:
                 print(f"   Waiting {wait_seconds} seconds...")
                 time.sleep(wait_seconds)
             
-            print("\n[Step 6/6] Refreshing semantic model...")
+            print("\n[Step 3/3] Refreshing existing semantic model...")
             refresh_dataset(dataset_name, workspace_id, client)
             
             print("\n" + "=" * 70)
