@@ -60,6 +60,49 @@ def _get_existing_tables_in_schema(duckrun_instance, schema_name: str) -> list:
         return []
 
 
+def _match_tables_by_pattern(duckrun_instance, pattern: str) -> dict:
+    """Match tables across all schemas using a wildcard pattern.
+    Pattern can be:
+    - '*.summary' - matches 'summary' table in all schemas
+    - '*summary' - matches any table ending with 'summary'
+    - 'schema.*' - matches all tables in 'schema'
+    Returns a dict mapping schema names to lists of matching table names."""
+    import fnmatch
+    
+    try:
+        # Query all schemas and tables in one go
+        query = """
+            SELECT table_schema, table_name 
+            FROM information_schema.tables 
+            WHERE table_schema NOT LIKE 'pg_%' 
+            AND table_schema != 'information_schema'
+            AND table_name NOT LIKE 'tbl_%'
+        """
+        result = duckrun_instance.con.execute(query).fetchall()
+        
+        matched = {}
+        
+        # Check if pattern contains a dot (schema.table pattern)
+        if '.' in pattern:
+            schema_pattern, table_pattern = pattern.split('.', 1)
+            for schema, table in result:
+                if fnmatch.fnmatch(schema, schema_pattern) and fnmatch.fnmatch(table, table_pattern):
+                    if schema not in matched:
+                        matched[schema] = []
+                    matched[schema].append(table)
+        else:
+            # Pattern matches only table names
+            for schema, table in result:
+                if fnmatch.fnmatch(table, pattern):
+                    if schema not in matched:
+                        matched[schema] = []
+                    matched[schema].append(table)
+        
+        return matched
+    except:
+        return {}
+
+
 def get_stats(duckrun_instance, source: str = None):
     """
     Get comprehensive statistics for Delta Lake tables.
@@ -71,6 +114,7 @@ def get_stats(duckrun_instance, source: str = None):
                - Table name: 'table_name' (uses main schema in DuckDB)
                - Schema.table: 'schema.table_name' (specific table in schema, if multi-schema)
                - Schema only: 'schema' (all tables in schema, if multi-schema)
+               - Wildcard pattern: '*.summary' (matches tables across all schemas)
     
     Returns:
         Arrow table with statistics including total rows, file count, row groups, 
@@ -90,6 +134,9 @@ def get_stats(duckrun_instance, source: str = None):
         
         # All tables in a schema (only if multi-schema enabled)
         stats = con.get_stats('aemo')
+        
+        # Wildcard pattern across all schemas (only if multi-schema enabled)
+        stats = con.get_stats('*.summary')
     """
     timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
     
@@ -101,8 +148,27 @@ def get_stats(duckrun_instance, source: str = None):
     if source is None:
         source = url_schema
     
+    # Check if source contains wildcard characters
+    if '*' in source or '?' in source:
+        # Wildcard pattern mode - only valid if multi-schema is enabled
+        if not duckrun_instance.scan_all_schemas:
+            raise ValueError(f"Wildcard pattern '{source}' not supported. Connection was made to a specific schema '{url_schema}'. Enable multi-schema mode to use wildcards.")
+        
+        matched_tables = _match_tables_by_pattern(duckrun_instance, source)
+        
+        if not matched_tables:
+            raise ValueError(f"No tables found matching pattern '{source}'")
+        
+        # Flatten the matched tables into a list with schema info
+        tables_with_schemas = []
+        for schema, tables in matched_tables.items():
+            for table in tables:
+                tables_with_schemas.append((schema, table))
+        
+        print(f"Found {len(tables_with_schemas)} tables matching pattern '{source}'")
+        
     # Parse the source and validate existence
-    if '.' in source:
+    elif '.' in source:
         # Format: schema.table - only valid if multi-schema is enabled
         schema_name, table_name = source.split('.', 1)
         
@@ -113,46 +179,45 @@ def get_stats(duckrun_instance, source: str = None):
         if not _table_exists(duckrun_instance, schema_name, table_name):
             raise ValueError(f"Table '{table_name}' does not exist in schema '{schema_name}'")
         
-        list_tables = [table_name]
+        tables_with_schemas = [(schema_name, table_name)]
     else:
         # Could be just table name or schema name
         if duckrun_instance.scan_all_schemas:
             # Multi-schema mode: DuckDB has actual schemas
             # First check if it's a table in main schema
             if _table_exists(duckrun_instance, duckdb_schema, source):
-                list_tables = [source]
-                schema_name = duckdb_schema
+                tables_with_schemas = [(duckdb_schema, source)]
             # Otherwise, check if it's a schema name
             elif _schema_exists(duckrun_instance, source):
                 schema_name = source
                 list_tables = _get_existing_tables_in_schema(duckrun_instance, source)
                 if not list_tables:
                     raise ValueError(f"Schema '{source}' exists but contains no tables")
+                tables_with_schemas = [(schema_name, tbl) for tbl in list_tables]
             else:
                 raise ValueError(f"Neither table '{source}' in main schema nor schema '{source}' exists")
         else:
             # Single-schema mode: tables are in DuckDB's main schema, use URL schema for file paths
             if _table_exists(duckrun_instance, duckdb_schema, source):
                 # It's a table name
-                list_tables = [source]
-                schema_name = url_schema  # Use URL schema for file path construction
+                tables_with_schemas = [(url_schema, source)]
             elif source == url_schema:
                 # Special case: user asked for stats on the URL schema name - list all tables
                 list_tables = _get_existing_tables_in_schema(duckrun_instance, duckdb_schema)
-                schema_name = url_schema  # Use URL schema for file path construction
                 if not list_tables:
                     raise ValueError(f"No tables found in schema '{url_schema}'")
+                tables_with_schemas = [(url_schema, tbl) for tbl in list_tables]
             else:
                 raise ValueError(f"Table '{source}' does not exist in the current context (schema: {url_schema})")
     
     # Use the existing connection
     con = duckrun_instance.con
     
-    print(f"Processing {len(list_tables)} tables: {list_tables}")
+    print(f"Processing {len(tables_with_schemas)} tables from {len(set(s for s, t in tables_with_schemas))} schema(s)")
     
     successful_tables = []
-    for idx, tbl in enumerate(list_tables):
-        print(f"[{idx+1}/{len(list_tables)}] Processing table '{tbl}'...")
+    for idx, (schema_name, tbl) in enumerate(tables_with_schemas):
+        print(f"[{idx+1}/{len(tables_with_schemas)}] Processing table '{schema_name}.{tbl}'...")
         # Construct lakehouse path using correct ABFSS URL format (no .Lakehouse suffix)
         table_path = f"{duckrun_instance.table_base_url}{schema_name}/{tbl}"
         
@@ -179,8 +244,18 @@ def get_stats(duckrun_instance, source: str = None):
                     print(f"Warning: Could not convert RecordBatch for table '{tbl}': Unexpected type {type(add_actions)}")
                     xx = {}
             
-            # Check if VORDER exists
-            vorder = 'tags.VORDER' in xx.keys()
+            # Check if VORDER exists - handle both formats:
+            # 1. Flattened format: 'tags.VORDER' or 'tags.vorder' in keys
+            # 2. Nested format: check in 'tags' dict for 'VORDER' or 'vorder'
+            vorder = False
+            if 'tags.VORDER' in xx.keys() or 'tags.vorder' in xx.keys():
+                vorder = True
+            elif 'tags' in xx.keys() and xx['tags']:
+                # Check nested tags dictionary (tags is a list of dicts, one per file)
+                for tag_dict in xx['tags']:
+                    if tag_dict and ('VORDER' in tag_dict or 'vorder' in tag_dict):
+                        vorder = True
+                        break
             
             # Calculate total size
             total_size = sum(xx['size_bytes']) if xx['size_bytes'] else 0
@@ -195,6 +270,7 @@ def get_stats(duckrun_instance, source: str = None):
                 con.execute(f'''
                     CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
                     SELECT 
+                        '{schema_name}' as schema,
                         '{tbl}' as tbl,
                         'empty' as file_name,
                         0 as num_rows,
@@ -210,6 +286,7 @@ def get_stats(duckrun_instance, source: str = None):
                 con.execute(f'''
                     CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
                     SELECT 
+                        '{schema_name}' as schema,
                         '{tbl}' as tbl,
                         fm.file_name,
                         fm.num_rows,
@@ -245,6 +322,7 @@ def get_stats(duckrun_instance, source: str = None):
                     con.execute(f'''
                         CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
                         SELECT 
+                            '{schema_name}' as schema,
                             '{tbl}' as tbl,
                             'empty' as file_name,
                             0 as num_rows,
@@ -272,6 +350,7 @@ def get_stats(duckrun_instance, source: str = None):
                     con.execute(f'''
                         CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
                         SELECT 
+                            '{schema_name}' as schema,
                             '{tbl}' as tbl,
                             fm.file_name,
                             fm.num_rows,
@@ -299,7 +378,7 @@ def get_stats(duckrun_instance, source: str = None):
         # No tables were processed successfully - return empty dataframe
         print("⚠️  No tables could be processed successfully")
         import pandas as pd
-        return pd.DataFrame(columns=['tbl', 'total_rows', 'num_files', 'num_row_group', 
+        return pd.DataFrame(columns=['schema', 'tbl', 'total_rows', 'num_files', 'num_row_group', 
                                      'average_row_group', 'file_size_MB', 'vorder', 'compression', 'timestamp'])
     
     # Union all successfully processed temp tables
@@ -309,6 +388,7 @@ def get_stats(duckrun_instance, source: str = None):
     # Generate final summary
     final_result = con.execute(f'''
         SELECT 
+            schema,
             tbl,
             SUM(num_rows) as total_rows,
             COUNT(*) as num_files,
@@ -320,7 +400,7 @@ def get_stats(duckrun_instance, source: str = None):
             ANY_VALUE(timestamp) as timestamp
         FROM ({union_query})
         WHERE tbl IS NOT NULL
-        GROUP BY tbl
+        GROUP BY schema, tbl
         ORDER BY total_rows DESC
     ''').df()
     
