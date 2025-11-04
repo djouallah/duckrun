@@ -160,6 +160,7 @@ def import_notebook_from_web(
             update_url = f"{base_url}/workspaces/{workspace_id}/notebooks/{notebook_id}/updateDefinition"
             payload = {
                 "definition": {
+                    "format": "ipynb",
                     "parts": [
                         {
                             "path": "notebook-content.py",
@@ -192,6 +193,7 @@ def import_notebook_from_web(
             payload = {
                 "displayName": notebook_name,
                 "definition": {
+                    "format": "ipynb",
                     "parts": [
                         {
                             "path": "notebook-content.py",
