@@ -1035,7 +1035,7 @@ class Duckrun(WorkspaceOperationsMixin):
         """Get underlying DuckDB connection"""
         return self.con
 
-    def get_stats(self, source: str = None):
+    def get_stats(self, source: str = None, detailed = False):
         """
         Get comprehensive statistics for Delta Lake tables.
         
@@ -1045,19 +1045,26 @@ class Duckrun(WorkspaceOperationsMixin):
                    - Table name: 'table_name' (uses current schema)
                    - Schema.table: 'schema.table_name' (specific table in schema)
                    - Schema only: 'schema' (all tables in schema)
+            detailed: Optional. Controls the level of detail in statistics:
+                     - False (default): Aggregated table-level stats
+                     - True: Row group level statistics with compression details
         
         Returns:
-            Arrow table with statistics including total rows, file count, row groups, 
-            average row group size, file sizes, VORDER status, and timestamp
+            DataFrame with statistics based on detailed parameter:
+            - If detailed=False: Aggregated table-level summary
+            - If detailed=True: Granular file and row group level stats
         
         Examples:
             con = duckrun.connect("tmp/data.lakehouse/aemo")
             
-            # All tables in current schema (aemo)
+            # All tables in current schema (aemo) - aggregated
             stats = con.get_stats()
             
-            # Single table in current schema
+            # Single table in current schema - aggregated
             stats = con.get_stats('price')
+            
+            # Single table with detailed row group statistics
+            stats_detailed = con.get_stats('price', detailed=True)
             
             # Specific table in different schema
             stats = con.get_stats('aemo.price')
@@ -1065,7 +1072,7 @@ class Duckrun(WorkspaceOperationsMixin):
             # All tables in a schema
             stats = con.get_stats('aemo')
         """
-        return _get_stats(self, source)
+        return _get_stats(self, source, detailed)
 
     def list_lakehouses(self) -> List[str]:
         """

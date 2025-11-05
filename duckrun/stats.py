@@ -103,7 +103,7 @@ def _match_tables_by_pattern(duckrun_instance, pattern: str) -> dict:
         return {}
 
 
-def get_stats(duckrun_instance, source: str = None):
+def get_stats(duckrun_instance, source: str = None, detailed = False):
     """
     Get comprehensive statistics for Delta Lake tables.
     
@@ -115,19 +115,25 @@ def get_stats(duckrun_instance, source: str = None):
                - Schema.table: 'schema.table_name' (specific table in schema, if multi-schema)
                - Schema only: 'schema' (all tables in schema, if multi-schema)
                - Wildcard pattern: '*.summary' (matches tables across all schemas)
+        detailed: Optional. Controls the level of detail in statistics:
+                 - False (default): Aggregated table-level stats (total rows, file count, 
+                   row groups, average row group size, file sizes, VORDER status)
+                 - True: Row group level statistics with compression details, row group sizes,
+                   and parquet metadata
     
     Returns:
-        Arrow table with statistics including total rows, file count, row groups, 
-        average row group size, file sizes, VORDER status, and timestamp
+        DataFrame with statistics based on detailed parameter:
+        - If detailed=False: Aggregated table-level summary
+        - If detailed=True: Granular file and row group level stats
     
     Examples:
         con = duckrun.connect("tmp/data.lakehouse/test")
         
-        # All tables in the connection's schema
+        # All tables in the connection's schema (aggregated)
         stats = con.get_stats()
         
-        # Single table in main schema (DuckDB uses 'main', not 'test')
-        stats = con.get_stats('price_today')
+        # Single table with detailed row group statistics
+        stats_detailed = con.get_stats('price_today', detailed=True)
         
         # Specific table in different schema (only if multi-schema enabled)
         stats = con.get_stats('aemo.price')
@@ -283,22 +289,36 @@ def get_stats(duckrun_instance, source: str = None):
                 ''')
             else:
                 # Get parquet metadata and create temp table with compression info
-                con.execute(f'''
-                    CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
-                    SELECT 
-                        '{schema_name}' as schema,
-                        '{tbl}' as tbl,
-                        fm.file_name,
-                        fm.num_rows,
-                        fm.num_row_groups,
-                        CEIL({total_size}/(1024*1024)) as size,
-                        {vorder} as vorder,
-                        COALESCE(STRING_AGG(DISTINCT pm.compression, ', ' ORDER BY pm.compression), 'UNCOMPRESSED') as compression,
-                        '{timestamp}' as timestamp
-                    FROM parquet_file_metadata({delta}) fm
-                    LEFT JOIN parquet_metadata({delta}) pm ON fm.file_name = pm.file_name
-                    GROUP BY fm.file_name, fm.num_rows, fm.num_row_groups
-                ''')
+                if detailed == True:
+                    # Detailed mode: Include ALL parquet_metadata columns
+                    con.execute(f'''
+                        CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
+                        SELECT 
+                            '{schema_name}' as schema,
+                            '{tbl}' as tbl,
+                            {vorder} as vorder,
+                            pm.*,
+                            '{timestamp}' as timestamp
+                        FROM parquet_metadata({delta}) pm
+                    ''')
+                else:
+                    # Aggregated mode: Original summary statistics
+                    con.execute(f'''
+                        CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
+                        SELECT 
+                            '{schema_name}' as schema,
+                            '{tbl}' as tbl,
+                            fm.file_name,
+                            fm.num_rows,
+                            fm.num_row_groups,
+                            CEIL({total_size}/(1024*1024)) as size,
+                            {vorder} as vorder,
+                            COALESCE(STRING_AGG(DISTINCT pm.compression, ', ' ORDER BY pm.compression), 'UNCOMPRESSED') as compression,
+                            '{timestamp}' as timestamp
+                        FROM parquet_file_metadata({delta}) fm
+                        LEFT JOIN parquet_metadata({delta}) pm ON fm.file_name = pm.file_name
+                        GROUP BY fm.file_name, fm.num_rows, fm.num_row_groups
+                    ''')
             
         except Exception as e:
             error_msg = str(e)
@@ -347,22 +367,36 @@ def get_stats(duckrun_instance, source: str = None):
                         filenames.append(table_path + "/" + filename)
                     
                     # Use parquet_file_metadata to get actual parquet stats with compression
-                    con.execute(f'''
-                        CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
-                        SELECT 
-                            '{schema_name}' as schema,
-                            '{tbl}' as tbl,
-                            fm.file_name,
-                            fm.num_rows,
-                            fm.num_row_groups,
-                            0 as size,
-                            false as vorder,
-                            COALESCE(STRING_AGG(DISTINCT pm.compression, ', ' ORDER BY pm.compression), 'UNCOMPRESSED') as compression,
-                            '{timestamp}' as timestamp
-                        FROM parquet_file_metadata({filenames}) fm
-                        LEFT JOIN parquet_metadata({filenames}) pm ON fm.file_name = pm.file_name
-                        GROUP BY fm.file_name, fm.num_rows, fm.num_row_groups
-                    ''')
+                    if detailed == True:
+                        # Detailed mode: Include ALL parquet_metadata columns
+                        con.execute(f'''
+                            CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
+                            SELECT 
+                                '{schema_name}' as schema,
+                                '{tbl}' as tbl,
+                                false as vorder,
+                                pm.*,
+                                '{timestamp}' as timestamp
+                            FROM parquet_metadata({filenames}) pm
+                        ''')
+                    else:
+                        # Aggregated mode: Original summary statistics
+                        con.execute(f'''
+                            CREATE OR REPLACE TEMP TABLE tbl_{idx} AS
+                            SELECT 
+                                '{schema_name}' as schema,
+                                '{tbl}' as tbl,
+                                fm.file_name,
+                                fm.num_rows,
+                                fm.num_row_groups,
+                                0 as size,
+                                false as vorder,
+                                COALESCE(STRING_AGG(DISTINCT pm.compression, ', ' ORDER BY pm.compression), 'UNCOMPRESSED') as compression,
+                                '{timestamp}' as timestamp
+                            FROM parquet_file_metadata({filenames}) fm
+                            LEFT JOIN parquet_metadata({filenames}) pm ON fm.file_name = pm.file_name
+                            GROUP BY fm.file_name, fm.num_rows, fm.num_row_groups
+                        ''')
                 
                 print(f"   ✓ Successfully processed '{tbl}' using DuckDB fallback with parquet metadata")
             except Exception as fallback_error:
@@ -378,31 +412,44 @@ def get_stats(duckrun_instance, source: str = None):
         # No tables were processed successfully - return empty dataframe
         print("⚠️  No tables could be processed successfully")
         import pandas as pd
-        return pd.DataFrame(columns=['schema', 'tbl', 'total_rows', 'num_files', 'num_row_group', 
-                                     'average_row_group', 'file_size_MB', 'vorder', 'compression', 'timestamp'])
+        if detailed == True:
+            return pd.DataFrame(columns=['schema', 'tbl', 'vorder', 'timestamp'])
+        else:
+            return pd.DataFrame(columns=['schema', 'tbl', 'total_rows', 'num_files', 'num_row_group', 
+                                         'average_row_group', 'file_size_MB', 'vorder', 'compression', 'timestamp'])
     
     # Union all successfully processed temp tables
     union_parts = [f'SELECT * FROM tbl_{i}' for i in successful_tables]
     union_query = ' UNION ALL '.join(union_parts)
     
-    # Generate final summary
-    final_result = con.execute(f'''
-        SELECT 
-            schema,
-            tbl,
-            SUM(num_rows) as total_rows,
-            COUNT(*) as num_files,
-            SUM(num_row_groups) as num_row_group,
-            CAST(CEIL(SUM(num_rows)::DOUBLE / NULLIF(SUM(num_row_groups), 0)) AS INTEGER) as average_row_group,
-            MIN(size) as file_size_MB,
-            ANY_VALUE(vorder) as vorder,
-            STRING_AGG(DISTINCT compression, ', ' ORDER BY compression) as compression,
-            ANY_VALUE(timestamp) as timestamp
-        FROM ({union_query})
-        WHERE tbl IS NOT NULL
-        GROUP BY schema, tbl
-        ORDER BY total_rows DESC
-    ''').df()
+    # Generate final summary based on detailed flag
+    if detailed == True:
+        # Detailed mode: Return ALL parquet_metadata columns
+        final_result = con.execute(f'''
+            SELECT *
+            FROM ({union_query})
+            WHERE tbl IS NOT NULL
+            ORDER BY schema, tbl, file_name, row_group_id, column_id
+        ''').df()
+    else:
+        # Aggregated mode: Original summary statistics
+        final_result = con.execute(f'''
+            SELECT 
+                schema,
+                tbl,
+                SUM(num_rows) as total_rows,
+                COUNT(*) as num_files,
+                SUM(num_row_groups) as num_row_group,
+                CAST(CEIL(SUM(num_rows)::DOUBLE / NULLIF(SUM(num_row_groups), 0)) AS INTEGER) as average_row_group,
+                MIN(size) as file_size_MB,
+                ANY_VALUE(vorder) as vorder,
+                STRING_AGG(DISTINCT compression, ', ' ORDER BY compression) as compression,
+                ANY_VALUE(timestamp) as timestamp
+            FROM ({union_query})
+            WHERE tbl IS NOT NULL
+            GROUP BY schema, tbl
+            ORDER BY total_rows DESC
+        ''').df()
     
     return final_result
 
