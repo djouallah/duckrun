@@ -1244,9 +1244,9 @@ class Duckrun(WorkspaceOperationsMixin):
             refresh=refresh
         )
 
-    def rle(self, table_name: str = None, mode: str = "summary", sort_columns: List[str] = None,
-            limit: int = None, max_combinations: int = 20, use_stratified_sampling: bool = True,
-            num_segments: int = 5, segment_size: int = 1000):
+    def rle(self, table_name: str = None, mode: str = "natural",
+            min_distinct_threshold: int = 2, max_cardinality_pct: float = 0.01,
+            max_ordering_depth: int = 3):
         """
         Analyze RLE (Run-Length Encoding) compression potential for Delta Lake tables.
         
@@ -1254,38 +1254,39 @@ class Duckrun(WorkspaceOperationsMixin):
             table_name: Name of the table to analyze. Can be:
                 - 'table_name' (uses current schema)
                 - 'schema.table_name' (specific schema)
-                - None (analyzes all tables in current schema - summary only)
             mode: Analysis mode:
-                - "summary": Quick NFV (Number of Distinct Values) analysis (default)
-                - "smart": Smart heuristic-based analysis (recommended)
-                - "full": Full RLE analysis with all column orderings
-            sort_columns: Optional list of columns to sort by for RLE calculation
-            limit: Optional limit on number of rows to analyze (ignored if using stratified sampling)
-            max_combinations: Maximum number of orderings to test (for smart mode)
-            use_stratified_sampling: If True, use stratified sampling across entire file (recommended)
-            num_segments: Number of segments for stratified sampling
-            segment_size: Size of each segment for sampling
+                - "natural": Calculate RLE for natural order only (default, fastest)
+                - "auto": Natural order + cardinality-based ordering (recommended)
+                - "advanced": Natural + cardinality + greedy incremental search (most thorough)
+            min_distinct_threshold: Exclude columns with fewer distinct values (default: 2)
+            max_cardinality_pct: Exclude columns with cardinality above this % (default: 0.01 = 1%)
+            max_ordering_depth: Maximum depth for greedy search in "advanced" mode (default: 3)
         
         Returns:
             DataFrame with RLE analysis results
         
         Examples:
-            # Quick summary of a specific table
+            # Natural order only (baseline)
             con = duckrun.connect("workspace/lakehouse.lakehouse/schema")
-            con.rle("mytable")  # defaults to summary mode
-            con.rle("mytable", "summary")
+            con.rle("mytable")  # same as con.rle("mytable", "natural")
             
-            # Smart analysis (finds optimal column ordering)
-            con.rle("mytable", "smart")
+            # Auto optimization (natural + cardinality-based)
+            con.rle("mytable", "auto")
+            
+            # Advanced optimization (greedy incremental search)
+            con.rle("mytable", "advanced")
+            
+            # Advanced with custom depth
+            con.rle("mytable", "advanced", max_ordering_depth=4)
             
             # Analyze table from different schema
-            con.rle("otherschema.mytable", "smart")
+            con.rle("otherschema.mytable", "auto")
             
-            # Full analysis with custom parameters
-            con.rle("mytable", "full", use_stratified_sampling=True, num_segments=10)
+            # Custom thresholds for small tables
+            con.rle("mytable", "auto", max_cardinality_pct=0.05)
         """
         from .rle import (
-            calculate_nfv_score,
+            calculate_cardinality_ratio,
             test_column_orderings_smart,
             calculate_rle_for_columns
         )
@@ -1310,7 +1311,7 @@ class Duckrun(WorkspaceOperationsMixin):
         # Construct the full table path using the same logic as get_stats
         table_path = f"{self.table_base_url}{schema_name}/{tbl}"
         
-        # Get the actual parquet files from Delta table
+        # Verify table exists and is not empty
         print(f"📊 Analyzing table: {schema_name}.{tbl}")
         
         try:
@@ -1321,40 +1322,20 @@ class Duckrun(WorkspaceOperationsMixin):
                 print("⚠️  Table is empty (no files)")
                 return None
             
-            # Construct full paths for parquet files
-            parquet_paths = [table_path + "/" + f for f in delta_files]
-            
         except Exception as e:
             print(f"❌ Error accessing Delta table: {e}")
             return None
         
-        # For now, analyze the first file (can be extended to analyze all files)
-        parquet_path = parquet_paths[0]
-        
-        if mode == "summary":
-            # Quick NFV analysis
-            nfv_scores = calculate_nfv_score(self.con, parquet_path, limit)
-            import pandas as pd
-            df = pd.DataFrame([
-                {"column": col, "nfv_score": score}
-                for col, score in sorted(nfv_scores.items(), key=lambda x: x[1])
-            ])
-            return df
-            
-        elif mode in ["smart", "full"]:
-            # Smart or full RLE analysis
-            return test_column_orderings_smart(
-                self.con,
-                parquet_path,
-                limit=limit,
-                max_combinations=max_combinations,
-                use_stratified_sampling=use_stratified_sampling,
-                num_segments=num_segments,
-                segment_size=segment_size
-            )
-        else:
-            print(f"❌ Unknown mode: {mode}. Use 'summary', 'smart', or 'full'")
-            return None
+        # All modes now use test_column_orderings_smart with the mode parameter
+        return test_column_orderings_smart(
+            self.con,
+            table_path,
+            table_name=table_name,  # Pass table name for cardinality calculation on full dataset
+            mode=mode,
+            min_distinct_threshold=min_distinct_threshold,
+            max_cardinality_pct=max_cardinality_pct,
+            max_ordering_depth=max_ordering_depth
+        )
 
     def close(self):
         """Close DuckDB connection"""

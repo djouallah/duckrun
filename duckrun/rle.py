@@ -54,14 +54,14 @@ def estimate_rle_from_row_groups(con, parquet_path: str) -> Dict[str, dict]:
         return None
 
 
-def stratified_rle_sampling(con, parquet_path: str, sort_columns: List[str] = None,
+def stratified_rle_sampling(con, delta_path: str, sort_columns: List[str] = None,
                             num_segments: int = 5, segment_size: int = 1000) -> Dict[str, float]:
     """
     Sample RLE density across multiple segments of the file.
     
     Args:
         con: DuckDB connection
-        parquet_path: Path to parquet file
+        delta_path: Path to Delta table
         sort_columns: List of columns to sort by before calculating RLE. If None, uses natural order.
         num_segments: Number of segments to sample across the file
         segment_size: Number of rows per segment
@@ -71,7 +71,7 @@ def stratified_rle_sampling(con, parquet_path: str, sort_columns: List[str] = No
     """
     # Get total row count
     total_rows = con.sql(f"""
-        SELECT COUNT(*) FROM read_parquet('{parquet_path}')
+        SELECT COUNT(*) FROM delta_scan('{delta_path}')
     """).fetchone()[0]
     
     # Get column names
@@ -79,7 +79,7 @@ def stratified_rle_sampling(con, parquet_path: str, sort_columns: List[str] = No
         SELECT column_name 
         FROM (
             DESCRIBE 
-            SELECT * FROM read_parquet('{parquet_path}', file_row_number = TRUE)
+            SELECT * FROM delta_scan('{delta_path}', file_row_number = TRUE)
         )
         WHERE column_name != 'file_row_number'
     """).fetchall()
@@ -114,7 +114,7 @@ def stratified_rle_sampling(con, parquet_path: str, sort_columns: List[str] = No
                     SELECT 
                         *,
                         ROW_NUMBER() OVER ({order_by_clause}) as sorted_row_num
-                    FROM read_parquet('{parquet_path}', file_row_number = TRUE)
+                    FROM delta_scan('{delta_path}', file_row_number = TRUE)
                 ),
                 segment_data AS (
                     SELECT 
@@ -168,13 +168,13 @@ def stratified_rle_sampling(con, parquet_path: str, sort_columns: List[str] = No
     return estimated_runs, density_stats
 
 
-def calculate_rle_for_columns(con, parquet_path: str, sort_columns: List[str] = None, limit: int = None) -> Dict[str, int]:
+def calculate_rle_for_columns(con, delta_path: str, sort_columns: List[str] = None, limit: int = None) -> Dict[str, int]:
     """
-    Calculate RLE runs for all columns in a parquet file, optionally after sorting.
+    Calculate RLE runs for all columns in a Delta table, optionally after sorting.
     
     Args:
         con: DuckDB connection
-        parquet_path: Path to parquet file
+        delta_path: Path to Delta table
         sort_columns: List of columns to sort by (in order). If None, uses natural file order.
         limit: Optional limit on number of rows to analyze
     
@@ -187,7 +187,7 @@ def calculate_rle_for_columns(con, parquet_path: str, sort_columns: List[str] = 
         FROM (
             DESCRIBE 
             SELECT * 
-            FROM read_parquet('{parquet_path}', file_row_number = TRUE)
+            FROM delta_scan('{delta_path}', file_row_number = TRUE)
         )
         WHERE column_name != 'file_row_number'
     """).fetchall()
@@ -209,16 +209,15 @@ def calculate_rle_for_columns(con, parquet_path: str, sort_columns: List[str] = 
             WITH ordered_data AS (
                 SELECT 
                     {column_name},
-                    file_row_number
-                FROM read_parquet('{parquet_path}', file_row_number = TRUE)
-                {order_by}
+                    ROW_NUMBER() OVER ({order_by}) as sort_order
+                FROM delta_scan('{delta_path}', file_row_number = TRUE)
                 {limit_clause}
             ),
             runs AS (
                 SELECT 
                     CASE 
-                        WHEN LAG({column_name}) OVER (ORDER BY file_row_number) != {column_name} 
-                        OR LAG({column_name}) OVER (ORDER BY file_row_number) IS NULL
+                        WHEN LAG({column_name}) OVER (ORDER BY sort_order) != {column_name} 
+                        OR LAG({column_name}) OVER (ORDER BY sort_order) IS NULL
                         THEN 1 
                         ELSE 0 
                     END AS new_run
@@ -233,44 +232,98 @@ def calculate_rle_for_columns(con, parquet_path: str, sort_columns: List[str] = 
     return results
 
 
-def calculate_nfv_score(con, parquet_path: str, limit: int = None) -> Dict[str, float]:
+def calculate_cardinality_ratio(con, source: str, limit: int = None, is_parquet: bool = False, 
+                       use_approx: bool = None, approx_threshold: int = 100_000_000) -> Dict[str, dict]:
     """
-    Calculate Number of Distinct Values (NFV) for each column.
-    Lower NFV = better for RLE compression.
+    Calculate cardinality ratio for each column (distinct_values / total_rows).
+    Lower ratio = better for RLE compression (more repetition).
+    
+    NEVER uses sampling - always scans full dataset with exact or approximate distinct counts.
+    
+    Args:
+        con: DuckDB connection
+        source: Either a table name (default) or parquet file path
+        limit: DEPRECATED - kept for backward compatibility but ignored. Always scans full dataset.
+        is_parquet: If True, source is a parquet file path; if False, source is a table name
+        use_approx: If True, use HyperLogLog (approx). If False, use exact COUNT(DISTINCT).
+                    If None (default), auto-decide based on table size threshold.
+        approx_threshold: Row count threshold for using HyperLogLog (default: 100M rows)
     
     Returns:
-        Dictionary mapping column names to NFV ratios (0-1, lower is better)
+        Dictionary mapping column names to dict with keys:
+        - 'cardinality_ratio': distinct/total, range 0-1, lower is better for RLE
+        - 'total_rows': total row count
+        - 'distinct_values': number of distinct values (exact or approximate)
     """
-    limit_clause = f"LIMIT {limit}" if limit else ""
+    # Build the FROM clause based on source type
+    if is_parquet:
+        from_clause = f"read_parquet('{source}', file_row_number = TRUE)"
+        column_filter = "WHERE column_name != 'file_row_number'"
+    else:
+        from_clause = source  # Table name
+        column_filter = ""
     
     columns = con.sql(f"""
         SELECT column_name 
-        FROM (
-            DESCRIBE 
-            SELECT * 
-            FROM read_parquet('{parquet_path}', file_row_number = TRUE)
-        )
-        WHERE column_name != 'file_row_number'
+        FROM (DESCRIBE SELECT * FROM {from_clause})
+        {column_filter}
     """).fetchall()
     
     column_names = [col[0] for col in columns]
-    nfv_scores = {}
     
+    if not column_names:
+        return {}
+    
+    # Auto-decide whether to use approximate or exact based on table size
+    if use_approx is None:
+        # Quick row count check
+        total_rows = con.sql(f"SELECT COUNT(*) FROM {from_clause}").fetchone()[0]
+        use_approx = total_rows > approx_threshold
+        if use_approx:
+            print(f"   Table has {total_rows:,} rows (>{approx_threshold:,}) - using HyperLogLog approximation")
+        else:
+            print(f"   Table has {total_rows:,} rows (<={approx_threshold:,}) - using exact COUNT(DISTINCT)")
+    else:
+        total_rows = None  # Will be calculated in main query
+    
+    # Build a single query that calculates all NFV scores in one pass
+    # This scans the data only ONCE instead of once per column
+    select_clauses = []
     for col in column_names:
-        result = con.sql(f"""
-            WITH data AS (
-                SELECT {col}
-                FROM read_parquet('{parquet_path}', file_row_number = TRUE)
-                {limit_clause}
-            )
-            SELECT 
-                COUNT(DISTINCT {col})::FLOAT / COUNT(*)::FLOAT as nfv_ratio
-            FROM data
-        """).fetchone()
-        
-        nfv_scores[col] = result[0] if result else 1.0
+        if use_approx:
+            select_clauses.append(f"approx_count_distinct({col}) as distinct_{col}")
+        else:
+            select_clauses.append(f"COUNT(DISTINCT {col}) as distinct_{col}")
     
-    return nfv_scores
+    query = f"""
+        SELECT 
+            COUNT(*)::BIGINT as total_rows,
+            {', '.join(select_clauses)}
+        FROM {from_clause}
+    """
+    
+    result = con.sql(query).fetchone()
+    
+    if not result:
+        return {}
+    
+    if total_rows is None:
+        total_rows = result[0]
+    
+    nfv_stats = {}
+    
+    # Parse results (total_rows, distinct_col1, distinct_col2, ...)
+    for idx, col in enumerate(column_names, start=1):
+        distinct_values = result[idx]
+        cardinality_ratio = (distinct_values / total_rows) if total_rows > 0 else 0.0
+        
+        nfv_stats[col] = {
+            'total_rows': total_rows,
+            'distinct_values': distinct_values,
+            'cardinality_ratio': cardinality_ratio
+        }
+    
+    return nfv_stats
 
 
 def filter_promising_combinations(columns: List[str], nfv_scores: Dict[str, float], 
@@ -280,44 +333,44 @@ def filter_promising_combinations(columns: List[str], nfv_scores: Dict[str, floa
     
     Heuristics based on research:
     1. Time/date columns first (temporal ordering)
-    2. Low cardinality columns before high cardinality
+    2. High NFV score columns before low NFV score (more repetition = better RLE)
     3. Correlated columns together (e.g., date + time)
-    4. Avoid starting with high-cardinality columns
+    4. Avoid starting with low-NFV columns (high cardinality)
     
     Args:
         columns: List of all column names
-        nfv_scores: NFV ratio for each column (lower = fewer distinct values)
+        nfv_scores: NFV score for each column (higher = more repetition, better for RLE)
         max_combinations: Maximum number of combinations to return
     
     Returns:
         List of promising column orderings to test
     """
-    # Sort columns by NFV (lower first = better for RLE)
-    sorted_by_nfv = sorted(columns, key=lambda c: nfv_scores[c])
+    # Sort columns by NFV (higher first = better for RLE)
+    sorted_by_nfv = sorted(columns, key=lambda c: nfv_scores[c], reverse=True)
     
     promising = []
     
     # Rule 1: Natural order baseline
     promising.append([])
     
-    # Rule 2: NFV-based ordering (lowest to highest)
+    # Rule 2: NFV-based ordering (highest to lowest)
     promising.append(sorted_by_nfv)
     
-    # Rule 3: Single best column (lowest NFV)
+    # Rule 3: Single best column (highest NFV)
     promising.append([sorted_by_nfv[0]])
     
     # Rule 4: Time-based patterns (common column names)
     time_cols = [c for c in columns if any(t in c.lower() for t in ['date', 'time', 'timestamp', 'year', 'month', 'day'])]
     if time_cols:
         promising.append(time_cols)
-        # Time columns + low NFV columns
+        # Time columns + high NFV columns
         non_time = [c for c in sorted_by_nfv if c not in time_cols]
         if non_time:
             promising.append(time_cols + non_time[:2])
     
-    # Rule 5: Top 2-3 lowest NFV columns in different orders
-    top_low_nfv = sorted_by_nfv[:min(3, len(sorted_by_nfv))]
-    for perm in itertools.permutations(top_low_nfv, min(2, len(top_low_nfv))):
+    # Rule 5: Top 2-3 highest NFV columns in different orders
+    top_high_nfv = sorted_by_nfv[:min(3, len(sorted_by_nfv))]
+    for perm in itertools.permutations(top_high_nfv, min(2, len(top_high_nfv))):
         promising.append(list(perm))
     
     # Rule 6: ID-like columns first (common patterns)
@@ -346,176 +399,315 @@ def filter_promising_combinations(columns: List[str], nfv_scores: Dict[str, floa
     return unique_promising[:max_combinations]
 
 
-def test_column_orderings_smart(con, parquet_path: str, limit: int = None, 
-                                max_combinations: int = 20, use_stratified_sampling: bool = True,
-                                num_segments: int = 5, segment_size: int = 1000) -> pd.DataFrame:
+def test_column_orderings_smart(con, delta_path: str, table_name: str = None, limit: int = None, 
+                                mode: str = "natural",
+                                min_distinct_threshold: int = 2,
+                                max_cardinality_pct: float = 0.01,
+                                max_ordering_depth: int = 3) -> pd.DataFrame:
     """
-    Test column orderings using heuristics to avoid testing all combinations.
+    Test column orderings for RLE optimization.
     
-    This uses research-backed heuristics:
-    - Temporal columns (date/time) should be sorted first
-    - Low cardinality (NFV) columns compress better
-    - Columns with correlation should be grouped
+    Modes:
+    - "natural": Calculate RLE for natural order only (baseline)
+    - "auto": Natural order + cardinality-based ordering (low to high)
+    - "advanced": Natural + cardinality + greedy incremental search
     
     Args:
         con: DuckDB connection
-        parquet_path: Path to parquet file
-        limit: Optional limit on number of rows to analyze (ignored if use_stratified_sampling=True)
-        max_combinations: Maximum number of orderings to test
-        use_stratified_sampling: If True, use stratified sampling across entire file
-        num_segments: Number of segments for stratified sampling
-        segment_size: Size of each segment for sampling
+        delta_path: Path to Delta table (used for RLE calculation with file_row_number via delta_scan)
+        table_name: Optional table name for cardinality calculation on full dataset (if None, uses delta_path)
+        limit: Optional limit on number of rows to analyze (for testing only)
+        mode: Analysis mode - "natural", "auto", or "advanced" (default: "natural")
+        min_distinct_threshold: Exclude columns with fewer distinct values (default: 2, i.e. only exclude constants with 1 value)
+        max_cardinality_pct: Exclude columns with cardinality ratio above this % (default: 0.01 = 1%)
+        max_ordering_depth: Maximum depth for greedy incremental search in "advanced" mode (default: 3)
     
     Returns:
-        DataFrame with columns: sort_order, total_rle, avg_rle, nfv_weighted_score, and individual column RLE counts
+        DataFrame with columns: sort_order, columns_used, total_rle_all, and individual column RLE counts
     """
     print("Analyzing column characteristics...")
     
-    # Try to get row group metadata first
-    print("\nAttempting to read Parquet row group metadata...")
-    row_group_stats = analyze_parquet_row_groups(con, parquet_path)
-    if row_group_stats is not None:
-        print("✓ Row group metadata available")
-        print(row_group_stats.head())
-    
-    # Get NFV scores for all columns (still use sampling for this as it's cheap)
-    sample_size = limit if limit else 100000
-    nfv_scores = calculate_nfv_score(con, parquet_path, sample_size)
-    
-    print(f"\nColumn NFV Scores (lower = better for RLE):")
-    for col, score in sorted(nfv_scores.items(), key=lambda x: x[1]):
-        print(f"  {col}: {score:.4f}")
-    
-    # Decide whether to use stratified sampling or simple limit
-    if use_stratified_sampling and not limit:
+    # For "natural" mode, just calculate RLE on natural order
+    if mode == "natural":
         print("\n" + "="*60)
-        print("Using STRATIFIED SAMPLING across entire file")
+        print("Mode: NATURAL ORDER (baseline)")
         print("="*60)
+        print("Calculating RLE for natural file order (single pass)...")
         
-        # Get total row count
-        total_rows = con.sql(f"SELECT COUNT(*) FROM read_parquet('{parquet_path}')").fetchone()[0]
-        print(f"Total rows in file: {total_rows:,}")
-        print(f"Sampling strategy: {num_segments} segments of {segment_size} rows each")
+        # Get all column names
+        columns = con.sql(f"""
+            SELECT column_name 
+            FROM (
+                DESCRIBE 
+                SELECT * FROM delta_scan('{delta_path}', file_row_number = TRUE)
+            )
+            WHERE column_name != 'file_row_number'
+        """).fetchall()
         
-        # Get baseline with natural order
-        print("\nCalculating baseline (natural order)...")
-        estimated_runs, density_stats = stratified_rle_sampling(
-            con, parquet_path, None, num_segments, segment_size
-        )
+        column_names = [col[0] for col in columns]
         
-        print("\nBaseline RLE Density Statistics:")
-        for col, stats in sorted(density_stats.items(), key=lambda x: x[1]['estimated_runs']):
-            cv = stats['variance_coefficient']
-            warning = " ⚠️ HIGH VARIANCE" if cv > 0.3 else ""
-            print(f"  {col}: {stats['estimated_runs']:,} runs (density: {stats['avg_density']:.4f}, CV: {cv:.2f}){warning}")
+        # Calculate RLE for natural order
+        rle_counts = calculate_rle_for_columns(con, delta_path, None, limit)
         
-        use_estimation = True
+        total_rle_all = sum(rle_counts.values())
+        
+        print(f"\nResults:")
+        print(f"  Total RLE (all columns): {total_rle_all:,}")
+        print(f"  Average RLE per column: {total_rle_all / len(column_names):.1f}")
+        
+        results = [{
+            'sort_order': 'natural_order',
+            'columns_used': 'file_row_number',
+            'total_rle_all': total_rle_all,
+            **rle_counts
+        }]
+        
+        df = pd.DataFrame(results)
+        print(f"\n{'='*60}")
+        print(f"✓ Analysis complete!")
+        print(f"{'='*60}")
+        
+        return df
+    
+    # For "auto" and "advanced" modes, calculate cardinality ratios first
+    print("\nCalculating cardinality ratios on full dataset...")
+    if table_name:
+        card_stats = calculate_cardinality_ratio(con, table_name, is_parquet=False)
     else:
-        print("\n" + "="*60)
-        print(f"Using simple sampling (first {limit or 'all'} rows)")
-        print("="*60)
-        use_estimation = False
+        # Fallback: use delta_scan directly
+        card_stats = calculate_cardinality_ratio(con, f"delta_scan('{delta_path}')", is_parquet=False)
     
-    # Get baseline (natural file order)
-    if not use_estimation:
-        print("\nCalculating baseline (natural file order)...")
-        baseline = calculate_rle_for_columns(con, parquet_path, None, limit)
-        column_names = list(baseline.keys())
-    else:
-        column_names = list(nfv_scores.keys())
+    print(f"\nColumn Cardinality Ratios (lower = better for RLE):")
+    for col, stats in sorted(card_stats.items(), key=lambda x: x[1]['cardinality_ratio']):
+        card_pct = stats['cardinality_ratio'] * 100
+        print(f"  {col}: {card_pct:.3f}% (distinct: {stats['distinct_values']:,}, rows: {stats['total_rows']:,})")
     
-    # Sort columns by NFV for the NFV-based ordering
-    sorted_by_nfv = sorted(column_names, key=lambda c: nfv_scores[c])
+    # Extract just the ratios for easier handling
+    cardinality_ratios = {col: stats['cardinality_ratio'] for col, stats in card_stats.items()}
+    column_names = list(card_stats.keys())
     
-    # Exclude obvious columns (very low NFV < 0.0001) from permutations
-    # These are likely constant columns that compress perfectly anywhere
-    nfv_threshold = 0.0001
-    non_trivial_cols = [c for c in sorted_by_nfv if nfv_scores[c] >= nfv_threshold]
-    trivial_cols = [c for c in sorted_by_nfv if nfv_scores[c] < nfv_threshold]
+    # Sort columns by cardinality for ordering (lower cardinality = better for RLE)
+    sorted_by_cardinality = sorted(column_names, key=lambda c: cardinality_ratios[c])
     
-    if trivial_cols:
-        print(f"\nExcluding trivial columns from permutations (NFV < {nfv_threshold}): {', '.join(trivial_cols)}")
+    # OPTIMIZATION: Filter columns based on configurable thresholds
+    # Exclude columns that won't benefit from reordering:
+    # 1. Too constant: < min_distinct_threshold (default: 2, only excludes single-value columns)
+    # 2. Too fragmented: cardinality_ratio > max_cardinality_pct (default: 10%)
+    total_rows = next(iter(card_stats.values()))['total_rows']
     
-    # Define specific orderings to test
+    constant_cols = [c for c in sorted_by_cardinality 
+                    if card_stats[c]['distinct_values'] < min_distinct_threshold]
+    
+    fragmented_cols = [c for c in sorted_by_cardinality 
+                      if cardinality_ratios[c] > max_cardinality_pct]
+    
+    good_for_reordering = [c for c in sorted_by_cardinality 
+                          if c not in constant_cols and c not in fragmented_cols]
+    
+    if constant_cols:
+        print(f"\n✓ Skipping constant columns (< {min_distinct_threshold} distinct values): {', '.join(constant_cols)}")
+        print(f"  These compress perfectly regardless of ordering.")
+    
+    if fragmented_cols:
+        print(f"✓ Skipping high-cardinality columns (cardinality > {max_cardinality_pct*100:.0f}%): {', '.join(fragmented_cols)}")
+        print(f"  These are too fragmented to benefit from reordering.")
+    
+    if not good_for_reordering:
+        print("\n⚠️  No columns suitable for reordering optimization!")
+        print("    All columns are either nearly constant or have too many unique values.")
+        return None
+    
+    print(f"\n✓ Analyzing {len(good_for_reordering)} columns suitable for reordering")
+    
+    # Get total row count from cardinality calculation
+    total_rows = next(iter(card_stats.values()))['total_rows'] if card_stats else 0
+    print(f"✓ Table size: {total_rows:,} rows")
+    
+    # Calculate RLE ONLY on natural order for baseline (single pass - fast!)
+    print("\n" + "="*60)
+    print("Calculating baseline RLE (natural order - single pass)")
+    print("="*60)
+    baseline = calculate_rle_for_columns(con, delta_path, None, limit)
+    
+    # Filter baseline to only include good_for_reordering columns
+    baseline_filtered = {col: rle for col, rle in baseline.items() if col in good_for_reordering}
+    
+    print(f"Baseline RLE runs (columns worth reordering):")
+    for col in sorted(baseline_filtered.keys(), key=lambda c: baseline_filtered[c]):
+        print(f"  {col}: {baseline_filtered[col]:,} runs")
+    
+    # Define only the most promising orderings to test
     orderings_to_test = [
-        ([], 'current_order'),  # Natural file order
-        (sorted_by_nfv, 'order_by_nfv')  # Sorted by NFV (low to high)
+        ([], 'natural_order'),  # Baseline
     ]
     
-    # Add permutations of top N lowest NFV columns (excluding trivial ones)
-    top_n = min(3, len(non_trivial_cols))  # Top 3 non-trivial or fewer
-    print(f"\nGenerating permutations of top {top_n} lowest non-trivial NFV columns...")
-    for perm in itertools.permutations(non_trivial_cols[:top_n]):
-        orderings_to_test.append((list(perm), f"perm_{', '.join(perm)}"))
+    # Add cardinality-based ordering for "auto" and "advanced" modes
+    if mode in ["auto", "advanced"] and len(good_for_reordering) >= 2:
+        orderings_to_test.append((good_for_reordering, 'by_cardinality'))
     
-    print(f"Testing {len(orderings_to_test)} orderings...")
+    print(f"\n✓ Testing {len(orderings_to_test)} orderings")
+    print("="*60)
+    
     results = []
     
     for i, (sort_cols, label) in enumerate(orderings_to_test, 1):
         print(f"\n[{i}/{len(orderings_to_test)}] Testing: {label}")
+        if sort_cols:
+            print(f"    Order: {', '.join(sort_cols)}")
         
-        if use_estimation:
-            # Use stratified sampling for this ordering
-            print(f"    Sort order: {', '.join(sort_cols) if sort_cols else 'natural (file_row_number)'}")
-            est_runs, _ = stratified_rle_sampling(
-                con, parquet_path, sort_cols if sort_cols else None, num_segments, segment_size
-            )
-            rle_counts = est_runs
+        if i == 1:
+            # Use baseline for natural order (already calculated)
+            rle_counts = baseline
         else:
-            # Use regular calculation
-            rle_counts = calculate_rle_for_columns(con, parquet_path, sort_cols if sort_cols else None, limit)
+            # Calculate RLE for this ordering
+            rle_counts = calculate_rle_for_columns(con, delta_path, sort_cols, limit)
         
-        # Calculate weighted score (considering both RLE and NFV)
-        nfv_weighted = sum(rle_counts[col] * nfv_scores[col] for col in rle_counts.keys())
+        # Calculate metrics for ALL columns and optimizable subset
+        total_rle_all = sum(rle_counts.values())
+        
+        # Filter to only good_for_reordering columns for scoring/comparison
+        rle_filtered = {col: rle for col, rle in rle_counts.items() if col in good_for_reordering}
+        total_rle_optimizable = sum(rle_filtered.values())
+        
+        # Calculate weighted score (considering both RLE and cardinality - lower cardinality = better)
+        cardinality_weighted = sum(rle_filtered[col] * cardinality_ratios[col] for col in rle_filtered.keys())
+        
+        print(f"    Total RLE (all columns): {total_rle_all:,}")
+        print(f"    Optimizable columns RLE: {total_rle_optimizable:,}")
+        print(f"    Avg RLE (optimizable): {total_rle_optimizable / len(rle_filtered):.1f}")
         
         results.append({
             'sort_order': label,
             'columns_used': ', '.join(sort_cols) if sort_cols else 'file_row_number',
-            'total_rle': sum(rle_counts.values()),
-            'avg_rle': sum(rle_counts.values()) / len(rle_counts),
-            'nfv_weighted_score': nfv_weighted,
-            'estimation_method': 'stratified' if use_estimation else 'sequential',
-            **rle_counts
+            'total_rle_all': total_rle_all,  # All columns (must be >= row_count)
+            'optimizable_rle': total_rle_optimizable,  # Only columns we're optimizing
+            'avg_rle': total_rle_optimizable / len(rle_filtered),
+            'cardinality_weighted_score': cardinality_weighted,
+            'method': 'single_pass',
+            **rle_counts  # Include individual column RLE counts
         })
     
-    # Convert to DataFrame and sort by total RLE
+    # Greedy incremental search (only in "advanced" mode)
+    if mode == "advanced" and max_ordering_depth > 0 and len(good_for_reordering) >= 2:
+        print(f"\n{'='*60}")
+        print(f"ADVANCED MODE: Greedy Incremental Search (max depth: {max_ordering_depth})")
+        print(f"{'='*60}")
+        print(f"Building optimal ordering column-by-column, testing all positions")
+        print(f"at each depth to find the best incremental improvement.\n")
+        
+        current_best_ordering = []
+        current_best_rle = sum(baseline_filtered.values())
+        remaining_columns = list(good_for_reordering)
+        
+        for depth in range(1, min(max_ordering_depth + 1, len(good_for_reordering) + 1)):
+            print(f"\n--- Depth {depth}: Testing {len(remaining_columns)} candidate columns ---")
+            
+            best_depth_ordering = None
+            best_depth_rle = float('inf')
+            best_depth_col = None
+            best_depth_position = None
+            
+            # Try adding each remaining column
+            for candidate_col in remaining_columns:
+                # Try inserting at each possible position (including end)
+                for insert_pos in range(len(current_best_ordering) + 1):
+                    # Build test ordering: insert candidate at position
+                    test_ordering = current_best_ordering[:insert_pos] + [candidate_col] + current_best_ordering[insert_pos:]
+                    
+                    # Calculate RLE for this ordering
+                    rle_counts = calculate_rle_for_columns(con, delta_path, test_ordering, limit)
+                    
+                    # Sum RLE for optimizable columns only
+                    rle_filtered = {col: rle for col, rle in rle_counts.items() if col in good_for_reordering}
+                    total_rle = sum(rle_filtered.values())
+                    
+                    # Track best at this depth
+                    if total_rle < best_depth_rle:
+                        best_depth_rle = total_rle
+                        best_depth_ordering = test_ordering
+                        best_depth_col = candidate_col
+                        best_depth_position = insert_pos
+                        best_depth_rle_counts = rle_counts
+            
+            # Check if we found improvement
+            if best_depth_rle < current_best_rle:
+                improvement_pct = ((current_best_rle - best_depth_rle) / current_best_rle) * 100
+                print(f"✓ Best at depth {depth}: Add '{best_depth_col}' at position {best_depth_position}")
+                print(f"  Ordering: {', '.join(best_depth_ordering)}")
+                print(f"  RLE: {best_depth_rle:,} runs (improved {improvement_pct:.1f}% from previous depth)")
+                
+                # Update for next depth
+                current_best_ordering = best_depth_ordering
+                current_best_rle = best_depth_rle
+                remaining_columns.remove(best_depth_col)
+                
+                # Store this result
+                rle_filtered = {col: rle for col, rle in best_depth_rle_counts.items() if col in good_for_reordering}
+                total_rle_all = sum(best_depth_rle_counts.values())
+                cardinality_weighted = sum(rle_filtered[col] * cardinality_ratios[col] for col in rle_filtered.keys())
+                
+                results.append({
+                    'sort_order': f'greedy_depth_{depth}',
+                    'columns_used': ', '.join(best_depth_ordering),
+                    'total_rle_all': total_rle_all,
+                    'optimizable_rle': best_depth_rle,
+                    'avg_rle': best_depth_rle / len(rle_filtered),
+                    'cardinality_weighted_score': cardinality_weighted,
+                    'method': 'greedy_incremental',
+                    **best_depth_rle_counts
+                })
+            else:
+                print(f"✗ No improvement found at depth {depth} - stopping early")
+                print(f"  Best RLE remains: {current_best_rle:,} runs")
+                break
+        
+        print(f"\n{'='*60}")
+        print(f"Greedy Search Complete")
+        print(f"{'='*60}")
+        if current_best_ordering:
+            print(f"Final greedy ordering: {', '.join(current_best_ordering)}")
+            print(f"Final RLE: {current_best_rle:,} runs")
+
+    
+    # Convert to DataFrame and sort by optimizable RLE (lower is better)
     df = pd.DataFrame(results)
-    df = df.sort_values('total_rle')
+    df = df.sort_values('optimizable_rle')
     
-    print(f"\n✓ Analysis complete! Tested {len(orderings_to_test)} orderings.")
+    print(f"\n{'='*60}")
+    print(f"✓ Analysis complete!")
+    print(f"{'='*60}")
+    print(f"Best ordering: {df.iloc[0]['sort_order']}")
+    print(f"Best optimizable RLE: {df.iloc[0]['optimizable_rle']:,} runs (lower is better)")
+    print(f"Total RLE (all columns): {df.iloc[0]['total_rle_all']:,} runs")
+
     
-    if use_estimation:
-        print("\n⚠️  Note: RLE counts are ESTIMATES based on stratified sampling.")
-        print("   Use these for relative comparison. Run full analysis on best candidate.")
+    improvement = baseline_filtered[list(baseline_filtered.keys())[0]] if baseline_filtered else 0
+    best_rle = df.iloc[0]['optimizable_rle']
+    if len(df) > 1 and improvement > 0:
+        pct = ((sum(baseline_filtered.values()) - best_rle) / sum(baseline_filtered.values())) * 100
+        if pct > 0:
+            print(f"Improvement: {pct:.1f}% fewer runs vs natural order")
     
-    return df
+    # Remove confusing internal columns from displayed output
+    # Keep: sort_order, columns_used, total_rle_all, and individual column RLE counts
+    # Remove: optimizable_rle, avg_rle, cardinality_weighted_score, method
+    display_df = df.drop(columns=['optimizable_rle', 'avg_rle', 'cardinality_weighted_score', 'method'], errors='ignore')
+    
+    return display_df
 
 
 # Example usage:
-# parquet_path = 'abfss://tmp@onelake.dfs.fabric.microsoft.com/data.Lakehouse/Tables/unsorted/summary/0-1c557fc2-59fe-487f-a3ee-67b5e63257df-0.parquet'
+# delta_path = 'abfss://tmp@onelake.dfs.fabric.microsoft.com/data.Lakehouse/Tables/unsorted/summary'
 # 
-# # OPTION 1: Fast stratified sampling across entire file (recommended for large files)
-# results_df = test_column_orderings_smart(
-#     con, 
-#     parquet_path, 
-#     use_stratified_sampling=True,
-#     num_segments=5,      # Sample 5 segments across the file
-#     segment_size=1000    # 1000 rows per segment
-# )
-# 
-# # OPTION 2: Traditional approach with limited rows (faster but less accurate)
-# results_df = test_column_orderings_smart(
-#     con, 
-#     parquet_path, 
-#     limit=10000,
-#     use_stratified_sampling=False
-# )
+# # Fast single-pass analysis (recommended for all table sizes)
+# results_df = test_column_orderings_smart(con, delta_path, table_name='summary')
 # 
 # # Show results
-# print("\nTop 5 best orderings:")
-# print(results_df[['sort_order', 'columns_used', 'total_rle', 'estimation_method']].head(5))
+# print("\nBest orderings:")
+# print(results_df[['sort_order', 'columns_used', 'optimizable_rle', 'total_rle_all', 'method']].head())
 # 
-# # Once you identify the best ordering, verify with full file scan:
-# best_ordering = results_df.iloc[0]['columns_used'].split(', ')
-# print(f"\nVerifying best ordering on FULL file: {best_ordering}")
-# full_rle = calculate_rle_for_columns(con, parquet_path, best_ordering if best_ordering[0] != 'file_row_number' else None, limit=None)
+# # The function automatically:
+# # - Calculates exact cardinality ratios (or approximate for >100M rows)
+# # - Excludes columns that won't benefit from reordering
+# # - Tests only 2-3 most promising orderings (low cardinality first, high cardinality first)
+# # - Uses single-pass RLE calculation (fast!)
