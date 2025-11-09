@@ -1244,8 +1244,121 @@ class Duckrun(WorkspaceOperationsMixin):
             refresh=refresh
         )
 
+    def rle(self, table_name: str = None, mode: str = "summary", sort_columns: List[str] = None,
+            limit: int = None, max_combinations: int = 20, use_stratified_sampling: bool = True,
+            num_segments: int = 5, segment_size: int = 1000):
+        """
+        Analyze RLE (Run-Length Encoding) compression potential for Delta Lake tables.
+        
+        Args:
+            table_name: Name of the table to analyze. Can be:
+                - 'table_name' (uses current schema)
+                - 'schema.table_name' (specific schema)
+                - None (analyzes all tables in current schema - summary only)
+            mode: Analysis mode:
+                - "summary": Quick NFV (Number of Distinct Values) analysis (default)
+                - "smart": Smart heuristic-based analysis (recommended)
+                - "full": Full RLE analysis with all column orderings
+            sort_columns: Optional list of columns to sort by for RLE calculation
+            limit: Optional limit on number of rows to analyze (ignored if using stratified sampling)
+            max_combinations: Maximum number of orderings to test (for smart mode)
+            use_stratified_sampling: If True, use stratified sampling across entire file (recommended)
+            num_segments: Number of segments for stratified sampling
+            segment_size: Size of each segment for sampling
+        
+        Returns:
+            DataFrame with RLE analysis results
+        
+        Examples:
+            # Quick summary of a specific table
+            con = duckrun.connect("workspace/lakehouse.lakehouse/schema")
+            con.rle("mytable")  # defaults to summary mode
+            con.rle("mytable", "summary")
+            
+            # Smart analysis (finds optimal column ordering)
+            con.rle("mytable", "smart")
+            
+            # Analyze table from different schema
+            con.rle("otherschema.mytable", "smart")
+            
+            # Full analysis with custom parameters
+            con.rle("mytable", "full", use_stratified_sampling=True, num_segments=10)
+        """
+        from .rle import (
+            calculate_nfv_score,
+            test_column_orderings_smart,
+            calculate_rle_for_columns
+        )
+        from deltalake import DeltaTable
+        
+        # Parse table name and construct path
+        if table_name is None:
+            if mode != "summary":
+                print("⚠️  Table name is required for 'smart' and 'full' modes")
+                return None
+            # TODO: Implement all-tables summary
+            print("⚠️  All-tables summary not yet implemented. Please specify a table name.")
+            return None
+        
+        # Parse schema.table or just table
+        if '.' in table_name:
+            schema_name, tbl = table_name.split('.', 1)
+        else:
+            schema_name = self.schema
+            tbl = table_name
+        
+        # Construct the full table path using the same logic as get_stats
+        table_path = f"{self.table_base_url}{schema_name}/{tbl}"
+        
+        # Get the actual parquet files from Delta table
+        print(f"📊 Analyzing table: {schema_name}.{tbl}")
+        
+        try:
+            dt = DeltaTable(table_path)
+            delta_files = dt.files()
+            
+            if not delta_files:
+                print("⚠️  Table is empty (no files)")
+                return None
+            
+            # Construct full paths for parquet files
+            parquet_paths = [table_path + "/" + f for f in delta_files]
+            
+        except Exception as e:
+            print(f"❌ Error accessing Delta table: {e}")
+            return None
+        
+        # For now, analyze the first file (can be extended to analyze all files)
+        parquet_path = parquet_paths[0]
+        
+        if mode == "summary":
+            # Quick NFV analysis
+            nfv_scores = calculate_nfv_score(self.con, parquet_path, limit)
+            import pandas as pd
+            df = pd.DataFrame([
+                {"column": col, "nfv_score": score}
+                for col, score in sorted(nfv_scores.items(), key=lambda x: x[1])
+            ])
+            return df
+            
+        elif mode in ["smart", "full"]:
+            # Smart or full RLE analysis
+            return test_column_orderings_smart(
+                self.con,
+                parquet_path,
+                limit=limit,
+                max_combinations=max_combinations,
+                use_stratified_sampling=use_stratified_sampling,
+                num_segments=num_segments,
+                segment_size=segment_size
+            )
+        else:
+            print(f"❌ Unknown mode: {mode}. Use 'summary', 'smart', or 'full'")
+            return None
+
     def close(self):
         """Close DuckDB connection"""
+
         if self.con:
             self.con.close()
             print("Connection closed")

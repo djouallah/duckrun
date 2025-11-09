@@ -49,3 +49,4 @@ tests/temp_*/
 # Confidential test files
 tests/basic.py
 tests/*.parquet
+test_rle.py
