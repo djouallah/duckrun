@@ -1035,6 +1035,21 @@ class Duckrun(WorkspaceOperationsMixin):
         """Get underlying DuckDB connection"""
         return self.con
 
+    def register(self, name: str, df):
+        """
+        Register a pandas DataFrame as a virtual table in DuckDB.
+        
+        Args:
+            name: Name for the virtual table
+            df: pandas DataFrame to register
+            
+        Example:
+            con = duckrun.connect("workspace/lakehouse.lakehouse")
+            con.register("tb", df)
+            con.sql("SELECT * FROM tb").show()
+        """
+        self.con.register(name, df)
+
     def get_stats(self, source: str = None, detailed = False):
         """
         Get comprehensive statistics for Delta Lake tables.
@@ -1244,9 +1259,9 @@ class Duckrun(WorkspaceOperationsMixin):
             refresh=refresh
         )
 
-    def rle(self, table_name: str = None, mode: str = "natural",
+    def rle(self, table_name: str = None, mode = "natural",
             min_distinct_threshold: int = 2, max_cardinality_pct: float = 0.01,
-            max_ordering_depth: int = 3):
+            max_ordering_depth: int = 3, limit: int = None):
         """
         Analyze RLE (Run-Length Encoding) compression potential for Delta Lake tables.
         
@@ -1254,13 +1269,15 @@ class Duckrun(WorkspaceOperationsMixin):
             table_name: Name of the table to analyze. Can be:
                 - 'table_name' (uses current schema)
                 - 'schema.table_name' (specific schema)
-            mode: Analysis mode:
-                - "natural": Calculate RLE for natural order only (default, fastest)
+            mode: Analysis mode or column ordering:
+                - "natural": Calculate RLE for natural order only (fastest)
                 - "auto": Natural order + cardinality-based ordering (recommended)
                 - "advanced": Natural + cardinality + greedy incremental search (most thorough)
+                - List[str]: Specific column ordering to test, e.g., ['date', 'duid']
             min_distinct_threshold: Exclude columns with fewer distinct values (default: 2)
             max_cardinality_pct: Exclude columns with cardinality above this % (default: 0.01 = 1%)
             max_ordering_depth: Maximum depth for greedy search in "advanced" mode (default: 3)
+            limit: Optional row limit for testing/development (default: None, analyzes all rows)
         
         Returns:
             DataFrame with RLE analysis results
@@ -1276,6 +1293,10 @@ class Duckrun(WorkspaceOperationsMixin):
             # Advanced optimization (greedy incremental search)
             con.rle("mytable", "advanced")
             
+            # Test specific column ordering
+            con.rle("mytable", ["date", "duid"])
+            con.rle("mytable", ["cutoff", "time", "DUID", "date"])
+            
             # Advanced with custom depth
             con.rle("mytable", "advanced", max_ordering_depth=4)
             
@@ -1284,6 +1305,9 @@ class Duckrun(WorkspaceOperationsMixin):
             
             # Custom thresholds for small tables
             con.rle("mytable", "auto", max_cardinality_pct=0.05)
+            
+            # Limit rows for testing
+            con.rle("mytable", "auto", limit=10000)
         """
         from .rle import (
             calculate_cardinality_ratio,
@@ -1326,15 +1350,98 @@ class Duckrun(WorkspaceOperationsMixin):
             print(f"❌ Error accessing Delta table: {e}")
             return None
         
+        # Check if mode is a list of columns (custom ordering)
+        if isinstance(mode, list):
+            # User wants to test a specific column ordering
+            print(f"Testing custom column ordering: {', '.join(mode)}")
+            
+            # Calculate cardinality for NDV values
+            card_stats = calculate_cardinality_ratio(self.con, table_name if table_name else f"delta_scan('{table_path}')", is_parquet=False)
+            
+            # Calculate RLE for the specified ordering
+            rle_counts = calculate_rle_for_columns(self.con, table_path, mode, limit)
+            
+            total_rle_all = sum(rle_counts.values())
+            
+            print(f"\nResults:")
+            print(f"  Custom ordering: [{', '.join(mode)}]")
+            print(f"  Total RLE (all columns): {total_rle_all:,} runs")
+            
+            # Return as DataFrame for consistency
+            import pandas as pd
+            results = [{
+                'schema': schema_name,
+                'table': tbl,
+                'sort_order': 'custom',
+                'columns_used': ', '.join(mode),
+                'total_rle_all': total_rle_all,
+                **rle_counts
+            }]
+            
+            df = pd.DataFrame(results)
+            
+            # Transform to long format
+            long_format_results = []
+            
+            for _, row in df.iterrows():
+                schema_val = row['schema']
+                table_val = row['table']
+                sort_order = row['sort_order']
+                columns_used = row['columns_used']
+                total_rle_all_val = row['total_rle_all']
+                
+                # Get all column names except metadata columns
+                metadata_cols = ['schema', 'table', 'sort_order', 'columns_used', 'total_rle_all']
+                data_columns = [col for col in df.columns if col not in metadata_cols]
+                
+                # Get total rows from card_stats if available
+                total_rows = card_stats[data_columns[0]]['total_rows'] if card_stats and data_columns else None
+                
+                # Parse the columns_used to get ordering
+                sort_columns_list = [c.strip() for c in columns_used.split(',')]
+                
+                # Create one row per data column
+                for col in data_columns:
+                    rle_value = row[col]
+                    
+                    # Get NDV from card_stats
+                    ndv_value = card_stats[col]['distinct_values'] if card_stats and col in card_stats else None
+                    
+                    # Determine if column was included in the sort and its position
+                    is_in_sort = col in sort_columns_list
+                    order_position = sort_columns_list.index(col) + 1 if is_in_sort else None
+                    comment = '' if is_in_sort else 'not included in the sort'
+                    
+                    long_format_results.append({
+                        'schema': schema_val,
+                        'table': table_val,
+                        'sort_type': sort_order,
+                        'column': col,
+                        'order': order_position,
+                        'RLE': rle_value,
+                        'NDV': ndv_value,
+                        'total_rows': total_rows,
+                        'total_RLE': total_rle_all_val,
+                        'comments': comment
+                    })
+            
+            long_df = pd.DataFrame(long_format_results)
+            
+            return long_df
+        
         # All modes now use test_column_orderings_smart with the mode parameter
         return test_column_orderings_smart(
             self.con,
             table_path,
             table_name=table_name,  # Pass table name for cardinality calculation on full dataset
             mode=mode,
+            limit=limit,
             min_distinct_threshold=min_distinct_threshold,
             max_cardinality_pct=max_cardinality_pct,
-            max_ordering_depth=max_ordering_depth
+            max_ordering_depth=max_ordering_depth,
+            schema_name=schema_name,
+            table_display_name=tbl,
+            duckrun_instance=self  # Pass duckrun instance for detailed parquet stats
         )
 
     def close(self):

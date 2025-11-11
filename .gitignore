@@ -41,12 +41,10 @@ htmlcov/
 Thumbs.db
 
 # Test artifacts (exclude temporary test files and downloads)
-tests/test_onelake_upload/
-tests/quick_test/
-tests/downloaded_*/
-tests/temp_*/
+tests/*/
+.tmp
+.tmp/*/
 
 # Confidential test files
-tests/basic.py
+tests/*.py
 tests/*.parquet
-test_rle.py
