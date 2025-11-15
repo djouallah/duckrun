@@ -25,6 +25,57 @@ def map_type_ducklake_to_spark(t):
         return 'date'
     return 'string'
 
+def convert_stat_value_to_json(value_str, column_type):
+    """
+    Convert DuckLake stat string value to proper JSON type for Delta Lake.
+    
+    Args:
+        value_str: String representation of the value from DuckLake
+        column_type: DuckDB column type
+    
+    Returns:
+        Properly typed value for JSON serialization
+    """
+    if value_str is None:
+        return None
+    
+    column_type = column_type.lower()
+    
+    try:
+        # Timestamp: Convert to ISO 8601 with .000Z suffix
+        if 'timestamp' in column_type:
+            # Parse and format to ISO 8601
+            # Assumes value_str is in format like "2025-06-22 23:55:00"
+            if 'T' not in value_str:
+                value_str = value_str.replace(' ', 'T')
+            if not value_str.endswith('Z'):
+                value_str += '.000Z' if '.000Z' not in value_str else 'Z'
+            return value_str
+        
+        # Date: Keep as YYYY-MM-DD string
+        elif 'date' in column_type:
+            return value_str
+        
+        # Boolean: Convert to JSON boolean
+        elif 'bool' in column_type:
+            return value_str.lower() in ('true', 't', '1', 'yes')
+        
+        # Numeric types: Convert to number (not string)
+        elif any(t in column_type for t in ['int', 'float', 'double', 'decimal', 'numeric']):
+            # Try to parse as float first (handles both int and float)
+            if '.' in value_str or 'e' in value_str.lower():
+                return float(value_str)
+            else:
+                return int(value_str)
+        
+        # String and others: Keep as string
+        else:
+            return value_str
+    
+    except (ValueError, AttributeError):
+        # If conversion fails, return as string
+        return value_str
+
 def create_spark_schema_string(fields):
     """Creates a JSON string for the Spark schema from a list of fields."""
     return json.dumps({"type": "struct", "fields": fields})
@@ -57,30 +108,50 @@ def get_file_modification_time(dummy_time):
     """
     return dummy_time
 
-def create_dummy_json_log(local_table_root, delta_version, table_info, schema_fields, now, latest_snapshot):
+def create_dummy_json_log(local_table_root, delta_version, table_info, schema_fields, now, latest_snapshot, 
+                         num_files, total_rows=None, total_bytes=None):
     """
-    Create a minimal JSON log file for Spark compatibility.
-    Writes to local filesystem (temp directory).
+    Create a minimal Delta Lake transaction log file for Spark compatibility.
+    Writes to local filesystem (temp directory) following Delta Lake specification.
+    Entry order: commitInfo → metaData → protocol (as per Delta Lake spec)
+    
+    Note: The actual add entries are in the checkpoint.parquet file.
+    This JSON log provides metadata for Delta readers to understand the checkpoint.
     """
+    import uuid
+    
     local_delta_log_dir = os.path.join(local_table_root, '_delta_log')
-    json_log_file = os.path.join(local_delta_log_dir, f"{delta_version:020d}.json")
     json_log_file = os.path.join(local_delta_log_dir, f"{delta_version:020d}.json")
     
     # Ensure directory exists
     os.makedirs(local_delta_log_dir, exist_ok=True)
     
-    # Protocol entry
-    protocol_json = json.dumps({
-        "protocol": {
-            "minReaderVersion": 1,
-            "minWriterVersion": 2
+    # 1. Commit info entry (FIRST - as per Delta Lake spec)
+    commitinfo_json = json.dumps({
+        "commitInfo": {
+            "timestamp": now,
+            "operation": "CONVERT",
+            "operationParameters": {
+                "convertedFrom": "DuckLake",
+                "duckLakeSnapshotId": str(latest_snapshot),
+                "partitionBy": "[]"
+            },
+            "isolationLevel": "Serializable",
+            "isBlindAppend": False,
+            "operationMetrics": {
+                "numFiles": str(num_files),
+                "numOutputRows": str(total_rows) if total_rows else "0",
+                "numOutputBytes": str(total_bytes) if total_bytes else "0"
+            },
+            "engineInfo": "DuckLake-Delta-Exporter/1.0.0",
+            "txnId": str(uuid.uuid4())
         }
     })
     
-    # Metadata entry
+    # 2. Metadata entry (SECOND)
     metadata_json = json.dumps({
         "metaData": {
-            "id": str(table_info['table_id']),
+            "id": str(uuid.uuid4()),  # Use UUID for metadata ID
             "name": table_info['table_name'],
             "description": None,
             "format": {
@@ -90,32 +161,23 @@ def create_dummy_json_log(local_table_root, delta_version, table_info, schema_fi
             "schemaString": create_spark_schema_string(schema_fields),
             "partitionColumns": [],
             "createdTime": now,
-            "configuration": {
-                "delta.logRetentionDuration": "interval 1 hour"
-            }
+            "configuration": {}
         }
     })
     
-    # Commit info entry
-    commitinfo_json = json.dumps({
-        "commitInfo": {
-            "timestamp": now,
-            "operation": "CONVERT",
-            "operationParameters": {
-                "convertedFrom": "DuckLake",
-                "duckLakeSnapshotId": latest_snapshot
-            },
-            "isBlindAppend": True,
-            "engineInfo": "DuckLake-Delta-Exporter",
-            "clientVersion": "1.0.0"
+    # 3. Protocol entry (THIRD)
+    protocol_json = json.dumps({
+        "protocol": {
+            "minReaderVersion": 1,
+            "minWriterVersion": 2
         }
     })
     
-    # Write JSON log file (newline-delimited JSON)
+    # Write JSON log file (newline-delimited JSON) in correct order
     with open(json_log_file, 'w') as f:
-        f.write(protocol_json + '\n')
-        f.write(metadata_json + '\n')
         f.write(commitinfo_json + '\n')
+        f.write(metadata_json + '\n')
+        f.write(protocol_json + '\n')
     
     return json_log_file
 
@@ -157,7 +219,9 @@ def create_checkpoint_for_latest_snapshot(con, table_info, data_root, temp_dir, 
     if latest_snapshot is None:
         print(f"⚠️ {table_info['schema_name']}.{table_info['table_name']}: No snapshots found")
         return False
-    delta_version   = get_latest_delta_checkpoint(con, table_info['table_id'])
+    
+    # Use snapshot ID as the delta version
+    delta_version = latest_snapshot
     
     # Local checkpoint files (in temp directory)
     local_delta_log_dir = os.path.join(local_table_root, '_delta_log')
@@ -172,54 +236,105 @@ def create_checkpoint_for_latest_snapshot(con, table_info, data_root, temp_dir, 
     
     # Check if checkpoint already exists (if store is provided)
     if store:
+        # Read _last_checkpoint to get the current version
         try:
-            import obstore as obs
-            # Extract relative path for obstore check
-            def get_relative_path(full_path):
-                if '/Tables/' in full_path:
-                    return full_path.split('/Tables/')[-1]
-                return full_path.lstrip('/')
+            last_checkpoint_result = con.execute(f"""
+                SELECT version
+                FROM read_json_auto('{remote_last_checkpoint_file}')
+                LIMIT 1
+            """).fetchone()
             
-            rel_json = get_relative_path(remote_json_log_file)
-            # Try to read existing JSON log to get last exported snapshot
-            try:
-                json_bytes = obs.get(store, rel_json)
-                json_content = json_bytes.decode('utf-8')
-                # Parse newline-delimited JSON to find commitInfo
-                for line in json_content.strip().split('\n'):
-                    entry = json.loads(line)
-                    if 'commitInfo' in entry:
-                        last_snapshot = entry['commitInfo'].get('operationParameters', {}).get('duckLakeSnapshotId')
-                        if last_snapshot == latest_snapshot:
-                            print(f"⚠️ {table_info['schema_name']}.{table_info['table_name']}: Snapshot {latest_snapshot} already exported (version {delta_version})")
-                            return False
-                        else:
-                            print(f"📊 {table_info['schema_name']}.{table_info['table_name']}: New snapshot detected (was {last_snapshot}, now {latest_snapshot})")
-                            break
-            except Exception:
-                # JSON file doesn't exist or couldn't be read, proceed with export
-                pass
-            
-            # Fallback: check if checkpoint file exists (for backwards compatibility)
-            rel_checkpoint = get_relative_path(remote_checkpoint_file)
-            try:
-                obs.head(store, rel_checkpoint)
-                print(f"⚠️ {table_info['schema_name']}.{table_info['table_name']}: Checkpoint exists but no snapshot info found (version {delta_version})")
-                return False
-            except Exception:
-                pass
-        except:
-            pass  # File doesn't exist, proceed with creation
+            if last_checkpoint_result:
+                current_version = last_checkpoint_result[0]
+                current_json_file = remote_table_root + f"/_delta_log/{current_version:020d}.json"
+                
+                # Read the current version's JSON to check snapshot ID
+                result = con.execute(f"""
+                    SELECT 
+                        commitInfo.operationParameters.duckLakeSnapshotId as snapshot_id
+                    FROM read_json_auto('{current_json_file}', format='newline_delimited')
+                    WHERE commitInfo IS NOT NULL
+                    LIMIT 1
+                """).fetchone()
+                
+                if result and result[0]:
+                    last_snapshot = result[0]
+                    if last_snapshot == str(latest_snapshot):
+                        print(f"⚠️ {table_info['schema_name']}.{table_info['table_name']}: Snapshot {latest_snapshot} already exported (version {current_version})")
+                        return False
+                    else:
+                        print(f"📊 {table_info['schema_name']}.{table_info['table_name']}: New snapshot detected (was {last_snapshot}, now {latest_snapshot})")
+        except Exception:
+            # _last_checkpoint doesn't exist, this is first export
+            pass
     
     now = int(time.time() * 1000)
     
-    # Get all files for the latest snapshot
-    file_rows = con.execute(f"""
-        SELECT path, file_size_bytes FROM ducklake_data_file
-        WHERE table_id = {table_info['table_id']}
-        AND begin_snapshot <= {latest_snapshot} 
-        AND (end_snapshot IS NULL OR end_snapshot > {latest_snapshot})
-    """).fetchall()
+    # Get all files with their stats for the latest snapshot
+    file_stats_query = f"""
+        SELECT 
+            df.data_file_id,
+            df.path,
+            df.file_size_bytes,
+            c.column_name,
+            c.column_type,
+            fcs.value_count,
+            fcs.null_count,
+            fcs.min_value,
+            fcs.max_value
+        FROM ducklake_data_file df
+        LEFT JOIN ducklake_file_column_stats fcs ON df.data_file_id = fcs.data_file_id
+        LEFT JOIN ducklake_column c ON fcs.column_id = c.column_id
+        WHERE df.table_id = {table_info['table_id']}
+          AND df.begin_snapshot <= {latest_snapshot}
+          AND (df.end_snapshot IS NULL OR df.end_snapshot > {latest_snapshot})
+          AND (c.begin_snapshot IS NULL OR c.begin_snapshot <= {latest_snapshot})
+          AND (c.end_snapshot IS NULL OR c.end_snapshot > {latest_snapshot})
+        ORDER BY df.data_file_id, c.column_order
+    """
+    
+    file_stats_rows = con.execute(file_stats_query).fetchall()
+    
+    # Group stats by file
+    from collections import defaultdict
+    files_dict = defaultdict(lambda: {
+        'path': None,
+        'size': 0,
+        'num_records': 0,
+        'min_values': {},
+        'max_values': {},
+        'null_count': {}
+    })
+    
+    for row in file_stats_rows:
+        file_id, path, size, col_name, col_type, value_count, null_count, min_val, max_val = row
+        
+        file_data = files_dict[file_id]
+        file_data['path'] = path
+        file_data['size'] = size
+        
+        # Set num_records from first column's value_count (all columns have same count)
+        if file_data['num_records'] == 0 and value_count is not None:
+            file_data['num_records'] = value_count
+        
+        # Only add column stats if column name exists (handle LEFT JOIN nulls)
+        if col_name is not None:
+            # Convert and add min/max values with proper typing
+            if min_val is not None:
+                file_data['min_values'][col_name] = convert_stat_value_to_json(min_val, col_type)
+            if max_val is not None:
+                file_data['max_values'][col_name] = convert_stat_value_to_json(max_val, col_type)
+            if null_count is not None:
+                file_data['null_count'][col_name] = null_count
+    
+    # Convert to list format for processing
+    file_rows = [(f['path'], f['size'], f['num_records'], f['min_values'], f['max_values'], f['null_count']) 
+                 for f in files_dict.values()]
+    
+    # Calculate aggregate metrics for commitInfo
+    total_files = len(file_rows)
+    total_rows = sum(f[2] for f in file_rows)  # num_records
+    total_bytes = sum(f[1] for f in file_rows)  # size
     
     # Get schema for the latest snapshot
     columns = con.execute(f"""
@@ -279,11 +394,19 @@ def create_checkpoint_for_latest_snapshot(con, table_info, data_root, temp_dir, 
         SELECT * FROM checkpoint_data
     """, [table_meta_id, table_info['table_name'], create_spark_schema_string(schema_fields), now])
     
-    # Add file records
-    for path, size in file_rows:
+    # Add file records with real statistics
+    for path, size, num_records, min_values, max_values, null_count in file_rows:
         rel_path = path.lstrip('/')
         full_path = build_file_path(remote_table_root, rel_path)
         mod_time = get_file_modification_time(now)
+        
+        # Build stats JSON with real values from DuckLake metadata
+        stats_json = json.dumps({
+            "numRecords": num_records,
+            "minValues": min_values,
+            "maxValues": max_values,
+            "nullCount": null_count
+        })
         
         duckdb.execute("""
             INSERT INTO checkpoint_table
@@ -297,11 +420,11 @@ def create_checkpoint_for_latest_snapshot(con, table_info, data_root, temp_dir, 
                     'modificationTime': ?, 
                     'dataChange': true, 
                     'stats': ?, 
-                    'tags': NULL::MAP(VARCHAR, VARCHAR)
+                    'tags': MAP{}::MAP(VARCHAR, VARCHAR)
                 }::STRUCT(path VARCHAR, partitionValues MAP(VARCHAR, VARCHAR), size BIGINT, modificationTime BIGINT, dataChange BOOLEAN, stats VARCHAR, tags MAP(VARCHAR, VARCHAR)) AS add,
                 NULL::STRUCT(path VARCHAR, deletionTimestamp BIGINT, dataChange BOOLEAN) AS remove,
                 NULL::STRUCT(timestamp TIMESTAMP, operation VARCHAR, operationParameters MAP(VARCHAR, VARCHAR), isBlindAppend BOOLEAN, engineInfo VARCHAR, clientVersion VARCHAR) AS commitInfo
-        """, [rel_path, size, mod_time, json.dumps({"numRecords": None})])
+        """, [rel_path, size, mod_time, stats_json])
     
     # Create the _delta_log directory
     os.makedirs(local_delta_log_dir, exist_ok=True)
@@ -309,8 +432,10 @@ def create_checkpoint_for_latest_snapshot(con, table_info, data_root, temp_dir, 
     # Write the checkpoint file to local temp directory
     duckdb.execute(f"COPY (SELECT * FROM checkpoint_table) TO '{local_checkpoint_file}' (FORMAT PARQUET)")
     
-    # Create dummy JSON log file for Spark compatibility (writes to local temp)
-    create_dummy_json_log(local_table_root, delta_version, table_info, schema_fields, now, latest_snapshot)
+    # Create minimal JSON log file (writes to local temp)
+    # Note: Full add entries are in the checkpoint.parquet, JSON only has metadata
+    create_dummy_json_log(local_table_root, delta_version, table_info, schema_fields, now, latest_snapshot,
+                         total_files, total_rows, total_bytes)
     
     # Write the _last_checkpoint file to local temp directory
     with open(local_last_checkpoint_file, 'w') as f:
@@ -336,15 +461,16 @@ def create_checkpoint_for_latest_snapshot(con, table_info, data_root, temp_dir, 
             rel_json_log = get_relative_path(remote_json_log_file)
             rel_last_checkpoint = get_relative_path(remote_last_checkpoint_file)
             
-            # Upload checkpoint file
+            # Upload checkpoint file first
             with open(local_checkpoint_file, 'rb') as f:
                 obs.put(store, rel_checkpoint, f.read())
             
-            # Upload JSON log file
+            # Upload JSON log file second
             with open(local_json_log_file, 'rb') as f:
                 obs.put(store, rel_json_log, f.read())
             
-            # Upload _last_checkpoint file
+            # Upload _last_checkpoint file last for semi-decent consistency
+            # (readers check this first to find the latest checkpoint)
             with open(local_last_checkpoint_file, 'rb') as f:
                 obs.put(store, rel_last_checkpoint, f.read())
             

@@ -104,6 +104,8 @@ def _get_local_token() -> Optional[str]:
         
     except Exception as cli_error:
         print(f"⚠️ Azure CLI authentication failed: {cli_error}")
+        print("💡 TIP: Due to MFA requirements, you now need to login with scope:")
+        print("   az login --scope https://storage.azure.com/.default")
         print("🔐 Falling back to interactive browser authentication...")
         
         # Fallback to interactive browser
@@ -119,6 +121,7 @@ def _get_local_token() -> Optional[str]:
             
         except Exception as browser_error:
             print(f"❌ Interactive browser authentication failed: {browser_error}")
+            print("💡 Please run: az login --scope https://storage.azure.com/.default")
             return None
 
 
