@@ -363,8 +363,11 @@ def create_checkpoint_for_latest_snapshot(con, table_info, data_root, temp_dir, 
         ORDER BY column_order
     """).fetchall()
     
-    # Get or generate table metadata ID
-    table_meta_id = str(table_info['table_id'])
+    # Generate deterministic UUID for table metadata ID (Delta Lake spec requirement)
+    # Same table_id always produces same UUID for consistency across versions
+    import uuid
+    namespace = uuid.UUID('6ba7b810-9dad-11d1-80b4-00c04fd430c8')  # DNS namespace
+    table_meta_id = str(uuid.uuid5(namespace, f"ducklake_table_{table_info['table_id']}"))
     
     # Prepare schema
     schema_fields = [
