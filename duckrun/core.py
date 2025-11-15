@@ -1249,15 +1249,80 @@ class Duckrun(WorkspaceOperationsMixin):
                 dataset_name = self.schema  # Use schema name
         
         # Call the deployment function (DirectLake only)
+        # Use lakehouse_id (with .ItemType suffix) instead of lakehouse_name (without suffix)
+        # This ensures proper item resolution for non-lakehouse items like .SnowflakeDatabase
         return deploy_semantic_model(
             workspace_name_or_id=self.workspace,
-            lakehouse_name_or_id=self.lakehouse_name,
+            lakehouse_name_or_id=self.lakehouse_id,
             schema_name=self.schema,
             dataset_name=dataset_name,
             bim_url_or_path=bim_url,
             wait_seconds=wait_seconds,
             refresh=refresh
         )
+
+    def export_ducklake_to_delta(self, db_path: str, data_root: str = None) -> bool:
+        """
+        Export DuckLake metadata to Delta Lake format for Spark compatibility.
+        
+        Reads a DuckLake database file from the Files section and generates Delta Lake
+        checkpoint files and JSON logs for all tables, making them readable by Spark
+        and other Delta Lake tools.
+        
+        Args:
+            db_path: Relative path to DuckLake DB file in Files section (e.g., "db/test/test.db")
+            data_root: Optional base path for lakehouse data. If None, reads from DuckLake metadata.
+        
+        Returns:
+            True if export succeeded, False otherwise
+        
+        Examples:
+            con = duckrun.connect("workspace/lakehouse.lakehouse/dbo")
+            
+            # Export DuckLake tables to Delta format
+            con.export_ducklake_to_delta("meta.db")
+            
+            # With explicit data root
+            con.export_ducklake_to_delta("db/ducklake.db", data_root="abfss://...")
+        """
+        from .ducklake_metadata import generate_latest_delta_log
+        import obstore as obs
+        from obstore.store import AzureStore
+        
+        # Construct full ABFSS path to DB file in Files section
+        full_db_path = f"{self.files_base_url}{db_path}"
+        
+        print(f"🔍 Exporting DuckLake metadata from: {db_path}")
+        print(f"📂 Full DB path: {full_db_path}")
+        
+        # Get Azure token
+        from .auth import get_token
+        token = self._get_storage_token()
+        if token == "PLACEHOLDER_TOKEN_TOKEN_NOT_AVAILABLE":
+            print("Authenticating with Azure for DuckLake export...")
+            token = get_token()
+            if not token:
+                print("❌ Failed to authenticate for DuckLake export")
+                return False
+        
+        # Setup OneLake store for uploading checkpoint files
+        # Use table_base_url as the base since we'll be writing to Tables section
+        store = AzureStore.from_url(self.table_base_url, bearer_token=token)
+        
+        # If data_root not provided, use table_base_url (which includes /Tables/)
+        # This will be used to construct full paths for checkpoint files
+        if data_root is None:
+            data_root = self.table_base_url.rstrip('/')
+        
+        try:
+            generate_latest_delta_log(full_db_path, data_root, store, token)
+            print(f"✅ DuckLake export completed successfully")
+            return True
+        except Exception as e:
+            print(f"❌ DuckLake export failed: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
 
     def rle(self, table_name: str = None, mode = "natural",
             min_distinct_threshold: int = 2, max_cardinality_pct: float = 0.01,

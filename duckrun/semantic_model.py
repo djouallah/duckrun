@@ -73,7 +73,10 @@ def get_workspace_id(workspace_name_or_id, client):
 
 
 def get_lakehouse_id(lakehouse_name_or_id, workspace_id, client):
-    """Get lakehouse ID by name or validate if already a GUID"""
+    """
+    Get lakehouse/item ID by name or validate if already a GUID.
+    Supports lakehouses, warehouses, databases, and other OneLake items.
+    """
     import re
     
     # Check if input is already a GUID
@@ -93,17 +96,114 @@ def get_lakehouse_id(lakehouse_name_or_id, workspace_id, client):
         except Exception as e:
             raise ValueError(f"Lakehouse with ID '{lakehouse_name_or_id}' not found: {e}")
     
-    # It's a name, search for it
-    response = client.get(f"/v1/workspaces/{workspace_id}/lakehouses")
-    items = response.json().get('value', [])
+    # Parse item type from name (e.g., "ItemName.ItemType")
+    item_type_map = {
+        '.lakehouse': 'Lakehouse',
+        '.warehouse': 'Warehouse',
+        '.database': 'Database',
+        '.snowflakedatabase': 'SnowflakeDatabase'
+    }
     
-    lakehouse_match = next((item for item in items if item.get('displayName') == lakehouse_name_or_id), None)
-    if not lakehouse_match:
-        raise ValueError(f"Lakehouse '{lakehouse_name_or_id}' not found")
+    item_type = None
+    item_name = lakehouse_name_or_id
     
-    lakehouse_id = lakehouse_match['id']
-    print(f"✓ Found lakehouse: {lakehouse_name_or_id}")
-    return lakehouse_id
+    for suffix, mapped_type in item_type_map.items():
+        if lakehouse_name_or_id.lower().endswith(suffix):
+            item_type = mapped_type
+            item_name = lakehouse_name_or_id[:-len(suffix)]
+            break
+    
+    # If no item type suffix, assume it's a lakehouse
+    if item_type is None or item_type == 'Lakehouse':
+        # Use lakehouse-specific API
+        response = client.get(f"/v1/workspaces/{workspace_id}/lakehouses")
+        items = response.json().get('value', [])
+        
+        lakehouse_match = next((item for item in items if item.get('displayName') == item_name), None)
+        if not lakehouse_match:
+            raise ValueError(f"Lakehouse '{item_name}' not found")
+        
+        lakehouse_id = lakehouse_match['id']
+        print(f"✓ Found lakehouse: {item_name}")
+        return lakehouse_id
+    else:
+        # Use generic items API for non-lakehouse items
+        print(f"   Searching for {item_type} '{item_name}'...")
+        response = client.get(f"/v1/workspaces/{workspace_id}/items")
+        items = response.json().get('value', [])
+        
+        # Filter by type and name
+        item_match = next(
+            (item for item in items 
+             if item.get('displayName') == item_name and item.get('type') == item_type),
+            None
+        )
+        
+        if not item_match:
+            raise ValueError(f"{item_type} '{item_name}' not found")
+        
+        item_id = item_match['id']
+        print(f"✓ Found {item_type.lower()}: {item_name}")
+        return item_id
+
+
+def resolve_to_guid(identifier, identifier_type, client, workspace_id=None):
+    """
+    Resolve workspace or item identifier to GUID if it's a friendly name.
+    If already a GUID, returns as-is.
+    
+    Args:
+        identifier: Workspace name/GUID or item name/GUID
+        identifier_type: 'workspace' or 'item'
+        client: FabricRestClient instance
+        workspace_id: Required if identifier_type is 'item'
+    
+    Returns:
+        GUID string or None if resolution fails
+    """
+    import re
+    
+    # Check if already a GUID
+    guid_pattern = re.compile(r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$', re.IGNORECASE)
+    if guid_pattern.match(identifier):
+        return identifier
+    
+    try:
+        if identifier_type == 'workspace':
+            # Resolve workspace name to GUID
+            response = client.get("/v1/workspaces")
+            workspaces = response.json().get('value', [])
+            workspace_match = next((ws for ws in workspaces if ws.get('displayName') == identifier), None)
+            return workspace_match['id'] if workspace_match else None
+        
+        elif identifier_type == 'item':
+            if not workspace_id:
+                return None
+            
+            # Parse item type from identifier
+            item_type_map = {
+                '.lakehouse': 'Lakehouse',
+                '.warehouse': 'Warehouse',
+                '.database': 'Database',
+                '.snowflakedatabase': 'SnowflakeDatabase'
+            }
+            
+            item_name = identifier
+            for suffix, mapped_type in item_type_map.items():
+                if identifier.lower().endswith(suffix):
+                    item_name = identifier[:-len(suffix)]
+                    break
+            
+            # Try generic items API
+            response = client.get(f"/v1/workspaces/{workspace_id}/items")
+            items = response.json().get('value', [])
+            item_match = next((item for item in items if item.get('displayName') == item_name), None)
+            
+            return item_match['id'] if item_match else None
+    
+    except Exception as e:
+        print(f"   ⚠️  Could not resolve {identifier_type} to GUID: {e}")
+        return None
 
 
 def get_dataset_id(dataset_name, workspace_id, client):
@@ -406,7 +506,14 @@ def download_bim_from_github(url_or_path):
 
 
 def update_bim_for_directlake(bim_content, workspace_id, lakehouse_id, schema_name):
-    """Update BIM file for DirectLake mode"""
+    """
+    Update BIM file for DirectLake mode.
+    
+    Args:
+        workspace_id: Workspace GUID (should be actual GUID, not friendly name)
+        lakehouse_id: Item GUID (should be actual GUID, not friendly name with suffix)
+        schema_name: Schema name
+    """
     
     new_url = f"https://onelake.dfs.fabric.microsoft.com/{workspace_id}/{lakehouse_id}"
     expression_name = None
@@ -606,15 +713,29 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
             print("=" * 70)
             return 1
         
-        # Step 3: Get lakehouse ID
+        # Step 3: Get lakehouse ID and ensure we have GUIDs for the BIM
         print(f"\n[Step 3/6] Finding lakehouse...")
         lakehouse_id = get_lakehouse_id(lakehouse_name_or_id, workspace_id, client)
+        
+        # Step 3.5: Resolve to actual GUIDs for semantic model compatibility
+        print(f"\n[Step 3.5/6] Resolving to GUIDs for semantic model...")
+        workspace_guid = resolve_to_guid(workspace_id, 'workspace', client)
+        lakehouse_guid = resolve_to_guid(lakehouse_id, 'item', client, workspace_guid)
+        
+        if workspace_guid:
+            print(f"✓ Workspace GUID: {workspace_guid}")
+        if lakehouse_guid:
+            print(f"✓ Item GUID: {lakehouse_guid}")
+        
+        # Use GUIDs if available, otherwise fall back to original values
+        workspace_for_bim = workspace_guid if workspace_guid else workspace_id
+        lakehouse_for_bim = lakehouse_guid if lakehouse_guid else lakehouse_id
         
         # Step 4: Download and update BIM
         print("\n[Step 4/6] Loading and configuring BIM file...")
         bim_content = download_bim_from_github(bim_url_or_path)
         
-        modified_bim = update_bim_for_directlake(bim_content, workspace_id, lakehouse_id, schema_name)
+        modified_bim = update_bim_for_directlake(bim_content, workspace_for_bim, lakehouse_for_bim, schema_name)
         modified_bim['name'] = dataset_name
         modified_bim['id'] = dataset_name
         
