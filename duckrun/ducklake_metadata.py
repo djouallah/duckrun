@@ -8,20 +8,21 @@ import shutil
 
 def map_type_ducklake_to_spark(t):
     """Maps DuckDB data types to their Spark SQL equivalents for the Delta schema."""
-    t = t.lower()
-    if 'int' in t:
-        return 'long' if '64' in t else 'integer'
-    elif 'float' in t:
+    t_lower = t.lower()
+    if 'int' in t_lower:
+        return 'long' if '64' in t_lower else 'integer'
+    elif 'float' in t_lower:
         return 'double'
-    elif 'double' in t:
+    elif 'double' in t_lower:
         return 'double'
-    elif 'decimal' in t:
-        return 'decimal(10,0)'
-    elif 'bool' in t:
+    elif 'decimal' in t_lower:
+        # Preserve the original decimal precision and scale
+        return t_lower
+    elif 'bool' in t_lower:
         return 'boolean'
-    elif 'timestamp' in t:
+    elif 'timestamp' in t_lower:
         return 'timestamp'
-    elif 'date' in t:
+    elif 'date' in t_lower:
         return 'date'
     return 'string'
 
@@ -42,14 +43,31 @@ def convert_stat_value_to_json(value_str, column_type):
     column_type = column_type.lower()
     
     try:
-        # Timestamp: Convert to ISO 8601 with .000Z suffix
+        # Timestamp: Convert to ISO 8601 with .000Z suffix (UTC format)
         if 'timestamp' in column_type:
             # Parse and format to ISO 8601
-            # Assumes value_str is in format like "2025-06-22 23:55:00"
+            # Handle various input formats from DuckDB:
+            # - "2025-06-22 23:55:00" -> "2025-06-22T23:55:00.000Z"
+            # - "2025-06-22T23:55:00+00" -> "2025-06-22T23:55:00.000Z"
+            # - "2025-06-22T23:55:00.123+00:00" -> "2025-06-22T23:55:00.123Z"
+            
+            # Replace space with T if needed
             if 'T' not in value_str:
                 value_str = value_str.replace(' ', 'T')
+            
+            # Remove timezone offset formats to normalize to UTC
+            # Strip patterns like: +00, +00:00, -05:00, etc.
+            import re
+            value_str = re.sub(r'[+-]\d{2}(?::\d{2})?$', '', value_str)
+            
+            # Ensure milliseconds are present
+            if '.' not in value_str:
+                value_str += '.000'
+            
+            # Add Z suffix for UTC if not present
             if not value_str.endswith('Z'):
-                value_str += '.000Z' if '.000Z' not in value_str else 'Z'
+                value_str += 'Z'
+            
             return value_str
         
         # Date: Keep as YYYY-MM-DD string
