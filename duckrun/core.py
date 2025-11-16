@@ -1758,3 +1758,12 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             import traceback
             traceback.print_exc()
             return None
+    
+    def close(self):
+        """
+        Close the workspace connection.
+        
+        Note: WorkspaceConnection doesn't maintain persistent connections,
+        so this is a no-op for compatibility with code patterns that call close().
+        """
+        pass

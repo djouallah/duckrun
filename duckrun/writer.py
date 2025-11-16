@@ -83,7 +83,9 @@ def _build_write_deltalake_args(path, df, mode, schema_mode=None, partition_by=N
             args['min_rows_per_group'] = RG
             # Set ZSTD compression for PyArrow engine
             if _HAS_PYARROW_DATASET:
-                args['file_options'] = ds.ParquetFileFormat().make_write_options(compression='ZSTD')
+                args['file_options'] = ds.ParquetFileFormat().make_write_options(
+                    compression='ZSTD'
+                )
         else:
             # Version 0.20+: no optimization available (rust by default, no row group params supported)
             # Set ZSTD compression for Rust engine

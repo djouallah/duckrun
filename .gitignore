@@ -48,6 +48,9 @@ tests/*/
 # Ignore JSON files (Delta logs, test data, etc.)
 *.json
 
+# Ignore CSV files
+*.csv
+
 # Confidential test files
 tests/*.py
 tests/*.parquet
