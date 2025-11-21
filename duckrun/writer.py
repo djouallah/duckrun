@@ -114,9 +114,9 @@ class DeltaWriter:
         return self
     
     def mode(self, write_mode: str):
-        """Set write mode: 'overwrite' or 'append'"""
-        if write_mode not in {"overwrite", "append"}:
-            raise ValueError(f"Mode must be 'overwrite' or 'append', got '{write_mode}'")
+        """Set write mode: 'overwrite', 'append', or 'ignore'"""
+        if write_mode not in {"overwrite", "append", "ignore"}:
+            raise ValueError(f"Mode must be 'overwrite', 'append', or 'ignore', got '{write_mode}'")
         self._mode = write_mode
         return self
     
@@ -154,6 +154,19 @@ class DeltaWriter:
         
         self.duckrun._create_onelake_secret()
         path = f"{self.duckrun.table_base_url}{schema}/{table}"
+        
+        # Handle 'ignore' mode - skip if table already exists
+        if self._mode == 'ignore':
+            try:
+                DeltaTable(path)
+                print(f"Table {schema}.{table} exists. Skipping (mode='ignore')")
+                return table
+            except Exception:
+                # Table doesn't exist, proceed with creation
+                print(f"Creating table {schema}.{table} (mode='ignore', table doesn't exist)")
+                # Change mode to 'overwrite' for actual write
+                self._mode = 'overwrite'
+        
         df = self.relation.record_batch()
         
         # Build write arguments based on schema_mode and partition_by
