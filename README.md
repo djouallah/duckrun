@@ -8,7 +8,7 @@ A helper package for working with Microsoft Fabric lakehouses - orchestration, S
 ## Important Notes
 
 **Requirements:**
-- Lakehouse without schema are not supported 
+- Lakehouses without schema are not supported 
 
 **Delta Lake Version:** This package uses an older version of deltalake to maintain row size control capabilities, which is crucial for Power BI performance optimization. The newer Rust-based deltalake versions don't yet support the row group size parameters that are essential for optimal DirectLake performance.
 

@@ -1,4 +1,4 @@
-"""
+﻿"""
 Semantic Model Deployer - DirectLake mode for Fabric Lakehouses
 Uses duckrun's authentication. Works anywhere duckrun works.
 """
@@ -36,10 +36,11 @@ class FabricRestClient:
         response.raise_for_status()
         return response
     
-    def post(self, endpoint: str, json: dict = None):
+    def post(self, endpoint: str, json: dict = None, raise_for_status: bool = True):
         url = f"{self.base_url}{endpoint}"
         response = requests.post(url, headers=self._get_headers(), json=json)
-        response.raise_for_status()
+        if raise_for_status:
+            response.raise_for_status()
         return response
 
 
@@ -54,7 +55,7 @@ def get_workspace_id(workspace_name_or_id, client):
         try:
             response = client.get(f"/v1/workspaces/{workspace_name_or_id}")
             workspace_name = response.json().get('displayName', workspace_name_or_id)
-            print(f"✓ Found workspace: {workspace_name}")
+            print(f"OK Found workspace: {workspace_name}")
             return workspace_name_or_id
         except:
             raise ValueError(f"Workspace with ID '{workspace_name_or_id}' not found")
@@ -68,7 +69,7 @@ def get_workspace_id(workspace_name_or_id, client):
         raise ValueError(f"Workspace '{workspace_name_or_id}' not found")
     
     workspace_id = workspace_match['id']
-    print(f"✓ Found workspace: {workspace_name_or_id}")
+    print(f"OK Found workspace: {workspace_name_or_id}")
     return workspace_id
 
 
@@ -89,7 +90,7 @@ def get_lakehouse_id(lakehouse_name_or_id, workspace_id, client):
             lakehouse_match = next((item for item in items if item.get('id') == lakehouse_name_or_id), None)
             if lakehouse_match:
                 lakehouse_name = lakehouse_match.get('displayName', lakehouse_name_or_id)
-                print(f"✓ Found lakehouse: {lakehouse_name}")
+                print(f"OK Found lakehouse: {lakehouse_name}")
                 return lakehouse_name_or_id
             else:
                 raise ValueError(f"Lakehouse with ID '{lakehouse_name_or_id}' not found")
@@ -124,7 +125,7 @@ def get_lakehouse_id(lakehouse_name_or_id, workspace_id, client):
             raise ValueError(f"Lakehouse '{item_name}' not found")
         
         lakehouse_id = lakehouse_match['id']
-        print(f"✓ Found lakehouse: {item_name}")
+        print(f"OK Found lakehouse: {item_name}")
         return lakehouse_id
     else:
         # Use generic items API for non-lakehouse items
@@ -143,7 +144,7 @@ def get_lakehouse_id(lakehouse_name_or_id, workspace_id, client):
             raise ValueError(f"{item_type} '{item_name}' not found")
         
         item_id = item_match['id']
-        print(f"✓ Found {item_type.lower()}: {item_name}")
+        print(f"OK Found {item_type.lower()}: {item_name}")
         return item_id
 
 
@@ -202,7 +203,7 @@ def resolve_to_guid(identifier, identifier_type, client, workspace_id=None):
             return item_match['id'] if item_match else None
     
     except Exception as e:
-        print(f"   ⚠️  Could not resolve {identifier_type} to GUID: {e}")
+        print(f"    WARNING:  Could not resolve {identifier_type} to GUID: {e}")
         return None
 
 
@@ -222,10 +223,10 @@ def check_dataset_exists(dataset_name, workspace_id, client):
     """Check if dataset already exists"""
     try:
         get_dataset_id(dataset_name, workspace_id, client)
-        print(f"⚠️  Dataset '{dataset_name}' already exists")
+        print(f" WARNING:  Dataset '{dataset_name}' already exists")
         return True
     except:
-        print(f"✓ Dataset name '{dataset_name}' is available")
+        print(f"OK Dataset name '{dataset_name}' is available")
         return False
 
 
@@ -263,7 +264,7 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None, refresh
                 status = latest_refresh.get('status')
                 if status in ['InProgress', 'Unknown']:
                     refresh_id = latest_refresh.get('requestId')
-                    print(f"   ⚠️  Found in-progress refresh (ID: {refresh_id})")
+                    print(f"    WARNING:  Found in-progress refresh (ID: {refresh_id})")
                     print(f"   Waiting for current refresh to complete...")
                     
                     # Wait for the in-progress refresh to complete
@@ -275,21 +276,21 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None, refresh
                             current_status = check_response.json().get('status')
                             
                             if current_status == 'Completed':
-                                print(f"   ✓ Previous refresh completed")
+                                print(f"   OK Previous refresh completed")
                                 break
                             elif current_status == 'Failed':
-                                print(f"   ⚠️  Previous refresh failed, continuing with new refresh")
+                                print(f"    WARNING:  Previous refresh failed, continuing with new refresh")
                                 break
                             elif current_status == 'Cancelled':
-                                print(f"   ⚠️  Previous refresh was cancelled, continuing with new refresh")
+                                print(f"    WARNING:  Previous refresh was cancelled, continuing with new refresh")
                                 break
                             
                             if attempt % 6 == 0:
                                 print(f"   Still waiting... (status: {current_status})")
                     else:
-                        print(f"   ⚠️  Timeout waiting for previous refresh, will attempt new refresh anyway")
+                        print(f"    WARNING:  Timeout waiting for previous refresh, will attempt new refresh anyway")
     except Exception as e:
-        print(f"   ⚠️  Could not check refresh status: {e}")
+        print(f"    WARNING:  Could not check refresh status: {e}")
         print(f"   Continuing with refresh attempt...")
     
     # Step 1: clearValues - Purge data from memory
@@ -310,7 +311,7 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None, refresh
             location = response.headers.get('Location')
             if location:
                 clear_refresh_id = location.split('/')[-1]
-                print("   ✓ Clear values initiated, monitoring progress...")
+                print("   OK Clear values initiated, monitoring progress...")
                 
                 max_attempts = 60
                 for attempt in range(max_attempts):
@@ -322,7 +323,7 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None, refresh
                     status = status_response.json().get('status')
                     
                     if status == 'Completed':
-                        print(f"   ✓ Clear values completed")
+                        print(f"   OK Clear values completed")
                         break
                     elif status == 'Failed':
                         error = status_response.json().get('serviceExceptionJson', '')
@@ -335,7 +336,7 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None, refresh
                 else:
                     raise Exception(f"Clear values timed out")
         else:
-            print("   ✓ Clear values completed")
+            print("   OK Clear values completed")
     else:
         # Provide detailed error message
         try:
@@ -358,7 +359,7 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None, refresh
     response = requests.post(powerbi_url, headers=headers, json=full_payload)
     
     if response.status_code in [200, 202]:
-        print(f"   ✓ Refresh initiated")
+        print(f"   OK Refresh initiated")
         
         # For 202, get the refresh_id from the Location header
         if response.status_code == 202:
@@ -377,7 +378,7 @@ def refresh_dataset(dataset_name, workspace_id, client, dataset_id=None, refresh
                     status = status_response.json().get('status')
                     
                     if status == 'Completed':
-                        print(f"✓ Refresh completed successfully")
+                        print(f"OK Refresh completed successfully")
                         return
                     elif status == 'Failed':
                         error = status_response.json().get('serviceExceptionJson', '')
@@ -420,14 +421,14 @@ def download_bim_from_github(url_or_path):
         print(f"Loading BIM file from local path...")
         with open(url_or_path, 'r', encoding='utf-8') as f:
             bim_content = json.load(f)
-        print(f"✓ BIM file loaded from: {url_or_path}")
+        print(f"OK BIM file loaded from: {url_or_path}")
     # Check if it's a URL
     elif url_or_path.startswith(('http://', 'https://')):
         print(f"Downloading BIM file from URL...")
         response = requests.get(url_or_path)
         response.raise_for_status()
         bim_content = response.json()
-        print(f"✓ BIM file downloaded from URL")
+        print(f"OK BIM file downloaded from URL")
     # Check if it's workspace/model format
     elif "/" in url_or_path and not os.path.exists(url_or_path):
         print(f"Downloading BIM from workspace/model...")
@@ -496,7 +497,7 @@ def download_bim_from_github(url_or_path):
         bim_content_str = base64.b64decode(bim_payload).decode('utf-8')
         bim_content = json.loads(bim_content_str)
         
-        print(f"✓ BIM downloaded from {ws_name}/{model_name}")
+        print(f"OK BIM downloaded from {ws_name}/{model_name}")
     else:
         raise ValueError(f"Invalid BIM source: '{url_or_path}'. Must be a valid file path, URL, or 'workspace/model' format.")
     
@@ -562,7 +563,7 @@ def update_bim_for_directlake(bim_content, workspace_id, lakehouse_id, schema_na
                             "schemaName": schema_name
                         }
     
-    print(f"✓ Updated BIM for DirectLake")
+    print(f"OK Updated BIM for DirectLake")
     print(f"  - OneLake URL: {new_url}")
     print(f"  - Schema: {schema_name}")
     
@@ -602,7 +603,7 @@ def create_dataset_from_bim(dataset_name, bim_content, workspace_id, client):
         json=payload
     )
     
-    print(f"✓ Semantic model created")
+    print(f"OK Semantic model created")
     
     # Handle long-running operation and return the dataset ID
     if response.status_code == 202:
@@ -618,7 +619,7 @@ def create_dataset_from_bim(dataset_name, bim_content, workspace_id, client):
             status = status_response.json().get('status')
             
             if status == 'Succeeded':
-                print(f"✓ Operation completed")
+                print(f"OK Operation completed")
                 
                 # Now get the result (only after status is Succeeded)
                 try:
@@ -697,7 +698,7 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         dataset_exists = check_dataset_exists(dataset_name, workspace_id, client)
         
         if dataset_exists:
-            print(f"✓ Dataset '{dataset_name}' already exists - skipping deployment")
+            print(f"OK Dataset '{dataset_name}' already exists - skipping deployment")
             
             if wait_seconds > 0:
                 print(f"   Waiting {wait_seconds} seconds...")
@@ -707,7 +708,7 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
             refresh_dataset(dataset_name, workspace_id, client, refresh=refresh)
             
             print("\n" + "=" * 70)
-            print("🎉 Refresh Completed!")
+            print(" SUCCESS: Refresh Completed!")
             print("=" * 70)
             print(f"Dataset: {dataset_name}")
             print("=" * 70)
@@ -723,9 +724,9 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         lakehouse_guid = resolve_to_guid(lakehouse_id, 'item', client, workspace_guid)
         
         if workspace_guid:
-            print(f"✓ Workspace GUID: {workspace_guid}")
+            print(f"OK Workspace GUID: {workspace_guid}")
         if lakehouse_guid:
-            print(f"✓ Item GUID: {lakehouse_guid}")
+            print(f"OK Item GUID: {lakehouse_guid}")
         
         # Use GUIDs if available, otherwise fall back to original values
         workspace_for_bim = workspace_guid if workspace_guid else workspace_id
@@ -753,7 +754,7 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         refresh_dataset(dataset_name, workspace_id, client, dataset_id=dataset_id, refresh=refresh)
         
         print("\n" + "=" * 70)
-        print("🎉 Deployment Completed!")
+        print(" SUCCESS: Deployment Completed!")
         print("=" * 70)
         print(f"Dataset: {dataset_name}")
         print(f"Workspace: {workspace_name_or_id}")
@@ -765,10 +766,10 @@ def deploy_semantic_model(workspace_name_or_id, lakehouse_name_or_id, schema_nam
         
     except Exception as e:
         print("\n" + "=" * 70)
-        print("❌ Deployment Failed")
+        print("ERROR Deployment Failed")
         print("=" * 70)
         print(f"Error: {str(e)}")
-        print("\n💡 Troubleshooting:")
+        print("\n TIP: Troubleshooting:")
         print(f"  - Verify workspace '{workspace_name_or_id}' exists")
         print(f"  - Verify lakehouse '{lakehouse_name_or_id}' exists")
         print(f"  - Ensure tables exist in '{schema_name}' schema")
@@ -868,7 +869,7 @@ def copy_model(ws_source, model_name, destination, new_model_name=None, wait_sec
                 raise ValueError(f"Semantic model '{model_name}' not found in workspace '{ws_source}'")
             
             model_id = model.get('id')
-            print(f"✓ Found source model: {model_name} (ID: {model_id})")
+            print(f"OK Found source model: {model_name} (ID: {model_id})")
             
             # Get definition using Items API with TMSL format
             print("  Downloading BIM definition...")
@@ -919,7 +920,7 @@ def copy_model(ws_source, model_name, destination, new_model_name=None, wait_sec
             # Write to temp file
             json.dump(bim_json, tmp_file, indent=2)
             
-            print(f"✓ BIM downloaded successfully")
+            print(f"OK BIM downloaded successfully")
             print(f"  - Tables: {len(bim_json.get('model', {}).get('tables', []))}")
             print(f"  - Relationships: {len(bim_json.get('model', {}).get('relationships', []))}")
         
@@ -946,7 +947,7 @@ def copy_model(ws_source, model_name, destination, new_model_name=None, wait_sec
         
         if result == 1:
             print("\n" + "=" * 70)
-            print("🎉 Copy Operation Completed!")
+            print(" SUCCESS: Copy Operation Completed!")
             print("=" * 70)
             print(f"Source: {ws_source}/{model_name}")
             print(f"Destination: {ws_dest}/{lakehouse}/{schema}/{new_model_name}")
@@ -956,13 +957,262 @@ def copy_model(ws_source, model_name, destination, new_model_name=None, wait_sec
         
     except Exception as e:
         print("\n" + "=" * 70)
-        print("❌ Copy Operation Failed")
+        print("ERROR Copy Operation Failed")
         print("=" * 70)
         print(f"Error: {str(e)}")
-        print("\n💡 Troubleshooting:")
+        print("\n TIP: Troubleshooting:")
         print(f"  - Verify source workspace '{ws_source}' and model '{model_name}' exist")
         print(f"  - Verify destination workspace and lakehouse exist")
         print(f"  - Ensure you have permissions for both workspaces")
+        print("=" * 70)
+        return 0
+
+
+def upload_pbix_and_bind(workspace_name_or_id, pbix_url, report_name, semantic_model_name):
+    """
+    Download a PBIX file and bind it to an existing semantic model.
+    
+    This function downloads a PBIX report from a URL, extracts its contents,
+    and creates a report in Fabric using the Items API, then binds it to the
+    specified semantic model. Works with all Fabric workspace types.
+    
+    Args:
+        workspace_name_or_id: Name or GUID of the target workspace
+        pbix_url: URL to download the PBIX file from
+        report_name: Name for the new report
+        semantic_model_name: Name of the existing semantic model to bind to
+    
+    Returns:
+        1 for success, 0 for failure
+    
+    Examples:
+        # Upload and bind a report to an existing semantic model
+        upload_pbix_and_bind(
+            workspace_name_or_id="My Workspace",
+            pbix_url="https://github.com/user/repo/raw/main/report.pbix",
+            report_name="Sales Report",
+            semantic_model_name="Sales Model"
+        )
+        
+        # Using workspace GUID
+        upload_pbix_and_bind(
+            workspace_name_or_id="cfafbeb1-8037-4d0c-896e-a46fb27ff229",
+            pbix_url="https://example.com/reports/monthly.pbix",
+            report_name="Monthly Dashboard",
+            semantic_model_name="Analytics Model"
+        )
+    """
+    import zipfile
+    import io
+    
+    print("=" * 70)
+    print("PBIX Upload and Bind Operation")
+    print("=" * 70)
+    
+    client = FabricRestClient()
+    
+    try:
+        # Step 1: Get workspace ID
+        print("\n[Step 1/6] Getting workspace information...")
+        workspace_id = get_workspace_id(workspace_name_or_id, client)
+        
+        # Step 2: Get semantic model ID
+        print(f"\n[Step 2/6] Finding semantic model '{semantic_model_name}'...")
+        dataset_id = get_dataset_id(semantic_model_name, workspace_id, client)
+        print(f"OK Found semantic model (ID: {dataset_id})")
+        
+        # Step 3: Check if report already exists
+        print(f"\n[Step 3/6] Checking if report '{report_name}' already exists...")
+        reports_response = client.get(f"/v1/workspaces/{workspace_id}/reports")
+        reports = reports_response.json().get('value', [])
+        existing_report = None
+        for rpt in reports:
+            if rpt.get('displayName') == report_name:
+                existing_report = rpt
+                break
+        
+        if existing_report:
+            print(f" WARNING: Report '{report_name}' already exists")
+            print(f"  Report ID: {existing_report.get('id')}")
+            print(f"  Skipping deployment to avoid duplicates")
+            print("\n" + "=" * 70)
+            print(f" TIP: To update the report, delete it first or use a different name")
+            print("=" * 70)
+            return 1
+        
+        print(f"OK Report name is available")
+        
+        # Step 4: Download PBIX file
+        print(f"\n[Step 4/7] Downloading PBIX file from URL...")
+        print(f"  URL: {pbix_url}")
+        
+        response = requests.get(pbix_url)
+        response.raise_for_status()
+        pbix_content = response.content
+        print(f"OK Downloaded PBIX file ({len(pbix_content)} bytes)")
+        
+        # Step 5: Extract PBIX contents (PBIX is a ZIP file)
+        print(f"\n[Step 5/7] Extracting PBIX contents...")
+        
+        pbix_zip = zipfile.ZipFile(io.BytesIO(pbix_content))
+        
+        # Read required files from PBIX
+        report_layout = None
+        
+        for file_name in pbix_zip.namelist():
+            if file_name == 'Report/Layout':
+                report_layout_bytes = pbix_zip.read(file_name)
+                # Report/Layout is UTF-16 LE encoded
+                try:
+                    report_layout = report_layout_bytes.decode('utf-16-le')
+                    print(f"  OK Found Report/Layout ({len(report_layout_bytes)} bytes)")
+                except:
+                    # Fallback to UTF-8
+                    report_layout = report_layout_bytes.decode('utf-8')
+                    print(f"  OK Found Report/Layout ({len(report_layout_bytes)} bytes)")
+        
+        if not report_layout:
+            raise Exception("PBIX file does not contain Report/Layout")
+        
+        # Step 6: Create report using Fabric Items API
+        print(f"\n[Step 6/7] Creating report in Fabric workspace...")
+        
+        # Create definition.pbir that binds to the semantic model
+        definition_pbir = {
+            "version": "1.0",
+            "datasetReference": {
+                "byPath": None,
+                "byConnection": {
+                    "connectionString": None,
+                    "pbiServiceModelId": None,
+                    "pbiModelVirtualServerName": "sobe_wowvirtualserver",
+                    "pbiModelDatabaseName": dataset_id,
+                    "name": "EntityDataSource",
+                    "connectionType": "pbiServiceXmlaStyleLive",
+                },
+            },
+        }
+        
+        # Prepare parts for Fabric API (only need report.json and definition.pbir)
+        parts = [
+            {
+                "path": "report.json",
+                "payload": base64.b64encode(report_layout.encode('utf-8')).decode('utf-8'),
+                "payloadType": "InlineBase64"
+            },
+            {
+                "path": "definition.pbir",
+                "payload": base64.b64encode(json.dumps(definition_pbir).encode('utf-8')).decode('utf-8'),
+                "payloadType": "InlineBase64"
+            }
+        ]
+        
+        # Create the report
+        create_payload = {
+            "displayName": report_name,
+            "description": f"Report bound to {semantic_model_name}",
+            "definition": {
+                "parts": parts
+            }
+        }
+        
+        create_response = client.post(f"/v1/workspaces/{workspace_id}/reports", json=create_payload, raise_for_status=False)
+        
+        if create_response is None:
+            raise Exception("Failed to get response from Fabric API")
+        
+        # Handle long-running operation (202 Accepted)
+        if create_response.status_code == 202:
+            operation_url = create_response.headers.get('Location')
+            if not operation_url:
+                raise Exception("API returned 202 but no Location header for polling")
+            
+            print(f"  Report creation initiated, monitoring progress...")
+            max_attempts = 60
+            for attempt in range(max_attempts):
+                time.sleep(2)
+                
+                # Poll the operation status
+                poll_response = requests.get(operation_url, headers=client._get_headers())
+                if poll_response.status_code == 200:
+                    operation_result = poll_response.json()
+                    status = operation_result.get('status')
+                    
+                    if status == 'Succeeded':
+                        print(f"  OK Report creation completed")
+                        # Get the report ID from the result
+                        report_id = operation_result.get('resourceId') or operation_result.get('id')
+                        if not report_id:
+                            # Extract from resourceLocation if available
+                            resource_location = operation_result.get('resourceLocation', '')
+                            if '/reports/' in resource_location:
+                                report_id = resource_location.split('/reports/')[-1]
+                            elif '/items/' in resource_location:
+                                # Fabric Items API format
+                                report_id = resource_location.split('/items/')[-1]
+                        
+                        # If still no ID, list reports to find it
+                        if not report_id:
+                            print(f"  Searching for created report...")
+                            reports_response = client.get(f"/v1/workspaces/{workspace_id}/reports")
+                            reports = reports_response.json().get('value', [])
+                            for rpt in reports:
+                                if rpt.get('displayName') == report_name:
+                                    report_id = rpt.get('id')
+                                    print(f"  OK Found report by name")
+                                    break
+                        
+                        break
+                    elif status == 'Failed':
+                        error = operation_result.get('error', {})
+                        raise Exception(f"Report creation failed: {error}")
+                    
+                    if attempt % 10 == 0 and attempt > 0:
+                        print(f"  Status: {status}...")
+                elif poll_response.status_code == 202:
+                    # Still processing
+                    continue
+                else:
+                    raise Exception(f"Polling failed with status {poll_response.status_code}: {poll_response.text}")
+            else:
+                raise Exception("Report creation timed out")
+        
+        elif not create_response.ok:
+            error_detail = create_response.text
+            raise Exception(f"Failed to create report: {create_response.status_code}\n{error_detail}")
+        
+        else:
+            # Immediate success (201)
+            report_data = create_response.json()
+            report_id = report_data.get('id')
+        
+        print(f"OK Report created successfully (ID: {report_id})")
+        
+        # Step 7: Verify the report was created with the correct binding
+        print(f"\n[Step 7/7] Verifying report binding...")
+        print(f"Report '{report_name}' is now bound to semantic model '{semantic_model_name}'")
+        
+        print("\n" + "=" * 70)
+        print("SUCCESS: Upload and Bind Completed!")
+        print("=" * 70)
+        print(f"Workspace: {workspace_name_or_id}")
+        print(f"Report: {report_name}")
+        print(f"Semantic Model: {semantic_model_name}")
+        print("=" * 70)
+        
+        return 1
+        
+    except Exception as e:
+        print("\n" + "=" * 70)
+        print("ERROR: Upload and Bind Failed")
+        print("=" * 70)
+        print(f"Error: {str(e)}")
+        print("\nTroubleshooting:")
+        print(f"  - Verify workspace '{workspace_name_or_id}' exists")
+        print(f"  - Verify semantic model '{semantic_model_name}' exists in workspace")
+        print(f"  - Check PBIX URL is accessible: {pbix_url}")
+        print(f"  - Ensure you have permissions to create reports in workspace")
+        print(f"  - Verify the PBIX file is valid and can be bound to the semantic model")
         print("=" * 70)
         return 0
 

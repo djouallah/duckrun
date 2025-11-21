@@ -52,5 +52,5 @@ tests/*/
 *.csv
 
 # Confidential test files
-tests/*.py
+tests/*.*
 tests/*.parquet

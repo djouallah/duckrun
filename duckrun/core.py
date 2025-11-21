@@ -1,4 +1,4 @@
-import duckdb
+﻿import duckdb
 import requests
 import os
 import importlib.util
@@ -197,7 +197,7 @@ class Duckrun(WorkspaceOperationsMixin):
         else:
             # In token_only mode, just create the secret for authentication
             self._create_onelake_secret()
-            print("✓ Token authenticated (fast mode - tables not listed)")
+            print("OK Token authenticated (fast mode - tables not listed)")
 
     @classmethod
     def connect(cls, connection_string: str, sql_folder: Optional[str] = None,
@@ -364,7 +364,7 @@ class Duckrun(WorkspaceOperationsMixin):
                 workspace_id = cls._resolve_workspace_id_by_name(token, workspace_name)
                 if not workspace_id:
                     # Fallback to current workspace if name resolution fails
-                    print(f"⚠️ Could not validate workspace name '{workspace_name}', using current workspace")
+                    print(f" WARNING: Could not validate workspace name '{workspace_name}', using current workspace")
                     workspace_id = current_workspace_id
             else:
                 # External environment - must resolve by name
@@ -385,9 +385,9 @@ class Duckrun(WorkspaceOperationsMixin):
             return workspace_id, item_id
             
         except Exception as e:
-            print(f"❌ Failed to resolve names to GUIDs: {e}")
-            print(f"❌ Cannot resolve '{workspace_name}'/'{item_name}' ({item_type}) to GUIDs")
-            print("❌ Microsoft Fabric requires actual workspace and item GUIDs for ABFSS access")
+            print(f"ERROR Failed to resolve names to GUIDs: {e}")
+            print(f"ERROR Cannot resolve '{workspace_name}'/'{item_name}' ({item_type}) to GUIDs")
+            print("ERROR Microsoft Fabric requires actual workspace and item GUIDs for ABFSS access")
             raise ValueError(
                 f"Unable to resolve workspace '{workspace_name}' and {item_type.lower()} '{item_name}' to GUIDs. "
                 f"ABFSS URLs require actual GUIDs. "
@@ -540,7 +540,7 @@ class Duckrun(WorkspaceOperationsMixin):
                 from .auth import get_token
                 token = get_token()
                 if not token:
-                    print("❌ Failed to authenticate for table discovery")
+                    print("ERROR Failed to authenticate for table discovery")
                     return []
             
             # OneLake Delta Table API endpoint (Unity Catalog compatible)
@@ -640,7 +640,7 @@ class Duckrun(WorkspaceOperationsMixin):
             return tables_found
             
         except Exception as e:
-            print(f"❌ Error during table discovery: {e}")
+            print(f"ERROR Error during table discovery: {e}")
             import traceback
             traceback.print_exc()
             return []
@@ -655,9 +655,9 @@ class Duckrun(WorkspaceOperationsMixin):
             
             if not tables:
                 if self.scan_all_schemas:
-                    print(f"⚠️  No tables found in any schema")
+                    print(f" WARNING:  No tables found in any schema")
                 else:
-                    print(f"⚠️  No tables found in {self.schema} schema")
+                    print(f" WARNING:  No tables found in {self.schema} schema")
                 return
             
             # Collect table names for display
@@ -680,7 +680,7 @@ class Duckrun(WorkspaceOperationsMixin):
                         AS SELECT * FROM delta_scan('{self.table_base_url}{schema_name}/{table_name}');
                     """)
                 except Exception as e:
-                    print(f"⚠️  Failed to attach table {schema_name}.{table_name}: {e}")
+                    print(f" WARNING:  Failed to attach table {schema_name}.{table_name}: {e}")
                     continue
             
             # Print discovered tables as comma-separated list
@@ -688,7 +688,7 @@ class Duckrun(WorkspaceOperationsMixin):
                 print(", ".join(table_names))
                 
         except Exception as e:
-            print(f"❌ Error attaching lakehouse: {e}")
+            print(f"ERROR Error attaching lakehouse: {e}")
             import traceback
             traceback.print_exc()
 
@@ -834,7 +834,7 @@ class Duckrun(WorkspaceOperationsMixin):
             self.con.create_function("get_workspace_id_from_name", get_workspace_id_from_name, null_handling='SPECIAL')
             self.con.create_function("get_lakehouse_id_from_name", get_lakehouse_id_from_name, null_handling='SPECIAL')
         except Exception as e:
-            print(f"⚠️  Warning: Could not register lookup functions: {e}")
+            print(f" WARNING:  Warning: Could not register lookup functions: {e}")
 
     def get_workspace_id(self, force: bool = False) -> str:
         """
@@ -1101,7 +1101,7 @@ class Duckrun(WorkspaceOperationsMixin):
             from .auth import get_fabric_api_token
             token = get_fabric_api_token()
             if not token:
-                print("❌ Failed to authenticate for listing lakehouses")
+                print("ERROR Failed to authenticate for listing lakehouses")
                 return []
             
             # Try to get current workspace ID if in notebook environment
@@ -1151,7 +1151,7 @@ class Duckrun(WorkspaceOperationsMixin):
             from .auth import get_fabric_api_token
             token = get_fabric_api_token()
             if not token:
-                print("❌ Failed to authenticate for lakehouse creation")
+                print("ERROR Failed to authenticate for lakehouse creation")
                 return False
             
             # Try to get current workspace ID if in notebook environment
@@ -1193,11 +1193,11 @@ class Duckrun(WorkspaceOperationsMixin):
             response = requests.post(url, headers=headers, json=payload)
             response.raise_for_status()
             
-            print(f"✅ Lakehouse '{lakehouse_name}' created successfully")
+            print(f"OK Lakehouse '{lakehouse_name}' created successfully")
             return True
             
         except Exception as e:
-            print(f"❌ Error creating lakehouse '{lakehouse_name}': {e}")
+            print(f"ERROR Error creating lakehouse '{lakehouse_name}': {e}")
             return False
 
     def deploy(self, bim_url: str, dataset_name: Optional[str] = None, 
@@ -1261,6 +1261,52 @@ class Duckrun(WorkspaceOperationsMixin):
             refresh=refresh
         )
 
+    def deploy_pbix(self, pbix_url: str, semantic_model_name: str, report_name: Optional[str] = None) -> int:
+        """
+        Download a PBIX file and bind it to an existing semantic model.
+        
+        This method downloads a PBIX report from a URL and binds it to an existing
+        semantic model in the workspace. The PBIX file should contain only report pages
+        (visualizations) without a data model, as it will be bound to the specified
+        semantic model.
+        
+        Args:
+            pbix_url: URL to download the PBIX file from
+            semantic_model_name: Name of the existing semantic model to bind to
+            report_name: Name for the new report (default: semantic model name)
+        
+        Returns:
+            1 for success, 0 for failure
+        
+        Examples:
+            con = duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo")
+            
+            # Download and bind PBIX to existing semantic model
+            con.deploy_pbix(
+                pbix_url="https://github.com/user/repo/raw/main/report.pbix",
+                semantic_model_name="Sales Model"
+            )
+            
+            # With custom report name
+            con.deploy_pbix(
+                pbix_url="https://example.com/reports/dashboard.pbix",
+                semantic_model_name="Analytics Model",
+                report_name="Monthly Dashboard"
+            )
+        """
+        from .semantic_model import upload_pbix_and_bind
+        
+        # Use semantic model name as report name if not provided
+        if report_name is None:
+            report_name = semantic_model_name
+        
+        return upload_pbix_and_bind(
+            workspace_name_or_id=self.workspace,
+            pbix_url=pbix_url,
+            report_name=report_name,
+            semantic_model_name=semantic_model_name
+        )
+
     def export_ducklake_to_delta(self, db_path: str, data_root: str = None) -> bool:
         """
         Export DuckLake metadata to Delta Lake format for Spark compatibility.
@@ -1302,7 +1348,7 @@ class Duckrun(WorkspaceOperationsMixin):
             print("Authenticating with Azure for DuckLake export...")
             token = get_token()
             if not token:
-                print("❌ Failed to authenticate for DuckLake export")
+                print("ERROR Failed to authenticate for DuckLake export")
                 return False
         
         # Setup OneLake store for uploading checkpoint files
@@ -1316,10 +1362,10 @@ class Duckrun(WorkspaceOperationsMixin):
         
         try:
             generate_latest_delta_log(full_db_path, data_root, store, token)
-            print(f"✅ DuckLake export completed successfully")
+            print(f"OK DuckLake export completed successfully")
             return True
         except Exception as e:
-            print(f"❌ DuckLake export failed: {e}")
+            print(f"ERROR DuckLake export failed: {e}")
             import traceback
             traceback.print_exc()
             return False
@@ -1384,10 +1430,10 @@ class Duckrun(WorkspaceOperationsMixin):
         # Parse table name and construct path
         if table_name is None:
             if mode != "summary":
-                print("⚠️  Table name is required for 'smart' and 'full' modes")
+                print(" WARNING:  Table name is required for 'smart' and 'full' modes")
                 return None
             # TODO: Implement all-tables summary
-            print("⚠️  All-tables summary not yet implemented. Please specify a table name.")
+            print(" WARNING:  All-tables summary not yet implemented. Please specify a table name.")
             return None
         
         # Parse schema.table or just table
@@ -1408,11 +1454,11 @@ class Duckrun(WorkspaceOperationsMixin):
             delta_files = dt.files()
             
             if not delta_files:
-                print("⚠️  Table is empty (no files)")
+                print(" WARNING:  Table is empty (no files)")
                 return None
             
         except Exception as e:
-            print(f"❌ Error accessing Delta table: {e}")
+            print(f"ERROR Error accessing Delta table: {e}")
             return None
         
         # Check if mode is a list of columns (custom ordering)
@@ -1537,7 +1583,7 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             from .auth import get_fabric_api_token
             token = get_fabric_api_token()
             if not token:
-                print("❌ Failed to authenticate for listing lakehouses")
+                print("ERROR Failed to authenticate for listing lakehouses")
                 return []
             
             # Always resolve workspace name to ID, even in notebook environment
@@ -1577,7 +1623,7 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             from .auth import get_fabric_api_token
             token = get_fabric_api_token()
             if not token:
-                print("❌ Failed to authenticate for lakehouse creation")
+                print("ERROR Failed to authenticate for lakehouse creation")
                 return False
             
             # Always resolve workspace name to ID, even in notebook environment
@@ -1613,11 +1659,11 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             response = requests.post(url, headers=headers, json=payload)
             response.raise_for_status()
             
-            print(f"✅ Lakehouse '{lakehouse_name}' created successfully")
+            print(f"OK Lakehouse '{lakehouse_name}' created successfully")
             return True
             
         except Exception as e:
-            print(f"❌ Error creating lakehouse '{lakehouse_name}': {e}")
+            print(f"ERROR Error creating lakehouse '{lakehouse_name}': {e}")
             return False
     
     def download_bim(self, semantic_model_name: str, output_path: Optional[str] = None) -> Optional[str]:
@@ -1643,13 +1689,13 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             from .auth import get_fabric_api_token
             token = get_fabric_api_token()
             if not token:
-                print("❌ Failed to authenticate for downloading semantic model")
+                print("ERROR Failed to authenticate for downloading semantic model")
                 return None
             
             # Resolve workspace name to ID
             workspace_id = self._get_workspace_id_by_name(token, self.workspace_name)
             if not workspace_id:
-                print(f"❌ Workspace '{self.workspace_name}' not found")
+                print(f"ERROR Workspace '{self.workspace_name}' not found")
                 return None
             
             # Get semantic model ID
@@ -1664,11 +1710,11 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             model = next((m for m in models if m.get("displayName") == semantic_model_name), None)
             
             if not model:
-                print(f"❌ Semantic model '{semantic_model_name}' not found in workspace '{self.workspace_name}'")
+                print(f"ERROR Semantic model '{semantic_model_name}' not found in workspace '{self.workspace_name}'")
                 return None
             
             model_id = model.get("id")
-            print(f"✓ Found semantic model: {semantic_model_name} (ID: {model_id})")
+            print(f"OK Found semantic model: {semantic_model_name} (ID: {model_id})")
             
             # Get the model definition using the generic items API
             print("📥 Downloading BIM definition...")
@@ -1702,10 +1748,10 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
                         break
                     elif status == 'Failed':
                         error = status_response.json().get('error', {})
-                        print(f"❌ Operation failed: {error.get('message')}")
+                        print(f"ERROR Operation failed: {error.get('message')}")
                         return None
                     elif attempt == max_attempts - 1:
-                        print("❌ Operation timed out")
+                        print("ERROR Operation timed out")
                         return None
             else:
                 result_data = response.json()
@@ -1716,7 +1762,7 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             
             # Debug: show what parts we have
             if not parts:
-                print("❌ No definition parts found in response")
+                print("ERROR No definition parts found in response")
                 print(f"   Result data keys: {list(result_data.keys())}")
                 print(f"   Definition keys: {list(definition.keys()) if definition else 'None'}")
                 return None
@@ -1727,7 +1773,7 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             
             bim_part = next((p for p in parts if p.get('path', '').endswith('.bim')), None)
             if not bim_part:
-                print("❌ No BIM file found in semantic model definition")
+                print("ERROR No BIM file found in semantic model definition")
                 print(f"   Looking for files ending with '.bim', found: {[p.get('path') for p in parts]}")
                 return None
             
@@ -1740,7 +1786,7 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             # Format as pretty JSON
             bim_formatted = json.dumps(bim_json, indent=2)
             
-            print(f"✓ BIM file downloaded successfully")
+            print(f"OK BIM file downloaded successfully")
             print(f"  - Tables: {len(bim_json.get('model', {}).get('tables', []))}")
             print(f"  - Relationships: {len(bim_json.get('model', {}).get('relationships', []))}")
             
@@ -1748,13 +1794,13 @@ class WorkspaceConnection(WorkspaceOperationsMixin):
             if output_path:
                 with open(output_path, 'w', encoding='utf-8') as f:
                     f.write(bim_formatted)
-                print(f"✓ Saved to: {output_path}")
+                print(f"OK Saved to: {output_path}")
                 return output_path
             else:
                 return bim_formatted
                 
         except Exception as e:
-            print(f"❌ Error downloading semantic model: {e}")
+            print(f"ERROR Error downloading semantic model: {e}")
             import traceback
             traceback.print_exc()
             return None
