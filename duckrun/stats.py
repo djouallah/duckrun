@@ -454,3 +454,195 @@ def get_stats(duckrun_instance, source: str = None, detailed = False):
     return final_result
 
 
+def get_rle(duckrun_instance, source: str = None) -> 'pd.DataFrame':
+    """
+    Get RLE statistics for tables at the column level.
+    
+    Args:
+        duckrun_instance: Duckrun connection (from duckrun.connect())
+        source: Optional. Can be one of:
+               - None: Use all tables in the connection's schema (default)
+               - Table name: 'table_name' (uses main schema in DuckDB)
+               - Schema.table: 'schema.table_name' (specific table in schema)
+               - Schema only: 'schema' (all tables in schema)
+               - Wildcard pattern: '*.summary' (matches tables across all schemas)
+    
+    Returns:
+        DataFrame with columns:
+        - schema_name: Schema name
+        - table_name: Table name
+        - column_name: Column name
+        - total_rows: Total number of rows
+        - rle_runs: RLE runs for this column in natural order
+        - ndv: Number of distinct values
+        - total_rle_runs: Sum of RLE runs across all columns (same for all rows of a table)
+    """
+    import fnmatch
+    import pandas as pd
+    
+    con = duckrun_instance.con  # Get underlying DuckDB connection
+    
+    # Determine which tables to process
+    tables_to_process = []  # List of (schema, table) tuples
+    
+    if source is None:
+        # Get all tables in the connection's schema
+        schema_name = duckrun_instance.schema if hasattr(duckrun_instance, 'schema') else 'main'
+        try:
+            if schema_name == 'main':
+                query = "SHOW TABLES"
+                result = con.execute(query).fetchall()
+                if result:
+                    tables = [row[0] for row in result if not row[0].startswith('tbl_')]
+                    tables_to_process = [(schema_name, tbl) for tbl in tables]
+            else:
+                query = f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema_name}'"
+                result = con.execute(query).fetchall()
+                if result:
+                    tables = [row[0] for row in result if not row[0].startswith('tbl_')]
+                    tables_to_process = [(schema_name, tbl) for tbl in tables]
+        except:
+            pass
+    
+    elif '.' in source:
+        parts = source.split('.', 1)
+        schema_pattern, table_pattern = parts[0], parts[1]
+        
+        # Check if patterns contain wildcards
+        if '*' in schema_pattern or '*' in table_pattern:
+            # Wildcard matching
+            query = """
+                SELECT table_schema, table_name 
+                FROM information_schema.tables 
+                WHERE table_schema NOT LIKE 'pg_%' 
+                AND table_schema != 'information_schema'
+                AND table_name NOT LIKE 'tbl_%'
+            """
+            result = con.execute(query).fetchall()
+            for schema, table in result:
+                if fnmatch.fnmatch(schema, schema_pattern) and fnmatch.fnmatch(table, table_pattern):
+                    tables_to_process.append((schema, table))
+        else:
+            # Exact schema.table
+            tables_to_process = [(schema_pattern, table_pattern)]
+    
+    elif '*' in source:
+        # Wildcard pattern for table names across all schemas
+        query = """
+            SELECT table_schema, table_name 
+            FROM information_schema.tables 
+            WHERE table_schema NOT LIKE 'pg_%' 
+            AND table_schema != 'information_schema'
+            AND table_name NOT LIKE 'tbl_%'
+        """
+        result = con.execute(query).fetchall()
+        for schema, table in result:
+            if fnmatch.fnmatch(table, source):
+                tables_to_process.append((schema, table))
+    
+    else:
+        # Check if it's a schema name or table name
+        try:
+            # Try as schema first
+            schema_query = f"SELECT 1 FROM information_schema.schemata WHERE schema_name = '{source}' LIMIT 1"
+            schema_exists = con.execute(schema_query).fetchone()
+            
+            if schema_exists:
+                # It's a schema - get all tables
+                tables_query = f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{source}'"
+                result = con.execute(tables_query).fetchall()
+                if result:
+                    tables = [row[0] for row in result if not row[0].startswith('tbl_')]
+                    tables_to_process = [(source, tbl) for tbl in tables]
+            else:
+                # It's a table name in default schema
+                schema_name = duckrun_instance.schema if hasattr(duckrun_instance, 'schema') else 'main'
+                tables_to_process = [(schema_name, source)]
+        except:
+            # Assume it's a table name
+            schema_name = duckrun_instance.schema if hasattr(duckrun_instance, 'schema') else 'main'
+            tables_to_process = [(schema_name, source)]
+    
+    if not tables_to_process:
+        print("No tables found matching the criteria")
+        return pd.DataFrame(columns=['schema_name', 'table_name', 'column_name', 'total_rows', 
+                                     'rle_runs', 'ndv', 'total_rle_runs'])
+    
+    print(f"Processing {len(tables_to_process)} table(s)...")
+    
+    # Process each table
+    results = []
+    for schema, table in tables_to_process:
+        table_path = f"{duckrun_instance.table_base_url}{schema}/{table}"
+        
+        print(f"\nCalculating RLE runs for {schema}.{table}...")
+        
+        # Get column names and row count
+        try:
+            schema_info = con.sql(f"""
+                SELECT column_name
+                FROM (DESCRIBE SELECT * FROM delta_scan('{table_path}'))
+            """).df()
+            
+            # Get total row count
+            total_rows = con.sql(f"SELECT COUNT(*) FROM delta_scan('{table_path}')").fetchone()[0]
+            
+            if schema_info.empty:
+                continue
+            
+            # Track total RLE runs for this table
+            table_total_rle = 0
+            table_results = []
+            
+            for _, row in schema_info.iterrows():
+                col_name = row['column_name']
+                
+                # Calculate RLE runs in natural (physical) order using delta_scan
+                rle_query = f"""
+                WITH numbered AS (
+                    SELECT 
+                        filename,
+                        file_row_number,
+                        {col_name},
+                        LAG({col_name}) OVER (ORDER BY filename, file_row_number) as prev_value
+                    FROM delta_scan('{table_path}', file_row_number=1, filename=1)
+                )
+                SELECT COUNT(*) as runs
+                FROM numbered
+                WHERE prev_value IS NULL OR {col_name} != prev_value OR {col_name} IS NULL OR prev_value IS NULL
+                """
+                
+                try:
+                    runs = con.sql(rle_query).fetchone()[0]
+                    
+                    # Also calculate NDV for this column
+                    ndv_query = f"SELECT COUNT(DISTINCT {col_name}) FROM delta_scan('{table_path}')"
+                    ndv = con.sql(ndv_query).fetchone()[0]
+                    
+                    table_total_rle += runs
+                    
+                    print(f"  {col_name}: {runs:,} runs, ndv={ndv:,}")
+                    
+                    table_results.append({
+                        'schema_name': schema,
+                        'table_name': table,
+                        'column_name': col_name,
+                        'total_rows': total_rows,
+                        'rle_runs': runs,
+                        'ndv': ndv
+                    })
+                except Exception as e:
+                    print(f"  Warning: Could not calculate RLE runs for {col_name}: {e}")
+            
+            # Add total_rle_runs to all rows for this table
+            for result in table_results:
+                result['total_rle_runs'] = table_total_rle
+                results.append(result)
+            
+            print(f"  Total RLE runs for table: {table_total_rle:,}")
+        
+        except Exception as e:
+            print(f"  Error processing table: {e}")
+    
+    return pd.DataFrame(results)
+

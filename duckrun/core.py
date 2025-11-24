@@ -7,7 +7,7 @@ import time
 from typing import List, Tuple, Union, Optional, Callable, Dict, Any
 from string import Template
 from datetime import datetime
-from .stats import get_stats as _get_stats
+from .stats import get_stats as _get_stats, get_rle as _get_rle
 from .runner import run as _run
 from .files import copy as _copy, download as _download
 from .writer import QueryResult
@@ -1050,6 +1050,98 @@ class Duckrun(WorkspaceOperationsMixin):
         """
         self.con.register(name, df)
 
+    def get_rle_stats(self, table_name: str, top_n_values: int = 10):
+        """
+        Get comprehensive table statistics including NDV and value frequency analysis.
+        
+        Analyzes column characteristics for RLE compression optimization.
+        
+        Args:
+            table_name: Name of the table to analyze
+            top_n_values: Number of top frequent values to show per column (default: 10)
+        
+        Returns:
+            DataFrame with statistics for each column:
+            - column_name: Name of the column
+            - data_type: Data type
+            - total_rows: Total number of rows
+            - null_count, null_pct: NULL statistics
+            - ndv: Number of distinct values (exact)
+            - cardinality_ratio: NDV / total_rows (lower = better for RLE)
+            - top_value, top_value_count, top_value_pct: Most frequent value stats
+            - top_n_coverage: Percentage covered by top N values
+            - repetition_score: RLE potential score (higher = better)
+        
+        Examples:
+            con = duckrun.connect("workspace/lakehouse.lakehouse")
+            
+            # Analyze a table
+            stats = con.get_rle_stats('sales')
+            print(stats)
+            
+            # Show top 20 values per column
+            stats = con.get_rle_stats('sales', top_n_values=20)
+        """
+        from .rle import get_table_stats as _get_rle_stats
+        return _get_rle_stats(self, table_name, top_n_values)
+    
+    def get_value_frequency(self, table_name: str, column_name: str, limit: int = 20):
+        """
+        Get detailed value frequency distribution for a specific column.
+        
+        Args:
+            table_name: Name of the table
+            column_name: Name of the column to analyze
+            limit: Maximum number of values to return (default: 20)
+        
+        Returns:
+            DataFrame with value frequencies:
+            - value: The distinct value
+            - count: Number of occurrences
+            - percentage: Percentage of total rows
+            - cumulative_pct: Cumulative percentage
+        
+        Examples:
+            con = duckrun.connect("workspace/lakehouse.lakehouse")
+            
+            # Get top 20 values for a column
+            freq = con.get_value_frequency('sales', 'status')
+            print(freq)
+        """
+        from .rle import get_value_frequency_details as _get_value_frequency
+        return _get_value_frequency(self, table_name, column_name, limit)
+    
+    def find_optimal_sort_order(self, table_name: str, max_combinations: int = 10):
+        """
+        Find optimal column sort order for compression using V-Order-like testing.
+        
+        Tests different column orderings and measures RLE compression effectiveness.
+        This simulates how V-Order/VertiPaq optimizes data layout.
+        
+        Args:
+            table_name: Name of the table to analyze
+            max_combinations: Maximum sort orderings to test (default: 10)
+        
+        Returns:
+            DataFrame with tested orderings ranked by compression:
+            - sort_order: Column ordering (e.g., "date → DUID → time")
+            - total_runs: Total RLE runs (fewer = better compression)
+            - compression_score: Compression effectiveness (higher = better)
+            - Individual RLE counts per column
+        
+        Examples:
+            con = duckrun.connect("workspace/lakehouse.lakehouse")
+            
+            # Find optimal sort order
+            optimal = con.find_optimal_sort_order('energy_data')
+            print(optimal)
+            
+            # Test more combinations
+            optimal = con.find_optimal_sort_order('energy_data', max_combinations=20)
+        """
+        from .rle import find_optimal_sort_order as _find_optimal_sort_order
+        return _find_optimal_sort_order(self, table_name, max_combinations)
+
     def get_stats(self, source: str = None, detailed = False):
         """
         Get comprehensive statistics for Delta Lake tables.
@@ -1088,6 +1180,39 @@ class Duckrun(WorkspaceOperationsMixin):
             stats = con.get_stats('aemo')
         """
         return _get_stats(self, source, detailed)
+
+    def get_rle(self, source: str = None):
+        """
+        Get RLE (Run-Length Encoding) statistics for Delta Lake tables.
+        Measures compression potential by counting consecutive identical values.
+        
+        Args:
+            source: Optional. Can be one of:
+                   - None: Use all tables in the connection's schema (default)
+                   - Table name: 'table_name' (uses current schema)
+                   - Schema.table: 'schema.table_name' (specific table in schema)
+                   - Schema only: 'schema' (all tables in schema)
+                   - Wildcard patterns: '*.summary' or 'schema.*'
+        
+        Returns:
+            DataFrame with columns: schema_name, table_name, total_rle_runs
+            
+        Examples:
+            con = duckrun.connect("tmp/data.lakehouse/aemo")
+            
+            # All tables in current schema
+            rle = con.get_rle()
+            
+            # Single table in current schema
+            rle = con.get_rle('price')
+            
+            # Specific table in different schema
+            rle = con.get_rle('deltars.summary')
+            
+            # All tables matching pattern
+            rle = con.get_rle('*.summary')
+        """
+        return _get_rle(self, source)
 
     def list_lakehouses(self) -> List[str]:
         """
