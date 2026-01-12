@@ -212,8 +212,10 @@ def _read_sql_file(duckrun_instance, table_name: str, params: Optional[Dict] = N
     if duckrun_instance.sql_folder is None:
         raise RuntimeError("sql_folder is not configured. Cannot read SQL files.")
     
-    is_url = duckrun_instance.sql_folder.startswith("http")
-    if is_url:
+    is_http = duckrun_instance.sql_folder.startswith("http")
+    is_abfss = duckrun_instance.sql_folder.startswith("abfss://")
+    
+    if is_http:
         url = f"{duckrun_instance.sql_folder.rstrip('/')}/{table_name}.sql".strip()
         try:
             resp = requests.get(url)
@@ -221,6 +223,18 @@ def _read_sql_file(duckrun_instance, table_name: str, params: Optional[Dict] = N
             content = resp.text
         except Exception as e:
             print(f"Failed to fetch SQL from {url}: {e}")
+            return None
+    elif is_abfss:
+        # Use DuckDB to read from ABFSS/OneLake - secrets already configured
+        file_url = f"{duckrun_instance.sql_folder.rstrip('/')}/{table_name}.sql"
+        try:
+            result = duckrun_instance.con.sql(f"SELECT content FROM read_text('{file_url}')").fetchone()
+            content = result[0] if result else None
+            if not content:
+                print(f"Failed to read SQL from OneLake: {file_url}")
+                return None
+        except Exception as e:
+            print(f"Failed to read SQL from OneLake {file_url}: {e}")
             return None
     else:
         path = os.path.join(duckrun_instance.sql_folder, f"{table_name}.sql")
@@ -287,9 +301,11 @@ def _load_py_function(duckrun_instance, name: str) -> Optional[Callable]:
     if duckrun_instance.sql_folder is None:
         raise RuntimeError("sql_folder is not configured. Cannot load Python functions.")
     
-    is_url = duckrun_instance.sql_folder.startswith("http")
+    is_http = duckrun_instance.sql_folder.startswith("http")
+    is_abfss = duckrun_instance.sql_folder.startswith("abfss://")
+    
     try:
-        if is_url:
+        if is_http:
             url = f"{duckrun_instance.sql_folder.rstrip('/')}/{name}.py".strip()
             resp = requests.get(url)
             resp.raise_for_status()
@@ -298,6 +314,22 @@ def _load_py_function(duckrun_instance, name: str) -> Optional[Callable]:
             exec(code, namespace)
             func = namespace.get(name)
             return func if callable(func) else None
+        elif is_abfss:
+            # Use DuckDB to read from ABFSS/OneLake - secrets already configured
+            file_url = f"{duckrun_instance.sql_folder.rstrip('/')}/{name}.py"
+            try:
+                result = duckrun_instance.con.sql(f"SELECT content FROM read_text('{file_url}')").fetchone()
+                if not result or not result[0]:
+                    print(f"Python file not found in OneLake: {file_url}")
+                    return None
+                code = result[0]
+                namespace = {}
+                exec(code, namespace)
+                func = namespace.get(name)
+                return func if callable(func) else None
+            except Exception as e:
+                print(f"Python file not found in OneLake: {file_url}")
+                return None
         else:
             path = os.path.join(duckrun_instance.sql_folder, f"{name}.py")
             if not os.path.isfile(path):
