@@ -19,9 +19,9 @@ class WorkspaceOperationsMixin:
     full Duckrun connections and workspace-only connections.
     """
     
-    def import_notebook(self, path: str, overwrite: bool = False, runtime: str = "python") -> dict:
+    def deploy_notebook(self, path: str, overwrite: bool = False, runtime: str = "python", parameters: dict = None) -> dict:
         """
-        Import a Jupyter notebook from a web URL or local file path into the workspace.
+        Deploy a Jupyter notebook from a web URL or local file path into the workspace.
         
         Args:
             path: URL or local file path to the notebook file. Required.
@@ -29,47 +29,61 @@ class WorkspaceOperationsMixin:
                   - For local: e.g., "/path/to/notebook.ipynb" or "C:\\path\\to\\notebook.ipynb"
             overwrite: Whether to overwrite if notebook already exists (default: False)
             runtime: The notebook runtime - "pyspark" (default) or "python" for pure Python notebooks.
+            parameters: Dictionary of parameters to inject into the notebook's parameters cell.
+                       Example: {"business_logic": "abfss://...", "nbr_of_files": 10}
             
         Returns:
-            Dictionary with import result
+            Dictionary with deployment result
             
         Examples:
             con = duckrun.connect("workspace/lakehouse.lakehouse")
-            result = con.import_notebook(
+            result = con.deploy_notebook(
                 path="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
             )
             
-            # From local file with Python runtime
-            result = con.import_notebook(
-                path="/fabric_demo/analysis/analysis.ipynb",
-                runtime="python"
+            # With parameters injection
+            result = con.deploy_notebook(
+                path="/fabric_demo/electricity.ipynb",
+                parameters={
+                    "business_logic": "abfss://duckrun@onelake.dfs.fabric.microsoft.com/data.Lakehouse/Files/transformation",
+                    "nbr_of_files": 10
+                }
             )
             
             # With overwrite
-            result = con.import_notebook(
+            result = con.deploy_notebook(
                 path="/fabric_demo/analysis/analysis.ipynb",
                 overwrite=True
             )
         """
-        from .notebook import import_notebook as _import_notebook
+        from .notebook import deploy_notebook as _deploy_notebook
         
         # Get workspace name from either self.workspace or self.workspace_name
         workspace_name = getattr(self, 'workspace', None) or getattr(self, 'workspace_name', None)
         
-        return _import_notebook(
+        return _deploy_notebook(
             path=path,
             overwrite=overwrite,
             workspace_name=workspace_name,
-            runtime=runtime
+            runtime=runtime,
+            parameters=parameters
         )
+    
+    # Backward compatibility alias
+    def import_notebook(self, path: str, overwrite: bool = False, runtime: str = "python", parameters: dict = None) -> dict:
+        """
+        Alias for deploy_notebook for backward compatibility.
+        Use deploy_notebook instead.
+        """
+        return self.deploy_notebook(path=path, overwrite=overwrite, runtime=runtime, parameters=parameters)
     
     # Backward compatibility alias
     def import_notebook_from_web(self, url: str, overwrite: bool = False, runtime: str = "python") -> dict:
         """
-        Alias for import_notebook for backward compatibility.
-        Use import_notebook instead - it supports both URLs and local file paths.
+        Alias for deploy_notebook for backward compatibility.
+        Use deploy_notebook instead - it supports both URLs and local file paths.
         """
-        return self.import_notebook(path=url, overwrite=overwrite, runtime=runtime)
+        return self.deploy_notebook(path=url, overwrite=overwrite, runtime=runtime)
     
     def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
         """Helper method to get workspace ID from name"""
@@ -1343,7 +1357,7 @@ class Duckrun(WorkspaceOperationsMixin):
             print(f"ERROR Error creating lakehouse '{lakehouse_name}': {e}")
             return False
 
-    def deploy(self, bim_url: str, dataset_name: Optional[str] = None, 
+    def deploy_bim(self, bim_url: str, dataset_name: Optional[str] = None, 
                wait_seconds: int = 5, refresh: str = "full") -> int:
         """
         Deploy a semantic model from a BIM file using DirectLake mode.
@@ -1366,16 +1380,16 @@ class Duckrun(WorkspaceOperationsMixin):
             dr = Duckrun.connect("My Workspace/My Lakehouse.lakehouse/dbo")
             
             # Deploy with schema name as dataset name (dbo)
-            dr.deploy("https://github.com/.../model.bim")
+            dr.deploy_bim("https://github.com/.../model.bim")
             
             # Deploy from workspace/model (uses same name by default)
-            dr.deploy("Source Workspace/Source Model")  # Creates "Source Model"
+            dr.deploy_bim("Source Workspace/Source Model")  # Creates "Source Model"
             
             # Deploy with custom name
-            dr.deploy("https://github.com/.../model.bim", dataset_name="Sales Model")
+            dr.deploy_bim("https://github.com/.../model.bim", dataset_name="Sales Model")
             
             # Deploy without refresh
-            dr.deploy("https://github.com/.../model.bim", refresh="ignore")
+            dr.deploy_bim("https://github.com/.../model.bim", refresh="ignore")
         """
         from .semantic_model import deploy_semantic_model
         
@@ -1403,6 +1417,12 @@ class Duckrun(WorkspaceOperationsMixin):
             wait_seconds=wait_seconds,
             refresh=refresh
         )
+
+    # Backward compatibility alias
+    def deploy(self, bim_url: str, dataset_name: Optional[str] = None, 
+               wait_seconds: int = 5, refresh: str = "full") -> int:
+        """Alias for deploy_bim for backward compatibility."""
+        return self.deploy_bim(bim_url, dataset_name, wait_seconds, refresh)
 
     def deploy_pbix(self, pbix_url: str, semantic_model_name: str, report_name: Optional[str] = None) -> int:
         """

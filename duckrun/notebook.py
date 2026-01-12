@@ -8,14 +8,15 @@ import json
 from typing import Optional, Literal
 
 
-def import_notebook(
+def deploy_notebook(
     path: str,
     overwrite: bool = False,
     workspace_name: Optional[str] = None,
-    runtime: Literal["pyspark", "python"] = "python"
+    runtime: Literal["pyspark", "python"] = "python",
+    parameters: Optional[dict] = None
 ) -> dict:
     """
-    Import a Jupyter notebook from a web URL or local file path into Microsoft Fabric workspace using REST API only.
+    Deploy a Jupyter notebook from a web URL or local file path into Microsoft Fabric workspace using REST API only.
     Uses duckrun.connect context by default or explicit workspace name.
     
     Args:
@@ -25,6 +26,10 @@ def import_notebook(
         overwrite: Whether to overwrite if notebook already exists (default: False)
         workspace_name: Target workspace name. Optional - will use current workspace from duckrun context if available.
         runtime: The notebook runtime - "pyspark" (default) or "python" for pure Python notebooks.
+        parameters: Dictionary of parameters to inject into the notebook's parameters cell.
+                   The notebook must have a cell tagged with "parameters" in its metadata.
+                   Values will be added/updated as variable assignments in that cell.
+                   Example: {"business_logic": "abfss://...", "nbr_of_files": 10}
         
     Returns:
         Dictionary with import result:
@@ -39,21 +44,23 @@ def import_notebook(
         # Basic usage with duckrun context - from web URL
         import duckrun
         dr = duckrun.connect("MyWorkspace/MyLakehouse.lakehouse")
-        from duckrun.notebook import import_notebook
         
-        result = import_notebook(
+        result = dr.deploy_notebook(
             path="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
         )
         
-        # From local file path with Python runtime
-        result = import_notebook(
-            path="/fabric_demo/analysis/analysis.ipynb",
-            runtime="python"
+        # With parameters injection
+        result = dr.deploy_notebook(
+            path="/fabric_demo/electricity.ipynb",
+            parameters={
+                "business_logic": "abfss://duckrun@onelake.dfs.fabric.microsoft.com/data.Lakehouse/Files/transformation",
+                "nbr_of_files": 10
+            }
         )
         
         # With overwrite
-        result = import_notebook(
-            path="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb",
+        result = dr.deploy_notebook(
+            path="/fabric_demo/analysis/analysis.ipynb",
             overwrite=True
         )
     """
@@ -135,8 +142,8 @@ def import_notebook(
         
         if existing_notebook and not overwrite:
             return {
-                "success": True,
-                "message": f"Notebook '{notebook_name}' already exists (use overwrite=True to replace)",
+                "success": False,
+                "message": f"Notebook '{notebook_name}' already exists. Use overwrite=True to replace.",
                 "notebook": existing_notebook,
                 "overwritten": False
             }
@@ -168,6 +175,15 @@ def import_notebook(
         # Parse and modify notebook metadata to set the correct runtime
         try:
             notebook_json = json.loads(notebook_content)
+            
+            # Normalize all cell sources to list format (Fabric API requires this)
+            cells = notebook_json.get("cells", [])
+            for cell in cells:
+                source = cell.get("source", [])
+                if isinstance(source, str):
+                    # Convert string to list of lines
+                    lines = source.split('\n')
+                    cell["source"] = [line + '\n' for line in lines[:-1]] + [lines[-1]] if lines else []
             
             # Set the kernel based on runtime parameter
             if runtime == "python":
@@ -204,6 +220,45 @@ def import_notebook(
                 "name": "python"
             }
             
+            # Inject parameters by adding a new cell right after the parameters cell
+            if parameters:
+                parameters_injected = False
+                cells = notebook_json.get("cells", [])
+                
+                for i, cell in enumerate(cells):
+                    cell_metadata = cell.get("metadata", {})
+                    tags = cell_metadata.get("tags", [])
+                    
+                    if "parameters" in tags and cell.get("cell_type") == "code":
+                        # Found the parameters cell - insert new cell right after it
+                        # Build new parameter assignments
+                        new_assignments = []
+                        for key, value in parameters.items():
+                            if isinstance(value, str):
+                                new_assignments.append(f'{key} = "{value}"')
+                            else:
+                                new_assignments.append(f'{key} = {repr(value)}')
+                        
+                        # Create new cell with injected parameters (tagged as "injected-parameters")
+                        new_cell = {
+                            "cell_type": "code",
+                            "execution_count": None,
+                            "metadata": {
+                                "tags": ["injected-parameters"]
+                            },
+                            "outputs": [],
+                            "source": [line + '\n' for line in new_assignments[:-1]] + [new_assignments[-1]] if new_assignments else []
+                        }
+                        
+                        # Insert new cell right after the parameters cell
+                        cells.insert(i + 1, new_cell)
+                        parameters_injected = True
+                        print(f"✓ Injected {len(parameters)} parameter(s) in new cell after parameters cell")
+                        break
+                
+                if not parameters_injected:
+                    print(f"⚠️ No cell tagged with 'parameters' found - parameters not injected")
+            
             # Convert back to string
             notebook_content = json.dumps(notebook_json, indent=2)
             print(f"✓ Set notebook runtime to: {runtime}")
@@ -226,7 +281,7 @@ def import_notebook(
                     "format": "ipynb",
                     "parts": [
                         {
-                            "path": "notebook-content.py",
+                            "path": "notebook-content.ipynb",
                             "payload": notebook_base64,
                             "payloadType": "InlineBase64"
                         }
@@ -241,7 +296,14 @@ def import_notebook(
             if response.status_code == 202:
                 operation_id = response.headers.get('x-ms-operation-id')
                 if operation_id:
-                    _wait_for_operation(operation_id, headers)
+                    operation_succeeded = _wait_for_operation(operation_id, headers)
+                    if not operation_succeeded:
+                        return {
+                            "success": False,
+                            "message": f"Notebook '{notebook_name}' update operation failed",
+                            "notebook": existing_notebook,
+                            "overwritten": False
+                        }
             
             return {
                 "success": True,
@@ -259,7 +321,7 @@ def import_notebook(
                     "format": "ipynb",
                     "parts": [
                         {
-                            "path": "notebook-content.py",
+                            "path": "notebook-content.ipynb",
                             "payload": notebook_base64,
                             "payloadType": "InlineBase64"
                         }
@@ -274,7 +336,14 @@ def import_notebook(
             if response.status_code == 202:
                 operation_id = response.headers.get('x-ms-operation-id')
                 if operation_id:
-                    _wait_for_operation(operation_id, headers)
+                    operation_succeeded = _wait_for_operation(operation_id, headers)
+                    if not operation_succeeded:
+                        return {
+                            "success": False,
+                            "message": f"Notebook '{notebook_name}' create operation failed",
+                            "notebook": None,
+                            "overwritten": False
+                        }
             
             created_notebook = response.json()
             
@@ -345,7 +414,27 @@ def _wait_for_operation(operation_id: str, headers: dict, max_attempts: int = 30
     return False
 
 
-# Backward compatibility alias
+# Backward compatibility aliases
+def import_notebook(
+    path: str,
+    overwrite: bool = False,
+    workspace_name: Optional[str] = None,
+    runtime: Literal["pyspark", "python"] = "python",
+    parameters: Optional[dict] = None
+) -> dict:
+    """
+    Alias for deploy_notebook for backward compatibility.
+    Use deploy_notebook instead.
+    """
+    return deploy_notebook(
+        path=path,
+        overwrite=overwrite,
+        workspace_name=workspace_name,
+        runtime=runtime,
+        parameters=parameters
+    )
+
+
 def import_notebook_from_web(
     url: str,
     overwrite: bool = False,
@@ -353,8 +442,8 @@ def import_notebook_from_web(
     runtime: Literal["pyspark", "python"] = "python"
 ) -> dict:
     """
-    Alias for import_notebook for backward compatibility.
-    Use import_notebook instead - it supports both URLs and local file paths.
+    Alias for deploy_notebook for backward compatibility.
+    Use deploy_notebook instead - it supports both URLs and local file paths.
     
     Args:
         url: URL to the notebook file (e.g., GitHub raw URL). Required.
@@ -365,7 +454,7 @@ def import_notebook_from_web(
     Returns:
         Dictionary with import result
     """
-    return import_notebook(
+    return deploy_notebook(
         path=url,
         overwrite=overwrite,
         workspace_name=workspace_name,

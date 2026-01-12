@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.2.24"
+version = "0.2.25"
 description = "Helper library for Fabric Python using duckdb, arrow and delta_rs (orchestration, queries, etc.)"
 readme = "README.md"
 license = {text = "MIT"}
