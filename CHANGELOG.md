@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.26] - 2026-01-13
+
+### Added
+- **`schedule_notebook()`**: Schedule notebooks to run automatically in Microsoft Fabric
+  - Supports `interval`, `daily`, `weekly`, and `monthly` schedule types
+  - `interval`: Run every X minutes (e.g., `interval_minutes=60` for hourly)
+  - `daily`: Run at specific times each day (e.g., `times=["09:00", "18:00"]`)
+  - `weekly`: Run on specific days (e.g., `weekdays=["Monday", "Friday"]`)
+  - `monthly`: Run on specific day of month (e.g., `day_of_month=1`)
+  - `overwrite=False` by default - prevents accidental schedule overwrites
+  - Available on connection: `con.schedule_notebook("notebook_name", ...)`
+
+### Note
+- Fabric does NOT support traditional cron expressions - uses interval/daily/weekly/monthly instead
+
 ## [0.2.17] - 2025-11-01
 
 ### Added

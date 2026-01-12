@@ -85,6 +85,76 @@ class WorkspaceOperationsMixin:
         """
         return self.deploy_notebook(path=url, overwrite=overwrite, runtime=runtime)
     
+    def schedule_notebook(
+        self,
+        notebook_name: str,
+        schedule_type: str = "daily",
+        start_time: str = None,
+        end_time: str = None,
+        interval_minutes: int = None,
+        times: list = None,
+        weekdays: list = None,
+        day_of_month: int = None,
+        timezone: str = "UTC",
+        enabled: bool = True,
+        overwrite: bool = False
+    ) -> dict:
+        """
+        Schedule a notebook to run automatically in the workspace.
+        
+        Note: Fabric does NOT support traditional cron expressions. It supports:
+        - interval: Run every X minutes
+        - daily: Run at specific times each day
+        - weekly: Run on specific days at specific times
+        - monthly: Run on specific day of month at specific times
+        
+        Args:
+            notebook_name: Name of the notebook to schedule (without .ipynb extension). Required.
+            schedule_type: Type of schedule - "interval", "daily", "weekly", or "monthly" (default: "daily")
+            start_time: Start datetime in ISO 8601 format (e.g., "2024-01-15T09:00:00Z").
+            end_time: End datetime in ISO 8601 format.
+            interval_minutes: For "interval" type - run every X minutes (1 to 5270400).
+            times: List of times in "HH:mm" format for daily/weekly/monthly schedules.
+            weekdays: For "weekly" type - list of days (e.g., ["Monday", "Friday"]).
+            day_of_month: For "monthly" type - day of month (1-31).
+            timezone: Windows timezone ID (default: "UTC").
+            enabled: Whether the schedule should be enabled (default: True)
+            overwrite: Whether to overwrite existing schedule (default: False)
+            
+        Returns:
+            Dictionary with schedule result
+            
+        Examples:
+            con = duckrun.connect("prod/data.lakehouse")
+            
+            # Run every 60 minutes
+            con.schedule_notebook("electricity", schedule_type="interval", interval_minutes=60)
+            
+            # Run daily at 9 AM
+            con.schedule_notebook("report", schedule_type="daily", times=["09:00"])
+            
+            # Run weekly on Monday and Friday
+            con.schedule_notebook("weekly", schedule_type="weekly", weekdays=["Monday", "Friday"], times=["08:00"])
+        """
+        from .notebook import schedule_notebook as _schedule_notebook
+        
+        workspace_name = getattr(self, 'workspace', None) or getattr(self, 'workspace_name', None)
+        
+        return _schedule_notebook(
+            notebook_name=notebook_name,
+            schedule_type=schedule_type,
+            start_time=start_time,
+            end_time=end_time,
+            interval_minutes=interval_minutes,
+            times=times,
+            weekdays=weekdays,
+            day_of_month=day_of_month,
+            timezone=timezone,
+            workspace_name=workspace_name,
+            enabled=enabled,
+            overwrite=overwrite
+        )
+    
     def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
         """Helper method to get workspace ID from name"""
         try:

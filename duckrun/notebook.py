@@ -460,3 +460,323 @@ def import_notebook_from_web(
         workspace_name=workspace_name,
         runtime=runtime
     )
+
+
+def schedule_notebook(
+    notebook_name: str,
+    schedule_type: Literal["interval", "daily", "weekly", "monthly"] = "daily",
+    start_time: Optional[str] = None,
+    end_time: Optional[str] = None,
+    interval_minutes: Optional[int] = None,
+    times: Optional[list] = None,
+    weekdays: Optional[list] = None,
+    day_of_month: Optional[int] = None,
+    timezone: str = "UTC",
+    workspace_name: Optional[str] = None,
+    enabled: bool = True,
+    overwrite: bool = False
+) -> dict:
+    """
+    Schedule a notebook to run automatically in Microsoft Fabric workspace.
+    Creates or updates a scheduled job for the specified notebook.
+    
+    Note: Fabric does NOT support traditional cron expressions. Instead it supports:
+    - interval: Run every X minutes
+    - daily: Run at specific times each day  
+    - weekly: Run on specific days at specific times
+    - monthly: Run on specific day of month at specific times
+    
+    Args:
+        notebook_name: Name of the notebook to schedule (without .ipynb extension). Required.
+        schedule_type: Type of schedule - "interval", "daily", "weekly", or "monthly" (default: "daily")
+        start_time: Start datetime in ISO 8601 format (e.g., "2024-01-15T09:00:00Z").
+                   If not provided, defaults to current time.
+        end_time: End datetime in ISO 8601 format. Required for all schedules.
+                 If not provided, defaults to 1 year from start_time.
+        interval_minutes: For "interval" type only - run every X minutes (1 to 5270400).
+                         Example: 60 for hourly, 1440 for daily.
+        times: List of times in "HH:mm" format for daily/weekly/monthly schedules.
+               Example: ["09:00", "18:00"] to run at 9 AM and 6 PM.
+               Maximum 100 time slots.
+        weekdays: For "weekly" type - list of days to run.
+                 Example: ["Monday", "Wednesday", "Friday"]
+        day_of_month: For "monthly" type - day of month (1-31).
+                     Example: 1 for first day, 15 for mid-month.
+        timezone: Windows timezone ID (default: "UTC").
+                 Example: "Central Standard Time", "Pacific Standard Time"
+        workspace_name: Target workspace name. Optional - uses current workspace if available.
+        enabled: Whether the schedule should be enabled (default: True)
+        overwrite: Whether to overwrite existing schedule (default: False).
+                  If False and schedule exists, returns error.
+        
+    Returns:
+        Dictionary with schedule result:
+        {
+            "success": bool,
+            "message": str,
+            "schedule": dict (if successful),
+            "notebook_id": str
+        }
+        
+    Examples:
+        # Run every 60 minutes (hourly)
+        result = schedule_notebook(
+            notebook_name="my_etl_notebook",
+            schedule_type="interval",
+            interval_minutes=60,
+            start_time="2024-01-15T00:00:00Z",
+            end_time="2025-01-15T00:00:00Z"
+        )
+        
+        # Run daily at 9 AM and 6 PM
+        result = schedule_notebook(
+            notebook_name="daily_report",
+            schedule_type="daily",
+            times=["09:00", "18:00"],
+            timezone="Central Standard Time"
+        )
+        
+        # Run weekly on Monday and Friday at 8 AM
+        result = schedule_notebook(
+            notebook_name="weekly_report",
+            schedule_type="weekly",
+            weekdays=["Monday", "Friday"],
+            times=["08:00"],
+            timezone="Pacific Standard Time"
+        )
+        
+        # Run monthly on the 1st at 6 AM
+        result = schedule_notebook(
+            notebook_name="monthly_report",
+            schedule_type="monthly",
+            day_of_month=1,
+            times=["06:00"]
+        )
+    """
+    try:
+        from datetime import datetime, timedelta
+        
+        # Get authentication token
+        from duckrun.auth import get_fabric_api_token
+        token = get_fabric_api_token()
+        if not token:
+            return {
+                "success": False,
+                "message": "Failed to get authentication token",
+                "schedule": None,
+                "notebook_id": None
+            }
+        
+        base_url = "https://api.fabric.microsoft.com/v1"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json"
+        }
+        
+        # Determine workspace ID
+        workspace_id = None
+        
+        # Try to get from duckrun context if not provided
+        if not workspace_name:
+            try:
+                import notebookutils  # type: ignore
+                workspace_id = notebookutils.runtime.context.get("workspaceId")
+                print("📓 Using current workspace from Fabric notebook context")
+            except (ImportError, Exception):
+                pass
+        
+        # If still no workspace_id, resolve from workspace_name
+        if not workspace_id:
+            if not workspace_name:
+                return {
+                    "success": False,
+                    "message": "workspace_name must be provided when not in Fabric notebook context",
+                    "schedule": None,
+                    "notebook_id": None
+                }
+            
+            # Get workspace ID by name
+            print(f"🔍 Resolving workspace: {workspace_name}")
+            ws_url = f"{base_url}/workspaces"
+            response = requests.get(ws_url, headers=headers)
+            response.raise_for_status()
+            
+            workspaces = response.json().get("value", [])
+            workspace = next((ws for ws in workspaces if ws.get("displayName") == workspace_name), None)
+            
+            if not workspace:
+                return {
+                    "success": False,
+                    "message": f"Workspace '{workspace_name}' not found",
+                    "schedule": None,
+                    "notebook_id": None
+                }
+            
+            workspace_id = workspace.get("id")
+            print(f"✓ Found workspace: {workspace_name}")
+        
+        # Find the notebook by name
+        print(f"🔍 Finding notebook: {notebook_name}")
+        notebooks_url = f"{base_url}/workspaces/{workspace_id}/notebooks"
+        response = requests.get(notebooks_url, headers=headers)
+        response.raise_for_status()
+        
+        notebooks = response.json().get("value", [])
+        notebook = next((nb for nb in notebooks if nb.get("displayName") == notebook_name), None)
+        
+        if not notebook:
+            return {
+                "success": False,
+                "message": f"Notebook '{notebook_name}' not found in workspace",
+                "schedule": None,
+                "notebook_id": None
+            }
+        
+        notebook_id = notebook.get("id")
+        print(f"✓ Found notebook: {notebook_name} (ID: {notebook_id})")
+        
+        # Set default start_time and end_time if not provided
+        if not start_time:
+            start_dt = datetime.utcnow()
+            start_time = start_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        if not end_time:
+            # Default to 1 year from now
+            end_dt = datetime.utcnow() + timedelta(days=365)
+            end_time = end_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        
+        print(f"⏰ Schedule: {start_time} to {end_time}")
+        
+        # Build the schedule configuration based on type
+        # Fabric API uses "Cron" for interval, but it's NOT a cron expression!
+        config = {
+            "startDateTime": start_time,
+            "endDateTime": end_time,
+            "localTimeZoneId": timezone
+        }
+        
+        if schedule_type == "interval":
+            if not interval_minutes:
+                return {
+                    "success": False,
+                    "message": "interval_minutes is required for 'interval' schedule type",
+                    "schedule": None,
+                    "notebook_id": notebook_id
+                }
+            config["type"] = "Cron"  # Fabric calls interval-based schedules "Cron" (confusingly)
+            config["interval"] = interval_minutes
+            print(f"📅 Setting interval schedule: every {interval_minutes} minutes")
+            
+        elif schedule_type == "daily":
+            config["type"] = "Daily"
+            config["times"] = times or ["09:00"]  # Default to 9 AM
+            print(f"📅 Setting daily schedule at: {', '.join(config['times'])}")
+            
+        elif schedule_type == "weekly":
+            config["type"] = "Weekly"
+            config["times"] = times or ["09:00"]
+            config["weekdays"] = weekdays or ["Monday"]
+            print(f"📅 Setting weekly schedule: {', '.join(config['weekdays'])} at {', '.join(config['times'])}")
+            
+        elif schedule_type == "monthly":
+            config["type"] = "Monthly"
+            config["times"] = times or ["09:00"]
+            config["recurrence"] = 1  # Every month
+            if day_of_month:
+                config["occurrence"] = {
+                    "occurrenceType": "DayOfMonth",
+                    "dayOfMonth": day_of_month
+                }
+            else:
+                config["occurrence"] = {
+                    "occurrenceType": "DayOfMonth",
+                    "dayOfMonth": 1  # Default to 1st of month
+                }
+            print(f"📅 Setting monthly schedule: day {config['occurrence']['dayOfMonth']} at {', '.join(config['times'])}")
+        
+        schedule_payload = {
+            "enabled": enabled,
+            "configuration": config
+        }
+        
+        # Create or update the job schedule for the notebook
+        # Using the Fabric Job Scheduler API - notebooks use "RunNotebook" job type
+        schedules_url = f"{base_url}/workspaces/{workspace_id}/items/{notebook_id}/jobs/RunNotebook/schedules"
+        
+        try:
+            response = requests.get(schedules_url, headers=headers)
+            
+            if response.status_code == 200:
+                existing_schedules = response.json().get("value", [])
+                
+                if existing_schedules:
+                    if not overwrite:
+                        return {
+                            "success": False,
+                            "message": f"Schedule already exists for notebook '{notebook_name}'. Use overwrite=True to update.",
+                            "schedule": existing_schedules[0],
+                            "notebook_id": notebook_id
+                        }
+                    
+                    # Overwrite existing schedule
+                    schedule_id = existing_schedules[0].get("id")
+                    print(f"🔄 Overwriting existing schedule: {schedule_id}")
+                    
+                    update_url = f"{schedules_url}/{schedule_id}"
+                    response = requests.patch(update_url, headers=headers, json=schedule_payload)
+                    response.raise_for_status()
+                    
+                    return {
+                        "success": True,
+                        "message": f"Schedule overwritten for notebook '{notebook_name}'",
+                        "schedule": schedule_payload,
+                        "notebook_id": notebook_id,
+                        "overwritten": True
+                    }
+        except requests.exceptions.RequestException:
+            # No existing schedule, will create new one
+            pass
+        
+        # Create new schedule
+        print(f"➕ Creating new schedule for notebook: {notebook_name}")
+        
+        response = requests.post(schedules_url, headers=headers, json=schedule_payload)
+        response.raise_for_status()
+        
+        # Handle long-running operation
+        if response.status_code == 202:
+            operation_id = response.headers.get('x-ms-operation-id')
+            if operation_id:
+                operation_succeeded = _wait_for_operation(operation_id, headers)
+                if not operation_succeeded:
+                    return {
+                        "success": False,
+                        "message": f"Schedule creation operation failed for notebook '{notebook_name}'",
+                        "schedule": None,
+                        "notebook_id": notebook_id
+                    }
+        
+        created_schedule = response.json() if response.status_code in [200, 201] else schedule_payload
+        
+        status_msg = "enabled" if enabled else "disabled (paused)"
+        return {
+            "success": True,
+            "message": f"Schedule created for notebook '{notebook_name}' - {status_msg}",
+            "schedule": created_schedule,
+            "notebook_id": notebook_id
+        }
+        
+    except requests.exceptions.RequestException as e:
+        return {
+            "success": False,
+            "message": f"HTTP Error: {str(e)}",
+            "schedule": None,
+            "notebook_id": None
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": f"Error: {str(e)}",
+            "schedule": None,
+            "notebook_id": None
+        }
