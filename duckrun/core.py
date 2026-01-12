@@ -1312,7 +1312,10 @@ class Duckrun(WorkspaceOperationsMixin):
             print(f"Creating lakehouse '{lakehouse_name}'...")
             payload = {
                 "displayName": lakehouse_name,
-                "description": f"Lakehouse {lakehouse_name} created via duckrun"
+                "description": f"Lakehouse {lakehouse_name} created via duckrun",
+                "creationPayload": {
+                    "enableSchemas": True
+                }
             }
             
             response = requests.post(url, headers=headers, json=payload)

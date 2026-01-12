@@ -3,7 +3,7 @@
 from duckrun.core import Duckrun
 from duckrun.notebook import import_notebook_from_web, import_notebook
 
-__version__ = "0.2.22.dev2"
+__version__ = "0.2.23"
 
 # Expose unified connect method at module level
 connect = Duckrun.connect

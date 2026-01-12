@@ -317,7 +317,10 @@ def create_lakehouse_simple(lakehouse_name: str, access_token: str, workspace_id
         create_url = f"{base_url}/workspaces/{workspace_id}/lakehouses"
         payload = {
             "displayName": lakehouse_name,
-            "description": f"Lakehouse {lakehouse_name} created via API"
+            "description": f"Lakehouse {lakehouse_name} created via API",
+            "creationPayload": {
+                "enableSchemas": True
+            }
         }
         
         response = requests.post(create_url, headers=headers, json=payload)
