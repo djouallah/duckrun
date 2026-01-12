@@ -19,42 +19,57 @@ class WorkspaceOperationsMixin:
     full Duckrun connections and workspace-only connections.
     """
     
-    def import_notebook_from_web(self, url: str, 
-                                  notebook_name: Optional[str] = None,
-                                  overwrite: bool = False) -> dict:
+    def import_notebook(self, path: str, overwrite: bool = False, runtime: str = "python") -> dict:
         """
-        Import a Jupyter notebook from a web URL into the workspace.
+        Import a Jupyter notebook from a web URL or local file path into the workspace.
         
         Args:
-            url: URL to the notebook file (e.g., GitHub raw URL). Required.
-            notebook_name: Name for the imported notebook. Optional - derived from URL if not provided.
+            path: URL or local file path to the notebook file. Required.
+                  - For web: e.g., "https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
+                  - For local: e.g., "/path/to/notebook.ipynb" or "C:\\path\\to\\notebook.ipynb"
             overwrite: Whether to overwrite if notebook already exists (default: False)
+            runtime: The notebook runtime - "pyspark" (default) or "python" for pure Python notebooks.
             
         Returns:
             Dictionary with import result
             
         Examples:
             con = duckrun.connect("workspace/lakehouse.lakehouse")
-            result = con.import_notebook_from_web(
-                url="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
+            result = con.import_notebook(
+                path="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
             )
             
-            ws = duckrun.connect("workspace")
-            result = ws.import_notebook_from_web(
-                url="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
+            # From local file with Python runtime
+            result = con.import_notebook(
+                path="/fabric_demo/analysis/analysis.ipynb",
+                runtime="python"
+            )
+            
+            # With overwrite
+            result = con.import_notebook(
+                path="/fabric_demo/analysis/analysis.ipynb",
+                overwrite=True
             )
         """
-        from .notebook import import_notebook_from_web as _import_notebook_from_web
+        from .notebook import import_notebook as _import_notebook
         
         # Get workspace name from either self.workspace or self.workspace_name
         workspace_name = getattr(self, 'workspace', None) or getattr(self, 'workspace_name', None)
         
-        return _import_notebook_from_web(
-            url=url,
-            notebook_name=notebook_name,
+        return _import_notebook(
+            path=path,
             overwrite=overwrite,
-            workspace_name=workspace_name
+            workspace_name=workspace_name,
+            runtime=runtime
         )
+    
+    # Backward compatibility alias
+    def import_notebook_from_web(self, url: str, overwrite: bool = False, runtime: str = "python") -> dict:
+        """
+        Alias for import_notebook for backward compatibility.
+        Use import_notebook instead - it supports both URLs and local file paths.
+        """
+        return self.import_notebook(path=url, overwrite=overwrite, runtime=runtime)
     
     def _get_workspace_id_by_name(self, token: str, workspace_name: str) -> Optional[str]:
         """Helper method to get workspace ID from name"""

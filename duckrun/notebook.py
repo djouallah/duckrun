@@ -1,26 +1,30 @@
 """
-Notebook operations functionality for duckrun - Import notebooks from web using Fabric REST API
+Notebook operations functionality for duckrun - Import notebooks from web or local path using Fabric REST API
 """
 import requests
 import base64
-from typing import Optional
+import os
+import json
+from typing import Optional, Literal
 
 
-def import_notebook_from_web(
-    url: str,
-    notebook_name: Optional[str] = None,
+def import_notebook(
+    path: str,
     overwrite: bool = False,
-    workspace_name: Optional[str] = None
+    workspace_name: Optional[str] = None,
+    runtime: Literal["pyspark", "python"] = "python"
 ) -> dict:
     """
-    Import a Jupyter notebook from a web URL into Microsoft Fabric workspace using REST API only.
+    Import a Jupyter notebook from a web URL or local file path into Microsoft Fabric workspace using REST API only.
     Uses duckrun.connect context by default or explicit workspace name.
     
     Args:
-        url: URL to the notebook file (e.g., GitHub raw URL). Required.
-        notebook_name: Name for the imported notebook in Fabric. Optional - will use filename from URL if not provided.
+        path: URL or local file path to the notebook file. Required.
+              - For web: e.g., "https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
+              - For local: e.g., "/path/to/notebook.ipynb" or "C:\\path\\to\\notebook.ipynb"
         overwrite: Whether to overwrite if notebook already exists (default: False)
         workspace_name: Target workspace name. Optional - will use current workspace from duckrun context if available.
+        runtime: The notebook runtime - "pyspark" (default) or "python" for pure Python notebooks.
         
     Returns:
         Dictionary with import result:
@@ -32,27 +36,25 @@ def import_notebook_from_web(
         }
         
     Examples:
-        # Basic usage with duckrun context
+        # Basic usage with duckrun context - from web URL
         import duckrun
         dr = duckrun.connect("MyWorkspace/MyLakehouse.lakehouse")
-        from duckrun.notebook import import_notebook_from_web
+        from duckrun.notebook import import_notebook
         
-        result = import_notebook_from_web(
-            url="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb",
-            notebook_name="MyNotebook"
+        result = import_notebook(
+            path="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb"
         )
         
-        # With explicit workspace
-        result = import_notebook_from_web(
-            url="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb",
-            notebook_name="MyNotebook",
-            workspace_name="Analytics Workspace",
+        # From local file path with Python runtime
+        result = import_notebook(
+            path="/fabric_demo/analysis/analysis.ipynb",
+            runtime="python"
+        )
+        
+        # With overwrite
+        result = import_notebook(
+            path="https://raw.githubusercontent.com/user/repo/main/notebook.ipynb",
             overwrite=True
-        )
-        
-        # Minimal usage - derives name from URL
-        result = import_notebook_from_web(
-            url="https://raw.githubusercontent.com/user/repo/main/RunPerfScenario.ipynb"
         )
     """
     try:
@@ -117,13 +119,11 @@ def import_notebook_from_web(
             workspace_id = workspace.get("id")
             print(f"✓ Found workspace: {workspace_name}")
         
-        # Derive notebook name from URL if not provided
-        if not notebook_name:
-            # Extract filename from URL
-            notebook_name = url.split("/")[-1]
-            if notebook_name.endswith(".ipynb"):
-                notebook_name = notebook_name[:-6]  # Remove .ipynb extension
-            print(f"📝 Using notebook name from URL: {notebook_name}")
+        # Derive notebook name from path
+        notebook_name = os.path.basename(path.rstrip('/'))
+        if notebook_name.endswith(".ipynb"):
+            notebook_name = notebook_name[:-6]  # Remove .ipynb extension
+        print(f"📝 Using notebook name: {notebook_name}")
         
         # Check if notebook already exists
         notebooks_url = f"{base_url}/workspaces/{workspace_id}/notebooks"
@@ -141,12 +141,75 @@ def import_notebook_from_web(
                 "overwritten": False
             }
         
-        # Download notebook content from URL
-        print(f"⬇️ Downloading notebook from: {url}")
-        response = requests.get(url)
-        response.raise_for_status()
-        notebook_content = response.text
-        print(f"✓ Notebook downloaded successfully")
+        # Check if path is a URL or local file path
+        is_url = path.lower().startswith(('http://', 'https://'))
+        
+        if is_url:
+            # Download notebook content from URL
+            print(f"⬇️ Downloading notebook from: {path}")
+            response = requests.get(path)
+            response.raise_for_status()
+            notebook_content = response.text
+            print(f"✓ Notebook downloaded successfully")
+        else:
+            # Read notebook content from local file
+            print(f"📂 Reading notebook from local path: {path}")
+            if not os.path.exists(path):
+                return {
+                    "success": False,
+                    "message": f"Local file not found: {path}",
+                    "notebook": None,
+                    "overwritten": False
+                }
+            with open(path, 'r', encoding='utf-8') as f:
+                notebook_content = f.read()
+            print(f"✓ Notebook read successfully")
+        
+        # Parse and modify notebook metadata to set the correct runtime
+        try:
+            notebook_json = json.loads(notebook_content)
+            
+            # Set the kernel based on runtime parameter
+            if runtime == "python":
+                kernel_name = "python3"
+                language_group = "jupyter_python"
+            else:  # pyspark
+                kernel_name = "synapse_pyspark"
+                language_group = "synapse_pyspark"
+            
+            # Ensure metadata structure exists
+            if "metadata" not in notebook_json:
+                notebook_json["metadata"] = {}
+            
+            # Set kernelspec
+            notebook_json["metadata"]["kernelspec"] = {
+                "name": kernel_name,
+                "display_name": kernel_name,
+                "language": "python"
+            }
+            
+            # Set kernel_info (Fabric-specific)
+            notebook_json["metadata"]["kernel_info"] = {
+                "name": "jupyter" if runtime == "python" else "synapse_pyspark"
+            }
+            
+            # Set microsoft metadata (Fabric-specific)
+            notebook_json["metadata"]["microsoft"] = {
+                "language": "python",
+                "language_group": language_group
+            }
+            
+            # Set language_info
+            notebook_json["metadata"]["language_info"] = {
+                "name": "python"
+            }
+            
+            # Convert back to string
+            notebook_content = json.dumps(notebook_json, indent=2)
+            print(f"✓ Set notebook runtime to: {runtime}")
+            
+        except json.JSONDecodeError:
+            print(f"⚠️ Could not parse notebook JSON, using original content")
         
         # Convert notebook content to base64
         notebook_base64 = base64.b64encode(notebook_content.encode('utf-8')).decode('utf-8')
@@ -282,43 +345,29 @@ def _wait_for_operation(operation_id: str, headers: dict, max_attempts: int = 30
     return False
 
 
-# Convenience wrapper for the try-except pattern mentioned in the request
-def import_notebook(
+# Backward compatibility alias
+def import_notebook_from_web(
     url: str,
-    notebook_name: Optional[str] = None,
     overwrite: bool = False,
-    workspace_name: Optional[str] = None
-) -> None:
+    workspace_name: Optional[str] = None,
+    runtime: Literal["pyspark", "python"] = "python"
+) -> dict:
     """
-    Convenience wrapper that prints results and handles errors.
+    Alias for import_notebook for backward compatibility.
+    Use import_notebook instead - it supports both URLs and local file paths.
     
     Args:
-        url: URL to the notebook file
-        notebook_name: Name for the imported notebook
-        overwrite: Whether to overwrite if exists
-        workspace_name: Target workspace name
+        url: URL to the notebook file (e.g., GitHub raw URL). Required.
+        overwrite: Whether to overwrite if notebook already exists (default: False)
+        workspace_name: Target workspace name. Optional.
+        runtime: The notebook runtime - "pyspark" (default) or "python".
         
-    Examples:
-        from duckrun.notebook import import_notebook
-        
-        import_notebook(
-            url="https://raw.githubusercontent.com/djouallah/fabric_demo/refs/heads/main/Benchmark/RunPerfScenario.ipynb",
-            notebook_name="RunPerfScenario",
-            overwrite=False
-        )
+    Returns:
+        Dictionary with import result
     """
-    try:
-        result = import_notebook_from_web(
-            url=url,
-            notebook_name=notebook_name,
-            overwrite=overwrite,
-            workspace_name=workspace_name
-        )
-        
-        if result["success"]:
-            print(f"✅ {result['message']}")
-        else:
-            print(f"❌ {result['message']}")
-            
-    except Exception as e:
-        print(f"Error: {e}")
+    return import_notebook(
+        path=url,
+        overwrite=overwrite,
+        workspace_name=workspace_name,
+        runtime=runtime
+    )
