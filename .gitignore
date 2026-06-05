@@ -64,3 +64,9 @@ integration_tests/warehouse/
 integration_tests/target/
 integration_tests/dbt_packages/
 integration_tests/logs/
+
+# dbt logs written to the repo root (e.g. running dbt with --project-dir)
+logs/
+
+# Local smoke-test scaffolding
+.localtest*
