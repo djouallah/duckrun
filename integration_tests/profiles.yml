@@ -13,4 +13,3 @@ aemo_electricity:
       root_path: "{{ env_var('WAREHOUSE_PATH') }}"
       storage_options:
         bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"
-        use_fabric_endpoint: "true"

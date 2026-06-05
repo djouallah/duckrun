@@ -12,9 +12,10 @@ plugin ecosystem) **plus** a `delta` materialization that writes real Delta tabl
 the one thing dbt-duckdb doesn't do out of the box. Delta writes use ZSTD compression
 and row-group sizing tuned for Power BI / DirectLake.
 
-> Note: versions ≤ 0.2.x of `duckrun` were a Microsoft Fabric/OneLake helper library.
-> From 0.1.0 of this line onward, duckrun is a dbt adapter. The old API lives in git
-> history on `main`.
+> **0.3.0 is a breaking change.** Versions ≤ 0.2.x of `duckrun` were a Microsoft
+> Fabric/OneLake helper library; from **0.3.0** onward `duckrun` is a dbt adapter.
+> Need the old library? Pin `pip install "duckrun<0.3"`, or use the
+> [`legacy`](https://github.com/djouallah/duckrun/tree/legacy) branch.
 
 ## Why
 
@@ -62,7 +63,6 @@ DuckDB Azure secret so `delta_scan()` reads work, no extra config.
       root_path: "abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>.Lakehouse/Tables"
       storage_options:
         bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"   # az account get-access-token --resource https://storage.azure.com
-        use_fabric_endpoint: "true"
 ```
 
 Tables are written as `root_path/<schema>/<model>` (e.g. `…/Tables/dbo/orders`).
