@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
 
 jobs:
-  test:
+  local:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -51,12 +51,9 @@ jobs:
   azurite:
     runs-on: ubuntu-latest
     # Azure Storage emulator: exercises the az:// path (delta_rs object_store emulator +
-    # DuckDB azure delta_scan/glob/COPY) without any real cloud creds.
-    services:
-      azurite:
-        image: mcr.microsoft.com/azure-storage/azurite
-        ports:
-          - 10000:10000
+    # DuckDB azure delta_scan/glob/COPY) without any real cloud creds. Azurite is started
+    # via `docker run` (not a service container) so we can pass --skipApiVersionCheck, which
+    # the runner's newer az CLI requires.
     defaults:
       run:
         working-directory: integration_tests
@@ -79,6 +76,15 @@ jobs:
       - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
         working-directory: ${{ github.workspace }}
         run: pip install -e .
+
+      - name: Start Azurite (blob; skip API-version check for newer az CLI)
+        run: |
+          docker run -d --name azurite -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite \
+            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
+          for i in $(seq 1 30); do
+            curl -s -o /dev/null "http://127.0.0.1:10000/devstoreaccount1" && break || sleep 1
+          done
 
       - name: Create Azurite blob container
         run: az storage container create --name lake --connection-string "$AZURITE_CONNECTION_STRING"
