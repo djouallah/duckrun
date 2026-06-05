@@ -47,3 +47,44 @@ jobs:
 
       - name: dbt build again (fresh process — delta_scan views rebuilt from disk expose state, exercises merge)
         run: dbt build --exclude tag:heavy
+
+  azurite:
+    runs-on: ubuntu-latest
+    # Azure Storage emulator: exercises the az:// path (delta_rs object_store emulator +
+    # DuckDB azure delta_scan/glob/COPY) without any real cloud creds.
+    services:
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite
+        ports:
+          - 10000:10000
+    defaults:
+      run:
+        working-directory: integration_tests
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests
+      WAREHOUSE_PATH: az://lake/Tables
+      FILES_PATH: az://lake/Files
+      DBT_SCHEMA: mart
+      download_limit: "2"
+      process_limit: "1000"
+      # Azurite's public well-known dev account/key (not a secret).
+      AZURITE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
+        working-directory: ${{ github.workspace }}
+        run: pip install -e .
+
+      - name: Create Azurite blob container
+        run: az storage container create --name lake --connection-string "$AZURITE_CONNECTION_STRING"
+
+      - name: dbt build (first pass — Azurite, creates Delta tables over az://)
+        run: dbt build --target azurite --exclude tag:heavy
+
+      - name: dbt build again (second pass — Azurite, delta_scan discovery + merge)
+        run: dbt build --target azurite --exclude tag:heavy

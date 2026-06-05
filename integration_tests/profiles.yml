@@ -12,4 +12,28 @@ aemo_electricity:
       # {{ this }} and is_incremental() resolve across separate dbt processes.
       root_path: "{{ env_var('WAREHOUSE_PATH') }}"
       storage_options:
-        bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"
+        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"
+
+    # Azure emulator (Azurite) target — exercises the az:// code path end to end without a
+    # real cloud: delta_rs writes via object_store's emulator mode, and DuckDB's azure
+    # extension reads / globs / writes through a connection-string secret pointing at the
+    # local Azurite blob endpoint. Credentials below are Azurite's public well-known dev
+    # account, not secrets.
+    azurite:
+      type: duckrun
+      threads: 1
+      schema: "{{ env_var('DBT_SCHEMA', 'mart') }}"
+      settings:
+        preserve_insertion_order: false
+      root_path: "{{ env_var('WAREHOUSE_PATH') }}"
+      extensions:
+        - azure
+        - httpfs
+      storage_options:
+        use_emulator: "true"
+        account_name: "devstoreaccount1"
+        account_key: "Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw=="
+      secrets:
+        - type: azure
+          name: azurite
+          connection_string: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
