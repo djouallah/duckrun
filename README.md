@@ -48,42 +48,61 @@ my_project:
 In a notebook where the storage secret is already provided to DuckDB, leave
 `storage_options` empty.
 
-## Use the `delta` materialization
+## Materializations
+
+| materialized | backed by | notes |
+|---|---|---|
+| **`table`** | Delta (overwrite) | DuckDB runs the SQL, delta_rs writes the table fresh each run. |
+| **`incremental`** | Delta (merge / append) | First run overwrites; later runs apply `incremental_strategy`. |
+| `view` | in-memory DuckDB | Ephemeral staging within a run (inherited from dbt-duckdb). |
+| `seed` | in-memory DuckDB | CSV fixtures (inherited). |
+| `delta` | Delta | Alias for `table`; honors `incremental=true`. Kept for convenience. |
+
+The persisted materializations (`table`, `incremental`, `delta`) write to
+`<root_path>/<schema>/<model>` by default, or to `config(location=...)`, and register a
+`delta_scan` view so downstream `ref()` works.
+
+### `table`
 
 ```sql
 -- models/orders.sql
-{{ config(materialized='delta') }}
+{{ config(materialized='table') }}
 
 select status, count(*) as n, sum(amount) as total
 from {{ ref('stg_orders') }}
 group by status
 ```
 
-This runs the SQL in DuckDB, writes a Delta table to
-`<root_path>/<schema>/orders` (or `config(location=...)`), and registers a
-`delta_scan` view so downstream `ref()` works.
-
-### Incremental Delta tables
+### `incremental`
 
 ```sql
-{{ config(materialized='delta', incremental=true, unique_key='order_id') }}
+{{ config(materialized='incremental', unique_key='order_id', incremental_strategy='merge') }}
 
 select * from {{ ref('stg_orders') }}
+{% if is_incremental() %}
+  where updated_at > (select max(updated_at) from {{ this }})
+{% endif %}
 ```
 
-First run (or `--full-refresh`) overwrites. Later runs **merge** on `unique_key` (or
-**append** when no `unique_key` is set) via delta_rs.
+First run (or `--full-refresh`, or missing table) overwrites. Later runs apply
+`incremental_strategy`:
 
-### Config options for `materialized='delta'`
+| `incremental_strategy` | behavior | requires |
+|---|---|---|
+| `merge` (default w/ `unique_key`) | upsert — update matched, insert new | `unique_key` |
+| `insert` | insert only new keys (idempotent append / dedupe) | `unique_key` |
+| `append` (default w/o `unique_key`) | blind append | — |
 
-| option            | description                                              |
-|-------------------|----------------------------------------------------------|
-| `location`        | Delta path. Defaults to `<root_path>/<schema>/<id>`.     |
-| `incremental`     | `true` to append/merge on later runs (default overwrite).|
-| `unique_key`      | column(s) to upsert on (`incremental` + `unique_key`).   |
-| `partition_by`    | Delta partition column(s).                               |
-| `merge_schema`    | allow schema evolution on write.                         |
-| `storage_options` | per-model override forwarded to deltalake.               |
+### Config options (table / incremental / delta)
+
+| option                 | description                                              |
+|------------------------|----------------------------------------------------------|
+| `location`             | Delta path. Defaults to `<root_path>/<schema>/<id>`.     |
+| `incremental_strategy` | `merge` \| `insert` \| `append` (incremental only).      |
+| `unique_key`           | column(s) to merge on.                                   |
+| `partition_by`         | Delta partition column(s).                               |
+| `merge_schema`         | allow schema evolution on write.                         |
+| `storage_options`      | per-model override forwarded to deltalake.               |
 
 ## Reading existing Delta tables as sources
 
@@ -100,20 +119,23 @@ sources:
 ## How it works
 
 1. dbt compiles your model SQL.
-2. The `delta` materialization stages it as a DuckDB view.
-3. A `dbt-duckdb` plugin (`store()` hook) reads that view as an Arrow record batch and
-   calls `write_deltalake(...)`.
+2. The materialization stages it as a DuckDB view.
+3. A `dbt-duckdb` plugin (`store()` hook) hands that relation to deltalake via the Arrow
+   C-stream interface (`__arrow_c_stream__`) — no pyarrow — which `write_deltalake` /
+   `DeltaTable.merge` consume natively.
 4. The model relation becomes a `delta_scan` view over the new Delta table.
 
-Because the adapter declares `dependencies=['duckdb']`, every other materialization
-(`view`, `table`, `seed`, `incremental`, `external`, …) is inherited directly from
-dbt-duckdb.
+The adapter is a thin subclass of dbt-duckdb declaring `dependencies=['duckdb']`, so
+`view`, `seed`, tests, etc. are inherited directly; `table` and `incremental` are
+overridden to write Delta.
 
 ## Development
 
 The `integration_tests/` directory is a small dbt project exercised by CI
-(`.github/workflows/integration.yml`): `dbt seed && dbt run && dbt test` against a local
-Delta `./warehouse`, including an incremental merge.
+(`.github/workflows/integration.yml`): `dbt build` (twice) against a local Delta
+`./warehouse` — a seed, a `view`, a `table`, and an `incremental` model — where the
+second build exercises the incremental merge. Verified to run with **pyarrow not
+installed**, on the minimum supported `duckdb` and `deltalake`.
 
 ## License
 

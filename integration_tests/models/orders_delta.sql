@@ -1,5 +1,5 @@
--- Full-refresh Delta table: DuckDB runs the SQL, delta_rs materializes it.
-{{ config(materialized='delta') }}
+-- Standard dbt `table` materialization, Delta-backed (overwrite each run).
+{{ config(materialized='table') }}
 
 select
     status,

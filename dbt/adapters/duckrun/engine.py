@@ -121,25 +121,30 @@ def merge_delta(
     data,
     unique_key,
     *,
+    insert_only: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> None:
     """
-    Upsert ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
+    Merge ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
 
     ``unique_key`` may be a single column name or a list of column names.
+
+    - insert_only=False (default): upsert — update matched rows, insert new ones.
+    - insert_only=True: insert only rows whose key is not present (idempotent
+      append / dedupe; never touches existing rows).
     """
     keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
     predicate = " AND ".join(f"target.{k} = source.{k}" for k in keys)
 
     dt = _delta_table(path, storage_options)
-    (
-        dt.merge(
-            source=data,
-            predicate=predicate,
-            source_alias="source",
-            target_alias="target",
-        )
-        .when_matched_update_all()
-        .when_not_matched_insert_all()
-        .execute()
+    merger = dt.merge(
+        source=data,
+        predicate=predicate,
+        source_alias="source",
+        target_alias="target",
     )
+    if insert_only:
+        merger = merger.when_not_matched_insert_all()
+    else:
+        merger = merger.when_matched_update_all().when_not_matched_insert_all()
+    merger.execute()

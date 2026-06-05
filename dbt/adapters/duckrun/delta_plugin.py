@@ -53,6 +53,7 @@ class Plugin(BasePlugin):
         unique_key = cfg.get("unique_key")
         incremental = bool(cfg.get("incremental", False))
         full_refresh = bool(cfg.get("full_refresh", False))
+        strategy = cfg.get("incremental_strategy")
         storage_options = cfg.get("storage_options", self._storage_options)
 
         # Keep `cur` referenced for the whole write so the relation's Arrow stream
@@ -64,7 +65,7 @@ class Plugin(BasePlugin):
         exists = engine.table_exists(path, storage_options)
 
         # Table-like (non-incremental) models always overwrite. Incremental models
-        # overwrite on first run / full-refresh, then merge (on unique_key) or append.
+        # overwrite on first run / full-refresh, then apply the incremental strategy.
         if not incremental or full_refresh or not exists:
             engine.write_delta(
                 path, data, "overwrite",
@@ -73,18 +74,34 @@ class Plugin(BasePlugin):
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,
             )
-        elif unique_key:
+            return
+
+        # Resolve the incremental strategy: default to merge when a unique_key is
+        # given, else a plain append.
+        strategy = strategy or ("merge" if unique_key else "append")
+
+        if strategy in ("merge", "insert"):
+            if not unique_key:
+                raise ValueError(
+                    f"incremental_strategy='{strategy}' requires a unique_key."
+                )
             engine.merge_delta(
                 path, data, unique_key,
+                insert_only=(strategy == "insert"),
                 storage_options=storage_options,
             )
-        else:
+        elif strategy == "append":
             engine.write_delta(
                 path, data, "append",
                 partition_by=partition_by,
                 merge_schema=merge_schema,
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,
+            )
+        else:
+            raise ValueError(
+                f"Unknown incremental_strategy '{strategy}'. "
+                "Use 'merge', 'insert', or 'append'."
             )
 
     @staticmethod
