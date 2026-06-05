@@ -18,7 +18,13 @@
 
   {%- set target_relation = this.incorporate(type='view') -%}
   {%- set existing_relation = load_relation(this) -%}
-  {%- set tmp_relation = make_temp_relation(target_relation) -%}
+  {#-- Fully-qualified staging relation so the plugin's cursor can resolve it
+       regardless of the connection's default catalog/schema. --#}
+  {%- set tmp_relation = api.Relation.create(
+        database=target_relation.database,
+        schema=target_relation.schema,
+        identifier=target_relation.identifier ~ '__duckrun_tmp',
+        type='view') -%}
 
   {#-- Resolve the Delta location: explicit config wins, else <root_path>/<schema>/<id> --#}
   {%- set location = config.get('location') -%}
