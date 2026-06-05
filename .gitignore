@@ -70,3 +70,6 @@ logs/
 
 # Local smoke-test scaffolding
 .localtest*
+
+# Local scratch notebook (not part of the package)
+simple_test.ipynb
