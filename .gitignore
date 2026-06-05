@@ -21,9 +21,13 @@ wheels/
 *.egg
 
 # Virtual environments
+.venv/
 venv/
 env/
 ENV/
+
+# dbt local user file
+integration_tests/.user.yml
 
 # IDE
 .vscode/

@@ -2,26 +2,20 @@
 dbt-duckdb plugin that materializes a model relation as a Delta Lake table.
 
 This is the one piece dbt-duckdb lacks: a Delta *write*. The plugin stashes the DuckDB
-connection (``configure_connection``), and on ``store()`` reads the model relation as an
-Arrow batch and hands it to the delta_rs engine. It also implements ``load()`` so Delta
-tables can be used as dbt sources.
+connection (``configure_connection``), and on ``store()`` hands the model relation
+straight to delta_rs. DuckDB relations expose the Arrow C-stream interface, which
+deltalake 1.x consumes directly, so there is no pyarrow dependency.
 """
 from typing import Any, Optional
 
 from dbt.adapters.duckdb.plugins import BasePlugin
 from dbt.adapters.duckdb.utils import SourceConfig, TargetConfig
 
-from deltalake import DeltaTable
-
 from . import engine
 
 
 class Plugin(BasePlugin):
-    """Registered in profiles as ``module: dbt.adapters.duckrun.delta_plugin``.
-
-    The duckrun adapter auto-registers it, so users normally don't configure it
-    explicitly.
-    """
+    """Registered automatically by the duckrun adapter (alias ``duckrun``)."""
 
     def initialize(self, config: dict) -> None:
         config = config or {}
@@ -38,6 +32,17 @@ class Plugin(BasePlugin):
         except Exception:
             pass
 
+    def _cursor(self):
+        if self._conn is None:
+            raise RuntimeError(
+                "duckrun delta plugin has no DuckDB connection; "
+                "configure_connection was not called."
+            )
+        try:
+            return self._conn.cursor()
+        except Exception:
+            return self._conn
+
     # ------------------------------------------------------------------ write
     def store(self, target_config: TargetConfig) -> None:
         path = target_config.location.path
@@ -50,7 +55,11 @@ class Plugin(BasePlugin):
         full_refresh = bool(cfg.get("full_refresh", False))
         storage_options = cfg.get("storage_options", self._storage_options)
 
-        batch = self._read_relation(target_config.relation)
+        # Keep `cur` referenced for the whole write so the relation's Arrow stream
+        # stays valid while deltalake consumes it.
+        cur = self._cursor()
+        name = self._relation_name(target_config.relation)
+        data = cur.sql(f"SELECT * FROM {name}")
 
         exists = engine.table_exists(path, storage_options)
 
@@ -58,7 +67,7 @@ class Plugin(BasePlugin):
         # overwrite on first run / full-refresh, then merge (on unique_key) or append.
         if not incremental or full_refresh or not exists:
             engine.write_delta(
-                path, batch, "overwrite",
+                path, data, "overwrite",
                 partition_by=partition_by,
                 merge_schema=merge_schema,
                 storage_options=storage_options,
@@ -66,33 +75,21 @@ class Plugin(BasePlugin):
             )
         elif unique_key:
             engine.merge_delta(
-                path, batch, unique_key,
+                path, data, unique_key,
                 storage_options=storage_options,
             )
         else:
             engine.write_delta(
-                path, batch, "append",
+                path, data, "append",
                 partition_by=partition_by,
                 merge_schema=merge_schema,
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,
             )
 
-    def _read_relation(self, relation: Any):
-        if self._conn is None:
-            raise RuntimeError(
-                "duckrun delta plugin has no DuckDB connection; "
-                "configure_connection was not called."
-            )
-        name = relation.render() if hasattr(relation, "render") else str(relation)
-        # Use a fresh cursor on the same connection so we don't disturb dbt's cursor.
-        try:
-            cur = self._conn.cursor()
-        except Exception:
-            cur = self._conn
-        cur.execute(f"SELECT * FROM {name}")
-        # RecordBatchReader is consumed once by the deltalake writer.
-        return cur.fetch_record_batch()
+    @staticmethod
+    def _relation_name(relation: Any) -> str:
+        return relation.render() if hasattr(relation, "render") else str(relation)
 
     # ------------------------------------------------------------------- read
     def load(self, source_config: SourceConfig):
@@ -101,13 +98,8 @@ class Plugin(BasePlugin):
             raise ValueError(
                 "Delta source requires 'delta_table_path' (or 'location') in meta."
             )
-        storage_options = source_config.get("storage_options", self._storage_options)
-        dt = (
-            DeltaTable(path, storage_options=storage_options)
-            if storage_options
-            else DeltaTable(path)
-        )
-        return dt.to_pyarrow_dataset()
+        # Read via DuckDB's delta_scan so no pyarrow import is required.
+        return self._cursor().sql(f"SELECT * FROM delta_scan('{path}')")
 
     def default_materialization(self) -> str:
         return "view"

@@ -14,7 +14,8 @@ authors = [
 requires-python = ">=3.9"
 dependencies = [
     "dbt-duckdb>=1.8",
-    "deltalake",
+    "duckdb>=1.4.4",
+    "deltalake>=1.2.1",
 ]
 
 [project.urls]

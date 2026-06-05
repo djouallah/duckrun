@@ -1,37 +1,32 @@
 """
 Delta Lake write engine for the duckrun dbt adapter.
 
-Ported from the original duckrun ``writer.py`` / ``runner.py``: DuckDB produces an
-Arrow record batch, ``deltalake`` (delta_rs) materializes it as a Delta table, and the
-table is maintained (vacuum / compact / cleanup). The version-aware argument builder is
-kept verbatim so the row-group sizing that matters for Power BI / DirectLake is preserved.
+DuckDB produces the data and ``deltalake`` (delta_rs) materializes it. We pass the
+DuckDB relation straight through: deltalake 1.x consumes any object exposing the Arrow
+C-stream interface (``__arrow_c_stream__``), which DuckDB relations do — so there is no
+pyarrow dependency.
 """
 from typing import Any, Dict, List, Optional
 
-from deltalake import DeltaTable, write_deltalake, __version__ as deltalake_version
+from deltalake import DeltaTable, write_deltalake
 
-# Try to import WriterProperties for Rust engine (available in 0.18.2+)
-try:
-    from deltalake.writer import WriterProperties
-    _HAS_WRITER_PROPERTIES = True
-except ImportError:
-    _HAS_WRITER_PROPERTIES = False
-
-# Try to import PyArrow dataset for old PyArrow engine
-try:
-    import pyarrow.dataset as ds
-    _HAS_PYARROW_DATASET = True
-except ImportError:
-    _HAS_PYARROW_DATASET = False
+try:  # deltalake 1.x exposes WriterProperties at the top level
+    from deltalake import WriterProperties
+except ImportError:  # pragma: no cover - older layouts
+    try:
+        from deltalake.writer import WriterProperties
+    except ImportError:
+        WriterProperties = None
 
 
-# Row Group configuration for optimal Delta Lake performance (Power BI / DirectLake)
-RG = 8_000_000
-
-# Version 0.18.x / 0.19.x support the ``engine`` param and row-group optimization.
-# Version 0.20+ removed these (rust only, no row groups).
-_DELTALAKE_VERSION = tuple(map(int, deltalake_version.split(".")[:2]))
-_IS_OLD_DELTALAKE = _DELTALAKE_VERSION < (0, 20)
+def _writer_properties():
+    # ZSTD compression for good Parquet footprint (Power BI / DirectLake friendly).
+    if WriterProperties is not None:
+        try:
+            return WriterProperties(compression="ZSTD")
+        except Exception:
+            return None
+    return None
 
 
 def build_write_deltalake_args(
@@ -42,56 +37,21 @@ def build_write_deltalake_args(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
-    """
-    Build kwargs for ``write_deltalake`` based on the installed deltalake version.
-
-    deltalake 0.18.2 - 0.19.x:
-      - has ``engine`` param (defaults to 'pyarrow') and row-group params
-      - mergeSchema -> schema_mode='merge' + engine='rust', no row-group params
-      - otherwise -> row-group params (pyarrow default)
-      - compression ZSTD via writer_properties (rust) or file_options (pyarrow)
-
-    deltalake 0.20+:
-      - rust only, no ``engine`` param, no row-group params
-      - mergeSchema -> schema_mode='merge'
-      - compression ZSTD via writer_properties
-    """
+    """Build kwargs for ``write_deltalake`` (deltalake >= 1.2)."""
     args: Dict[str, Any] = {
         "table_or_uri": path,
         "data": data,
         "mode": mode,
     }
-
     if partition_by:
         args["partition_by"] = partition_by
-
     if storage_options:
         args["storage_options"] = storage_options
-
     if schema_mode == "merge":
         args["schema_mode"] = "merge"
-        if _IS_OLD_DELTALAKE:
-            # 0.18.2-0.19.x: must also set engine='rust' for schema merging.
-            args["engine"] = "rust"
-            if _HAS_WRITER_PROPERTIES:
-                args["writer_properties"] = WriterProperties(compression="ZSTD")
-        else:
-            if _HAS_WRITER_PROPERTIES:
-                args["writer_properties"] = WriterProperties(compression="ZSTD")
-    else:
-        if _IS_OLD_DELTALAKE:
-            # 0.18.2-0.19.x: pyarrow default + row-group optimization.
-            args["max_rows_per_file"] = RG
-            args["max_rows_per_group"] = RG
-            args["min_rows_per_group"] = RG
-            if _HAS_PYARROW_DATASET:
-                args["file_options"] = ds.ParquetFileFormat().make_write_options(
-                    compression="ZSTD"
-                )
-        else:
-            if _HAS_WRITER_PROPERTIES:
-                args["writer_properties"] = WriterProperties(compression="ZSTD")
-
+    wp = _writer_properties()
+    if wp is not None:
+        args["writer_properties"] = wp
     return args
 
 
@@ -121,9 +81,8 @@ def write_delta(
     compaction_threshold: int = 100,
 ) -> None:
     """
-    Materialize an Arrow record batch / table to Delta and maintain it.
+    Materialize ``data`` (a DuckDB relation / Arrow C-stream) to Delta and maintain it.
 
-    Mirrors the original ``runner._run_sql`` behavior:
       - overwrite: write, then vacuum(retention=0) + cleanup_metadata
       - append:    write, then compact/vacuum/cleanup if file count exceeds threshold
       - ignore:    write only if the table does not already exist
@@ -165,7 +124,7 @@ def merge_delta(
     storage_options: Optional[Dict[str, str]] = None,
 ) -> None:
     """
-    Upsert an Arrow batch into an existing Delta table on ``unique_key`` using delta_rs.
+    Upsert ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
 
     ``unique_key`` may be a single column name or a list of column names.
     """
