@@ -28,6 +28,11 @@ class DuckrunCredentials(DuckDBCredentials):
     def type(self) -> str:
         return "duckrun"
 
+    def _connection_keys(self):
+        # Expose root_path on the Jinja `target` so the delta materialization can
+        # resolve a default location (dbt only surfaces listed keys).
+        return tuple(super()._connection_keys()) + ("root_path",)
+
     def __post_init__(self):
         # Ensure the Delta-write plugin is registered exactly once.
         plugins = list(self.plugins or [])
