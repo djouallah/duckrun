@@ -48,6 +48,10 @@
     create or replace view {{ tmp_relation }} as {{ sql }}
   {%- endcall %}
 
+  {#-- Commit so the staging view is visible to the plugin's cursor (cross-cursor
+       isolation otherwise hides uncommitted DDL). --#}
+  {{ adapter.commit() }}
+
   {%- set columns = adapter.get_columns_in_relation(tmp_relation) -%}
 
   {#-- 2. Hand off to the delta-write plugin (store -> write_deltalake) --#}
