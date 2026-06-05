@@ -1,0 +1,4 @@
+version: 2
+
+# csv_archive_log is now a standalone parquet file on abfss://
+# (no longer a DuckLake table, so no source definition needed)

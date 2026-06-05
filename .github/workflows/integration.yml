@@ -14,6 +14,11 @@ jobs:
         working-directory: integration_tests
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests
+      ONELAKE_TOKEN: ${{ secrets.ONELAKE_TOKEN }}     # az account get-access-token --resource https://storage.azure.com
+      WAREHOUSE_PATH: ${{ secrets.WAREHOUSE_PATH }}   # abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse/Tables
+      FILES_PATH: ${{ secrets.FILES_PATH }}           # abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse/Files (csv archive + log)
+      DBT_SCHEMA: mart
+      download_limit: "2"
     steps:
       - uses: actions/checkout@v4
 
@@ -28,15 +33,8 @@ jobs:
       - name: dbt --version (adapter registered + dependency macros loaded)
         run: dbt --version
 
-      - name: dbt build (stateless, in-memory; first run overwrites Delta)
-        run: dbt build
+      - name: dbt build (first pass — creates Delta tables via delta_rs)
+        run: dbt build --exclude tag:heavy
 
-      - name: dbt build again (new process; orders_incr exercises delta merge)
-        run: dbt build
-
-      - name: Assert Delta tables exist and no DuckDB state file was created
-        run: |
-          test -d warehouse/main/orders_delta/_delta_log
-          test -d warehouse/main/orders_incr/_delta_log
-          ! ls *.duckdb 2>/dev/null
-          echo "Delta tables present; no DuckDB file (stateless)."
+      - name: dbt build again (fresh process — delta_classic attach exposes state, exercises merge)
+        run: dbt build --exclude tag:heavy

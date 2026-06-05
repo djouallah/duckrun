@@ -1,0 +1,25 @@
+version: 2
+
+models:
+  - name: stg_csv_archive_log
+    description: Log of all downloaded CSV files
+    columns:
+      - name: source_filename
+        description: Name of the downloaded file
+        tests:
+          - not_null
+      - name: source_type
+        description: Type of source (daily, scada_today, price_today)
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['daily', 'scada_today', 'price_today', 'duid_data', 'duid_facilities', 'duid_wa_energy', 'duid_geo_data']
+      - name: csv_filename
+        description: Actual CSV filename (without extension) extracted from ZIP
+        tests:
+          - not_null
+      - name: archived_at
+        description: Timestamp when file was archived
+        tests:
+          - not_null

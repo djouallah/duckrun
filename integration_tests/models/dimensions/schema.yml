@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: dim_duid
+    description: Dimension table for DUID (Dispatchable Unit Identifier)
+    columns:
+      - name: DUID
+        description: Unique identifier for dispatchable unit
+        tests:
+          - unique
+          - not_null
+
+  - name: dim_calendar
+    description: Calendar dimension with date attributes
+    columns:
+      - name: date
+        description: Calendar date
+        tests:
+          - unique
+          - not_null

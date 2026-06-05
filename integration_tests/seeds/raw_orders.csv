@@ -1,6 +1,0 @@
-order_id,customer,amount,status
-1,alice,100,shipped
-2,bob,55,pending
-3,carol,200,shipped
-4,dave,30,cancelled
-5,erin,75,pending
