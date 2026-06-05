@@ -9,3 +9,13 @@ duckrun_integration:
       # Default Delta location for models that don't set config(location=...).
       root_path: "{{ env_var('DBT_DELTA_ROOT', './warehouse') }}"
       # storage_options: {}   # only needed for remote stores (abfss/s3/gs)
+
+    # Real Microsoft Fabric OneLake target (run: dbt build --target onelake)
+    onelake:
+      type: duckrun
+      threads: 1
+      schema: dbo
+      root_path: "abfss://tpch@onelake.dfs.fabric.microsoft.com/storage.Lakehouse/Tables"
+      storage_options:
+        bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"
+        use_fabric_endpoint: "true"

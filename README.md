@@ -48,6 +48,27 @@ my_project:
 In a notebook where the storage secret is already provided to DuckDB, leave
 `storage_options` empty.
 
+### Remote stores (Microsoft Fabric OneLake / ADLS / S3 / GCS)
+
+Point `root_path` at the warehouse location and pass credentials via `storage_options`
+— these flow straight to deltalake for writes/merges. If `storage_options` carries a
+`bearer_token` (or `token` / `access_token`), the adapter also auto-creates a matching
+DuckDB Azure secret so `delta_scan()` reads work, no extra config.
+
+```yaml
+    onelake:
+      type: duckrun
+      schema: dbo
+      root_path: "abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>.Lakehouse/Tables"
+      storage_options:
+        bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"   # az account get-access-token --resource https://storage.azure.com
+        use_fabric_endpoint: "true"
+```
+
+Tables are written as `root_path/<schema>/<model>` (e.g. `…/Tables/dbo/orders`).
+Verified end-to-end against real Fabric OneLake: `table` overwrite, `incremental` merge,
+and `delta_scan` reads/tests.
+
 ## Materializations
 
 | materialized | backed by | notes |

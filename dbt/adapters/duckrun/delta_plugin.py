@@ -31,6 +31,20 @@ class Plugin(BasePlugin):
             conn.execute("INSTALL delta; LOAD delta;")
         except Exception:
             pass
+        # If a bearer token was supplied in storage_options (e.g. OneLake/ADLS),
+        # create a matching DuckDB Azure secret so delta_scan() can read the tables.
+        # In a notebook where the secret is already provided this is skipped.
+        so = self._storage_options or {}
+        token = so.get("bearer_token") or so.get("token") or so.get("access_token")
+        if token:
+            try:
+                conn.execute("INSTALL azure; LOAD azure;")
+                conn.execute(
+                    "CREATE OR REPLACE SECRET duckrun_onelake "
+                    f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}')"
+                )
+            except Exception:
+                pass
 
     def _cursor(self):
         if self._conn is None:
@@ -54,7 +68,9 @@ class Plugin(BasePlugin):
         incremental = bool(cfg.get("incremental", False))
         full_refresh = bool(cfg.get("full_refresh", False))
         strategy = cfg.get("incremental_strategy")
-        storage_options = cfg.get("storage_options", self._storage_options)
+        # Per-model override wins; fall back to the credential-level storage_options.
+        # (Use `or` because the macro always sets the key, often to None.)
+        storage_options = cfg.get("storage_options") or self._storage_options
 
         # Keep `cur` referenced for the whole write so the relation's Arrow stream
         # stays valid while deltalake consumes it.
