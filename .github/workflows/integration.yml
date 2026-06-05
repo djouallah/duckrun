@@ -14,11 +14,17 @@ jobs:
         working-directory: integration_tests
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests
-      ONELAKE_TOKEN: ${{ secrets.ONELAKE_TOKEN }}     # az account get-access-token --resource https://storage.azure.com
-      WAREHOUSE_PATH: ${{ secrets.WAREHOUSE_PATH }}   # abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse/Tables
-      FILES_PATH: ${{ secrets.FILES_PATH }}           # abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse/Files (csv archive + log)
+      # Local-filesystem run (no OneLake creds needed): delta_rs writes Delta tables to
+      # WAREHOUSE_PATH and the staging model downloads AEMO data from the public web into
+      # FILES_PATH. A dummy token just makes the adapter load the azure extension (used by
+      # the on-run-start setting); it is ignored for local paths. Remote OneLake is a
+      # separate, secret-backed job to add once this is green.
+      ONELAKE_TOKEN: dummy
+      WAREHOUSE_PATH: /tmp/duckrun_warehouse
+      FILES_PATH: /tmp/duckrun_files
       DBT_SCHEMA: mart
       download_limit: "2"
+      process_limit: "1000"
     steps:
       - uses: actions/checkout@v4
 
@@ -29,6 +35,9 @@ jobs:
       - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
         working-directory: ${{ github.workspace }}
         run: pip install -e .
+
+      - name: Create local warehouse + files dirs
+        run: mkdir -p /tmp/duckrun_warehouse /tmp/duckrun_files
 
       - name: dbt --version (adapter registered + dependency macros loaded)
         run: dbt --version
