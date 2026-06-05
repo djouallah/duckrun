@@ -22,6 +22,7 @@ class Plugin(BasePlugin):
         self._storage_options: Optional[dict] = config.get("storage_options")
         self._compaction_threshold: int = int(config.get("compaction_threshold", 100))
         self._conn = None
+        self._cursor_handle = None
 
     def configure_connection(self, conn) -> None:
         # Stash the live DuckDB connection so store()/load() can use it later.
@@ -46,7 +47,19 @@ class Plugin(BasePlugin):
             except Exception:
                 pass
 
+    def configure_cursor(self, cursor) -> None:
+        # dbt creates a fresh child cursor per model connection (see dbt-duckdb's
+        # initialize_cursor) and runs that model's pre-hooks / staged-model DDL on it.
+        # DuckDB session state (e.g. SET VARIABLE used by getvariable()/read_csv()) is
+        # cursor-local, so store()/load() MUST read on this same cursor — not a new child
+        # of the shared connection — or the variables/relations won't be visible.
+        self._cursor_handle = cursor
+
     def _cursor(self):
+        # Prefer the live per-model cursor (shares the session where pre-hook variables and
+        # the staged relation were created); fall back to the shared connection.
+        if self._cursor_handle is not None:
+            return self._cursor_handle
         if self._conn is None:
             raise RuntimeError(
                 "duckrun delta plugin has no DuckDB connection; "

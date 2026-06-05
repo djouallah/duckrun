@@ -127,6 +127,20 @@ current run are not auto-registered — do a full/`+upstream` build, the normal 
 `table.sql`, `incremental.sql`, `delta.sql` wrappers are unchanged except that they keep
 calling `duckrun__build_delta(...)`.
 
+### 2b. Plugin must read on the model's cursor  (`delta_plugin.py`)
+
+The model is staged as a **view** and streamed to delta_rs as an Arrow stream (no full
+in-DuckDB materialization). But the staged view (and any `SET VARIABLE` a pre-hook set, used
+by `getvariable()`/`read_csv(...)`) lives in the **session of the cursor dbt ran the model
+on**. DuckDB session state is cursor-local: dbt-duckdb calls `configure_connection` once on
+the shared connection but gives each model its own child cursor via `configure_cursor`, and
+the plugin's old `self._conn.cursor()` made *yet another* child — so `getvariable(...)` was
+`NULL` and the model failed with `read_csv cannot take NULL list as parameter`.
+
+Fix: the plugin overrides `configure_cursor(cursor)` to stash the live per-model cursor and
+`store()`/`load()` read on **that** cursor (falling back to the shared connection). Now the
+pre-hook variable, the staged view, and the delta_rs read all share one session.
+
 ### 3. Remove `delta_classic` machinery
 
 - **`impl.py`**: delete `delta_attach_alias`, `_attachment_for_alias`,
@@ -170,13 +184,15 @@ unchanged.)
   remove attach methods.
 - `dbt/adapters/duckrun/credentials.py` — remove `delta_attach`.
 - `dbt/include/duckrun/macros/materializations/_delta_core.sql` — single view-after-write
-  path; remove attach branches.
+  path; pre-register `{{ this }}`; remove attach branches.
+- `dbt/adapters/duckrun/delta_plugin.py` — `configure_cursor` stashes the model cursor;
+  `store()`/`load()` read on it so pre-hook `SET VARIABLE` / staged view are in scope.
 - `integration_tests/profiles.yml` — drop `lake`/`delta_classic`/`attach`.
 - `.github/workflows/integration.yml` — comment only.
 - `integration_tests/models/dimensions/dim_duid.sql`,
   `integration_tests/models/marts/fct_summary.sql` — drop writable-`this` pre-hooks.
 
-(`delta_plugin.py`, `engine.py`, `table.sql`, `incremental.sql`, `delta.sql` unchanged.)
+(`engine.py`, `table.sql`, `incremental.sql`, `delta.sql` unchanged.)
 
 ## Verification
 
@@ -193,6 +209,14 @@ Confirmed: pass 1 creates the table (delta_rs overwrite) + a `delta_scan` view; 
 process) discovers it from disk → `is_incremental()` true (compiled SQL contains
 `WHERE date NOT IN (SELECT date FROM …dim_calendar)`) → `{{ this }}` pre-registered → merge
 runs idempotently (3197 rows / 3197 distinct dates, no dupes). `not_null`/`unique` tests pass.
+
+**Full local run (needs internet, no OneLake):** the staging model downloads AEMO data from
+public web (nemweb + GitHub raw) to a local `FILES_PATH`, so the whole project runs offline
+of OneLake with `WAREHOUSE_PATH`/`FILES_PATH` set to local dirs. Confirmed green on both
+passes: `dbt build --exclude tag:heavy` → `PASS=33, ERROR=0` (one `warn`-severity
+`relationships` data test on orphan DUIDs, unrelated to the adapter). Pass 2 exercises
+cross-process `is_incremental()`, `{{ this }}` pre-register, pre-hook `SET VARIABLE`, and
+merge/append via delta_rs across all `fct_*` models.
 
 **Full CI (`.github/workflows/integration.yml`):** two-pass `dbt build --exclude tag:heavy`
 against OneLake:
