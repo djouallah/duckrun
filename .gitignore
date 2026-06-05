@@ -26,9 +26,6 @@ venv/
 env/
 ENV/
 
-# dbt local user file
-integration_tests/.user.yml
-
 # IDE
 .vscode/
 .idea/
@@ -59,6 +56,8 @@ tests/*/
 !integration_tests/**/*.csv
 !integration_tests/**/*.yml
 !integration_tests/**/*.json
+# ...except dbt's auto-generated local user file
+integration_tests/.user.yml
 
 # Delta output and dbt artifacts produced by the integration tests (runtime)
 integration_tests/warehouse/
