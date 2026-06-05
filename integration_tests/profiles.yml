@@ -4,30 +4,23 @@ aemo_electricity:
     dev:
       type: duckrun
       threads: 1
-      # The dbt `database` is the read-only delta_classic attach alias, so {{ this }}
-      # and is_incremental() resolve against the existing Delta tables.
-      database: lake
       schema: "{{ env_var('DBT_SCHEMA', 'mart') }}"
       settings:
         preserve_insertion_order: false
       # delta_rs writes land here as <root_path>/<schema>/<model> (arbitrary fs path).
+      # Existing Delta tables are surfaced back as delta_scan views by the adapter, so
+      # {{ this }} and is_incremental() resolve across separate dbt processes.
       root_path: "{{ env_var('WAREHOUSE_PATH') }}"
       storage_options:
         bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"
         use_fabric_endpoint: "true"
-      # DuckDB read secret (delta_classic / delta_scan).
+      # DuckDB read secret (delta_scan / glob over OneLake).
       secrets:
         - type: azure
           name: onelake_storage
           provider: access_token
           access_token: "{{ env_var('ONELAKE_TOKEN') }}"
-      # delta_classic community extension provides the multi-schema read catalog.
       extensions:
-        - {name: delta_classic, repo: community}
-      # Read-only attach over the same Tables/ root: existing Delta tables show up as
-      # lake.<schema>.<model>. PIN_SNAPSHOT off (default) => every query reads latest.
-      attach:
-        - path: "{{ env_var('WAREHOUSE_PATH') }}"
-          alias: lake
-          type: delta_classic
-          read_only: true
+        - {name: delta, repo: community}
+        - azure
+        - httpfs

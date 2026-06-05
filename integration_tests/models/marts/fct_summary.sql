@@ -1,11 +1,13 @@
 -- depends_on: {{ ref('fct_scada_today') }}
 -- depends_on: {{ ref('fct_price_today') }}
 
+{#-- Delta state is written by delta_rs and {{ this }} is a read-only delta_scan view, so the
+     old TRUNCATE+append rebuild can't run in place. Materialize as a table: delta_rs overwrites
+     with the full picture (daily + today) every run. is_incremental() is then always false, so
+     the full-refresh branch at the bottom runs. --#}
 {{ config(
-    materialized='incremental',
-    incremental_strategy='append',
-    schema='mart',
-    pre_hook=[{"sql": "{% if is_incremental() and execute and flags.WHICH == 'run' %}{%- set r = run_query('SELECT (SELECT COUNT(DISTINCT DATE) FROM ' ~ ref('fct_scada') ~ ' WHERE INTERVENTION = 0) AS s, (SELECT COUNT(DISTINCT date) FROM ' ~ this ~ ') AS m') -%}{%- if r and r.rows[0][0] > r.rows[0][1] -%}TRUNCATE TABLE {{ this }}{%- endif -%}{% endif %}", "transaction": false}]
+    materialized='table',
+    schema='mart'
 ) }}
 
 {% if is_incremental() %}

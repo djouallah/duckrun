@@ -93,8 +93,11 @@ class Plugin(BasePlugin):
             return
 
         # Resolve the incremental strategy: default to merge when a unique_key is
-        # given, else a plain append.
+        # given, else a plain append. delta_rs has no separate delete+insert; with a
+        # unique_key it is equivalent to an upsert, so treat it as merge.
         strategy = strategy or ("merge" if unique_key else "append")
+        if strategy in ("delete+insert", "delete_insert"):
+            strategy = "merge"
 
         if strategy in ("merge", "insert"):
             if not unique_key:

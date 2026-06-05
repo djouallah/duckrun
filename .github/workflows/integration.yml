@@ -36,5 +36,5 @@ jobs:
       - name: dbt build (first pass — creates Delta tables via delta_rs)
         run: dbt build --exclude tag:heavy
 
-      - name: dbt build again (fresh process — delta_classic attach exposes state, exercises merge)
+      - name: dbt build again (fresh process — delta_scan views rebuilt from disk expose state, exercises merge)
         run: dbt build --exclude tag:heavy

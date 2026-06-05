@@ -28,38 +28,10 @@ class DuckrunCredentials(DuckDBCredentials):
     def type(self) -> str:
         return "duckrun"
 
-    @property
-    def delta_attach(self) -> Optional[str]:
-        """
-        Alias of a read-only ``delta_classic`` attachment that backs the dbt
-        ``database`` (i.e. ``{{ this }}`` resolves to it). When set, the delta
-        materialization runs in "attach state mode": it reads existing tables from
-        this read-only catalog and never tries to CREATE inside it — it stages in the
-        writable in-memory ``memory`` catalog and writes the table via delta_rs.
-
-        Returns ``None`` for the plain delta_scan/local mode.
-        """
-        for att in (self.attach or []):
-            # `attach` items are Attachment dataclasses at runtime, but tolerate dicts.
-            if isinstance(att, dict):
-                alias = att.get("alias")
-                options = att.get("options") or {}
-                atype = (att.get("type") or options.get("type") or "")
-                read_only = bool(att.get("read_only") or options.get("read_only"))
-            else:
-                options = getattr(att, "options", None) or {}
-                alias = getattr(att, "alias", None)
-                atype = (getattr(att, "type", None) or options.get("type") or "")
-                read_only = bool(getattr(att, "read_only", False) or options.get("read_only"))
-            if str(atype).lower() == "delta_classic" and read_only and alias == self.database:
-                return alias
-        return None
-
     def _connection_keys(self):
-        # Expose root_path + delta_attach on the Jinja `target` so the delta
-        # materialization can resolve a default location and pick the write/read mode
-        # (dbt only surfaces listed keys).
-        return tuple(super()._connection_keys()) + ("root_path", "delta_attach")
+        # Expose root_path on the Jinja `target` so the delta materialization can resolve a
+        # default location (dbt only surfaces listed keys).
+        return tuple(super()._connection_keys()) + ("root_path",)
 
     def __post_init__(self):
         # Ensure the Delta-write plugin is registered exactly once.

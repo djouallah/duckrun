@@ -1,37 +1,29 @@
 {#
   Shared flow for duckrun's Delta-backed materializations (table / incremental / delta).
 
-  Two modes:
+  State lives in Delta Lake. DuckDB executes the model into a staging relation; the
+  delta-write plugin (delta_rs) materializes the Delta table; the model relation then becomes
+  a `delta_scan` view so downstream ref() and the model's own `{{ this }}` resolve. A brand
+  new table is just a `create or replace view` — instantly visible to the rest of the run,
+  with no attach/re-attach. Cross-process state comes from run-start discovery in the adapter
+  (list_relations_without_caching rebuilds these views from disk).
 
-  - delta_scan mode (default): DuckDB executes the model SQL into a staging view; the
-    delta-write plugin reads that view and materializes a Delta table; the model relation
-    becomes a `delta_scan` view so downstream ref() resolves.
-
-  - attach state mode (target.delta_attach set): dbt's `database` is a read-only
-    `delta_classic` attach, so `{{ this }}` already resolves to the existing Delta table.
-    We must NOT create inside that read-only catalog: stage in the writable in-memory
-    `memory` catalog, write the Delta table via delta_rs, and skip the relation view — the
-    delta_classic attach surfaces the (latest) table from the directory on every query.
+  Python models: dbt's `submit_python_job` may only be called directly from a
+  materialization macro (depth-2 guard), so python staging is done in the materialization
+  wrappers (table/incremental/delta.sql) via `duckrun__stage_python()`, and this macro
+  skips its own staging for python.
 #}
 
-{% macro duckrun__build_delta(model_sql, pre_hooks, post_hooks, is_incremental) %}
-
+{#-- Compute the relations/location used by both the materialization wrappers (python
+     staging) and duckrun__build_delta. Deterministic; returns values only (no SQL). --#}
+{% macro duckrun__delta_paths() %}
   {%- set target_relation = this.incorporate(type='view') -%}
-
-  {#-- attach state mode when the dbt database is a read-only delta_classic attach. --#}
-  {%- set attach_mode = target.delta_attach -%}
-  {%- set stage_db = 'memory' if attach_mode else target_relation.database -%}
-
-  {#-- Fully-qualified staging relation so the plugin's cursor can resolve it regardless
-       of the connection's default catalog/schema. In attach mode it lives in the writable
-       `memory` catalog (the attach catalog is read-only). --#}
+  {%- set is_py = (model['language'] == 'python') -%}
   {%- set tmp_relation = api.Relation.create(
-        database=stage_db,
+        database=target_relation.database,
         schema=target_relation.schema,
         identifier=target_relation.identifier ~ '__duckrun_tmp',
-        type='view') -%}
-
-  {#-- Resolve the Delta location: explicit config wins, else <root_path>/<schema>/<id> --#}
+        type=('table' if is_py else 'view')) -%}
   {%- set location = config.get('location') -%}
   {%- if not location -%}
     {%- set root_path = target.root_path -%}
@@ -41,25 +33,37 @@
     {%- endif -%}
     {%- set location = root_path ~ '/' ~ target_relation.schema ~ '/' ~ target_relation.identifier -%}
   {%- endif -%}
+  {{ return({'target': target_relation, 'tmp': tmp_relation, 'location': location}) }}
+{% endmacro %}
+
+
+{% macro duckrun__build_delta(model_sql, pre_hooks, post_hooks, is_incremental) %}
+
+  {%- set language = model['language'] -%}
+  {%- set p = duckrun__delta_paths() -%}
+  {%- set target_relation = p['target'] -%}
+  {%- set tmp_relation = p['tmp'] -%}
+  {%- set location = p['location'] -%}
 
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
 
-  {#-- Create the schema we actually write into. In attach mode that's the writable
-       staging schema in `memory`; the read-only delta_classic catalog must be left alone. --#}
-  {%- if attach_mode -%}
-    {%- do adapter.create_schema(tmp_relation) -%}
-  {%- else -%}
+  {#-- Create the schema we write into. For python the staging table (and its schema) was
+       already created in the materialization wrapper. --#}
+  {%- if language != 'python' -%}
     {%- do adapter.create_schema(target_relation) -%}
   {%- endif -%}
 
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
-  {#-- 1. Stage the model SQL as a DuckDB view so the plugin can read it as Arrow --#}
-  {% call statement('stage_model') -%}
-    create or replace view {{ tmp_relation }} as {{ model_sql }}
-  {%- endcall %}
+  {#-- 1. Stage the model SQL as a DuckDB view so the plugin can read it as Arrow.
+       (python models are already staged as a table by the materialization wrapper) --#}
+  {%- if language != 'python' -%}
+    {% call statement('stage_model') -%}
+      create or replace view {{ tmp_relation }} as {{ model_sql }}
+    {%- endcall %}
+  {%- endif -%}
 
-  {#-- Commit so the staging view is visible to the plugin's cursor (cross-cursor
+  {#-- Commit so the staging relation is visible to the plugin's cursor (cross-cursor
        isolation otherwise hides uncommitted DDL). --#}
   {{ adapter.commit() }}
 
@@ -77,34 +81,23 @@
   } -%}
   {% do adapter.store_relation('duckrun', tmp_relation, columns, location, 'delta', delta_config) %}
 
-  {#-- 3. Drop the staging view --#}
+  {#-- 3. Drop the staging relation (a table for python, a view for sql) --#}
   {% call statement('drop_stage') -%}
-    drop view if exists {{ tmp_relation }}
+    {% if language == 'python' %}drop table if exists {{ tmp_relation }}{% else %}drop view if exists {{ tmp_relation }}{% endif %}
   {%- endcall %}
 
-  {#-- 4. Surface the model relation.
-       - delta_scan mode: (re)create a delta_scan view as the model relation.
-       - attach mode: nothing to create — the read-only delta_classic catalog exposes the
-         table from <location> on every query (PIN_SNAPSHOT off => always latest). The
-         `main` statement is still required by dbt, so run a no-op. --#}
-  {%- if attach_mode -%}
-    {% call statement('main') -%}
-      select 1
-    {%- endcall %}
-  {%- else -%}
-    {% call statement('main') -%}
-      create or replace view {{ target_relation }} as
-        select * from delta_scan('{{ location }}')
-    {%- endcall %}
-  {%- endif -%}
+  {#-- 4. Surface the model relation as a delta_scan view over the freshly written Delta
+       table. A brand-new table becomes visible to the rest of the run right here. --#}
+  {% call statement('main') -%}
+    create or replace view {{ target_relation }} as
+      select * from delta_scan('{{ location }}')
+  {%- endcall %}
 
   {{ run_hooks(post_hooks, inside_transaction=True) }}
   {{ adapter.commit() }}
   {{ run_hooks(post_hooks, inside_transaction=False) }}
 
-  {%- if not attach_mode -%}
-    {% do persist_docs(target_relation, model) %}
-  {%- endif -%}
+  {% do persist_docs(target_relation, model) %}
 
   {{ return({'relations': [target_relation]}) }}
 

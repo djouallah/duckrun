@@ -17,10 +17,12 @@
   {%- set has_new_duids = true -%}
 {%- endif -%}
 
+{#-- Delta state is written by delta_rs and {{ this }} is a read-only delta_scan view, so we
+     can't DELETE+rebuild in place. dim_duid is small (a few CSVs), so materialize as a table:
+     delta_rs overwrites the whole dimension every run. is_incremental() is then always false,
+     so has_new_duids resolves true above and the full-rebuild branch below runs. --#}
 {{ config(
-    materialized='incremental',
-    on_schema_change='sync_all_columns',
-    pre_hook=["DELETE FROM " ~ this ~ " WHERE 1=1"] if (has_new_duids and is_incremental()) else []
+    materialized='table'
 ) }}
 
 -- Ensure download runs first by depending on stg_csv_archive_log
