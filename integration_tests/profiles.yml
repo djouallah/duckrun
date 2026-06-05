@@ -14,13 +14,3 @@ aemo_electricity:
       storage_options:
         bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"
         use_fabric_endpoint: "true"
-      # DuckDB read secret (delta_scan / glob over OneLake).
-      secrets:
-        - type: azure
-          name: onelake_storage
-          provider: access_token
-          access_token: "{{ env_var('ONELAKE_TOKEN') }}"
-      extensions:
-        - {name: delta, repo: community}
-        - azure
-        - httpfs

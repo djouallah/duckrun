@@ -49,14 +49,16 @@ class DuckrunAdapter(DuckDBAdapter):
         return self.connections.get_thread_connection().handle.cursor()
 
     def _discover_delta_relations(self, schema_relation):
-        """Discover Delta tables physically present under ``root_path/<schema>`` and surface
-        each as a ``delta_scan`` view named ``<db>.<schema>.<table>``.
+        """Discover Delta tables physically present under ``root_path/<schema>`` and return
+        them as relations so they land in dbt's relation cache.
 
         This is what makes the adapter stateless across processes: dbt rebuilds its relation
         cache at run start by calling list_relations_without_caching for every manifest
-        schema, even on a fresh in-memory DuckDB. Here we (a) recreate a view over each
-        existing Delta table so ``{{ this }}`` / ``ref()`` are queryable, and (b) return the
-        tables as relations so they land in the cache and ``is_incremental()`` is true.
+        schema, even on a fresh in-memory DuckDB. Returning a table-typed relation per Delta
+        table makes ``is_incremental()`` true on later runs. We deliberately do NOT create the
+        ``delta_scan`` views here: discovery runs during the before_run cache-population phase,
+        and views created on that connection don't survive to the model-run phase. The view is
+        (re)created in the materialization instead (pre-register {{ this }} + step-4 view).
         """
         root_path = getattr(self.config.credentials, "root_path", None)
         if not root_path:
@@ -78,34 +80,24 @@ class DuckrunAdapter(DuckDBAdapter):
             return []
 
         marker = "/_delta_log/"
-        seen = {}
+        names = []
         for (file_path,) in rows:
-            idx = file_path.find(marker)
+            # glob returns OS-native separators (backslashes on Windows); normalize so the
+            # marker match and table-name split work regardless of platform / store.
+            fp = file_path.replace("\\", "/")
+            idx = fp.find(marker)
             if idx == -1:
                 continue
-            location = file_path[:idx]
-            name = location.rsplit("/", 1)[-1]
-            if name and name not in seen:
-                seen[name] = location
+            name = fp[:idx].rsplit("/", 1)[-1]
+            if name and name not in names:
+                names.append(name)
 
-        relations = []
-        for name, location in seen.items():
-            rel = self.Relation.create(
+        return [
+            self.Relation.create(
                 database=database, schema=schema, identifier=name, type=RelationType.Table
             )
-            location_sql = location.replace("'", "''")
-            try:
-                cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {rel.without_identifier().render()}")
-                cursor.execute(
-                    f"CREATE OR REPLACE VIEW {rel.render()} AS "
-                    f"SELECT * FROM delta_scan('{location_sql}')"
-                )
-            except Exception:
-                # A table whose view can't be built (e.g. transient read error) is simply
-                # not advertised; dbt will treat it as not-existing.
-                continue
-            relations.append(rel)
-        return relations
+            for name in names
+        ]
 
     def list_relations_without_caching(self, schema_relation):
         try:

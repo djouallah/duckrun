@@ -63,7 +63,7 @@ what `is_incremental()` needs.)
 
 ## Design
 
-### 1. Run-start discovery → views + relation cache  (`impl.py`)
+### 1. Disk discovery → relation cache only  (`impl.py`)
 
 Replace the `delta_classic` override of `list_relations_without_caching` with disk-based
 discovery. dbt populates its relation cache at run start by calling
@@ -72,21 +72,15 @@ a fresh in-memory DuckDB). For each call:
 
 1. Compute `base = root_path/<schema_relation.schema>`.
 2. Enumerate Delta tables via DuckDB `glob` on the adapter's connection (works for local,
-   OneLake/abfss, S3 — the azure secret/httpfs are already configured for `delta_scan`):
+   OneLake/abfss, S3 — azure autoloads and the plugin's secret is already configured):
    ```sql
    SELECT DISTINCT file FROM glob('<base>/*/_delta_log/*.json')
    ```
-   Derive the table name as the path segment immediately before `/_delta_log/`, and the
-   table `location` as everything before `/_delta_log/`. (Use `*.json` — every committed
-   table has at least one commit log; `00…0.json` is unreliable after `cleanup_metadata()`.
-   If single-`*` globbing misbehaves on abfss, fall back to `**`.)
-3. For each discovered table, in the same DuckDB connection:
-   ```sql
-   CREATE SCHEMA IF NOT EXISTS "<db>"."<schema>";
-   CREATE OR REPLACE VIEW "<db>"."<schema>"."<name>" AS
-     SELECT * FROM delta_scan('<location>');
-   ```
-4. Return relations built with `self.Relation.create(database=<db>, schema=<schema>,
+   `*` matches one segment (the table dir); use `*.json` (a table always has ≥1 commit log;
+   `00…0.json` is unreliable after `cleanup_metadata()`). **Normalize separators**: `glob`
+   returns OS-native paths (backslashes on Windows), so `replace("\\","/")` before splitting
+   on `/_delta_log/` to get the table name (last segment before the marker).
+3. Return relations built with `self.Relation.create(database=<db>, schema=<schema>,
    identifier=<name>, type=RelationType.Table)` merged (de-duped) with `super()`'s result.
 
    **Type must be `Table`**: dbt-core's `is_incremental()` requires
@@ -94,22 +88,29 @@ a fresh in-memory DuckDB). For each call:
    table so `is_incremental()` is true on the 2nd run. Use `db`/`schema` from
    `schema_relation` (no hardcoded `lake`).
 
-Net effect: at run start every existing Delta table becomes a queryable view *and* lands in
-dbt's cache, so `{{ this }}`, `ref()`, and `is_incremental()` all work in a fresh process —
-without any attach. Guard: if `root_path` is unset or `glob` finds nothing, return
-`super()`'s result unchanged.
+**Discovery does NOT create views.** dbt runs `list_relations_without_caching` during the
+`before_run` cache-population phase; views created on that connection do **not** survive to
+the model-run phase (confirmed empirically — the view is created and queryable at discovery
+time but gone when the model runs). So discovery only feeds dbt's Python relation cache
+(making `is_incremental()` true); the physical `delta_scan` view is created in the
+materialization instead (step 2). Guard: if `root_path` is unset or `glob` finds nothing,
+return `super()`'s result unchanged.
 
-### 2. Materialization: one code path, view-after-write  (`_delta_core.sql`)
+### 2. Materialization: pre-register `{{ this }}`, then view-after-write  (`_delta_core.sql`)
 
 Strip the attach branches; there is now a single flow:
 
 - `duckrun__delta_paths()`: drop `attach_mode`; `stage_db` is always
   `target_relation.database`. Keep the deterministic `location`.
 - `duckrun__build_delta()`:
-  - Drop `is_new_delta`, `refresh_delta_attach()`, and the `attach_mode` create-schema /
-    `select 1` branches.
-  - Always `create_schema(target_relation)`, stage the model as a view, hand off to the
-    delta_rs plugin (unchanged), drop the staging view.
+  - **Pre-register `{{ this }}`** at the very top, *before* `run_hooks`: when
+    `adapter.delta_table_exists(location)`, `create_schema(target_relation)` and
+    `create or replace view {{ this }} as select * from delta_scan('<location>')`. This runs
+    on the stable run-phase connection, so pre-hooks and the model's own SQL
+    (`is_incremental()` self-reference, e.g. `… NOT IN (SELECT … FROM {{ this }})`) resolve.
+  - Drop `is_new_delta`, `refresh_delta_attach()`, and the `attach_mode` branches.
+  - `create_schema(target_relation)`, stage the model as a view, hand off to the delta_rs
+    plugin (unchanged), drop the staging view.
   - **Step 4 (`main`) is always:**
     ```sql
     create or replace view {{ target_relation }} as
@@ -117,10 +118,11 @@ Strip the attach branches; there is now a single flow:
     ```
   - Always `persist_docs`.
 
-A newly created table is now just a `CREATE OR REPLACE VIEW` at the end of its own
-materialization — immediately visible to every downstream `ref()` in the same run. `{{ this }}`
-for an incremental model is already a view from step-1 run-start discovery, so its model SQL
-(e.g. `SELECT … FROM {{ this }}`) resolves.
+A newly created table is just a `CREATE OR REPLACE VIEW` at the end of its own
+materialization — immediately visible to every downstream `ref()` in the same run (the
+run-phase connection is stable across models). Cross-process `{{ this }}` works via the
+pre-register step above. (Refs to a Delta table that exists on disk but is *not* built in the
+current run are not auto-registered — do a full/`+upstream` build, the normal dbt workflow.)
 
 `table.sql`, `incremental.sql`, `delta.sql` wrappers are unchanged except that they keep
 calling `duckrun__build_delta(...)`.
@@ -134,9 +136,14 @@ calling `duckrun__build_delta(...)`.
 - **`credentials.py`**: delete the `delta_attach` property; drop `"delta_attach"` from
   `_connection_keys`; keep `root_path`, `storage_options`, plugin auto-registration.
 - **`integration_tests/profiles.yml`**: remove `database: lake`, the `delta_classic`
-  extension entry, and the entire `attach:` block. Keep `root_path`, `storage_options`,
-  the azure `secrets:` entry, and `extensions: [delta, azure, httpfs]`. Let `database`
-  default (in-memory); discovery uses `schema_relation.database`, so naming stays consistent.
+  extension entry, and the entire `attach:` block. Keep only `root_path` + `storage_options`
+  (`bearer_token` + `use_fabric_endpoint`). No explicit `extensions:`/`secrets:` blocks are
+  needed: the plugin runs `INSTALL delta; LOAD delta;` and creates the azure secret from
+  `storage_options.bearer_token`, and azure autoloads. (An explicit
+  `extensions: [{name: delta, repo: community}]` actually *breaks* — `delta` is already
+  installed from the core repo, so re-installing from community errors with "origin is
+  different".) Let `database` default (in-memory); discovery uses `schema_relation.database`,
+  so naming stays consistent.
 - **`.github/workflows/integration.yml`**: update the second-pass step comment (no longer
   "delta_classic attach exposes state" → "delta_scan views rebuilt from disk expose state").
 
@@ -173,16 +180,28 @@ unchanged.)
 
 ## Verification
 
-Per the global workflow: push to the **fork** branch and let **fork CI**
-(`.github/workflows/integration.yml`) run — do not build/test locally.
+**Local smoke test (no OneLake creds needed):** point `root_path` at a local dir and build
+the offline-capable `dim_calendar` model (incremental, `delete+insert`, `unique_key=date`,
+no external data) twice in separate processes:
 
-The CI two-pass `dbt build --exclude tag:heavy` is the end-to-end test:
+```
+WAREHOUSE_PATH=<localdir> FILES_PATH=dummy ONELAKE_TOKEN=dummy DBT_SCHEMA=mart \
+  dbt build --select dim_calendar --project-dir integration_tests --profiles-dir integration_tests
+```
+
+Confirmed: pass 1 creates the table (delta_rs overwrite) + a `delta_scan` view; pass 2 (fresh
+process) discovers it from disk → `is_incremental()` true (compiled SQL contains
+`WHERE date NOT IN (SELECT date FROM …dim_calendar)`) → `{{ this }}` pre-registered → merge
+runs idempotently (3197 rows / 3197 distinct dates, no dupes). `not_null`/`unique` tests pass.
+
+**Full CI (`.github/workflows/integration.yml`):** two-pass `dbt build --exclude tag:heavy`
+against OneLake:
 
 1. **Pass 1 (empty store):** discovery finds nothing → `is_incremental()` false → delta_rs
    overwrites; each model ends as a `delta_scan` view. New tables created earlier in the run
    are visible to later models (the bug we're fixing).
-2. **Pass 2 (fresh process, populated store):** run-start discovery rebuilds views for all
-   existing Delta tables and caches them as `table`s → `is_incremental()` true; `{{ this }}`
+2. **Pass 2 (fresh process, populated store):** disk discovery caches existing tables as
+   `table`s → `is_incremental()` true; the materialization pre-registers `{{ this }}` so it
    reads current state; incremental models `merge`/`append` via delta_rs.
 
 Green on both passes — with no `delta_classic`, no `refresh_delta_attach`, and no

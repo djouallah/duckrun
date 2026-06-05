@@ -45,6 +45,18 @@
   {%- set tmp_relation = p['tmp'] -%}
   {%- set location = p['location'] -%}
 
+  {#-- Pre-register {{ this }} as a delta_scan view when the Delta table already exists on
+       disk, so pre-hooks and the model's own SQL (is_incremental self-reference) can read the
+       current state. Disk discovery already reports the relation as existing in dbt's cache
+       (so is_incremental() is true); this creates the matching physical view on the run-phase
+       connection (views created during cache population don't survive to model run). --#}
+  {%- if adapter.delta_table_exists(location) -%}
+    {%- do adapter.create_schema(target_relation) -%}
+    {% call statement('register_this') -%}
+      create or replace view {{ target_relation }} as select * from delta_scan('{{ location }}')
+    {%- endcall %}
+  {%- endif -%}
+
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
 
   {#-- Create the schema we write into. For python the staging table (and its schema) was
