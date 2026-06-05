@@ -9,8 +9,7 @@
 It is a thin wrapper around [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb). You
 keep everything dbt-duckdb gives you — views, seeds, sources, tests, snapshots, the full
 plugin ecosystem — and gain one extra thing: a Delta-backed `table` / `incremental`
-materialization that writes real Delta tables, with ZSTD compression and row-group
-sizing tuned for Power BI / DirectLake.
+materialization that writes real Delta tables
 
 > ### Why a separate adapter instead of a PR to dbt-duckdb?
 >
