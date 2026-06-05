@@ -16,6 +16,16 @@ from dbt.adapters.duckrun.credentials import DuckrunCredentials
 class DuckrunConnectionManager(DuckDBConnectionManager):
     TYPE = "duckrun"
 
+    @classmethod
+    def open(cls, connection):
+        # dbt-duckdb stores its singleton Environment on whichever class `open` is
+        # invoked on. adapter.store_relation() looks it up via the *base* class
+        # (DuckDBConnectionManager.env()), so delegate to the base to keep _ENV there,
+        # then mirror it onto this subclass for any instance-level lookups.
+        handle = DuckDBConnectionManager.open(connection)
+        DuckrunConnectionManager._ENV = DuckDBConnectionManager._ENV
+        return handle
+
 
 class DuckrunAdapter(DuckDBAdapter):
     ConnectionManager = DuckrunConnectionManager
