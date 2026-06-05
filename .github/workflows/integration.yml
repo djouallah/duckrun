@@ -1,0 +1,47 @@
+name: integration
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: integration_tests
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
+        working-directory: ${{ github.workspace }}
+        run: pip install -e .
+
+      - name: dbt --version (adapter registered + dependency macros loaded)
+        run: dbt --version
+
+      - name: dbt seed
+        run: dbt seed
+
+      - name: dbt run (view + delta + incremental first run = overwrite)
+        run: dbt run
+
+      - name: dbt test
+        run: dbt test
+
+      - name: dbt run incremental again (exercises delta merge on unique_key)
+        run: dbt run --select orders_incr
+
+      - name: Assert Delta tables were materialized
+        run: |
+          test -d warehouse/main/orders_delta/_delta_log
+          test -d warehouse/main/orders_incr/_delta_log
+          echo "Delta tables present."

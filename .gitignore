@@ -51,6 +51,13 @@ tests/*/
 # Ignore CSV files
 *.csv
 
-# Confidential test files
-tests/*.*
-tests/*.parquet
+# But DO keep integration test fixtures and dbt project files
+!integration_tests/**/*.csv
+!integration_tests/**/*.yml
+!integration_tests/**/*.json
+
+# Delta output and dbt artifacts produced by the integration tests (runtime)
+integration_tests/warehouse/
+integration_tests/target/
+integration_tests/dbt_packages/
+integration_tests/logs/

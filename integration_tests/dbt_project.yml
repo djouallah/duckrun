@@ -1,0 +1,16 @@
+name: 'duckrun_integration'
+version: '1.0'
+config-version: 2
+
+profile: 'duckrun_integration'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+
+seeds:
+  duckrun_integration:
+    +quote_columns: false
+
+models:
+  duckrun_integration:
+    +materialized: view

@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.2.26"
-description = "Helper library for Fabric Python using duckdb, arrow and delta_rs (orchestration, queries, etc.)"
+version = "0.1.0"
+description = "A dbt adapter that runs SQL in DuckDB and materializes to Delta Lake (delta_rs)."
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -13,15 +13,8 @@ authors = [
 ]
 requires-python = ">=3.9"
 dependencies = [
-    "duckdb>=1.2.0",
-    "deltalake<=0.18.2",
-    "requests>=2.28.0",
-    "obstore>=0.2.0"
-]
-
-[project.optional-dependencies]
-local = [
-    "azure-identity>=1.12.0"
+    "dbt-duckdb>=1.8",
+    "deltalake",
 ]
 
 [project.urls]
@@ -29,8 +22,10 @@ Homepage = "https://github.com/djouallah/duckrun"
 Repository = "https://github.com/djouallah/duckrun"
 Issues = "https://github.com/djouallah/duckrun/issues"
 
-[tool.setuptools]
-packages = ["duckrun"]
+[tool.setuptools.packages.find]
+# dbt uses PEP 420 namespace packages under dbt/adapters and dbt/include.
+include = ["dbt", "dbt.*"]
+namespaces = true
 
 [tool.setuptools.package-data]
-duckrun = ["py.typed"]
+"dbt.include.duckrun" = ["dbt_project.yml", "**/*.sql", "**/*.yml"]

@@ -1,0 +1,10 @@
+duckrun_integration:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      path: ':memory:'
+      threads: 1
+      # Default Delta location for models that don't set config(location=...).
+      root_path: "{{ env_var('DBT_DELTA_ROOT', './warehouse') }}"
+      # storage_options: {}   # only needed for remote stores (abfss/s3/gs)
