@@ -39,7 +39,7 @@ my_project:
   outputs:
     dev:
       type: duckrun
-      path: ':memory:'          # or a .duckdb file
+      # DuckDB runs in-memory by default — the Delta tables are the only state.
       # Default Delta location for models that don't set config(location=...)
       root_path: './warehouse'  # local path, or abfss://.../Tables, s3://..., gs://...
       # storage_options: {}     # passed through to deltalake for remote stores

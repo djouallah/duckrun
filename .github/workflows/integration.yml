@@ -28,20 +28,15 @@ jobs:
       - name: dbt --version (adapter registered + dependency macros loaded)
         run: dbt --version
 
-      - name: dbt seed
-        run: dbt seed
+      - name: dbt build (stateless, in-memory; first run overwrites Delta)
+        run: dbt build
 
-      - name: dbt run (view + delta + incremental first run = overwrite)
-        run: dbt run
+      - name: dbt build again (new process; orders_incr exercises delta merge)
+        run: dbt build
 
-      - name: dbt test
-        run: dbt test
-
-      - name: dbt run incremental again (exercises delta merge on unique_key)
-        run: dbt run --select orders_incr
-
-      - name: Assert Delta tables were materialized
+      - name: Assert Delta tables exist and no DuckDB state file was created
         run: |
           test -d warehouse/main/orders_delta/_delta_log
           test -d warehouse/main/orders_incr/_delta_log
-          echo "Delta tables present."
+          ! ls *.duckdb 2>/dev/null
+          echo "Delta tables present; no DuckDB file (stateless)."

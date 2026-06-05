@@ -64,5 +64,3 @@ integration_tests/warehouse/
 integration_tests/target/
 integration_tests/dbt_packages/
 integration_tests/logs/
-integration_tests/*.duckdb
-integration_tests/*.duckdb.wal
