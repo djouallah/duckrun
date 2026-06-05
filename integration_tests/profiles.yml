@@ -3,7 +3,9 @@ duckrun_integration:
   outputs:
     dev:
       type: duckrun
-      path: ':memory:'
+      # A persistent file (not :memory:) so seeds/models survive across separate
+      # dbt invocations (e.g. the second incremental run below).
+      path: 'dev.duckdb'
       threads: 1
       # Default Delta location for models that don't set config(location=...).
       root_path: "{{ env_var('DBT_DELTA_ROOT', './warehouse') }}"
