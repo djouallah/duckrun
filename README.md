@@ -3,25 +3,39 @@
 [![PyPI version](https://badge.fury.io/py/duckrun.svg)](https://badge.fury.io/py/duckrun)
 
 **duckrun** is a [dbt](https://www.getdbt.com/) adapter that runs your model SQL in
-**DuckDB** and materializes the results to **Delta Lake** using
+**DuckDB** and writes the results to **Delta Lake** using
 [`delta_rs`](https://delta-io.github.io/delta-rs/) (the `deltalake` Python package).
 
-It is a thin layer on top of [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb): you
-get everything dbt-duckdb offers (views, seeds, sources, tests, snapshots, the full
-plugin ecosystem) **plus** a `delta` materialization that writes real Delta tables —
-the one thing dbt-duckdb doesn't do out of the box. Delta writes use ZSTD compression
-and row-group sizing tuned for Power BI / DirectLake.
+It is a thin wrapper around [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb). You
+keep everything dbt-duckdb gives you — views, seeds, sources, tests, snapshots, the full
+plugin ecosystem — and gain one extra thing: a Delta-backed `table` / `incremental`
+materialization that writes real Delta tables, with ZSTD compression and row-group
+sizing tuned for Power BI / DirectLake.
 
-> **0.3.0 is a breaking change.** Versions ≤ 0.2.x of `duckrun` were a Microsoft
-> Fabric/OneLake helper library; from **0.3.0** onward `duckrun` is a dbt adapter.
-> Need the old library? Pin `pip install "duckrun<0.3"`, or use the
+> ### Why a separate adapter instead of a PR to dbt-duckdb?
+>
+> Writing Delta with delta_rs needs the `deltalake` package. dbt-duckdb deliberately
+> keeps a minimal dependency footprint and avoids external dependencies like this — for
+> very good reasons — so this doesn't belong upstream. duckrun keeps it isolated here
+> instead.
+>
+> It's also meant to be a **temporary workaround**: DuckDB is gaining native Delta
+> *write* support, and once that matures the delta_rs hop should no longer be needed.
+> Until then, this adapter fills the gap.
+
+> ### 0.3.0 is a breaking change
+>
+> Versions ≤ 0.2.x of `duckrun` were a Microsoft Fabric / OneLake helper library. From
+> **0.3.0** onward `duckrun` is a dbt adapter. Need the old library? Pin
+> `pip install "duckrun<0.3"`, or use the
 > [`legacy`](https://github.com/djouallah/duckrun/tree/legacy) branch.
 
-## Why
+## How it fits together
 
-DuckDB is a fantastic query engine; Delta Lake is a great open table format. dbt is the
-right tool to orchestrate the DAG. `duckrun` simply wires the three together: **DuckDB
-executes, delta_rs materializes, dbt orchestrates.**
+DuckDB is a great query engine, Delta Lake is a great open table format, and dbt is the
+right tool to orchestrate the DAG. duckrun wires the three together:
+
+> **DuckDB executes · delta_rs materializes · dbt orchestrates.**
 
 ## Install
 
@@ -29,7 +43,7 @@ executes, delta_rs materializes, dbt orchestrates.**
 pip install duckrun
 ```
 
-That single install pulls `dbt-duckdb` (and therefore `duckdb`) and `deltalake`.
+That single install pulls in `dbt-duckdb` (and therefore `duckdb`) plus `deltalake`.
 
 ## Configure your profile
 
@@ -41,20 +55,23 @@ my_project:
     dev:
       type: duckrun
       # DuckDB runs in-memory by default — the Delta tables are the only state.
-      # Default Delta location for models that don't set config(location=...)
-      root_path: './warehouse'  # local path, or abfss://.../Tables, s3://..., gs://...
-      # storage_options: {}     # passed through to deltalake for remote stores
+      # Default Delta location for models that don't set config(location=...).
+      root_path: './warehouse'   # local path, or abfss://.../Tables, s3://..., gs://...
+      # storage_options: {}      # passed through to deltalake for remote stores
 ```
 
-In a notebook where the storage secret is already provided to DuckDB, leave
-`storage_options` empty.
+Persisted models are written to `<root_path>/<schema>/<model>` (e.g.
+`./warehouse/dbo/orders`), or to an explicit `config(location=...)`.
 
-### Remote stores (Microsoft Fabric OneLake / ADLS / S3 / GCS)
+### Remote stores (Fabric OneLake / ADLS / S3 / GCS)
 
-Point `root_path` at the warehouse location and pass credentials via `storage_options`
-— these flow straight to deltalake for writes/merges. If `storage_options` carries a
-`bearer_token` (or `token` / `access_token`), the adapter also auto-creates a matching
-DuckDB Azure secret so `delta_scan()` reads work, no extra config.
+Point `root_path` at the warehouse location and pass credentials through
+`storage_options` — these flow straight to deltalake for writes and merges.
+
+If `storage_options` carries a `bearer_token` (or `token` / `access_token`), the adapter
+also auto-creates a matching DuckDB Azure secret, so `delta_scan()` reads work with no
+extra config. In a notebook where the storage secret is already provided to DuckDB, you
+can leave `storage_options` empty.
 
 ```yaml
     onelake:
@@ -62,26 +79,25 @@ DuckDB Azure secret so `delta_scan()` reads work, no extra config.
       schema: dbo
       root_path: "abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>.Lakehouse/Tables"
       storage_options:
-        bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"   # az account get-access-token --resource https://storage.azure.com
+        # az account get-access-token --resource https://storage.azure.com
+        bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"
 ```
 
-Tables are written as `root_path/<schema>/<model>` (e.g. `…/Tables/dbo/orders`).
 Verified end-to-end against real Fabric OneLake: `table` overwrite, `incremental` merge,
-and `delta_scan` reads/tests.
+and `delta_scan` reads / tests.
 
 ## Materializations
 
-| materialized | backed by | notes |
-|---|---|---|
-| **`table`** | Delta (overwrite) | DuckDB runs the SQL, delta_rs writes the table fresh each run. |
-| **`incremental`** | Delta (merge / append) | First run overwrites; later runs apply `incremental_strategy`. |
-| `view` | in-memory DuckDB | Ephemeral staging within a run (inherited from dbt-duckdb). |
-| `seed` | in-memory DuckDB | CSV fixtures (inherited). |
-| `delta` | Delta | Alias for `table`; honors `incremental=true`. Kept for convenience. |
+| materialized      | backed by                | notes                                                                 |
+|-------------------|--------------------------|-----------------------------------------------------------------------|
+| **`table`**       | Delta (overwrite)        | DuckDB runs the SQL; delta_rs writes the table fresh each run.         |
+| **`incremental`** | Delta (merge / append)   | First run overwrites; later runs apply `incremental_strategy`.         |
+| `view`            | in-memory DuckDB         | Ephemeral staging within a run (inherited from dbt-duckdb).            |
+| `seed`            | in-memory DuckDB         | CSV fixtures (inherited from dbt-duckdb).                              |
+| `delta`           | Delta                    | Alias for `table`; honors `incremental=true`. Kept for convenience.   |
 
-The persisted materializations (`table`, `incremental`, `delta`) write to
-`<root_path>/<schema>/<model>` by default, or to `config(location=...)`, and register a
-`delta_scan` view so downstream `ref()` works.
+The persisted materializations (`table`, `incremental`, `delta`) register a `delta_scan`
+view over the new Delta table, so downstream `ref()` works.
 
 ### `table`
 
@@ -105,16 +121,16 @@ select * from {{ ref('stg_orders') }}
 {% endif %}
 ```
 
-First run (or `--full-refresh`, or missing table) overwrites. Later runs apply
+The first run (or `--full-refresh`, or a missing table) overwrites. Later runs apply the
 `incremental_strategy`:
 
-| `incremental_strategy` | behavior | requires |
-|---|---|---|
-| `merge` (default w/ `unique_key`) | upsert — update matched, insert new | `unique_key` |
-| `insert` | insert only new keys (idempotent append / dedupe) | `unique_key` |
-| `append` (default w/o `unique_key`) | blind append | — |
+| `incremental_strategy`             | behavior                                  | requires     |
+|------------------------------------|-------------------------------------------|--------------|
+| `merge` (default with `unique_key`) | upsert — update matched, insert new       | `unique_key` |
+| `insert`                           | insert only new keys (idempotent append)  | `unique_key` |
+| `append` (default without `unique_key`) | blind append                          | —            |
 
-### Config options (table / incremental / delta)
+### Config options (`table` / `incremental` / `delta`)
 
 | option                 | description                                              |
 |------------------------|----------------------------------------------------------|
@@ -141,19 +157,19 @@ sources:
 
 1. dbt compiles your model SQL.
 2. The materialization stages it as a DuckDB view.
-3. A `dbt-duckdb` plugin (`store()` hook) hands that relation to deltalake via the Arrow
-   C-stream interface (`__arrow_c_stream__`) — no pyarrow — which `write_deltalake` /
-   `DeltaTable.merge` consume natively.
+3. A `dbt-duckdb` plugin (a `store()` hook) hands that relation to deltalake over the
+   Arrow C-stream interface (`__arrow_c_stream__`) — no pyarrow required — which
+   `write_deltalake` / `DeltaTable.merge` consume natively.
 4. The model relation becomes a `delta_scan` view over the new Delta table.
 
 The adapter is a thin subclass of dbt-duckdb declaring `dependencies=['duckdb']`, so
-`view`, `seed`, tests, etc. are inherited directly; `table` and `incremental` are
-overridden to write Delta.
+`view`, `seed`, tests, and the rest are inherited directly; only `table` and
+`incremental` are overridden to write Delta.
 
 ## Development
 
 The `integration_tests/` directory is a small dbt project exercised by CI
-(`.github/workflows/integration.yml`): `dbt build` (twice) against a local Delta
+(`.github/workflows/integration.yml`): `dbt build` runs twice against a local Delta
 `./warehouse` — a seed, a `view`, a `table`, and an `incremental` model — where the
 second build exercises the incremental merge. Verified to run with **pyarrow not
 installed**, on the minimum supported `duckdb` and `deltalake`.
