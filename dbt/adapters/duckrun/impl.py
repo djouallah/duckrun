@@ -12,6 +12,7 @@ from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
 from dbt.adapters.duckdb.impl import DuckDBAdapter
 
+from dbt.adapters.duckrun import remote
 from dbt.adapters.duckrun import secret
 from dbt.adapters.duckrun.credentials import DuckrunCredentials
 
@@ -105,12 +106,39 @@ class DuckrunAdapter(DuckDBAdapter):
 
         schema = schema_relation.schema
         database = schema_relation.database
-        base = root_path.rstrip("/") + "/" + str(schema).strip('"')
 
+        # OneLake (abfss://) can't be listed with DuckDB glob (duckdb/duckdb-azure#174), so
+        # enumerate table directories with the OneLake DFS REST API; local / az:// stores use
+        # DuckDB glob, which works there.
+        if remote.is_abfss(root_path):
+            names = self._discover_via_rest(root_path, schema)
+        else:
+            names = self._discover_via_glob(root_path, schema)
+
+        return [
+            self.Relation.create(
+                database=database, schema=schema, identifier=name, type=RelationType.Table
+            )
+            for name in names
+        ]
+
+    def _discover_via_rest(self, root_path, schema):
+        """Table names under ``<root_path>/<schema>`` on a OneLake/ADLS store, via REST."""
+        so = getattr(self.config.credentials, "storage_options", None)
+        try:
+            return remote.list_delta_tables(root_path, str(schema).strip('"'), so)
+        except Exception as exc:
+            # Don't let a listing failure masquerade as "no Delta tables" — that silently
+            # surfaces downstream as "schema does not exist" for every model. Log (debug) so
+            # an empty remote discovery is visible, then fall back to the in-memory catalog.
+            logger.debug(f"duckrun: OneLake table listing failed under {root_path}/{schema}: {exc}")
+            return []
+
+    def _discover_via_glob(self, root_path, schema):
+        """Table names under ``<root_path>/<schema>`` on a local / az:// store, via DuckDB glob."""
+        base = root_path.rstrip("/") + "/" + str(schema).strip('"')
         cursor = self._cursor()
-        # A remote store (abfss:// OneLake) needs its Azure secret on the connection before
-        # the glob can authenticate; mint it here so read-only commands, which materialize
-        # nothing, don't glob an unauthenticated store and come back empty.
+        # az:// needs its Azure secret on the connection before the glob can authenticate.
         self._ensure_remote_secret(cursor)
         # `*` matches one path segment (the table dir); every committed Delta table has at
         # least one commit json (00..0.json is unreliable after cleanup_metadata()).
@@ -120,9 +148,6 @@ class DuckrunAdapter(DuckDBAdapter):
                 f"SELECT DISTINCT file FROM glob('{pattern}')"
             ).fetchall()
         except Exception as exc:
-            # Don't let a glob failure masquerade as "no Delta tables" — that silently
-            # surfaces downstream as "schema does not exist" for every model. Log it (debug)
-            # so an empty remote discovery is visible, then fall back to the in-memory catalog.
             logger.debug(f"duckrun: Delta relation discovery glob failed for {pattern!r}: {exc}")
             return []
 
@@ -138,13 +163,7 @@ class DuckrunAdapter(DuckDBAdapter):
             name = fp[:idx].rsplit("/", 1)[-1]
             if name and name not in names:
                 names.append(name)
-
-        return [
-            self.Relation.create(
-                database=database, schema=schema, identifier=name, type=RelationType.Table
-            )
-            for name in names
-        ]
+        return names
 
     def _register_delta_view(self, relation):
         """Create the ``delta_scan`` view for a discovered Delta relation on the live

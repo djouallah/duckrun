@@ -45,17 +45,6 @@ def ensure_azure_secret(conn, storage_options: Optional[Dict[str, str]]) -> bool
     if not token:
         return False
     conn.execute("INSTALL azure; LOAD azure;")
-    # OneLake/ADLS directory listing (DuckDB glob, used by relation discovery) goes through
-    # the blob endpoint, and the azure extension's default transport fails the TLS handshake
-    # there on some hosts ("Problem with the SSL CA cert"). The curl transport respects the
-    # system CA bundle. This must be set at connection-open: discovery globs the store before
-    # any dbt on-run-start `SET` hook runs, so relying on the hook leaves discovery (and thus
-    # read-only commands) globbing with the broken transport → empty → "schema does not exist".
-    transport = (storage_options or {}).get("azure_transport_option_type", "curl")
-    try:
-        conn.execute(f"SET GLOBAL azure_transport_option_type='{transport}'")
-    except Exception:
-        pass  # older azure extensions may not expose this knob; the default may still work
     conn.execute(
         f"CREATE OR REPLACE SECRET {SECRET_NAME} "
         f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}')"
