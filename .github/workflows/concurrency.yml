@@ -5,10 +5,9 @@ name: concurrency
 # HEAD-at-merge-start, not the version an earlier read observed (read -> concurrent DELETE
 # -> MERGE commits cleanly, no error). See tests/test_concurrency*.py.
 
+# Manual only — this is a demonstration of OCC semantics, not a regression gate. Run it
+# from the Actions tab when you want to make the point; it never triggers on code changes.
 on:
-  push:
-    branches: ["**"]
-  pull_request:
   workflow_dispatch:
 
 jobs:
