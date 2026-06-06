@@ -37,6 +37,10 @@ jobs:
       DBT_SCHEMA: mart
       download_limit: "1"
       process_limit: "1000"
+      # DuckDB azure extension's default transport fails the TLS handshake to the OneLake
+      # blob endpoint on the runner ("Problem with the SSL CA cert"); the curl transport
+      # respects the system CA bundle. Read by the on-run-start hook in dbt_project.yml.
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
 
