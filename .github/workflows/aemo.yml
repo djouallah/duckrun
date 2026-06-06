@@ -12,31 +12,31 @@ permissions:
   pages: write
   id-token: write
 
-# Don't let concurrent runs race the single Pages deployment.
+# Serialize across branches: the job writes a single shared OneLake lakehouse (and there is
+# one Pages deployment), so concurrent runs would race each other's Delta tables / files.
 concurrency:
-  group: pages
+  group: aemo-onelake
   cancel-in-progress: false
 
 jobs:
-  azurite:
+  onelake:
     runs-on: ubuntu-latest
-    # Azure Storage emulator: exercises the az:// path (delta_rs object_store emulator +
-    # DuckDB azure delta_scan/glob/COPY) without any real cloud creds. This is a superset of a
-    # plain local-filesystem run, so CI runs only this; the local-path case is what you verify
-    # on your laptop. Azurite is started via `docker run` (not a service container) so we can
-    # pass --skipApiVersionCheck, which the runner's newer az CLI requires.
+    # Real Microsoft Fabric OneLake over abfss://. This exercises the production read path
+    # end to end: delta_rs writes to OneLake, and DuckDB's azure extension reads/globs/COPYs
+    # through an ACCESS_TOKEN secret minted from the bearer_token in storage_options. It covers
+    # the bit that only breaks on a real bearer-token store: discovery globbing abfss:// for
+    # read-only commands needs the secret created at connection-open (there's no profile
+    # `secrets:` block for OneLake, only the bearer_token) — see the dbt test step.
     defaults:
       run:
         working-directory: integration_tests
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests
-      WAREHOUSE_PATH: az://lake/Tables
-      FILES_PATH: az://lake/Files
+      WAREHOUSE_PATH: abfss://duckrun@onelake.dfs.fabric.microsoft.com/dev.Lakehouse/Tables
+      FILES_PATH: abfss://duckrun@onelake.dfs.fabric.microsoft.com/dev.Lakehouse/Files
       DBT_SCHEMA: mart
-      download_limit: "2"
+      download_limit: "1"
       process_limit: "1000"
-      # Azurite's public well-known dev account/key (not a secret).
-      AZURITE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
     steps:
       - uses: actions/checkout@v4
 
@@ -48,33 +48,39 @@ jobs:
         working-directory: ${{ github.workspace }}
         run: pip install -e .
 
-      - name: Start Azurite (blob; skip API-version check for newer az CLI)
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Acquire a fresh OneLake bearer token
+        # Bearer tokens last ~1h, so mint one per run rather than storing a stale token.
+        # OneLake authenticates with Azure Storage AAD tokens (resource storage.azure.com).
         run: |
-          docker run -d --name azurite -p 10000:10000 \
-            mcr.microsoft.com/azure-storage/azurite \
-            azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck
-          for i in $(seq 1 30); do
-            curl -s -o /dev/null "http://127.0.0.1:10000/devstoreaccount1" && break || sleep 1
-          done
+          TOKEN=$(az account get-access-token \
+            --resource https://storage.azure.com/ \
+            --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
-      - name: Create Azurite blob container
-        run: az storage container create --name lake --connection-string "$AZURITE_CONNECTION_STRING"
+      - name: dbt build (first pass — OneLake, creates Delta tables over abfss://)
+        run: dbt build --target dev --exclude tag:heavy
 
-      - name: dbt build (first pass — Azurite, creates Delta tables over az://)
-        run: dbt build --target azurite --exclude tag:heavy
+      - name: dbt build again (second pass — OneLake, delta_scan discovery + merge)
+        run: dbt build --target dev --exclude tag:heavy
 
-      - name: dbt build again (second pass — Azurite, delta_scan discovery + merge)
-        run: dbt build --target azurite --exclude tag:heavy
+      - name: dbt test (fresh process — read-only delta_scan registration over abfss://)
+        # A standalone `dbt test` materializes nothing, so it can only pass if the adapter
+        # re-registers every Delta table on disk as a delta_scan view at run start. On a real
+        # OneLake target that discovery glob needs the Azure secret created at connection-open
+        # (there is no profile `secrets:` block for it, only the bearer_token) — this step is
+        # the regression gate for the "schema does not exist" bug on the abfss:// read path.
+        run: dbt test --target dev --exclude tag:heavy
 
-      - name: dbt test (fresh process — read-only delta_scan registration over az://)
-        # A standalone `dbt test` materializes nothing, so unlike the in-process tests inside
-        # `dbt build` above it can only pass if the adapter re-registers every Delta table on
-        # disk as a delta_scan view at run start (read-only commands populate the cache but run
-        # no model). This step is the regression gate for that cross-process read path.
-        run: dbt test --target azurite --exclude tag:heavy
-
-      - name: dbt docs generate (Azurite — catalog over az:// Delta tables)
-        run: dbt docs generate --target azurite
+      - name: dbt docs generate (OneLake — catalog over abfss:// Delta tables)
+        run: dbt docs generate --target dev
 
       - name: Collect the static docs site (index.html + manifest + catalog)
         run: |
@@ -97,7 +103,7 @@ jobs:
 
   deploy-docs:
     # Publish the generated dbt docs to GitHub Pages (main only).
-    needs: azurite
+    needs: onelake
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:

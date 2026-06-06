@@ -12,6 +12,7 @@ from dbt.adapters.duckdb.plugins import BasePlugin
 from dbt.adapters.duckdb.utils import SourceConfig, TargetConfig
 
 from . import engine
+from . import secret
 
 try:  # raise on_schema_change='fail' as a dbt compilation error (matches dbt semantics)
     from dbt_common.exceptions import CompilationError
@@ -42,20 +43,14 @@ class Plugin(BasePlugin):
             conn.execute("INSTALL delta; LOAD delta;")
         except Exception:
             pass
-        # If a bearer token was supplied in storage_options (e.g. OneLake/ADLS),
-        # create a matching DuckDB Azure secret so delta_scan() can read the tables.
-        # In a notebook where the secret is already provided this is skipped.
-        so = self._storage_options or {}
-        token = so.get("bearer_token") or so.get("token") or so.get("access_token")
-        if token:
-            try:
-                conn.execute("INSTALL azure; LOAD azure;")
-                conn.execute(
-                    "CREATE OR REPLACE SECRET duckrun_onelake "
-                    f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}')"
-                )
-            except Exception:
-                pass
+        # If a bearer token was supplied in storage_options (e.g. OneLake/ADLS), mint a
+        # matching DuckDB Azure secret so delta_scan() can read the tables. Same helper the
+        # adapter uses before discovery, so the two paths can't drift. In a notebook where
+        # the secret is already provided there's no token, so this is a no-op.
+        try:
+            secret.ensure_azure_secret(conn, self._storage_options)
+        except Exception:
+            pass
 
     def configure_cursor(self, cursor) -> None:
         # dbt creates a fresh child cursor per model connection (see dbt-duckdb's

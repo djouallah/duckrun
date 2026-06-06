@@ -8,10 +8,14 @@ match ``database.schema.identifier`` so ``{{ this }}``, ``ref()`` and ``is_incre
 resolve — with no ``delta_classic`` attach and no re-attach when a table is created.
 """
 from dbt.adapters.base.meta import available
+from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
 from dbt.adapters.duckdb.impl import DuckDBAdapter
 
+from dbt.adapters.duckrun import secret
 from dbt.adapters.duckrun.credentials import DuckrunCredentials
+
+logger = AdapterLogger("Duckrun")
 
 try:  # dbt 1.8+
     from dbt.adapters.contracts.relation import RelationType
@@ -63,6 +67,23 @@ class DuckrunAdapter(DuckDBAdapter):
     def _cursor(self):
         return self.connections.get_thread_connection().handle.cursor()
 
+    def _ensure_remote_secret(self, cursor):
+        """Mint the DuckDB Azure secret from a ``bearer_token`` in ``storage_options`` on
+        this connection, before discovery globs the store.
+
+        For an abfss:// OneLake target the bearer token is the only credential and dbt-duckdb
+        never creates a secret for it (unlike a profile ``secrets:`` block, which it mints at
+        connection-open). Read-only commands materialize nothing, so without this the very
+        first thing that touches the store is the discovery glob below — which throws on
+        ``abfss://`` with no secret, making every table look absent ("schema does not exist").
+        Idempotent and cheap to repeat; a no-op when no token is configured (local/az://).
+        """
+        so = getattr(self.config.credentials, "storage_options", None)
+        try:
+            secret.ensure_azure_secret(cursor, so)
+        except Exception as exc:  # pragma: no cover - logged, then discovery proceeds
+            logger.debug(f"duckrun: could not create Azure secret before Delta discovery: {exc}")
+
     def _discover_delta_relations(self, schema_relation):
         """Discover Delta tables physically present under ``root_path/<schema>`` and return
         them as relations so they land in dbt's relation cache.
@@ -87,6 +108,10 @@ class DuckrunAdapter(DuckDBAdapter):
         base = root_path.rstrip("/") + "/" + str(schema).strip('"')
 
         cursor = self._cursor()
+        # A remote store (abfss:// OneLake) needs its Azure secret on the connection before
+        # the glob can authenticate; mint it here so read-only commands, which materialize
+        # nothing, don't glob an unauthenticated store and come back empty.
+        self._ensure_remote_secret(cursor)
         # `*` matches one path segment (the table dir); every committed Delta table has at
         # least one commit json (00..0.json is unreliable after cleanup_metadata()).
         pattern = (base + "/*/_delta_log/*.json").replace("'", "''")
@@ -94,7 +119,11 @@ class DuckrunAdapter(DuckDBAdapter):
             rows = cursor.execute(
                 f"SELECT DISTINCT file FROM glob('{pattern}')"
             ).fetchall()
-        except Exception:
+        except Exception as exc:
+            # Don't let a glob failure masquerade as "no Delta tables" — that silently
+            # surfaces downstream as "schema does not exist" for every model. Log it (debug)
+            # so an empty remote discovery is visible, then fall back to the in-memory catalog.
+            logger.debug(f"duckrun: Delta relation discovery glob failed for {pattern!r}: {exc}")
             return []
 
         marker = "/_delta_log/"
@@ -142,10 +171,11 @@ class DuckrunAdapter(DuckDBAdapter):
                 f"create or replace view {relation.render()} as "
                 f"select * from delta_scan('{location}')"
             )
-        except Exception:
+        except Exception as exc:
             # A table mid-write or an unreadable log shouldn't abort cache population;
-            # the materialization re-creates the view on the next run regardless.
-            pass
+            # the materialization re-creates the view on the next run regardless. Log at
+            # debug so a systematic failure (e.g. a missing secret) is still diagnosable.
+            logger.debug(f"duckrun: could not register delta_scan view for {location!r}: {exc}")
 
     def list_relations_without_caching(self, schema_relation):
         try:
