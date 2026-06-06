@@ -14,7 +14,7 @@ permissions:
 
 # Don't let concurrent runs race the single Pages deployment.
 concurrency:
-  group: occ
+  group: pages
   cancel-in-progress: false
 
 jobs:
