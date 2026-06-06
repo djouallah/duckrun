@@ -69,10 +69,7 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
-      - name: dbt build (first pass — OneLake, creates Delta tables over abfss://)
-        run: dbt build --target dev --exclude tag:heavy
-
-      - name: dbt build again (second pass — OneLake, delta_scan discovery + merge)
+      - name: dbt build (OneLake — creates Delta tables over abfss://)
         run: dbt build --target dev --exclude tag:heavy
 
       - name: dbt test (fresh process — read-only delta_scan registration over abfss://)
