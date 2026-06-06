@@ -42,6 +42,9 @@ def test_ensure_azure_secret_mints_secret_from_bearer_token():
     assert "install azure" in joined and "load azure" in joined
     assert "create or replace secret duckrun_onelake" in joined
     assert "tok123" in joined  # the token is embedded in the ACCESS_TOKEN secret
+    # The curl transport must be set too, or discovery globs the OneLake blob endpoint with
+    # the default transport (SSL CA failure) and comes back empty — the standalone-test bug.
+    assert "azure_transport_option_type='curl'" in joined
 
 
 def test_ensure_azure_secret_accepts_token_aliases():
