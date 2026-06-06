@@ -1,72 +1,121 @@
 """
-Render a JUnit XML report (from `pytest --junitxml`) as a Markdown pass/fail summary.
+Render a JUnit XML report (from `pytest --junitxml`) as a Markdown "card" for the GitHub job
+summary: an at-a-glance totals box, a per-suite pass-rate table, and a collapsible list of
+everything that did not pass.
 
-Used by the conformance workflow to write the result to the GitHub step summary, and handy
-locally:  python tools/conformance_summary.py tests/conformance/_report.xml
+Used by .github/workflows/conformance.yml, and handy locally:
+    python tools/conformance_summary.py tests/conformance/_report.xml
 """
 import sys
 import xml.etree.ElementTree as ET
-from collections import Counter
+from collections import Counter, defaultdict
 
-# The summary contains emoji; force UTF-8 so it prints on a Windows cp1252 console too
-# (GitHub runners are already UTF-8). Guarded for older Pythons without reconfigure().
+# The summary contains emoji / box-drawing; force UTF-8 so it prints on a Windows cp1252
+# console too (GitHub runners are already UTF-8). Guarded for older Pythons.
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
 
+def _outcome(case):
+    if case.find("error") is not None:
+        return "error"
+    if case.find("failure") is not None:
+        return "failed"
+    if case.find("skipped") is not None:
+        return "skipped"
+    return "passed"
+
+
+def _suite_name(classname: str) -> str:
+    # "tests.conformance.test_basic.TestX" -> "basic"
+    parts = classname.split(".")
+    for p in parts:
+        if p.startswith("test_"):
+            return p[len("test_"):]
+    return classname or "?"
+
+
+def _bar(passed: int, total: int, width: int = 10) -> str:
+    filled = round((passed / total) * width) if total else 0
+    return "█" * filled + "░" * (width - filled)
+
+
 def main(path: str) -> int:
-    tree = ET.parse(path)
-    root = tree.getroot()
-    # --junitxml emits either a <testsuites> wrapper or a single <testsuite>.
+    root = ET.parse(path).getroot()
     suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
 
-    counts = Counter()
-    failures = []  # (outcome, classname, name, message)
+    total = Counter()
+    by_suite = defaultdict(Counter)
+    not_passing = []  # (outcome, classname, name, message)
+
     for suite in suites:
         for case in suite.findall("testcase"):
-            name = case.get("name", "")
-            classname = case.get("classname", "")
-            failure = case.find("failure")
-            error = case.find("error")
-            skipped = case.find("skipped")
-            if error is not None:
-                counts["error"] += 1
-                failures.append(("error", classname, name, (error.get("message") or "").strip()))
-            elif failure is not None:
-                counts["failed"] += 1
-                failures.append(("failed", classname, name, (failure.get("message") or "").strip()))
-            elif skipped is not None:
-                counts["skipped"] += 1
-            else:
-                counts["passed"] += 1
+            outcome = _outcome(case)
+            total[outcome] += 1
+            by_suite[_suite_name(case.get("classname", ""))][outcome] += 1
+            if outcome in ("failed", "error"):
+                node = case.find("failure") if outcome == "failed" else case.find("error")
+                msg = (node.get("message") or "").strip() if node is not None else ""
+                not_passing.append((outcome, case.get("classname", ""), case.get("name", ""), msg))
 
-    total = sum(counts.values())
-    lines = []
-    lines.append("## dbt adapter conformance — duckrun")
-    lines.append("")
-    lines.append("| Result | Count |")
-    lines.append("| --- | ---: |")
-    lines.append(f"| ✅ passed | {counts['passed']} |")
-    lines.append(f"| ❌ failed | {counts['failed']} |")
-    lines.append(f"| 💥 error | {counts['error']} |")
-    lines.append(f"| ⏭️ skipped | {counts['skipped']} |")
-    lines.append(f"| **total** | **{total}** |")
-    lines.append("")
+    n = sum(total.values())
+    passed, failed, error, skipped = (total["passed"], total["failed"], total["error"], total["skipped"])
+    pct = round(100 * passed / n) if n else 0
 
-    if failures:
-        lines.append(f"<details><summary>{len(failures)} not passing</summary>")
-        lines.append("")
-        lines.append("| Outcome | Test | Message |")
-        lines.append("| --- | --- | --- |")
-        for outcome, classname, name, message in failures:
+    out = []
+    out.append("## dbt adapter conformance — duckrun")
+    out.append("")
+    # Totals card (fenced so the box-drawing renders monospaced).
+    headline = f"✅ {passed} passed   ❌ {failed} failed   💥 {error} errors"
+    if skipped:
+        headline += f"   ⏭️ {skipped} skipped"
+    sub = f"{n} total · {pct}% passing"
+    width = max(len(headline), len(sub)) + 2
+    out.append("```")
+    out.append("┌" + "─" * width + "┐")
+    out.append("│ " + headline.ljust(width - 1) + "│")
+    out.append("│ " + sub.ljust(width - 1) + "│")
+    out.append("└" + "─" * width + "┘")
+    out.append("```")
+    out.append("")
+
+    # Per-suite table, best pass-rate first.
+    out.append("### By suite")
+    out.append("")
+    out.append("| Suite | Pass rate | ✅ | ❌ | 💥 | ⏭️ | Total |")
+    out.append("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+
+    def rate(c):
+        t = sum(c.values())
+        return (c["passed"] / t) if t else 0
+
+    for suite in sorted(by_suite, key=lambda s: (-rate(by_suite[s]), s)):
+        c = by_suite[suite]
+        t = sum(c.values())
+        out.append(
+            f"| `{suite}` | `{_bar(c['passed'], t)}` {round(100*rate(c))}% "
+            f"| {c['passed']} | {c['failed']} | {c['error']} | {c['skipped']} | {t} |"
+        )
+    out.append(
+        f"| **Total** | `{_bar(passed, n)}` **{pct}%** "
+        f"| **{passed}** | **{failed}** | **{error}** | **{skipped}** | **{n}** |"
+    )
+    out.append("")
+
+    if not_passing:
+        out.append(f"<details><summary>{len(not_passing)} not passing</summary>")
+        out.append("")
+        out.append("| Outcome | Test | Message |")
+        out.append("| --- | --- | --- |")
+        for outcome, classname, name, message in not_passing:
             short = " ".join(message.split())[:140].replace("|", "\\|")
-            lines.append(f"| {outcome} | `{classname}::{name}` | {short} |")
-        lines.append("")
-        lines.append("</details>")
+            out.append(f"| {outcome} | `{classname}::{name}` | {short} |")
+        out.append("")
+        out.append("</details>")
 
-    print("\n".join(lines))
+    print("\n".join(out))
     return 0
 
 
