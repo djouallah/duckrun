@@ -1,80 +1,75 @@
 """
-Concurrency / optimistic-concurrency-control (OCC) behaviour of the duckrun engine.
+Delta Lake OCC demonstration (duckrun / delta-rs engine).
 
-Conceptual reference: occ.ipynb (Fabric_Notebooks_Demo) pins a Delta version, lets a
-concurrent transaction change the table, then runs a write against the *pinned* version —
-which Delta rejects with CommitFailedError (OCC protecting you from clobbering changes you
-never saw).
+A common misconception: reading a table and then writing gives you read-to-write isolation.
+It does not. A MERGE's conflict check is bound to the snapshot at the *merge transaction's
+start* (HEAD-at-merge-start), not to the version an earlier application read observed.
 
-duckrun's engine (engine.merge_delta / engine.write_delta) always loads the *current*
-DeltaTable(path); it has no way to pin a version. So a duckrun run built from a stale view of
-the table commits successfully even though the table changed underneath it — it does not, and
-cannot, detect the conflict. These tests demonstrate exactly that:
+So the sequence below commits with no error — and it is correct, working-as-designed OCC:
 
-  * test_duckrun_merge_succeeds_despite_concurrent_change  -> passes (current reality)
-  * test_stale_write_should_be_rejected                    -> xfail  (the gap we can't close)
+  1. Read the target -> batch_001 is present, so the work-list SKIPS it.
+  2. A concurrent transaction DELETEs batch_001 between the read and the merge.
+  3. MERGE ... WHEN NOT MATCHED commits successfully. batch_001 is simply gone: the merge
+     never re-adds it (the work-list skipped it), and OCC raises nothing because the only
+     window it checks — merge-start -> commit — had no conflicting change.
+
+Reference notebook: occ.ipynb (Fabric_Notebooks_Demo). The Spark equivalent lives in
+test_concurrency_spark.py and reaches the same conclusion.
 """
 import pyarrow as pa
-import pytest
+
 from deltalake import DeltaTable
-from deltalake.exceptions import CommitFailedError
 
 from dbt.adapters.duckrun import engine
 
+# Five batches of 20 ids each; filename is the provenance column we dedupe on.
+ALL_BATCHES = {
+    f"batch_{b:03d}.csv": range((b - 1) * 20 + 1, b * 20 + 1)
+    for b in range(1, 6)
+}
 
-def _rows(ids):
-    """Build a reusable Arrow table with columns id, value (value = id * 10)."""
-    ids = list(ids)
+
+def _batch_table(filenames):
+    """Build a reusable Arrow table (id, value, filename) for the given batch filenames."""
+    ids, values, names = [], [], []
+    for fname in filenames:
+        for i in ALL_BATCHES[fname]:
+            ids.append(i)
+            values.append(i * 10)
+            names.append(fname)
     return pa.table({
         "id": pa.array(ids, pa.int64()),
-        "value": pa.array([i * 10 for i in ids], pa.int64()),
+        "value": pa.array(values, pa.int64()),
+        "filename": pa.array(names),
     })
 
 
-def _bootstrap(tmp_path):
-    """Create the target Delta table with ids 1..5 and return (path, vB, stale_rows)."""
+def _filenames(path):
+    return set(DeltaTable(path).to_pyarrow_table().column("filename").to_pylist())
+
+
+def test_merge_conflict_check_is_bound_to_merge_start_not_read(tmp_path):
+    """The merge commits and batch_001 is silently lost — correct OCC, commonly misread."""
     path = str(tmp_path / "target")
-    engine.write_delta(path, _rows(range(1, 6)), "overwrite")
 
-    vB = DeltaTable(path).version()              # the version duckrun "saw"
-    stale_rows = _rows(range(1, 6))              # the rows that view contained
-    return path, vB, stale_rows
+    # Bootstrap: batch_001 already ingested.
+    engine.write_delta(path, _batch_table(["batch_001.csv"]), "overwrite")
 
+    # Ordinary read of the target (what every pipeline does). The work-list is derived from
+    # this observed state: batches NOT already seen -> 002..005. batch_001 is skipped.
+    seen = _filenames(path)
+    assert seen == {"batch_001.csv"}
+    to_ingest = _batch_table([f for f in ALL_BATCHES if f not in seen])
 
-def test_duckrun_merge_succeeds_despite_concurrent_change(tmp_path):
-    """duckrun commits a merge even though the table changed since the run was built."""
-    path, vB, stale_rows = _bootstrap(tmp_path)
+    # A concurrent transaction deletes batch_001 between our read and our merge.
+    DeltaTable(path).delete("filename = 'batch_001.csv'")
+    assert _filenames(path) == set()  # B is now empty
 
-    # A concurrent writer mutates the table behind duckrun's back (merge only, no append):
-    # update the values of ids 1..5 and insert 6..8, advancing the table past vB.
-    engine.merge_delta(path, _rows(range(1, 9)), "id")
-    assert DeltaTable(path).version() > vB
+    # Our merge, built from the earlier read, commits with NO concurrency error: OCC only
+    # checks HEAD-at-merge-start (the post-delete, empty table) -> commit, where nothing
+    # conflicts. The work-list never carried batch_001, so it is not re-added.
+    engine.merge_delta(path, to_ingest, "filename")
 
-    # duckrun now merges data built from the stale (vB) view. Because the engine reloads the
-    # current table and cannot pin vB, this commits successfully — no conflict is detected.
-    version_before = DeltaTable(path).version()
-    engine.merge_delta(path, stale_rows, "id")
-    assert DeltaTable(path).version() > version_before
-
-
-@pytest.mark.xfail(
-    reason="duckrun cannot pin a Delta version, so a write built on a stale view commits "
-           "instead of being rejected on the concurrent change",
-    strict=False,
-)
-def test_stale_write_should_be_rejected(tmp_path):
-    """What OCC *would* do if duckrun could pin a version — the gap we can't close today."""
-    path, vB, stale_rows = _bootstrap(tmp_path)
-
-    # Concurrent change touches the rows the pinned view read (merge only).
-    engine.merge_delta(path, _rows(range(1, 9)), "id")
-
-    # duckrun has no pin API; pinning is only possible via deltalake directly. If duckrun
-    # could express this, a stale write ought to be rejected:
-    with pytest.raises(CommitFailedError):
-        DeltaTable(path, version=vB).merge(
-            source=stale_rows,
-            predicate="t.id = s.id",
-            source_alias="s",
-            target_alias="t",
-        ).when_not_matched_insert_all().execute()
+    final = _filenames(path)
+    assert "batch_001.csv" not in final                       # silently lost — by design
+    assert {f for f in ALL_BATCHES if f != "batch_001.csv"} == final

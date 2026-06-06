@@ -98,3 +98,27 @@ jobs:
 
       - name: dbt build again (second pass — Azurite, delta_scan discovery + merge)
         run: dbt build --target azurite --exclude tag:heavy
+
+  spark:
+    runs-on: ubuntu-latest
+    # Spark OCC demonstration: proves Delta's MERGE conflict check is bound to
+    # HEAD-at-merge-start, not the read snapshot (same conclusion as the delta-rs test in the
+    # `local` job). Heavy (JVM + delta-spark), so it gets its own job; the first run downloads
+    # the Delta jars via configure_spark_with_delta_pip.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test + spark deps (pyspark + delta-spark)
+        run: pip install -e ".[test,spark]"
+
+      - name: pytest (Spark OCC demonstration)
+        run: pytest tests/test_concurrency_spark.py -v
