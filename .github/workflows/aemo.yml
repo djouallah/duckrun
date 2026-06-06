@@ -1,4 +1,4 @@
-name: integration
+name: aemo
 
 on:
   push:
@@ -14,7 +14,7 @@ permissions:
 
 # Don't let concurrent runs race the single Pages deployment.
 concurrency:
-  group: pages
+  group: occ
   cancel-in-progress: false
 
 jobs:
