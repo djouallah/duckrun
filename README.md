@@ -29,6 +29,12 @@ materialization that writes real Delta tables
 >
 > Iceberg writers still need time to mature. I built a POC and table maintenance was a blocker.
 
+> ### Why didn't you build this sooner?
+>
+> Honest answer: I didn't know how awesome dbt is. I was living under a rock — so the old
+> `duckrun` (the `legacy` branch) was a bespoke orchestrator I hand-rolled myself. Sometimes
+> people build silly stuff because they don't know better :)
+
 > ### 0.3.0 is a breaking change
 >
 > Versions ≤ 0.2.x of `duckrun` were a Microsoft Fabric / OneLake helper library. From
