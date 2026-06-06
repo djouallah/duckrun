@@ -6,6 +6,17 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Allow the deploy job to publish the generated dbt docs to GitHub Pages.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Don't let concurrent runs race the single Pages deployment.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
 jobs:
   azurite:
     runs-on: ubuntu-latest
@@ -54,3 +65,38 @@ jobs:
 
       - name: dbt build again (second pass — Azurite, delta_scan discovery + merge)
         run: dbt build --target azurite --exclude tag:heavy
+
+      - name: dbt docs generate (Azurite — catalog over az:// Delta tables)
+        run: dbt docs generate --target azurite
+
+      - name: Collect the static docs site (index.html + manifest + catalog)
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dbt-docs-site"
+          cp target/index.html target/manifest.json target/catalog.json \
+            "$GITHUB_WORKSPACE/dbt-docs-site/"
+
+      - name: Upload docs as a build artifact (available on every run)
+        uses: actions/upload-artifact@v4
+        with:
+          name: dbt-docs
+          path: dbt-docs-site
+
+      - name: Package docs for Pages
+        # Only the default branch publishes; PR/feature runs still get the artifact above.
+        if: github.ref == 'refs/heads/main'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dbt-docs-site
+
+  deploy-docs:
+    # Publish the generated dbt docs to GitHub Pages (main only).
+    needs: azurite
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
