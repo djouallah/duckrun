@@ -18,9 +18,16 @@ materialization that writes real Delta tables
 > very good reasons — so this doesn't belong upstream. duckrun keeps it isolated here
 > instead.
 >
-> It's also meant to be a **temporary workaround**: DuckDB is gaining native Delta
-> *write* support, and once that matures the delta_rs hop should no longer be needed.
-> Until then, this adapter fills the gap.
+
+> ### Why not write with DuckDB's native Delta writer?
+>
+> The project's direction seems to be writing through Unity Catalog, which is a non-starter:
+> the whole point of Delta is filesystem simplicity. Once you require a catalog, Iceberg makes
+> more sense — there are far more providers for it.
+
+> ### Why Delta and not Iceberg?
+>
+> Iceberg writers still need time to mature. I built a POC and table maintenance was a blocker.
 
 > ### 0.3.0 is a breaking change
 >
@@ -53,7 +60,7 @@ my_project:
   outputs:
     dev:
       type: duckrun
-      # No `threads:` needed — duckrun always runs single-threaded (see Limitations).
+      # No `threads:` needed — duckrun always runs single-threaded.
       # DuckDB runs in-memory by default — the Delta tables are the only state.
       # Default Delta location for models that don't set config(location=...).
       root_path: './warehouse'   # local path, or abfss://.../Tables, s3://..., gs://...
@@ -170,13 +177,24 @@ The adapter is a thin subclass of dbt-duckdb declaring `dependencies=['duckdb']`
 `view`, `seed`, tests, and the rest are inherited directly; only `table` and
 `incremental` are overridden to write Delta.
 
-## Limitations
+## Concurrency
 
-- **Single-threaded (enforced).** duckrun's delta_rs write path isn't thread-safe — parallel
-  models would collide on the shared DuckDB connection — so the adapter **pins the run to one
-  thread**, overriding any `threads:` you set in the profile. There's nothing to configure;
-  it's fine for duckrun's intended use (incremental Delta builds on DuckDB) and isn't aimed at
-  large-scale concurrent workloads (that's Spark's job, not this).
+Merge relies on Delta's optimistic concurrency control (OCC). One behaviour is commonly
+misread: a merge's conflict check is bound to the table version at the **start of the merge
+transaction** (HEAD-at-merge-start), not to whatever version an earlier application read
+observed. So a "read the target → derive a work-list → merge" pipeline can commit cleanly even
+if another writer changed the table between that read and the merge.
+
+The subtle difference from Spark — the reference implementation — is how the merge's own scan
+lines up with that conflict check. Spark pins a single snapshot for the whole merge: the scan
+and the conflict check see the same Delta version. duckrun's scan is lazy, so in practice it
+reads HEAD-at-merge-start too and the two line up — but that's a practical consequence, not a
+guarantee, and Spark's conflict detection is more sophisticated.
+
+This repo demonstrates the behaviour on both engines —
+[tests/test_concurrency.py](tests/test_concurrency.py) (delta-rs) and
+[tests/test_concurrency_spark.py](tests/test_concurrency_spark.py) (Spark) — runnable via the
+[`concurrency`](.github/workflows/concurrency.yml) workflow from the Actions tab.
 
 ## Development
 
@@ -198,9 +216,143 @@ report — fails the build on a merge regression. It shares no files with `integ
 
 `tests/conformance/` runs the official dbt adapter test suite
 ([`dbt-tests-adapter`](https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-tests-adapter))
-against duckrun (`.github/workflows/conformance.yml`, results card in the job summary). It runs
-**single-threaded (`threads: 1`)** — see [Limitations](#limitations) — as is normal for
-adapter conformance suites (e.g. dbt-iceberg does the same).
+against duckrun (`.github/workflows/conformance.yml`). The results card is published to the
+job summary and rendered live into this README below — regenerated on every push to `main`.
+
+## Conformance results
+
+<!-- CONFORMANCE:START -->
+
+## dbt adapter conformance — duckrun
+
+```
+┌───────────────────────────────────────────────────────┐
+│ ✅ 92 passed   ❌ 38 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 68% passing                               │
+└───────────────────────────────────────────────────────┘
+```
+
+### By suite
+
+| Suite | Pass rate | ✅ | ❌ | 💥 | ⏭️ | Total |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| `aliases` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
+| `caching` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
+| `concurrency` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
+| `empty` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
+| `ephemeral` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
+| `fast_seed` | `██████████` 100% | 4 | 0 | 0 | 0 | 4 |
+| `simple_snapshot` | `██████████` 100% | 6 | 0 | 0 | 0 | 6 |
+| `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
+| `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
+| `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
+| `basic` | `████████░░` 81% | 13 | 3 | 0 | 0 | 16 |
+| `incremental` | `█████░░░░░` 54% | 14 | 12 | 0 | 0 | 26 |
+| `incremental_microbatch` | `█████░░░░░` 54% | 7 | 6 | 0 | 0 | 13 |
+| `constraints` | `██░░░░░░░░` 24% | 4 | 13 | 0 | 0 | 17 |
+| `persist_docs` | `██░░░░░░░░` 20% | 1 | 3 | 0 | 1 | 5 |
+| `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
+| **Total** | `███████░░░` **68%** | **92** | **38** | **0** | **5** | **135** |
+
+### Incremental / write support
+
+| Capability | | Notes |
+| --- | :-: | --- |
+| `materialized='table'` (overwrite) | ✅ | full rewrite each run (delta_rs overwrite) |
+| first run / `--full-refresh` | ✅ | overwrites |
+| `append` | ✅ | blind append; default when no `unique_key` |
+| `merge` (upsert) | ✅ | update matched + insert new, on `unique_key`; default with `unique_key` |
+| `insert` (insert-only) | ✅ | insert new keys only (idempotent / dedupe) |
+| `merge_update_columns` | ✅ | update only the listed columns on match |
+| `merge_exclude_columns` | ✅ | update every column except the listed ones |
+| `incremental_predicates` | ✅ | AND-ed into the merge condition (merge strategy) |
+| `on_schema_change='append_new_columns'` | ✅ | new columns added via delta_rs schema evolution |
+| `on_schema_change='fail'` | ✅ | raises if the model's columns drift from the table |
+| `partition_by` | ✅ | Delta partition columns |
+| `on_schema_change='sync_all_columns'` | ⚠️ | **add-only** — delta_rs can't drop columns |
+| `delete+insert` | ⚠️ | mapped to `merge` (not exact delete+insert semantics) |
+| `microbatch` strategy | ✅ | per-batch delete+insert on the `event_time` window (delta_rs delete + append) |
+| advanced merge clauses (conditions / set / returning / custom) | ❌ | dbt-duckdb-specific, not implemented |
+| constraints / DDL enforcement | ❌ | models are `delta_scan` views, not physical tables |
+
+### Not passing — details by suite
+
+<details><summary><b>changing_relation_type</b> — 1 not passing (0/1 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestChangeRelationTypesDuckDB::test_changing_materialization_changes_relation_type` | AssertionError: dbt exit state did not match expected |
+
+</details>
+<details><summary><b>persist_docs</b> — 3 not passing (1/5 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestPersistDocs::test_has_comments_pglike` | AttributeError: 'NoneType' object has no attribute 'startswith' |
+| ❌ | `TestPersistDocsColumnMissing::test_missing_column` | AttributeError: 'NoneType' object has no attribute 'startswith' |
+| ❌ | `TestPersistDocsCommentOnQuotedColumn::test_quoted_column_comments` | AttributeError: 'NoneType' object has no attribute 'startswith' |
+
+</details>
+<details><summary><b>constraints</b> — 13 not passing (4/17 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_wrong_column_names` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_wrong_column_data_types` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestViewConstraintsColumnsEqual::test__constraints_wrong_column_data_types` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestViewConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_wrong_column_names` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_wrong_column_data_types` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestTableConstraintsRuntimeDdlEnforcement::test__constraints_ddl` | AssertionError: assert 'create table... model_subq);' == 'create or re...l_identifier>' - create or replace view <model_identifier> as select * from <model_iden |
+| ❌ | `TestTableConstraintsRollback::test__constraints_enforcement_rollback` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalConstraintsRuntimeDdlEnforcement::test__constraints_ddl` | AssertionError: assert 'create table... model_subq);' == 'create or re...l_identifier>' - create or replace view <model_identifier> as select * from <model_iden |
+| ❌ | `TestIncrementalConstraintsRollback::test__constraints_enforcement_rollback` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestModelConstraintsRuntimeEnforcement::test__model_constraints_ddl` | AssertionError: assert 'create table... model_subq);' == 'create or re...l_identifier>' - create or replace view <model_identifier> as select * from <model_iden |
+
+</details>
+<details><summary><b>incremental</b> — 12 not passing (14/26 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestIncrementalPredicates::test__incremental_predicates` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
+| ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | assert 1 == 2 |
+| ❌ | `TestIncrementalMergeValidation::test_invalid_condition_type` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMergeValidation::test_invalid_columns_type` | AssertionError: assert 'merge_update_columns must be a list' in 'Generic DeltaTable error: External error: Generic DeltaTable error: Schema error: No field name |
+| ❌ | `TestIncrementalMergeValidation::test_invalid_set_expressions_type` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMergeValidation::test_conflicting_configs` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMergeValidation::test_invalid_clauses_type` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMergeValidation::test_empty_clauses` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMergeValidation::test_invalid_clause_list` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMergeValidation::test_invalid_clause_element` | AssertionError: dbt exit state did not match expected |
+
+</details>
+<details><summary><b>incremental_microbatch</b> — 6 not passing (7/13 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestMicrobatchScenarios::test_microbatch_inserts_new_batches` | _duckdb.CatalogException: Catalog Error: microbatch_exec_input is not an table |
+| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_date_event_time` | _duckdb.CatalogException: Catalog Error: microbatch_event_date_input is not an table |
+| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_hour_batch_size` | _duckdb.CatalogException: Catalog Error: microbatch_batch_hour_input is not an table |
+| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_month_batch_size` | _duckdb.CatalogException: Catalog Error: microbatch_batch_month_input is not an table |
+| ❌ | `TestMicrobatchScenarios::test_microbatch_reprocesses_existing_batch` | _duckdb.BinderException: Binder Error: Can only update base table! |
+| ❌ | `TestMicrobatchScenarios::test_microbatch_lookback_reprocesses_previous_batches` | _duckdb.BinderException: Binder Error: Can only update base table! |
+
+</details>
+<details><summary><b>basic</b> — 3 not passing (13/16 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestDocsGenReferencesDuckDB::test_references` | AssertionError: Key 'metadata' in 'model.test.ephemeral_summary' did not match assert {'comment': N...r': None, ...} == {'comment': N...r': None, ...} Omitting  |
+| ❌ | `TestCatalogRelationsDuckDB::test_get_catalog_relations` | AssertionError: dbt exit state did not match expected |
+
+</details>
+
+<!-- CONFORMANCE:END -->
 
 ## License
 
