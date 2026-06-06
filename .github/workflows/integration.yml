@@ -32,9 +32,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
+      - name: Install duckrun + test deps (pulls dbt-duckdb + duckdb + deltalake + pytest)
         working-directory: ${{ github.workspace }}
-        run: pip install -e .
+        run: pip install -e ".[test]"
+
+      - name: pytest (concurrency / OCC engine tests)
+        working-directory: ${{ github.workspace }}
+        run: pytest tests/ -v
 
       - name: Create local warehouse + files dirs
         run: mkdir -p /tmp/duckrun_warehouse /tmp/duckrun_files

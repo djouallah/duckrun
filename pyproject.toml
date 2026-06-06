@@ -18,6 +18,11 @@ dependencies = [
     "deltalake>=1.2.1",
 ]
 
+[project.optional-dependencies]
+# Test-only; pyarrow is used to build reusable Arrow fixtures. Production duckrun stays
+# pyarrow-free (it streams DuckDB relations straight to deltalake).
+test = ["pytest>=7", "pyarrow"]
+
 [project.urls]
 Homepage = "https://github.com/djouallah/duckrun"
 Repository = "https://github.com/djouallah/duckrun"
