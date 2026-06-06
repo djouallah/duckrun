@@ -104,16 +104,33 @@ def main(path: str) -> int:
     )
     out.append("")
 
+    # Per-suite breakdown of what didn't pass — one collapsible section per non-100% suite,
+    # worst pass-rate first, so e.g. `incremental` lists exactly which tests fail and why.
     if not_passing:
-        out.append(f"<details><summary>{len(not_passing)} not passing</summary>")
-        out.append("")
-        out.append("| Outcome | Test | Message |")
-        out.append("| --- | --- | --- |")
+        np_by_suite = defaultdict(list)
         for outcome, classname, name, message in not_passing:
-            short = " ".join(message.split())[:140].replace("|", "\\|")
-            out.append(f"| {outcome} | `{classname}::{name}` | {short} |")
+            np_by_suite[_suite_name(classname)].append((outcome, classname, name, message))
+
+        out.append("### Not passing — details by suite")
         out.append("")
-        out.append("</details>")
+        for suite in sorted(np_by_suite, key=lambda s: (rate(by_suite[s]), s)):
+            rows = np_by_suite[suite]
+            c = by_suite[suite]
+            out.append(
+                f"<details><summary><b>{suite}</b> — {len(rows)} not passing "
+                f"({c['passed']}/{sum(c.values())} pass)</summary>"
+            )
+            out.append("")
+            out.append("| Outcome | Test | Message |")
+            out.append("| --- | --- | --- |")
+            for outcome, classname, name, message in rows:
+                emoji = "💥" if outcome == "error" else "❌"
+                short = " ".join(message.split())[:160].replace("|", "\\|")
+                cls = classname.split(".")[-1]
+                out.append(f"| {emoji} | `{cls}::{name}` | {short} |")
+            out.append("")
+            out.append("</details>")
+        out.append("")
 
     print("\n".join(out))
     return 0

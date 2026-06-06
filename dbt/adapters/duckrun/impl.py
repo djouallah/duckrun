@@ -109,9 +109,18 @@ class DuckrunAdapter(DuckDBAdapter):
         if not discovered:
             return in_memory
 
-        existing = {str(r.identifier).strip('"').lower() for r in in_memory}
-        merged = list(in_memory)
-        for rel in discovered:
-            if str(rel.identifier).strip('"').lower() not in existing:
-                merged.append(rel)
+        # A Delta table on disk is the source of truth, so disk discovery WINS over the
+        # in-memory catalog. This matters when several dbt runs share one process (dbt's test
+        # harness, a notebook, a long-lived runner): run 1 leaves a `delta_scan` *view* (type
+        # view) in the in-memory DuckDB, and if that stale view shadowed the disk table here,
+        # the relation would be reported as a view and is_incremental() would be false on run
+        # 2 — making the model clobber instead of merge. Reporting the discovered table (type
+        # table) instead makes a shared process behave exactly like a fresh one. Non-Delta
+        # relations (native `view`/`seed`) aren't discovered, so they pass through untouched.
+        discovered_names = {str(r.identifier).strip('"').lower() for r in discovered}
+        merged = [
+            r for r in in_memory
+            if str(r.identifier).strip('"').lower() not in discovered_names
+        ]
+        merged.extend(discovered)
         return merged
