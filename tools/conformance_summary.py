@@ -42,6 +42,38 @@ def _bar(passed: int, total: int, width: int = 10) -> str:
     return "█" * filled + "░" * (width - filled)
 
 
+# Hand-maintained: what duckrun's table/incremental materializations actually support. This
+# is the "what can I use?" reference people always ask about — kept in the card on purpose.
+INCREMENTAL_SUPPORT = [
+    ("`materialized='table'` (overwrite)", "✅", "full rewrite each run (delta_rs overwrite)"),
+    ("first run / `--full-refresh`", "✅", "overwrites"),
+    ("`append`", "✅", "blind append; default when no `unique_key`"),
+    ("`merge` (upsert)", "✅", "update matched + insert new, on `unique_key`; default with `unique_key`"),
+    ("`insert` (insert-only)", "✅", "insert new keys only (idempotent / dedupe)"),
+    ("`merge_update_columns`", "✅", "update only the listed columns on match"),
+    ("`merge_exclude_columns`", "✅", "update every column except the listed ones"),
+    ("`incremental_predicates`", "✅", "AND-ed into the merge condition (merge strategy)"),
+    ("`on_schema_change='append_new_columns'`", "✅", "new columns added via delta_rs schema evolution"),
+    ("`on_schema_change='fail'`", "✅", "raises if the model's columns drift from the table"),
+    ("`partition_by`", "✅", "Delta partition columns"),
+    ("`on_schema_change='sync_all_columns'`", "⚠️", "**add-only** — delta_rs can't drop columns"),
+    ("`delete+insert`", "⚠️", "mapped to `merge` (not exact delete+insert semantics)"),
+    ("`microbatch` strategy", "❌", "not supported"),
+    ("advanced merge clauses (conditions / set / returning / custom)", "❌", "dbt-duckdb-specific, not implemented"),
+    ("constraints / DDL enforcement", "❌", "models are `delta_scan` views, not physical tables"),
+]
+
+
+def _incremental_support_lines():
+    out = ["### Incremental / write support", ""]
+    out.append("| Capability | | Notes |")
+    out.append("| --- | :-: | --- |")
+    for cap, status, note in INCREMENTAL_SUPPORT:
+        out.append(f"| {cap} | {status} | {note} |")
+    out.append("")
+    return out
+
+
 def main(path: str) -> int:
     root = ET.parse(path).getroot()
     suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
@@ -103,6 +135,9 @@ def main(path: str) -> int:
         f"| **{passed}** | **{failed}** | **{error}** | **{skipped}** | **{n}** |"
     )
     out.append("")
+
+    # Educational: spell out exactly which write/incremental features duckrun supports.
+    out.extend(_incremental_support_lines())
 
     # Per-suite breakdown of what didn't pass — one collapsible section per non-100% suite,
     # worst pass-rate first, so e.g. `incremental` lists exactly which tests fail and why.

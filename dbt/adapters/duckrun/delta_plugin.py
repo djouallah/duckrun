@@ -13,6 +13,11 @@ from dbt.adapters.duckdb.utils import SourceConfig, TargetConfig
 
 from . import engine
 
+try:  # raise on_schema_change='fail' as a dbt compilation error (matches dbt semantics)
+    from dbt_common.exceptions import CompilationError
+except Exception:  # pragma: no cover - older layouts
+    CompilationError = ValueError
+
 
 class Plugin(BasePlugin):
     """Registered automatically by the duckrun adapter (alias ``duckrun``)."""
@@ -117,9 +122,19 @@ class Plugin(BasePlugin):
                 raise ValueError(
                     f"incremental_strategy='{strategy}' requires a unique_key."
                 )
+            # on_schema_change: detect added/removed columns vs the existing table and
+            # decide whether to let delta_rs evolve the schema (or fail). Default 'ignore'.
+            on_schema_change = (cfg.get("on_schema_change") or "ignore").lower()
+            evolve_schema = self._resolve_schema_change(
+                on_schema_change, path, data, storage_options
+            )
             engine.merge_delta(
                 path, data, unique_key,
                 insert_only=(strategy == "insert"),
+                update_columns=cfg.get("merge_update_columns"),
+                exclude_columns=cfg.get("merge_exclude_columns"),
+                predicates=self._merge_predicates(cfg),
+                merge_schema=evolve_schema,
                 storage_options=storage_options,
             )
         elif strategy == "append":
@@ -139,6 +154,46 @@ class Plugin(BasePlugin):
     @staticmethod
     def _relation_name(relation: Any) -> str:
         return relation.render() if hasattr(relation, "render") else str(relation)
+
+    @staticmethod
+    def _merge_predicates(cfg: dict):
+        """dbt ``incremental_predicates`` (or ``predicates``), with dbt's standard merge
+        aliases rewritten to the ones delta_rs uses here."""
+        preds = cfg.get("incremental_predicates") or cfg.get("predicates")
+        if not preds:
+            return None
+        if isinstance(preds, str):
+            preds = [preds]
+        out = []
+        for p in preds:
+            p = str(p).replace("DBT_INTERNAL_DEST", "target").replace("DBT_INTERNAL_SOURCE", "source")
+            out.append(p)
+        return out
+
+    @staticmethod
+    def _resolve_schema_change(on_schema_change, path, data, storage_options) -> bool:
+        """Handle dbt ``on_schema_change`` for the merge path.
+
+        Returns whether delta_rs should evolve the table schema (``merge_schema``).
+        - ignore (default): no evolution.
+        - append_new_columns / sync_all_columns: evolve so new columns are added.
+        - fail: raise if the incoming columns differ from the table's.
+        """
+        if on_schema_change in ("ignore", "", None):
+            return False
+        existing = [c.lower() for c in engine.delta_columns(path, storage_options)]
+        incoming = [c.lower() for c in data.columns]
+        added = [c for c in incoming if c not in existing]
+        removed = [c for c in existing if c not in incoming]
+        if on_schema_change == "fail" and (added or removed):
+            raise CompilationError(
+                "The source and target schemas on this incremental model are out of sync: "
+                f"added={added or '[]'}, removed={removed or '[]'} "
+                "(on_schema_change='fail')."
+            )
+        # append_new_columns / sync_all_columns: let delta_rs union in the new columns.
+        # (delta_rs can add but not drop columns, so sync_all_columns is add-only here.)
+        return bool(added) or on_schema_change == "sync_all_columns"
 
     # ------------------------------------------------------------------- read
     def load(self, source_config: SourceConfig):

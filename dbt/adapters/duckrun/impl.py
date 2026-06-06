@@ -37,6 +37,21 @@ class DuckrunAdapter(DuckDBAdapter):
     ConnectionManager = DuckrunConnectionManager
     Credentials = DuckrunCredentials
 
+    def __init__(self, config, mp_context):
+        super().__init__(config, mp_context)
+        # duckrun's Delta write path is single-threaded: parallel models would collide on the
+        # shared DuckDB connection (Arrow stream held open across the delta_rs write). dbt sizes
+        # its run thread pool from config.threads (dbt.task.runnable), and the adapter shares
+        # that RuntimeConfig object — so pin it to 1 here, overriding whatever the profile says.
+        # `threads` is deliberately undocumented for duckrun; users never need to set it.
+        try:
+            config.threads = 1
+        except Exception:  # pragma: no cover - frozen config fallback
+            try:
+                object.__setattr__(config, "threads", 1)
+            except Exception:
+                pass
+
     @available
     def delta_table_exists(self, location) -> bool:
         """True if a Delta table already exists at ``location``."""

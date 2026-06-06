@@ -90,6 +90,10 @@
       'partition_by': config.get('partition_by'),
       'merge_schema': config.get('merge_schema', false),
       'storage_options': config.get('storage_options'),
+      'merge_update_columns': config.get('merge_update_columns'),
+      'merge_exclude_columns': config.get('merge_exclude_columns'),
+      'incremental_predicates': config.get('incremental_predicates') or config.get('predicates'),
+      'on_schema_change': config.get('on_schema_change', 'ignore'),
   } -%}
   {% do adapter.store_relation('duckrun', tmp_relation, columns, location, 'delta', delta_config) %}
 

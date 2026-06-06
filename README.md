@@ -53,7 +53,7 @@ my_project:
   outputs:
     dev:
       type: duckrun
-      threads: 1                 # single-threaded — see Limitations
+      # No `threads:` needed — duckrun always runs single-threaded (see Limitations).
       # DuckDB runs in-memory by default — the Delta tables are the only state.
       # Default Delta location for models that don't set config(location=...).
       root_path: './warehouse'   # local path, or abfss://.../Tables, s3://..., gs://...
@@ -132,14 +132,18 @@ The first run (or `--full-refresh`, or a missing table) overwrites. Later runs a
 
 ### Config options (`table` / `incremental` / `delta`)
 
-| option                 | description                                              |
-|------------------------|----------------------------------------------------------|
-| `location`             | Delta path. Defaults to `<root_path>/<schema>/<id>`.     |
-| `incremental_strategy` | `merge` \| `insert` \| `append` (incremental only).      |
-| `unique_key`           | column(s) to merge on.                                   |
-| `partition_by`         | Delta partition column(s).                               |
-| `merge_schema`         | allow schema evolution on write.                         |
-| `storage_options`      | per-model override forwarded to deltalake.               |
+| option                  | description                                                                 |
+|-------------------------|-----------------------------------------------------------------------------|
+| `location`              | Delta path. Defaults to `<root_path>/<schema>/<id>`.                        |
+| `incremental_strategy`  | `merge` \| `insert` \| `append` (incremental only).                         |
+| `unique_key`            | column(s) to merge on.                                                       |
+| `merge_update_columns`  | merge: update only these columns on match (others untouched).               |
+| `merge_exclude_columns` | merge: update all columns **except** these on match.                        |
+| `incremental_predicates`| merge: extra predicates AND-ed into the merge condition (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). |
+| `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. (`sync_all_columns` only *adds* — delta_rs can't drop columns.) |
+| `partition_by`          | Delta partition column(s).                                                   |
+| `merge_schema`          | allow schema evolution on write.                                            |
+| `storage_options`       | per-model override forwarded to deltalake.                                   |
 
 ## Reading existing Delta tables as sources
 
@@ -168,11 +172,11 @@ The adapter is a thin subclass of dbt-duckdb declaring `dependencies=['duckdb']`
 
 ## Limitations
 
-- **Single-threaded — run with `threads: 1`.** duckrun's delta_rs write path is
-  single-threaded; with `threads > 1` parallel models collide on the shared DuckDB
-  connection. This is fine for duckrun's intended use — incremental Delta builds on DuckDB —
-  and isn't aimed at large-scale concurrent workloads (that's Spark's job, not this). Making
-  `threads: 1` the adapter default is a planned follow-up.
+- **Single-threaded (enforced).** duckrun's delta_rs write path isn't thread-safe — parallel
+  models would collide on the shared DuckDB connection — so the adapter **pins the run to one
+  thread**, overriding any `threads:` you set in the profile. There's nothing to configure;
+  it's fine for duckrun's intended use (incremental Delta builds on DuckDB) and isn't aimed at
+  large-scale concurrent workloads (that's Spark's job, not this).
 
 ## Development
 

@@ -70,6 +70,11 @@ def table_exists(path: str, storage_options: Optional[Dict[str, str]] = None) ->
         return False
 
 
+def delta_columns(path: str, storage_options: Optional[Dict[str, str]] = None) -> List[str]:
+    """Column names of the existing Delta table at ``path`` (for on_schema_change)."""
+    return [f.name for f in _delta_table(path, storage_options).schema().fields]
+
+
 def write_delta(
     path: str,
     data,
@@ -122,19 +127,34 @@ def merge_delta(
     unique_key,
     *,
     insert_only: bool = False,
+    update_columns: Optional[List[str]] = None,
+    exclude_columns: Optional[List[str]] = None,
+    predicates: Optional[List[str]] = None,
+    merge_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> None:
     """
     Merge ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
 
-    ``unique_key`` may be a single column name or a list of column names.
+    ``unique_key`` may be a single column name or a list of column names. The merge
+    condition is ``target.k = source.k`` for each key, AND-ed with any extra
+    ``predicates`` (dbt ``incremental_predicates``); predicates should reference the
+    ``target``/``source`` aliases.
 
-    - insert_only=False (default): upsert — update matched rows, insert new ones.
-    - insert_only=True: insert only rows whose key is not present (idempotent
-      append / dedupe; never touches existing rows).
+    - insert_only=True: insert only rows whose key is not present (idempotent append /
+      dedupe; never touches existing rows). Mutually exclusive with the update options.
+    - default upsert: update matched rows, insert new ones. Narrow the update with
+      ``update_columns`` (only these) or ``exclude_columns`` (all but these) — dbt's
+      ``merge_update_columns`` / ``merge_exclude_columns``.
+    - merge_schema=True lets delta_rs evolve the table schema (new columns), backing
+      ``on_schema_change='append_new_columns'`` / ``'sync_all_columns'``.
     """
     keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
-    predicate = " AND ".join(f"target.{k} = source.{k}" for k in keys)
+    conditions = [f"target.{k} = source.{k}" for k in keys]
+    if predicates:
+        extra = predicates if isinstance(predicates, (list, tuple)) else [predicates]
+        conditions.extend(p for p in extra if p)
+    predicate = " AND ".join(conditions)
 
     dt = _delta_table(path, storage_options)
     merger = dt.merge(
@@ -142,9 +162,17 @@ def merge_delta(
         predicate=predicate,
         source_alias="source",
         target_alias="target",
+        merge_schema=merge_schema,
     )
     if insert_only:
         merger = merger.when_not_matched_insert_all()
     else:
-        merger = merger.when_matched_update_all().when_not_matched_insert_all()
+        if update_columns:
+            updates = {c: f"source.{c}" for c in update_columns}
+            merger = merger.when_matched_update(updates=updates)
+        elif exclude_columns:
+            merger = merger.when_matched_update_all(except_cols=list(exclude_columns))
+        else:
+            merger = merger.when_matched_update_all()
+        merger = merger.when_not_matched_insert_all()
     merger.execute()

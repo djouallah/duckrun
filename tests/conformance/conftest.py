@@ -53,12 +53,11 @@ def profile_type(request):
 @pytest.fixture(scope="session")
 def dbt_profile_target(tmp_path_factory):
     # duckrun writes Delta tables under root_path/<schema>/<model> and reads them via
-    # delta_scan. dbt supplies a unique schema per test; DuckDB stays in-memory. Single-
-    # threaded — see README "Limitations".
+    # delta_scan. dbt supplies a unique schema per test; DuckDB stays in-memory. (No threads:
+    # the adapter forces single-threaded — see README "Limitations".)
     root = tmp_path_factory.mktemp("duckrun_warehouse")
     return {
         "type": "duckrun",
-        "threads": 1,
         "root_path": str(root).replace("\\", "/"),
     }
 
