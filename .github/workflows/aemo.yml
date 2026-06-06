@@ -66,6 +66,13 @@ jobs:
       - name: dbt build again (second pass — Azurite, delta_scan discovery + merge)
         run: dbt build --target azurite --exclude tag:heavy
 
+      - name: dbt test (fresh process — read-only delta_scan registration over az://)
+        # A standalone `dbt test` materializes nothing, so unlike the in-process tests inside
+        # `dbt build` above it can only pass if the adapter re-registers every Delta table on
+        # disk as a delta_scan view at run start (read-only commands populate the cache but run
+        # no model). This step is the regression gate for that cross-process read path.
+        run: dbt test --target azurite --exclude tag:heavy
+
       - name: dbt docs generate (Azurite — catalog over az:// Delta tables)
         run: dbt docs generate --target azurite
 

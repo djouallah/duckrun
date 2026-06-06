@@ -70,10 +70,13 @@ class DuckrunAdapter(DuckDBAdapter):
         This is what makes the adapter stateless across processes: dbt rebuilds its relation
         cache at run start by calling list_relations_without_caching for every manifest
         schema, even on a fresh in-memory DuckDB. Returning a table-typed relation per Delta
-        table makes ``is_incremental()`` true on later runs. We deliberately do NOT create the
-        ``delta_scan`` views here: discovery runs during the before_run cache-population phase,
-        and views created on that connection don't survive to the model-run phase. The view is
-        (re)created in the materialization instead (pre-register {{ this }} + step-4 view).
+        table makes ``is_incremental()`` true on later runs.
+
+        This only returns the relations (for the cache); list_relations_without_caching then
+        calls _register_delta_view on each so the physical ``delta_scan`` view exists too —
+        which is what lets read-only commands (``dbt test``/``show``/``docs``), that run no
+        model and so never hit a materialization, still query the table. For ``run``/``build``
+        the materialization re-creates the view anyway (pre-register {{ this }} + step-4 view).
         """
         root_path = getattr(self.config.credentials, "root_path", None)
         if not root_path:
@@ -114,6 +117,36 @@ class DuckrunAdapter(DuckDBAdapter):
             for name in names
         ]
 
+    def _register_delta_view(self, relation):
+        """Create the ``delta_scan`` view for a discovered Delta relation on the live
+        connection so read-only commands (``dbt test``, ``dbt show``, ``dbt docs``) that
+        never materialize anything can still query the model.
+
+        ``dbt run``/``build`` create this same view in the materialization (step 4); doing it
+        here too is harmless — the materialization's ``create or replace`` just supersedes it.
+        But for a command that runs no models, this is the only place the physical view gets
+        created from the Delta tables discovered on disk.
+        """
+        root_path = getattr(self.config.credentials, "root_path", None)
+        if not root_path:
+            return
+        location = (
+            root_path.rstrip("/")
+            + "/" + str(relation.schema).strip('"')
+            + "/" + str(relation.identifier).strip('"')
+        )
+        try:
+            self.create_schema(relation)
+            cursor = self._cursor()
+            cursor.execute(
+                f"create or replace view {relation.render()} as "
+                f"select * from delta_scan('{location}')"
+            )
+        except Exception:
+            # A table mid-write or an unreadable log shouldn't abort cache population;
+            # the materialization re-creates the view on the next run regardless.
+            pass
+
     def list_relations_without_caching(self, schema_relation):
         try:
             in_memory = list(super().list_relations_without_caching(schema_relation))
@@ -123,6 +156,11 @@ class DuckrunAdapter(DuckDBAdapter):
         discovered = self._discover_delta_relations(schema_relation)
         if not discovered:
             return in_memory
+
+        # Physically register each discovered Delta table as a delta_scan view so read-only
+        # commands (dbt test/show/docs) can query models without a prior in-process run.
+        for rel in discovered:
+            self._register_delta_view(rel)
 
         # A Delta table on disk is the source of truth, so disk discovery WINS over the
         # in-memory catalog. This matters when several dbt runs share one process (dbt's test
