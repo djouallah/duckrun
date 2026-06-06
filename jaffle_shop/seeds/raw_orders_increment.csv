@@ -1,0 +1,4 @@
+id,user_id,order_date,status
+99,85,2018-04-09,completed
+100,1,2018-04-10,placed
+101,2,2018-04-11,shipped

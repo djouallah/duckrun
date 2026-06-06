@@ -186,6 +186,16 @@ The `integration_tests/` directory is a small dbt project exercised by CI
 second build exercises the incremental merge. Verified to run with **pyarrow not
 installed**, on the minimum supported `duckdb` and `deltalake`.
 
+`jaffle_shop/` is a self-contained build of the canonical
+[dbt-labs jaffle shop](https://github.com/dbt-labs/jaffle-shop) project on duckrun, run by
+`.github/workflows/jaffle.yml` as a **gating** end-to-end test over a local Delta warehouse.
+It seeds the classic data, builds staging views → a `dim_customers` Delta table → an
+incremental `fct_orders`, then drives a **two-pass merge**: pass 1 lands the 99 base orders,
+pass 2 applies a late-arriving batch (a restated order plus two new ones) and singular tests
+assert the Delta merge upserted correctly (right row count, the existing order UPDATEd, the
+new orders INSERTed). It's industry-standard and recognisable, and — unlike the conformance
+report — fails the build on a merge regression. It shares no files with `integration_tests/`.
+
 `tests/conformance/` runs the official dbt adapter test suite
 ([`dbt-tests-adapter`](https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-tests-adapter))
 against duckrun (`.github/workflows/conformance.yml`, results card in the job summary). It runs
