@@ -47,6 +47,9 @@ def dbt_profile_target(tmp_path_factory):
     root = tmp_path_factory.mktemp("duckrun_warehouse")
     return {
         "type": "duckrun",
-        "threads": 4,
+        # Single-threaded, as is normal for dbt adapter conformance suites (e.g. dbt-iceberg
+        # runs threads=1 too). duckrun's delta_rs write path is single-threaded today; making
+        # it the adapter default is a planned follow-up.
+        "threads": 1,
         "root_path": str(root).replace("\\", "/"),
     }

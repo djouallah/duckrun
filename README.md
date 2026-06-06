@@ -53,6 +53,7 @@ my_project:
   outputs:
     dev:
       type: duckrun
+      threads: 1                 # single-threaded — see Limitations
       # DuckDB runs in-memory by default — the Delta tables are the only state.
       # Default Delta location for models that don't set config(location=...).
       root_path: './warehouse'   # local path, or abfss://.../Tables, s3://..., gs://...
@@ -165,6 +166,14 @@ The adapter is a thin subclass of dbt-duckdb declaring `dependencies=['duckdb']`
 `view`, `seed`, tests, and the rest are inherited directly; only `table` and
 `incremental` are overridden to write Delta.
 
+## Limitations
+
+- **Single-threaded — run with `threads: 1`.** duckrun's delta_rs write path is
+  single-threaded; with `threads > 1` parallel models collide on the shared DuckDB
+  connection. This is fine for duckrun's intended use — incremental Delta builds on DuckDB —
+  and isn't aimed at large-scale concurrent workloads (that's Spark's job, not this). Making
+  `threads: 1` the adapter default is a planned follow-up.
+
 ## Development
 
 The `integration_tests/` directory is a small dbt project exercised by CI
@@ -172,6 +181,12 @@ The `integration_tests/` directory is a small dbt project exercised by CI
 `./warehouse` — a seed, a `view`, a `table`, and an `incremental` model — where the
 second build exercises the incremental merge. Verified to run with **pyarrow not
 installed**, on the minimum supported `duckdb` and `deltalake`.
+
+`tests/conformance/` runs the official dbt adapter test suite
+([`dbt-tests-adapter`](https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-tests-adapter))
+against duckrun (`.github/workflows/conformance.yml`, results card in the job summary). It runs
+**single-threaded (`threads: 1`)** — see [Limitations](#limitations) — as is normal for
+adapter conformance suites (e.g. dbt-iceberg does the same).
 
 ## License
 
