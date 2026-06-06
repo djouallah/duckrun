@@ -1,5 +1,8 @@
 def model(dbt, session):
-    dbt.config(materialized="incremental", incremental_strategy="append", schema="landing")
+    # merge (upsert), not append: the model returns the full log each run, so an upsert
+    # keyed on the file identity keeps the table idempotent and safe under concurrent runs
+    # (re-running a file replaces its row instead of duplicating it).
+    dbt.config(materialized="incremental", unique_key=["source_type", "source_filename"], incremental_strategy="merge", schema="landing")
 
     import os
     import io
@@ -15,7 +18,25 @@ def model(dbt, session):
     csv_log_path = root_path + "/csv_archive_log.parquet"
     download_limit = int(os.environ.get("download_limit", "2"))
     batch_size = 7
-    max_workers = 8
+    max_workers = 4          # keep concurrency modest to avoid AEMO rate-limiting
+    batch_pause_seconds = 2  # pause between batches to spread requests out
+
+    def sql_with_retry(query, attempts=4, base_delay=5):
+        """Run a session.sql that hits the network (the read_text listing fetches).
+        nemweb / the GitHub API occasionally throw a transient 403 or time out on a
+        slow connection; without a retry a single bad request kills the whole model.
+        Back off and retry before giving up."""
+        import time
+        for attempt in range(attempts):
+            try:
+                return session.sql(query)
+            except Exception as e:
+                if attempt == attempts - 1:
+                    raise
+                wait = base_delay * (2 ** attempt)
+                print(f"  WARN: listing fetch failed (attempt {attempt + 1}/{attempts}), "
+                      f"retrying in {wait}s: {str(e).splitlines()[0][:120]}", flush=True)
+                time.sleep(wait)
 
     # =========================================================================
     # Load existing log
@@ -74,9 +95,11 @@ def model(dbt, session):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (dbt-aemo)"})
         for attempt in range(3):
             try:
-                zip_bytes = urllib.request.urlopen(req, timeout=60).read()
+                zip_bytes = urllib.request.urlopen(req, timeout=120).read()
                 break
-            except urllib.error.HTTPError as e:
+            except Exception as e:
+                # Retry on transient HTTP errors AND slow-network timeouts
+                # (URLError / socket.timeout), not just HTTPError.
                 if attempt < 2:
                     import time; time.sleep(2 ** attempt)
                     continue
@@ -141,12 +164,18 @@ def model(dbt, session):
                     """)
             save_log()
 
+            # Throttle between batches so we don't burst requests at AEMO, which
+            # rate-limits (403s) and can then block the runner IP entirely.
+            if i + batch_size < len(files_to_process):
+                import time
+                time.sleep(batch_pause_seconds)
+
     # =========================================================================
     # DAILY REPORTS (SCADA + PRICE)
     # =========================================================================
 
     # Fetch file listing from AEMO
-    session.sql("""
+    sql_with_retry("""
         CREATE OR REPLACE TEMP TABLE daily_files_web AS
         WITH
           html_data AS (
@@ -173,7 +202,7 @@ def model(dbt, session):
 
     if aemo_new < download_limit:
         # Backfill from GitHub
-        session.sql("""
+        sql_with_retry("""
             INSERT INTO daily_files_web
             WITH
               api_responses AS (
@@ -216,7 +245,7 @@ def model(dbt, session):
     # INTRADAY SCADA
     # =========================================================================
 
-    session.sql("""
+    sql_with_retry("""
         CREATE OR REPLACE TEMP TABLE intraday_scada_web AS
         WITH
           html_data AS (
@@ -250,7 +279,7 @@ def model(dbt, session):
     # INTRADAY PRICE
     # =========================================================================
 
-    session.sql("""
+    sql_with_retry("""
         CREATE OR REPLACE TEMP TABLE intraday_price_web AS
         WITH
           html_data AS (
@@ -330,13 +359,23 @@ def model(dbt, session):
             os.makedirs(duid_dir, exist_ok=True)
 
         for source_type, source_filename, url, csv_filename in duid_sources:
-            session.sql(f"""
-                COPY (
-                    SELECT * FROM read_csv_auto('{url}',
-                        null_padding=true, ignore_errors=true
-                        {", header=true" if source_filename == "WA_ENERGY" else ""})
-                ) TO ('{csv_archive_path}/duid/{csv_filename}') (FORMAT CSV, HEADER)
-            """)
+            local_path = f"{csv_archive_path}/duid/{csv_filename}"
+            try:
+                session.sql(f"""
+                    COPY (
+                        SELECT * FROM read_csv_auto('{url}',
+                            null_padding=true, ignore_errors=true
+                            {", header=true" if source_filename == "WA_ENERGY" else ""})
+                    ) TO ('{local_path}') (FORMAT CSV, HEADER)
+                """)
+            except Exception as e:
+                # On a flaky/slow network, fall back to the already-downloaded copy
+                # rather than failing the whole model. Only possible on a local fs.
+                if not local_path.startswith(("az://", "abfss://")) and os.path.exists(local_path):
+                    print(f"  WARN: {source_filename} download failed, using existing "
+                          f"local file: {e}", flush=True)
+                else:
+                    raise
 
         # Delete old DUID log entries and re-insert
         session.sql("DELETE FROM _csv_archive_log WHERE source_type LIKE 'duid_%'")
