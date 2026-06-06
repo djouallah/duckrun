@@ -1,0 +1,35 @@
+name: conformance
+
+# Runs the official dbt adapter conformance suite (dbt-labs/dbt-adapters) against duckrun and
+# publishes a pass/fail report to the job summary. It is non-blocking: duckrun is a Delta-only
+# adapter, so a number of standard tests are expected not to pass — the value is the report,
+# not a green/red gate. Inspect the run summary to see exactly which suites pass.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  conformance:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + conformance deps (dbt-tests-adapter)
+        run: pip install -e ".[conformance]"
+
+      - name: Run official dbt adapter conformance suite (non-blocking)
+        continue-on-error: true
+        run: |
+          pytest tests/conformance --tb=no -rA -p no:cacheprovider \
+            --continue-on-collection-errors --junitxml=conformance.xml
+
+      - name: Publish pass/fail summary
+        if: always()
+        run: python tools/conformance_summary.py conformance.xml >> "$GITHUB_STEP_SUMMARY"

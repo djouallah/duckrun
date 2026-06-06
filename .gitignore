@@ -46,6 +46,12 @@ tests/*/
 .tmp
 .tmp/*/
 
+# ...but keep the committed conformance suite; only its runtime outputs are ignored.
+!tests/conformance/
+tests/conformance/_run.log
+tests/conformance/_report.xml
+conformance.xml
+
 # Ignore JSON files (Delta logs, test data, etc.)
 *.json
 
