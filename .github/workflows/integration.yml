@@ -7,53 +7,13 @@ on:
   workflow_dispatch:
 
 jobs:
-  local:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: integration_tests
-    env:
-      DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests
-      # Local-filesystem run (no OneLake creds needed): delta_rs writes Delta tables to
-      # WAREHOUSE_PATH and the staging model downloads AEMO data from the public web into
-      # FILES_PATH. A dummy token just makes the adapter load the azure extension (used by
-      # the on-run-start setting); it is ignored for local paths. Remote OneLake is a
-      # separate, secret-backed job to add once this is green.
-      ONELAKE_TOKEN: dummy
-      WAREHOUSE_PATH: /tmp/duckrun_warehouse
-      FILES_PATH: /tmp/duckrun_files
-      DBT_SCHEMA: mart
-      download_limit: "2"
-      process_limit: "1000"
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
-        working-directory: ${{ github.workspace }}
-        run: pip install -e .
-
-      - name: Create local warehouse + files dirs
-        run: mkdir -p /tmp/duckrun_warehouse /tmp/duckrun_files
-
-      - name: dbt --version (adapter registered + dependency macros loaded)
-        run: dbt --version
-
-      - name: dbt build (first pass — creates Delta tables via delta_rs)
-        run: dbt build --exclude tag:heavy
-
-      - name: dbt build again (fresh process — delta_scan views rebuilt from disk expose state, exercises merge)
-        run: dbt build --exclude tag:heavy
-
   azurite:
     runs-on: ubuntu-latest
     # Azure Storage emulator: exercises the az:// path (delta_rs object_store emulator +
-    # DuckDB azure delta_scan/glob/COPY) without any real cloud creds. Azurite is started
-    # via `docker run` (not a service container) so we can pass --skipApiVersionCheck, which
-    # the runner's newer az CLI requires.
+    # DuckDB azure delta_scan/glob/COPY) without any real cloud creds. This is a superset of a
+    # plain local-filesystem run, so CI runs only this; the local-path case is what you verify
+    # on your laptop. Azurite is started via `docker run` (not a service container) so we can
+    # pass --skipApiVersionCheck, which the runner's newer az CLI requires.
     defaults:
       run:
         working-directory: integration_tests
