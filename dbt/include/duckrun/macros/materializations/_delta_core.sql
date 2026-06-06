@@ -81,6 +81,13 @@
 
   {%- set columns = adapter.get_columns_in_relation(tmp_relation) -%}
 
+  {#-- microbatch batch bounds: dbt sets model.batch (a BatchContext) per batch run; the
+       values are UTC datetimes. Render them as naive 'YYYY-MM-DD HH:MM:SS' for the plugin's
+       delete+insert window. None for every non-microbatch model. --#}
+  {%- set _batch = model.get('batch') -%}
+  {%- set _batch_start = _batch.get('event_time_start').strftime('%Y-%m-%d %H:%M:%S') if _batch and _batch.get('event_time_start') else none -%}
+  {%- set _batch_end = _batch.get('event_time_end').strftime('%Y-%m-%d %H:%M:%S') if _batch and _batch.get('event_time_end') else none -%}
+
   {#-- 2. Hand off to the delta-write plugin (store -> write_deltalake / merge) --#}
   {%- set delta_config = {
       'incremental': is_incremental,
@@ -94,6 +101,10 @@
       'merge_exclude_columns': config.get('merge_exclude_columns'),
       'incremental_predicates': config.get('incremental_predicates') or config.get('predicates'),
       'on_schema_change': config.get('on_schema_change', 'ignore'),
+      'event_time': config.get('event_time'),
+      'batch_start': _batch_start,
+      'batch_end': _batch_end,
+      'invocation_id': invocation_id,
   } -%}
   {% do adapter.store_relation('duckrun', tmp_relation, columns, location, 'delta', delta_config) %}
 

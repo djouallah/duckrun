@@ -121,6 +121,41 @@ def write_delta(
             dt.cleanup_metadata()
 
 
+def delete_insert_window(
+    path: str,
+    data,
+    *,
+    column: str,
+    start: str,
+    end: str,
+    storage_options: Optional[Dict[str, str]] = None,
+    compaction_threshold: int = 100,
+) -> None:
+    """Microbatch delete+insert for one batch window: delete the rows already in
+    ``[start, end)`` on ``column``, then append ``data`` (the batch's rows).
+
+    This is the Delta-native equivalent of dbt's microbatch ``delete from target where
+    event_time in window; insert ...``. ``start``/``end`` are naive ``YYYY-MM-DD HH:MM:SS``
+    strings (UTC batch bounds from dbt). The column is cast to TIMESTAMP so the same
+    predicate works whether ``event_time`` is a DATE or a TIMESTAMP.
+    """
+    dt = _delta_table(path, storage_options)
+    # delta_rs parses this with datafusion and coerces the string literal to the column's
+    # type. Keep it CAST-free: delta_rs can't serialize a CAST expression back to a string
+    # ("Unable to convert expression to string"), which a wrapping CAST would trigger.
+    predicate = f"{column} >= '{start}' AND {column} < '{end}'"
+    dt.delete(predicate)
+
+    args = build_write_deltalake_args(path, data, "append", storage_options=storage_options)
+    write_deltalake(**args)
+
+    dt = _delta_table(path, storage_options)
+    if len(dt.file_uris()) > compaction_threshold:
+        dt.optimize.compact()
+        dt.vacuum(dry_run=False)
+        dt.cleanup_metadata()
+
+
 def merge_delta(
     path: str,
     data,

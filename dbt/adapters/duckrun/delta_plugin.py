@@ -28,6 +28,11 @@ class Plugin(BasePlugin):
         self._compaction_threshold: int = int(config.get("compaction_threshold", 100))
         self._conn = None
         self._cursor_handle = None
+        # Microbatch: remember which (invocation, path) pairs we've written this run, so a
+        # multi-batch --full-refresh truncates the table on its *first* batch only and appends
+        # the rest. Keyed by dbt's per-run invocation_id, so two runs in one process (the test
+        # harness / a notebook) don't see each other's batches.
+        self._microbatch_seen: set = set()
 
     def configure_connection(self, conn) -> None:
         # Stash the live DuckDB connection so store()/load() can use it later.
@@ -98,6 +103,15 @@ class Plugin(BasePlugin):
 
         exists = engine.table_exists(path, storage_options)
 
+        # Microbatch is delete+insert per event_time window, not a key-based upsert, so it
+        # bypasses the generic overwrite/merge dispatch below (which would clobber every batch
+        # under --full-refresh, since dbt marks each microbatch batch full_refresh in that case).
+        if incremental and strategy == "microbatch":
+            self._store_microbatch(
+                path, cur, name, cfg, storage_options, exists, full_refresh
+            )
+            return
+
         # Table-like (non-incremental) models always overwrite. Incremental models
         # overwrite on first run / full-refresh, then apply the incremental strategy.
         if not incremental or full_refresh or not exists:
@@ -149,6 +163,65 @@ class Plugin(BasePlugin):
             raise ValueError(
                 f"Unknown incremental_strategy '{strategy}'. "
                 "Use 'merge', 'insert', or 'append'."
+            )
+
+    def _store_microbatch(
+        self, path, cur, name, cfg, storage_options, exists, full_refresh
+    ) -> None:
+        """dbt ``incremental_strategy='microbatch'``: for the current batch window
+        ``[event_time_start, event_time_end)``, delete the rows already in that window and
+        insert the batch's rows — an idempotent delete+insert keyed on the event-time range.
+
+        dbt drives this by re-running the model once per batch with bounds it computes from
+        ``event_time`` / ``batch_size`` / ``begin`` / ``lookback`` and passes down via the
+        materialization macro (``batch_start`` / ``batch_end`` / ``invocation_id``).
+        """
+        # microbatch is range-based, not key-based; unique_key would be silently misleading.
+        if cfg.get("unique_key"):
+            raise CompilationError(
+                "incremental_strategy='microbatch' does not support 'unique_key'. "
+                "Microbatch deletes+inserts each batch by its 'event_time' window, not by key. "
+                "Remove 'unique_key' or use incremental_strategy='merge'."
+            )
+        event_time = cfg.get("event_time")
+        start = cfg.get("batch_start")
+        end = cfg.get("batch_end")
+        if not event_time:
+            raise CompilationError(
+                "microbatch incremental strategy requires an 'event_time' model config."
+            )
+        if not (start and end):
+            raise CompilationError(
+                "microbatch incremental strategy requires batch bounds "
+                "('event_time_start'/'event_time_end') in the run context."
+            )
+
+        # Re-filter the staged rows to this batch's window (dbt also filters the model's
+        # inputs, but this keeps the delete and the insert covering exactly the same range).
+        window = cur.sql(
+            f"SELECT * FROM {name} WHERE "
+            f"CAST({event_time} AS TIMESTAMP) >= CAST('{start}' AS TIMESTAMP) "
+            f"AND CAST({event_time} AS TIMESTAMP) < CAST('{end}' AS TIMESTAMP)"
+        )
+
+        # First batch of a --full-refresh run truncates; later batches (and every batch of a
+        # normal run) append into the window. A brand-new table is just created.
+        seen_key = (cfg.get("invocation_id"), path)
+        first_batch = seen_key not in self._microbatch_seen
+        self._microbatch_seen.add(seen_key)
+
+        if not exists or (full_refresh and first_batch):
+            engine.write_delta(
+                path, window, "overwrite",
+                storage_options=storage_options,
+                compaction_threshold=self._compaction_threshold,
+            )
+        else:
+            engine.delete_insert_window(
+                path, window,
+                column=event_time, start=start, end=end,
+                storage_options=storage_options,
+                compaction_threshold=self._compaction_threshold,
             )
 
     @staticmethod

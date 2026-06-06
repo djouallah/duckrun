@@ -58,7 +58,7 @@ INCREMENTAL_SUPPORT = [
     ("`partition_by`", "✅", "Delta partition columns"),
     ("`on_schema_change='sync_all_columns'`", "⚠️", "**add-only** — delta_rs can't drop columns"),
     ("`delete+insert`", "⚠️", "mapped to `merge` (not exact delete+insert semantics)"),
-    ("`microbatch` strategy", "❌", "not supported"),
+    ("`microbatch` strategy", "✅", "per-batch delete+insert on the `event_time` window (delta_rs delete + append)"),
     ("advanced merge clauses (conditions / set / returning / custom)", "❌", "dbt-duckdb-specific, not implemented"),
     ("constraints / DDL enforcement", "❌", "models are `delta_scan` views, not physical tables"),
 ]
