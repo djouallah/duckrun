@@ -14,16 +14,13 @@ authors = [
 requires-python = ">=3.9"
 dependencies = [
     "dbt-duckdb>=1.8",
-    # Cap below 1.5.0 on BOTH the reader and the writer of the Delta log:
-    #  - duckdb 1.5.x bundles a duckdb-delta extension that fails to read a valid log with
+    # Cap out the broken upstream Delta releases until they're fixed:
+    #  - duckdb 1.5.2+ bundles a duckdb-delta extension that fails to read a valid log with
     #    "Generic delta kernel error: No files in log segment" (https://github.com/duckdb/
-    #    duckdb-delta/issues). This is the read side (delta_scan).
-    #  - deltalake 1.5.0 has a matching delta-log regression where cleanup_metadata/vacuum
-    #    leaves an unreadable log. This is the write side.
-    # Both 1.5.x lines are broken, so exclude them until fixed upstream and a plain
-    # `pip install duckrun` gets a working read+write delta stack out of the box.
-    "duckdb>=1.4.4,<1.5.0",
-    "deltalake>=1.2.1,<1.5.0",
+    #    duckdb-delta/issues) — the read side (delta_scan); 1.5.1 is fine.
+    #  - deltalake 1.5.1+ has a matching delta-log regression — the write side; 1.5.0 is fine.
+    "duckdb>=1.4.4,<1.5.2",
+    "deltalake>=1.2.1,<1.5.1",
 ]
 
 [project.optional-dependencies]
