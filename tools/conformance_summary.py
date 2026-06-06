@@ -8,6 +8,13 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import Counter
 
+# The summary contains emoji; force UTF-8 so it prints on a Windows cp1252 console too
+# (GitHub runners are already UTF-8). Guarded for older Pythons without reconfigure().
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 
 def main(path: str) -> int:
     tree = ET.parse(path)
