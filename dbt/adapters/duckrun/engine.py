@@ -446,6 +446,7 @@ def merge_delta(
     predicates: Optional[List[str]] = None,
     merge_schema: bool = False,
     max_spill_size: Optional[int] = None,
+    streamed_exec: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> None:
     """
@@ -466,6 +467,14 @@ def merge_delta(
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
       join to disk instead of OOMing. None -> default to ~40% of RAM (_default_merge_spill_size);
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
+    - streamed_exec: delta_rs's flag for how it reads the source. Its default (True) STREAMS the
+      source and so cannot compute source statistics, which means it cannot derive an early
+      pruning predicate — it scans the *whole* target. We default it to False: collect the source
+      so delta_rs uses its min/max to prune target files to the ones the source can actually
+      touch. That's the right trade for the incremental pattern (small source, large target):
+      collecting a small delta is cheap and the prune avoids a full-target scan. For a merge whose
+      *source* is itself huge, pass streamed_exec=True (``merge_streamed_exec``) so it isn't
+      materialized — at the cost of no pruning.
     """
     keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
     conditions = [f"target.{k} = source.{k}" for k in keys]
@@ -491,6 +500,11 @@ def merge_delta(
         )
     else:
         logger.info("merge spill cap: disabled (memory limit undetectable or opted out) — merge runs unbounded")
+    logger.info(
+        "merge target pruning: "
+        + ("on (source stats derive an early filter)" if not streamed_exec
+           else "off (streamed_exec=True — source streamed, whole target scanned)")
+    )
 
     dt = _delta_table(path, storage_options)
     merger = dt.merge(
@@ -499,6 +513,7 @@ def merge_delta(
         source_alias="source",
         target_alias="target",
         merge_schema=merge_schema,
+        streamed_exec=streamed_exec,
         **spill_kwargs,
     )
     if insert_only:

@@ -158,6 +158,10 @@ class Plugin(BasePlugin):
             # Merge is the only path where DuckDB and the delta_rs pool peak together: tighten
             # DuckDB to its share so the two fit. (write/append above left it at the baseline.)
             engine.set_merge_memory_limit(cur)
+            # streamed_exec: default False so delta_rs collects the source and uses its stats to
+            # prune the target (right for small incremental deltas into a large table). A model
+            # whose source is itself huge can set merge_streamed_exec=true to stream it instead.
+            sx = cfg.get("merge_streamed_exec")
             engine.merge_delta(
                 path, data, unique_key,
                 insert_only=(strategy == "insert"),
@@ -166,6 +170,7 @@ class Plugin(BasePlugin):
                 predicates=self._merge_predicates(cfg),
                 merge_schema=evolve_schema,
                 max_spill_size=cfg.get("merge_max_spill_size"),
+                streamed_exec=(False if sx is None else bool(sx)),
                 storage_options=storage_options,
             )
         elif strategy == "append":
