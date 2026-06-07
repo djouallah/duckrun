@@ -272,7 +272,6 @@ job summary and rendered live into this README below — regenerated on every pu
 | `insert` (insert-only) | ✅ | insert new keys only (idempotent / dedupe) |
 | `merge_update_columns` | ✅ | update only the listed columns on match |
 | `merge_exclude_columns` | ✅ | update every column except the listed ones |
-| `merge_max_spill_size` | ✅ | RAM ceiling (bytes) for the merge; spills to disk beyond it. Defaults to ~80% of RAM |
 | `incremental_predicates` | ✅ | AND-ed into the merge condition (merge strategy) |
 | `on_schema_change='append_new_columns'` | ✅ | new columns added via delta_rs schema evolution |
 | `on_schema_change='fail'` | ✅ | raises if the model's columns drift from the table |
