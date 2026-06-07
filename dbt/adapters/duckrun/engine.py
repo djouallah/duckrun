@@ -84,8 +84,12 @@ def _available_ram_bytes() -> Optional[int]:
 
     On a busy shared box — a Fabric notebook sharing the node with the Spark runtime and a
     background DuckDB job — this sits far below *total* RAM, and it's the number the budget must
-    respect: total RAM would overcommit a process that doesn't own the whole node. Reached via
-    _startup_available_ram_bytes() so it's read once, at startup, before we allocate our own.
+    respect: total RAM would overcommit a process that doesn't own the whole node. Read FRESH on
+    every call (no startup snapshot): _effective_mem_limit_bytes() is sampled right before each
+    job (e.g. at the top of merge_delta, before the source relation is materialized), so the cap
+    reflects the memory actually free at that moment — after whatever earlier models, a Spark
+    runtime, or a background DuckDB job have already taken — instead of a stale value frozen at
+    connection setup.
     """
     # Linux: the kernel's own estimate, which already discounts reclaimable page cache.
     try:
@@ -98,30 +102,6 @@ def _available_ram_bytes() -> Optional[int]:
     # Windows: GlobalMemoryStatusEx -> ullAvailPhys.
     stat = _win_mem_status()
     return int(stat.ullAvailPhys) if stat else None
-
-
-# Captured ONCE, on first read (adapter connection setup, before any model runs), so the budget
-# reflects the runtime/background-job baseline — not memory we ourselves allocate later. Reading
-# available RAM at merge time would count DuckDB's own merge source against us and collapse the
-# spill cap (possibly below the data-dependent minimum, turning an OOM into "Resources exhausted").
-_AVAILABLE_AT_STARTUP: Optional[int] = None
-_AVAILABLE_CAPTURED: bool = False
-
-
-def _startup_available_ram_bytes() -> Optional[int]:
-    """_available_ram_bytes() captured once on first call; see the note above."""
-    global _AVAILABLE_AT_STARTUP, _AVAILABLE_CAPTURED
-    if not _AVAILABLE_CAPTURED:
-        _AVAILABLE_AT_STARTUP = _available_ram_bytes()
-        _AVAILABLE_CAPTURED = True
-    return _AVAILABLE_AT_STARTUP
-
-
-def _reset_mem_cache() -> None:
-    """Test hook: drop the captured startup-available reading so the next call re-reads."""
-    global _AVAILABLE_AT_STARTUP, _AVAILABLE_CAPTURED
-    _AVAILABLE_AT_STARTUP = None
-    _AVAILABLE_CAPTURED = False
 
 
 def _cgroup_mem_limit_bytes() -> Optional[int]:
@@ -171,16 +151,21 @@ def _cgroup_mem_limit_bytes() -> Optional[int]:
 
 
 def _effective_mem_limit_bytes() -> Optional[int]:
-    """The memory we may actually use: the tightest of physical RAM, the cgroup/container cap,
-    and the RAM that was actually free at startup (_startup_available_ram_bytes). None if none
+    """The memory we may actually use, recomputed FRESH on every call: the tightest of physical
+    RAM, the cgroup/container cap, and the RAM currently free (_available_ram_bytes). None if none
     of them can be determined.
 
-    The available-RAM term is what catches Fabric: there the cgroup is the unlimited *root*
+    Sampled per job (right before each merge, before its source is materialized) rather than once
+    at startup — so the cap tracks the memory actually free *now*, after earlier models / a Spark
+    runtime / a background DuckDB job have taken their share, instead of a stale connection-time
+    snapshot.
+
+    The available-RAM term is also what catches Fabric: there the cgroup is the unlimited *root*
     (`/proc/self/cgroup` = `0::/`, `memory.max` = `max`), so the cap would otherwise fall back to
     *total* node RAM — ignoring that the Spark runtime, the kernel, and any background DuckDB job
     already hold most of it. Available RAM reflects that pressure; total RAM does not."""
     vals = [v for v in (_total_ram_bytes(), _cgroup_mem_limit_bytes(),
-                        _startup_available_ram_bytes()) if v]
+                        _available_ram_bytes()) if v]
     return min(vals) if vals else None
 
 
@@ -189,11 +174,11 @@ def _effective_mem_limit_source() -> str:
     eff = _effective_mem_limit_bytes()
     if not eff:
         return "unknown"
-    avail = _startup_available_ram_bytes()
-    if avail and avail == eff:
+    avail = _available_ram_bytes()
+    if avail and avail <= eff:
         return "available RAM"
     cgroup = _cgroup_mem_limit_bytes()
-    if cgroup and cgroup == eff:
+    if cgroup and cgroup <= eff:
         return "cgroup/container limit"
     return "physical RAM"
 
