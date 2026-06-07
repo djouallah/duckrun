@@ -5,8 +5,8 @@ aemo_electricity:
       type: duckrun
       threads: 1
       schema: "{{ env_var('DBT_SCHEMA', 'mart') }}"
-      settings:
-        preserve_insertion_order: false
+      # NB: no `settings: {preserve_insertion_order: false}` here — duckrun sets that by
+      # default now (engine.configure_duckdb_memory), so large writes/merges don't OOM.
       # delta_rs writes land here as <root_path>/<schema>/<model> (arbitrary fs path).
       # Existing Delta tables are surfaced back as delta_scan views by the adapter, so
       # {{ this }} and is_incremental() resolve across separate dbt processes.

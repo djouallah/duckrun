@@ -167,18 +167,25 @@ def _parse_byte_size(text: Optional[str]) -> Optional[int]:
 
 
 def configure_duckdb_memory(con) -> None:
-    """Pin DuckDB's ``memory_limit`` to a cgroup-aware value and ensure it has a
-    ``temp_directory`` so it spills to disk instead of OOM-killing the container.
+    """Tune the DuckDB session for duckrun's Delta write path: a cgroup-aware ``memory_limit``
+    (+ a ``temp_directory`` to spill to), and ``preserve_insertion_order=false``.
 
-    DuckDB's own default is 80% of *physical* RAM, which in a container is the host's RAM —
-    far above the cgroup cap on Fabric/Spark/k8s. DuckDB produces the merge source in the same
-    process as the delta_rs merge pool, so it's the big consumer the merge's max_spill_size
-    can't see. We give it ``_DUCKDB_MEM_FRACTION`` of the effective limit (the merge gets
-    ``_MERGE_SPILL_FRACTION``; the two sum under 1.0).
+    memory_limit: DuckDB's own default is 80% of *physical* RAM, which in a container is the
+    host's RAM — far above the cgroup cap on Fabric/Spark/k8s. DuckDB produces the merge source
+    in the same process as the delta_rs merge pool, so it's the big consumer the merge's
+    max_spill_size can't see. We give it ``_DUCKDB_MEM_FRACTION`` of the effective limit (the
+    merge gets ``_MERGE_SPILL_FRACTION``; the two sum under 1.0). Only ever *tightened*, never
+    loosened — an explicit lower ``memory_limit`` in the dbt profile is preserved; no-op when
+    the limit is unknown (a plain host, where physical RAM is the real ceiling anyway).
 
-    We only ever *tighten* the limit, never loosen it — an explicit lower ``memory_limit`` in
-    the dbt profile is preserved. No-op (DuckDB keeps its default) when the limit is unknown,
-    e.g. on a plain host where physical RAM is the real ceiling anyway."""
+    preserve_insertion_order=false: with DuckDB's default (true), streaming a large result into
+    delta_rs makes DuckDB buffer the *whole* result to keep row order, which OOMs big writes /
+    merges. Delta tables are unordered and explicit ORDER BY still works, so duckrun turns it
+    off by default — users no longer need to set it in their profile ``settings``."""
+    try:
+        con.execute("SET preserve_insertion_order=false")
+    except Exception:
+        pass
     limit = _effective_mem_limit_bytes()
     if limit:
         target = int(limit * _DUCKDB_MEM_FRACTION)

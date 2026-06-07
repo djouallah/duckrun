@@ -94,7 +94,7 @@ class _FakeCon:
         if m:
             val = self._settings.get(m.group(1))
             return _FakeResult(val)
-        m = re.match(r"\s*SET (\w+)='([^']*)'", sql)
+        m = re.match(r"\s*SET (\w+)\s*=\s*'?([^']*?)'?\s*$", sql)
         if m:
             self.sets.append((m.group(1), m.group(2)))
             self._settings[m.group(1)] = m.group(2)
@@ -133,6 +133,16 @@ def test_configure_duckdb_memory_sets_temp_dir_when_empty(monkeypatch, tmp_path)
     con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ""})
     engine.configure_duckdb_memory(con)
     assert any(k == "temp_directory" for k, _ in con.sets)
+
+
+def test_configure_duckdb_memory_disables_preserve_insertion_order(monkeypatch):
+    """duckrun turns preserve_insertion_order off by default so large writes/merges (which
+    stream the whole result into delta_rs) don't make DuckDB buffer everything and OOM. Set
+    even when the memory limit is unknown — it's about the write path, not the cgroup."""
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: None)
+    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
+    engine.configure_duckdb_memory(con)
+    assert ("preserve_insertion_order", "false") in con.sets
 
 
 def test_configure_duckdb_memory_noop_when_limit_unknown(monkeypatch):
