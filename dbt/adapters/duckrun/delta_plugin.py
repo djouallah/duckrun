@@ -29,6 +29,10 @@ class Plugin(BasePlugin):
         self._compaction_threshold: int = int(config.get("compaction_threshold", 100))
         self._conn = None
         self._cursor_handle = None
+        # DuckDB's memory_limit as it stood when the connection was configured (profile value,
+        # or DuckDB's own default). Restored on the overwrite/append path so DuckDB manages its
+        # own memory; the merge path tightens it to DuckDB's split share instead.
+        self._baseline_memory_limit: Optional[str] = None
         # Microbatch: remember which (invocation, path) pairs we've written this run, so a
         # multi-batch --full-refresh truncates the table on its *first* batch only and appends
         # the rest. Keyed by dbt's per-run invocation_id, so two runs in one process (the test
@@ -43,12 +47,14 @@ class Plugin(BasePlugin):
             conn.execute("INSTALL delta; LOAD delta;")
         except Exception:
             pass
-        # Pin DuckDB's memory_limit to a cgroup-aware value (+ temp_directory) so DuckDB —
-        # the merge source producer, in this same process — spills to disk instead of OOM-
-        # killing the container. DuckDB's own default is 80% of *host* RAM, blind to the
-        # Fabric/Spark/k8s cgroup cap. Pairs with the merge's max_spill_size in engine.py.
+        # Always-on write-path tuning (preserve_insertion_order=false + a temp_directory to spill
+        # to). The DuckDB memory_limit is NOT touched here: a plain overwrite/append lets DuckDB
+        # manage its own memory; only the merge path tightens it (set_merge_memory_limit), pairing
+        # with the merge's max_spill_size. Capture the baseline limit (profile value or DuckDB's
+        # default) so the write path can restore it after a merge tightened the shared connection.
         try:
-            engine.configure_duckdb_memory(conn)
+            engine.configure_duckdb_session(conn)
+            self._baseline_memory_limit = engine.read_memory_limit(conn)
         except Exception:
             pass
         # If a bearer token was supplied in storage_options (e.g. OneLake/ADLS), mint a
@@ -101,6 +107,10 @@ class Plugin(BasePlugin):
         # Keep `cur` referenced for the whole write so the relation's Arrow stream
         # stays valid while deltalake consumes it.
         cur = self._cursor()
+        # Start every model with DuckDB's memory managing itself (the write-path default). Undoes
+        # any tightening a previous merge left on the shared connection; the merge branch below
+        # re-tightens. So the 0.3/0.6 split applies to merge ONLY — overwrite/append do nothing.
+        engine.restore_memory_limit(cur, self._baseline_memory_limit)
         name = self._relation_name(target_config.relation)
         data = cur.sql(f"SELECT * FROM {name}")
 
@@ -145,6 +155,9 @@ class Plugin(BasePlugin):
             evolve_schema = self._resolve_schema_change(
                 on_schema_change, path, data, storage_options
             )
+            # Merge is the only path where DuckDB and the delta_rs pool peak together: tighten
+            # DuckDB to its share so the two fit. (write/append above left it at the baseline.)
+            engine.set_merge_memory_limit(cur)
             engine.merge_delta(
                 path, data, unique_key,
                 insert_only=(strategy == "insert"),

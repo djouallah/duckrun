@@ -2,10 +2,11 @@
 
 delta_rs only builds a disk-spilling merge session when ``max_spill_size`` is set; otherwise
 the merge runs under an unbounded memory pool and can OOM on large upserts. duckrun defaults
-the cap to a fraction of the *effective* memory limit (min of physical RAM and the cgroup cap)
-and lets a model override it via ``merge_max_spill_size``. DuckDB itself — the merge source
-producer in the same process — is pinned to its own cgroup-aware share via
-``configure_duckdb_memory``. These tests pin that wiring down.
+the cap to a fraction of the *effective* memory limit (min of physical RAM, the cgroup cap, and
+currently-available RAM) and lets a model override it via ``merge_max_spill_size``. DuckDB itself
+— the merge source producer in the same process — is pinned to its own share via
+``set_merge_memory_limit`` on the merge path only (overwrite/append leave it to DuckDB via
+``configure_duckdb_session`` + ``restore_memory_limit``). These tests pin that wiring down.
 """
 import re
 
@@ -139,46 +140,64 @@ class _FakeResult:
         return (self._val,)
 
 
-def test_configure_duckdb_memory_tightens_host_default(monkeypatch):
-    """DuckDB's host-RAM default (way above the cgroup cap) gets pulled down to our share."""
+def test_configure_duckdb_session_disables_preserve_insertion_order():
+    """duckrun turns preserve_insertion_order off by default so large writes/merges (which
+    stream the whole result into delta_rs) don't make DuckDB buffer everything and OOM."""
+    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
+    engine.configure_duckdb_session(con)
+    assert ("preserve_insertion_order", "false") in con.sets
+
+
+def test_configure_duckdb_session_sets_temp_dir_when_empty(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ""})
+    engine.configure_duckdb_session(con)
+    assert any(k == "temp_directory" for k, _ in con.sets)
+
+
+def test_configure_duckdb_session_leaves_memory_limit_alone():
+    """The session setup must NOT touch memory_limit — overwrite/append let DuckDB manage its
+    own memory; only the merge path applies the split."""
+    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
+    engine.configure_duckdb_session(con)
+    assert not any(k == "memory_limit" for k, _ in con.sets)
+
+
+def test_set_merge_memory_limit_tightens_host_default(monkeypatch):
+    """Before a merge, DuckDB's host-RAM default gets pulled down to its split share."""
     monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
     con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
-    engine.configure_duckdb_memory(con)
+    engine.set_merge_memory_limit(con)
     target = int(16 * 2 ** 30 * engine._DUCKDB_MEM_FRACTION)
     assert ("memory_limit", f"{target}B") in con.sets
 
 
-def test_configure_duckdb_memory_preserves_lower_profile_limit(monkeypatch):
-    """An explicit, smaller memory_limit from the profile must not be loosened."""
+def test_set_merge_memory_limit_preserves_lower_profile_limit(monkeypatch):
+    """An explicit, smaller memory_limit from the profile must not be loosened, even for merge."""
     monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
     con = _FakeCon({"memory_limit": "2.0 GiB", "temp_directory": ".tmp"})
-    engine.configure_duckdb_memory(con)
+    engine.set_merge_memory_limit(con)
     assert not any(k == "memory_limit" for k, _ in con.sets)
 
 
-def test_configure_duckdb_memory_sets_temp_dir_when_empty(monkeypatch, tmp_path):
-    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
-    monkeypatch.chdir(tmp_path)
-    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ""})
-    engine.configure_duckdb_memory(con)
-    assert any(k == "temp_directory" for k, _ in con.sets)
-
-
-def test_configure_duckdb_memory_disables_preserve_insertion_order(monkeypatch):
-    """duckrun turns preserve_insertion_order off by default so large writes/merges (which
-    stream the whole result into delta_rs) don't make DuckDB buffer everything and OOM. Set
-    even when the memory limit is unknown — it's about the write path, not the cgroup."""
+def test_set_merge_memory_limit_noop_when_limit_unknown(monkeypatch):
+    """No cgroup/physical/available signal: leave DuckDB's own default alone."""
     monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: None)
     con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
-    engine.configure_duckdb_memory(con)
-    assert ("preserve_insertion_order", "false") in con.sets
+    engine.set_merge_memory_limit(con)
+    assert not any(k == "memory_limit" for k, _ in con.sets)
 
 
-def test_configure_duckdb_memory_noop_when_limit_unknown(monkeypatch):
-    """No cgroup/physical signal: leave DuckDB's own default alone."""
-    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: None)
-    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
-    engine.configure_duckdb_memory(con)
+def test_restore_memory_limit_sets_baseline():
+    """The write path restores DuckDB's baseline limit (undoing any prior merge tighten)."""
+    con = _FakeCon({"memory_limit": "1000000000B", "temp_directory": ".tmp"})
+    engine.restore_memory_limit(con, "8.0 GiB")
+    assert ("memory_limit", "8.0 GiB") in con.sets
+
+
+def test_restore_memory_limit_noop_when_baseline_unknown():
+    con = _FakeCon({"memory_limit": "1000000000B", "temp_directory": ".tmp"})
+    engine.restore_memory_limit(con, None)
     assert not any(k == "memory_limit" for k, _ in con.sets)
 
 
