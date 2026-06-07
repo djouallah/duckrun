@@ -19,6 +19,7 @@ the row count grew by exactly the inserts, and the updated rows carry the source
 measures. Exit 0 = all rounds completed and matched.
 """
 import argparse
+import glob
 import os
 import shutil
 import subprocess
@@ -190,7 +191,8 @@ def run(args):
 
     con = duckdb.connect()
     con.execute("INSTALL delta; LOAD delta;")
-    # Mirror the real duckrun connection: pin DuckDB's memory_limit (cgroup-aware) + temp dir.
+    # Mirror the real duckrun connection: duckrun's session tuning (cgroup-aware memory_limit +
+    # temp_directory + preserve_insertion_order=false) — the same call the dbt plugin makes.
     engine.configure_duckdb_memory(con)
     target_rows = con.execute(f"SELECT count(*) FROM read_parquet('{tgt_glob}')").fetchone()[0]
     eff = engine._effective_mem_limit_bytes()
@@ -213,12 +215,18 @@ def run(args):
         "rounds": args.rounds,
     }
 
-    # Build the target fact Delta table (memory-heavy; runs once, before the merges).
+    # Build the target fact Delta table part-by-part. Writing all ~120M rows in one
+    # write_deltalake holds the whole stream at once (no spill on the write path, unlike the
+    # merge) and OOM-kills the runner; appending one parquet part at a time bounds it.
     if os.path.exists(base):
         shutil.rmtree(base)
     t = time.time()
-    engine.write_delta(base, con.sql(f"SELECT * FROM read_parquet('{tgt_glob}')"), "overwrite")
-    print(f"   wrote target Delta ({len(DeltaTable(base).file_uris())} files) in {time.time()-t:.1f}s")
+    parts = sorted(glob.glob(os.path.join(target_dir, "lineitem", "*.parquet")))
+    for i, pf in enumerate(parts):
+        rel = con.sql(f"SELECT * FROM read_parquet('{pf.replace(os.sep, '/')}')")
+        engine.write_delta(base, rel, "overwrite" if i == 0 else "append")
+    print(f"   wrote target Delta from {len(parts)} parts "
+          f"({len(DeltaTable(base).file_uris())} files) in {time.time()-t:.1f}s")
 
     ok = True
     rounds_data = []
