@@ -248,6 +248,21 @@ def test_max_spill_size_explicit_is_forwarded(monkeypatch):
     assert captured["max_spill_size"] == 123_456
 
 
+def test_streamed_exec_defaults_to_false(monkeypatch):
+    """Default to collecting the source so delta_rs can derive an early prune predicate from its
+    stats (streamed_exec=True would stream it and scan the whole target)."""
+    captured = _spy(monkeypatch)
+    engine.merge_delta("target", _table([1]), "id")
+    assert captured["streamed_exec"] is False
+
+
+def test_streamed_exec_can_be_enabled(monkeypatch):
+    """A huge-source merge can opt back into streaming (no prune) so the source isn't collected."""
+    captured = _spy(monkeypatch)
+    engine.merge_delta("target", _table([1]), "id", streamed_exec=True)
+    assert captured["streamed_exec"] is True
+
+
 def test_max_spill_size_zero_disables_the_cap(monkeypatch):
     """0 (or any falsy non-None) opts out: the kwarg is omitted so delta_rs runs unbounded."""
     captured = _spy(monkeypatch)

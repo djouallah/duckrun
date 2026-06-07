@@ -100,6 +100,7 @@
       'merge_update_columns': config.get('merge_update_columns'),
       'merge_exclude_columns': config.get('merge_exclude_columns'),
       'merge_max_spill_size': config.get('merge_max_spill_size'),
+      'merge_streamed_exec': config.get('merge_streamed_exec'),
       'incremental_predicates': config.get('incremental_predicates') or config.get('predicates'),
       'on_schema_change': config.get('on_schema_change', 'ignore'),
       'event_time': config.get('event_time'),
