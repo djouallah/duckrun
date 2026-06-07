@@ -6,6 +6,8 @@ DuckDB relation straight through: deltalake 1.x consumes any object exposing the
 C-stream interface (``__arrow_c_stream__``), which DuckDB relations do — so there is no
 pyarrow dependency.
 """
+import ctypes
+import os
 from typing import Any, Dict, List, Optional
 
 from deltalake import DeltaTable, write_deltalake
@@ -27,6 +29,49 @@ def _writer_properties():
         except Exception:
             return None
     return None
+
+
+def _total_ram_bytes() -> Optional[int]:
+    """Total physical RAM in bytes, cross-platform; None if it can't be determined.
+
+    Note: reports *physical* RAM, not a cgroup/container memory limit — on a memory-capped
+    container 80% of this can still exceed the cap (see _default_merge_spill_size callers).
+    """
+    # POSIX (Linux, macOS): pages * page size.
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, AttributeError, OSError):
+        pass
+    # Windows: GlobalMemoryStatusEx -> ullTotalPhys.
+    try:
+        class _MemStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        stat = _MemStatusEx()
+        stat.dwLength = ctypes.sizeof(_MemStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return int(stat.ullTotalPhys)
+    except Exception:
+        pass
+    return None
+
+
+def _default_merge_spill_size() -> Optional[int]:
+    """delta_rs merge ``max_spill_size`` default: ~80% of physical RAM (mirrors DuckDB's
+    ``memory_limit``), so the merge spills to disk instead of OOMing. None if RAM is
+    unknown (then merge runs unbounded, as it did before)."""
+    total = _total_ram_bytes()
+    return int(total * 0.8) if total else None
 
 
 def build_write_deltalake_args(
@@ -166,6 +211,7 @@ def merge_delta(
     exclude_columns: Optional[List[str]] = None,
     predicates: Optional[List[str]] = None,
     merge_schema: bool = False,
+    max_spill_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> None:
     """
@@ -183,6 +229,9 @@ def merge_delta(
       ``merge_update_columns`` / ``merge_exclude_columns``.
     - merge_schema=True lets delta_rs evolve the table schema (new columns), backing
       ``on_schema_change='append_new_columns'`` / ``'sync_all_columns'``.
+    - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
+      join to disk instead of OOMing. None -> default to ~80% of RAM (_default_merge_spill_size);
+      pass 0 (or any falsy non-None) to disable the cap and run unbounded.
     """
     keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
     conditions = [f"target.{k} = source.{k}" for k in keys]
@@ -191,6 +240,13 @@ def merge_delta(
         conditions.extend(p for p in extra if p)
     predicate = " AND ".join(conditions)
 
+    if max_spill_size is None:
+        max_spill_size = _default_merge_spill_size()
+    # Only forward the kwarg when we have a positive cap: delta_rs builds a spilling session
+    # only when max_spill_size is set, so omitting it preserves the prior unbounded behavior
+    # (e.g. RAM undetectable, or caller explicitly passed 0 to opt out).
+    spill_kwargs = {"max_spill_size": max_spill_size} if max_spill_size else {}
+
     dt = _delta_table(path, storage_options)
     merger = dt.merge(
         source=data,
@@ -198,6 +254,7 @@ def merge_delta(
         source_alias="source",
         target_alias="target",
         merge_schema=merge_schema,
+        **spill_kwargs,
     )
     if insert_only:
         merger = merger.when_not_matched_insert_all()
