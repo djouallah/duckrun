@@ -65,23 +65,11 @@ conformance.xml
 # ...except dbt's auto-generated local user file
 integration_tests/.user.yml
 
-# Likewise keep the jaffle_shop project's seeds and dbt files (the gating CI fixtures)
-!jaffle_shop/**/*.csv
-!jaffle_shop/**/*.yml
-!jaffle_shop/**/*.json
-jaffle_shop/.user.yml
-
 # Delta output and dbt artifacts produced by the integration tests (runtime)
 integration_tests/warehouse/
 integration_tests/target/
 integration_tests/dbt_packages/
 integration_tests/logs/
-
-# Delta output and dbt artifacts produced by the jaffle_shop gating CI (runtime)
-jaffle_warehouse/
-jaffle_shop/target/
-jaffle_shop/dbt_packages/
-jaffle_shop/logs/
 
 # dbt logs written to the repo root (e.g. running dbt with --project-dir)
 logs/
