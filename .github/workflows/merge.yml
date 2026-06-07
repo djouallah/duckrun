@@ -7,8 +7,13 @@ name: merge-spill
 # is whether duckrun completes on the runner's real 16 GB RAM, with its shipping defaults on
 # (cgroup-aware DuckDB memory_limit + delta_rs merge spill). Runs against the pinned
 # deltalake 1.5.0 (1.6.0's merge is broken at scale).
+#
+# Expensive (~10 min), so it does NOT run on every push. It gates a release: the publish
+# workflow calls it (workflow_call) on a version tag and only publishes if it passes. Can
+# also be run by hand via workflow_dispatch.
 
 on:
+  workflow_call:
   workflow_dispatch:
     inputs:
       sf:
@@ -20,9 +25,6 @@ on:
       rounds:
         description: number of sequential incremental merges
         default: "3"
-  push:
-    branches: [main]
-  pull_request:
 
 jobs:
   merge-spill:

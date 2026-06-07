@@ -6,7 +6,12 @@ on:
       - 'v*'
 
 jobs:
+  # Gate: the expensive merge-spill test must pass before we publish a release.
+  merge-spill:
+    uses: ./.github/workflows/merge.yml
+
   publish:
+    needs: merge-spill
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
