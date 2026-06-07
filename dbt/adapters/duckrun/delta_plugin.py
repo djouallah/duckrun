@@ -144,6 +144,7 @@ class Plugin(BasePlugin):
                 exclude_columns=cfg.get("merge_exclude_columns"),
                 predicates=self._merge_predicates(cfg),
                 merge_schema=evolve_schema,
+                max_spill_size=cfg.get("merge_max_spill_size"),
                 storage_options=storage_options,
             )
         elif strategy == "append":

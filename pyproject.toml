@@ -19,8 +19,13 @@ dependencies = [
     #    "Generic delta kernel error: No files in log segment" (https://github.com/duckdb/
     #    duckdb-delta/issues) — the read side (delta_scan); 1.5.1 is fine.
     #  - deltalake 1.5.1+ has a matching delta-log regression — the write side; 1.5.0 is fine.
+    # The deltalake floor is 1.5.0 (not just a ceiling): 1.5.0 is the first release with
+    # MERGE disk-spill config (max_spill_size), which engine.merge_delta relies on to cap
+    # the merge's RAM and avoid OOM on large upserts. Combined with the <1.5.1 ceiling this
+    # pins exactly 1.5.0. Fabric preinstalls an older deltalake that satisfied the old floor,
+    # so this also forces the upgrade on `pip install duckrun` instead of needing a manual pin.
     "duckdb>=1.4.4,<1.5.2",
-    "deltalake>=1.2.1,<1.5.1",
+    "deltalake>=1.5.0,<1.5.1",
 ]
 
 [project.optional-dependencies]

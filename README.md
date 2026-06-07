@@ -152,6 +152,7 @@ The first run (or `--full-refresh`, or a missing table) overwrites. Later runs a
 | `unique_key`            | column(s) to merge on.                                                       |
 | `merge_update_columns`  | merge: update only these columns on match (others untouched).               |
 | `merge_exclude_columns` | merge: update all columns **except** these on match.                        |
+| `merge_max_spill_size`  | merge: RAM ceiling in **bytes** (not a disk budget). Defaults to ~80% of physical RAM; beyond it delta_rs spills the merge join to disk instead of OOMing (like DuckDB's `memory_limit`). Set `0` to disable the cap. Requires deltalake ≥ 1.5.0 (pinned). |
 | `incremental_predicates`| merge: extra predicates AND-ed into the merge condition (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). |
 | `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. (`sync_all_columns` only *adds* — delta_rs can't drop columns.) |
 | `partition_by`          | Delta partition column(s).                                                   |
@@ -271,6 +272,7 @@ job summary and rendered live into this README below — regenerated on every pu
 | `insert` (insert-only) | ✅ | insert new keys only (idempotent / dedupe) |
 | `merge_update_columns` | ✅ | update only the listed columns on match |
 | `merge_exclude_columns` | ✅ | update every column except the listed ones |
+| `merge_max_spill_size` | ✅ | RAM ceiling (bytes) for the merge; spills to disk beyond it. Defaults to ~80% of RAM |
 | `incremental_predicates` | ✅ | AND-ed into the merge condition (merge strategy) |
 | `on_schema_change='append_new_columns'` | ✅ | new columns added via delta_rs schema evolution |
 | `on_schema_change='fail'` | ✅ | raises if the model's columns drift from the table |
