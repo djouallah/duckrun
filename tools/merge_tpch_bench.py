@@ -376,8 +376,9 @@ def main():
     ap.add_argument("--sf", type=float, default=20.0, help="target fact table scale factor")
     ap.add_argument("--mixed-frac", type=float, default=0.01, dest="mixed_frac",
                     help="sample fraction for the mixed upsert scenario")
-    ap.add_argument("--insert-frac", type=float, default=0.25, dest="insert_frac",
-                    help="sample fraction for the insert-only scenario (~30M rows at SF=20)")
+    ap.add_argument("--insert-frac", type=float, default=0.10, dest="insert_frac",
+                    help="sample fraction for the insert-only scenario (a realistic incremental "
+                         "delta, ~6M rows at SF=10; not a 25%-of-table bulk load)")
     ap.add_argument("--update-frac", type=float, default=0.05, dest="update_frac",
                     help="sample fraction for the update-only scenario")
     ap.set_defaults(func=run)
