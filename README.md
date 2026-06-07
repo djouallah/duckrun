@@ -57,6 +57,19 @@ pip install duckrun
 
 That single install pulls in `dbt-duckdb` (and therefore `duckdb`) plus `deltalake`.
 
+> **On Microsoft Fabric notebooks**, `deltalake` is already imported by the runtime, so a
+> `pip install`/upgrade won't take effect until you restart the Python session. After
+> installing, run:
+>
+> ```python
+> %pip install -q duckrun --upgrade
+> notebookutils.session.restartPython()
+> ```
+>
+> duckrun pins `deltalake==1.5.0` (the first release with MERGE disk-spill, which bounds
+> merge memory — see `merge_max_spill_size`), so the restart is what actually swaps Fabric's
+> preinstalled `deltalake` for the pinned one.
+
 ## Configure your profile
 
 ```yaml
