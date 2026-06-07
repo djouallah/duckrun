@@ -22,11 +22,7 @@ on:
         default: "3"
   push:
     branches: [main]
-    paths:
-      - dbt/adapters/duckrun/engine.py
-      - dbt/adapters/duckrun/delta_plugin.py
-      - tools/merge_tpch_bench.py
-      - .github/workflows/merge.yml
+  pull_request:
 
 jobs:
   merge-spill:
