@@ -33,9 +33,24 @@ def test_total_ram_bytes_is_plausible():
     assert total > 256 * 1024 * 1024  # > 256 MiB
 
 
-def test_default_merge_spill_size_is_80_percent():
-    total = engine._total_ram_bytes()
-    assert engine._default_merge_spill_size() == int(total * 0.8)
+def test_cgroup_mem_limit_is_none_or_positive():
+    # No container limit on a dev box (returns None); inside a memory-capped cgroup it must
+    # be a sane positive value. Either way it must never raise.
+    lim = engine._cgroup_mem_limit_bytes()
+    assert lim is None or lim > 0
+
+
+def test_effective_limit_is_min_of_physical_and_cgroup():
+    eff = engine._effective_mem_limit_bytes()
+    phys = engine._total_ram_bytes()
+    cg = engine._cgroup_mem_limit_bytes()
+    expected = min([v for v in (phys, cg) if v]) if (phys or cg) else None
+    assert eff == expected
+
+
+def test_default_merge_spill_size_is_80_percent_of_effective_limit():
+    eff = engine._effective_mem_limit_bytes()
+    assert engine._default_merge_spill_size() == int(eff * 0.8)
 
 
 # ---------------------------------------------------------- kwarg forwarding

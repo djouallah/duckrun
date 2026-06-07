@@ -34,8 +34,8 @@ def _writer_properties():
 def _total_ram_bytes() -> Optional[int]:
     """Total physical RAM in bytes, cross-platform; None if it can't be determined.
 
-    Note: reports *physical* RAM, not a cgroup/container memory limit — on a memory-capped
-    container 80% of this can still exceed the cap (see _default_merge_spill_size callers).
+    This is *physical* RAM only; a container can be capped well below it — callers should
+    go through _effective_mem_limit_bytes(), which also folds in the cgroup limit.
     """
     # POSIX (Linux, macOS): pages * page size.
     try:
@@ -66,12 +66,70 @@ def _total_ram_bytes() -> Optional[int]:
     return None
 
 
+def _cgroup_mem_limit_bytes() -> Optional[int]:
+    """Memory limit imposed by the current cgroup (i.e. a container), or None if unlimited
+    or not on Linux. This is what matters on Fabric/Spark/k8s, where physical RAM is the
+    host's but the kernel OOM-kills us at the (much lower) container limit.
+
+    cgroup v2: the tightest finite ``memory.max`` walking up our cgroup to the root.
+    cgroup v1: ``memory/memory.limit_in_bytes`` (huge sentinel == unlimited)."""
+    # cgroup v2 (unified hierarchy): /proc/self/cgroup is a single "0::<relpath>" line.
+    try:
+        rel = None
+        with open("/proc/self/cgroup") as fh:
+            for line in fh:
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[0] == "0":
+                    rel = parts[2]
+                    break
+        if rel is not None:
+            base = "/sys/fs/cgroup"
+            cur = os.path.join(base, rel.lstrip("/"))
+            limits = []
+            while True:
+                try:
+                    with open(os.path.join(cur, "memory.max")) as fh:
+                        val = fh.read().strip()
+                    if val.isdigit():  # "max" (unlimited) is not a digit string
+                        limits.append(int(val))
+                except OSError:
+                    pass
+                if os.path.normpath(cur) == os.path.normpath(base):
+                    break
+                cur = os.path.dirname(cur)
+            if limits:
+                return min(limits)
+    except OSError:
+        pass
+    # cgroup v1.
+    try:
+        with open("/sys/fs/cgroup/memory/memory.limit_in_bytes") as fh:
+            val = int(fh.read().strip())
+        if 0 < val < 2 ** 62:  # v1 "unlimited" is ~2**63; reject it
+            return val
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _effective_mem_limit_bytes() -> Optional[int]:
+    """The memory we may actually use: min(physical RAM, cgroup/container limit). None if
+    neither can be determined."""
+    vals = [v for v in (_total_ram_bytes(), _cgroup_mem_limit_bytes()) if v]
+    return min(vals) if vals else None
+
+
 def _default_merge_spill_size() -> Optional[int]:
-    """delta_rs merge ``max_spill_size`` default: ~80% of physical RAM (mirrors DuckDB's
-    ``memory_limit``), so the merge spills to disk instead of OOMing. None if RAM is
-    unknown (then merge runs unbounded, as it did before)."""
-    total = _total_ram_bytes()
-    return int(total * 0.8) if total else None
+    """delta_rs merge ``max_spill_size`` default: ~80% of the *effective* memory limit
+    (min of physical RAM and the cgroup/container cap), mirroring DuckDB's ``memory_limit``
+    so the merge spills to disk instead of being OOM-killed. None if the limit is unknown
+    (then the merge runs unbounded, as it did before).
+
+    Caveat: this bounds delta_rs's merge *pool*, not the whole process — the Arrow source
+    and read buffers live outside it — so on a tight container with a large source the total
+    can still exceed the cap. Override per model with ``merge_max_spill_size`` if so."""
+    limit = _effective_mem_limit_bytes()
+    return int(limit * 0.8) if limit else None
 
 
 def build_write_deltalake_args(
