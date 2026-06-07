@@ -8,9 +8,13 @@ pyarrow dependency.
 """
 import ctypes
 import os
+import re
 from typing import Any, Dict, List, Optional
 
+from dbt.adapters.events.logging import AdapterLogger
 from deltalake import DeltaTable, write_deltalake
+
+logger = AdapterLogger("Duckrun")
 
 try:  # deltalake 1.x exposes WriterProperties at the top level
     from deltalake import WriterProperties
@@ -119,16 +123,17 @@ def _effective_mem_limit_bytes() -> Optional[int]:
     return min(vals) if vals else None
 
 
-# Fraction of the effective memory limit to hand delta_rs as the merge pool. Deliberately
-# below 1.0 to leave headroom for memory that sits *outside* the pool and still counts toward
-# a cgroup limit: the streamed source, Delta read buffers, and — on cgroup v2 — the page
-# cache of the spill files the merge writes. 0.7 survived a hard MemoryMax in CI where 0.8
-# left too little margin once that spill page cache grew.
-_MERGE_SPILL_FRACTION = 0.7
+# How the effective memory limit is split between the two big consumers that can peak at the
+# same time during a merge — DuckDB (producing the source relation) and delta_rs (the merge
+# pool). They share one cgroup cap, so the shares must sum *under* 1.0 or we've just moved the
+# OOM. 0.5 + 0.4 leaves ~10% slack for Python, Arrow buffers, and page cache. Each consumer
+# spills to disk past its share rather than OOM-killing the container.
+_DUCKDB_MEM_FRACTION = 0.5   # DuckDB's memory_limit (see configure_duckdb_memory)
+_MERGE_SPILL_FRACTION = 0.4  # delta_rs merge max_spill_size
 
 
 def _default_merge_spill_size() -> Optional[int]:
-    """delta_rs merge ``max_spill_size`` default: ~70% of the *effective* memory limit
+    """delta_rs merge ``max_spill_size`` default: ~40% of the *effective* memory limit
     (min of physical RAM and the cgroup/container cap), so the merge spills to disk instead
     of being OOM-killed. None if the limit is unknown (then the merge runs unbounded, as it
     did before).
@@ -138,6 +143,74 @@ def _default_merge_spill_size() -> Optional[int]:
     large source the total can still exceed the cap. Override with ``merge_max_spill_size``."""
     limit = _effective_mem_limit_bytes()
     return int(limit * _MERGE_SPILL_FRACTION) if limit else None
+
+
+# Units DuckDB emits from current_setting('memory_limit') (e.g. "25.0 GiB"). Binary (GiB) and
+# decimal (GB) both occur; bare "B"/"" is bytes.
+_BYTE_UNITS = {
+    "": 1, "B": 1,
+    "KIB": 2 ** 10, "MIB": 2 ** 20, "GIB": 2 ** 30, "TIB": 2 ** 40,
+    "KB": 10 ** 3, "MB": 10 ** 6, "GB": 10 ** 9, "TB": 10 ** 12,
+}
+
+
+def _parse_byte_size(text: Optional[str]) -> Optional[int]:
+    """Parse a DuckDB byte-size string ("25.0 GiB", "1073741824B", "0 bytes") to bytes;
+    None if it doesn't look like one."""
+    m = re.fullmatch(r"\s*([0-9]*\.?[0-9]+)\s*([A-Za-z]*)\s*", text or "")
+    if not m:
+        return None
+    unit = m.group(2).upper().rstrip("S")  # "bytes" -> "BYTE" -> "BYTE"; handle "B"/"BYTE"
+    unit = "B" if unit in ("B", "BYTE") else unit
+    mult = _BYTE_UNITS.get(unit)
+    return int(float(m.group(1)) * mult) if mult is not None else None
+
+
+def configure_duckdb_memory(con) -> None:
+    """Pin DuckDB's ``memory_limit`` to a cgroup-aware value and ensure it has a
+    ``temp_directory`` so it spills to disk instead of OOM-killing the container.
+
+    DuckDB's own default is 80% of *physical* RAM, which in a container is the host's RAM —
+    far above the cgroup cap on Fabric/Spark/k8s. DuckDB produces the merge source in the same
+    process as the delta_rs merge pool, so it's the big consumer the merge's max_spill_size
+    can't see. We give it ``_DUCKDB_MEM_FRACTION`` of the effective limit (the merge gets
+    ``_MERGE_SPILL_FRACTION``; the two sum under 1.0).
+
+    We only ever *tighten* the limit, never loosen it — an explicit lower ``memory_limit`` in
+    the dbt profile is preserved. No-op (DuckDB keeps its default) when the limit is unknown,
+    e.g. on a plain host where physical RAM is the real ceiling anyway."""
+    limit = _effective_mem_limit_bytes()
+    if limit:
+        target = int(limit * _DUCKDB_MEM_FRACTION)
+        try:
+            current = _parse_byte_size(
+                con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+            )
+        except Exception:
+            current = None
+        # Tighten only: skip when an explicit limit is already at/below our target.
+        if current is None or current > target:
+            try:
+                con.execute(f"SET memory_limit='{target}B'")
+                logger.info(
+                    f"DuckDB memory_limit set to {target / 2 ** 30:.2f} GiB "
+                    f"({int(_DUCKDB_MEM_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB effective limit)"
+                )
+            except Exception:
+                pass
+    # An in-memory DuckDB can default to an empty temp_directory and then *cannot* spill;
+    # give it one so the memory_limit above degrades to disk instead of an error.
+    try:
+        tmp = con.execute("SELECT current_setting('temp_directory')").fetchone()[0]
+    except Exception:
+        tmp = "skip"  # couldn't read it; don't risk overriding
+    if not tmp:
+        spill_dir = os.path.join(os.getcwd(), ".duckrun_duckdb_spill")
+        try:
+            os.makedirs(spill_dir, exist_ok=True)
+            con.execute(f"SET temp_directory='{spill_dir}'")
+        except Exception:
+            pass
 
 
 def build_write_deltalake_args(
@@ -296,7 +369,7 @@ def merge_delta(
     - merge_schema=True lets delta_rs evolve the table schema (new columns), backing
       ``on_schema_change='append_new_columns'`` / ``'sync_all_columns'``.
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
-      join to disk instead of OOMing. None -> default to ~80% of RAM (_default_merge_spill_size);
+      join to disk instead of OOMing. None -> default to ~40% of RAM (_default_merge_spill_size);
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
     """
     keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
@@ -312,6 +385,18 @@ def merge_delta(
     # only when max_spill_size is set, so omitting it preserves the prior unbounded behavior
     # (e.g. RAM undetectable, or caller explicitly passed 0 to opt out).
     spill_kwargs = {"max_spill_size": max_spill_size} if max_spill_size else {}
+
+    # Make the spill decision observable: this is the only way to confirm, from a normal dbt
+    # run, that the cgroup-aware cap is actually being applied (and what value it picked).
+    if spill_kwargs:
+        cgroup = _cgroup_mem_limit_bytes()
+        source = "cgroup/container limit" if cgroup and cgroup <= (_total_ram_bytes() or cgroup) else "physical RAM"
+        logger.info(
+            f"merge spill cap: {max_spill_size / 2**30:.2f} GiB "
+            f"({int(_MERGE_SPILL_FRACTION * 100)}% of {(_effective_mem_limit_bytes() or 0) / 2**30:.2f} GiB {source})"
+        )
+    else:
+        logger.info("merge spill cap: disabled (memory limit undetectable or opted out) — merge runs unbounded")
 
     dt = _delta_table(path, storage_options)
     merger = dt.merge(

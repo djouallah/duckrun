@@ -1,28 +1,30 @@
 name: merge-spill
 
-# Proves the Delta MERGE memory cap / disk-spill (engine.merge_delta max_spill_size) works
-# on real data: generate TPCH lineitem with DuckDB, then merge it through duckrun under a
-# hard memory cgroup. Without a cap the merge is OOM-killed; with the cap it spills to disk
-# and completes. The job writes a single summary table (Actions run page) so the result is
-# readable at a glance. Runs against the pinned deltalake 1.5.0 (1.6.0's merge is broken at
-# scale; the pyproject pin protects against it).
+# Rigorous incremental-MERGE smoke test on a big fact table: generate a large TPCH lineitem
+# (default SF=20, ~120M rows) as the target Delta table, then merge a small (~0.1%) sample with
+# randomized measures back into it THREE times (successive incremental loads), covering both
+# UPDATE (matched) and INSERT (key-shifted) branches. No artificial memory cgroup — the question
+# is whether duckrun completes on the runner's real 16 GB RAM, with its shipping defaults on
+# (cgroup-aware DuckDB memory_limit + delta_rs merge spill). Runs against the pinned
+# deltalake 1.5.0 (1.6.0's merge is broken at scale).
 
 on:
   workflow_dispatch:
     inputs:
       sf:
-        description: TPCH scale factor for lineitem
-        default: "1"
-      mem:
-        description: MemoryMax (cgroup hard limit) for the "under limit" scenarios
-        default: "4G"
-      cap:
-        description: explicit max_spill_size in bytes for the merge pool
-        default: "2684354560"   # 2.5 GiB
+        description: TPCH scale factor for the target fact table
+        default: "20"
+      sample_frac:
+        description: fraction of the fact sampled per incremental round
+        default: "0.001"
+      rounds:
+        description: number of sequential incremental merges
+        default: "3"
   push:
     branches: [main]
     paths:
       - dbt/adapters/duckrun/engine.py
+      - dbt/adapters/duckrun/delta_plugin.py
       - tools/merge_tpch_bench.py
       - .github/workflows/merge.yml
 
@@ -30,116 +32,48 @@ jobs:
   merge-spill:
     runs-on: ubuntu-latest
     env:
-      SF: ${{ github.event.inputs.sf || '1' }}
-      MEM: ${{ github.event.inputs.mem || '4G' }}
-      CAP: ${{ github.event.inputs.cap || '2684354560' }}
-      DIR: /tmp/mbench
+      SF: ${{ github.event.inputs.sf || '20' }}
+      SAMPLE_FRAC: ${{ github.event.inputs.sample_frac || '0.001' }}
+      ROUNDS: ${{ github.event.inputs.rounds || '3' }}
+      DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install duckrun + test deps
-        run: pip install -e ".[test]"
+      - name: Install duckrun + tpchgen-cli
+        run: |
+          pip install -e ".[test]"
+          pip install tpchgen-cli
 
-      - name: Show RAM / deltalake version (must be 1.5.0)
+      - name: Show RAM / disk / deltalake version (must be 1.5.0)
         run: |
           free -h
+          df -h /mnt /
           DLV=$(python -c "import deltalake; print(deltalake.__version__)")
           echo "deltalake $DLV"
           python -c "import deltalake,sys; sys.exit(0 if deltalake.__version__.startswith('1.5.') else 1)"
           echo "DLV=$DLV" >> "$GITHUB_ENV"
 
-      - name: Generate lineitem + source (unconstrained)
+      - name: Prepare big disk dir
+        run: sudo mkdir -p "$DIR" && sudo chown "$(id -u):$(id -g)" "$DIR"
+
+      - name: Generate fact + run incremental merges
+        # The bench writes the detailed, data-engineer-readable report straight to
+        # $GITHUB_STEP_SUMMARY on completion (pass or assertion-fail). We only add a fallback
+        # line here for the case where it dies before writing — i.e. OOM-killed (rc 137/139).
         run: |
-          out=$(python tools/merge_tpch_bench.py prepare --dir "$DIR" --sf "$SF")
-          echo "$out"
-          echo "ROWS=$(echo "$out" | grep -oP 'rows=\K[0-9,]+' | head -1)" >> "$GITHUB_ENV"
-
-      - name: Run merge-spill matrix + report
-        run: |
-          set -u
-          FAIL=0
-
-          human_bytes() {  # bytes -> "X.X GiB" / "X MiB"
-            local b=$1
-            if   [ "$b" -ge 1073741824 ]; then awk "BEGIN{printf \"%.1f GiB\", $b/1073741824}"
-            elif [ "$b" -ge 1048576 ];    then awk "BEGIN{printf \"%d MiB\", $b/1048576}"
-            else echo "${b} B"; fi
-          }
-          spill_label() {  # bench --spill arg -> human label
-            case "$1" in
-              off)     echo "disabled (unbounded)";;
-              default) echo "auto (~70% of limit)";;
-              *)       human_bytes "$1";;
-            esac
-          }
-
-          # Detect what the cgroup-aware default resolves to under MemoryMax, for the report.
-          DET=$(sudo systemd-run --scope -p MemoryMax=$MEM -p MemorySwapMax=0 \
-                  --uid=$(id -u) --gid=$(id -g) env "PATH=$PATH" python - <<'PY'
-          from dbt.adapters.duckrun import engine
-          print(f"{engine._cgroup_mem_limit_bytes()} {engine._effective_mem_limit_bytes()} {engine._default_merge_spill_size()}")
-          PY
-          )
-          read CG EFF DEFCAP <<<"$DET" || true
-
-          {
-            echo "## Merge-spill report"
-            echo
-            echo "What this checks: a Delta MERGE of **${ROWS} TPCH lineitem rows** through duckrun, on deltalake **${DLV}**."
-            echo "\`max_spill_size\` caps the merge's memory pool; above it delta_rs spills to disk instead of being OOM-killed."
-            echo
-            echo "- Memory limit (\`MemoryMax\`) = a hard cgroup cap on the whole process, like a container."
-            echo "- \`max_spill_size\` = the cap handed to the merge. \`auto\` = duckrun's default = ~70% of the detected limit."
-            echo "- Detected under MemoryMax=${MEM}: cgroup limit = $(human_bytes ${CG}), effective = $(human_bytes ${EFF}), auto cap = $(human_bytes ${DEFCAP})."
-            echo
-            echo "What good looks like: **disabled + no limit** = how much RAM the merge wants; under the limit it gets **💀 OOM-killed**;"
-            echo "with a cap (explicit or auto) it **✅ completes** at a much lower peak. That contrast is the whole point."
-            echo
-            echo "| # | Scenario | Memory limit | max_spill_size | Peak RSS | Result |"
-            echo "|---|----------|--------------|----------------|----------|--------|"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          N=0
-          run_scenario() {  # name, mem(or "none"), spill-arg, expect(ok|killed)
-            local name="$1" mem="$2" spill="$3" expect="$4"
-            N=$((N+1))
-            local cmd="python tools/merge_tpch_bench.py merge --dir $DIR --spill $spill"
-            local memlabel="none"
-            if [ "$mem" != "none" ]; then
-              cmd="sudo systemd-run --scope -p MemoryMax=$mem -p MemorySwapMax=0 --uid=$(id -u) --gid=$(id -g) env PATH=$PATH $cmd"
-              memlabel="$mem"
-            fi
-            echo "::group::scenario $N — $name"
-            set +e
-            out=$(eval "$cmd" 2>&1); rc=$?
-            set -e
-            echo "$out"
-            echo "::endgroup::"
-            local peak=$(echo "$out" | grep -oP 'peakRSS=\K[0-9]+' | tail -1)
-            [ -n "$peak" ] && peak="${peak} MB" || peak="—"
-            local result
-            if   [ $rc -eq 0 ]; then result="✅ completed"
-            elif [ $rc -eq 137 ] || [ $rc -eq 139 ]; then result="💀 OOM-killed"
-            else result="❌ error (rc=$rc)"; fi
-            echo "| $N | $name | $memlabel | $(spill_label "$spill") | $peak | $result |" >> "$GITHUB_STEP_SUMMARY"
-            case "$expect" in
-              ok)     [ $rc -eq 0 ] || { echo "::error::scenario $N '$name' expected success, got rc=$rc"; FAIL=1; };;
-              killed) { [ $rc -eq 137 ] || [ $rc -eq 139 ]; } || { echo "::error::scenario $N '$name' expected OOM-kill, got rc=$rc (try a higher sf)"; FAIL=1; };;
-            esac
-          }
-
-          run_scenario "Baseline: how much RAM the merge wants" none    off      ok
-          run_scenario "Explicit cap, no OS limit"             none    "$CAP"   ok
-          run_scenario "Unbounded, under the memory limit"     "$MEM"  off      killed
-          run_scenario "Explicit cap, under the memory limit"  "$MEM"  "$CAP"   ok
-          run_scenario "Auto (cgroup-aware) cap, under limit"  "$MEM"  default  ok
-
-          echo >> "$GITHUB_STEP_SUMMARY"
-          if [ $FAIL -ne 0 ]; then
-            echo "**Result: ❌ one or more scenarios did not behave as expected.**" >> "$GITHUB_STEP_SUMMARY"
-            exit 1
+          set -o pipefail
+          python tools/merge_tpch_bench.py --dir "$DIR" \
+            --sf "$SF" --sample-frac "$SAMPLE_FRAC" --rounds "$ROUNDS" ; rc=$?
+          if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
+            {
+              echo "## 🔀 Incremental MERGE test — duckrun on Delta Lake"
+              echo
+              echo "Merging a ~${SAMPLE_FRAC} sample into a SF=${SF} lineitem table ${ROUNDS}× on the runner's real RAM."
+              echo
+              echo "**Result: 💀 OOM-killed (rc=$rc)** — duckrun's defaults did not keep the merge under the runner's RAM."
+            } >> "$GITHUB_STEP_SUMMARY"
           fi
-          echo "**Result: ✅ the cap makes a merge that gets OOM-killed complete instead.**" >> "$GITHUB_STEP_SUMMARY"
+          exit $rc
