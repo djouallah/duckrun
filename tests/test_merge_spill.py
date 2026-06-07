@@ -10,20 +10,10 @@ producer in the same process — is pinned to its own cgroup-aware share via
 import re
 
 import pyarrow as pa
-import pytest
 
 from deltalake import DeltaTable
 
 from dbt.adapters.duckrun import engine
-
-
-@pytest.fixture(autouse=True)
-def _reset_mem_cache():
-    """The startup-available RAM reading is captured once in a module global; clear it around
-    every test so monkeypatched values take effect and don't leak between tests."""
-    engine._reset_mem_cache()
-    yield
-    engine._reset_mem_cache()
 
 
 def _table(ids):
@@ -61,22 +51,24 @@ def test_available_ram_bytes_is_plausible():
     assert 0 < avail <= engine._total_ram_bytes()
 
 
-def test_startup_available_is_captured_once(monkeypatch):
-    """The reading is anchored at startup: a later change in free RAM must not move it (else a
-    merge's own source would shrink its spill cap)."""
-    seq = iter([10 * 2 ** 30, 1 * 2 ** 30])
+def test_effective_limit_is_min_of_all_signals(monkeypatch):
+    # Pin the leaves so the assertion isn't racing two live samples of fluctuating free RAM.
+    monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 16 * 2 ** 30)
+    monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
+    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: 9 * 2 ** 30)
+    assert engine._effective_mem_limit_bytes() == 9 * 2 ** 30
+
+
+def test_effective_limit_recomputed_fresh_every_call(monkeypatch):
+    """The fix for the anchoring bug: the limit is sampled per call, NOT frozen at startup. As
+    free RAM drops between jobs (earlier models / a background DuckDB job took it), the cap must
+    drop with it — no stale connection-time snapshot."""
+    monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 32 * 2 ** 30)
+    monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
+    seq = iter([20 * 2 ** 30, 8 * 2 ** 30])  # free RAM at job 1, then less at job 2
     monkeypatch.setattr(engine, "_available_ram_bytes", lambda: next(seq))
-    first = engine._startup_available_ram_bytes()
-    second = engine._startup_available_ram_bytes()
-    assert first == second == 10 * 2 ** 30
-
-
-def test_effective_limit_is_min_of_all_signals():
-    eff = engine._effective_mem_limit_bytes()
-    sigs = [engine._total_ram_bytes(), engine._cgroup_mem_limit_bytes(),
-            engine._startup_available_ram_bytes()]
-    expected = min([v for v in sigs if v]) if any(sigs) else None
-    assert eff == expected
+    assert engine._effective_mem_limit_bytes() == 20 * 2 ** 30
+    assert engine._effective_mem_limit_bytes() == 8 * 2 ** 30
 
 
 def test_effective_limit_folds_in_available(monkeypatch):
@@ -89,9 +81,9 @@ def test_effective_limit_folds_in_available(monkeypatch):
     assert engine._effective_mem_limit_source() == "available RAM"
 
 
-def test_default_merge_spill_size_is_fraction_of_effective_limit():
-    eff = engine._effective_mem_limit_bytes()
-    assert engine._default_merge_spill_size() == int(eff * engine._MERGE_SPILL_FRACTION)
+def test_default_merge_spill_size_is_fraction_of_effective_limit(monkeypatch):
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
+    assert engine._default_merge_spill_size() == int(16 * 2 ** 30 * engine._MERGE_SPILL_FRACTION)
     assert 0 < engine._MERGE_SPILL_FRACTION < 1
 
 
@@ -223,6 +215,9 @@ def _spy(monkeypatch):
 
 
 def test_max_spill_size_defaults_to_effective_fraction(monkeypatch):
+    # Pin the limit so the forwarded cap can be compared exactly (free RAM is now sampled live
+    # on every call, so two unpinned reads would differ by a few KB and flake).
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
     captured = _spy(monkeypatch)
     engine.merge_delta("target", _table([1]), "id")
     assert captured["max_spill_size"] == engine._default_merge_spill_size()
