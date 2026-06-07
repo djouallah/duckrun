@@ -9,9 +9,21 @@ name: conformance
 # markers) and commits the result, so the README always reflects the latest run.
 
 on:
+  # Code-only: run when the adapter, deps/pins, or the conformance suite change — not on edits
+  # to docs or other workflows. Its own file is included so changes to it are still tested.
   push:
     branches: ["**"]
+    paths:
+      - 'dbt/**'
+      - 'pyproject.toml'
+      - 'tests/conformance/**'
+      - '.github/workflows/conformance.yml'
   pull_request:
+    paths:
+      - 'dbt/**'
+      - 'pyproject.toml'
+      - 'tests/conformance/**'
+      - '.github/workflows/conformance.yml'
   workflow_dispatch:
 
 permissions:

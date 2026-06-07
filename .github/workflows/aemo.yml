@@ -1,9 +1,21 @@
 name: aemo
 
 on:
+  # Code-only: run when the adapter, the integration_tests project, or deps/pins change — not
+  # on edits to docs or other workflows. Its own file is included so changes to it are tested.
   push:
     branches: ["**"]
+    paths:
+      - 'dbt/**'
+      - 'integration_tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/aemo.yml'
   pull_request:
+    paths:
+      - 'dbt/**'
+      - 'integration_tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/aemo.yml'
   workflow_dispatch:
 
 # Allow the deploy job to publish the generated dbt docs to GitHub Pages.
