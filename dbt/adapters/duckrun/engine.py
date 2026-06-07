@@ -185,11 +185,14 @@ def _effective_mem_limit_source() -> str:
 
 # How the effective memory limit is split between the two big consumers that can peak at the
 # same time during a merge — DuckDB (producing the source relation) and delta_rs (the merge
-# pool). They share one cgroup cap, so the shares must sum *under* 1.0 or we've just moved the
-# OOM. 0.5 + 0.4 leaves ~10% slack for Python, Arrow buffers, and page cache. Each consumer
-# spills to disk past its share rather than OOM-killing the container.
-_DUCKDB_MEM_FRACTION = 0.5   # DuckDB's memory_limit (see configure_duckdb_memory)
-_MERGE_SPILL_FRACTION = 0.4  # delta_rs merge max_spill_size
+# pool). They share one cap, so the shares must sum *under* 1.0 or we've just moved the OOM; each
+# consumer spills to disk past its share rather than OOM-killing the container. The merge gets the
+# larger share: when DuckDB is only *streaming* the merge source it needs far less than the merge's
+# hash-join pool, and starving that pool makes delta_rs raise "Resources exhausted" (the merge can't
+# fit its working set) — the opposite failure from an OOM. 0.35 + 0.5 leaves ~15% slack for Python,
+# Arrow buffers, and page cache.
+_DUCKDB_MEM_FRACTION = 0.35  # DuckDB's memory_limit (see configure_duckdb_memory)
+_MERGE_SPILL_FRACTION = 0.5  # delta_rs merge max_spill_size
 
 
 def _default_merge_spill_size() -> Optional[int]:
