@@ -1,6 +1,7 @@
 {{ config(
     materialized='incremental',
-    unique_key=['file', 'DUID', 'SETTLEMENTDATE','INTERVENTION'],
+    incremental_strategy='insert',
+    unique_key=['file'],
     pre_hook="SET VARIABLE scada_daily_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT file FROM {{ this }}){% endif %} LIMIT {{ env_var('process_limit', '1000') }}))"
 ) }}
 
