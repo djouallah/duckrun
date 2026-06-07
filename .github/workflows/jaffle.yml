@@ -47,3 +47,11 @@ jobs:
         # Block scalar so YAML doesn't read the '{...: ...}' vars as a nested mapping.
         run: |
           dbt build --vars '{jaffle_increment: true}'
+
+      - name: Test in a fresh process (local-filesystem delta_scan discovery)
+        # The local-filesystem analogue of the aemo abfss:// read-only gate. A standalone
+        # `dbt test` materializes nothing, so it only passes if the adapter re-registers every
+        # on-disk Delta table as a delta_scan view at run start — confirming cross-process
+        # discovery still works on a plain local path (DuckDB glob), not just on remote stores.
+        run: |
+          dbt test --vars '{jaffle_increment: true}'

@@ -43,6 +43,14 @@ class Plugin(BasePlugin):
             conn.execute("INSTALL delta; LOAD delta;")
         except Exception:
             pass
+        # Pin DuckDB's memory_limit to a cgroup-aware value (+ temp_directory) so DuckDB —
+        # the merge source producer, in this same process — spills to disk instead of OOM-
+        # killing the container. DuckDB's own default is 80% of *host* RAM, blind to the
+        # Fabric/Spark/k8s cgroup cap. Pairs with the merge's max_spill_size in engine.py.
+        try:
+            engine.configure_duckdb_memory(conn)
+        except Exception:
+            pass
         # If a bearer token was supplied in storage_options (e.g. OneLake/ADLS), mint a
         # matching DuckDB Azure secret so delta_scan() can read the tables. Same helper the
         # adapter uses before discovery, so the two paths can't drift. In a notebook where
