@@ -35,7 +35,7 @@ jobs:
       WAREHOUSE_PATH: abfss://duckrun@onelake.dfs.fabric.microsoft.com/dev.Lakehouse/Tables
       FILES_PATH: abfss://duckrun@onelake.dfs.fabric.microsoft.com/dev.Lakehouse/Files
       DBT_SCHEMA: mart
-      download_limit: "1"
+      download_limit: "10"
       process_limit: "1000"
       # DuckDB azure extension's default transport fails the TLS handshake to the OneLake
       # blob endpoint on the runner ("Problem with the SSL CA cert"); the curl transport
