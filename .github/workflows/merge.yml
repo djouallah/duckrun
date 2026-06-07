@@ -1,0 +1,93 @@
+name: merge-spill
+
+# Proves the Delta MERGE memory cap / disk-spill (engine.merge_delta max_spill_size) works
+# on real data: generate TPCH lineitem with DuckDB, then merge it through duckrun under a
+# hard memory cgroup. Without a cap the merge is OOM-killed; with the cap it spills to disk
+# and completes. Also asserts the default is cgroup-aware (sizes to the container, not the
+# host). Runs against the pinned deltalake 1.5.0 (1.6.0's merge is broken at scale; the
+# pyproject pin protects against it).
+
+on:
+  workflow_dispatch:
+    inputs:
+      sf:
+        description: TPCH scale factor for lineitem
+        default: "1"
+      mem:
+        description: MemoryMax for the capped merge (cgroup hard limit)
+        default: "4G"
+      cap:
+        description: explicit max_spill_size in bytes for the merge pool
+        default: "2684354560"   # 2.5 GiB
+  push:
+    branches: [main]
+    paths:
+      - dbt/adapters/duckrun/engine.py
+      - tools/merge_tpch_bench.py
+      - .github/workflows/merge.yml
+
+jobs:
+  merge-spill:
+    runs-on: ubuntu-latest
+    env:
+      SF: ${{ github.event.inputs.sf || '1' }}
+      MEM: ${{ github.event.inputs.mem || '4G' }}
+      CAP: ${{ github.event.inputs.cap || '2684354560' }}
+      DIR: /tmp/mbench
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps
+        run: pip install -e ".[test]"
+
+      - name: Show RAM / deltalake version (must be 1.5.0)
+        run: |
+          free -h
+          python - <<'PY'
+          import deltalake
+          v = deltalake.__version__
+          print("deltalake", v)
+          assert v.startswith("1.5."), f"expected pinned deltalake 1.5.x, got {v}"
+          PY
+
+      - name: Generate lineitem + source (unconstrained)
+        run: python tools/merge_tpch_bench.py prepare --dir "$DIR" --sf "$SF"
+
+      - name: Baseline — uncapped merge peak (informational)
+        run: python tools/merge_tpch_bench.py merge --dir "$DIR" --spill off
+
+      - name: GATE — explicit cap spills and succeeds (no OS limit)
+        run: python tools/merge_tpch_bench.py merge --dir "$DIR" --spill "$CAP"
+
+      - name: GATE — cgroup-aware default detects the container limit
+        run: |
+          sudo systemd-run --scope -p MemoryMax=$MEM -p MemorySwapMax=0 \
+            --uid=$(id -u) --gid=$(id -g) env "PATH=$PATH" python - <<'PY'
+          from dbt.adapters.duckrun import engine
+          eff = engine._effective_mem_limit_bytes()
+          cg = engine._cgroup_mem_limit_bytes()
+          dflt = engine._default_merge_spill_size()
+          print(f"cgroup_limit={cg} effective={eff} default_cap={dflt}")
+          gib = 1024**3
+          assert cg is not None and 3.5*gib < cg < 4.5*gib, f"cgroup not detected as ~4G: {cg}"
+          assert eff == cg, "effective should equal the (smaller) cgroup limit in a container"
+          PY
+
+      - name: GATE — capped merge survives a hard memory limit that kills the uncapped one
+        run: |
+          set -x
+          # Unbounded merge under the limit must be OOM-killed (non-zero exit).
+          if sudo systemd-run --scope -p MemoryMax=$MEM -p MemorySwapMax=0 \
+               --uid=$(id -u) --gid=$(id -g) env "PATH=$PATH" \
+               python tools/merge_tpch_bench.py merge --dir "$DIR" --spill off; then
+            echo "ERROR: uncapped merge unexpectedly survived MemoryMax=$MEM (raise sf)"; exit 1
+          else
+            echo "OK: uncapped merge was killed under MemoryMax=$MEM (expected)"
+          fi
+          # Same limit, explicit cap -> must spill to disk and complete.
+          sudo systemd-run --scope -p MemoryMax=$MEM -p MemorySwapMax=0 \
+            --uid=$(id -u) --gid=$(id -g) env "PATH=$PATH" \
+            python tools/merge_tpch_bench.py merge --dir "$DIR" --spill "$CAP"
