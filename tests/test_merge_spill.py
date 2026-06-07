@@ -10,10 +10,20 @@ producer in the same process — is pinned to its own cgroup-aware share via
 import re
 
 import pyarrow as pa
+import pytest
 
 from deltalake import DeltaTable
 
 from dbt.adapters.duckrun import engine
+
+
+@pytest.fixture(autouse=True)
+def _reset_mem_cache():
+    """The startup-available RAM reading is captured once in a module global; clear it around
+    every test so monkeypatched values take effect and don't leak between tests."""
+    engine._reset_mem_cache()
+    yield
+    engine._reset_mem_cache()
 
 
 def _table(ids):
@@ -44,12 +54,39 @@ def test_cgroup_mem_limit_is_none_or_positive():
     assert lim is None or lim > 0
 
 
-def test_effective_limit_is_min_of_physical_and_cgroup():
+def test_available_ram_bytes_is_plausible():
+    avail = engine._available_ram_bytes()
+    # Some RAM is always free on a live box; and it can't exceed physical RAM.
+    assert avail is not None
+    assert 0 < avail <= engine._total_ram_bytes()
+
+
+def test_startup_available_is_captured_once(monkeypatch):
+    """The reading is anchored at startup: a later change in free RAM must not move it (else a
+    merge's own source would shrink its spill cap)."""
+    seq = iter([10 * 2 ** 30, 1 * 2 ** 30])
+    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: next(seq))
+    first = engine._startup_available_ram_bytes()
+    second = engine._startup_available_ram_bytes()
+    assert first == second == 10 * 2 ** 30
+
+
+def test_effective_limit_is_min_of_all_signals():
     eff = engine._effective_mem_limit_bytes()
-    phys = engine._total_ram_bytes()
-    cg = engine._cgroup_mem_limit_bytes()
-    expected = min([v for v in (phys, cg) if v]) if (phys or cg) else None
+    sigs = [engine._total_ram_bytes(), engine._cgroup_mem_limit_bytes(),
+            engine._startup_available_ram_bytes()]
+    expected = min([v for v in sigs if v]) if any(sigs) else None
     assert eff == expected
+
+
+def test_effective_limit_folds_in_available(monkeypatch):
+    """Fabric case: cgroup is the unlimited root, physical RAM is the whole node, but most of it
+    is already in use — available RAM must be what bounds the budget."""
+    monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 16 * 2 ** 30)
+    monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
+    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: 6 * 2 ** 30)
+    assert engine._effective_mem_limit_bytes() == 6 * 2 ** 30
+    assert engine._effective_mem_limit_source() == "available RAM"
 
 
 def test_default_merge_spill_size_is_fraction_of_effective_limit():
@@ -205,7 +242,10 @@ def test_max_spill_size_zero_disables_the_cap(monkeypatch):
 
 
 def test_undetectable_ram_omits_the_cap(monkeypatch):
+    # No memory signal at all (physical, cgroup, available all undetectable) -> run unbounded.
     monkeypatch.setattr(engine, "_total_ram_bytes", lambda: None)
+    monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
+    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: None)
     captured = _spy(monkeypatch)
     engine.merge_delta("target", _table([1]), "id")
     assert "max_spill_size" not in captured

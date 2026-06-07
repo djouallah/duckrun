@@ -35,18 +35,9 @@ def _writer_properties():
     return None
 
 
-def _total_ram_bytes() -> Optional[int]:
-    """Total physical RAM in bytes, cross-platform; None if it can't be determined.
-
-    This is *physical* RAM only; a container can be capped well below it — callers should
-    go through _effective_mem_limit_bytes(), which also folds in the cgroup limit.
-    """
-    # POSIX (Linux, macOS): pages * page size.
-    try:
-        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
-    except (ValueError, AttributeError, OSError):
-        pass
-    # Windows: GlobalMemoryStatusEx -> ullTotalPhys.
+def _win_mem_status():
+    """GlobalMemoryStatusEx result (total + available physical RAM), or None off-Windows /
+    on failure. Shared by _total_ram_bytes and _available_ram_bytes."""
     try:
         class _MemStatusEx(ctypes.Structure):
             _fields_ = [
@@ -64,10 +55,73 @@ def _total_ram_bytes() -> Optional[int]:
         stat = _MemStatusEx()
         stat.dwLength = ctypes.sizeof(_MemStatusEx)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
-            return int(stat.ullTotalPhys)
+            return stat
     except Exception:
         pass
     return None
+
+
+def _total_ram_bytes() -> Optional[int]:
+    """Total physical RAM in bytes, cross-platform; None if it can't be determined.
+
+    This is *physical* RAM only; a container can be capped well below it, and on a shared box
+    most of it may already be in use — callers should go through _effective_mem_limit_bytes(),
+    which also folds in the cgroup limit and the RAM actually free at startup.
+    """
+    # POSIX (Linux, macOS): pages * page size.
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, AttributeError, OSError):
+        pass
+    # Windows: GlobalMemoryStatusEx -> ullTotalPhys.
+    stat = _win_mem_status()
+    return int(stat.ullTotalPhys) if stat else None
+
+
+def _available_ram_bytes() -> Optional[int]:
+    """Physical RAM the kernel reports as currently allocatable (free + reclaimable),
+    cross-platform; None if it can't be determined.
+
+    On a busy shared box — a Fabric notebook sharing the node with the Spark runtime and a
+    background DuckDB job — this sits far below *total* RAM, and it's the number the budget must
+    respect: total RAM would overcommit a process that doesn't own the whole node. Reached via
+    _startup_available_ram_bytes() so it's read once, at startup, before we allocate our own.
+    """
+    # Linux: the kernel's own estimate, which already discounts reclaimable page cache.
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024  # value is in kB
+    except (OSError, ValueError, IndexError):
+        pass
+    # Windows: GlobalMemoryStatusEx -> ullAvailPhys.
+    stat = _win_mem_status()
+    return int(stat.ullAvailPhys) if stat else None
+
+
+# Captured ONCE, on first read (adapter connection setup, before any model runs), so the budget
+# reflects the runtime/background-job baseline — not memory we ourselves allocate later. Reading
+# available RAM at merge time would count DuckDB's own merge source against us and collapse the
+# spill cap (possibly below the data-dependent minimum, turning an OOM into "Resources exhausted").
+_AVAILABLE_AT_STARTUP: Optional[int] = None
+_AVAILABLE_CAPTURED: bool = False
+
+
+def _startup_available_ram_bytes() -> Optional[int]:
+    """_available_ram_bytes() captured once on first call; see the note above."""
+    global _AVAILABLE_AT_STARTUP, _AVAILABLE_CAPTURED
+    if not _AVAILABLE_CAPTURED:
+        _AVAILABLE_AT_STARTUP = _available_ram_bytes()
+        _AVAILABLE_CAPTURED = True
+    return _AVAILABLE_AT_STARTUP
+
+
+def _reset_mem_cache() -> None:
+    """Test hook: drop the captured startup-available reading so the next call re-reads."""
+    global _AVAILABLE_AT_STARTUP, _AVAILABLE_CAPTURED
+    _AVAILABLE_AT_STARTUP = None
+    _AVAILABLE_CAPTURED = False
 
 
 def _cgroup_mem_limit_bytes() -> Optional[int]:
@@ -117,10 +171,31 @@ def _cgroup_mem_limit_bytes() -> Optional[int]:
 
 
 def _effective_mem_limit_bytes() -> Optional[int]:
-    """The memory we may actually use: min(physical RAM, cgroup/container limit). None if
-    neither can be determined."""
-    vals = [v for v in (_total_ram_bytes(), _cgroup_mem_limit_bytes()) if v]
+    """The memory we may actually use: the tightest of physical RAM, the cgroup/container cap,
+    and the RAM that was actually free at startup (_startup_available_ram_bytes). None if none
+    of them can be determined.
+
+    The available-RAM term is what catches Fabric: there the cgroup is the unlimited *root*
+    (`/proc/self/cgroup` = `0::/`, `memory.max` = `max`), so the cap would otherwise fall back to
+    *total* node RAM — ignoring that the Spark runtime, the kernel, and any background DuckDB job
+    already hold most of it. Available RAM reflects that pressure; total RAM does not."""
+    vals = [v for v in (_total_ram_bytes(), _cgroup_mem_limit_bytes(),
+                        _startup_available_ram_bytes()) if v]
     return min(vals) if vals else None
+
+
+def _effective_mem_limit_source() -> str:
+    """Which signal currently bounds _effective_mem_limit_bytes() — for the run-start log line."""
+    eff = _effective_mem_limit_bytes()
+    if not eff:
+        return "unknown"
+    avail = _startup_available_ram_bytes()
+    if avail and avail == eff:
+        return "available RAM"
+    cgroup = _cgroup_mem_limit_bytes()
+    if cgroup and cgroup == eff:
+        return "cgroup/container limit"
+    return "physical RAM"
 
 
 # How the effective memory limit is split between the two big consumers that can peak at the
@@ -134,9 +209,9 @@ _MERGE_SPILL_FRACTION = 0.4  # delta_rs merge max_spill_size
 
 def _default_merge_spill_size() -> Optional[int]:
     """delta_rs merge ``max_spill_size`` default: ~40% of the *effective* memory limit
-    (min of physical RAM and the cgroup/container cap), so the merge spills to disk instead
-    of being OOM-killed. None if the limit is unknown (then the merge runs unbounded, as it
-    did before).
+    (the tightest of physical RAM, the cgroup/container cap, and the RAM free at startup), so
+    the merge spills to disk instead of being OOM-killed. None if the limit is unknown (then the
+    merge runs unbounded, as it did before).
 
     Caveat: this bounds delta_rs's merge *pool*, not the whole process — the Arrow source,
     read buffers, and spill-file page cache live outside it — so on a tight container with a
@@ -171,12 +246,14 @@ def configure_duckdb_memory(con) -> None:
     (+ a ``temp_directory`` to spill to), and ``preserve_insertion_order=false``.
 
     memory_limit: DuckDB's own default is 80% of *physical* RAM, which in a container is the
-    host's RAM — far above the cgroup cap on Fabric/Spark/k8s. DuckDB produces the merge source
-    in the same process as the delta_rs merge pool, so it's the big consumer the merge's
-    max_spill_size can't see. We give it ``_DUCKDB_MEM_FRACTION`` of the effective limit (the
-    merge gets ``_MERGE_SPILL_FRACTION``; the two sum under 1.0). Only ever *tightened*, never
-    loosened — an explicit lower ``memory_limit`` in the dbt profile is preserved; no-op when
-    the limit is unknown (a plain host, where physical RAM is the real ceiling anyway).
+    host's RAM — far above what's actually free on Fabric/Spark/k8s. DuckDB produces the merge
+    source in the same process as the delta_rs merge pool, so it's the big consumer the merge's
+    max_spill_size can't see. We give it ``_DUCKDB_MEM_FRACTION`` of the effective limit — the
+    tightest of physical RAM, the cgroup cap, and the RAM free at startup (the last is what bounds
+    us on Fabric, whose cgroup is the unlimited root) — with the merge getting
+    ``_MERGE_SPILL_FRACTION``; the two sum under 1.0. Only ever *tightened*, never loosened — an
+    explicit lower ``memory_limit`` in the dbt profile is preserved; no-op when the limit is
+    unknown.
 
     preserve_insertion_order=false: with DuckDB's default (true), streaming a large result into
     delta_rs makes DuckDB buffer the *whole* result to keep row order, which OOMs big writes /
@@ -396,11 +473,10 @@ def merge_delta(
     # Make the spill decision observable: this is the only way to confirm, from a normal dbt
     # run, that the cgroup-aware cap is actually being applied (and what value it picked).
     if spill_kwargs:
-        cgroup = _cgroup_mem_limit_bytes()
-        source = "cgroup/container limit" if cgroup and cgroup <= (_total_ram_bytes() or cgroup) else "physical RAM"
         logger.info(
             f"merge spill cap: {max_spill_size / 2**30:.2f} GiB "
-            f"({int(_MERGE_SPILL_FRACTION * 100)}% of {(_effective_mem_limit_bytes() or 0) / 2**30:.2f} GiB {source})"
+            f"({int(_MERGE_SPILL_FRACTION * 100)}% of {(_effective_mem_limit_bytes() or 0) / 2**30:.2f} GiB "
+            f"{_effective_mem_limit_source()})"
         )
     else:
         logger.info("merge spill cap: disabled (memory limit undetectable or opted out) — merge runs unbounded")
