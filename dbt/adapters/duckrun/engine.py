@@ -119,17 +119,25 @@ def _effective_mem_limit_bytes() -> Optional[int]:
     return min(vals) if vals else None
 
 
-def _default_merge_spill_size() -> Optional[int]:
-    """delta_rs merge ``max_spill_size`` default: ~80% of the *effective* memory limit
-    (min of physical RAM and the cgroup/container cap), mirroring DuckDB's ``memory_limit``
-    so the merge spills to disk instead of being OOM-killed. None if the limit is unknown
-    (then the merge runs unbounded, as it did before).
+# Fraction of the effective memory limit to hand delta_rs as the merge pool. Deliberately
+# below 1.0 to leave headroom for memory that sits *outside* the pool and still counts toward
+# a cgroup limit: the streamed source, Delta read buffers, and — on cgroup v2 — the page
+# cache of the spill files the merge writes. 0.7 survived a hard MemoryMax in CI where 0.8
+# left too little margin once that spill page cache grew.
+_MERGE_SPILL_FRACTION = 0.7
 
-    Caveat: this bounds delta_rs's merge *pool*, not the whole process — the Arrow source
-    and read buffers live outside it — so on a tight container with a large source the total
-    can still exceed the cap. Override per model with ``merge_max_spill_size`` if so."""
+
+def _default_merge_spill_size() -> Optional[int]:
+    """delta_rs merge ``max_spill_size`` default: ~70% of the *effective* memory limit
+    (min of physical RAM and the cgroup/container cap), so the merge spills to disk instead
+    of being OOM-killed. None if the limit is unknown (then the merge runs unbounded, as it
+    did before).
+
+    Caveat: this bounds delta_rs's merge *pool*, not the whole process — the Arrow source,
+    read buffers, and spill-file page cache live outside it — so on a tight container with a
+    large source the total can still exceed the cap. Override with ``merge_max_spill_size``."""
     limit = _effective_mem_limit_bytes()
-    return int(limit * 0.8) if limit else None
+    return int(limit * _MERGE_SPILL_FRACTION) if limit else None
 
 
 def build_write_deltalake_args(

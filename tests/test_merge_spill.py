@@ -48,9 +48,10 @@ def test_effective_limit_is_min_of_physical_and_cgroup():
     assert eff == expected
 
 
-def test_default_merge_spill_size_is_80_percent_of_effective_limit():
+def test_default_merge_spill_size_is_fraction_of_effective_limit():
     eff = engine._effective_mem_limit_bytes()
-    assert engine._default_merge_spill_size() == int(eff * 0.8)
+    assert engine._default_merge_spill_size() == int(eff * engine._MERGE_SPILL_FRACTION)
+    assert 0 < engine._MERGE_SPILL_FRACTION < 1
 
 
 # ---------------------------------------------------------- kwarg forwarding
