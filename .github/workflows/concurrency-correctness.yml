@@ -9,7 +9,12 @@ name: concurrency-correctness
 # The job exits non-zero if either invariant is ever violated, so a regression blocks the PR.
 # Read the scorecard on the run's summary page. See repro/concurrency_correctness.py.
 on:
+  # The most important gate: run on EVERY pull request, and on every direct push to main
+  # (state lands on main directly here, so PR-only would miss those commits). No paths filter
+  # on purpose — concurrency correctness must hold regardless of what changed.
   pull_request:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 jobs:
