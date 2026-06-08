@@ -14,29 +14,22 @@ concurrency:
   group: publish
   cancel-in-progress: false
 
-# A release must pass the FULL set — conformance + aemo + merge-spill — before publishing, not
-# just merge-spill. Each is a reusable workflow run as a gate job here. Two things to know:
+# A release must pass conformance + merge-spill before publishing, not just merge-spill. Each is a
+# reusable workflow run as a gate job here. Two things to know:
 #  - A reusable workflow can only use permissions the CALLER grants, so each call job grants what
-#    that workflow declares (contents:write for the README-card commit; aemo's pages/id-token for
-#    its Azure-OIDC + Pages). Missing a grant fails validation at startup (it bit v0.3.9's first
-#    tag push). aemo also needs the Azure secrets, hence `secrets: inherit`.
-#  - These run on the TAG ref, where conformance's README commit and aemo's Pages deploy are
-#    already gated `if: github.ref == 'refs/heads/main'` — so on a release they only TEST, never
-#    write. And because conformance/aemo use static concurrency groups, a tag-time call queues
-#    behind any in-flight push-to-main run, so publish waits for them to finish.
+#    that workflow declares (contents:write for the README-card commit). Missing a grant fails
+#    validation at startup (it bit v0.3.9's first tag push).
+#  - These run on the TAG ref, where conformance's README commit is already gated
+#    `if: github.ref == 'refs/heads/main'` — so on a release it only TESTS, never writes. And
+#    because conformance uses a static concurrency group, a tag-time call queues behind any
+#    in-flight push-to-main run, so publish waits for it to finish.
+# aemo is deliberately NOT a release gate: it depends on live OneLake/AEMO data and so is prone to
+# transient infra failures that would needlessly block a publish. It still runs on its own.
 jobs:
   conformance:
     permissions:
       contents: write
     uses: ./.github/workflows/conformance.yml
-
-  aemo:
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    secrets: inherit
-    uses: ./.github/workflows/aemo.yml
 
   merge-spill:
     permissions:
@@ -44,7 +37,7 @@ jobs:
     uses: ./.github/workflows/merge.yml
 
   publish:
-    needs: [conformance, aemo, merge-spill]
+    needs: [conformance, merge-spill]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
