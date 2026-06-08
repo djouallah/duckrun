@@ -417,11 +417,12 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 The [`merge-spill`](.github/workflows/merge.yml) workflow builds a large TPCH `lineitem`
 fact table (the release gate runs scale factor **20**, ~120M rows) and runs four merge
 shapes against it — mixed upsert, insert-only, update-only, and an idempotent re-merge —
-plus a plain `append` and `overwrite` of the same batch, on a single machine with duckrun's
-shipping memory defaults (per-merge DuckDB `memory_limit` + delta_rs `max_spill_size` +
-target pruning). It proves the merges stay within the runner's RAM and apply every
-UPDATE/INSERT correctly, and lets you compare a MERGE's cost against a plain write of the
-same batch. It gates every release; the latest scorecard is rendered live below.
+plus a full-table (~120M-row) `append`, `safeappend`, and `overwrite` for comparison, on a
+single machine with duckrun's shipping memory defaults (per-merge DuckDB `memory_limit` +
+delta_rs `max_spill_size` + target pruning). It proves the merges stay within the runner's
+RAM and apply every UPDATE/INSERT correctly, and lets you compare a MERGE's scan+join cost
+against the cheap streaming write paths (which feed delta_rs a full-table batch over DuckDB's
+Arrow stream, no target scan). It gates every release; the latest scorecard is rendered live below.
 
 <!-- MERGE:START -->
 
