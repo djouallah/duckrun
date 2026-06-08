@@ -237,6 +237,26 @@ def _scenario_idempotent(con, base, source):
     }
 
 
+def _scenario_write(con, base_write, source, mode, before):
+    """Plain duckrun write (overwrite/append) of the same batch the merges use, on a scratch
+    table — so users can see how much faster a write is than a MERGE of the same row count
+    (a write just lands files; it never scans or joins the target). Returns the standard result
+    dict so it tabulates alongside the merge scenarios."""
+    src_rows = con.execute(f"SELECT count(*) FROM read_parquet('{source}')").fetchone()[0]
+    rel = con.sql(f"SELECT * FROM read_parquet('{source}')")
+    t = time.time()
+    engine.write_delta(base_write, rel, mode)
+    dt = time.time() - t
+    after = _count(base_write)
+    expected = src_rows if mode == "overwrite" else before + src_rows
+    return {
+        "name": f"{mode.capitalize()} (no merge)", "src": src_rows, "upd": 0, "ins": src_rows,
+        "before": before, "after": after, "expected": expected, "dt": dt,
+        "count_ok": after == expected, "verify_ok": True,
+        "verify": f"{mode} landed {src_rows:,} rows without scanning the target",
+    }
+
+
 def run(args):
     target_dir = os.path.join(args.dir, "target")
     base = os.path.join(args.dir, BASE)
@@ -296,8 +316,20 @@ def run(args):
         # be a no-op (idempotency). Keep last so that source still exists.
         _scenario_idempotent(con, base, source),
     ]
+    # For comparison: the same-size batch written with plain overwrite/append (no MERGE), on a
+    # scratch table so it doesn't disturb the merge target above. Shows how much cheaper a write
+    # is than a merge of identical row count — a write lands files, it never scans/joins the target.
+    base_write = os.path.join(args.dir, "writes")
+    if os.path.exists(base_write):
+        shutil.rmtree(base_write)
+    r_overwrite = _scenario_write(con, base_write, source, "overwrite", 0)
+    write_results = [
+        r_overwrite,
+        _scenario_write(con, base_write, source, "append", r_overwrite["after"]),
+    ]
+
     ok = True
-    for r in results:
+    for r in results + write_results:
         status = "OK" if (r["count_ok"] and r["verify_ok"]) else "FAIL"
         ok = ok and r["count_ok"] and r["verify_ok"]
         print(f"== [{status}] {r['name']}: {r['src']:,} rows "
@@ -312,14 +344,14 @@ def run(args):
     peak = _peak_rss_mb()
     final = _count(base)
     print(f"== done: final rows={final:,} (from {target_rows:,}) peakRSS={peak}MB ==")
-    _write_summary(setup, results, final, peak, ok)
+    _write_summary(setup, results, write_results, final, peak, ok)
     if not ok:
         sys.exit(2)
     print("OK: duckrun ran mixed / insert-only / update-only / idempotent merges on a big table "
           "correctly and survived.")
 
 
-def _write_summary(setup, results, final_rows, peak, all_ok):
+def _write_summary(setup, results, write_results, final_rows, peak, all_ok):
     """Append a data-engineer-readable report to $GITHUB_STEP_SUMMARY (no-op locally)."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -366,6 +398,17 @@ def _write_summary(setup, results, final_rows, peak, all_ok):
             f"{r['after']:,} | {r['expected']:,} | {'✅' if r['count_ok'] else '❌'} | "
             f"{'✅' if r['verify_ok'] else '❌'} | {r['dt']:.1f}s |")
     L.append("")
+    if write_results:
+        L.append("### Write path, for comparison (same batch, no MERGE)")
+        L.append("The identical row count written with a plain `overwrite` / `append` on a scratch "
+                 "table — a write only *lands files*, it never scans or joins the target, so it's "
+                 "far cheaper than a MERGE of the same size.")
+        L.append("")
+        L.append("| Operation | Rows written | Rows before | Rows after | Time |")
+        L.append("|---|---:|---:|---:|---:|")
+        for r in write_results:
+            L.append(f"| {r['name']} | {r['src']:,} | {r['before']:,} | {r['after']:,} | {r['dt']:.1f}s |")
+        L.append("")
     verdict = (f"**Result: ✅ all four scenarios correct.** Final table **{final_rows:,} rows**, "
                f"peak memory **{peak_s}** — duckrun stayed within the runner's RAM and every "
                f"update/insert landed as expected."

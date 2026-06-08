@@ -1,14 +1,14 @@
 name: merge-spill
 
 # Rigorous incremental-MERGE smoke test on a big fact table: generate a large TPCH lineitem
-# (gate runs SF=10, ~60M rows) as the target Delta table, then merge a small (~0.1%) sample with
-# randomized measures back into it THREE times (successive incremental loads), covering both
-# UPDATE (matched) and INSERT (key-shifted) branches. No artificial memory cgroup — the question
-# is whether duckrun completes on the runner's real 16 GB RAM, with its shipping defaults on
-# (cgroup-aware DuckDB memory_limit + delta_rs merge spill). SF=10 has enough headroom that
-# pass/fail is deterministic while the merge still genuinely spills (so the cap is exercised);
-# SF=20 (~120M rows) is ~the size of the runner's RAM and has no safe budget split on 16 GB, so
-# it's left as a dispatch-only stress run (workflow_dispatch input `sf`), not a release gate. Runs against the pinned
+# (gate runs SF=20, ~120M rows) as the target Delta table, then merge several incremental batches
+# back into it (mixed upsert, insert-only, update-only, idempotent), covering both UPDATE (matched)
+# and INSERT (key-shifted) branches, plus plain overwrite/append for comparison. No artificial
+# memory cgroup — the question is whether duckrun completes on the runner's real 16 GB RAM with its
+# shipping defaults on (per-merge DuckDB memory_limit + delta_rs merge spill cap + streamed_exec=
+# False so the merge prunes the target via source stats instead of scanning all ~120M rows). SF=20
+# is ~the size of the runner's RAM and only fits *because* of that pruning — it's the real stress
+# test. Override the scale with the workflow_dispatch `sf` input. Runs against the pinned
 # deltalake 1.5.0 (1.6.0's merge is broken at scale).
 #
 # Expensive (~10 min), so it does NOT run on every push. It gates a release: the publish
@@ -27,7 +27,7 @@ jobs:
   merge-spill:
     runs-on: ubuntu-latest
     env:
-      SF: ${{ github.event.inputs.sf || '10' }}
+      SF: ${{ github.event.inputs.sf || '20' }}
       DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4
