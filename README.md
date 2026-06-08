@@ -7,7 +7,7 @@
 [`delta_rs`](https://delta-io.github.io/delta-rs/) (the `deltalake` Python package).
 duckrun itself is just glue — it owns none of the heavy lifting. The real work is done
 by **DuckDB** (executes the SQL), **delta-rs** (writes the Delta table), **Arrow** (the
-zero-copy bridge that hands query results from DuckDB to delta-rs), and **dbt** (orchestrates
+zero-copy (kind of) bridge that hands query results from DuckDB to delta-rs), and **dbt** (orchestrates
 the DAG). DuckDB is here for convenience as the SQL engine; the materialization is all
 delta-rs and Arrow.
 
@@ -16,29 +16,8 @@ keep everything dbt-duckdb gives you — views, seeds, sources, tests, snapshots
 plugin ecosystem — and gain one extra thing: a Delta-backed `table` / `incremental`
 materialization that writes real Delta tables
 
-> ### Why a separate adapter instead of a PR to dbt-duckdb?
->
-> Writing Delta with delta_rs needs the `deltalake` package. dbt-duckdb deliberately
-> keeps a minimal dependency footprint and avoids external dependencies like this — for
-> very good reasons — so this doesn't belong upstream. duckrun keeps it isolated here
-> instead
->
-
-> ### Why not write with DuckDB's native Delta writer?
->
-> The project's direction seems to be writing through Unity Catalog, which is a non-starter:
-> the whole point of Delta is filesystem simplicity. Once you require a catalog, Iceberg makes
-> more sense — there are far more providers for it.
-
-> ### Why Delta and not Iceberg?
->
-> Iceberg writers still need time to mature. I built a POC and table maintenance is a blocker.
-
-> ### Why didn't you build this sooner?
->
-> Honest answer: I didn't know how awesome dbt is. I was living under a rock — so the old
-> `duckrun` (the `legacy` branch) was a bespoke orchestrator I hand-rolled myself. Sometimes
-> people build silly stuff because they don't know better :)
+The design rationale — why delta_rs and not DuckDB's native Delta writer, why Delta and not
+Iceberg, why a separate adapter — lives in [design_document.md](design_document.md).
 
 > ### 0.3.0 is a breaking change
 >

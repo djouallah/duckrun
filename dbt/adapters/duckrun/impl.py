@@ -5,7 +5,7 @@ State lives entirely in Delta Lake. Writes always go through delta_rs (see engin
 delta_plugin.py); DuckDB is only ever used to *read* (via ``delta_scan``) and to run model
 logic. Each existing Delta table is surfaced to dbt as a plain ``delta_scan`` view named to
 match ``database.schema.identifier`` so ``{{ this }}``, ``ref()`` and ``is_incremental()``
-resolve — with no ``delta_classic`` attach and no re-attach when a table is created.
+resolve, with no attach or re-attach when a table is created.
 """
 from dbt.adapters.base.meta import available
 from dbt.adapters.events.logging import AdapterLogger
