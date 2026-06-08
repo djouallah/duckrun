@@ -249,7 +249,8 @@ def _scenario_write(con, base, source, mode, before):
     dt = time.time() - t
     after = _count(base)
     expected = src_rows if mode == "overwrite" else before + src_rows
-    verify = (f"overwrite replaced the table with {src_rows:,} rows (vacuumed the old {before:,})"
+    verify = (f"overwrite replaced the table with {src_rows:,} rows "
+              f"(old {before:,}-row version kept for the 7-day vacuum window)"
               if mode == "overwrite"
               else f"appended {src_rows:,} rows to the {before:,}-row table — no target scan")
     return {
@@ -349,10 +350,20 @@ def run(args):
 
 
 def _write_summary(setup, results, final_rows, peak, all_ok):
-    """Append a data-engineer-readable report to $GITHUB_STEP_SUMMARY (no-op locally)."""
+    """Build the data-engineer-readable MERGE scorecard and emit it twice: append it to
+    $GITHUB_STEP_SUMMARY (no-op locally) and always write it to ``merge_card.md`` in the cwd,
+    which the merge-spill workflow injects into the README (between the MERGE markers)."""
+    card = _build_card(setup, results, final_rows, peak, all_ok)
+    with open("merge_card.md", "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(card + "\n")
     path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if not path:
-        return
+    if path:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(card + "\n")
+
+
+def _build_card(setup, results, final_rows, peak, all_ok) -> str:
+    """The MERGE scorecard as one Markdown string (shared by the step summary and the README)."""
     peak_s = f"{peak:,} MB" if peak is not None else "n/a"
     L = []
     L.append("## 🔀 Incremental MERGE test — duckrun on Delta Lake")
@@ -409,8 +420,7 @@ def _write_summary(setup, results, final_rows, peak, all_ok):
                if all_ok else
                "**Result: ❌ one or more operations were wrong** — see the ❌ cells above and the step log.")
     L.append(verdict)
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write("\n".join(L) + "\n")
+    return "\n".join(L)
 
 
 def main():

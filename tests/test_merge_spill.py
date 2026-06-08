@@ -226,6 +226,11 @@ class _FakeDeltaTable:
         self._captured.update(kwargs)
         return _FakeMerger()
 
+    def file_uris(self):
+        # Below the default compaction_threshold, so the post-merge maintenance block is
+        # skipped — these tests only care about the kwargs forwarded into .merge().
+        return []
+
 
 def _spy(monkeypatch):
     captured = {}
@@ -303,3 +308,41 @@ def test_merge_with_explicit_spill_size_upserts_correctly(tmp_path):
         max_spill_size=256 * 1024 * 1024,
     )
     assert _rows(path) == {1: 10, 2: 222, 3: 30}
+
+
+# ----------------------------------------------- post-merge maintenance
+
+def _commit_ops(path):
+    """The operation name of each commit in the table's history, newest first."""
+    return [c.get("operation") for c in DeltaTable(path).history()]
+
+
+def test_merge_compacts_and_vacuums_when_over_threshold(tmp_path):
+    """Past compaction_threshold, the merge path must compact + vacuum + cleanup like append —
+    so a merged-on-every-run table doesn't grow small files and tombstoned versions forever."""
+    path = str(tmp_path / "t")
+    engine.write_delta(path, _table([1, 2, 3]), "overwrite")
+    # Each merge adds a file; threshold=1 makes maintenance fire on this merge.
+    engine.merge_delta(
+        path,
+        pa.table({"id": pa.array([4], pa.int64()), "value": pa.array([40], pa.int64())}),
+        "id",
+        compaction_threshold=1,
+    )
+    # Data is still correct, and an OPTIMIZE commit was added (compaction ran).
+    assert _rows(path) == {1: 10, 2: 20, 3: 30, 4: 40}
+    assert any(op and "OPTIMIZE" in op.upper() for op in _commit_ops(path))
+
+
+def test_merge_skips_maintenance_under_threshold(tmp_path):
+    """A high threshold leaves the merge untouched — maintenance is gated, not unconditional."""
+    path = str(tmp_path / "t")
+    engine.write_delta(path, _table([1, 2, 3]), "overwrite")
+    engine.merge_delta(
+        path,
+        pa.table({"id": pa.array([4], pa.int64()), "value": pa.array([40], pa.int64())}),
+        "id",
+        compaction_threshold=1000,
+    )
+    assert _rows(path) == {1: 10, 2: 20, 3: 30, 4: 40}
+    assert not any(op and "OPTIMIZE" in op.upper() for op in _commit_ops(path))
