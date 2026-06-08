@@ -32,8 +32,6 @@ dependencies = [
 # Test-only; pyarrow is used to build reusable Arrow fixtures. Production duckrun stays
 # pyarrow-free (it streams DuckDB relations straight to deltalake).
 test = ["pytest>=7", "pyarrow"]
-# Spark OCC demonstration test only (heavy: pulls a JVM-backed engine). Kept out of `test`.
-spark = ["pyspark>=3.5", "delta-spark>=3.2"]
 # Official dbt adapter conformance suite (dbt-labs/dbt-adapters). Subclassed in
 # tests/conformance/ to run the standard adapter tests against duckrun.
 conformance = ["pytest>=7", "pyarrow", "dbt-tests-adapter"]
