@@ -1,0 +1,27 @@
+name: merge-snapshot-demo
+
+# Manual-only DEMONSTRATION (NOT a gate, never runs on push) of why duckrun's incremental
+# merge is correctness-safe under concurrent writes: DuckDB's source delta_scan always reads a
+# version >= the version delta-rs fixed for the merge target (same with no concurrency, ahead
+# under it, never before), in both streamed_exec modes. The only reachable gap makes the merge
+# FAIL loudly via delta-rs OCC (CommitFailedError) -- never a silent wrong result.
+# Run it from the Actions tab and read the printed matrix. See repro/merge_snapshot_safety.py.
+on:
+  workflow_dispatch:
+
+jobs:
+  demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (duckdb + deltalake + pyarrow)
+        run: pip install -e ".[test]"
+
+      - name: Demonstrate merge snapshot safety under concurrency
+        # Exit 0 = safety invariant holds (expected). Exit 1 = a run behaved unexpectedly.
+        run: python repro/merge_snapshot_safety.py
