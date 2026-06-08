@@ -101,4 +101,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add README.md
           git commit -m "docs: update MERGE scorecard in README [skip ci]"
-          git push
+          # main may have moved during the ~10 min run (this step is the only writer of the
+          # MERGE card, so rebasing can't conflict on it) — rebase before pushing so a race
+          # doesn't fail the job. Retry once in case another push lands in the rebase window.
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push && break
+            echo "push race (attempt $i), retrying"; sleep 3
+          done
