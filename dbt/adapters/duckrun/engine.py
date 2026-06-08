@@ -12,7 +12,8 @@ import re
 from typing import Any, Dict, List, Optional
 
 from dbt.adapters.events.logging import AdapterLogger
-from deltalake import DeltaTable, write_deltalake
+from deltalake import CommitProperties, DeltaTable, write_deltalake
+from deltalake.exceptions import CommitFailedError
 
 logger = AdapterLogger("Duckrun")
 
@@ -398,6 +399,64 @@ def write_delta(
             dt.optimize.compact()
             dt.vacuum(dry_run=False)
             dt.cleanup_metadata()
+
+
+def append_if_unchanged(
+    path: str,
+    data,
+    *,
+    read_version: Optional[int] = None,
+    partition_by: Optional[List[str]] = None,
+    merge_schema: bool = False,
+    storage_options: Optional[Dict[str, str]] = None,
+    compaction_threshold: int = 100,
+) -> None:
+    """
+    Optimistic ("safe") append: append ``data`` only if the table version has not moved since
+    we read it — otherwise refuse with ``CommitFailedError``.
+
+    delta_rs has no native conditional / compare-and-swap commit. A plain append normally
+    auto-rebases onto the latest version (appends are non-conflicting), so it can never fail on
+    a concurrent write. We instead pin the write to the snapshot we read — a ``DeltaTable``
+    loaded at ``read_version`` (or current HEAD) — and pass ``max_commit_retries=0`` so delta_rs
+    does NOT rebase: if any commit landed since that snapshot, the append's target version is
+    already taken and the commit fails. That is compare-and-swap on the table version.
+
+    Dedup is NOT performed — that is the model SQL's job. This only guarantees the append is
+    atomic with respect to the version it was computed against; on a conflict the caller should
+    re-run the model against the new HEAD. After a successful append, run the same threshold-
+    gated maintenance as the plain append path.
+    """
+    dt = _delta_table(path, storage_options)
+    if read_version is not None:
+        dt.load_as_version(read_version)
+    pinned = dt.version()
+
+    schema_mode = "merge" if merge_schema else None
+    args = build_write_deltalake_args(
+        path, data, "append",
+        schema_mode=schema_mode,
+        partition_by=partition_by,
+        storage_options=storage_options,
+    )
+    # Pin to the snapshot we read and disable rebasing so a concurrent commit fails the append
+    # instead of silently landing on top of it. storage_options live on the DeltaTable already.
+    args["table_or_uri"] = dt
+    args.pop("storage_options", None)
+    args["commit_properties"] = CommitProperties(max_commit_retries=0)
+    try:
+        write_deltalake(**args)
+    except CommitFailedError as e:
+        raise CommitFailedError(
+            f"safeappend: table '{path}' changed since version {pinned} "
+            f"(a concurrent write committed); append refused. Re-run the model."
+        ) from e
+
+    dt = _delta_table(path, storage_options)
+    if len(dt.file_uris()) > compaction_threshold:
+        dt.optimize.compact()
+        dt.vacuum(dry_run=False)
+        dt.cleanup_metadata()
 
 
 def delete_insert_window(

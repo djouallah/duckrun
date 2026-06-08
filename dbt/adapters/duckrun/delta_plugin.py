@@ -182,10 +182,21 @@ class Plugin(BasePlugin):
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,
             )
+        elif strategy == "safeappend":
+            # Optimistic append: commit only if the table version has not moved since we read it,
+            # else fail (so dbt errors and the orchestrator re-runs). No dedup — that's the SQL's
+            # job. Compare-and-swap via delta_rs max_commit_retries=0 (see engine).
+            engine.append_if_unchanged(
+                path, data,
+                partition_by=partition_by,
+                merge_schema=merge_schema,
+                storage_options=storage_options,
+                compaction_threshold=self._compaction_threshold,
+            )
         else:
             raise ValueError(
                 f"Unknown incremental_strategy '{strategy}'. "
-                "Use 'merge', 'insert', or 'append'."
+                "Use 'merge', 'insert', 'append', or 'safeappend'."
             )
 
     def _store_microbatch(

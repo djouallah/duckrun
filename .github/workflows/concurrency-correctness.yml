@@ -1,0 +1,31 @@
+name: concurrency-correctness
+
+# Required check on every PR (and runnable manually) proving duckrun's concurrency-correctness:
+#   A) MERGE snapshot safety — DuckDB's lazy source delta_scan always reads a version >= the one
+#      delta-rs fixed for the merge target (same, or ahead, never before), in both streamed_exec
+#      modes; the only reachable gap fails loudly via delta-rs OCC, never a silent wrong result.
+#   B) safeappend — appends only if the table version has not moved (compare-and-swap via
+#      max_commit_retries=0); a concurrent write makes it refuse instead of silently landing.
+# The job exits non-zero if either invariant is ever violated, so a regression blocks the PR.
+# Read the scorecard on the run's summary page. See repro/concurrency_correctness.py.
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  concurrency-correctness:
+    name: concurrency correctness
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (duckdb + deltalake + pyarrow)
+        run: pip install -e ".[test]"
+
+      - name: Prove concurrency correctness (merge snapshot safety + safeappend)
+        # Exit 0 = both invariants hold (expected). Exit 1 = a case behaved unexpectedly.
+        run: python repro/concurrency_correctness.py
