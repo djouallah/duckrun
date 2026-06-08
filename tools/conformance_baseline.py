@@ -1,0 +1,117 @@
+"""
+Baseline-diff gate for the dbt adapter conformance suite.
+
+duckrun is a Delta-only adapter, so a number of standard dbt conformance tests are *expected* not
+to pass — a plain green/red on the whole suite is meaningless. What we actually want to gate on is
+**regressions**: a test that passes on `main` must not start failing in a PR. Known-failing tests
+stay tolerated; only a previously-passing test going red blocks.
+
+The "currently passing on main" set lives in a committed baseline file (one `classname::name`
+per line). The conformance workflow keeps it current: every push to `main` regenerates it from
+that run (`update`); every PR checks against it (`check`).
+
+Usage:
+    # Fail (exit 1) if any test in the baseline is no longer passing in this run's junit:
+    python tools/conformance_baseline.py check <baseline.txt> <junit.xml>
+
+    # Rewrite the baseline from this run's passing tests (used on push to main):
+    python tools/conformance_baseline.py update <baseline.txt> <junit.xml>
+"""
+import sys
+import xml.etree.ElementTree as ET
+
+try:
+    sys.stdout.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
+HEADER = (
+    "# Conformance tests that PASS on main — the regression baseline.\n"
+    "# Auto-maintained by .github/workflows/conformance.yml on every push to main.\n"
+    "# A PR fails if any id below is no longer passing (see tools/conformance_baseline.py).\n"
+    "# Do not edit by hand.\n"
+)
+
+
+def _passing_ids(junit_path: str) -> set:
+    """The set of `classname::name` test ids that PASSED in a junit report (no failure/error/skip)."""
+    root = ET.parse(junit_path).getroot()
+    suites = root.findall("testsuite") if root.tag == "testsuites" else [root]
+    passing = set()
+    for suite in suites:
+        for case in suite.findall("testcase"):
+            if (case.find("failure") is None and case.find("error") is None
+                    and case.find("skipped") is None):
+                passing.add(f"{case.get('classname', '')}::{case.get('name', '')}")
+    return passing
+
+
+def _read_baseline(path: str):
+    """Return the set of baseline ids, or None if the baseline file does not exist yet."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return {ln.strip() for ln in fh if ln.strip() and not ln.startswith("#")}
+    except FileNotFoundError:
+        return None
+
+
+def _write_baseline(path: str, ids: set) -> None:
+    with open(path, "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(HEADER)
+        for tid in sorted(ids):
+            fh.write(tid + "\n")
+
+
+def check(baseline_path: str, junit_path: str) -> int:
+    baseline = _read_baseline(baseline_path)
+    passing = _passing_ids(junit_path)
+    if baseline is None:
+        print(f"No baseline at {baseline_path} yet (it is seeded on the next push to main) — "
+              f"nothing to gate on. {len(passing)} tests passing in this run.")
+        return 0
+    regressions = sorted(baseline - passing)
+    new_passes = sorted(passing - baseline)
+    if new_passes:
+        print(f"ℹ️  {len(new_passes)} test(s) now pass that aren't in the baseline yet "
+              f"(the baseline refreshes when this merges to main):")
+        for tid in new_passes:
+            print(f"    + {tid}")
+    if regressions:
+        print(f"\n❌ conformance REGRESSION — {len(regressions)} test(s) that pass on main are "
+              f"failing here:")
+        for tid in regressions:
+            print(f"    - {tid}")
+        print("\nFix the regression, or if the behaviour change is intentional, explain it — the "
+              "baseline only updates from a green main run.")
+        return 1
+    print(f"\n✅ no conformance regressions — all {len(baseline)} baseline tests still pass.")
+    return 0
+
+
+def update(baseline_path: str, junit_path: str) -> int:
+    passing = _passing_ids(junit_path)
+    before = _read_baseline(baseline_path)
+    _write_baseline(baseline_path, passing)
+    if before is None:
+        print(f"Seeded conformance baseline with {len(passing)} passing tests → {baseline_path}")
+    else:
+        added, dropped = sorted(passing - before), sorted(before - passing)
+        print(f"Updated conformance baseline → {len(passing)} passing "
+              f"(+{len(added)} / -{len(dropped)}).")
+        for tid in added:
+            print(f"    + {tid}")
+        for tid in dropped:
+            print(f"    - {tid}")
+    return 0
+
+
+def main(argv) -> int:
+    if len(argv) != 4 or argv[1] not in ("check", "update"):
+        print(__doc__)
+        return 2
+    cmd, baseline_path, junit_path = argv[1], argv[2], argv[3]
+    return check(baseline_path, junit_path) if cmd == "check" else update(baseline_path, junit_path)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

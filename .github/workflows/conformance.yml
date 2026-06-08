@@ -1,29 +1,21 @@
 name: conformance
 
-# Runs the official dbt adapter conformance suite (dbt-labs/dbt-adapters) against duckrun and
-# publishes a pass/fail report to the job summary. It is non-blocking: duckrun is a Delta-only
-# adapter, so a number of standard tests are expected not to pass — the value is the report,
-# not a green/red gate. Inspect the run summary to see exactly which suites pass.
-#
-# On pushes to `main` it also renders the card live into README.md (between the CONFORMANCE
-# markers) and commits the result, so the README always reflects the latest run.
+# Runs the official dbt adapter conformance suite (dbt-labs/dbt-adapters) against duckrun. This is
+# a REQUIRED check on every PR, gated on REGRESSIONS only: duckrun is a Delta-only adapter, so a
+# number of standard tests are *expected* not to pass — what must not happen is a test that passes
+# on main starting to fail. The "passing on main" set lives in tests/conformance/passing_baseline.txt
+# and is auto-maintained here:
+#   - on every PR:   run the suite, fail iff a baseline test regressed (tools/conformance_baseline.py)
+#   - on push main:  run the suite, refresh the baseline + render the card into README, commit both
+# It also publishes the at-a-glance pass/fail card to the job summary every run.
 
 on:
-  # Code-only: run when the adapter, deps/pins, or the conformance suite change — not on edits
-  # to docs or other workflows. Its own file is included so changes to it are still tested.
-  push:
-    branches: ["**"]
-    paths:
-      - 'dbt/**'
-      - 'pyproject.toml'
-      - 'tests/conformance/**'
-      - '.github/workflows/conformance.yml'
+  # REQUIRED check, so it must run and report on EVERY pull request (a paths-filtered run never
+  # reports, leaving the required check stuck "Expected"). The job always runs; the expensive
+  # install + suite self-skip on docs-only changes and the job still reports green.
   pull_request:
-    paths:
-      - 'dbt/**'
-      - 'pyproject.toml'
-      - 'tests/conformance/**'
-      - '.github/workflows/conformance.yml'
+  push:
+    branches: [main]
   workflow_dispatch:
   # Lets the publish workflow run this as a release gate (publish.yml).
   workflow_call:
@@ -33,8 +25,8 @@ permissions:
 
 # Serialize: at most one conformance run at a time, queue the rest (no cancel). A STATIC group
 # (not keyed by ref) is what makes a release tag's publish-called run wait behind an in-flight
-# push-to-main run, instead of racing it — the README card commit on main can't tolerate two at
-# once (the second push would be a non-fast-forward).
+# push-to-main run, instead of racing it — the README card + baseline commits on main can't
+# tolerate two at once (the second push would be a non-fast-forward).
 concurrency:
   group: conformance
   cancel-in-progress: false
@@ -44,38 +36,85 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Need history to diff what changed (docs-only self-skip) and to commit back to main.
+          fetch-depth: 0
+
+      # The conformance result is a property of the code, not the docs. If a change touches nothing
+      # but Markdown, skip the (multi-minute) install + suite and report green — the required check
+      # is still satisfied and a docs change can't regress conformance. Any non-.md change runs it.
+      - name: Detect whether code changed (vs docs-only)
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change — skipping the conformance suite."
+          fi
 
       - uses: actions/setup-python@v5
+        if: steps.changes.outputs.code == 'true'
         with:
           python-version: '3.11'
 
       - name: Install duckrun + conformance deps (dbt-tests-adapter)
+        if: steps.changes.outputs.code == 'true'
         run: pip install -e ".[conformance]"
 
-      - name: Run official dbt adapter conformance suite (non-blocking)
+      - name: Run official dbt adapter conformance suite
+        if: steps.changes.outputs.code == 'true'
+        # Per-test pass/fail is informational (duckrun can't pass every standard test); the gate is
+        # the baseline-diff step below. continue-on-error so a known failure doesn't stop the job
+        # before we render the card and run the regression check.
         continue-on-error: true
         run: |
           pytest tests/conformance --tb=no -rA -p no:cacheprovider \
             --continue-on-collection-errors --junitxml=conformance.xml
 
       - name: Render conformance card
-        if: always()
+        if: always() && steps.changes.outputs.code == 'true'
         run: python tools/conformance_summary.py conformance.xml > conformance_card.md
 
       - name: Publish pass/fail summary
-        if: always()
+        if: always() && steps.changes.outputs.code == 'true'
         run: cat conformance_card.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Render card into README and commit (main only)
-        if: always() && github.ref == 'refs/heads/main'
+      # THE GATE (PRs): fail iff a test that passes on main is no longer passing here. Known-failing
+      # tests are tolerated; new passes never block. No-op (green) until the baseline is seeded by
+      # the first push to main. This is the required-check teeth — no continue-on-error.
+      - name: Gate on conformance regressions (baseline diff)
+        if: steps.changes.outputs.code == 'true' && github.event_name != 'push'
+        run: python tools/conformance_baseline.py check tests/conformance/passing_baseline.txt conformance.xml
+
+      # On push to main: refresh the baseline from this (authoritative) run and render the card into
+      # README, then commit both. The PR gate above always compares against this. [skip ci] avoids
+      # re-triggering. Never fails the push on a commit hiccup.
+      - name: Refresh baseline + render card into README and commit (main only)
+        if: always() && steps.changes.outputs.code == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
         run: |
+          python tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml
           python tools/inject_readme.py README.md conformance_card.md CONFORMANCE
-          if git diff --quiet -- README.md; then
-            echo "README conformance card unchanged."
+          if git diff --quiet -- README.md tests/conformance/passing_baseline.txt; then
+            echo "Conformance card + baseline unchanged."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add README.md
-          git commit -m "docs: update conformance card in README [skip ci]"
-          git push
+          git add README.md tests/conformance/passing_baseline.txt
+          git commit -m "docs: refresh conformance card + baseline [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            echo "push race (attempt $i), retrying"; sleep 3
+          done
