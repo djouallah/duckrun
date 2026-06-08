@@ -6,6 +6,8 @@
     - merge  (default when unique_key set): upsert on unique_key
     - insert : insert only new keys (idempotent append / dedupe), requires unique_key
     - append (default when no unique_key): blind append
+    - safeappend: optimistic append — commit only if the table version has not moved
+      since the write began, else fail (no dedup; that's the model SQL's job)
     - microbatch: delete+insert the model's event_time window per dbt-driven batch
 #}
 {% materialization incremental, adapter='duckrun', supported_languages=['sql', 'python'] %}
