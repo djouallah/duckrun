@@ -10,8 +10,10 @@ name: concurrency-correctness
 # Read the scorecard on the run's summary page. See repro/concurrency_correctness.py.
 on:
   # The most important gate: run on EVERY pull request, and on every direct push to main
-  # (state lands on main directly here, so PR-only would miss those commits). No paths filter
-  # on purpose — concurrency correctness must hold regardless of what changed.
+  # (state lands on main directly here, so PR-only would miss those commits). We deliberately
+  # do NOT use a top-level paths filter: this is a *required* status check, and a filtered-out
+  # run never reports, leaving the required check stuck "Expected" forever. Instead the job
+  # always runs and reports green; the expensive steps below self-skip on docs-only changes.
   pull_request:
   push:
     branches: [main]
@@ -23,14 +25,45 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Need the previous commit(s) so we can diff what changed (push uses event.before).
+          fetch-depth: 0
+
+      # Concurrency correctness is a property of the code, not the docs. If a change touches
+      # nothing but Markdown, skip the (multi-minute) install + repro and just report green —
+      # the required check is still satisfied. Any non-.md change runs the full proof.
+      - name: Detect whether code changed (vs docs-only)
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          # First push to a new branch (or unknown base) -> run the full proof to be safe.
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change — skipping the concurrency-correctness proof."
+          fi
 
       - uses: actions/setup-python@v5
+        if: steps.changes.outputs.code == 'true'
         with:
           python-version: '3.11'
 
       - name: Install duckrun + test deps (duckdb + deltalake + pyarrow)
+        if: steps.changes.outputs.code == 'true'
         run: pip install -e ".[test]"
 
       - name: Prove concurrency correctness (merge snapshot safety + safeappend)
+        if: steps.changes.outputs.code == 'true'
         # Exit 0 = both invariants hold (expected). Exit 1 = a case behaved unexpectedly.
         run: python repro/concurrency_correctness.py
