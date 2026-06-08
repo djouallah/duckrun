@@ -9,22 +9,19 @@ name: merge-spill
 # shipping defaults on (per-merge DuckDB memory_limit + delta_rs merge spill cap + streamed_exec=
 # False so the merge prunes the target via source stats instead of scanning all ~120M rows). SF=20
 # is ~the size of the runner's RAM and only fits *because* of that pruning — it's the real stress
-# test. Override the scale with the workflow_dispatch `sf` input. Runs against the pinned
-# deltalake 1.5.0 (1.6.0's merge is broken at scale).
+# test. Runs against the pinned deltalake 1.5.0 (1.6.0's merge is broken at scale).
 #
 # Expensive (~10 min) and heavy (needs the whole runner's RAM + the big disk), so it runs ONLY as
 # a release gate: the publish workflow calls it (workflow_call) on a version tag and only publishes
 # if it passes. It is deliberately NOT runnable by hand (no workflow_dispatch) and never runs on a
-# push/PR — a release is the only thing that should pay this cost. The release run is also what
-# renders the MERGE scorecard into README.md and commits it to main (see the render step), so the
-# card is always maintained by CI, never by hand.
+# push/PR — a release is the only thing that should pay this cost. The release run uploads the
+# MERGE scorecard as an artifact (merge-scorecard); refresh the README card by committing it.
 
 on:
   workflow_call:
 
-# Needed so the release run can commit the rendered scorecard back to README.md on main.
 permissions:
-  contents: write
+  contents: read
 
 # Serialize: never run two SF=20 merge-spill jobs at once (each needs the whole runner's RAM and
 # the big disk). Static group so concurrent release tags queue rather than race.
@@ -79,33 +76,13 @@ jobs:
           fi
           exit $rc
 
-      # Render the scorecard the bench just wrote (merge_card.md) into the README between the MERGE
-      # markers and commit it to main. This runs on the release path (workflow_call on a tag ref),
-      # so it explicitly checks out main and pushes there — the released version's numbers become
-      # the README card. [skip ci] keeps it from re-triggering CI. No-op if the bench died before
-      # writing the card. Never fails the release: a card-commit problem must not block publishing.
-      - name: Render scorecard into README and commit to main
-        if: always()
-        continue-on-error: true
-        run: |
-          if [ ! -f merge_card.md ]; then
-            echo "No merge_card.md (bench did not complete) — nothing to render."
-            exit 0
-          fi
-          git fetch origin main
-          git checkout -B main origin/main          # the card is docs; render it onto main, not the tag
-          python tools/inject_readme.py README.md merge_card.md MERGE
-          if git diff --quiet -- README.md; then
-            echo "README MERGE card unchanged."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add README.md
-          git commit -m "docs: update MERGE scorecard in README [skip ci]"
-          # main may have moved during the ~10 min run (this step is the only writer of the MERGE
-          # card, so rebasing can't conflict on it) — rebase + retry so a race doesn't error out.
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            echo "push race (attempt $i), retrying"; sleep 3
-          done
+      # Upload the scorecard the bench just wrote (merge_card.md) as an artifact. No bot commits to
+      # the protected branch: refresh the README MERGE card by downloading this artifact from the
+      # release run and committing it over the markers (an admin push). No-op if the bench died
+      # before writing the card.
+      - name: Upload MERGE scorecard (artifact)
+        if: always() && hashFiles('merge_card.md') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-scorecard
+          path: merge_card.md

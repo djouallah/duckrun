@@ -21,7 +21,7 @@ on:
   workflow_call:
 
 permissions:
-  contents: write
+  contents: read
 
 # Serialize: at most one conformance run at a time, queue the rest (no cancel). A STATIC group
 # (not keyed by ref) is what makes a release tag's publish-called run wait behind an in-flight

@@ -15,25 +15,17 @@ concurrency:
   cancel-in-progress: false
 
 # A release must pass conformance + merge-spill before publishing, not just merge-spill. Each is a
-# reusable workflow run as a gate job here. Two things to know:
-#  - A reusable workflow can only use permissions the CALLER grants, so each call job grants what
-#    that workflow declares (contents:write for the README-card commit). Missing a grant fails
-#    validation at startup (it bit v0.3.9's first tag push).
-#  - These run on the TAG ref, where conformance's README commit is already gated
-#    `if: github.ref == 'refs/heads/main'` — so on a release it only TESTS, never writes. And
-#    because conformance uses a static concurrency group, a tag-time call queues behind any
-#    in-flight push-to-main run, so publish waits for it to finish.
+# reusable workflow run as a gate job here. Neither writes to the repo anymore — they only test and
+# upload their scorecard as an artifact (refresh the README cards by committing those artifacts) —
+# so no contents:write grant is needed. Both use a static concurrency group, so a tag-time call
+# queues behind any in-flight push-to-main run rather than racing it.
 # aemo is deliberately NOT a release gate: it depends on live OneLake/AEMO data and so is prone to
 # transient infra failures that would needlessly block a publish. It still runs on its own.
 jobs:
   conformance:
-    permissions:
-      contents: write
     uses: ./.github/workflows/conformance.yml
 
   merge-spill:
-    permissions:
-      contents: write
     uses: ./.github/workflows/merge.yml
 
   publish:
