@@ -219,25 +219,6 @@ concurrent reader might still be reading are never deleted out from under it. Th
 is that a superseded file version lingers for the retention window before it can be
 reclaimed — duckrun favors read-safety over immediate disk savings.
 
-## Concurrency
-
-Merge relies on Delta's optimistic concurrency control (OCC). One behaviour is commonly
-misread: a merge's conflict check is bound to the table version at the **start of the merge
-transaction** (HEAD-at-merge-start), not to whatever version an earlier application read
-observed. So a "read the target → derive a work-list → merge" pipeline can commit cleanly even
-if another writer changed the table between that read and the merge.
-
-The subtle difference from Spark — the reference implementation — is how the merge's own scan
-lines up with that conflict check. Spark pins a single snapshot for the whole merge: the scan
-and the conflict check see the same Delta version. duckrun's scan is lazy, so in practice it
-reads HEAD-at-merge-start too and the two line up — but that's a practical consequence, not a
-guarantee, and Spark's conflict detection is more sophisticated.
-
-This repo demonstrates the behaviour on both engines —
-[tests/test_concurrency.py](tests/test_concurrency.py) (delta-rs) and
-[tests/test_concurrency_spark.py](tests/test_concurrency_spark.py) (Spark) — runnable via the
-[`concurrency`](.github/workflows/concurrency.yml) workflow from the Actions tab.
-
 ## Development
 
 The `integration_tests/` directory is a small dbt project exercised by CI
