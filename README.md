@@ -19,14 +19,6 @@ materialization that writes real Delta tables.
 The design rationale — why delta_rs and not DuckDB's native Delta writer, why Delta and not
 Iceberg, why a separate adapter — lives in [design_document.md](design_document.md).
 
-> ### 0.3.0 is a breaking change
->
-> Versions ≤ 0.2.x of `duckrun` were a custom orchestrator, which was silly in hindsight — in
-> my defence, I did not know how awesome dbt is. From
-> **0.3.0** onward `duckrun` is a dbt adapter. Need the old library? Pin
-> `pip install "duckrun<0.3"`, or use the
-> [`legacy`](https://github.com/djouallah/duckrun/tree/legacy) branch.
-
 ## How it fits together
 
 DuckDB is a great query engine, Delta Lake is a great open table format, and dbt is the
@@ -34,7 +26,7 @@ right tool to orchestrate the DAG. duckrun wires the three together:
 
 > **DuckDB executes · delta_rs materializes · dbt orchestrates.**
 
-## In the wild
+## Full Project
 
 [**dbt_fabric_python_delta**](https://github.com/djouallah/dbt_fabric_python_delta) is an
 end-to-end example project that runs duckrun against **Microsoft Fabric**: dbt models
@@ -53,19 +45,6 @@ pip install duckrun
 
 That single install pulls in `dbt-duckdb` (and therefore `duckdb`) plus `deltalake`.
 
-> **On Microsoft Fabric notebooks**, `deltalake` is already imported by the runtime, so a
-> `pip install`/upgrade won't take effect until you restart the Python session. After
-> installing, run:
->
-> ```python
-> %pip install -q duckrun --upgrade
-> notebookutils.session.restartPython()
-> ```
->
-> duckrun pins `deltalake==1.5.0` (the first release with MERGE disk-spill, which bounds
-> merge memory — see `merge_max_spill_size`), so the restart is what actually swaps Fabric's
-> preinstalled `deltalake` for the pinned one.
-
 ## Configure your profile
 
 ```yaml
@@ -78,35 +57,35 @@ my_project:
       # No `threads:` needed — duckrun always runs single-threaded.
       # DuckDB runs in-memory by default — the Delta tables are the only state.
       # Default Delta location for models that don't set config(location=...).
-      root_path: './warehouse'   # local path, or abfss://.../Tables, s3://..., gs://...
+      root_path: './warehouse'   # local path, or s3://..., gs://..., abfss://...
       # storage_options: {}      # passed through to deltalake for remote stores
 ```
 
 Persisted models are written to `<root_path>/<schema>/<model>` (e.g.
 `./warehouse/dbo/orders`), or to an explicit `config(location=...)`.
 
-### Remote stores (Fabric OneLake / ADLS / S3 / GCS)
+### Remote stores (S3 / GCS / ADLS / OneLake)
 
 Point `root_path` at the warehouse location and pass credentials through
 `storage_options` — these flow straight to deltalake for writes and merges.
 
-If `storage_options` carries a `bearer_token` (or `token` / `access_token`), the adapter
-also auto-creates a matching DuckDB Azure secret, so `delta_scan()` reads work with no
-extra config. In a notebook where the storage secret is already provided to DuckDB, you
-can leave `storage_options` empty.
+On Azure-backed stores, if `storage_options` carries a `bearer_token` (or `token` /
+`access_token`), the adapter also auto-creates a matching DuckDB Azure secret, so
+`delta_scan()` reads work with no extra config. In a notebook where the storage secret is
+already provided to DuckDB, you can leave `storage_options` empty.
 
 ```yaml
-    onelake:
+    remote:
       type: duckrun
       schema: dbo
-      root_path: "abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>.Lakehouse/Tables"
+      root_path: "s3://my-bucket/warehouse"   # or abfss://... , gs://...
       storage_options:
-        # az account get-access-token --resource https://storage.azure.com
-        bearer_token: "{{ env_var('ONELAKE_TOKEN') }}"
+        aws_access_key_id: "{{ env_var('AWS_ACCESS_KEY_ID') }}"
+        aws_secret_access_key: "{{ env_var('AWS_SECRET_ACCESS_KEY') }}"
 ```
 
-Verified end-to-end against real Fabric OneLake: `table` overwrite, `incremental` merge,
-and `delta_scan` reads / tests.
+Verified end-to-end against real remote object storage: `table` overwrite, `incremental`
+merge, and `delta_scan` reads / tests.
 
 ## Materializations
 
