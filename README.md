@@ -234,6 +234,9 @@ job summary and rendered live into this README below — regenerated on every pu
 
 ## Conformance results
 
+_The conformance and MERGE scorecards below are regenerated on every push to `main`, so they
+reflect the latest `main` — which may be ahead of the published PyPI release._
+
 <!-- CONFORMANCE:START -->
 
 ## dbt adapter conformance — duckrun
