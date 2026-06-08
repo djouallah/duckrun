@@ -199,10 +199,13 @@ The adapter is a thin subclass of dbt-duckdb declaring `dependencies=['duckdb']`
 
 ## Table maintenance (compaction & vacuum)
 
-delta_rs has **no** automatic, post-commit maintenance — and it ignores Databricks-style
-auto-optimize table properties (`delta.autoOptimize.*`). Left alone, an incremental table
-fragments into many small Parquet files and keeps every superseded file version forever.
-duckrun runs the maintenance for you, inline, right after each write:
+**duckrun maintains your Delta tables automatically — no configuration, no scheduled job, no
+separate `OPTIMIZE`/`VACUUM` run to remember.** It happens inline on every write.
+
+This matters because delta_rs has **no** automatic, post-commit maintenance of its own — and it
+ignores Databricks-style auto-optimize table properties (`delta.autoOptimize.*`). Left alone, an
+incremental table fragments into many small Parquet files and keeps every superseded file version
+forever. duckrun runs the maintenance for you, right after each write:
 
 | write | maintenance |
 |---|---|
