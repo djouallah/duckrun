@@ -433,7 +433,7 @@ plain write of the same batch. It gates every release; the latest scorecard is r
 
 ## 🔀 Incremental MERGE test — duckrun on Delta Lake
 
-**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table on one machine — across four merge shapes — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same batch compares against a plain `append` / `overwrite` on that same table (which never scan the target).
+**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table on one machine — across four merge shapes — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same batch compares against a plain `append` / `safeappend` / `overwrite` on that same table (which never scan the target).
 
 ### Setup (the inputs)
 | | |
@@ -441,31 +441,33 @@ plain write of the same batch. It gates every release; the latest scorecard is r
 | Engine | duckrun &middot; DuckDB 1.5.1 &middot; delta_rs 1.5.0 |
 | Target fact table | TPCH `lineitem`, scale factor **20.0** → **119,994,608 rows** |
 | Primary key (merge on) | `(l_orderkey, l_linenumber)` |
-| Effective memory | 14928 MB (runner RAM, no artificial limit) |
+| Effective memory | 14925 MB (runner RAM, no artificial limit) |
 | DuckDB `memory_limit` | 12.4 GiB — set by duckrun (cgroup-aware) |
-| Merge spill cap | 8957 MB — delta_rs `max_spill_size` |
+| Merge spill cap | 8955 MB — delta_rs `max_spill_size` |
 
 ### The operations (run in order, on the same growing table)
 1. **Mixed upsert (~1% sample):** ~80% existing keys → UPDATE (randomized measures), ~20% key-shifted → INSERT. _Expect:_ rows grow by the inserts; updated rows carry the new measures.
 2. **Insert-only (~5% sample):** key-shifted past the max key so nothing matches, stamped with a future `l_shipdate` (2035). _Expect:_ every row INSERTed; exactly that many rows carry the 2035 date.
 3. **Update-only (~5% sample):** existing keys, randomized measures, no key shift → 100% match. _Expect:_ row count unchanged; rows carry the new measures.
 4. **Idempotent re-merge:** re-run scenario 3's exact batch. _Expect:_ a correct MERGE is idempotent — nothing changes (same row count, same values).
-5. **Append (no merge):** the same batch appended to the table. _Expect:_ rows grow by the batch — and it's far faster, because an append only lands files.
-6. **Overwrite (no merge):** the same batch overwriting the table. _Expect:_ the table is replaced by the batch — also far faster than a MERGE (no target scan/join).
+5. **Append (no merge):** the same batch appended to the table. _Expect:_ rows grow by the batch — far faster than a MERGE, because an append only lands files (no target scan/join) and DuckDB streams the source.
+6. **Safeappend (no merge):** the same batch via `safeappend` — a plain append that commits only if the table version is unchanged since it was read (it is here). _Expect:_ same cheap append, now version-guarded against concurrent writers.
+7. **Overwrite (no merge):** the same batch overwriting the table. _Expect:_ the table is replaced by the batch — also far faster than a MERGE (no target scan/join).
 
 ### Results (row counts in millions)
 | Operation | Increment | Updates | Inserts | Before | After | Expected | Count ✓ | Values ✓ | Time |
 |---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|
-| Mixed upsert | 1.2M | 1.0M | 0.2M | 120.0M | 120.2M | 120.2M | ✅ | ✅ | 217.7s |
+| Mixed upsert | 1.2M | 1.0M | 0.2M | 120.0M | 120.2M | 120.2M | ✅ | ✅ | 170.3s |
 | Insert-only (future shipdate) | 6.0M | 0.0M | 6.0M | 120.2M | 126.2M | 126.2M | ✅ | ✅ | 5.3s |
-| Update-only (100% match) | 6.0M | 6.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 142.6s |
-| Idempotent re-merge | 6.0M | 6.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 180.8s |
-| Append (no merge) | 6.0M | 0.0M | 6.0M | 126.2M | 132.2M | 132.2M | ✅ | ✅ | 4.7s |
-| Overwrite (no merge) | 6.0M | 0.0M | 6.0M | 132.2M | 6.0M | 6.0M | ✅ | ✅ | 4.4s |
+| Update-only (100% match) | 6.0M | 6.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 192.4s |
+| Idempotent re-merge | 6.0M | 6.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 200.9s |
+| Append (no merge) | 6.0M | 0.0M | 6.0M | 126.2M | 132.2M | 132.2M | ✅ | ✅ | 4.3s |
+| Safeappend (no merge) | 6.0M | 0.0M | 6.0M | 132.2M | 138.2M | 138.2M | ✅ | ✅ | 4.4s |
+| Overwrite (no merge) | 6.0M | 0.0M | 6.0M | 138.2M | 6.0M | 6.0M | ✅ | ✅ | 4.5s |
 
-_The last two rows are the same batch as a plain append / overwrite — compare their time against the merges above to see the cost a MERGE pays to scan & join the target._
+_The last three rows are the same batch as a plain `append` / `safeappend` / `overwrite` — compare their time against the merges above to see the cost a MERGE pays to scan & join the target._
 
-**Result: ✅ all operations correct.** Target grew to **126,236,033 rows** across the merges, peak memory **6,172 MB** — duckrun stayed within the runner's RAM and every update/insert landed as expected.
+**Result: ✅ all operations correct.** Target grew to **126,234,440 rows** across the merges, peak memory **6,286 MB** — duckrun stayed within the runner's RAM and every update/insert landed as expected.
 
 <!-- MERGE:END -->
 
