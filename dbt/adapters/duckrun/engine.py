@@ -26,14 +26,26 @@ except ImportError:  # pragma: no cover - older layouts
         WriterProperties = None
 
 
+# 6 row groups' worth of delta-rs's default (1,048,576 rows) per group. Bigger row groups
+# give Power BI / DirectLake fewer, larger scan ranges at the cost of more write-time memory.
+_MAX_ROW_GROUP_SIZE = 1_048_576 * 6
+
+
 def _writer_properties():
-    # ZSTD compression for good Parquet footprint (Power BI / DirectLake friendly).
-    if WriterProperties is not None:
-        try:
-            return WriterProperties(compression="ZSTD")
-        except Exception:
-            return None
-    return None
+    # ZSTD compression for a good Parquet footprint (Power BI / DirectLake friendly), plus
+    # larger row groups. If a WriterProperties build ever rejects max_row_group_size, fall
+    # back to compression-only rather than losing ZSTD entirely (ZSTD is the property we most
+    # care about keeping).
+    if WriterProperties is None:
+        return None
+    try:
+        return WriterProperties(compression="ZSTD", max_row_group_size=_MAX_ROW_GROUP_SIZE)
+    except Exception:
+        pass
+    try:
+        return WriterProperties(compression="ZSTD")
+    except Exception:
+        return None
 
 
 def _win_mem_status():
@@ -355,6 +367,18 @@ def delta_columns(path: str, storage_options: Optional[Dict[str, str]] = None) -
     return [f.name for f in _delta_table(path, storage_options).schema().fields]
 
 
+def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:
+    """Threshold-gated upkeep shared by the append / merge / delete+insert paths: once the table
+    has more than ``compaction_threshold`` files, compact small files, vacuum tombstoned old
+    versions (safe 7-day default retention — no concurrent reader broken), and clean up expired
+    log entries. Without it a table written on every run fragments into small files and keeps old
+    versions forever. (The overwrite path vacuums unconditionally instead and does not use this.)"""
+    if len(dt.file_uris()) > compaction_threshold:
+        dt.optimize.compact()
+        dt.vacuum(dry_run=False)
+        dt.cleanup_metadata()
+
+
 def write_delta(
     path: str,
     data,
@@ -395,10 +419,7 @@ def write_delta(
         dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
         dt.cleanup_metadata()
     else:  # append
-        if len(dt.file_uris()) > compaction_threshold:
-            dt.optimize.compact()
-            dt.vacuum(dry_run=False)
-            dt.cleanup_metadata()
+        _maintain(dt, compaction_threshold)
 
 
 def append_if_unchanged(
@@ -452,11 +473,7 @@ def append_if_unchanged(
             f"(a concurrent write committed); append refused. Re-run the model."
         ) from e
 
-    dt = _delta_table(path, storage_options)
-    if len(dt.file_uris()) > compaction_threshold:
-        dt.optimize.compact()
-        dt.vacuum(dry_run=False)
-        dt.cleanup_metadata()
+    _maintain(_delta_table(path, storage_options), compaction_threshold)
 
 
 def delete_insert_window(
@@ -466,6 +483,7 @@ def delete_insert_window(
     column: str,
     start: str,
     end: str,
+    partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
 ) -> None:
@@ -484,14 +502,12 @@ def delete_insert_window(
     predicate = f"{column} >= '{start}' AND {column} < '{end}'"
     dt.delete(predicate)
 
-    args = build_write_deltalake_args(path, data, "append", storage_options=storage_options)
+    args = build_write_deltalake_args(
+        path, data, "append", partition_by=partition_by, storage_options=storage_options
+    )
     write_deltalake(**args)
 
-    dt = _delta_table(path, storage_options)
-    if len(dt.file_uris()) > compaction_threshold:
-        dt.optimize.compact()
-        dt.vacuum(dry_run=False)
-        dt.cleanup_metadata()
+    _maintain(_delta_table(path, storage_options), compaction_threshold)
 
 
 def merge_delta(
@@ -548,8 +564,11 @@ def merge_delta(
         conditions.extend(p for p in extra if p)
     predicate = " AND ".join(conditions)
 
+    # Sample the effective limit ONCE so the cap we apply and the cap we log can't disagree:
+    # free RAM is read live on every call, so two separate reads would drift on a busy box.
+    eff_limit = _effective_mem_limit_bytes()
     if max_spill_size is None:
-        max_spill_size = _default_merge_spill_size()
+        max_spill_size = int(eff_limit * _MERGE_SPILL_FRACTION) if eff_limit else None
     # Only forward the kwarg when we have a positive cap: delta_rs builds a spilling session
     # only when max_spill_size is set, so omitting it preserves the prior unbounded behavior
     # (e.g. RAM undetectable, or caller explicitly passed 0 to opt out).
@@ -560,7 +579,7 @@ def merge_delta(
     if spill_kwargs:
         logger.info(
             f"merge spill cap: {max_spill_size / 2**30:.2f} GiB "
-            f"({int(_MERGE_SPILL_FRACTION * 100)}% of {(_effective_mem_limit_bytes() or 0) / 2**30:.2f} GiB "
+            f"({int(_MERGE_SPILL_FRACTION * 100)}% of {(eff_limit or 0) / 2**30:.2f} GiB "
             f"{_effective_mem_limit_source()})"
         )
     else:
@@ -596,8 +615,4 @@ def merge_delta(
 
     # Same threshold-gated maintenance as the append / delete+insert paths: a merged-on-every-run
     # incremental table fragments into small files and leaves tombstoned old versions otherwise.
-    dt = _delta_table(path, storage_options)
-    if len(dt.file_uris()) > compaction_threshold:
-        dt.optimize.compact()
-        dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
-        dt.cleanup_metadata()
+    _maintain(_delta_table(path, storage_options), compaction_threshold)

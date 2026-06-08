@@ -45,8 +45,10 @@ def ensure_azure_secret(conn, storage_options: Optional[Dict[str, str]]) -> bool
     if not token:
         return False
     conn.execute("INSTALL azure; LOAD azure;")
+    # Escape single quotes so a token containing one can't break out of the SQL string literal.
+    token_sql = token.replace("'", "''")
     conn.execute(
         f"CREATE OR REPLACE SECRET {SECRET_NAME} "
-        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token}')"
+        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}')"
     )
     return True

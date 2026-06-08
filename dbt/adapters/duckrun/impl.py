@@ -199,9 +199,10 @@ class DuckrunAdapter(DuckDBAdapter):
         try:
             self.create_schema(relation)
             cursor = self._cursor()
+            loc_sql = location.replace("'", "''")  # escape quotes in the delta_scan path literal
             cursor.execute(
                 f"create or replace view {relation.render()} as "
-                f"select * from delta_scan('{location}')"
+                f"select * from delta_scan('{loc_sql}')"
             )
         except Exception as exc:
             # A table mid-write or an unreadable log shouldn't abort cache population;

@@ -244,13 +244,19 @@ class Plugin(BasePlugin):
 
         # First batch of a --full-refresh run truncates; later batches (and every batch of a
         # normal run) append into the window. A brand-new table is just created.
-        seen_key = (cfg.get("invocation_id"), path)
+        invocation = cfg.get("invocation_id")
+        # Only the current run's batches matter; drop bookkeeping from earlier invocations so this
+        # set can't grow unbounded in a long-lived process (a notebook / runner doing many runs).
+        self._microbatch_seen = {k for k in self._microbatch_seen if k[0] == invocation}
+        seen_key = (invocation, path)
         first_batch = seen_key not in self._microbatch_seen
         self._microbatch_seen.add(seen_key)
 
+        partition_by = cfg.get("partition_by")
         if not exists or (full_refresh and first_batch):
             engine.write_delta(
                 path, window, "overwrite",
+                partition_by=partition_by,
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,
             )
@@ -258,6 +264,7 @@ class Plugin(BasePlugin):
             engine.delete_insert_window(
                 path, window,
                 column=event_time, start=start, end=end,
+                partition_by=partition_by,
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,
             )
@@ -313,8 +320,10 @@ class Plugin(BasePlugin):
             raise ValueError(
                 "Delta source requires 'delta_table_path' (or 'location') in meta."
             )
-        # Read via DuckDB's delta_scan so no pyarrow import is required.
-        return self._cursor().sql(f"SELECT * FROM delta_scan('{path}')")
+        # Read via DuckDB's delta_scan so no pyarrow import is required. Escape single quotes
+        # so a path containing one can't break out of the string literal.
+        path_sql = str(path).replace("'", "''")
+        return self._cursor().sql(f"SELECT * FROM delta_scan('{path_sql}')")
 
     def default_materialization(self) -> str:
         return "view"

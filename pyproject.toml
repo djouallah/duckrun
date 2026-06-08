@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.3.11"
+version = "0.3.12"
 description = "A dbt adapter that runs SQL in DuckDB and materializes to Delta Lake (delta_rs)."
 readme = "README.md"
 license = {text = "MIT"}
@@ -24,7 +24,10 @@ dependencies = [
     # the merge's RAM and avoid OOM on large upserts. Combined with the <1.5.1 ceiling this
     # pins exactly 1.5.0. Fabric preinstalls an older deltalake that satisfied the old floor,
     # so this also forces the upgrade on `pip install duckrun` instead of needing a manual pin.
-    "duckdb>=1.4.4,<1.5.2",
+    # Pinned to 1.5.1 (not a range): upgrading deltalake already forces a kernel restart,
+    # so we may as well move duckdb up to the newest version that still works with OneLake.
+    # 1.5.2+ is held back by the duckdb-delta read-side bug above.
+    "duckdb==1.5.1",
     "deltalake>=1.5.0,<1.5.1",
 ]
 

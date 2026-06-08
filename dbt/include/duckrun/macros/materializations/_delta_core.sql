@@ -59,7 +59,7 @@
   {%- if adapter.delta_table_exists(location) -%}
     {%- do adapter.create_schema(target_relation) -%}
     {% call statement('register_this') -%}
-      create or replace view {{ target_relation }} as select * from delta_scan('{{ location }}')
+      create or replace view {{ target_relation }} as select * from delta_scan('{{ location | replace("'", "''") }}')
     {%- endcall %}
   {%- endif -%}
 
@@ -126,7 +126,7 @@
        table. A brand-new table becomes visible to the rest of the run right here. --#}
   {% call statement('main') -%}
     create or replace view {{ target_relation }} as
-      select * from delta_scan('{{ location }}')
+      select * from delta_scan('{{ location | replace("'", "''") }}')
   {%- endcall %}
 
   {{ run_hooks(post_hooks, inside_transaction=True) }}
