@@ -237,23 +237,26 @@ def _scenario_idempotent(con, base, source):
     }
 
 
-def _scenario_write(con, base_write, source, mode, before):
-    """Plain duckrun write (overwrite/append) of the same batch the merges use, on a scratch
-    table — so users can see how much faster a write is than a MERGE of the same row count
-    (a write just lands files; it never scans or joins the target). Returns the standard result
-    dict so it tabulates alongside the merge scenarios."""
+def _scenario_write(con, base, source, mode, before):
+    """Plain duckrun write (overwrite/append) of the same batch the merges use, against the SAME
+    big target table — so the card compares merge vs append vs overwrite head-to-head. A write
+    only lands files (overwrite also vacuums the old ones); it never scans or joins the target,
+    which is why it's far cheaper than a MERGE of the same row count. Standard result dict."""
     src_rows = con.execute(f"SELECT count(*) FROM read_parquet('{source}')").fetchone()[0]
     rel = con.sql(f"SELECT * FROM read_parquet('{source}')")
     t = time.time()
-    engine.write_delta(base_write, rel, mode)
+    engine.write_delta(base, rel, mode)
     dt = time.time() - t
-    after = _count(base_write)
+    after = _count(base)
     expected = src_rows if mode == "overwrite" else before + src_rows
+    verify = (f"overwrite replaced the table with {src_rows:,} rows (vacuumed the old {before:,})"
+              if mode == "overwrite"
+              else f"appended {src_rows:,} rows to the {before:,}-row table — no target scan")
     return {
         "name": f"{mode.capitalize()} (no merge)", "src": src_rows, "upd": 0, "ins": src_rows,
         "before": before, "after": after, "expected": expected, "dt": dt,
         "count_ok": after == expected, "verify_ok": True,
-        "verify": f"{mode} landed {src_rows:,} rows without scanning the target",
+        "verify": verify,
     }
 
 
@@ -316,20 +319,16 @@ def run(args):
         # be a no-op (idempotency). Keep last so that source still exists.
         _scenario_idempotent(con, base, source),
     ]
-    # For comparison: the same-size batch written with plain overwrite/append (no MERGE), on a
-    # scratch table so it doesn't disturb the merge target above. Shows how much cheaper a write
-    # is than a merge of identical row count — a write lands files, it never scans/joins the target.
-    base_write = os.path.join(args.dir, "writes")
-    if os.path.exists(base_write):
-        shutil.rmtree(base_write)
-    r_overwrite = _scenario_write(con, base_write, source, "overwrite", 0)
-    write_results = [
-        r_overwrite,
-        _scenario_write(con, base_write, source, "append", r_overwrite["after"]),
-    ]
+    # Same target, no MERGE: append the same batch, then overwrite — so the one card compares
+    # merge vs append vs overwrite of an identical batch against the *same* big table. Kept last
+    # (overwrite is destructive) and after the merge asserts above have all been captured.
+    n = _count(base)
+    r_append = _scenario_write(con, base, source, "append", n)
+    results.append(r_append)
+    results.append(_scenario_write(con, base, source, "overwrite", r_append["after"]))
 
     ok = True
-    for r in results + write_results:
+    for r in results:
         status = "OK" if (r["count_ok"] and r["verify_ok"]) else "FAIL"
         ok = ok and r["count_ok"] and r["verify_ok"]
         print(f"== [{status}] {r['name']}: {r['src']:,} rows "
@@ -342,16 +341,14 @@ def run(args):
             print(f"   FAIL: value check failed ({r['verify']})", file=sys.stderr)
 
     peak = _peak_rss_mb()
-    final = _count(base)
-    print(f"== done: final rows={final:,} (from {target_rows:,}) peakRSS={peak}MB ==")
-    _write_summary(setup, results, write_results, final, peak, ok)
+    print(f"== done: peakRSS={peak}MB (target grew to {n:,} rows across the merges) ==")
+    _write_summary(setup, results, n, peak, ok)
     if not ok:
         sys.exit(2)
-    print("OK: duckrun ran mixed / insert-only / update-only / idempotent merges on a big table "
-          "correctly and survived.")
+    print("OK: duckrun ran the merges + overwrite/append on a big table correctly and survived.")
 
 
-def _write_summary(setup, results, write_results, final_rows, peak, all_ok):
+def _write_summary(setup, results, final_rows, peak, all_ok):
     """Append a data-engineer-readable report to $GITHUB_STEP_SUMMARY (no-op locally)."""
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if not path:
@@ -361,8 +358,9 @@ def _write_summary(setup, results, write_results, final_rows, peak, all_ok):
     L.append("## 🔀 Incremental MERGE test — duckrun on Delta Lake")
     L.append("")
     L.append("**What this checks:** that duckrun MERGEs incremental batches into a large Delta "
-             "*fact* table on one machine — across four different merge shapes — applying "
-             "UPDATEs and INSERTs correctly, without being OOM-killed.")
+             "*fact* table on one machine — across four merge shapes — applying UPDATEs and "
+             "INSERTs correctly without being OOM-killed, and how the same batch compares against "
+             "a plain `append` / `overwrite` on that same table (which never scan the target).")
     L.append("")
     L.append("### Setup (the inputs)")
     L.append("| | |")
@@ -376,7 +374,7 @@ def _write_summary(setup, results, write_results, final_rows, peak, all_ok):
     L.append(f"| DuckDB `memory_limit` | {setup['duckdb_mem']} — set by duckrun (cgroup-aware) |")
     L.append(f"| Merge spill cap | {setup['cap_mb']} MB — delta_rs `max_spill_size` |")
     L.append("")
-    L.append("### The four scenarios (run in order, on the same growing table)")
+    L.append("### The operations (run in order, on the same growing table)")
     L.append(f"1. **Mixed upsert (~{setup['mixed_pct']} sample):** ~80% existing keys → UPDATE "
              "(randomized measures), ~20% key-shifted → INSERT. _Expect:_ rows grow by the inserts; "
              "updated rows carry the new measures.")
@@ -388,9 +386,13 @@ def _write_summary(setup, results, write_results, final_rows, peak, all_ok):
              "new measures.")
     L.append("4. **Idempotent re-merge:** re-run scenario 3's exact batch. _Expect:_ a correct "
              "MERGE is idempotent — nothing changes (same row count, same values).")
+    L.append("5. **Append (no merge):** the same batch appended to the table. _Expect:_ rows grow "
+             "by the batch — and it's far faster, because an append only lands files.")
+    L.append("6. **Overwrite (no merge):** the same batch overwriting the table. _Expect:_ the "
+             "table is replaced by the batch — also far faster than a MERGE (no target scan/join).")
     L.append("")
     L.append("### Results")
-    L.append("| Scenario | Increment | Updates | Inserts | Rows before | Rows after | Expected | Count ✓ | Values ✓ | Time |")
+    L.append("| Operation | Increment | Updates | Inserts | Rows before | Rows after | Expected | Count ✓ | Values ✓ | Time |")
     L.append("|---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
     for r in results:
         L.append(
@@ -398,22 +400,14 @@ def _write_summary(setup, results, write_results, final_rows, peak, all_ok):
             f"{r['after']:,} | {r['expected']:,} | {'✅' if r['count_ok'] else '❌'} | "
             f"{'✅' if r['verify_ok'] else '❌'} | {r['dt']:.1f}s |")
     L.append("")
-    if write_results:
-        L.append("### Write path, for comparison (same batch, no MERGE)")
-        L.append("The identical row count written with a plain `overwrite` / `append` on a scratch "
-                 "table — a write only *lands files*, it never scans or joins the target, so it's "
-                 "far cheaper than a MERGE of the same size.")
-        L.append("")
-        L.append("| Operation | Rows written | Rows before | Rows after | Time |")
-        L.append("|---|---:|---:|---:|---:|")
-        for r in write_results:
-            L.append(f"| {r['name']} | {r['src']:,} | {r['before']:,} | {r['after']:,} | {r['dt']:.1f}s |")
-        L.append("")
-    verdict = (f"**Result: ✅ all four scenarios correct.** Final table **{final_rows:,} rows**, "
-               f"peak memory **{peak_s}** — duckrun stayed within the runner's RAM and every "
-               f"update/insert landed as expected."
+    L.append("_The last two rows are the same batch as a plain append / overwrite — compare their "
+             "time against the merges above to see the cost a MERGE pays to scan & join the target._")
+    L.append("")
+    verdict = (f"**Result: ✅ all operations correct.** Target grew to **{final_rows:,} rows** across "
+               f"the merges, peak memory **{peak_s}** — duckrun stayed within the runner's RAM and "
+               f"every update/insert landed as expected."
                if all_ok else
-               "**Result: ❌ one or more scenarios were wrong** — see the ❌ cells above and the step log.")
+               "**Result: ❌ one or more operations were wrong** — see the ❌ cells above and the step log.")
     L.append(verdict)
     with open(path, "a", encoding="utf-8") as fh:
         fh.write("\n".join(L) + "\n")
