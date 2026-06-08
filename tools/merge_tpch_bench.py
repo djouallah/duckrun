@@ -237,16 +237,16 @@ def _scenario_idempotent(con, base, source):
     }
 
 
-def _scenario_write(con, base, src_path, mode, before):
-    """Plain duckrun write of `src_path` against the SAME big target — `append` / `safeappend` /
-    `overwrite` — so the card compares MERGE vs these head-to-head. None scan or join the target:
-    they stream the source straight to Delta over DuckDB's Arrow C-stream, which is why they handle
-    a full ~120M-row batch memory-safe and far cheaper than a MERGE. `safeappend` additionally pins
-    the version it read and commits only if it's unchanged (here it always is — single writer).
-    Threshold-gated compaction is disabled (no_compact) so the timing reflects the write itself,
-    not maintenance. Standard result dict."""
-    src_rows = con.execute(f"SELECT count(*) FROM read_parquet('{src_path}')").fetchone()[0]
-    rel = con.sql(f"SELECT * FROM read_parquet('{src_path}')")
+def _scenario_write(con, base, source, mode, before):
+    """Plain duckrun write of the same batch the merges use against the SAME big target — `append` /
+    `safeappend` / `overwrite` — so the card compares MERGE vs these head-to-head. None scan or join
+    the target: they stream the source straight to Delta over DuckDB's Arrow C-stream, which is why
+    they're far cheaper than a MERGE of the same row count. `safeappend` additionally pins the version
+    it read and commits only if it's unchanged (here it always is — single writer). Threshold-gated
+    compaction is disabled (no_compact) so the timing reflects the write itself, not maintenance.
+    Standard result dict."""
+    src_rows = con.execute(f"SELECT count(*) FROM read_parquet('{source}')").fetchone()[0]
+    rel = con.sql(f"SELECT * FROM read_parquet('{source}')")
     no_compact = 10**12
     t = time.time()
     if mode == "safeappend":
@@ -333,17 +333,15 @@ def run(args):
         # be a no-op (idempotency). Keep last so that source still exists.
         _scenario_idempotent(con, base, source),
     ]
-    # Same target, no MERGE: write the WHOLE ~120M-row lineitem three ways — append, safeappend,
-    # overwrite — each streamed in one write, so the card compares a MERGE's scan+join against the
-    # cheap full-volume write paths on the *same* big table. This is the memory-safe streaming test:
-    # DuckDB's Arrow C-stream feeds delta_rs a full-table batch without materializing it. Kept last
-    # (overwrite is destructive) and after the merge asserts above have all been captured.
+    # Same target, no MERGE: append, safeappend, then overwrite the SAME batch the merges use — so
+    # the one card compares merge vs append vs safeappend vs overwrite of an identical batch against
+    # the *same* big table. Kept last (overwrite is destructive) and after the merge asserts above.
     n = _count(base)
-    r_append = _scenario_write(con, base, tgt_glob, "append", n)
+    r_append = _scenario_write(con, base, source, "append", n)
     results.append(r_append)
-    r_safe = _scenario_write(con, base, tgt_glob, "safeappend", r_append["after"])
+    r_safe = _scenario_write(con, base, source, "safeappend", r_append["after"])
     results.append(r_safe)
-    results.append(_scenario_write(con, base, tgt_glob, "overwrite", r_safe["after"]))
+    results.append(_scenario_write(con, base, source, "overwrite", r_safe["after"]))
 
     ok = True
     for r in results:
@@ -388,7 +386,8 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
     L.append("**What this checks:** that duckrun MERGEs incremental batches into a large Delta "
              "*fact* table on one machine — across four merge shapes — applying UPDATEs and "
              "INSERTs correctly without being OOM-killed, and how the same batch compares against "
-             "a plain `append` / `overwrite` on that same table (which never scan the target).")
+             "a plain `append` / `safeappend` / `overwrite` on that same table (which never scan "
+             "the target).")
     L.append("")
     L.append("### Setup (the inputs)")
     L.append("| | |")
@@ -414,13 +413,13 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
              "new measures.")
     L.append("4. **Idempotent re-merge:** re-run scenario 3's exact batch. _Expect:_ a correct "
              "MERGE is idempotent — nothing changes (same row count, same values).")
-    L.append("5. **Append (no merge):** the **full ~120M-row lineitem** appended in one streamed "
-             "write. _Expect:_ rows grow by the whole batch — far faster than a MERGE, because an "
-             "append only lands files (no target scan/join) and DuckDB streams the source.")
-    L.append("6. **Safeappend (no merge):** the same full batch via `safeappend` — a plain append "
-             "that commits only if the table version is unchanged since it was read (it is here). "
+    L.append("5. **Append (no merge):** the same batch appended to the table. _Expect:_ rows grow "
+             "by the batch — far faster than a MERGE, because an append only lands files (no target "
+             "scan/join) and DuckDB streams the source.")
+    L.append("6. **Safeappend (no merge):** the same batch via `safeappend` — a plain append that "
+             "commits only if the table version is unchanged since it was read (it is here). "
              "_Expect:_ same cheap append, now version-guarded against concurrent writers.")
-    L.append("7. **Overwrite (no merge):** the same full batch overwriting the table. _Expect:_ the "
+    L.append("7. **Overwrite (no merge):** the same batch overwriting the table. _Expect:_ the "
              "table is replaced by the batch — also far faster than a MERGE (no target scan/join).")
     L.append("")
     # Counts as millions ("120.0M") so the table stays narrow — full row counts blow the columns
@@ -436,10 +435,9 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
             f"{_m(r['after'])} | {_m(r['expected'])} | {'✅' if r['count_ok'] else '❌'} | "
             f"{'✅' if r['verify_ok'] else '❌'} | {r['dt']:.1f}s |")
     L.append("")
-    L.append("_The last three rows write the full ~120M-row table as a plain `append` / "
-             "`safeappend` / `overwrite` — compare their time against the merges above to see the "
-             "cost a MERGE pays to scan & join the target, and that the write paths stream a "
-             "full-table batch memory-safe._")
+    L.append("_The last three rows are the same batch as a plain `append` / `safeappend` / "
+             "`overwrite` — compare their time against the merges above to see the cost a MERGE "
+             "pays to scan & join the target._")
     L.append("")
     verdict = (f"**Result: ✅ all operations correct.** Target grew to **{final_rows:,} rows** across "
                f"the merges, peak memory **{peak_s}** — duckrun stayed within the runner's RAM and "

@@ -3,8 +3,8 @@ name: merge-spill
 # Rigorous incremental-MERGE smoke test on a big fact table: generate a large TPCH lineitem
 # (gate runs SF=20, ~120M rows) as the target Delta table, then merge several incremental batches
 # back into it (mixed upsert, insert-only, update-only, idempotent), covering both UPDATE (matched)
-# and INSERT (key-shifted) branches, plus a full-table (~120M-row) append / safeappend / overwrite
-# for comparison — the cheap streaming write paths next to the MERGE. No artificial
+# and INSERT (key-shifted) branches, plus an append / safeappend / overwrite of the same batch for
+# comparison — the cheap streaming write paths next to the MERGE. No artificial
 # memory cgroup — the question is whether duckrun completes on the runner's real 16 GB RAM with its
 # shipping defaults on (per-merge DuckDB memory_limit + delta_rs merge spill cap + streamed_exec=
 # False so the merge prunes the target via source stats instead of scanning all ~120M rows). SF=20
