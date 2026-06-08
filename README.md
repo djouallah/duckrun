@@ -421,15 +421,15 @@ same batch. It gates every release; the latest scorecard is rendered live below.
 5. **Append (no merge):** the same batch appended to the table. _Expect:_ rows grow by the batch — and it's far faster, because an append only lands files.
 6. **Overwrite (no merge):** the same batch overwriting the table. _Expect:_ the table is replaced by the batch — also far faster than a MERGE (no target scan/join).
 
-### Results
-| Operation | Increment | Updates | Inserts | Rows before | Rows after | Expected | Count ✓ | Values ✓ | Time |
+### Results (row counts in millions)
+| Operation | Increment | Updates | Inserts | Before | After | Expected | Count ✓ | Values ✓ | Time |
 |---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|
-| Mixed upsert | 1,200,480 | 960,291 | 240,189 | 119,994,608 | 120,234,797 | 120,234,797 | ✅ | ✅ | 217.7s |
-| Insert-only (future shipdate) | 6,001,236 | 0 | 6,001,236 | 120,234,797 | 126,236,033 | 126,236,033 | ✅ | ✅ | 5.3s |
-| Update-only (100% match) | 5,998,111 | 5,998,111 | 0 | 126,236,033 | 126,236,033 | 126,236,033 | ✅ | ✅ | 142.6s |
-| Idempotent re-merge | 5,998,111 | 5,998,111 | 0 | 126,236,033 | 126,236,033 | 126,236,033 | ✅ | ✅ | 180.8s |
-| Append (no merge) | 5,998,111 | 0 | 5,998,111 | 126,236,033 | 132,234,144 | 132,234,144 | ✅ | ✅ | 4.7s |
-| Overwrite (no merge) | 5,998,111 | 0 | 5,998,111 | 132,234,144 | 5,998,111 | 5,998,111 | ✅ | ✅ | 4.4s |
+| Mixed upsert | 1.2M | 1.0M | 0.2M | 120.0M | 120.2M | 120.2M | ✅ | ✅ | 217.7s |
+| Insert-only (future shipdate) | 6.0M | 0.0M | 6.0M | 120.2M | 126.2M | 126.2M | ✅ | ✅ | 5.3s |
+| Update-only (100% match) | 6.0M | 6.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 142.6s |
+| Idempotent re-merge | 6.0M | 6.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 180.8s |
+| Append (no merge) | 6.0M | 0.0M | 6.0M | 126.2M | 132.2M | 132.2M | ✅ | ✅ | 4.7s |
+| Overwrite (no merge) | 6.0M | 0.0M | 6.0M | 132.2M | 6.0M | 6.0M | ✅ | ✅ | 4.4s |
 
 _The last two rows are the same batch as a plain append / overwrite — compare their time against the merges above to see the cost a MERGE pays to scan & join the target._
 

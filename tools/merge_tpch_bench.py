@@ -402,13 +402,17 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
     L.append("6. **Overwrite (no merge):** the same batch overwriting the table. _Expect:_ the "
              "table is replaced by the batch — also far faster than a MERGE (no target scan/join).")
     L.append("")
-    L.append("### Results")
-    L.append("| Operation | Increment | Updates | Inserts | Rows before | Rows after | Expected | Count ✓ | Values ✓ | Time |")
+    # Counts as millions ("120.0M") so the table stays narrow — full row counts blow the columns
+    # out to ~9 digits each.
+    def _m(n):
+        return f"{n / 1_000_000:.1f}M"
+    L.append("### Results (row counts in millions)")
+    L.append("| Operation | Increment | Updates | Inserts | Before | After | Expected | Count ✓ | Values ✓ | Time |")
     L.append("|---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|")
     for r in results:
         L.append(
-            f"| {r['name']} | {r['src']:,} | {r['upd']:,} | {r['ins']:,} | {r['before']:,} | "
-            f"{r['after']:,} | {r['expected']:,} | {'✅' if r['count_ok'] else '❌'} | "
+            f"| {r['name']} | {_m(r['src'])} | {_m(r['upd'])} | {_m(r['ins'])} | {_m(r['before'])} | "
+            f"{_m(r['after'])} | {_m(r['expected'])} | {'✅' if r['count_ok'] else '❌'} | "
             f"{'✅' if r['verify_ok'] else '❌'} | {r['dt']:.1f}s |")
     L.append("")
     L.append("_The last two rows are the same batch as a plain append / overwrite — compare their "
