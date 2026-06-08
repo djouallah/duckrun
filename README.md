@@ -155,13 +155,55 @@ The first run (or `--full-refresh`, or a missing table) overwrites. Later runs a
 | `merge` (default with `unique_key`) | upsert — update matched, insert new       | `unique_key` |
 | `insert`                           | insert only new keys (idempotent append)  | `unique_key` |
 | `append` (default without `unique_key`) | blind append                          | —            |
+| `safeappend`                       | append, but only if the table is unchanged since the model read it (else fail) — cheap, no dedup scan | — |
+
+### `safeappend`
+
+A cheap append for the common "load only what's new" pattern — when your model SQL **already
+guarantees no duplicates** and you don't want to pay for a merge.
+
+```sql
+{{ config(materialized='incremental', incremental_strategy='safeappend') }}
+
+select * from read_csv(getvariable('new_files'))
+{% if is_incremental() %}
+  -- the dedup is your SQL's job: only load files not already in the table
+  where file not in (select distinct file from {{ this }})
+{% endif %}
+```
+
+**Why, reason 1 — performance.** `merge` / `insert` scan the target and join on the key to find
+what's new — expensive on a large table. If the SQL above already excludes rows that are present,
+that work is redundant. `safeappend` is a plain append: **no target data scan, no key join, and
+DuckDB keeps its full memory budget** (the merge memory split is never applied — same as `append`
+/ `overwrite`). The only thing it reads from the target is one Delta log entry to get the version.
+
+**Why, reason 2 — a concurrency guard a blind `append` doesn't have.** Because the dedup is done
+in SQL against `{{ this }}`, a plain `append` is unsafe under concurrency: if another writer
+commits between your `not in (... from {{ this }})` read and your write, the file it added isn't
+excluded and you get a duplicate. `safeappend` closes that gap — it commits **only if the table
+version is unchanged since the model started** (captured *before* it reads `{{ this }}`); if
+anything committed in between, it fails with `CommitFailedError` so the run re-runs against the new
+state. No duplicate slips in.
+
+This is **optimistic concurrency control** — it never locks the table or blocks other writers; it
+appends, then validates at commit with a compare-and-swap on the version and aborts on a mismatch.
+Its policy is the strictest of the strategies (abort on *any* concurrent change, rather than
+reconcile like `merge` or auto-rebase like `append`), but the mechanism is optimistic, not
+pessimistic. Re-running is safe and idempotent: the SQL dedup simply excludes whatever the previous
+attempt already loaded.
+
+First run (or `--full-refresh`, or a missing table) overwrites to create the table; `safeappend`
+applies on later runs. A real example is the AEMO
+[`fct_scada`](integration_tests/models/marts/fct_scada.sql) model — the project's largest table,
+which loads only not-yet-seen files and so uses `safeappend` instead of an expensive merge.
 
 ### Config options (`table` / `incremental` / `delta`)
 
 | option                  | description                                                                 |
 |-------------------------|-----------------------------------------------------------------------------|
 | `location`              | Delta path. Defaults to `<root_path>/<schema>/<id>`.                        |
-| `incremental_strategy`  | `merge` \| `insert` \| `append` (incremental only).                         |
+| `incremental_strategy`  | `merge` \| `insert` \| `append` \| `safeappend` (incremental only).          |
 | `unique_key`            | column(s) to merge on.                                                       |
 | `merge_update_columns`  | merge: update only these columns on match (others untouched).               |
 | `merge_exclude_columns` | merge: update all columns **except** these on match.                        |
