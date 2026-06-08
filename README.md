@@ -2,6 +2,10 @@
 
 [![PyPI version](https://badge.fury.io/py/duckrun.svg)](https://badge.fury.io/py/duckrun)
 
+> **Disclaimer:** This is a personal project, built and maintained in my own time. It is
+> not affiliated with, endorsed by, or supported by any employer or vendor. No warranty —
+> use it at your own risk.
+
 **duckrun** is a [dbt](https://www.getdbt.com/) adapter that runs your model SQL in
 **DuckDB** and writes the results to **Delta Lake** using
 [`delta_rs`](https://delta-io.github.io/delta-rs/) (the `deltalake` Python package).
@@ -395,9 +399,10 @@ fact table (the release gate runs scale factor **20**, ~120M rows) and runs four
 shapes against it — mixed upsert, insert-only, update-only, and an idempotent re-merge —
 plus a plain `append`, `safeappend`, and `overwrite` of the same batch for comparison, on a
 single machine with duckrun's shipping memory defaults (per-merge DuckDB `memory_limit` +
-delta_rs `max_spill_size` + target pruning). It proves the merges stay within the runner's
-RAM and apply every UPDATE/INSERT correctly, and lets you compare a MERGE's cost against a
-plain write of the same batch. It gates every release; the latest scorecard is rendered live below.
+delta_rs `max_spill_size` + target pruning). It runs on a standard **GitHub-hosted runner
+(~16 GB RAM)** — no beefy hardware — proving the merges stay within that RAM and apply every
+UPDATE/INSERT correctly, and lets you compare a MERGE's cost against a plain write of the same
+batch. It gates every release; the latest scorecard is rendered live below.
 
 <!-- MERGE:START -->
 
