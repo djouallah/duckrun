@@ -1,26 +1,20 @@
 name: aemo
 
 on:
-  # Code-only: run when the adapter, the integration_tests project, or deps/pins change — not
-  # on edits to docs or other workflows. Its own file is included so changes to it are tested.
+  # Scoped to the aemo project itself: only run when something in integration_tests/ (or this
+  # workflow) changes — not on every adapter/dep change. aemo hits live OneLake and is prone to
+  # transient infra failures, so we don't want it firing on unrelated commits. Run it by hand
+  # (workflow_dispatch) to exercise the adapter against OneLake when an adapter change warrants it.
   push:
     branches: ["**"]
     paths:
-      - 'dbt/**'
       - 'integration_tests/**'
-      - 'pyproject.toml'
       - '.github/workflows/aemo.yml'
   pull_request:
     paths:
-      - 'dbt/**'
       - 'integration_tests/**'
-      - 'pyproject.toml'
       - '.github/workflows/aemo.yml'
   workflow_dispatch:
-  # Lets the publish workflow run this as a release gate (publish.yml). The existing
-  # `concurrency: aemo-onelake` group (below) is static, so a release-time call queues behind any
-  # in-flight push run rather than racing it on the shared OneLake lakehouse.
-  workflow_call:
 
 # Allow the deploy job to publish the generated dbt docs to GitHub Pages.
 permissions:
