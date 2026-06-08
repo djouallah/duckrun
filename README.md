@@ -5,6 +5,11 @@
 **duckrun** is a [dbt](https://www.getdbt.com/) adapter that runs your model SQL in
 **DuckDB** and writes the results to **Delta Lake** using
 [`delta_rs`](https://delta-io.github.io/delta-rs/) (the `deltalake` Python package).
+duckrun itself is just glue — it owns none of the heavy lifting. The real work is done
+by **DuckDB** (executes the SQL), **delta-rs** (writes the Delta table), **Arrow** (the
+zero-copy bridge that hands query results from DuckDB to delta-rs), and **dbt** (orchestrates
+the DAG). DuckDB is here for convenience as the SQL engine; the materialization is all
+delta-rs and Arrow.
 
 It is a thin wrapper around [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb). You
 keep everything dbt-duckdb gives you — views, seeds, sources, tests, snapshots, the full
@@ -16,7 +21,7 @@ materialization that writes real Delta tables
 > Writing Delta with delta_rs needs the `deltalake` package. dbt-duckdb deliberately
 > keeps a minimal dependency footprint and avoids external dependencies like this — for
 > very good reasons — so this doesn't belong upstream. duckrun keeps it isolated here
-> instead.
+> instead
 >
 
 > ### Why not write with DuckDB's native Delta writer?
@@ -27,7 +32,7 @@ materialization that writes real Delta tables
 
 > ### Why Delta and not Iceberg?
 >
-> Iceberg writers still need time to mature. I built a POC and table maintenance was a blocker.
+> Iceberg writers still need time to mature. I built a POC and table maintenance is a blocker.
 
 > ### Why didn't you build this sooner?
 >
