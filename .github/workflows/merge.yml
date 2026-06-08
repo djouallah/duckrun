@@ -14,14 +14,15 @@ name: merge-spill
 # Expensive (~10 min) and heavy (needs the whole runner's RAM + the big disk), so it runs ONLY as
 # a release gate: the publish workflow calls it (workflow_call) on a version tag and only publishes
 # if it passes. It is deliberately NOT runnable by hand (no workflow_dispatch) and never runs on a
-# push/PR — a release is the only thing that should pay this cost. The release run uploads the
-# MERGE scorecard as an artifact (merge-scorecard); refresh the README card by committing it.
+# push/PR — a release is the only thing that should pay this cost. The release run also renders the
+# MERGE scorecard into README.md and commits it to main, so the card always reflects the release.
 
 on:
   workflow_call:
 
+# Needed so the release run can commit the rendered scorecard back to README.md on main.
 permissions:
-  contents: read
+  contents: write
 
 # Serialize: never run two SF=20 merge-spill jobs at once (each needs the whole runner's RAM and
 # the big disk). Static group so concurrent release tags queue rather than race.
@@ -76,13 +77,26 @@ jobs:
           fi
           exit $rc
 
-      # Upload the scorecard the bench just wrote (merge_card.md) as an artifact. No bot commits to
-      # the protected branch: refresh the README MERGE card by downloading this artifact from the
-      # release run and committing it over the markers (an admin push). No-op if the bench died
-      # before writing the card.
-      - name: Upload MERGE scorecard (artifact)
+      # Render the scorecard the bench just wrote (merge_card.md) into the README and commit it to
+      # main, so the README MERGE card always reflects the latest release. The release runs on a tag
+      # ref, so check out main explicitly and push there. [skip ci] avoids re-triggering. Never fails
+      # the release on a commit hiccup. No-op if the bench died before writing the card.
+      - name: Render scorecard into README and commit to main
         if: always() && hashFiles('merge_card.md') != ''
-        uses: actions/upload-artifact@v4
-        with:
-          name: merge-scorecard
-          path: merge_card.md
+        continue-on-error: true
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python tools/inject_readme.py README.md merge_card.md MERGE
+          if git diff --quiet -- README.md; then
+            echo "README MERGE card unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: update MERGE scorecard in README [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
