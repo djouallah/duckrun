@@ -25,9 +25,19 @@ on:
       - 'tests/conformance/**'
       - '.github/workflows/conformance.yml'
   workflow_dispatch:
+  # Lets the publish workflow run this as a release gate (publish.yml).
+  workflow_call:
 
 permissions:
   contents: write
+
+# Serialize: at most one conformance run at a time, queue the rest (no cancel). A STATIC group
+# (not keyed by ref) is what makes a release tag's publish-called run wait behind an in-flight
+# push-to-main run, instead of racing it — the README card commit on main can't tolerate two at
+# once (the second push would be a non-fast-forward).
+concurrency:
+  group: conformance
+  cancel-in-progress: false
 
 jobs:
   conformance:

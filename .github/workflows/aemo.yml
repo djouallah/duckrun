@@ -17,6 +17,10 @@ on:
       - 'pyproject.toml'
       - '.github/workflows/aemo.yml'
   workflow_dispatch:
+  # Lets the publish workflow run this as a release gate (publish.yml). The existing
+  # `concurrency: aemo-onelake` group (below) is static, so a release-time call queues behind any
+  # in-flight push run rather than racing it on the shared OneLake lakehouse.
+  workflow_call:
 
 # Allow the deploy job to publish the generated dbt docs to GitHub Pages.
 permissions:

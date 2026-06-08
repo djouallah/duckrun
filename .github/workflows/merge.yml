@@ -27,6 +27,12 @@ on:
 permissions:
   contents: write
 
+# Serialize: never run two SF=20 merge-spill jobs at once (each needs the whole runner's RAM and
+# the big disk). Static group so a release-tag call queues behind an in-flight dispatch run.
+concurrency:
+  group: merge-spill
+  cancel-in-progress: false
+
 jobs:
   merge-spill:
     runs-on: ubuntu-latest

@@ -5,19 +5,46 @@ on:
     tags:
       - 'v*'
 
+# Default token scope for jobs that don't override it below.
+permissions:
+  contents: read
+
+# One release at a time.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+# A release must pass the FULL set — conformance + aemo + merge-spill — before publishing, not
+# just merge-spill. Each is a reusable workflow run as a gate job here. Two things to know:
+#  - A reusable workflow can only use permissions the CALLER grants, so each call job grants what
+#    that workflow declares (contents:write for the README-card commit; aemo's pages/id-token for
+#    its Azure-OIDC + Pages). Missing a grant fails validation at startup (it bit v0.3.9's first
+#    tag push). aemo also needs the Azure secrets, hence `secrets: inherit`.
+#  - These run on the TAG ref, where conformance's README commit and aemo's Pages deploy are
+#    already gated `if: github.ref == 'refs/heads/main'` — so on a release they only TEST, never
+#    write. And because conformance/aemo use static concurrency groups, a tag-time call queues
+#    behind any in-flight push-to-main run, so publish waits for them to finish.
 jobs:
-  # Gate: the expensive merge-spill test must pass before we publish a release.
-  # merge.yml declares `permissions: contents: write` (for its README-scorecard commit on a
-  # manual dispatch); a reusable workflow can only use permissions the caller grants, so grant
-  # it here too — or the call fails validation at startup. The commit step itself is skipped on
-  # a tag release (it only runs on refs/heads/main), so nothing is actually written here.
+  conformance:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/conformance.yml
+
+  aemo:
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    secrets: inherit
+    uses: ./.github/workflows/aemo.yml
+
   merge-spill:
     permissions:
       contents: write
     uses: ./.github/workflows/merge.yml
 
   publish:
-    needs: merge-spill
+    needs: [conformance, aemo, merge-spill]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
