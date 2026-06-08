@@ -7,7 +7,13 @@ on:
 
 jobs:
   # Gate: the expensive merge-spill test must pass before we publish a release.
+  # merge.yml declares `permissions: contents: write` (for its README-scorecard commit on a
+  # manual dispatch); a reusable workflow can only use permissions the caller grants, so grant
+  # it here too — or the call fails validation at startup. The commit step itself is skipped on
+  # a tag release (it only runs on refs/heads/main), so nothing is actually written here.
   merge-spill:
+    permissions:
+      contents: write
     uses: ./.github/workflows/merge.yml
 
   publish:
