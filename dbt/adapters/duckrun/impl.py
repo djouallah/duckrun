@@ -64,6 +64,19 @@ class DuckrunAdapter(DuckDBAdapter):
         so = getattr(self.config.credentials, "storage_options", None)
         return engine.table_exists(location, so)
 
+    @available
+    def delta_version(self, location):
+        """Current Delta version at ``location``, or None if the table does not exist. Captured
+        at the *start* of a model build (before it reads ``{{ this }}``) so a ``safeappend`` can
+        pin to it: if any writer commits during the run, the append fails instead of landing a
+        duplicate."""
+        from . import engine
+        so = getattr(self.config.credentials, "storage_options", None)
+        try:
+            return engine._delta_table(location, so).version()
+        except Exception:
+            return None
+
     # ------------------------------------------------------------------ discovery
     def _cursor(self):
         return self.connections.get_thread_connection().handle.cursor()

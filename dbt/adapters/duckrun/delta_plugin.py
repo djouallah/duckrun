@@ -183,11 +183,15 @@ class Plugin(BasePlugin):
                 compaction_threshold=self._compaction_threshold,
             )
         elif strategy == "safeappend":
-            # Optimistic append: commit only if the table version has not moved since we read it,
-            # else fail (so dbt errors and the orchestrator re-runs). No dedup — that's the SQL's
-            # job. Compare-and-swap via delta_rs max_commit_retries=0 (see engine).
+            # Optimistic append: commit only if the table version has not moved since the model
+            # *started* (read_version, captured before it read {{ this }}), else fail so dbt errors
+            # and the orchestrator re-runs. Pinning to the start version — not HEAD at write time —
+            # is what closes the read→write gap: a writer that commits any time during the build
+            # makes this fail instead of appending a duplicate. No dedup — that's the SQL's job.
+            # Compare-and-swap via delta_rs max_commit_retries=0 (see engine).
             engine.append_if_unchanged(
                 path, data,
+                read_version=cfg.get("read_version"),
                 partition_by=partition_by,
                 merge_schema=merge_schema,
                 storage_options=storage_options,

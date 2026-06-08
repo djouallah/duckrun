@@ -45,6 +45,12 @@
   {%- set tmp_relation = p['tmp'] -%}
   {%- set location = p['location'] -%}
 
+  {#-- Capture the target's Delta version NOW, before pre-hooks or the model read `{{ this }}`,
+       so `safeappend` can pin to it: if any writer commits during this build, the optimistic
+       append fails (rather than appending against a newer version and risking a duplicate).
+       None when the table doesn't exist yet (first run overwrites anyway). --#}
+  {%- set read_version = adapter.delta_version(location) -%}
+
   {#-- Pre-register {{ this }} as a delta_scan view when the Delta table already exists on
        disk, so pre-hooks and the model's own SQL (is_incremental self-reference) can read the
        current state. Disk discovery already reports the relation as existing in dbt's cache
@@ -92,6 +98,7 @@
   {%- set delta_config = {
       'incremental': is_incremental,
       'incremental_strategy': config.get('incremental_strategy'),
+      'read_version': read_version,
       'full_refresh': should_full_refresh(),
       'unique_key': config.get('unique_key'),
       'partition_by': config.get('partition_by'),
