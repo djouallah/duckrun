@@ -93,6 +93,7 @@ def merge_run(streamed: bool, concurrent: bool) -> dict:
         cap["outcome"] = f"RAISED {type(e).__name__}"
     finally:
         engine._delta_table = real
+        con.close()
     return cap
 
 
@@ -244,4 +245,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    _code = main()
+    # The demo is done and the scorecard is printed/written. delta-rs (Tokio) and duckdb spin up
+    # native threads/runtimes that can abort the interpreter during shutdown on Linux
+    # ("terminate called without an active exception" -> exit 134) even when the run succeeded.
+    # Exit hard with the already-computed result, skipping that teardown, so CI reflects the
+    # actual outcome. (A real invariant violation still returns 1 here; an exception still
+    # propagates before we reach this.)
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(_code)
