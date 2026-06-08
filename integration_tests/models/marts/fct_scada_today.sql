@@ -2,6 +2,8 @@
     materialized='incremental',
     incremental_strategy='insert',
     unique_key=['file'],
+    partition_by=['month_key'],
+    incremental_predicates=["target.month_key = source.month_key"],
     pre_hook="SET VARIABLE scada_today_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'scada_today'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT file FROM {{ this }}){% endif %} LIMIT {{ env_var('process_limit', '1000') }}))"
 ) }}
 
@@ -40,5 +42,8 @@ SELECT
   CAST(SETTLEMENTDATE AS TIMESTAMPTZ) AS SETTLEMENTDATE,
   CAST(LASTCHANGED AS TIMESTAMPTZ) AS LASTCHANGED,
   CAST(SETTLEMENTDATE AS DATE) AS DATE,
-  CAST(YEAR(SETTLEMENTDATE) AS INT) AS YEAR
+  CAST(YEAR(SETTLEMENTDATE) AS INT) AS YEAR,
+  -- Monthly partition key (YYYYMM): low-cardinality column delta_rs prunes the merge on
+  -- (target.month_key = source.month_key), so each merge only touches the batch's months.
+  CAST(YEAR(SETTLEMENTDATE) AS INT) * 100 + CAST(MONTH(SETTLEMENTDATE) AS INT) AS month_key
 FROM scada_staging
