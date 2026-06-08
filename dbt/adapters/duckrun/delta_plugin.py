@@ -172,6 +172,7 @@ class Plugin(BasePlugin):
                 max_spill_size=cfg.get("merge_max_spill_size"),
                 streamed_exec=(False if sx is None else bool(sx)),
                 storage_options=storage_options,
+                compaction_threshold=self._compaction_threshold,
             )
         elif strategy == "append":
             engine.write_delta(

@@ -23,6 +23,10 @@ on:
         description: TPCH scale factor for the target fact table
         default: "20"
 
+# Needed so the dispatch-on-main run can commit the rendered scorecard back to README.md.
+permissions:
+  contents: write
+
 jobs:
   merge-spill:
     runs-on: ubuntu-latest
@@ -69,3 +73,25 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           fi
           exit $rc
+
+      # On a manual dispatch from main, render the scorecard the bench just wrote (merge_card.md)
+      # into the README between the MERGE markers and commit it — same mechanism as the conformance
+      # card. Skipped on the release path (workflow_call runs on a tag ref, not main) so a release
+      # never commits to README. No-op if the bench died before writing the card.
+      - name: Render scorecard into README and commit (main only)
+        if: always() && github.ref == 'refs/heads/main'
+        run: |
+          if [ ! -f merge_card.md ]; then
+            echo "No merge_card.md (bench did not complete) — nothing to render."
+            exit 0
+          fi
+          python tools/inject_readme.py README.md merge_card.md MERGE
+          if git diff --quiet -- README.md; then
+            echo "README MERGE card unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: update MERGE scorecard in README [skip ci]"
+          git push

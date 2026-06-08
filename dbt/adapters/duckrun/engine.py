@@ -367,7 +367,7 @@ def write_delta(
     """
     Materialize ``data`` (a DuckDB relation / Arrow C-stream) to Delta and maintain it.
 
-      - overwrite: write, then vacuum(retention=0) + cleanup_metadata
+      - overwrite: write, then vacuum (safe 7-day default) + cleanup_metadata
       - append:    write, then compact/vacuum/cleanup if file count exceeds threshold
       - ignore:    write only if the table does not already exist
     """
@@ -391,7 +391,7 @@ def write_delta(
 
     dt = _delta_table(path, storage_options)
     if mode == "overwrite":
-        dt.vacuum(retention_hours=0, dry_run=False, enforce_retention_duration=False)
+        dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
         dt.cleanup_metadata()
     else:  # append
         if len(dt.file_uris()) > compaction_threshold:
@@ -448,6 +448,7 @@ def merge_delta(
     max_spill_size: Optional[int] = None,
     streamed_exec: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
+    compaction_threshold: int = 100,
 ) -> None:
     """
     Merge ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
@@ -475,6 +476,11 @@ def merge_delta(
       collecting a small delta is cheap and the prune avoids a full-target scan. For a merge whose
       *source* is itself huge, pass streamed_exec=True (``merge_streamed_exec``) so it isn't
       materialized — at the cost of no pruning.
+
+    After the merge, run the same threshold-gated maintenance the append/delete+insert paths
+    use: when the file count exceeds ``compaction_threshold``, compact small files, vacuum
+    tombstoned old versions (safe 7-day default retention), and clean up expired log entries.
+    Without this an incremental table that is merged on every run grows old files forever.
     """
     keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
     conditions = [f"target.{k} = source.{k}" for k in keys]
@@ -528,3 +534,11 @@ def merge_delta(
             merger = merger.when_matched_update_all()
         merger = merger.when_not_matched_insert_all()
     merger.execute()
+
+    # Same threshold-gated maintenance as the append / delete+insert paths: a merged-on-every-run
+    # incremental table fragments into small files and leaves tombstoned old versions otherwise.
+    dt = _delta_table(path, storage_options)
+    if len(dt.file_uris()) > compaction_threshold:
+        dt.optimize.compact()
+        dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
+        dt.cleanup_metadata()
