@@ -14,14 +14,15 @@ delta-rs and Arrow.
 It is a thin wrapper around [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb). You
 keep everything dbt-duckdb gives you — views, seeds, sources, tests, snapshots, the full
 plugin ecosystem — and gain one extra thing: a Delta-backed `table` / `incremental`
-materialization that writes real Delta tables
+materialization that writes real Delta tables.
 
 The design rationale — why delta_rs and not DuckDB's native Delta writer, why Delta and not
 Iceberg, why a separate adapter — lives in [design_document.md](design_document.md).
 
 > ### 0.3.0 is a breaking change
 >
-> Versions ≤ 0.2.x of `duckrun` were a Microsoft Fabric / OneLake helper library. From
+> Versions ≤ 0.2.x of `duckrun` were a custom orchestrator, which was silly in hindsight — in
+> my defence, I did not know how awesome dbt is. From
 > **0.3.0** onward `duckrun` is a dbt adapter. Need the old library? Pin
 > `pip install "duckrun<0.3"`, or use the
 > [`legacy`](https://github.com/djouallah/duckrun/tree/legacy) branch.
@@ -32,6 +33,17 @@ DuckDB is a great query engine, Delta Lake is a great open table format, and dbt
 right tool to orchestrate the DAG. duckrun wires the three together:
 
 > **DuckDB executes · delta_rs materializes · dbt orchestrates.**
+
+## In the wild
+
+[**dbt_fabric_python_delta**](https://github.com/djouallah/dbt_fabric_python_delta) is an
+end-to-end example project that runs duckrun against **Microsoft Fabric**: dbt models
+execute in DuckDB and land as Delta tables in **OneLake**, which **Power BI Direct Lake**
+reads natively — no virtualization layer in between. Because the whole pipeline is pure
+Python, it runs anywhere — a laptop, GitHub Actions, or a Fabric notebook — and uses
+duckrun's file-level incremental pattern (`safeappend`) so each run ingests only
+not-yet-seen files. It also shows OIDC-based auth and scheduled runs via the Azure and
+Fabric CLIs. A good place to see how the pieces fit together on a real warehouse.
 
 ## Install
 
