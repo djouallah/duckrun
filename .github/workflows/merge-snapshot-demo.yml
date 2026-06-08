@@ -1,16 +1,19 @@
 name: merge-snapshot-demo
 
-# Manual-only DEMONSTRATION (NOT a gate, never runs on push) of why duckrun's incremental
-# merge is correctness-safe under concurrent writes: DuckDB's source delta_scan always reads a
-# version >= the version delta-rs fixed for the merge target (same with no concurrency, ahead
-# under it, never before), in both streamed_exec modes. The only reachable gap makes the merge
-# FAIL loudly via delta-rs OCC (CommitFailedError) -- never a silent wrong result.
-# Run it from the Actions tab and read the printed matrix. See repro/merge_snapshot_safety.py.
+# Required check on every PR (and runnable manually) proving duckrun's incremental merge is
+# correctness-safe under concurrent writes: DuckDB's source delta_scan always reads a version
+# >= the version delta-rs fixed for the merge target (same with no concurrency, ahead under it,
+# never before), in both streamed_exec modes. The only reachable gap makes the merge FAIL loudly
+# via delta-rs OCC (CommitFailedError) -- never a silent wrong result. The job exits non-zero if
+# that invariant is ever violated, so a regression that breaks it blocks the PR.
+# Read the scorecard on the run's summary page. See repro/merge_snapshot_safety.py.
 on:
+  pull_request:
   workflow_dispatch:
 
 jobs:
-  demo:
+  merge-snapshot-safety:
+    name: merge snapshot safety
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
