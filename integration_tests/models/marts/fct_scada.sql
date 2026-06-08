@@ -1,11 +1,16 @@
 {{ config(
     materialized='incremental',
-    incremental_strategy='insert',
-    unique_key=['file'],
+    incremental_strategy='safeappend',
     partition_by=['month_key'],
-    incremental_predicates=["target.month_key = source.month_key"],
     pre_hook="SET VARIABLE scada_daily_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT file FROM {{ this }}){% endif %} LIMIT {{ env_var('process_limit', '1000') }}))"
 ) }}
+
+{#-- This is the most expensive table to build, so it uses `safeappend` rather than a
+     merge/insert: dedup is already done in SQL (the pre_hook + staging only load files NOT
+     already in {{ this }}), so a key-join merge is redundant work. `safeappend` is a plain
+     append (no target scan, no join — DuckDB keeps full memory like append/overwrite) plus a
+     compare-and-swap: it commits only if the table version has not moved since this run read
+     it, else it fails so the run re-runs against the new state. No duplicate files slip in. --#}
 
 {%- set check_files_query -%}
 SELECT COUNT(*) as cnt FROM {{ ref('stg_csv_archive_log') }}
@@ -149,9 +154,8 @@ SELECT
   CAST(SETTLEMENTDATE AS TIMESTAMPTZ) AS SETTLEMENTDATE,
   CAST(SETTLEMENTDATE AS DATE) AS DATE,
   CAST(YEAR(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS YEAR,
-  -- Monthly partition key (YYYYMM): low-cardinality column delta_rs can prune the merge on
-  -- (target.month_key = source.month_key), so each incremental merge only touches the months
-  -- the batch covers instead of scanning the whole table. ~84 partitions over 7 years.
+  -- Monthly partition key (YYYYMM): low-cardinality Delta partition column (~84 partitions over
+  -- 7 years) that organizes the files on disk and lets downstream readers prune by month.
   CAST(YEAR(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) * 100
     + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
 FROM scada_staging
