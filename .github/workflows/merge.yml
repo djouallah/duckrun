@@ -92,8 +92,8 @@ jobs:
             echo "README MERGE card unchanged."
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
           git add README.md
           git commit -m "docs: update MERGE scorecard in README [skip ci]"
           for i in 1 2 3; do

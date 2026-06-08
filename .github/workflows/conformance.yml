@@ -110,8 +110,8 @@ jobs:
             echo "Conformance card + baseline unchanged."
             exit 0
           fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
           git add README.md tests/conformance/passing_baseline.txt
           git commit -m "docs: refresh conformance card + baseline [skip ci]"
           for i in 1 2 3; do
