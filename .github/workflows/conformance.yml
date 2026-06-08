@@ -90,31 +90,21 @@ jobs:
         if: always() && steps.changes.outputs.code == 'true'
         run: cat conformance_card.md >> "$GITHUB_STEP_SUMMARY"
 
-      # THE GATE (PRs): fail iff a test that passes on main is no longer passing here. Known-failing
-      # tests are tolerated; new passes never block. No-op (green) until the baseline is seeded by
-      # the first push to main. This is the required-check teeth — no continue-on-error.
+      # THE GATE: fail iff a test that passes on main (tests/conformance/passing_baseline.txt) is no
+      # longer passing here. Known failures are tolerated; new passes never block. No-op (green)
+      # until the baseline file is committed. Runs on every code change — no continue-on-error.
       - name: Gate on conformance regressions (baseline diff)
-        if: steps.changes.outputs.code == 'true' && github.event_name != 'push'
+        if: steps.changes.outputs.code == 'true'
         run: python tools/conformance_baseline.py check tests/conformance/passing_baseline.txt conformance.xml
 
-      # On push to main: refresh the baseline from this (authoritative) run and render the card into
-      # README, then commit both. The PR gate above always compares against this. [skip ci] avoids
-      # re-triggering. Never fails the push on a commit hiccup.
-      - name: Refresh baseline + render card into README and commit (main only)
-        if: always() && steps.changes.outputs.code == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
-        continue-on-error: true
-        run: |
-          python tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml
-          python tools/inject_readme.py README.md conformance_card.md CONFORMANCE
-          if git diff --quiet -- README.md tests/conformance/passing_baseline.txt; then
-            echo "Conformance card + baseline unchanged."
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add README.md tests/conformance/passing_baseline.txt
-          git commit -m "docs: refresh conformance card + baseline [skip ci]"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            echo "push race (attempt $i), retrying"; sleep 3
-          done
+      # Regenerate the baseline from this run and upload it as an artifact. The committed baseline is
+      # refreshed by committing this artifact (an admin push) when it legitimately changes — no bot
+      # pushes to the protected branch. Cheap; lets the gate above grow as duckrun passes more tests.
+      - name: Upload regenerated baseline (artifact)
+        if: always() && steps.changes.outputs.code == 'true'
+        run: python tools/conformance_baseline.py update passing_baseline.new.txt conformance.xml
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.changes.outputs.code == 'true'
+        with:
+          name: conformance-baseline
+          path: passing_baseline.new.txt
