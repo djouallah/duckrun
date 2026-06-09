@@ -208,6 +208,15 @@ def _effective_mem_limit_source() -> str:
 _DUCKDB_MEM_FRACTION = 0.3   # DuckDB's memory_limit (see set_merge_memory_limit)
 _MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size
 
+# Write path (overwrite/append/safeappend/microbatch): DuckDB runs alone — no competing delta_rs
+# merge pool — so it gets the bulk of the cap, not a 0.3 share. But it must still be BOUNDED to the
+# effective limit, because DuckDB's own default memory_limit is 80% of *physical* RAM, and on a
+# container (Fabric/Spark/k8s) physical RAM is the whole node, not our slice — so the default
+# overcommits and the kernel OOM-kills us. 0.7 of the effective limit (which folds in available RAM,
+# the only signal that reflects the container on Fabric where the cgroup is the unlimited root)
+# leaves ~30% for the Arrow source stream, the Parquet writer, and page cache outside DuckDB's pool.
+_WRITE_MEM_FRACTION = 0.7
+
 
 def _default_merge_spill_size() -> Optional[int]:
     """delta_rs merge ``max_spill_size`` default: ~40% of the *effective* memory limit
@@ -253,10 +262,11 @@ def configure_duckdb_session(con) -> None:
     merges. Delta tables are unordered and explicit ORDER BY still works, so duckrun turns it
     off by default — users no longer need to set it in their profile ``settings``.
 
-    The DuckDB ``memory_limit`` is deliberately left ALONE here. A plain overwrite/append has no
-    competing delta_rs merge pool, so DuckDB manages its own memory — it streams and spills fine
-    on its own, even for very large writes. Only the merge path tightens it (see
-    ``set_merge_memory_limit``); the write path restores the baseline (``restore_memory_limit``)."""
+    The DuckDB ``memory_limit`` is deliberately left ALONE here; it's set per model in ``store()``.
+    The write path clamps it to ``_WRITE_MEM_FRACTION`` of the effective limit
+    (``set_write_memory_limit``) — DuckDB has no competing delta_rs pool there so it gets the bulk,
+    but still bounded so its host-physical-RAM default can't OOM-kill a container. The merge path
+    tightens further to its 0.3 share (``set_merge_memory_limit``)."""
     try:
         con.execute("SET preserve_insertion_order=false")
     except Exception:
@@ -310,13 +320,41 @@ def set_merge_memory_limit(con) -> None:
 
 def restore_memory_limit(con, baseline: Optional[str]) -> None:
     """Restore DuckDB's ``memory_limit`` to the connection ``baseline`` — its profile value, or
-    DuckDB's own default if none. Called on the overwrite/append path so DuckDB manages its own
-    memory (no merge split), and to undo a prior merge's tightening on the shared connection.
-    No-op if the baseline is unknown."""
+    DuckDB's own default if none. No-op if the baseline is unknown."""
     if not baseline:
         return
     try:
         con.execute(f"SET memory_limit='{baseline}'")
+    except Exception:
+        pass
+
+
+def set_write_memory_limit(con, baseline: Optional[str]) -> None:
+    """Write-path (overwrite/append/safeappend/microbatch) ``memory_limit``: the connection
+    ``baseline``, clamped DOWN to ``_WRITE_MEM_FRACTION`` of the effective limit. The write path
+    has no competing delta_rs pool, so DuckDB gets the bulk — but still bounded, because DuckDB's
+    own default is 80% of *physical* RAM, which on a container is the whole node, not our slice, and
+    OOM-kills us (the bug this fixes on Fabric). Also undoes any tightening a prior merge left on the
+    shared connection, by setting the limit absolutely (not tighten-only) from the baseline.
+
+    Set to ``min(baseline, _WRITE_MEM_FRACTION * effective)`` so an explicit lower profile limit is
+    respected and the bogus host default is capped. Falls back to restoring the baseline string when
+    the effective limit is unknown; no-op when neither is known."""
+    eff = _effective_mem_limit_bytes()
+    target = int(eff * _WRITE_MEM_FRACTION) if eff else None
+    base_bytes = _parse_byte_size(baseline)
+    candidates = [v for v in (base_bytes, target) if v]
+    if not candidates:
+        restore_memory_limit(con, baseline)
+        return
+    final = min(candidates)
+    try:
+        con.execute(f"SET memory_limit='{final}B'")
+        if target is not None and final == target:
+            logger.info(
+                f"write: DuckDB memory_limit set to {final / 2 ** 30:.2f} GiB "
+                f"({int(_WRITE_MEM_FRACTION * 100)}% of {eff / 2 ** 30:.2f} GiB effective limit)"
+            )
     except Exception:
         pass
 

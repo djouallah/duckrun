@@ -48,10 +48,10 @@ class Plugin(BasePlugin):
         except Exception:
             pass
         # Always-on write-path tuning (preserve_insertion_order=false + a temp_directory to spill
-        # to). The DuckDB memory_limit is NOT touched here: a plain overwrite/append lets DuckDB
-        # manage its own memory; only the merge path tightens it (set_merge_memory_limit), pairing
-        # with the merge's max_spill_size. Capture the baseline limit (profile value or DuckDB's
-        # default) so the write path can restore it after a merge tightened the shared connection.
+        # to). The DuckDB memory_limit is NOT touched here — store() sets it per model: the write
+        # path clamps to _WRITE_MEM_FRACTION of the effective limit (set_write_memory_limit), the
+        # merge path to its 0.3 share (set_merge_memory_limit). Capture the baseline limit (profile
+        # value or DuckDB's default) so store() can clamp DOWN from it rather than guess a floor.
         try:
             engine.configure_duckdb_session(conn)
             self._baseline_memory_limit = engine.read_memory_limit(conn)
@@ -107,10 +107,12 @@ class Plugin(BasePlugin):
         # Keep `cur` referenced for the whole write so the relation's Arrow stream
         # stays valid while deltalake consumes it.
         cur = self._cursor()
-        # Start every model with DuckDB's memory managing itself (the write-path default). Undoes
-        # any tightening a previous merge left on the shared connection; the merge branch below
-        # re-tightens. So the 0.3/0.6 split applies to merge ONLY — overwrite/append do nothing.
-        engine.restore_memory_limit(cur, self._baseline_memory_limit)
+        # Start every model bounded to the write-path share (_WRITE_MEM_FRACTION of the effective
+        # limit), clamping DuckDB's host-physical-RAM default that OOM-kills us on containers. Also
+        # undoes any tightening a previous merge left on the shared connection; the merge branch
+        # below re-tightens to its 0.3 share. So the write clamp applies to overwrite/append/
+        # safeappend/microbatch, and the 0.3/0.6 split applies to merge ONLY.
+        engine.set_write_memory_limit(cur, self._baseline_memory_limit)
         name = self._relation_name(target_config.relation)
         data = cur.sql(f"SELECT * FROM {name}")
 

@@ -201,6 +201,53 @@ def test_restore_memory_limit_noop_when_baseline_unknown():
     assert not any(k == "memory_limit" for k, _ in con.sets)
 
 
+def test_set_write_memory_limit_clamps_host_default(monkeypatch):
+    """The write path bounds DuckDB's host-physical-RAM baseline to the write share, so the
+    default 80%-of-node-RAM can't OOM-kill a container (the Fabric bug)."""
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
+    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
+    engine.set_write_memory_limit(con, "100.0 GiB")
+    target = int(16 * 2 ** 30 * engine._WRITE_MEM_FRACTION)
+    assert ("memory_limit", f"{target}B") in con.sets
+
+
+def test_set_write_memory_limit_respects_lower_baseline(monkeypatch):
+    """An explicit, smaller profile limit is kept — we clamp DOWN, never loosen above baseline."""
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
+    con = _FakeCon({"memory_limit": "2.0 GiB", "temp_directory": ".tmp"})
+    engine.set_write_memory_limit(con, "2.0 GiB")
+    assert ("memory_limit", f"{2 * 2 ** 30}B") in con.sets
+
+
+def test_set_write_memory_limit_loosens_from_prior_merge_tighten(monkeypatch):
+    """Set absolutely from the baseline (not tighten-only): a prior merge left memory_limit at its
+    0.3 share, and the next write must loosen it back up to its larger 0.7 write share."""
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
+    merge_share = f"{int(16 * 2 ** 30 * engine._DUCKDB_MEM_FRACTION)}B"
+    con = _FakeCon({"memory_limit": merge_share, "temp_directory": ".tmp"})
+    engine.set_write_memory_limit(con, "100.0 GiB")
+    target = int(16 * 2 ** 30 * engine._WRITE_MEM_FRACTION)
+    assert ("memory_limit", f"{target}B") in con.sets
+    assert target > int(16 * 2 ** 30 * engine._DUCKDB_MEM_FRACTION)
+
+
+def test_set_write_memory_limit_keeps_baseline_when_limit_unknown(monkeypatch):
+    """No cgroup/physical/available signal: keep the baseline (as its byte equivalent), don't
+    invent a floor."""
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: None)
+    con = _FakeCon({"memory_limit": "1000000000B", "temp_directory": ".tmp"})
+    engine.set_write_memory_limit(con, "8.0 GiB")
+    assert ("memory_limit", f"{8 * 2 ** 30}B") in con.sets
+
+
+def test_set_write_memory_limit_noop_when_nothing_known(monkeypatch):
+    """Effective limit unknown AND baseline unparseable/missing: leave memory_limit untouched."""
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: None)
+    con = _FakeCon({"memory_limit": "1000000000B", "temp_directory": ".tmp"})
+    engine.set_write_memory_limit(con, None)
+    assert not any(k == "memory_limit" for k, _ in con.sets)
+
+
 # ---------------------------------------------------------- kwarg forwarding
 
 class _FakeMerger:
