@@ -30,17 +30,6 @@ right tool to orchestrate the DAG. duckrun wires the three together:
 
 > **DuckDB executes · delta_rs materializes · dbt orchestrates.**
 
-## Full Project
-
-[**dbt_fabric_python_delta**](https://github.com/djouallah/dbt_fabric_python_delta) is an
-end-to-end example project that runs duckrun against **Microsoft Fabric**: dbt models
-execute in DuckDB and land as Delta tables in **OneLake**, which **Power BI Direct Lake**
-reads natively — no virtualization layer in between. Because the whole pipeline is pure
-Python, it runs anywhere — a laptop, GitHub Actions, or a Fabric notebook — and uses
-duckrun's file-level incremental pattern (`safeappend`) so each run ingests only
-not-yet-seen files. It also shows OIDC-based auth and scheduled runs via the Azure and
-Fabric CLIs. A good place to see how the pieces fit together on a real warehouse.
-
 ## Install
 
 ```bash
@@ -68,7 +57,7 @@ my_project:
 Persisted models are written to `<root_path>/<schema>/<model>` (e.g.
 `./warehouse/dbo/orders`), or to an explicit `config(location=...)`.
 
-### Remote stores (S3 / GCS / ADLS / OneLake)
+### Remote stores (S3 / GCS / ADLS)
 
 Point `root_path` at the warehouse location and pass credentials through
 `storage_options` — these flow straight to deltalake for writes and merges.
