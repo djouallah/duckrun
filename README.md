@@ -252,10 +252,10 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 ## dbt adapter conformance — duckrun
 
 ```
-┌───────────────────────────────────────────────────────┐
-│ ✅ 92 passed   ❌ 38 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 68% passing                               │
-└───────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│ ✅ 100 passed   ❌ 30 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 74% passing                                │
+└────────────────────────────────────────────────────────┘
 ```
 
 ### By suite
@@ -272,13 +272,13 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
+| `incremental` | `████████░░` 85% | 22 | 4 | 0 | 0 | 26 |
 | `basic` | `████████░░` 81% | 13 | 3 | 0 | 0 | 16 |
-| `incremental` | `█████░░░░░` 54% | 14 | 12 | 0 | 0 | 26 |
 | `incremental_microbatch` | `█████░░░░░` 54% | 7 | 6 | 0 | 0 | 13 |
 | `constraints` | `██░░░░░░░░` 24% | 4 | 13 | 0 | 0 | 17 |
 | `persist_docs` | `██░░░░░░░░` 20% | 1 | 3 | 0 | 1 | 5 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `███████░░░` **68%** | **92** | **38** | **0** | **5** | **135** |
+| **Total** | `███████░░░` **74%** | **100** | **30** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -339,24 +339,6 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | ❌ | `TestModelConstraintsRuntimeEnforcement::test__model_constraints_ddl` | AssertionError: assert 'create table... model_subq);' == 'create or re...l_identifier>' - create or replace view <model_identifier> as select * from <model_iden |
 
 </details>
-<details><summary><b>incremental</b> — 12 not passing (14/26 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestIncrementalPredicates::test__incremental_predicates` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
-| ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | assert 1 == 2 |
-| ❌ | `TestIncrementalMergeValidation::test_invalid_condition_type` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMergeValidation::test_invalid_columns_type` | AssertionError: assert 'merge_update_columns must be a list' in 'Generic DeltaTable error: External error: Generic DeltaTable error: Schema error: No field name |
-| ❌ | `TestIncrementalMergeValidation::test_invalid_set_expressions_type` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMergeValidation::test_conflicting_configs` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMergeValidation::test_invalid_clauses_type` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMergeValidation::test_empty_clauses` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMergeValidation::test_invalid_clause_list` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMergeValidation::test_invalid_clause_element` | AssertionError: dbt exit state did not match expected |
-
-</details>
 <details><summary><b>incremental_microbatch</b> — 6 not passing (7/13 pass)</summary>
 
 | Outcome | Test | Message |
@@ -376,6 +358,16 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestDocsGenReferencesDuckDB::test_references` | AssertionError: Key 'metadata' in 'model.test.ephemeral_summary' did not match assert {'comment': N...r': None, ...} == {'comment': N...r': None, ...} Omitting  |
 | ❌ | `TestCatalogRelationsDuckDB::test_get_catalog_relations` | AssertionError: dbt exit state did not match expected |
+
+</details>
+<details><summary><b>incremental</b> — 4 not passing (22/26 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestIncrementalPredicates::test__incremental_predicates` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
+| ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | assert 1 == 2 |
 
 </details>
 
