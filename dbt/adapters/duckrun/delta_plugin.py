@@ -161,6 +161,11 @@ class Plugin(BasePlugin):
             strategy = "merge"
 
         if strategy in ("merge", "insert"):
+            # Validate the merge config shape FIRST — before any Delta access, memory tuning, or
+            # write — so an invalid config fails fast and cleanly (no partial/late delta_rs
+            # "Schema error" after the log has moved). Messages mirror dbt-duckdb's
+            # validate_merge_config so the behavior is portable.
+            self._validate_merge_config(cfg)
             if not unique_key:
                 raise ValueError(
                     f"incremental_strategy='{strategy}' requires a unique_key."
@@ -288,6 +293,109 @@ class Plugin(BasePlugin):
     @staticmethod
     def _relation_name(relation: Any) -> str:
         return relation.render() if hasattr(relation, "render") else str(relation)
+
+    @staticmethod
+    def _validate_merge_config(cfg: dict) -> None:
+        """Fail fast on an invalid merge config, BEFORE any Delta access or write.
+
+        Ported from dbt-duckdb's ``validate_merge_config`` macro (and its helpers) so the error
+        messages match exactly — duckrun otherwise passes raw config to delta_rs, which dies
+        late with a generic "Schema error" *after* it has started touching the table. The shape
+        checks (string / list / dict, merge_clauses structure, basic-vs-clauses conflict) are
+        engine-agnostic, so validating them here is honest even though delta_rs doesn't act on
+        every key. All problems are collected and raised together.
+        """
+        def is_string(v):
+            return isinstance(v, str)
+
+        def is_sequence(v):
+            return isinstance(v, (list, tuple))
+
+        def is_mapping(v):
+            return isinstance(v, dict)
+
+        errors = []
+        # field name -> expected shape; order matters for the conflict message.
+        base_fields = {
+            "merge_update_condition": "string",
+            "merge_insert_condition": "string",
+            "merge_on_using_columns": "sequence",
+            "merge_update_columns": "sequence",
+            "merge_update_set_expressions": "mapping",
+            "merge_exclude_columns": "sequence",
+            "merge_returning_columns": "sequence",
+        }
+
+        for name, ftype in base_fields.items():
+            val = cfg.get(name)
+            if val is None:
+                continue
+            if ftype == "string":
+                if not is_string(val):
+                    errors.append(f"{name} must be a string, found: {val}")
+            elif ftype == "sequence":
+                if not is_sequence(val):
+                    errors.append(f"{name} must be a list")
+                else:
+                    for item in val:
+                        if not is_string(item):
+                            errors.append(f"{name} must contain only string values, found: {item}")
+            elif ftype == "mapping":
+                if not is_mapping(val):
+                    errors.append(f"{name} must be a dictionary, found: {val}")
+
+        merge_clauses = cfg.get("merge_clauses")
+        if merge_clauses is not None:
+            if not is_mapping(merge_clauses):
+                errors.append(f"merge_clauses must be a dictionary, found: {merge_clauses}")
+            else:
+                if "when_matched" not in merge_clauses and "when_not_matched" not in merge_clauses:
+                    errors.append(
+                        "merge_clauses must contain at least one of "
+                        "'when_matched' or 'when_not_matched' keys"
+                    )
+                for ct in ("when_matched", "when_not_matched"):
+                    if ct not in merge_clauses:
+                        continue
+                    clause = merge_clauses.get(ct)
+                    if not is_sequence(clause):
+                        errors.append(f"merge_clauses.{ct} must be a list")
+                    elif len(clause) == 0:
+                        errors.append(f"merge_clauses.{ct} must contain at least one element")
+                    else:
+                        for c in clause:
+                            if not is_mapping(c):
+                                errors.append(
+                                    f"merge_clauses.{ct} elements must be dictionaries, found: {c}"
+                                )
+                # Basic merge configs are ignored when merge_clauses is set — flag the conflict.
+                conflicting = []
+                for name, ftype in base_fields.items():
+                    if name in ("merge_on_using_columns", "merge_returning_columns"):
+                        continue
+                    val = cfg.get(name)
+                    if val is None:
+                        continue
+                    if ftype == "sequence":
+                        if is_sequence(val) and len(val) > 0:
+                            conflicting.append(name)
+                        elif not is_sequence(val):
+                            conflicting.append(name)
+                    elif ftype == "mapping":
+                        if is_mapping(val) and len(val.keys()) > 0:
+                            conflicting.append(name)
+                    else:
+                        conflicting.append(name)
+                if conflicting:
+                    errors.append(
+                        "When merge_clauses is specified, the following basic merge "
+                        "configurations will be ignored and should be removed: "
+                        + ", ".join(conflicting)
+                        + ". Define your merge behavior within merge_clauses instead."
+                    )
+
+        if errors:
+            raise CompilationError("MERGE configuration errors:\n" + "\n".join(errors))
 
     @staticmethod
     def _merge_predicates(cfg: dict):
