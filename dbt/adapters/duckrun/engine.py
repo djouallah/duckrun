@@ -407,6 +407,96 @@ def table_exists(path: str, storage_options: Optional[Dict[str, str]] = None) ->
         return False
 
 
+# Delta column-metadata key under which we stash a dbt column description, and the dollar-quote
+# label used to embed arbitrary comment text (newlines, quotes, dollar signs) in COMMENT ON SQL.
+_DELTA_COMMENT_KEY = "comment"
+_COMMENT_DOLLAR_TAG = "$duckrun_comment$"
+
+
+def persist_docs_to_delta(
+    path: str,
+    relation_docs: Optional[str],
+    column_docs: Optional[Dict[str, str]],
+    storage_options: Optional[Dict[str, str]] = None,
+) -> None:
+    """Persist a model's relation/column descriptions into the Delta table's own metadata so they
+    survive across processes (a later ``dbt docs generate`` runs in a fresh DuckDB and rebuilds
+    the views from disk — see ``read_delta_docs`` / view registration). Table description via
+    ``alter.set_table_description``; column descriptions via per-field ``alter.set_column_metadata``
+    under ``_DELTA_COMMENT_KEY``. Best-effort and idempotent; a docs-only failure must never fail
+    the model build."""
+    if not relation_docs and not column_docs:
+        return
+    dt = _delta_table(path, storage_options)
+    if relation_docs:
+        try:
+            dt.alter.set_table_description(relation_docs)
+        except Exception as exc:  # best-effort: docs persistence must not fail the build
+            logger.debug(f"duckrun: could not set Delta table description at {path!r}: {exc}")
+    if column_docs:
+        existing = {f.name for f in dt.schema().fields}
+        for col, desc in column_docs.items():
+            if col not in existing or not desc:
+                continue
+            try:
+                dt.alter.set_column_metadata(col, {_DELTA_COMMENT_KEY: desc})
+            except Exception as exc:  # best-effort per column
+                logger.debug(f"duckrun: could not set Delta column metadata for {col!r}: {exc}")
+
+
+def read_delta_docs(
+    path: str, storage_options: Optional[Dict[str, str]] = None
+):
+    """Read back (relation_description, {column: description}) stored by ``persist_docs_to_delta``.
+    Returns ``(None, {})`` when the table is absent or carries no docs. Best-effort: a read failure
+    yields empty docs rather than aborting view registration."""
+    try:
+        dt = _delta_table(path, storage_options)
+    except Exception:  # best-effort: no table / unreadable -> no docs to restore
+        return None, {}
+    try:
+        relation_docs = dt.metadata().description or None
+    except Exception:  # best-effort
+        relation_docs = None
+    column_docs = {}
+    try:
+        for f in dt.schema().fields:
+            desc = (f.metadata or {}).get(_DELTA_COMMENT_KEY)
+            if desc:
+                column_docs[f.name] = desc
+    except Exception:  # best-effort
+        pass
+    return relation_docs, column_docs
+
+
+def comment_on_sql(relation_render: str, relation_type: str,
+                   relation_docs: Optional[str],
+                   column_docs: Optional[Dict[str, str]]) -> List[str]:
+    """Build ``COMMENT ON {VIEW|TABLE} ...`` / ``COMMENT ON COLUMN ...`` statements that re-apply
+    persisted docs to a (re-registered) DuckDB relation. Comment text is dollar-quoted so newlines,
+    single quotes and dollar signs in the description can't break the literal. Column names are
+    double-quoted. Returns an empty list when there's nothing to comment."""
+    out: List[str] = []
+
+    def _lit(text: str) -> Optional[str]:
+        # Dollar-quoting handles arbitrary text; bail (skip) only if the tag itself appears.
+        return None if _COMMENT_DOLLAR_TAG in text else f"{_COMMENT_DOLLAR_TAG}{text}{_COMMENT_DOLLAR_TAG}"
+
+    if relation_docs:
+        lit = _lit(relation_docs)
+        if lit is not None:
+            out.append(f"comment on {relation_type} {relation_render} is {lit}")
+    for col, desc in (column_docs or {}).items():
+        if not desc:
+            continue
+        lit = _lit(desc)
+        if lit is None:
+            continue
+        quoted = '"' + str(col).replace('"', '""') + '"'
+        out.append(f"comment on column {relation_render}.{quoted} is {lit}")
+    return out
+
+
 def delta_columns(path: str, storage_options: Optional[Dict[str, str]] = None) -> List[str]:
     """Column names of the existing Delta table at ``path`` (for on_schema_change)."""
     return [f.name for f in _delta_table(path, storage_options).schema().fields]

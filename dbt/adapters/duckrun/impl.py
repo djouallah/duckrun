@@ -82,6 +82,35 @@ class DuckrunAdapter(DuckDBAdapter):
             # the read->write race the pin exists to close.
             return None
 
+    @available
+    def persist_delta_docs(self, location, relation_docs, column_docs) -> None:
+        """Persist a model's relation/column descriptions into the Delta table's metadata so they
+        survive into a later ``dbt docs generate`` (a fresh process that rebuilds the views from
+        disk). Called from the materialization after the write. Best-effort."""
+        from . import engine
+        so = getattr(self.config.credentials, "storage_options", None)
+        try:
+            engine.persist_docs_to_delta(location, relation_docs, dict(column_docs or {}), so)
+        except Exception as exc:  # best-effort: docs persistence must not fail the build
+            logger.debug(f"duckrun: could not persist Delta docs at {location!r}: {exc}")
+
+    def _apply_delta_comments(self, cursor, relation, location):
+        """Re-apply persisted Delta docs (relation + column descriptions) as COMMENT ON statements
+        on a freshly (re-)registered delta_scan view, so catalog queries (``dbt docs generate``)
+        return non-null comments even in a process that never ran the model. Best-effort."""
+        from . import engine
+        so = getattr(self.config.credentials, "storage_options", None)
+        relation_docs, column_docs = engine.read_delta_docs(location, so)
+        if not relation_docs and not column_docs:
+            return
+        # The physical object is a view, so COMMENT ON VIEW (DuckDB reports it under the view's
+        # catalog entry, which get_catalog reads).
+        for stmt in engine.comment_on_sql(relation.render(), "view", relation_docs, column_docs):
+            try:
+                cursor.execute(stmt)
+            except Exception as exc:  # best-effort: a single failed comment must not abort registration
+                logger.debug(f"duckrun: could not apply comment for {location!r}: {exc}")
+
     # ------------------------------------------------------------------ discovery
     def _cursor(self):
         return self.connections.get_thread_connection().handle.cursor()
@@ -209,6 +238,9 @@ class DuckrunAdapter(DuckDBAdapter):
                 f"create or replace view {relation.render()} as "
                 f"select * from delta_scan('{loc_sql}')"
             )
+            # Re-apply persisted docs as COMMENT ON so a docs/test/show process (which rebuilt
+            # this view from disk and so lost any in-run comment) still reports them.
+            self._apply_delta_comments(cursor, relation, location)
         except Exception as exc:
             # A table mid-write or an unreadable log shouldn't abort cache population;
             # the materialization re-creates the view on the next run regardless. Log at

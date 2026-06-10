@@ -168,7 +168,23 @@
   {{ adapter.commit() }}
   {{ run_hooks(post_hooks, inside_transaction=False) }}
 
+  {#-- persist_docs: COMMENT ON the in-run DuckDB view (dbt-duckdb macros), then ALSO write the
+       descriptions into the Delta table's own metadata so they survive a later `dbt docs generate`
+       (a fresh process rebuilds the views from disk via list_relations_without_caching, which
+       re-applies these as COMMENT ON — see impl._apply_delta_comments). --#}
   {% do persist_docs(target_relation, model) %}
+  {%- set _relation_docs = model.description if (config.persist_relation_docs() and model.description) else none -%}
+  {%- set _column_docs = {} -%}
+  {%- if config.persist_column_docs() and model.columns -%}
+    {%- for _cn, _col in model.columns.items() -%}
+      {%- if _col.description -%}
+        {%- do _column_docs.update({_col.name: _col.description}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if _relation_docs or _column_docs -%}
+    {% do adapter.persist_delta_docs(location, _relation_docs, _column_docs) %}
+  {%- endif -%}
 
   {{ return({'relations': [target_relation]}) }}
 
