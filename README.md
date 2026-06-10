@@ -253,8 +253,8 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ ✅ 100 passed   ❌ 30 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 74% passing                                │
+│ ✅ 110 passed   ❌ 20 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 81% passing                                │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -273,12 +273,12 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
 | `incremental` | `████████░░` 85% | 22 | 4 | 0 | 0 | 26 |
+| `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
 | `basic` | `████████░░` 81% | 13 | 3 | 0 | 0 | 16 |
 | `incremental_microbatch` | `█████░░░░░` 54% | 7 | 6 | 0 | 0 | 13 |
-| `constraints` | `██░░░░░░░░` 24% | 4 | 13 | 0 | 0 | 17 |
 | `persist_docs` | `██░░░░░░░░` 20% | 1 | 3 | 0 | 1 | 5 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `███████░░░` **74%** | **100** | **30** | **0** | **5** | **135** |
+| **Total** | `████████░░` **81%** | **110** | **20** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -320,25 +320,6 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | ❌ | `TestPersistDocsCommentOnQuotedColumn::test_quoted_column_comments` | AttributeError: 'NoneType' object has no attribute 'startswith' |
 
 </details>
-<details><summary><b>constraints</b> — 13 not passing (4/17 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_wrong_column_names` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_wrong_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestViewConstraintsColumnsEqual::test__constraints_wrong_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestViewConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_wrong_column_names` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_wrong_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestTableConstraintsRuntimeDdlEnforcement::test__constraints_ddl` | AssertionError: assert 'create table... model_subq);' == 'create or re...l_identifier>' - create or replace view <model_identifier> as select * from <model_iden |
-| ❌ | `TestTableConstraintsRollback::test__constraints_enforcement_rollback` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalConstraintsRuntimeDdlEnforcement::test__constraints_ddl` | AssertionError: assert 'create table... model_subq);' == 'create or re...l_identifier>' - create or replace view <model_identifier> as select * from <model_iden |
-| ❌ | `TestIncrementalConstraintsRollback::test__constraints_enforcement_rollback` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestModelConstraintsRuntimeEnforcement::test__model_constraints_ddl` | AssertionError: assert 'create table... model_subq);' == 'create or re...l_identifier>' - create or replace view <model_identifier> as select * from <model_iden |
-
-</details>
 <details><summary><b>incremental_microbatch</b> — 6 not passing (7/13 pass)</summary>
 
 | Outcome | Test | Message |
@@ -358,6 +339,15 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestDocsGenReferencesDuckDB::test_references` | AssertionError: Key 'metadata' in 'model.test.ephemeral_summary' did not match assert {'comment': N...r': None, ...} == {'comment': N...r': None, ...} Omitting  |
 | ❌ | `TestCatalogRelationsDuckDB::test_get_catalog_relations` | AssertionError: dbt exit state did not match expected |
+
+</details>
+<details><summary><b>constraints</b> — 3 not passing (14/17 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestViewConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
 
 </details>
 <details><summary><b>incremental</b> — 4 not passing (22/26 pass)</summary>
