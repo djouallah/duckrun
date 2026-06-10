@@ -132,6 +132,16 @@ class Plugin(BasePlugin):
                 "--full-refresh if the table was deliberately deleted."
             )
 
+        # Contract NOT NULL enforcement (config(contract={enforced:true}) with a not_null column
+        # constraint). duckrun writes via delta_rs, not SQL DDL, so dbt-core's column-constraint
+        # DDL never runs. Guard the staged rows BEFORE any write: a null in a not-null column
+        # raises, and because nothing has been written yet the prior Delta version is untouched
+        # (the rollback the constraint tests assert). Message carries "NOT NULL constraint failed"
+        # to match dbt's standard contract-error phrasing.
+        not_null_columns = cfg.get("not_null_columns") or []
+        if not_null_columns:
+            self._assert_not_null(cur, name, not_null_columns)
+
         # Microbatch is delete+insert per event_time window, not a key-based upsert, so it
         # bypasses the generic overwrite/merge dispatch below (which would clobber every batch
         # under --full-refresh, since dbt marks each microbatch batch full_refresh in that case).
@@ -293,6 +303,26 @@ class Plugin(BasePlugin):
     @staticmethod
     def _relation_name(relation: Any) -> str:
         return relation.render() if hasattr(relation, "render") else str(relation)
+
+    @staticmethod
+    def _assert_not_null(cur, name: str, columns) -> None:
+        """Raise if any of ``columns`` contains a NULL in the staged relation ``name``.
+
+        A pre-write DuckDB guard query — the honest, engine-agnostic way to enforce a contract
+        NOT NULL constraint when the materialization is a delta_rs write rather than SQL DDL.
+        Runs before the Delta write, so a violation leaves the existing table (and its version)
+        untouched. The double-quoted identifiers handle column names that need quoting.
+        """
+        for col in columns:
+            quoted = '"' + str(col).replace('"', '""') + '"'
+            cnt = cur.sql(
+                f"SELECT count(*) FROM {name} WHERE {quoted} IS NULL"
+            ).fetchone()[0]
+            if cnt:
+                raise CompilationError(
+                    f"NOT NULL constraint failed: column '{col}' in this contracted model "
+                    f"produced {cnt} null value(s). Fix the model SQL or relax the contract."
+                )
 
     @staticmethod
     def _validate_merge_config(cfg: dict) -> None:

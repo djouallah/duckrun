@@ -78,6 +78,28 @@
 
   {{ run_hooks(pre_hooks, inside_transaction=True) }}
 
+  {#-- Model contracts (config(contract={enforced:true})). duckrun materializes via delta_rs
+       writes, not SQL DDL, so dbt-core's create-table-with-constraints path never runs — we
+       enforce here instead. Preflight column equivalence (name/type/count of the model SQL vs
+       the yaml contract) is the standard dbt check; reusing get_assert_columns_equivalent keeps
+       the error formatting identical. NOT NULL is enforced at write time in the plugin (a guard
+       query on the staged rows), so collect the not-null column names and thread them through.
+       check / primary_key / foreign_key constraints are not enforceable against a delta_scan
+       view and are documented as structural gaps in the README scorecard (no fixture-override of
+       behavioral check tests). --#}
+  {%- set contract_config = config.get('contract') -%}
+  {%- set not_null_columns = [] -%}
+  {%- if contract_config and contract_config.enforced and language != 'python' -%}
+    {{ get_assert_columns_equivalent(model_sql) }}
+    {%- for _cname, _col in (model.get('columns') or {}).items() -%}
+      {%- for _c in (_col.get('constraints') or []) -%}
+        {%- if _c.get('type') == 'not_null' -%}
+          {%- do not_null_columns.append(_col['name']) -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endfor -%}
+  {%- endif -%}
+
   {#-- 1. Stage the model SQL as a DuckDB view so the plugin can read it as Arrow.
        (python models are already staged as a table by the materialization wrapper) --#}
   {%- if language != 'python' -%}
@@ -105,6 +127,7 @@
       'incremental_strategy': config.get('incremental_strategy'),
       'read_version': read_version,
       'dbt_believes_exists': dbt_believes_exists,
+      'not_null_columns': not_null_columns,
       'full_refresh': should_full_refresh(),
       'unique_key': config.get('unique_key'),
       'partition_by': config.get('partition_by'),

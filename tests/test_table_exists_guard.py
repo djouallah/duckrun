@@ -22,6 +22,11 @@ from deltalake.exceptions import TableNotFoundError
 from dbt.adapters.duckrun import engine
 from dbt.adapters.duckrun.delta_plugin import Plugin
 
+try:
+    from dbt_common.exceptions import CompilationError
+except Exception:  # pragma: no cover - older layouts
+    CompilationError = ValueError
+
 
 # ----------------------------------------------------------------- unit: table_exists
 
@@ -118,6 +123,21 @@ def test_store_refuses_overwrite_when_table_vanishes_midrun(tmp_path, monkeypatc
     assert DeltaTable(path).version() == version_before
     ids = sorted(DeltaTable(path).to_pyarrow_table().column("id").to_pylist())
     assert ids == [1, 2, 3, 4, 5]
+
+
+def test_assert_not_null_raises_with_contract_message():
+    """The contract NOT NULL guard fires on a staged null and uses dbt's phrasing."""
+    con = duckdb.connect()
+    con.execute("create view staged as select * from (values (1,'a'),(null,'b')) t(id, color)")
+    with pytest.raises(CompilationError, match="NOT NULL constraint failed"):
+        Plugin._assert_not_null(con, "staged", ["id"])
+
+
+def test_assert_not_null_passes_when_no_nulls():
+    con = duckdb.connect()
+    con.execute("create view staged as select * from (values (1,'a'),(2,'b')) t(id, color)")
+    # No exception for a fully-populated column.
+    Plugin._assert_not_null(con, "staged", ["id", "color"])
 
 
 def test_store_contradiction_guard_when_exists_false(tmp_path, monkeypatch):

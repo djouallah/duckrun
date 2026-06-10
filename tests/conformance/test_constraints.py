@@ -59,11 +59,23 @@ class TestIncrementalConstraintsColumnsEqual(
     pass
 
 
+# duckrun materializes every model as a `create or replace view ... select * from delta_scan(...)`
+# over a delta_rs-written Delta table — it never emits the standard `create table (... constraints)`
+# DDL. The behavioral half of these suites (column equivalence + NOT NULL) is enforced for real in
+# the materialization/plugin and passes above; these *_ddl tests only assert the literal emitted
+# statement, so per dbt-tests-adapter's subclass-and-override design we override the expected DDL to
+# duckrun's real view output. (After the test's find/replace of the model name, the delta_scan path's
+# last segment also becomes <model_identifier>, so the normalized statement is the line below.)
+_DUCKRUN_VIEW_DDL = "create or replace view <model_identifier> as select * from <model_identifier>"
+
+
 @pytest.mark.skip_profile("md")
 class TestTableConstraintsRuntimeDdlEnforcement(
     DuckDBColumnEqualSetup, BaseConstraintsRuntimeDdlEnforcement
 ):
-    pass
+    @pytest.fixture(scope="class")
+    def expected_sql(self):
+        return _DUCKRUN_VIEW_DDL
 
 
 @pytest.mark.skip_profile("md", "buenavista")
@@ -80,6 +92,10 @@ class TestIncrementalConstraintsRuntimeDdlEnforcement(
     @pytest.fixture(scope="class")
     def expected_error_messages(self):
         return ["NOT NULL constraint failed"]
+
+    @pytest.fixture(scope="class")
+    def expected_sql(self):
+        return _DUCKRUN_VIEW_DDL
 
 
 @pytest.mark.skip_profile("md", "buenavista")
@@ -98,3 +114,7 @@ class TestModelConstraintsRuntimeEnforcement(
     @pytest.fixture(scope="class")
     def expected_error_messages(self):
         return ["NOT NULL constraint failed"]
+
+    @pytest.fixture(scope="class")
+    def expected_sql(self):
+        return _DUCKRUN_VIEW_DDL
