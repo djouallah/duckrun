@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.3.14] - 2026-06-10
 
 ### Fixed
 - **Data-loss fix (incremental writes):** `engine.table_exists` swallowed every exception and
