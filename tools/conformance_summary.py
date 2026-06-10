@@ -60,8 +60,10 @@ INCREMENTAL_SUPPORT = [
     ("`on_schema_change='sync_all_columns'`", "⚠️", "**add-only** — delta_rs can't drop columns"),
     ("`delete+insert`", "⚠️", "mapped to `merge` (not exact delete+insert semantics)"),
     ("`microbatch` strategy", "✅", "per-batch delete+insert on the `event_time` window (delta_rs delete + append)"),
-    ("advanced merge clauses (conditions / set / returning / custom)", "❌", "dbt-duckdb-specific, not implemented"),
-    ("constraints / DDL enforcement", "❌", "models are `delta_scan` views, not physical tables"),
+    ("advanced merge clauses (conditions / set / returning / custom)", "❌", "dbt-duckdb-specific; config **validated** (fails fast with the right message) but not executed"),
+    ("model contracts — column name/type/count", "✅", "enforced via dbt's `assert_columns_equivalent` preflight before the write"),
+    ("constraints — `not null`", "✅", "pre-write guard on the staged rows; a null fails the run and leaves the prior table intact"),
+    ("constraints — `check` / `primary_key` / `foreign_key`", "❌", "not enforceable against a `delta_scan` view; declared but not checked"),
 ]
 
 

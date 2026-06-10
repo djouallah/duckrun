@@ -247,6 +247,20 @@ job summary and rendered live into this README below — regenerated on every pu
 _The conformance and MERGE scorecards below are regenerated on every push to `main`, so they
 reflect the latest `main` — which may be ahead of the published PyPI release._
 
+Every still-failing test in the card below falls into one of three categories:
+
+- **delta-rs API gap** — the write the test needs isn't supported by `deltalake==1.5.0`, e.g.
+  the `constraints` `correct_column_data_types` cases require writing a `TIMESTAMP`-without-timezone
+  column (`timestampNtz`), a Delta writer feature we don't enable because it bumps the table
+  protocol and can break DirectLake/older readers.
+- **view-backed relation limit** — duckrun surfaces each Delta table as a `delta_scan` view, so
+  tests that mutate the relation in place (several `incremental_microbatch` fixtures `UPDATE` the
+  view; `changing_relation_type` swaps a table for a view) can't be satisfied without a physical
+  table.
+- **deliberate scope-out** — e.g. `TestCatalogRelationsDuckDB` forces a `type: duckdb` profile and
+  exercises `get_catalog_relations`, which this pinned dbt-duckdb doesn't implement — outside the
+  duckrun adapter entirely.
+
 <!-- CONFORMANCE:START -->
 
 ## dbt adapter conformance — duckrun
