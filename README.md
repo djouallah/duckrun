@@ -253,7 +253,7 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ ✅ 113 passed   ❌ 17 failed   💥 0 errors   ⏭️ 5 skipped │
+│ ✅ 114 passed   ❌ 16 failed   💥 0 errors   ⏭️ 5 skipped │
 │ 135 total · 84% passing                                │
 └────────────────────────────────────────────────────────┘
 ```
@@ -271,14 +271,14 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | `simple_snapshot` | `██████████` 100% | 6 | 0 | 0 | 0 | 6 |
 | `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
+| `basic` | `█████████░` 88% | 14 | 2 | 0 | 0 | 16 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
 | `incremental` | `████████░░` 85% | 22 | 4 | 0 | 0 | 26 |
 | `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
-| `basic` | `████████░░` 81% | 13 | 3 | 0 | 0 | 16 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
 | `incremental_microbatch` | `█████░░░░░` 54% | 7 | 6 | 0 | 0 | 13 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `████████░░` **84%** | **113** | **17** | **0** | **5** | **135** |
+| **Total** | `████████░░` **84%** | **114** | **16** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -323,15 +323,6 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | ❌ | `TestMicrobatchScenarios::test_microbatch_lookback_reprocesses_previous_batches` | _duckdb.BinderException: Binder Error: Can only update base table |
 
 </details>
-<details><summary><b>basic</b> — 3 not passing (13/16 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestDocsGenReferencesDuckDB::test_references` | AssertionError: Key 'metadata' in 'model.test.ephemeral_summary' did not match assert {'comment': N...r': None, ...} == {'comment': N...r': None, ...} Omitting  |
-| ❌ | `TestCatalogRelationsDuckDB::test_get_catalog_relations` | AssertionError: dbt exit state did not match expected |
-
-</details>
 <details><summary><b>constraints</b> — 3 not passing (14/17 pass)</summary>
 
 | Outcome | Test | Message |
@@ -349,6 +340,14 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
 | ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | assert 1 == 2 |
+
+</details>
+<details><summary><b>basic</b> — 2 not passing (14/16 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestCatalogRelationsDuckDB::test_get_catalog_relations` | AssertionError: dbt exit state did not match expected |
 
 </details>
 
