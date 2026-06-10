@@ -56,7 +56,12 @@
        current state. Disk discovery already reports the relation as existing in dbt's cache
        (so is_incremental() is true); this creates the matching physical view on the run-phase
        connection (views created during cache population don't survive to model run). --#}
-  {%- if adapter.delta_table_exists(location) -%}
+  {#-- dbt's relation cache resolved is_incremental() from run-start disk discovery; capture the
+       same "table exists" belief here so the plugin can detect a contradiction (discovery said
+       it exists, but the Delta table can't be opened at store time → a transient storage error,
+       NOT a real absence) and refuse to overwrite an incremental dataset. --#}
+  {%- set dbt_believes_exists = adapter.delta_table_exists(location) -%}
+  {%- if dbt_believes_exists -%}
     {%- do adapter.create_schema(target_relation) -%}
     {% call statement('register_this') -%}
       create or replace view {{ target_relation }} as select * from delta_scan('{{ location | replace("'", "''") }}')
@@ -99,6 +104,7 @@
       'incremental': is_incremental,
       'incremental_strategy': config.get('incremental_strategy'),
       'read_version': read_version,
+      'dbt_believes_exists': dbt_believes_exists,
       'full_refresh': should_full_refresh(),
       'unique_key': config.get('unique_key'),
       'partition_by': config.get('partition_by'),

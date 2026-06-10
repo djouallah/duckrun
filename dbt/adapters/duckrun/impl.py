@@ -54,7 +54,7 @@ class DuckrunAdapter(DuckDBAdapter):
         except Exception:  # pragma: no cover - frozen config fallback
             try:
                 object.__setattr__(config, "threads", 1)
-            except Exception:
+            except Exception:  # last resort: if even __setattr__ is blocked, leave threads as-is
                 pass
 
     @available
@@ -71,10 +71,15 @@ class DuckrunAdapter(DuckDBAdapter):
         pin to it: if any writer commits during the run, the append fails instead of landing a
         duplicate."""
         from . import engine
+        from deltalake.exceptions import TableNotFoundError
         so = getattr(self.config.credentials, "storage_options", None)
         try:
             return engine._delta_table(location, so).version()
-        except Exception:
+        except TableNotFoundError:
+            # Genuinely-missing table -> None (first run overwrites; safeappend has no pin yet).
+            # A real fault (transient storage error, bad token) must RE-RAISE: swallowing it here
+            # would silently degrade safeappend's start-of-build pin to HEAD-at-write, reopening
+            # the read->write race the pin exists to close.
             return None
 
     # ------------------------------------------------------------------ discovery
@@ -213,7 +218,7 @@ class DuckrunAdapter(DuckDBAdapter):
     def list_relations_without_caching(self, schema_relation):
         try:
             in_memory = list(super().list_relations_without_caching(schema_relation))
-        except Exception:
+        except Exception:  # best-effort: a missing/empty in-memory schema still allows disk discovery
             in_memory = []
 
         discovered = self._discover_delta_relations(schema_relation)

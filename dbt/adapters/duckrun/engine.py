@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from dbt.adapters.events.logging import AdapterLogger
 from deltalake import CommitProperties, DeltaTable, write_deltalake
-from deltalake.exceptions import CommitFailedError
+from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 logger = AdapterLogger("Duckrun")
 
@@ -40,11 +40,11 @@ def _writer_properties():
         return None
     try:
         return WriterProperties(compression="ZSTD", max_row_group_size=_MAX_ROW_GROUP_SIZE)
-    except Exception:
+    except Exception:  # best-effort: any build rejection falls back to compression-only below
         pass
     try:
         return WriterProperties(compression="ZSTD")
-    except Exception:
+    except Exception:  # best-effort: if even ZSTD-only is rejected, write without writer props
         return None
 
 
@@ -69,7 +69,7 @@ def _win_mem_status():
         stat.dwLength = ctypes.sizeof(_MemStatusEx)
         if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
             return stat
-    except Exception:
+    except Exception:  # best-effort: off-Windows / no ctypes.windll -> caller treats RAM as unknown
         pass
     return None
 
@@ -269,20 +269,20 @@ def configure_duckdb_session(con) -> None:
     tightens further to its 0.3 share (``set_merge_memory_limit``)."""
     try:
         con.execute("SET preserve_insertion_order=false")
-    except Exception:
+    except Exception:  # best-effort tuning: a failed SET must not abort connection setup
         pass
     # An in-memory DuckDB can default to an empty temp_directory and then *cannot* spill; give it
     # one so a tight memory_limit (set later for a merge) degrades to disk instead of an error.
     try:
         tmp = con.execute("SELECT current_setting('temp_directory')").fetchone()[0]
-    except Exception:
+    except Exception:  # best-effort: if we can't read it, skip overriding rather than guess
         tmp = "skip"  # couldn't read it; don't risk overriding
     if not tmp:
         spill_dir = os.path.join(os.getcwd(), ".duckrun_duckdb_spill")
         try:
             os.makedirs(spill_dir, exist_ok=True)
             con.execute(f"SET temp_directory='{spill_dir}'")
-        except Exception:
+        except Exception:  # best-effort spill dir: failure just leaves the default in place
             pass
 
 
@@ -291,7 +291,7 @@ def read_memory_limit(con) -> Optional[str]:
     unreadable. Captured once at connection setup as the baseline to restore on write paths."""
     try:
         return con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
-    except Exception:
+    except Exception:  # best-effort: unreadable limit -> None baseline (write path skips clamping)
         return None
 
 
@@ -314,7 +314,7 @@ def set_merge_memory_limit(con) -> None:
                 f"merge: DuckDB memory_limit set to {target / 2 ** 30:.2f} GiB "
                 f"({int(_DUCKDB_MEM_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB effective limit)"
             )
-        except Exception:
+        except Exception:  # best-effort tuning: a failed SET leaves the prior limit, no abort
             pass
 
 
@@ -325,7 +325,7 @@ def restore_memory_limit(con, baseline: Optional[str]) -> None:
         return
     try:
         con.execute(f"SET memory_limit='{baseline}'")
-    except Exception:
+    except Exception:  # best-effort restore: a failed SET leaves the current limit, no abort
         pass
 
 
@@ -355,7 +355,7 @@ def set_write_memory_limit(con, baseline: Optional[str]) -> None:
                 f"write: DuckDB memory_limit set to {final / 2 ** 30:.2f} GiB "
                 f"({int(_WRITE_MEM_FRACTION * 100)}% of {eff / 2 ** 30:.2f} GiB effective limit)"
             )
-    except Exception:
+    except Exception:  # best-effort tuning: a failed SET leaves the prior limit, no abort
         pass
 
 
@@ -392,11 +392,18 @@ def _delta_table(path: str, storage_options: Optional[Dict[str, str]]) -> DeltaT
 
 
 def table_exists(path: str, storage_options: Optional[Dict[str, str]] = None) -> bool:
-    """Return True if a Delta table already exists at ``path``."""
+    """Return True if a Delta table already exists at ``path``.
+
+    Catch ONLY ``TableNotFoundError`` (the table genuinely isn't there) → False. Every other
+    error — a transient ADLS/OneLake 503, an expired token, a permissions blip — is RE-RAISED.
+    Swallowing those was a silent data-loss bug: a transient open failure at store time made an
+    incremental (already row-filtered) write fall into the overwrite branch, replacing the table
+    with just the increment. A real error must fail the run loudly, not look like "no table".
+    """
     try:
         _delta_table(path, storage_options)
         return True
-    except Exception:
+    except TableNotFoundError:
         return False
 
 

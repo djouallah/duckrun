@@ -45,7 +45,7 @@ class Plugin(BasePlugin):
         # Ensure delta_scan() is available for the model relation views.
         try:
             conn.execute("INSTALL delta; LOAD delta;")
-        except Exception:
+        except Exception:  # best-effort: delta may already be loaded / autoloaded; reads still work
             pass
         # Always-on write-path tuning (preserve_insertion_order=false + a temp_directory to spill
         # to). The DuckDB memory_limit is NOT touched here — store() sets it per model: the write
@@ -55,7 +55,7 @@ class Plugin(BasePlugin):
         try:
             engine.configure_duckdb_session(conn)
             self._baseline_memory_limit = engine.read_memory_limit(conn)
-        except Exception:
+        except Exception:  # best-effort tuning: a failure just leaves DuckDB's defaults in place
             pass
         # If a bearer token was supplied in storage_options (e.g. OneLake/ADLS), mint a
         # matching DuckDB Azure secret so delta_scan() can read the tables. Same helper the
@@ -63,7 +63,7 @@ class Plugin(BasePlugin):
         # the secret is already provided there's no token, so this is a no-op.
         try:
             secret.ensure_azure_secret(conn, self._storage_options)
-        except Exception:
+        except Exception:  # best-effort: no token (local/notebook) -> no secret needed, a no-op
             pass
 
     def configure_cursor(self, cursor) -> None:
@@ -86,7 +86,7 @@ class Plugin(BasePlugin):
             )
         try:
             return self._conn.cursor()
-        except Exception:
+        except Exception:  # best-effort: if a child cursor can't be made, use the shared connection
             return self._conn
 
     # ------------------------------------------------------------------ write
@@ -117,6 +117,20 @@ class Plugin(BasePlugin):
         data = cur.sql(f"SELECT * FROM {name}")
 
         exists = engine.table_exists(path, storage_options)
+
+        # Contradiction guard (closes a silent data-loss window). dbt resolved this model as
+        # incremental because run-start disk discovery saw the table, so the model SQL already
+        # filtered to only-new rows. If the table now can't be opened at store time *and* that's
+        # not a deliberate full-refresh, something is wrong — most likely a transient storage
+        # error that table_exists() now (correctly) does NOT swallow, or the table was deleted
+        # mid-run. Overwriting here would replace the whole table with just the increment. Refuse.
+        dbt_believes_exists = bool(cfg.get("dbt_believes_exists", False))
+        if incremental and not full_refresh and not exists and dbt_believes_exists:
+            raise RuntimeError(
+                "dbt resolved this model as incremental (target existed at discovery) but the "
+                "Delta table is not found at store time. Refusing to overwrite — rerun, or pass "
+                "--full-refresh if the table was deliberately deleted."
+            )
 
         # Microbatch is delete+insert per event_time window, not a key-based upsert, so it
         # bypasses the generic overwrite/merge dispatch below (which would clobber every batch
