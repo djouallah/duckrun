@@ -253,8 +253,8 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ ✅ 110 passed   ❌ 20 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 81% passing                                │
+│ ✅ 113 passed   ❌ 17 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 84% passing                                │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -275,10 +275,10 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | `incremental` | `████████░░` 85% | 22 | 4 | 0 | 0 | 26 |
 | `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
 | `basic` | `████████░░` 81% | 13 | 3 | 0 | 0 | 16 |
+| `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
 | `incremental_microbatch` | `█████░░░░░` 54% | 7 | 6 | 0 | 0 | 13 |
-| `persist_docs` | `██░░░░░░░░` 20% | 1 | 3 | 0 | 1 | 5 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `████████░░` **81%** | **110** | **20** | **0** | **5** | **135** |
+| **Total** | `████████░░` **84%** | **113** | **17** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -309,15 +309,6 @@ reflect the latest `main` — which may be ahead of the published PyPI release._
 | Outcome | Test | Message |
 | --- | --- | --- |
 | ❌ | `TestChangeRelationTypesDuckDB::test_changing_materialization_changes_relation_type` | AssertionError: dbt exit state did not match expected |
-
-</details>
-<details><summary><b>persist_docs</b> — 3 not passing (1/5 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestPersistDocs::test_has_comments_pglike` | AttributeError: 'NoneType' object has no attribute 'startswith' |
-| ❌ | `TestPersistDocsColumnMissing::test_missing_column` | AttributeError: 'NoneType' object has no attribute 'startswith' |
-| ❌ | `TestPersistDocsCommentOnQuotedColumn::test_quoted_column_comments` | AttributeError: 'NoneType' object has no attribute 'startswith' |
 
 </details>
 <details><summary><b>incremental_microbatch</b> — 6 not passing (7/13 pass)</summary>
