@@ -140,6 +140,35 @@ def test_assert_not_null_passes_when_no_nulls():
     Plugin._assert_not_null(con, "staged", ["id", "color"])
 
 
+def test_validate_merge_rejects_unsupported_semantics():
+    """Valid-but-unsupported merge configs are REJECTED (not silently ignored) so a green run
+    can't quietly diverge from what the user asked for."""
+    for key, value in (
+        ("merge_clauses", {"when_matched": [{"action": "update"}]}),
+        ("merge_update_set_expressions", {"v": "v + 1"}),
+        ("merge_on_using_columns", ["id"]),
+    ):
+        with pytest.raises(CompilationError, match="duckrun cannot honor"):
+            Plugin._validate_merge_config({key: value})
+
+
+def test_validate_merge_allows_supported_conditions():
+    """Conditions duckrun honors as delta_rs predicates must pass validation."""
+    Plugin._validate_merge_config({
+        "merge_update_condition": "DBT_INTERNAL_DEST.age < DBT_INTERNAL_SOURCE.age",
+        "merge_insert_condition": "DBT_INTERNAL_SOURCE.age > 25",
+        "merge_update_columns": ["name", "age"],
+    })
+
+
+def test_rewrite_merge_aliases():
+    assert Plugin._rewrite_merge_aliases(None) is None
+    assert (
+        Plugin._rewrite_merge_aliases("DBT_INTERNAL_DEST.age < DBT_INTERNAL_SOURCE.age")
+        == "target.age < source.age"
+    )
+
+
 def test_store_contradiction_guard_when_exists_false(tmp_path, monkeypatch):
     """If table_exists returns False (no table found) but dbt's discovery believed it existed and
     this is an incremental non-full-refresh run, store() refuses rather than overwriting with the

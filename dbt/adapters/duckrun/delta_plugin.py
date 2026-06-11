@@ -199,6 +199,8 @@ class Plugin(BasePlugin):
                 update_columns=cfg.get("merge_update_columns"),
                 exclude_columns=cfg.get("merge_exclude_columns"),
                 predicates=self._merge_predicates(cfg),
+                update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
+                insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
                 merge_schema=evolve_schema,
                 max_spill_size=cfg.get("merge_max_spill_size"),
                 streamed_exec=(False if sx is None else bool(sx)),
@@ -427,8 +429,38 @@ class Plugin(BasePlugin):
         if errors:
             raise CompilationError("MERGE configuration errors:\n" + "\n".join(errors))
 
+        # Shape is valid — now REJECT (don't silently ignore) any present-and-valid merge config
+        # whose *semantics* delta_rs can't express. Accepting these and then quietly running a plain
+        # upsert is the same silent-divergence class as the WS1 data-loss bug: the run is green but
+        # the result ignores what the user asked for. merge_update_condition / merge_insert_condition
+        # ARE honored (delta_rs per-clause predicates — see merge_delta), so they are NOT rejected;
+        # merge_update_columns / merge_exclude_columns / incremental_predicates are honored too.
+        # (merge_returning_columns is a caller-side return value duckrun never surfaces, so ignoring
+        # it changes no table state — left unflagged.)
+        unsupported = [
+            k for k in ("merge_clauses", "merge_update_set_expressions", "merge_on_using_columns")
+            if cfg.get(k)
+        ]
+        if unsupported:
+            raise CompilationError(
+                "duckrun cannot honor these merge configs (delta_rs has no equivalent), and "
+                "refuses to run them as a plain upsert because that would silently ignore what you "
+                "asked for: " + ", ".join(unsupported) + ". Supported merge controls: unique_key, "
+                "merge_update_columns, merge_exclude_columns, merge_update_condition, "
+                "merge_insert_condition, incremental_predicates. Remove the unsupported keys or "
+                "express the logic with the supported ones."
+            )
+
     @staticmethod
-    def _merge_predicates(cfg: dict):
+    def _rewrite_merge_aliases(expr):
+        """Rewrite dbt's standard merge aliases (DBT_INTERNAL_DEST/SOURCE) to the target/source
+        aliases delta_rs uses here. Returns None unchanged so an absent condition stays absent."""
+        if not expr:
+            return None
+        return str(expr).replace("DBT_INTERNAL_DEST", "target").replace("DBT_INTERNAL_SOURCE", "source")
+
+    @classmethod
+    def _merge_predicates(cls, cfg: dict):
         """dbt ``incremental_predicates`` (or ``predicates``), with dbt's standard merge
         aliases rewritten to the ones delta_rs uses here."""
         preds = cfg.get("incremental_predicates") or cfg.get("predicates")
@@ -436,11 +468,7 @@ class Plugin(BasePlugin):
             return None
         if isinstance(preds, str):
             preds = [preds]
-        out = []
-        for p in preds:
-            p = str(p).replace("DBT_INTERNAL_DEST", "target").replace("DBT_INTERNAL_SOURCE", "source")
-            out.append(p)
-        return out
+        return [cls._rewrite_merge_aliases(p) for p in preds]
 
     @staticmethod
     def _resolve_schema_change(on_schema_change, path, data, storage_options) -> bool:

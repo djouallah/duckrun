@@ -654,6 +654,8 @@ def merge_delta(
     update_columns: Optional[List[str]] = None,
     exclude_columns: Optional[List[str]] = None,
     predicates: Optional[List[str]] = None,
+    update_condition: Optional[str] = None,
+    insert_condition: Optional[str] = None,
     merge_schema: bool = False,
     max_spill_size: Optional[int] = None,
     streamed_exec: bool = False,
@@ -673,6 +675,10 @@ def merge_delta(
     - default upsert: update matched rows, insert new ones. Narrow the update with
       ``update_columns`` (only these) or ``exclude_columns`` (all but these) — dbt's
       ``merge_update_columns`` / ``merge_exclude_columns``.
+    - update_condition / insert_condition (dbt ``merge_update_condition`` /
+      ``merge_insert_condition``): per-clause predicates gating which matched rows update and
+      which unmatched rows insert. Reference the ``target``/``source`` aliases (the caller has
+      already rewritten dbt's DBT_INTERNAL_DEST/SOURCE).
     - merge_schema=True lets delta_rs evolve the table schema (new columns), backing
       ``on_schema_change='append_new_columns'`` / ``'sync_all_columns'``.
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
@@ -735,17 +741,23 @@ def merge_delta(
         streamed_exec=streamed_exec,
         **spill_kwargs,
     )
+    # dbt merge_update_condition / merge_insert_condition gate which matched rows update and which
+    # unmatched rows insert. delta_rs expresses these as per-clause predicates (referencing the
+    # target/source aliases), so they are honored for real here — not silently dropped. The caller
+    # has already rewritten dbt's DBT_INTERNAL_DEST/SOURCE aliases to target/source.
     if insert_only:
-        merger = merger.when_not_matched_insert_all()
+        merger = merger.when_not_matched_insert_all(predicate=insert_condition)
     else:
         if update_columns:
             updates = {c: f"source.{c}" for c in update_columns}
-            merger = merger.when_matched_update(updates=updates)
+            merger = merger.when_matched_update(updates=updates, predicate=update_condition)
         elif exclude_columns:
-            merger = merger.when_matched_update_all(except_cols=list(exclude_columns))
+            merger = merger.when_matched_update_all(
+                except_cols=list(exclude_columns), predicate=update_condition
+            )
         else:
-            merger = merger.when_matched_update_all()
-        merger = merger.when_not_matched_insert_all()
+            merger = merger.when_matched_update_all(predicate=update_condition)
+        merger = merger.when_not_matched_insert_all(predicate=insert_condition)
     merger.execute()
 
     # Same threshold-gated maintenance as the append / delete+insert paths: a merged-on-every-run

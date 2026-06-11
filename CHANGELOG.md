@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.15] - 2026-06-11
+
+### Fixed
+- **Merge: stop silently ignoring valid-but-unsupported config.** A merge config that *passed*
+  shape validation but used a key delta-rs can't express (`merge_clauses`,
+  `merge_update_set_expressions`, `merge_on_using_columns`) was accepted and then quietly run as a
+  plain upsert — a green run that ignored what the user asked for (the same silent-divergence class
+  as the WS1 data-loss fix). These keys are now **rejected** with a clear error naming the supported
+  alternatives, instead of being dropped.
+
+### Added
+- **Merge: honor `merge_update_condition` / `merge_insert_condition`.** These are now applied as
+  delta-rs per-clause predicates (gating which matched rows update and which unmatched rows insert),
+  rather than ignored.
+
 ## [0.3.14] - 2026-06-10
 
 ### Fixed
