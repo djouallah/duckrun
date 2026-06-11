@@ -267,8 +267,8 @@ Every still-failing test in the card below falls into one of three categories:
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ ✅ 114 passed   ❌ 16 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 84% passing                                │
+│ ✅ 112 passed   ❌ 18 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 83% passing                                │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -287,12 +287,12 @@ Every still-failing test in the card below falls into one of three categories:
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `basic` | `█████████░` 88% | 14 | 2 | 0 | 0 | 16 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
-| `incremental` | `████████░░` 85% | 22 | 4 | 0 | 0 | 26 |
 | `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
+| `incremental` | `████████░░` 77% | 20 | 6 | 0 | 0 | 26 |
 | `incremental_microbatch` | `█████░░░░░` 54% | 7 | 6 | 0 | 0 | 13 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `████████░░` **84%** | **114** | **16** | **0** | **5** | **135** |
+| **Total** | `████████░░` **83%** | **112** | **18** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -307,13 +307,14 @@ Every still-failing test in the card below falls into one of three categories:
 | `merge_update_columns` | ✅ | update only the listed columns on match |
 | `merge_exclude_columns` | ✅ | update every column except the listed ones |
 | `incremental_predicates` | ✅ | AND-ed into the merge condition (merge strategy) |
+| `merge_update_condition` / `merge_insert_condition` | ✅ | honored as delta_rs per-clause predicates (gate which rows update / insert) |
 | `on_schema_change='append_new_columns'` | ✅ | new columns added via delta_rs schema evolution |
 | `on_schema_change='fail'` | ✅ | raises if the model's columns drift from the table |
 | `partition_by` | ✅ | Delta partition columns |
 | `on_schema_change='sync_all_columns'` | ⚠️ | **add-only** — delta_rs can't drop columns |
 | `delete+insert` | ⚠️ | mapped to `merge` (not exact delete+insert semantics) |
 | `microbatch` strategy | ✅ | per-batch delete+insert on the `event_time` window (delta_rs delete + append) |
-| advanced merge clauses (conditions / set / returning / custom) | ❌ | dbt-duckdb-specific; config **validated** (fails fast with the right message) but not executed |
+| `merge_clauses` / `merge_update_set_expressions` / `merge_on_using_columns` | ❌ | dbt-duckdb-specific, no delta_rs equivalent — **rejected** with a clear error, never silently ignored |
 | model contracts — column name/type/count | ✅ | enforced via dbt's `assert_columns_equivalent` preflight before the write |
 | constraints — `not null` | ✅ | pre-write guard on the staged rows; a null fails the run and leaves the prior table intact |
 | constraints — `check` / `primary_key` / `foreign_key` | ❌ | not enforceable against a `delta_scan` view; declared but not checked |
@@ -339,6 +340,18 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestMicrobatchScenarios::test_microbatch_lookback_reprocesses_previous_batches` | _duckdb.BinderException: Binder Error: Can only update base table |
 
 </details>
+<details><summary><b>incremental</b> — 6 not passing (20/26 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestIncrementalPredicates::test__incremental_predicates` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
+| ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMerge::test_merge_custom_clauses` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestIncrementalMergeValidation::test_ducklake_valid_single_update` | AssertionError: dbt exit state did not match expected |
+
+</details>
 <details><summary><b>constraints</b> — 3 not passing (14/17 pass)</summary>
 
 | Outcome | Test | Message |
@@ -346,16 +359,6 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestTableConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestViewConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-
-</details>
-<details><summary><b>incremental</b> — 4 not passing (22/26 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestIncrementalPredicates::test__incremental_predicates` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
-| ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | assert 1 == 2 |
 
 </details>
 <details><summary><b>basic</b> — 2 not passing (14/16 pass)</summary>
