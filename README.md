@@ -57,6 +57,22 @@ my_project:
 Persisted models are written to `<root_path>/<schema>/<model>` (e.g.
 `./warehouse/dbo/orders`), or to an explicit `config(location=...)`.
 
+### Fabric Lakehouse without a schema
+
+A schema-less Lakehouse (tables straight under `Tables/`, no `Tables/<schema>/` grouping) is
+a **bad pattern** — you lose the namespace that keeps a warehouse organized — but if you're
+stuck with one, no special config is needed. Drop the trailing `Tables` from `root_path` and
+let the schema fill that slot:
+
+```yaml
+      schema: Tables
+      root_path: "abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse"
+```
+
+Since models are written to `<root_path>/<schema>/<model>`, this lands them at
+`<lh>.Lakehouse/Tables/<model>` — exactly the flat layout the schema-less Lakehouse expects.
+Prefer a schema-enabled Lakehouse (`root_path: .../Tables`, real schemas) whenever you can.
+
 ### Remote stores (S3 / GCS / ADLS)
 
 Point `root_path` at the warehouse location and pass credentials through
