@@ -13,8 +13,9 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-on-run-start:
-  - "SET GLOBAL azure_transport_option_type = '{{ env_var('AZURE_TRANSPORT_OPTION_TYPE', 'default') }}'"
+# The OneLake azure transport (AZURE_TRANSPORT_OPTION_TYPE) is set by the duckrun adapter at
+# connection-open (see secret.ensure_azure_secret), so it applies to read-only commands too
+# (dbt test / show / docs generate) — an on-run-start hook would only cover run/build/seed.
 
 vars:
   # Env vars used:

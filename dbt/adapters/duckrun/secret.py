@@ -18,6 +18,7 @@ This module is the single place that mints that secret, used by both the connect
 path (the plugin's ``configure_connection``) and the discovery path (the adapter), so the
 two can't drift.
 """
+import os
 from typing import Dict, Optional
 
 # Stable name so repeated creation is an idempotent CREATE OR REPLACE, not a pile-up.
@@ -45,6 +46,16 @@ def ensure_azure_secret(conn, storage_options: Optional[Dict[str, str]]) -> bool
     if not token:
         return False
     conn.execute("INSTALL azure; LOAD azure;")
+    # Set the azure HTTP transport at connection-open (here), NOT via an on-run-start hook:
+    # hooks only fire for run/build/seed, so read-only commands that still open the store —
+    # dbt test / show / docs generate — would miss it. On some runners the azure extension's
+    # default transport fails the OneLake TLS handshake ("Problem with the SSL CA cert"); the
+    # curl transport respects the system CA bundle. Driven by AZURE_TRANSPORT_OPTION_TYPE so the
+    # value isn't hardcoded; absent → leave DuckDB's default.
+    transport = os.environ.get("AZURE_TRANSPORT_OPTION_TYPE")
+    if transport:
+        transport_sql = transport.replace("'", "''")
+        conn.execute(f"SET GLOBAL azure_transport_option_type = '{transport_sql}'")
     # Escape single quotes so a token containing one can't break out of the SQL string literal.
     token_sql = token.replace("'", "''")
     conn.execute(
