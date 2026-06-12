@@ -14,14 +14,13 @@ concurrency:
   group: publish
   cancel-in-progress: false
 
-# A release must pass conformance + merge-spill + aemo before publishing. Each is a reusable
-# workflow run as a gate job here. conformance/merge render their scorecard into README and commit
-# it to main, so those call jobs grant contents:write (a reusable workflow can only use permissions
-# the caller grants). They use a static concurrency group, so a tag-time call queues behind any
+# A release must pass conformance + merge-spill before publishing, not just merge-spill. Each is a
+# reusable workflow run as a gate job here. Both render their scorecard into README and commit it to
+# main, so each call job grants contents:write (a reusable workflow can only use permissions the
+# caller grants). Both use a static concurrency group, so a tag-time call queues behind any
 # in-flight push-to-main run rather than racing it.
-# aemo exercises the real Microsoft Fabric OneLake read/write path end to end; it needs the Azure
-# OIDC + Pages permissions and the repo secrets (inherited). It can be flaky on transient OneLake
-# infra, but a publish must not ship an adapter that can't talk to OneLake, so it gates releases.
+# aemo is deliberately NOT a release gate: it depends on live OneLake/AEMO data and so is prone to
+# transient infra failures that would needlessly block a publish. It still runs on its own.
 jobs:
   conformance:
     permissions:
@@ -33,16 +32,8 @@ jobs:
       contents: write
     uses: ./.github/workflows/merge.yml
 
-  aemo:
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    secrets: inherit
-    uses: ./.github/workflows/aemo.yml
-
   publish:
-    needs: [conformance, merge-spill, aemo]
+    needs: [conformance, merge-spill]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
