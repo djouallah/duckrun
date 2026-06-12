@@ -496,16 +496,55 @@ class Plugin(BasePlugin):
         return bool(added) or on_schema_change == "sync_all_columns"
 
     # ------------------------------------------------------------------- read
-    def load(self, source_config: SourceConfig):
-        path = source_config.get("delta_table_path") or source_config.get("location")
+    @staticmethod
+    def source_scan_sql(source_config: SourceConfig) -> str:
+        """SQL that scans a ``meta.plugin: duckrun`` source.
+
+        The source can be a Delta table, a CSV, or a Parquet file. ``delta_table_path`` forces
+        Delta (back-compat); otherwise the path is ``location``/``path`` and the format is
+        ``meta.format`` or inferred from the extension (a bare directory is a Delta table).
+        DuckrunEnvironment.load_source wraps this in ``CREATE OR REPLACE VIEW`` — a connection-
+        independent catalog view, so no pyarrow and no copying the source into a table.
+        """
+        delta_path = source_config.get("delta_table_path")
+        path = delta_path or source_config.get("location") or source_config.get("path")
         if not path:
             raise ValueError(
-                "Delta source requires 'delta_table_path' (or 'location') in meta."
+                "duckrun source requires 'delta_table_path', 'location', or 'path' in meta."
             )
-        # Read via DuckDB's delta_scan so no pyarrow import is required. Escape single quotes
-        # so a path containing one can't break out of the string literal.
+
+        fmt = (source_config.get("format") or "").strip().lower()
+        if delta_path:
+            fmt = "delta"
+        if not fmt:
+            lower = str(path).lower()
+            if lower.endswith(".csv") or lower.endswith(".csv.gz"):
+                fmt = "csv"
+            elif lower.endswith(".parquet") or lower.endswith(".pq"):
+                fmt = "parquet"
+            else:
+                fmt = "delta"
+
+        # Escape single quotes so a path can't break out of the string literal.
         path_sql = str(path).replace("'", "''")
-        return self._cursor().sql(f"SELECT * FROM delta_scan('{path_sql}')")
+        if fmt == "delta":
+            return f"SELECT * FROM delta_scan('{path_sql}')"
+        if fmt == "parquet":
+            return f"SELECT * FROM read_parquet('{path_sql}')"
+        if fmt == "csv":
+            # read_csv_auto auto-detects header/types; meta.read_options can append raw DuckDB
+            # reader options (e.g. "header = 1") for files that need them.
+            opts = source_config.get("read_options")
+            opts_sql = (", " + str(opts)) if opts else ""
+            return f"SELECT * FROM read_csv_auto('{path_sql}'{opts_sql})"
+        raise ValueError(
+            f"Unsupported duckrun source format {fmt!r}; expected 'csv', 'parquet', or 'delta'."
+        )
+
+    def load(self, source_config: SourceConfig):
+        # Kept for dbt-duckdb's stock load_source path; DuckrunEnvironment registers duckrun
+        # sources as catalog views via source_scan_sql instead of this relation.
+        return self._cursor().sql(self.source_scan_sql(source_config))
 
     def default_materialization(self) -> str:
         return "view"

@@ -8,6 +8,7 @@ match ``database.schema.identifier`` so ``{{ this }}``, ``ref()`` and ``is_incre
 resolve, with no attach or re-attach when a table is created.
 """
 from dbt.adapters.base.meta import available
+from dbt.adapters.contracts.connection import ConnectionState
 from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
 from dbt.adapters.duckdb.impl import DuckDBAdapter
@@ -15,6 +16,7 @@ from dbt.adapters.duckdb.impl import DuckDBAdapter
 from dbt.adapters.duckrun import remote
 from dbt.adapters.duckrun import secret
 from dbt.adapters.duckrun.credentials import DuckrunCredentials
+from dbt.adapters.duckrun.environment import DuckrunEnvironment
 
 logger = AdapterLogger("Duckrun")
 
@@ -29,12 +31,25 @@ class DuckrunConnectionManager(DuckDBConnectionManager):
 
     @classmethod
     def open(cls, connection):
-        # dbt-duckdb stores its singleton Environment on whichever class `open` is
-        # invoked on. adapter.store_relation() looks it up via the *base* class
-        # (DuckDBConnectionManager.env()), so delegate to the base to keep _ENV there,
-        # then mirror it onto this subclass for any instance-level lookups.
-        handle = DuckDBConnectionManager.open(connection)
-        DuckrunConnectionManager._ENV = DuckDBConnectionManager._ENV
+        # duckrun runs single-threaded, so it uses ONE DuckDB connection for the whole run
+        # (DuckrunEnvironment) instead of dbt-duckdb's per-handle cursors — see environment.py.
+        # Pre-seed the base class's singleton _ENV with it for the local case; remote/MotherDuck
+        # fall through to dbt-duckdb's stock environment selection in the base open().
+        base = DuckDBConnectionManager
+        if connection.state != ConnectionState.OPEN:
+            creds = cls.get_credentials(connection.credentials)
+            is_local = not getattr(creds, "remote", None) and not getattr(
+                creds, "is_motherduck", False
+            )
+            if is_local:
+                with base._LOCK:
+                    if not base._ENV or base._ENV.creds != creds:
+                        base._ENV = DuckrunEnvironment(creds)
+        # dbt-duckdb stores its singleton Environment on whichever class `open` is invoked on.
+        # adapter.store_relation() looks it up via the *base* class (DuckDBConnectionManager.env()),
+        # so delegate to the base to keep _ENV there, then mirror it onto this subclass.
+        handle = base.open(connection)
+        DuckrunConnectionManager._ENV = base._ENV
         return handle
 
 

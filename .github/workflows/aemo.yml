@@ -15,6 +15,8 @@ on:
       - 'integration_tests/**'
       - '.github/workflows/aemo.yml'
   workflow_dispatch:
+  # Callable as a release gate from publish.yml (secrets inherited from the caller).
+  workflow_call:
 
 # Allow the deploy job to publish the generated dbt docs to GitHub Pages.
 permissions:
@@ -78,6 +80,11 @@ jobs:
             --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Generate external sources (calendar Delta table)
+        # dim_calendar is an external Delta table read via source('aemo','dim_calendar'),
+        # not a dbt model. Build it before dbt so the source (and its tests) can resolve.
+        run: python scripts/generate_calendar.py
 
       - name: dbt build (OneLake — creates Delta tables over abfss://)
         run: dbt build --target dev --exclude tag:heavy

@@ -1,11 +1,9 @@
-{% set csv_archive_path = get_csv_archive_path() %}
-
 {# Check if there are new DUIDs not in the existing table #}
 {%- set check_new_duids_query -%}
   SELECT count(*) as cnt FROM (
-    SELECT DUID FROM read_csv('{{ csv_archive_path }}/duid/duid_data.csv') WHERE length(DUID) > 2
+    SELECT DUID FROM {{ source('aemo', 'duid_data') }} WHERE length(DUID) > 2
     UNION
-    SELECT "Facility Code" AS DUID FROM read_csv_auto('{{ csv_archive_path }}/duid/facilities.csv')
+    SELECT "Facility Code" AS DUID FROM {{ source('aemo', 'facilities') }}
   ) source_duids
   WHERE DUID NOT IN (SELECT DUID FROM {{ this }})
 {%- endset -%}
@@ -46,7 +44,7 @@ WITH
       first("Fuel Source - Descriptor") AS FuelSourceDescriptor,
       first(Participant) AS Participant
     FROM
-      read_csv('{{ csv_archive_path }}/duid/duid_data.csv')
+      {{ source('aemo', 'duid_data') }}
     WHERE
       length(DUID) > 2
     GROUP BY
@@ -59,12 +57,12 @@ WITH
       "Facility Code" AS DUID,
       "Participant Name" AS Participant
     FROM
-      read_csv_auto('{{ csv_archive_path }}/duid/facilities.csv')
+      {{ source('aemo', 'facilities') }}
   ),
 
   wa_energy AS (
     SELECT *
-    FROM read_csv_auto('{{ csv_archive_path }}/duid/WA_ENERGY.csv', header = 1)
+    FROM {{ source('aemo', 'wa_energy') }}
   ),
 
   duid_wa AS (
@@ -88,7 +86,7 @@ WITH
       duid,
       max(latitude) as latitude,
       max(longitude) as longitude
-    FROM read_csv('{{ csv_archive_path }}/duid/geo_data.csv')
+    FROM {{ source('aemo', 'geo_data') }}
     WHERE latitude IS NOT NULL
     GROUP BY duid
   )

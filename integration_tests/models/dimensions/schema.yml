@@ -9,12 +9,3 @@ models:
         tests:
           - unique
           - not_null
-
-  - name: dim_calendar
-    description: Calendar dimension with date attributes
-    columns:
-      - name: date
-        description: Calendar date
-        tests:
-          - unique
-          - not_null

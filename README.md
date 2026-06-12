@@ -182,16 +182,31 @@ which loads only not-yet-seen files and so uses `safeappend` instead of an expen
 | `merge_schema`          | allow schema evolution on write.                                            |
 | `storage_options`       | per-model override forwarded to deltalake.                                   |
 
-## Reading existing Delta tables as sources
+## Reading existing tables/files as sources
+
+A source routed to the `duckrun` plugin can be a Delta table, a CSV, or a Parquet file.
+`delta_table_path` always reads Delta; otherwise the path comes from `location` and the
+format is taken from `format` (`csv` | `parquet` | `delta`) or inferred from the extension.
 
 ```yaml
 sources:
   - name: lake
     tables:
-      - name: customers
+      - name: customers           # Delta table
         meta:
           plugin: duckrun
           delta_table_path: 's3://bucket/lake/customers'
+      - name: events              # CSV (read_csv_auto)
+        meta:
+          plugin: duckrun
+          format: csv
+          location: 's3://bucket/raw/events.csv'
+          read_options: 'header = 1'   # optional, appended to read_csv_auto
+      - name: metrics             # Parquet
+        meta:
+          plugin: duckrun
+          format: parquet
+          location: 's3://bucket/raw/metrics.parquet'
 ```
 
 ## How it works
