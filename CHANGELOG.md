@@ -2,6 +2,30 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.16] - 2026-06-12
+
+### Added
+- **dbt sources via the `duckrun` plugin can now read CSV and Parquet, not just Delta.** A source
+  with `meta: {plugin: duckrun}` resolves a Delta table (`delta_table_path`), or any `location`
+  whose `format` is `csv` / `parquet` / `delta` (inferred from the file extension when `format` is
+  omitted). A source declares *location + format* only — CSV parsing is left to `read_csv_auto`'s
+  detection; hand-tuned parse options belong in a model's `read_csv(...)`, not the source.
+
+### Fixed
+- **Plugin sources failed with `... created by another Connection`.** dbt-duckdb registers the
+  plugin's returned `DuckDBPyRelation` and re-registers it on every new per-handle cursor; a
+  `DuckDBPyRelation` is bound to its creating connection, so the re-registration threw (and a
+  read-only command could miss it entirely). duckrun now registers a plugin source as a
+  connection-independent **catalog view** (`CREATE OR REPLACE VIEW … AS delta_scan/read_csv_auto/
+  read_parquet(…)`) — the same way it surfaces model Delta tables — so it resolves on every cursor
+  and is rebuilt in a fresh process, with no pyarrow and no copying the source into a table.
+  Thanks to **Jose Marquez** for reporting the bug.
+- **Azure transport for OneLake/ADLS is now set at connection-open**, alongside the bearer-token
+  secret in the adapter, instead of relying on a run-only `on-run-start` hook. Read-only commands
+  that still open the store — `dbt test` / `show` / `docs generate` — now get the configured
+  `azure_transport_option_type` too (driven by `AZURE_TRANSPORT_OPTION_TYPE`; absent → DuckDB's
+  default), fixing a OneLake `Problem with the SSL CA cert` failure on `docs generate`.
+
 ## [0.3.15] - 2026-06-11
 
 ### Fixed
