@@ -503,8 +503,11 @@ class Plugin(BasePlugin):
         The source can be a Delta table, a CSV, or a Parquet file. ``delta_table_path`` forces
         Delta (back-compat); otherwise the path is ``location``/``path`` and the format is
         ``meta.format`` or inferred from the extension (a bare directory is a Delta table).
-        DuckrunEnvironment.load_source wraps this in ``CREATE OR REPLACE VIEW`` — a connection-
-        independent catalog view, so no pyarrow and no copying the source into a table.
+        A source declares *where/what* (location + format) only; CSV parsing is left to
+        ``read_csv_auto``'s detection — anything that needs hand-tuned parse options belongs in
+        a model's ``read_csv(...)``, not the source. DuckrunEnvironment.load_source wraps this in
+        ``CREATE OR REPLACE VIEW`` — a connection-independent catalog view, so no pyarrow and no
+        copying the source into a table.
         """
         delta_path = source_config.get("delta_table_path")
         path = delta_path or source_config.get("location") or source_config.get("path")
@@ -532,11 +535,8 @@ class Plugin(BasePlugin):
         if fmt == "parquet":
             return f"SELECT * FROM read_parquet('{path_sql}')"
         if fmt == "csv":
-            # read_csv_auto auto-detects header/types; meta.read_options can append raw DuckDB
-            # reader options (e.g. "header = 1") for files that need them.
-            opts = source_config.get("read_options")
-            opts_sql = (", " + str(opts)) if opts else ""
-            return f"SELECT * FROM read_csv_auto('{path_sql}'{opts_sql})"
+            # read_csv_auto detects header/types; a source carries no parse options by design.
+            return f"SELECT * FROM read_csv_auto('{path_sql}')"
         raise ValueError(
             f"Unsupported duckrun source format {fmt!r}; expected 'csv', 'parquet', or 'delta'."
         )

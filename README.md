@@ -201,7 +201,6 @@ sources:
           plugin: duckrun
           format: csv
           location: 's3://bucket/raw/events.csv'
-          read_options: 'header = 1'   # optional, appended to read_csv_auto
       - name: metrics             # Parquet
         meta:
           plugin: duckrun

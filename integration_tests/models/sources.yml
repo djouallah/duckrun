@@ -23,7 +23,6 @@ sources:
           plugin: duckrun
           format: csv
           location: "{{ env_var('FILES_PATH', '/tmp') }}/csv/duid/WA_ENERGY.csv"
-          read_options: "header = 1"
       - name: geo_data
         description: DUID geolocation (latitude/longitude).
         meta:
