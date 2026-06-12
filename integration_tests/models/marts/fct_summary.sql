@@ -5,9 +5,13 @@
      old TRUNCATE+append rebuild can't run in place. Materialize as a table: delta_rs overwrites
      with the full picture (daily + today) every run. is_incremental() is then always false, so
      the full-refresh branch at the bottom runs. --#}
+{#-- merge_schema: this table fully overwrites every run, and now carries a `year` column joined
+     from the dim_calendar source. Schema evolution lets the overwrite add `year` to an existing
+     Delta table instead of failing on the column-count mismatch. --#}
 {{ config(
     materialized='table',
-    schema='mart'
+    schema='mart',
+    merge_schema=true
 ) }}
 
 {% if is_incremental() %}
@@ -48,13 +52,15 @@ WITH daily_summary AS (
 )
 
 SELECT
-  date,
-  time,
-  DUID,
-  CAST(mw AS DECIMAL(18, 4)) AS mw,
-  CAST(price AS DECIMAL(18, 4)) AS price,
-  cutoff
-FROM daily_summary
+  ds.date,
+  ds.time,
+  ds.DUID,
+  CAST(ds.mw AS DECIMAL(18, 4)) AS mw,
+  CAST(ds.price AS DECIMAL(18, 4)) AS price,
+  cal.year,
+  ds.cutoff
+FROM daily_summary ds
+LEFT JOIN {{ source('aemo', 'dim_calendar') }} cal ON ds.date = cal.date
 
 {% else %}
 
@@ -83,13 +89,15 @@ incremental_data AS (
 )
 
 SELECT
-  date,
-  CAST(strftime(SETTLEMENTDATE, '%H%M') AS INT) AS time,
-  DUID,
-  CAST(mw AS DECIMAL(18, 4)) AS mw,
-  CAST(price AS DECIMAL(18, 4)) AS price,
-  CAST(MAX(SETTLEMENTDATE) OVER () AS TIMESTAMPTZ) AS cutoff
-FROM incremental_data
+  id.date,
+  CAST(strftime(id.SETTLEMENTDATE, '%H%M') AS INT) AS time,
+  id.DUID,
+  CAST(id.mw AS DECIMAL(18, 4)) AS mw,
+  CAST(id.price AS DECIMAL(18, 4)) AS price,
+  cal.year,
+  CAST(MAX(id.SETTLEMENTDATE) OVER () AS TIMESTAMPTZ) AS cutoff
+FROM incremental_data id
+LEFT JOIN {{ source('aemo', 'dim_calendar') }} cal ON id.date = cal.date
 
 {% endif %}
 
@@ -133,16 +141,18 @@ WITH daily_summary AS (
 )
 
 SELECT
-  date,
-  time,
-  DUID,
-  CAST(mw AS DECIMAL(18, 4)) AS mw,
-  CAST(price AS DECIMAL(18, 4)) AS price,
+  ds.date,
+  ds.time,
+  ds.DUID,
+  CAST(ds.mw AS DECIMAL(18, 4)) AS mw,
+  CAST(ds.price AS DECIMAL(18, 4)) AS price,
+  cal.year,
   (SELECT GREATEST(
     (SELECT MAX(CAST(SETTLEMENTDATE AS TIMESTAMPTZ)) FROM {{ ref('fct_scada') }}),
     COALESCE((SELECT MAX(CAST(SETTLEMENTDATE AS TIMESTAMPTZ)) FROM {{ ref('fct_scada_today') }}), CAST('1900-01-01' AS TIMESTAMPTZ))
   )) AS cutoff
-FROM daily_summary
-ORDER BY date
+FROM daily_summary ds
+LEFT JOIN {{ source('aemo', 'dim_calendar') }} cal ON ds.date = cal.date
+ORDER BY ds.date
 
 {% endif %}
