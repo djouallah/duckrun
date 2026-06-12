@@ -6,7 +6,10 @@ name: concurrency-correctness
 #      modes; the only reachable gap fails loudly via delta-rs OCC, never a silent wrong result.
 #   B) safeappend — appends only if the table version has not moved (compare-and-swap via
 #      max_commit_retries=0); a concurrent write makes it refuse instead of silently landing.
-# The job exits non-zero if either invariant is ever violated, so a regression blocks the PR.
+#   C) pre-snapshot window — a commit landing between source bind and target-snapshot
+#      load is still seen by the source (delta_scan resolves at pull time). This is the
+#      one window OCC cannot cover; this case pins the DuckDB behavior it depends on.
+# The job exits non-zero if any invariant is ever violated, so a regression blocks the PR.
 # Read the scorecard on the run's summary page. See repro/concurrency_correctness.py.
 on:
   # The most important gate: run on EVERY pull request, and on every direct push to main
