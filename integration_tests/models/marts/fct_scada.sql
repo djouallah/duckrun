@@ -1,3 +1,7 @@
+-- Lineage only: the daily report CSVs are read below via read_csv with the file list from
+-- stg_csv_archive_log; this records the source dependency and draws the node in the DAG.
+-- depends_on: {{ source('aemo', 'daily_report') }}
+
 {{ config(
     materialized='incremental',
     incremental_strategy='safeappend',

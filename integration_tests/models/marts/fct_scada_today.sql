@@ -1,3 +1,7 @@
+-- Lineage only: the intraday SCADA CSVs are read below via read_csv with the file list from
+-- stg_csv_archive_log; this records the source dependency and draws the node in the DAG.
+-- depends_on: {{ source('aemo', 'scada_today') }}
+
 {{ config(
     materialized='incremental',
     incremental_strategy='insert',

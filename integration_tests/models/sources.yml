@@ -42,3 +42,20 @@ sources:
             tests:
               - unique
               - not_null
+
+      # ---- Raw AEMO CSV archives (downloaded by stg_csv_archive_log) ----
+      # Lineage-only sources: the marts read these files with a tailored read_csv(...) driven by
+      # the log table, so there is no `plugin` meta and nothing is materialized here. Declaring
+      # them as sources just records the dependency and draws the node in the DAG.
+      - name: daily_report
+        description: >
+          AEMO Daily_Reports CSVs (each file holds both DUNIT SCADA and DREGION price records).
+          Read by fct_scada and fct_price via read_csv with the file list from stg_csv_archive_log.
+      - name: scada_today
+        description: >
+          Intraday Dispatch_SCADA CSVs. Read by fct_scada_today via read_csv with the file list
+          from stg_csv_archive_log.
+      - name: price_today
+        description: >
+          Intraday DispatchIS price CSVs. Read by fct_price_today via read_csv with the file list
+          from stg_csv_archive_log.
