@@ -68,13 +68,13 @@ conformance.xml
 !.claude-plugin/marketplace.json
 !plugins/**/.claude-plugin/plugin.json
 # ...except dbt's auto-generated local user file
-tests/integration_tests/.user.yml
+tests/integration_tests/aemo/.user.yml
 
-# Delta output and dbt artifacts produced by the integration tests (runtime)
-tests/integration_tests/warehouse/
-tests/integration_tests/target/
-tests/integration_tests/dbt_packages/
-tests/integration_tests/logs/
+# Delta output and dbt artifacts produced by the aemo integration project (runtime)
+tests/integration_tests/aemo/warehouse/
+tests/integration_tests/aemo/target/
+tests/integration_tests/aemo/dbt_packages/
+tests/integration_tests/aemo/logs/
 
 # dbt logs written to the repo root (e.g. running dbt with --project-dir)
 logs/

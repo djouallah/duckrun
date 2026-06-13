@@ -179,7 +179,7 @@ attempt already loaded.
 
 First run (or `--full-refresh`, or a missing table) overwrites to create the table; `safeappend`
 applies on later runs. A real example is the AEMO
-[`fct_scada`](tests/integration_tests/models/marts/fct_scada.sql) model — the project's largest table,
+[`fct_scada`](tests/integration_tests/aemo/models/marts/fct_scada.sql) model — the project's largest table,
 which loads only not-yet-seen files and so uses `safeappend` instead of an expensive merge.
 
 ### Config options (`table` / `incremental` / `delta`)
@@ -316,8 +316,9 @@ None of this is required to use duckrun — `pip install duckrun` is unaffected.
 | [dbt adapter conformance](docs/conformance.md) | Official `dbt-tests-adapter` results, regenerated on every push to `main`. |
 | [Incremental MERGE benchmark](docs/merge-benchmark.md) | ~120M-row TPCH merge / append / overwrite scorecard — the release gate. |
 
-**Testing.** `tests/integration_tests/` is a small dbt project built twice against a local Delta
-`./warehouse` (CI: [`integration.yml`](.github/workflows/integration.yml)); `tests/conformance/`
+**Testing.** `tests/integration_tests/aemo/` is a small dbt project built against OneLake, and
+`tests/integration_tests/coffee/` is the connection-API coffee-shop scenario / stress test (CI:
+[`integration.yml`](.github/workflows/integration.yml)); `tests/conformance/`
 runs the official suite (above); `tests/correctness/` proves the concurrency guarantees. The cards
 in those docs are rendered live by CI, so they always reflect the latest `main`.
 

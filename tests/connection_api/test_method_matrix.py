@@ -7,7 +7,8 @@ the JUnit results into a scorecard (tests/tools/connection_summary.py) so every 
 with a ✅/❌ — the connection-API analogue of the conformance card.
 
 Granularity is the point: keep one assertion-ish concept per test so the card reads as a method
-checklist. (Broader end-to-end coverage lives in test_local_filesystem.py and coffeeshop/.)
+checklist. (Broader end-to-end coverage lives in test_local_filesystem.py and the coffee scenario
+under tests/integration_tests/coffee/.)
 """
 import pytest
 

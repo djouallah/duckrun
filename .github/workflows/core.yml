@@ -1,0 +1,46 @@
+name: core tests
+
+# duckrun's two core public surfaces, tested offline on a local-filesystem Delta warehouse (no
+# secrets, no network — quick and deterministic):
+#   • tests/adapter                                  — the dbt adapter internals (delta-rs write
+#                                                      engine, remote discovery, table_exists guard).
+#   • tests/connection_api/test_local_filesystem.py  — the duckrun.connect() API end to end
+#                                                      (write modes, reader, catalog, merge/delete/update).
+# Runs on EVERY push / PR, and as a release gate (workflow_call from publish.yml). Catches a broken
+# connect / write / read / merge / catalog before it reaches the heavier, gated suites.
+#
+# Out of scope here (deliberately): tests/integration_tests/ — the aemo dbt project (live OneLake)
+# and the coffee scenario (coffee/; local variant pulls CSVs over the network and generates a big
+# fact, OneLake variant needs creds), both under integration.yml — plus tests/conformance/ (its own
+# workflow). Those are integration/stress, not the per-change gate.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  # Callable as a release gate from publish.yml.
+  workflow_call:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (dbt-duckdb + duckdb + deltalake + pytest + pyarrow)
+        run: pip install -e ".[test]"
+
+      - name: Adapter unit tests + connection-API offline tests
+        run: |
+          python -m pytest \
+            tests/adapter \
+            tests/connection_api/test_local_filesystem.py \
+            -q -p no:cacheprovider

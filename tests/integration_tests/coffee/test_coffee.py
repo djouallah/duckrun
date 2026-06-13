@@ -73,7 +73,6 @@ def run_coffee_scenario(conn, schema, n_rows):
     with _step(1, "ingest dimensions: read Dim_Locations / Dim_Products CSVs over https → Delta") as say:
         conn.read.csv(GH + "Dim_Locations.csv").write.mode("overwrite").saveAsTable("dim_locations")
         conn.read.csv(GH + "Dim_Products.csv").write.mode("overwrite").saveAsTable("dim_products")
-        conn.refresh()
         assert conn.table("dim_locations").count() == 1000
         assert conn.table("dim_products").count() == 26   # SCD2 rows (product_id repeats)
         say("dim_locations=1,000 rows, dim_products=26 SCD2 rows")
@@ -88,7 +87,6 @@ def run_coffee_scenario(conn, schema, n_rows):
                 from dim_products
             ) where rn = 1
         """).write.mode("overwrite").saveAsTable("products")
-        conn.refresh()
         n_products = conn.table("products").count()
         assert n_products == q("select count(distinct product_id) from dim_products")
         say(f"{n_products} unique products (down from 26 SCD2 rows)")
@@ -122,7 +120,6 @@ def run_coffee_scenario(conn, schema, n_rows):
             join prods p on p.prn = r.prn
             join locs  l on l.lrn = r.lrn
         """).write.mode("overwrite").partitionBy("region").saveAsTable("fact_sales")
-        conn.refresh()
         assert conn.table("fact_sales").count() == n_rows   # 1:1 joins → no rows dropped
         regions = q("select count(distinct region) from fact_sales")
         say(f"fact_sales={n_rows:,} rows across {regions} region partitions (1:1 joins, no rows dropped)")
@@ -142,7 +139,6 @@ def run_coffee_scenario(conn, schema, n_rows):
             from fact_sales f join products p on p.product_id = f.product_id
             group by 1, 2
         """).write.mode("overwrite").saveAsTable("mart_revenue")
-        conn.refresh()
         cells = q("select count(*) from mart_revenue")
         revenue = q("select sum(revenue) from mart_revenue")
         assert cells >= 4   # (category x season) cells
@@ -170,11 +166,9 @@ def run_coffee_scenario(conn, schema, n_rows):
     with _step(7, "schema evolution: overwriteSchema resets columns, then mergeSchema widens") as say:
         conn.sql("select 1 id, 'A' grp") \
             .write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("evt")
-        conn.refresh()
         assert conn.sql("select * from evt").columns == ["id", "grp"]
         conn.sql("select 2 id, 'B' grp, true as flagged") \
             .write.mode("append").option("mergeSchema", "true").saveAsTable("evt")
-        conn.refresh()
         assert "flagged" in conn.sql("select * from evt").columns
         say("evt columns after mergeSchema append: " + str(conn.sql("select * from evt").columns))
 
