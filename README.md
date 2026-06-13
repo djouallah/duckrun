@@ -456,6 +456,22 @@ _The last three rows are the same batch as a plain `append` / `safeappend` / `ov
 
 <!-- MERGE:END -->
 
+## Claude Code skill
+
+If you build duckrun projects with an AI agent, this repo ships a Claude Code skill
+(`duckrun-projects`) covering profiles, incremental strategies, OneLake/Fabric, sources,
+and troubleshooting. It's distributed as a plugin marketplace — install it once:
+
+```
+/plugin marketplace add djouallah/duckrun
+/plugin install duckrun-projects@duckrun
+```
+
+The skill loads on demand when you ask a duckrun question, and works across every Claude
+Code surface (terminal, VS Code, JetBrains). It updates when you run
+`/plugin marketplace update`. Not needed to use duckrun itself — `pip install duckrun` is
+unaffected.
+
 ## License
 
 MIT
