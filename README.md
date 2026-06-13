@@ -470,23 +470,23 @@ The card below — every public method with a ✅ — is regenerated on every pu
 ## duckrun connection API — method scorecard
 
 ```
-┌───────────────────────────────────────┐
-│ ✅ 39 passed   ❌ 0 failed   💥 0 errors │
-│ 39 methods · 100% passing             │
-└───────────────────────────────────────┘
+┌───────────────────────────┐
+│ ✅ 34 passed   ❌ 0 failed  │
+│ 34 methods · 100% passing │
+└───────────────────────────┘
 ```
 
-### Spark / Delta-on-Spark API — 33/33 ✅
+### Spark / Delta-on-Spark API — 28/28 ✅
 
 > Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.
 
 | Surface | Methods | Pass |
 | --- | --- | :-: |
-| `DuckSession` | `sql`, `table`, `read_property`, `catalog_property`, `show_tables` | 5/5 ✅ |
+| `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
 | `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase` | 4/4 ✅ |
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas` | 5/5 ✅ |
-| `DataFrameReader` | `format_load_delta`, `table`, `parquet`, `csv` | 4/4 ✅ |
-| `DataFrameWriter` | `saveAsTable`, `mode_overwrite`, `mode_append`, `mode_ignore`, `mode_error`, `option_mergeSchema`, `option_overwriteSchema`, `partitionBy`, `format` | 9/9 ✅ |
+| `DataFrameReader` | `format/load`, `table`, `parquet`, `csv` | 4/4 ✅ |
+| `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `partitionBy`, `format` | 5/5 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `merge_upsert`, `merge_update_columns`, `merge_insert_only`, `update_only_rejected` | 6/6 ✅ |
 
 ### duckrun-specific helpers — 6/6 ✅
@@ -499,7 +499,7 @@ The card below — every public method with a ✅ — is regenerated on every pu
 | `refresh` | `DuckSession` | ✅ |
 | `connection` | `DuckSession` | ✅ |
 | `table_path` | `DuckSession` | ✅ |
-| `relation_passthrough` | `DataFrame` | ✅ |
+| `__getattr__` | `DataFrame` | ✅ |
 | `delta` | `DataFrameReader` | ✅ |
 
 <!-- CONNECTION_API:END -->
