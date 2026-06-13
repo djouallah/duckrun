@@ -1,0 +1,12 @@
+merge_spill_bench:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      threads: 1
+      schema: "{{ env_var('DBT_SCHEMA', 'mart') }}"
+      # Local-filesystem Delta warehouse (no OneLake): delta_rs writes land at
+      # <root_path>/<schema>/<model>. The runner converts the big TPCH target into that same
+      # path so the model resolves as incremental. duckrun sets preserve_insertion_order=false
+      # and the cgroup-aware memory_limit itself, so large merges don't OOM.
+      root_path: "{{ env_var('WAREHOUSE_PATH') }}"

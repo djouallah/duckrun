@@ -775,12 +775,13 @@ def merge_delta(
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
       join to disk instead of OOMing. None -> default to ~40% of RAM (_default_merge_spill_size);
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
-    - read_version: pin the merge TARGET to this Delta version (the model's ``vB``), instead of
-      opening HEAD. delta_rs then validates OCC over ``(vB, HEAD]`` — the exact window the model's
-      pinned read of ``{{ this }}`` could not have seen — so the read and the commit share one
-      snapshot (Spark single-snapshot MERGE semantics). None opens HEAD (the prior behavior, still
-      safe-by-ordering). NOTE: only the merge target is pinned; the post-merge maintenance below
-      always reopens a fresh HEAD and must NEVER receive this version.
+    - read_version (REQUIRED): pin the merge TARGET to this Delta version (the model's ``vB``).
+      delta_rs then validates OCC over ``(vB, HEAD]`` — the exact window the model's pinned read of
+      ``{{ this }}`` could not have seen — so the read and the commit share one snapshot (Spark
+      single-snapshot MERGE semantics). None is rejected: a merge always has an existing target, so
+      the caller always read a version; merging against HEAD instead would reopen the read->write
+      gap. NOTE: only the merge target is pinned; the post-merge maintenance below always reopens a
+      fresh HEAD and must NEVER receive this version.
     - streamed_exec: delta_rs's flag for how it reads the source. Its default (True) STREAMS the
       source and so cannot compute source statistics, which means it cannot derive an early
       pruning predicate — it scans the *whole* target. We default it to False: collect the source
@@ -832,11 +833,18 @@ def merge_delta(
            else "off (streamed_exec=True — source streamed, whole target scanned)")
     )
 
+    # A merge always has an existing target (a brand-new table is created, never merged into), so
+    # the caller (the dbt materialization / DeltaTable.merge) always pins the version it read.
+    # read_version=None would silently merge against HEAD and reopen the read->write gap — refuse it.
+    if read_version is None:
+        raise ValueError(
+            "merge_delta requires read_version (the version the caller read). A merge always has "
+            "an existing target to pin to; None would merge against HEAD and break single-snapshot."
+        )
     dt = _delta_table(path, storage_options)
     # Pin the target to the snapshot the model read (vB) so OCC validates (vB, HEAD] — one snapshot
-    # for both the read and the commit. None leaves it at HEAD (prior safe-by-ordering behavior).
-    if read_version is not None:
-        dt.load_as_version(read_version)
+    # for both the read and the commit.
+    dt.load_as_version(read_version)
     merger = dt.merge(
         source=data,
         predicate=predicate,

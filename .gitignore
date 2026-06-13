@@ -67,14 +67,16 @@ conformance.xml
 # Keep the Claude Code plugin marketplace manifests (the *.json rule above ignores them)
 !.claude-plugin/marketplace.json
 !plugins/**/.claude-plugin/plugin.json
-# ...except dbt's auto-generated local user file
-tests/integration_tests/aemo/.user.yml
+# ...except dbt's auto-generated local user file (aemo, merge_spill, any integration project)
+tests/integration_tests/*/.user.yml
 
-# Delta output and dbt artifacts produced by the aemo integration project (runtime)
-tests/integration_tests/aemo/warehouse/
-tests/integration_tests/aemo/target/
-tests/integration_tests/aemo/dbt_packages/
-tests/integration_tests/aemo/logs/
+# Delta output and dbt artifacts produced by the integration projects (runtime)
+tests/integration_tests/*/warehouse/
+tests/integration_tests/*/target/
+tests/integration_tests/*/dbt_packages/
+tests/integration_tests/*/logs/
+# The MERGE benchmark scorecard the runner writes to cwd (injected into the README in CI)
+merge_card.md
 
 # dbt logs written to the repo root (e.g. running dbt with --project-dir)
 logs/

@@ -268,6 +268,10 @@ class _FakeDeltaTable:
     def __init__(self, captured):
         self._captured = captured
 
+    def load_as_version(self, version):
+        # merge_delta now always pins (read_version is required); the fake just accepts it.
+        self._captured["read_version"] = version
+
     def merge(self, **kwargs):
         self._captured.clear()
         self._captured.update(kwargs)
@@ -290,13 +294,13 @@ def test_max_spill_size_defaults_to_effective_fraction(monkeypatch):
     # on every call, so two unpinned reads would differ by a few KB and flake).
     monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
     captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id")
+    engine.merge_delta("target", _table([1]), "id", read_version=0)
     assert captured["max_spill_size"] == engine._default_merge_spill_size()
 
 
 def test_max_spill_size_explicit_is_forwarded(monkeypatch):
     captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", max_spill_size=123_456)
+    engine.merge_delta("target", _table([1]), "id", max_spill_size=123_456, read_version=0)
     assert captured["max_spill_size"] == 123_456
 
 
@@ -304,21 +308,21 @@ def test_streamed_exec_defaults_to_false(monkeypatch):
     """Default to collecting the source so delta_rs can derive an early prune predicate from its
     stats (streamed_exec=True would stream it and scan the whole target)."""
     captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id")
+    engine.merge_delta("target", _table([1]), "id", read_version=0)
     assert captured["streamed_exec"] is False
 
 
 def test_streamed_exec_can_be_enabled(monkeypatch):
     """A huge-source merge can opt back into streaming (no prune) so the source isn't collected."""
     captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", streamed_exec=True)
+    engine.merge_delta("target", _table([1]), "id", streamed_exec=True, read_version=0)
     assert captured["streamed_exec"] is True
 
 
 def test_max_spill_size_zero_disables_the_cap(monkeypatch):
     """0 (or any falsy non-None) opts out: the kwarg is omitted so delta_rs runs unbounded."""
     captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", max_spill_size=0)
+    engine.merge_delta("target", _table([1]), "id", max_spill_size=0, read_version=0)
     assert "max_spill_size" not in captured
 
 
@@ -328,7 +332,7 @@ def test_undetectable_ram_omits_the_cap(monkeypatch):
     monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
     monkeypatch.setattr(engine, "_available_ram_bytes", lambda: None)
     captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id")
+    engine.merge_delta("target", _table([1]), "id", read_version=0)
     assert "max_spill_size" not in captured
 
 
@@ -337,10 +341,10 @@ def test_undetectable_ram_omits_the_cap(monkeypatch):
 def test_merge_with_default_spill_upserts_correctly(tmp_path):
     """The real delta_rs merge path still produces a correct upsert with the spill default on."""
     path = str(tmp_path / "t")
-    engine.write_delta(path, _table([1, 2, 3]), "overwrite")
+    engine.write_delta(path, _table([1, 2, 3]), "overwrite")  # v0
     # update id=3, insert id=4
     engine.merge_delta(path, pa.table({"id": pa.array([3, 4], pa.int64()),
-                                       "value": pa.array([999, 40], pa.int64())}), "id")
+                                       "value": pa.array([999, 40], pa.int64())}), "id", read_version=0)
     assert _rows(path) == {1: 10, 2: 20, 3: 999, 4: 40}
 
 
@@ -353,6 +357,7 @@ def test_merge_with_explicit_spill_size_upserts_correctly(tmp_path):
         pa.table({"id": pa.array([2], pa.int64()), "value": pa.array([222], pa.int64())}),
         "id",
         max_spill_size=256 * 1024 * 1024,
+        read_version=0,
     )
     assert _rows(path) == {1: 10, 2: 222, 3: 30}
 
@@ -375,6 +380,7 @@ def test_merge_compacts_and_vacuums_when_over_threshold(tmp_path):
         pa.table({"id": pa.array([4], pa.int64()), "value": pa.array([40], pa.int64())}),
         "id",
         compaction_threshold=1,
+        read_version=0,
     )
     # Data is still correct, and an OPTIMIZE commit was added (compaction ran).
     assert _rows(path) == {1: 10, 2: 20, 3: 30, 4: 40}
@@ -390,6 +396,7 @@ def test_merge_skips_maintenance_under_threshold(tmp_path):
         pa.table({"id": pa.array([4], pa.int64()), "value": pa.array([40], pa.int64())}),
         "id",
         compaction_threshold=1000,
+        read_version=0,
     )
     assert _rows(path) == {1: 10, 2: 20, 3: 30, 4: 40}
     assert not any(op and "OPTIMIZE" in op.upper() for op in _commit_ops(path))

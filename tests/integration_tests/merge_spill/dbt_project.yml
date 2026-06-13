@@ -1,0 +1,26 @@
+name: 'merge_spill_bench'
+version: '1.0.0'
+
+profile: 'merge_spill_bench'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# The MERGE spill benchmark runs entirely through the dbt path: a single incremental model
+# (fct_lineitem) merges a batch source into a large TPCH lineitem target on (l_orderkey,
+# l_linenumber). The big target is created cheaply by convert_to_deltalake over tpchgen's parquet
+# (metadata only, no rewrite) AT this model's own table path, so dbt sees it as existing and every
+# run is an incremental merge — never a create. The merge spill cap (merge_max_spill_size) and the
+# read-pin (the materialization macro) are therefore exercised for real, end to end.
+
+vars:
+  # delta_rs merge spill cap forwarded into the model config; None -> duckrun's cgroup-aware default.
+  merge_max_spill_size: ~
+
+models:
+  merge_spill_bench:
+    +materialized: incremental
