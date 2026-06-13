@@ -44,8 +44,8 @@ jobs:
         working-directory: integration_tests
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests
-      WAREHOUSE_PATH: abfss://duckrun@onelake.dfs.fabric.microsoft.com/dev.Lakehouse/Tables
-      FILES_PATH: abfss://duckrun@onelake.dfs.fabric.microsoft.com/dev.Lakehouse/Files
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+      FILES_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Files
       DBT_SCHEMA: mart
       download_limit: "10"
       process_limit: "1000"
