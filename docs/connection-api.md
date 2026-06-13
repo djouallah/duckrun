@@ -57,7 +57,7 @@ The card below — every public method with a ✅ — is regenerated on every pu
 
 ### duckrun-specific helpers — 9/9 ✅
 
-> Conveniences with no Spark equivalent (session plumbing + shortcuts).
+> Conveniences with no Spark equivalent (session plumbing + two shortcuts).
 
 | Method | Surface | Pass |
 | --- | --- | :-: |
