@@ -58,6 +58,22 @@ def _api(group: str, method: str) -> str:
     return _METHOD_API.get((group, method), _GROUP_API.get(group, "duckrun"))
 
 
+def _label(test: str) -> str:
+    """Map a test name to the actual API method it exercises, so the card lists *methods*, not
+    test cases. e.g. test_mode_overwrite/append/ignore/error all exercise the one `mode()` method."""
+    if test.startswith("mode_"):
+        return "mode"
+    if test.startswith("option_"):
+        return "option"
+    return {
+        "format_load_delta": "format/load",
+        "read_property": "read",
+        "catalog_property": "catalog",
+        "show_tables": "sql",
+        "relation_passthrough": "__getattr__",
+    }.get(test, test)
+
+
 def _outcome(case):
     if case.find("error") is not None:
         return "error"
@@ -96,39 +112,46 @@ def main(path: str, check: bool = False) -> int:
         print(f"connection API: {passed}/{n} methods passing, {bad} failing, {skipped} skipped")
         return 1 if bad else 0
 
-    pct = round(100 * passed / n) if n else 0
-    out = ["## duckrun connection API — method scorecard", ""]
-    headline = f"✅ {passed} passed   ❌ {failed} failed   💥 {error} errors"
-    if skipped:
-        headline += f"   ⏭️ {skipped} skipped"
-    sub = f"{n} methods · {pct}% passing"
-    width = max(len(headline), len(sub)) + 2
-    out += ["```", "┌" + "─" * width + "┐", "│ " + headline.ljust(width - 1) + "│",
-            "│ " + sub.ljust(width - 1) + "│", "└" + "─" * width + "┘", "```", ""]
-    # Split every method by its API tag into two cards: Spark/Delta-on-Spark vs duckrun-specific.
-    labels = dict(GROUPS)
-    ordered = [g for g, _ in GROUPS if g in by_group] + [g for g in by_group if g not in labels]
-
-    spark = []   # (surface, [(method, outcome)])
-    duck = []    # (method, surface, outcome)
+    # Roll tests up into the actual API methods (the four mode_* tests are ONE `mode` method, etc.),
+    # preserving order within each surface; a method passes iff all its tests passed. Then split by
+    # API tag into two cards: Spark/Delta-on-Spark vs duckrun-specific.
+    ordered = [g for g, _ in GROUPS if g in by_group] + [g for g in by_group if g not in dict(GROUPS)]
+    spark = []   # (surface, [(method, ok)])
+    duck = []    # (method, surface, ok)
+    m_pass = m_tot = 0
     for g in ordered:
         surface = SHORT.get(g, g)
+        order, agg = [], {}   # label -> {"outs": [...], "api": str}
+        for test, outcome in by_group[g]:
+            lab = _label(test)
+            if lab not in agg:
+                order.append(lab)
+                agg[lab] = {"outs": [], "api": _api(g, test)}
+            agg[lab]["outs"].append(outcome)
         sp = []
-        for method, outcome in by_group[g]:
-            if _api(g, method) == "duckrun":
-                duck.append((method, surface, outcome))
-            else:
-                sp.append((method, outcome))
+        for lab in order:
+            ok = all(o == "passed" for o in agg[lab]["outs"])
+            m_tot += 1
+            m_pass += 1 if ok else 0
+            (duck.append((lab, surface, ok)) if agg[lab]["api"] == "duckrun" else sp.append((lab, ok)))
         if sp:
             spark.append((surface, sp))
 
-    def _cell(rows):
-        p = sum(1 for _, o in rows if o == "passed")
-        t = len(rows)
-        fails = [m for m, o in rows if o != "passed"]
-        return f"{p}/{t} ✅" if not fails else f"{p}/{t} ❌ ({', '.join(fails)})"
+    m_fail = m_tot - m_pass
+    pct = round(100 * m_pass / m_tot) if m_tot else 0
+    out = ["## duckrun connection API — method scorecard", ""]
+    headline = f"✅ {m_pass} passed   ❌ {m_fail} failed"
+    sub = f"{m_tot} methods · {pct}% passing"
+    width = max(len(headline), len(sub)) + 2
+    out += ["```", "┌" + "─" * width + "┐", "│ " + headline.ljust(width - 1) + "│",
+            "│ " + sub.ljust(width - 1) + "│", "└" + "─" * width + "┘", "```", ""]
 
-    sp_pass = sum(1 for _, rows in spark for _, o in rows if o == "passed")
+    def _cell(rows):  # rows: [(method, ok)]
+        p = sum(1 for _, ok in rows if ok)
+        fails = [m for m, ok in rows if not ok]
+        return f"{p}/{len(rows)} ✅" if not fails else f"{p}/{len(rows)} ❌ ({', '.join(fails)})"
+
+    sp_pass = sum(1 for _, rows in spark for _, ok in rows if ok)
     sp_tot = sum(len(rows) for _, rows in spark)
     out.append(f"### Spark / Delta-on-Spark API — {sp_pass}/{sp_tot} ✅")
     out.append("")
@@ -141,15 +164,15 @@ def main(path: str, check: bool = False) -> int:
         out.append(f"| `{surface}` | {names} | {_cell(rows)} |")
     out.append("")
 
-    d_pass = sum(1 for _, _, o in duck if o == "passed")
+    d_pass = sum(1 for _, _, ok in duck if ok)
     out.append(f"### duckrun-specific helpers — {d_pass}/{len(duck)} ✅")
     out.append("")
     out.append("> Conveniences with no Spark equivalent (session plumbing + two shortcuts).")
     out.append("")
     out.append("| Method | Surface | Pass |")
     out.append("| --- | --- | :-: |")
-    for method, surface, outcome in duck:
-        out.append(f"| `{method}` | `{surface}` | {_EMOJI.get(outcome, outcome)} |")
+    for method, surface, ok in duck:
+        out.append(f"| `{method}` | `{surface}` | {'✅' if ok else '❌'} |")
     out.append("")
 
     print("\n".join(out))
