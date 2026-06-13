@@ -72,22 +72,27 @@ what `is_incremental()` needs.)
 
 ## Design
 
-### 1. Disk discovery → relation cache only  (`impl.py`)
+### 1. Disk discovery → relation cache + read-path views  (`impl.py`)
 
 `list_relations_without_caching` discovers tables from disk. dbt populates its relation cache
 at run start by calling `list_relations_without_caching(schema_relation)` for every schema in
 the manifest (even on a fresh in-memory DuckDB). For each call:
 
 1. Compute `base = root_path/<schema_relation.schema>`.
-2. Enumerate Delta tables via DuckDB `glob` on the adapter's connection (works for local,
-   OneLake/abfss, S3 — azure autoloads and the plugin's secret is already configured):
-   ```sql
-   SELECT DISTINCT file FROM glob('<base>/*/_delta_log/*.json')
-   ```
-   `*` matches one segment (the table dir); use `*.json` (a table always has ≥1 commit log;
-   `00…0.json` is unreliable after `cleanup_metadata()`). **Normalize separators**: `glob`
-   returns OS-native paths (backslashes on Windows), so `replace("\\","/")` before splitting
-   on `/_delta_log/` to get the table name (last segment before the marker).
+2. Enumerate the Delta table directories under `base`. **The mechanism depends on the store**
+   (`_discover_via_glob` vs `_discover_via_rest`):
+   - **Local / `az://`** — DuckDB `glob` on the adapter's connection (azure autoloads, the
+     plugin's secret is already configured):
+     ```sql
+     SELECT DISTINCT file FROM glob('<base>/*/_delta_log/*.json')
+     ```
+     `*` matches one segment (the table dir); use `*.json` (a table always has ≥1 commit log;
+     `00…0.json` is unreliable after `cleanup_metadata()`). **Normalize separators**: `glob`
+     returns OS-native paths (backslashes on Windows), so `replace("\\","/")` before splitting
+     on `/_delta_log/` to get the table name (last segment before the marker).
+   - **OneLake / `abfss://`** — DuckDB cannot glob `abfss://` (duckdb-azure#174), so the
+     table directories are listed with the OneLake DFS REST API instead (`_discover_via_rest`).
+     Same result — a set of table names — by a different path.
 3. Return relations built with `self.Relation.create(database=<db>, schema=<schema>,
    identifier=<name>, type=RelationType.Table)` merged (de-duped) with `super()`'s result.
 
@@ -96,13 +101,16 @@ the manifest (even on a fresh in-memory DuckDB). For each call:
    table so `is_incremental()` is true on the 2nd run. Use `db`/`schema` from
    `schema_relation` (no hardcoded `lake`).
 
-**Discovery does NOT create views.** dbt runs `list_relations_without_caching` during the
-`before_run` cache-population phase; views created on that connection do **not** survive to
-the model-run phase (confirmed empirically — the view is created and queryable at discovery
-time but gone when the model runs). So discovery only feeds dbt's Python relation cache
-(making `is_incremental()` true); the physical `delta_scan` view is created in the
-materialization instead (step 2). Guard: if `root_path` is unset or `glob` finds nothing,
-return `super()`'s result unchanged.
+**Discovery feeds the cache AND registers the read-path view.** It returns the relations so
+dbt's Python relation cache makes `is_incremental()` true, and it also calls
+`_register_delta_view` on each discovered table so the physical `delta_scan` view exists for
+**read-only commands** (`dbt test` / `show` / `docs`), which run no materialization and would
+otherwise have no view to query. What that registration does **not** do is make `{{ this }}`
+resolve during a `dbt run`: views created on the cache-population connection do **not** survive
+to the model-run phase (confirmed empirically — queryable at discovery time, gone when the
+model runs). So the run-phase `{{ this }}` view is pre-registered separately in the
+materialization (step 2). Guard: if `root_path` is unset or discovery finds nothing, return
+`super()`'s result unchanged.
 
 ### 2. Materialization: pre-register `{{ this }}`, then view-after-write  (`_delta_core.sql`)
 
@@ -147,6 +155,31 @@ So the plugin overrides `configure_cursor(cursor)` to stash the live per-model c
 `store()`/`load()` read on **that** cursor (falling back to the shared connection). The
 pre-hook variable, the staged view, and the delta_rs read all share one session.
 
+### 3. Memory: one cap split across two engines  (`engine.py`)
+
+DuckDB and delta_rs each manage their own memory and neither knows the other exists. On a
+**merge** — the one path where both peak in the same process at the same time (DuckDB
+producing the source relation, delta_rs running the join pool) — they share one RAM budget
+with no shared allocator. duckrun therefore carves a single *effective* limit into static
+shares (`engine.set_merge_memory_limit` / `_default_merge_spill_size`):
+
+- DuckDB `memory_limit` → `_DUCKDB_MEM_FRACTION` (**0.3**),
+- delta_rs `max_spill_size` → `_MERGE_SPILL_FRACTION` (**0.6**),
+- the remaining **~10%** is slack for Python, Arrow buffers, and page cache.
+
+Past its share each consumer **spills to disk** rather than OOM-killing the container. The
+write path (overwrite/append/safeappend/microbatch) has no competing delta_rs pool, so DuckDB
+gets the bulk — clamped to `_WRITE_MEM_FRACTION` (**0.7**) of the effective limit
+(`engine.set_write_memory_limit`).
+
+The effective limit (`_effective_mem_limit_bytes`) is the **tightest of physical RAM, the
+cgroup/container cap, and the RAM actually free**, sampled fresh per job. It is cgroup-aware
+on purpose: on Fabric/Spark/k8s, DuckDB's own default (80% of *physical* RAM) sees the whole
+node, not our slice, so without this clamp the kernel OOM-kills us.
+
+This is a coordination layer that exists *only* because two independent processes split one
+RAM budget. A single engine would not need it — see [Tradeoffs](#tradeoffs).
+
 ## Cross-process state
 
 State survives across separate `dbt build` processes with no persistent catalog:
@@ -163,6 +196,16 @@ State survives across separate `dbt build` processes with no persistent catalog:
 Two engines split across a write means paying for a handoff that a single native engine
 wouldn't. The honest costs:
 
+- **Managing memory across two independent systems is a hack.** This is the headline cost.
+  Neither engine knows the other exists, yet on a merge both peak in one process against one
+  RAM budget with no shared allocator. duckrun papers over that with a *static* `0.3` /
+  `0.6` / `0.7` split (see [§3](#3-memory-one-cap-split-across-two-engines)) and a
+  cgroup-derived limit sampled per job. There is no split that is right for every workload:
+  pick wrong and you either starve the merge pool ("Resources exhausted") or overcommit and
+  get OOM-killed. A single engine has **one allocator over one budget** and spills against
+  its own true peak — it will always be more predictable than two processes dividing a number
+  they each only estimate. A native engine needs no tuning constant here at all; this one
+  does, and the constant is a guess.
 - **The Arrow bridge isn't truly zero-copy.** The C-stream interface passes buffers by
   pointer, but DuckDB's internal vector format is *not* Arrow — producing the Arrow stream
   materializes DuckDB's results into Arrow buffers first. So "zero-copy" describes the
@@ -175,26 +218,18 @@ wouldn't. The honest costs:
   reads/writes the log and data files independently — duplicated metadata and Parquet
   machinery that one engine would share.
 
-So yes: **a single native engine reading and writing Delta would generally win on the write
-path**, and once DuckDB's native Delta writes mature this design should be revisited (see
-[Context](#context)).
+So, plainly: **a single native engine reading and writing Delta would win** — on the write
+path and, more importantly, on predictability. The split-memory coordination above is not a
+clever optimization; it is a workaround for not having that engine.
 
-Where I'd push back on "a single engine is *always* better":
-
-- **It isn't an option today.** DuckDB's Delta writer is blind `INSERT` only — no
-  `UPDATE`/`DELETE`/`MERGE`. For the upsert/merge workloads this adapter exists to serve,
-  the single-engine path doesn't exist yet, so the comparison is against a capability we
-  can't ship, not a slower-but-working alternative.
-- **Two specialized engines can beat one generalist.** DuckDB is an excellent vectorized
-  reader/executor and delta_rs is a mature, correct Delta writer (concurrency, retries,
-  spill-aware merge). A single engine that is merely adequate at both can lose to two that
-  are each best-in-class at their half — the boundary cost has to exceed what you gain from
-  specialization, and for these workloads it doesn't.
-- **The cost is bounded and amortized.** The handoff is an Arrow stream, not a full
-  in-DuckDB materialization, and the dominant cost on incremental tables is the Delta
-  merge/scan itself — the conversion is a small slice of total runtime here.
+The one thing worth saying in its defence is *not* that two engines are secretly better — it
+is that **the single-engine path does not exist today.** DuckDB's Delta writer is blind
+`INSERT` only — no `UPDATE`/`DELETE`/`MERGE` — so for the upsert/merge workloads this adapter
+exists to serve, the comparison is against a capability we can't ship, not a slower-but-working
+alternative.
 
 Net: the boundary is a deliberate, temporary cost we accept to get correct Delta writes
 *now*; it is not the long-term ideal, and the design is structured (writes isolated behind
 delta_rs, reads behind `delta_scan`) so the writer can be swapped for a native one later
-without touching the read/state model.
+without touching the read/state model — at which point the cross-engine memory split goes away
+entirely.
