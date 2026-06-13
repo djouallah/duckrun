@@ -232,6 +232,70 @@ def prebind_display(rows):
     return out
 
 
+# -------------------------------------------------------------- D. DELETE / UPDATE snapshot safety
+
+def mutate_run(op: str, concurrent: bool) -> dict:
+    """A connection-API ``conn.sql('DELETE …'/'UPDATE …')`` (engine.delete_rows / update_rows)
+    is a genuinely conflicting Delta operation, so — exactly like MERGE — delta-rs OCC fails it
+    with CommitFailedError when a foreign commit changed the same rows after its snapshot was
+    opened. No max_commit_retries hack (that was only needed for non-conflicting appends): the
+    conflict detection is native. With no concurrent writer it simply commits."""
+    path = str(Path(tempfile.mkdtemp()) / "t")
+    engine.write_delta(
+        path,
+        pa.table({"id": pa.array([1, 2, 3], pa.int64()),
+                  "value": pa.array([10, 10, 10], pa.int64())}),
+        "overwrite",
+    )                                                            # v0
+    cap = {"op": op, "concurrent": concurrent}
+
+    # Inject the foreign commit AFTER the operation opens its snapshot but BEFORE it commits, by
+    # patching the first _delta_table() call the engine helper makes (same trick as merge_run).
+    real = engine._delta_table
+    done = {"x": False}
+
+    def patched(p, so):
+        dt = real(p, so)
+        if not done["x"]:
+            done["x"] = True
+            cap["read_ver"] = dt.version()
+            if concurrent:
+                real(p, so).update(predicate="id = 1", updates={"value": "999"})  # foreign -> v1
+                cap["head_ver"] = DeltaTable(p).version()
+        return dt
+
+    engine._delta_table = patched
+    try:
+        if op == "delete":
+            engine.delete_rows(path, "id = 1")
+        else:
+            engine.update_rows(path, {"value": "5"}, "id = 1")
+        cap["outcome"] = "COMMITTED"
+    except CommitFailedError:
+        cap["outcome"] = "REFUSED"
+    except Exception as e:
+        cap["outcome"] = f"RAISED {type(e).__name__}"
+    finally:
+        engine._delta_table = real
+    cap.setdefault("head_ver", cap.get("read_ver"))
+    return cap
+
+
+def mutate_display(rows):
+    out = []
+    for c in rows:
+        if c["concurrent"]:
+            ok = c["outcome"] == "REFUSED"                  # a moved table must fail loudly
+            res_md, res_txt = "🛡️ refused — `CommitFailedError`", "refused (CommitFailedError)"
+        else:
+            ok = c["outcome"] == "COMMITTED"                # uncontended -> commits
+            res_md, res_txt = "✅ committed", "committed"
+        out.append({"op": c["op"], "concurrent": "yes" if c["concurrent"] else "no",
+                    "read": f"v{c.get('read_ver', '?')}", "head": f"v{c.get('head_ver', '?')}",
+                    "res_txt": res_txt, "res_md": res_md, "ok": ok})
+    return out
+
+
 # ----------------------------------------------------------------------------- presentation
 
 def _ascii_table(headers, rows):
@@ -247,7 +311,7 @@ def _ascii_table(headers, rows):
                       *[line(r) for r in rows], rule("└", "┴", "┘")])
 
 
-def render_console(merge_disp, sa_disp, pb_disp, safe):
+def render_console(merge_disp, sa_disp, pb_disp, mut_disp, safe):
     a = _ascii_table(
         ["streamed_exec", "concurrent write", "merge target", "duckdb source", "result"],
         [[d["streamed"], d["concurrent"], d["merge"], d["duckdb"], d["res_txt"]] for d in merge_disp])
@@ -257,9 +321,12 @@ def render_console(merge_disp, sa_disp, pb_disp, safe):
     c = _ascii_table(
         ["streamed_exec", "bound at", "foreign commit", "source read", "result"],
         [[d["streamed"], d["bind"], d["foreign"], d["source"], d["res_txt"]] for d in pb_disp])
+    d = _ascii_table(
+        ["operation", "concurrent write", "read", "head", "result"],
+        [[x["op"], x["concurrent"], x["read"], x["head"], x["res_txt"]] for x in mut_disp])
     verdict = ("CONCURRENCY-CORRECT: merge source is always >= the merge version (gap fails loudly,\n"
                "  never silent); safeappend refuses a moved table, plain append has no guard;\n"
-               "  a pre-bound source re-reads at pull time and sees the pre-snapshot commit."
+               "  a pre-bound source re-reads at pull time; DELETE/UPDATE fail on a conflicting commit."
                if safe else
                "INVARIANT VIOLATED — a case behaved unexpectedly (see tables). Investigate.")
     return ("\n  duckrun — concurrency correctness\n\n"
@@ -268,10 +335,12 @@ def render_console(merge_disp, sa_disp, pb_disp, safe):
             "  B) safeappend (pin intended) — append only if the table version didn't move\n"
             + b + "\n\n"
             "  C) pre-snapshot window — does a pre-bound source re-read at pull time?\n"
-            + c + "\n\n  " + verdict + "\n")
+            + c + "\n\n"
+            "  D) DELETE / UPDATE — do they fail on a conflicting concurrent commit (like merge)?\n"
+            + d + "\n\n  " + verdict + "\n")
 
 
-def render_markdown(merge_disp, sa_disp, pb_disp, safe):
+def render_markdown(merge_disp, sa_disp, pb_disp, mut_disp, safe):
     tick = "✅" if safe else "❌"
     L = [f"## duckrun — concurrency correctness {tick}", "",
          "### A) MERGE snapshot safety", "",
@@ -306,6 +375,18 @@ def render_markdown(merge_disp, sa_disp, pb_disp, safe):
           "Safety in this window depends entirely on DuckDB resolving the delta_scan snapshot "
           "at pull time. If this case ever fails, that assumption broke in duckdb-delta — "
           "do not merge the version bump.", "",
+          "### D) DELETE / UPDATE — *do they fail on a conflicting concurrent commit?*", "",
+          "| operation | concurrent write | read | head | result |",
+          "|:---:|:---:|:---:|:---:|:---|"]
+    for d in mut_disp:
+        cc = "**yes**" if d["concurrent"] == "yes" else "no"
+        L.append(f"| `{d['op']}` | {cc} | {d['read']} | {d['head']} | {d['res_md']} |")
+    L += ["",
+          "> `conn.sql(\"DELETE …\"/\"UPDATE …\")` (engine `delete_rows`/`update_rows`) are genuinely "
+          "conflicting Delta operations, so — like `MERGE` — delta-rs OCC **refuses** them with "
+          "`CommitFailedError` when a foreign commit changed the same rows after the snapshot was "
+          "opened. No `max_commit_retries` hack: the conflict detection is native (the hack was only "
+          "needed for non-conflicting appends in `safeappend`). Uncontended, they just commit.", "",
           ("> ✅ **Concurrency-correct.**" if safe
            else "> ❌ **Invariant violated** — see tables above.")]
     return "\n".join(L) + "\n"
@@ -323,17 +404,19 @@ def main() -> int:
                safeappend_run("safeappend", False),
                safeappend_run("safeappend", True)]
     pb_rows = [prebind_run(False), prebind_run(True)]
+    mut_rows = [mutate_run("delete", False), mutate_run("delete", True),
+                mutate_run("update", False), mutate_run("update", True)]
 
     merge_disp, sa_disp = merge_display(merge_rows), safeappend_display(sa_rows)
-    pb_disp = prebind_display(pb_rows)
+    pb_disp, mut_disp = prebind_display(pb_rows), mutate_display(mut_rows)
     safe = (all(d["ok"] for d in merge_disp) and all(d["ok"] for d in sa_disp)
-            and all(d["ok"] for d in pb_disp))
+            and all(d["ok"] for d in pb_disp) and all(d["ok"] for d in mut_disp))
 
-    print(render_console(merge_disp, sa_disp, pb_disp, safe))
+    print(render_console(merge_disp, sa_disp, pb_disp, mut_disp, safe))
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
-            fh.write(render_markdown(merge_disp, sa_disp, pb_disp, safe))
+            fh.write(render_markdown(merge_disp, sa_disp, pb_disp, mut_disp, safe))
     return 0 if safe else 1
 
 
