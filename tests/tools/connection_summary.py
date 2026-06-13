@@ -25,6 +25,7 @@ GROUPS = [
     ("TestDataFrameReader", "DataFrameReader (read)"),
     ("TestDataFrameWriter", "DataFrameWriter (write)"),
     ("TestDeltaTable", "DeltaTable (merge / upsert)"),
+    ("TestSqlWrite", "SQL writes → Delta"),
 ]
 _EMOJI = {"passed": "✅", "failed": "❌", "error": "💥", "skipped": "⏭️"}
 
@@ -32,7 +33,7 @@ _EMOJI = {"passed": "✅", "failed": "❌", "error": "💥", "skipped": "⏭️"
 SHORT = {
     "TestSession": "DuckSession", "TestCatalog": "Catalog", "TestDataFrame": "DataFrame",
     "TestDataFrameReader": "DataFrameReader", "TestDataFrameWriter": "DataFrameWriter",
-    "TestDeltaTable": "DeltaTable",
+    "TestDeltaTable": "DeltaTable", "TestSqlWrite": "sql()",
 }
 
 # Which established API each method mirrors, so a reader can tell what's a real Spark/Delta method
@@ -44,6 +45,7 @@ _GROUP_API = {
     "TestDataFrameReader": "Spark",    # pyspark.sql.DataFrameReader
     "TestDataFrameWriter": "Spark",    # pyspark.sql.DataFrameWriter
     "TestDeltaTable": "Spark",         # delta.tables.DeltaTable — the Delta-on-Spark API (≈ Spark)
+    "TestSqlWrite": "Spark",           # spark.sql runs CREATE TABLE AS / INSERT / DELETE / UPDATE
 }
 _METHOD_API = {
     ("TestSession", "sql"): "Spark", ("TestSession", "table"): "Spark",
@@ -65,6 +67,14 @@ def _label(test: str) -> str:
         return "mode"
     if test.startswith("option_"):
         return "option"
+    if test.startswith("ctas"):
+        return "CREATE TABLE AS"
+    if test.startswith("insert"):
+        return "INSERT"
+    if test in ("delete", "update"):
+        return test.upper()
+    if test == "select_passthrough":
+        return "SELECT (passthrough)"
     return {
         "format_load_delta": "format/load",
         "read_property": "read",

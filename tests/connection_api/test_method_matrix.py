@@ -217,3 +217,56 @@ class TestDeltaTable:
         with pytest.raises(ValueError):
             DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
                 .whenMatchedUpdateAll().execute()
+
+
+class TestSqlWrite:
+    """conn.sql() routes CREATE TABLE AS / INSERT / DELETE / UPDATE to Delta (delta_scan views
+    are read-only); everything else passes straight through to DuckDB."""
+
+    def test_ctas(self, conn):
+        conn.sql("CREATE TABLE w AS SELECT 1 a, 2 b")
+        assert conn.table("w").collect() == [(1, 2)]
+
+    def test_ctas_or_replace(self, conn):
+        conn.sql("CREATE TABLE w AS SELECT 1 a, 2 b")
+        conn.sql("CREATE OR REPLACE TABLE w AS SELECT 9 a")  # narrower schema, wholesale replace
+        assert conn.sql("select * from w").columns == ["a"]
+        assert conn.table("w").collect() == [(9,)]
+
+    def test_ctas_error_if_exists(self, conn):
+        with pytest.raises(ValueError):
+            conn.sql("CREATE TABLE src AS SELECT 1 a")  # src exists, plain CREATE refuses
+
+    def test_ctas_if_not_exists(self, conn):
+        conn.sql("CREATE TABLE w AS SELECT 1 a")
+        conn.sql("CREATE TABLE IF NOT EXISTS w AS SELECT 2 a")  # no-op, table kept
+        assert conn.table("w").collect() == [(1,)]
+
+    def test_insert(self, conn):
+        conn.sql("CREATE TABLE w AS SELECT 1 a, 2 b")
+        conn.sql("INSERT INTO w VALUES (3, 4)")
+        assert sorted(conn.table("w").collect()) == [(1, 2), (3, 4)]
+
+    def test_insert_with_column_list(self, conn):
+        conn.sql("CREATE TABLE w AS SELECT 1 a, 2 b")
+        conn.sql("INSERT INTO w (b, a) SELECT 30, 10")  # reordered to (a, b)
+        assert sorted(conn.table("w").collect()) == [(1, 2), (10, 30)]
+
+    def test_insert_missing_table_errors(self, conn):
+        with pytest.raises(ValueError):
+            conn.sql("INSERT INTO ghost VALUES (1)")
+
+    def test_delete(self, conn):
+        conn.sql("CREATE TABLE w AS SELECT * FROM (values (1),(2),(3)) t(a)")
+        conn.sql("DELETE FROM w WHERE a = 2")
+        assert sorted(conn.table("w").collect()) == [(1,), (3,)]
+
+    def test_update(self, conn):
+        conn.sql("CREATE TABLE w AS SELECT 1 id, 10 n")
+        conn.sql("INSERT INTO w VALUES (2, 20)")
+        conn.sql("UPDATE w SET n = n + 1 WHERE id = 1")
+        assert dict(conn.sql("select id, n from w").collect()) == {1: 11, 2: 20}
+
+    def test_select_passthrough(self, conn):
+        # a plain read is untouched by the write router
+        assert conn.sql("SELECT 1").fetchall() == [(1,)]

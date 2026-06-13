@@ -86,6 +86,22 @@ def test_overwrite_schema_replaces(wh):
     assert conn.table("os").count() == 1
 
 
+def test_sql_writes_persist_to_delta(wh):
+    # CREATE TABLE AS / INSERT / UPDATE / DELETE via conn.sql() must land as real Delta, visible
+    # to a brand-new connection (not just DuckDB-native tables in this session).
+    conn = duckrun.connect(wh, schema="dbo")
+    conn.sql("CREATE TABLE evt AS SELECT 1 id, 'A' grp")
+    conn.sql("INSERT INTO evt VALUES (2, 'B')")
+    conn.sql("INSERT INTO evt (grp, id) SELECT 'C', 3")   # column list reordered
+    conn.sql("UPDATE evt SET grp = 'Z' WHERE id = 1")
+    conn.sql("DELETE FROM evt WHERE id = 2")
+    assert sorted(conn.sql("select * from evt").collect()) == [(1, "Z"), (3, "C")]
+
+    # real persistence: a fresh connection reads it off the store
+    fresh = duckrun.connect(wh, schema="dbo")
+    assert sorted(fresh.table("evt").collect()) == [(1, "Z"), (3, "C")]
+
+
 def test_read_api(wh):
     conn = duckrun.connect(wh, schema="dbo")
     t1_path = conn.table_path("dbo", "t1")

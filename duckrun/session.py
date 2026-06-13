@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 import duckdb
 
 from dbt.adapters.duckrun import engine, remote, secret
-from . import auth
+from . import auth, sqlwrite
 
 
 def _qid(name: str) -> str:
@@ -169,6 +169,11 @@ class DuckSession:
     # ---- Spark-shaped surface --------------------------------------------------------------
 
     def sql(self, query: str) -> "DataFrame":
+        # CREATE TABLE AS / INSERT / DELETE / UPDATE are routed to Delta (delta_scan views are
+        # read-only); everything else passes straight through to DuckDB unchanged.
+        kind = sqlwrite.classify(query)
+        if kind is not None:
+            return sqlwrite.execute(self, kind, query)
         return DataFrame(self.con.sql(query), self)
 
     def table(self, name: str) -> "DataFrame":

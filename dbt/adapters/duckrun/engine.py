@@ -656,6 +656,37 @@ def delete_insert_window(
     _maintain(_delta_table(path, storage_options), compaction_threshold)
 
 
+def delete_rows(
+    path: str,
+    predicate: Optional[str] = None,
+    *,
+    storage_options: Optional[Dict[str, str]] = None,
+    compaction_threshold: int = 100,
+) -> None:
+    """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
+    when ``predicate`` is None. The Delta-native ``DELETE FROM`` for the connection API; same
+    delta_rs ``dt.delete`` the microbatch window path uses. Then threshold-gated maintenance."""
+    dt = _delta_table(path, storage_options)
+    dt.delete(predicate) if predicate else dt.delete()
+    _maintain(_delta_table(path, storage_options), compaction_threshold)
+
+
+def update_rows(
+    path: str,
+    updates: Dict[str, str],
+    predicate: Optional[str] = None,
+    *,
+    storage_options: Optional[Dict[str, str]] = None,
+    compaction_threshold: int = 100,
+) -> None:
+    """Update ``{column: expression}`` for rows matching ``predicate`` (delta_rs/datafusion SQL),
+    or every row when ``predicate`` is None. The Delta-native ``UPDATE`` for the connection API.
+    Then threshold-gated maintenance."""
+    dt = _delta_table(path, storage_options)
+    dt.update(updates=updates, predicate=predicate)
+    _maintain(_delta_table(path, storage_options), compaction_threshold)
+
+
 def merge_delta(
     path: str,
     data,
