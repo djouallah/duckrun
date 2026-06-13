@@ -111,10 +111,12 @@ class DuckSession:
                 schemas.append(parts[-2])
         return schemas
 
-    def refresh(self):
+    def refresh(self, quiet: bool = False):
         """Re-discover the Delta tables and (re)register them as ``delta_scan`` views.
 
         Call after writing tables out-of-band (or from another process) to surface them.
+        Pass ``quiet=True`` to skip the connection banner (used by the catalog existence checks,
+        which refresh on every call).
         """
         if self._schema is not None:
             mapping = {self._schema: self._list_tables(self._schema)}
@@ -135,9 +137,10 @@ class DuckSession:
             self._current_database = "dbo" if "dbo" in schemas else (schemas[0] if schemas else "dbo")
         self._set_search_path(self._current_database)
 
-        lh = self.root_path.rstrip("/").rsplit("/", 1)[-1]
-        print(f"🔌 Connected to {lh} — discovered {len(registered)} table(s)"
-              + (": " + ", ".join(registered) if registered else ""))
+        if not quiet:
+            lh = self.root_path.rstrip("/").rsplit("/", 1)[-1]
+            print(f"🔌 Connected to {lh} — discovered {len(registered)} table(s)"
+                  + (": " + ", ".join(registered) if registered else ""))
         return self
 
     def _register_view(self, schema: str, table: str):
@@ -370,6 +373,34 @@ class Catalog:
     def setCurrentDatabase(self, dbName: str):
         self.session._current_database = dbName
         self.session._set_search_path(dbName)
+
+    def tableExists(self, tableName: str, dbName: Optional[str] = None) -> bool:
+        self.session.refresh(quiet=True)  # safe: reflect on-store truth, not stale views
+        schema, table = self.session.resolve(tableName)
+        if dbName is not None:
+            schema = dbName
+        rows = self.session.con.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = ? AND table_name = ?",
+            [schema, table],
+        ).fetchall()
+        return len(rows) > 0
+
+    def databaseExists(self, dbName: str) -> bool:
+        self.session.refresh(quiet=True)  # safe: re-discover schema folders first
+        return dbName in self.listDatabases()
+
+    def listColumns(self, tableName: str, dbName: Optional[str] = None) -> List[str]:
+        self.session.refresh(quiet=True)
+        schema, table = self.session.resolve(tableName)
+        if dbName is not None:
+            schema = dbName
+        rows = self.session.con.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+            [schema, table],
+        ).fetchall()
+        return [r[0] for r in rows]
 
 
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,

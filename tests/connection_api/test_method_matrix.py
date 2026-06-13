@@ -70,6 +70,24 @@ class TestCatalog:
         assert conn.catalog.currentDatabase() == "other"
         assert conn.sql("select n from thing").fetchone()[0] == 7  # resolves via search_path
 
+    def test_tableExists(self, conn):
+        assert conn.catalog.tableExists("src") is True
+        assert conn.catalog.tableExists("nope") is False
+        assert conn.catalog.tableExists("other.thing") is True  # qualified name
+
+    def test_tableExists_is_fresh(self, conn):
+        # safety: a table written out-of-band (no manual refresh) must still be found —
+        # tableExists refreshes internally.
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("fresh")
+        assert conn.catalog.tableExists("fresh") is True
+
+    def test_databaseExists(self, conn):
+        assert conn.catalog.databaseExists("dbo") is True
+        assert conn.catalog.databaseExists("ghost") is False
+
+    def test_listColumns(self, conn):
+        assert conn.catalog.listColumns("src") == ["id", "name"]
+
 
 class TestDataFrame:
     def test_collect(self, conn):
