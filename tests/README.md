@@ -13,7 +13,9 @@ subfolder is one kind of thing; nothing loose at the top level.
 | [`correctness/`](correctness/) | Standalone **correctness scripts** for specific invariants (e.g. concurrency / OCC). | `.github/workflows/concurrency-correctness.yml` |
 | [`tools/`](tools/) | **Tooling/scripts**: the MERGE TPCH benchmark, conformance baseline/gate/summary, README card injection. | `.github/workflows/merge.yml`, `conformance.yml` |
 
-`.localtest_*` are gitignored local scratch (a throwaway warehouse + run script); ignore them.
+**What's gitignored:** only runtime outputs (`conformance/_run.log`, the integration dbt
+`target/`/`logs/`/`warehouse/`) and **`_local/`** — the one clearly-named folder for local
+throwaway (scratch warehouses, ad-hoc run scripts). Test *code* is never ignored.
 
 ## Live OneLake tests
 
