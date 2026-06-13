@@ -259,251 +259,21 @@ concurrent reader might still be reading are never deleted out from under it. Th
 is that a superseded file version lingers for the retention window before it can be
 reclaimed — duckrun favors read-safety over immediate disk savings.
 
-## Development
-
-The `tests/integration_tests/` directory is a small dbt project exercised by CI
-(`.github/workflows/integration.yml`): `dbt build` runs twice against a local Delta
-`./warehouse` — a seed, a `view`, a `table`, and an `incremental` model — where the
-second build exercises the incremental merge. Verified to run with **pyarrow not
-installed**, on the minimum supported `duckdb` and `deltalake`.
-
-`tests/conformance/` runs the official dbt adapter test suite
-([`dbt-tests-adapter`](https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-tests-adapter))
-against duckrun (`.github/workflows/conformance.yml`). The results card is published to the
-job summary and rendered live into this README below — regenerated on every push to `main`.
-
-## Conformance results
-
-_The conformance and MERGE scorecards below are regenerated on every push to `main`, so they
-reflect the latest `main` — which may be ahead of the published PyPI release._
-
-Every still-failing test in the card below falls into one of three categories:
-
-- **delta-rs API gap** — the write the test needs isn't supported by `deltalake==1.5.0`, e.g.
-  the `constraints` `correct_column_data_types` cases require writing a `TIMESTAMP`-without-timezone
-  column (`timestampNtz`), a Delta writer feature we don't enable because it bumps the table
-  protocol and can break DirectLake/older readers.
-- **view-backed relation limit** — duckrun surfaces each Delta table as a `delta_scan` view, so
-  tests that mutate the relation in place (several `incremental_microbatch` fixtures `UPDATE` the
-  view; `changing_relation_type` swaps a table for a view) can't be satisfied without a physical
-  table.
-- **deliberate scope-out** — e.g. `TestCatalogRelationsDuckDB` forces a `type: duckdb` profile and
-  exercises `get_catalog_relations`, which this pinned dbt-duckdb doesn't implement — outside the
-  duckrun adapter entirely.
-
-<!-- CONFORMANCE:START -->
-
-## dbt adapter conformance — duckrun
-
-```
-┌────────────────────────────────────────────────────────┐
-│ ✅ 112 passed   ❌ 18 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 83% passing                                │
-└────────────────────────────────────────────────────────┘
-```
-
-### By suite
-
-| Suite | Pass rate | ✅ | ❌ | 💥 | ⏭️ | Total |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `aliases` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
-| `caching` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
-| `concurrency` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
-| `empty` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
-| `ephemeral` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
-| `fast_seed` | `██████████` 100% | 4 | 0 | 0 | 0 | 4 |
-| `simple_snapshot` | `██████████` 100% | 6 | 0 | 0 | 0 | 6 |
-| `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
-| `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
-| `basic` | `█████████░` 88% | 14 | 2 | 0 | 0 | 16 |
-| `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
-| `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
-| `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
-| `incremental` | `████████░░` 77% | 20 | 6 | 0 | 0 | 26 |
-| `incremental_microbatch` | `█████░░░░░` 54% | 7 | 6 | 0 | 0 | 13 |
-| `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `████████░░` **83%** | **112** | **18** | **0** | **5** | **135** |
-
-### Incremental / write support
-
-| Capability | | Notes |
-| --- | :-: | --- |
-| `materialized='table'` (overwrite) | ✅ | full rewrite each run (delta_rs overwrite) |
-| first run / `--full-refresh` | ✅ | overwrites |
-| `append` | ✅ | blind append; default when no `unique_key` |
-| `safeappend` | ✅ | append only if the table version is unchanged since the model read it (else fail); cheap, no dedup scan |
-| `merge` (upsert) | ✅ | update matched + insert new, on `unique_key`; default with `unique_key` |
-| `insert` (insert-only) | ✅ | insert new keys only (idempotent / dedupe) |
-| `merge_update_columns` | ✅ | update only the listed columns on match |
-| `merge_exclude_columns` | ✅ | update every column except the listed ones |
-| `incremental_predicates` | ✅ | AND-ed into the merge condition (merge strategy) |
-| `merge_update_condition` / `merge_insert_condition` | ✅ | honored as delta_rs per-clause predicates (gate which rows update / insert) |
-| `on_schema_change='append_new_columns'` | ✅ | new columns added via delta_rs schema evolution |
-| `on_schema_change='fail'` | ✅ | raises if the model's columns drift from the table |
-| `partition_by` | ✅ | Delta partition columns |
-| `on_schema_change='sync_all_columns'` | ⚠️ | **add-only** — delta_rs can't drop columns |
-| `delete+insert` | ⚠️ | mapped to `merge` (not exact delete+insert semantics) |
-| `microbatch` strategy | ✅ | per-batch delete+insert on the `event_time` window (delta_rs delete + append) |
-| `merge_clauses` / `merge_update_set_expressions` / `merge_on_using_columns` | ❌ | dbt-duckdb-specific, no delta_rs equivalent — **rejected** with a clear error, never silently ignored |
-| model contracts — column name/type/count | ✅ | enforced via dbt's `assert_columns_equivalent` preflight before the write |
-| constraints — `not null` | ✅ | pre-write guard on the staged rows; a null fails the run and leaves the prior table intact |
-| constraints — `check` / `primary_key` / `foreign_key` | ❌ | not enforceable against a `delta_scan` view; declared but not checked |
-
-### Not passing — details by suite
-
-<details><summary><b>changing_relation_type</b> — 1 not passing (0/1 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestChangeRelationTypesDuckDB::test_changing_materialization_changes_relation_type` | AssertionError: dbt exit state did not match expected |
-
-</details>
-<details><summary><b>incremental_microbatch</b> — 6 not passing (7/13 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_inserts_new_batches` | _duckdb.CatalogException: Catalog Error: microbatch_exec_input is not an table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_date_event_time` | _duckdb.CatalogException: Catalog Error: microbatch_event_date_input is not an table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_hour_batch_size` | _duckdb.CatalogException: Catalog Error: microbatch_batch_hour_input is not an table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_month_batch_size` | _duckdb.CatalogException: Catalog Error: microbatch_batch_month_input is not an table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_reprocesses_existing_batch` | _duckdb.BinderException: Binder Error: Can only update base table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_lookback_reprocesses_previous_batches` | _duckdb.BinderException: Binder Error: Can only update base table |
-
-</details>
-<details><summary><b>incremental</b> — 6 not passing (20/26 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestIncrementalPredicates::test__incremental_predicates` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
-| ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMerge::test_merge_custom_clauses` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMergeValidation::test_ducklake_valid_single_update` | AssertionError: dbt exit state did not match expected |
-
-</details>
-<details><summary><b>constraints</b> — 3 not passing (14/17 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestViewConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-
-</details>
-<details><summary><b>basic</b> — 2 not passing (14/16 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestCatalogRelationsDuckDB::test_get_catalog_relations` | AssertionError: dbt exit state did not match expected |
-
-</details>
-
-<!-- CONFORMANCE:END -->
-
-## Incremental MERGE benchmark
-
-The [`merge-spill`](.github/workflows/merge.yml) workflow builds a large TPCH `lineitem`
-fact table (the release gate runs scale factor **20**, ~120M rows) and runs four merge
-shapes against it — mixed upsert, insert-only, update-only, and an idempotent re-merge —
-plus a plain `append`, `safeappend`, and `overwrite` of the same batch for comparison, on a
-single machine with duckrun's shipping memory defaults (per-merge DuckDB `memory_limit` +
-delta_rs `max_spill_size` + target pruning). It runs on a standard **GitHub-hosted runner
-(~16 GB RAM)** — no beefy hardware — proving the merges stay within that RAM and apply every
-UPDATE/INSERT correctly, and lets you compare a MERGE's cost against a plain write of the same
-batch. It gates every release; the latest scorecard is rendered live below.
-
-<!-- MERGE:START -->
-
-## 🔀 Incremental MERGE test — duckrun on Delta Lake
-
-**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table on one machine — across four merge shapes — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same batch compares against a plain `append` / `safeappend` / `overwrite` on that same table (which never scan the target).
-
-### Setup (the inputs)
-| | |
-|---|---|
-| Engine | duckrun &middot; DuckDB 1.5.1 &middot; delta_rs 1.5.0 |
-| Target fact table | TPCH `lineitem`, scale factor **20.0** → **119,994,608 rows** |
-| Primary key (merge on) | `(l_orderkey, l_linenumber)` |
-| Effective memory | 14927 MB (runner RAM, no artificial limit) |
-| DuckDB `memory_limit` | 12.4 GiB — set by duckrun (cgroup-aware) |
-| Merge spill cap | 8956 MB — delta_rs `max_spill_size` |
-
-### The operations (run in order, on the same growing table)
-1. **Mixed upsert (~1% sample):** ~80% existing keys → UPDATE (randomized measures), ~20% key-shifted → INSERT. _Expect:_ rows grow by the inserts; updated rows carry the new measures.
-2. **Insert-only (~5% sample):** key-shifted past the max key so nothing matches, stamped with a future `l_shipdate` (2035). _Expect:_ every row INSERTed; exactly that many rows carry the 2035 date.
-3. **Update-only (~5% sample):** existing keys, randomized measures, no key shift → 100% match. _Expect:_ row count unchanged; rows carry the new measures.
-4. **Idempotent re-merge:** re-run scenario 3's exact batch. _Expect:_ a correct MERGE is idempotent — nothing changes (same row count, same values).
-5. **Append (no merge):** the same batch appended to the table. _Expect:_ rows grow by the batch — far faster than a MERGE, because an append only lands files (no target scan/join) and DuckDB streams the source.
-6. **Safeappend (no merge):** the same batch via `safeappend` — a plain append that commits only if the table version is unchanged since it was read (it is here). _Expect:_ same cheap append, now version-guarded against concurrent writers.
-7. **Overwrite (no merge):** the same batch overwriting the table. _Expect:_ the table is replaced by the batch — also far faster than a MERGE (no target scan/join).
-
-### Results (row counts in millions)
-| Operation | Increment | Updates | Inserts | Before | After | Expected | Count ✓ | Values ✓ | Time |
-|---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|
-| Mixed upsert | 1.2M | 1.0M | 0.2M | 120.0M | 120.2M | 120.2M | ✅ | ✅ | 150.1s |
-| Insert-only (future shipdate) | 6.0M | 0.0M | 6.0M | 120.2M | 126.2M | 126.2M | ✅ | ✅ | 5.0s |
-| Update-only (100% match) | 6.0M | 6.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 158.3s |
-| Idempotent re-merge | 6.0M | 6.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 172.3s |
-| Append (no merge) | 6.0M | 0.0M | 6.0M | 126.2M | 132.2M | 132.2M | ✅ | ✅ | 4.3s |
-| Safeappend (no merge) | 6.0M | 0.0M | 6.0M | 132.2M | 138.2M | 138.2M | ✅ | ✅ | 4.2s |
-| Overwrite (no merge) | 6.0M | 0.0M | 6.0M | 138.2M | 6.0M | 6.0M | ✅ | ✅ | 4.1s |
-
-_The last three rows are the same batch as a plain `append` / `safeappend` / `overwrite` — compare their time against the merges above to see the cost a MERGE pays to scan & join the target._
-
-**Result: ✅ all operations correct.** Target grew to **126,231,331 rows** across the merges, peak memory **6,507 MB** — duckrun stayed within the runner's RAM and every update/insert landed as expected.
-
-<!-- MERGE:END -->
-
-## Connection API (notebook) — method scorecard
+## Connection API (notebook)
 
 Besides the dbt adapter, duckrun ships a storage-neutral, PySpark-shaped `duckrun.connect()` for
-interactive/notebook use (local, S3, GCS, ADLS, OneLake): `conn.sql(...)`, a `DataFrame` with
-`.write…saveAsTable()`, `conn.read`, `conn.catalog`, and a `DeltaTable.merge(...)` upsert builder.
-The card below — every public method with a ✅ — is regenerated on every push by
-[`connection-card.yml`](.github/workflows/connection-card.yml) from
-[`tests/connection_api/test_method_matrix.py`](tests/connection_api/test_method_matrix.py).
+interactive/notebook use (local, S3, GCS, ADLS, OneLake): `conn.sql(...)` — with `CREATE TABLE AS`,
+`INSERT`, `UPDATE`, and `DELETE` routed to Delta — a `DataFrame` with `.write…saveAsTable()`,
+`conn.read`, `conn.catalog`, and a `DeltaTable.merge(...)` upsert builder.
 
-<!-- CONNECTION_API:START -->
-
-## duckrun connection API — method scorecard
-
-```
-┌───────────────────────────┐
-│ ✅ 43 passed   ❌ 0 failed  │
-│ 43 methods · 100% passing │
-└───────────────────────────┘
+```python
+import duckrun
+conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")
+conn.sql("CREATE TABLE orders_copy AS SELECT * FROM orders")
+conn.table("orders_copy").show()
 ```
 
-### Spark / Delta-on-Spark API — 37/37 ✅
-
-> Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.
-
-| Surface | Methods | Pass |
-| --- | --- | :-: |
-| `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
-| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns` | 8/8 ✅ |
-| `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas` | 5/5 ✅ |
-| `DataFrameReader` | `format/load`, `table`, `parquet`, `csv` | 4/4 ✅ |
-| `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `partitionBy`, `format` | 5/5 ✅ |
-| `DeltaTable` | `forName`, `forPath`, `merge_upsert`, `merge_update_columns`, `merge_insert_only`, `update_only_rejected` | 6/6 ✅ |
-| `sql()` | `CREATE TABLE AS`, `INSERT`, `DELETE`, `UPDATE`, `SELECT (passthrough)` | 5/5 ✅ |
-
-### duckrun-specific helpers — 6/6 ✅
-
-> Conveniences with no Spark equivalent (session plumbing + two shortcuts).
-
-| Method | Surface | Pass |
-| --- | --- | :-: |
-| `connect` | `DuckSession` | ✅ |
-| `refresh` | `DuckSession` | ✅ |
-| `connection` | `DuckSession` | ✅ |
-| `table_path` | `DuckSession` | ✅ |
-| `__getattr__` | `DataFrame` | ✅ |
-| `delta` | `DataFrameReader` | ✅ |
-
-<!-- CONNECTION_API:END -->
+See [docs/connection-api.md](docs/connection-api.md) for the full per-method scorecard.
 
 ## Building with an AI assistant
 
@@ -521,6 +291,20 @@ out? It reads the [`AGENTS.md`](AGENTS.md) at the repo root automatically, which
 the full guide in
 [`plugins/duckrun-projects/skills/duckrun-projects/SKILL.md`](plugins/duckrun-projects/skills/duckrun-projects/SKILL.md).
 None of this is required to use duckrun — `pip install duckrun` is unaffected.
+
+## Docs & test results
+
+| Doc | What's in it |
+|---|---|
+| [Design document](docs/design_document.md) | Why delta_rs (not DuckDB's native Delta writer), why Delta (not Iceberg), why a separate adapter. |
+| [Connection API](docs/connection-api.md) | The `duckrun.connect()` notebook API + the live per-method scorecard. |
+| [dbt adapter conformance](docs/conformance.md) | Official `dbt-tests-adapter` results, regenerated on every push to `main`. |
+| [Incremental MERGE benchmark](docs/merge-benchmark.md) | ~120M-row TPCH merge / append / overwrite scorecard — the release gate. |
+
+**Testing.** `tests/integration_tests/` is a small dbt project built twice against a local Delta
+`./warehouse` (CI: [`integration.yml`](.github/workflows/integration.yml)); `tests/conformance/`
+runs the official suite (above); `tests/correctness/` proves the concurrency guarantees. The cards
+in those docs are rendered live by CI, so they always reflect the latest `main`.
 
 ## License
 

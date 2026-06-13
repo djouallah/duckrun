@@ -100,19 +100,19 @@ jobs:
       # On push to main: this run IS the latest state of main, so refresh the baseline + render the
       # card into README and commit both. That's what keeps the README card always reflecting main.
       # [skip ci] avoids re-triggering. Never fails the push on a commit hiccup.
-      - name: Refresh baseline + render card into README and commit (main only)
+      - name: Refresh baseline + render card into docs and commit (main only)
         if: always() && steps.changes.outputs.code == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
           python tests/tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml
-          python tests/tools/inject_readme.py README.md conformance_card.md CONFORMANCE
-          if git diff --quiet -- README.md tests/conformance/passing_baseline.txt; then
+          python tests/tools/inject_readme.py docs/conformance.md conformance_card.md CONFORMANCE
+          if git diff --quiet -- docs/conformance.md tests/conformance/passing_baseline.txt; then
             echo "Conformance card + baseline unchanged."
             exit 0
           fi
           git config user.name "djouallah"
           git config user.email "mimoune.djouallah@gmail.com"
-          git add README.md tests/conformance/passing_baseline.txt
+          git add docs/conformance.md tests/conformance/passing_baseline.txt
           git commit -m "docs: refresh conformance card + baseline [skip ci]"
           for i in 1 2 3; do
             git pull --rebase origin main && git push origin main && break

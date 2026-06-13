@@ -55,18 +55,18 @@ jobs:
         if: always()
         run: cat connection_card.md >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Inject card into README and commit (main only)
+      - name: Inject card into docs and commit (main only)
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
-          python tests/tools/inject_readme.py README.md connection_card.md CONNECTION_API
-          if git diff --quiet -- README.md; then
+          python tests/tools/inject_readme.py docs/connection-api.md connection_card.md CONNECTION_API
+          if git diff --quiet -- docs/connection-api.md; then
             echo "Connection card unchanged."
             exit 0
           fi
           git config user.name "djouallah"
           git config user.email "mimoune.djouallah@gmail.com"
-          git add README.md
+          git add docs/connection-api.md
           git commit -m "docs: refresh connection API method scorecard [skip ci]"
           for i in 1 2 3; do
             git pull --rebase origin main && git push origin main && break
