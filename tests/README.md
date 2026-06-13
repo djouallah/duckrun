@@ -5,8 +5,8 @@ subfolder is one kind of thing; nothing loose at the top level.
 
 | Folder | What it is | Run by |
 | --- | --- | --- |
-| [`adapter/`](adapter/) | Unit/integration tests for the **dbt adapter** internals (write engine, remote discovery, the `table_exists` guard). Fast, local, no network. | `pytest tests/adapter` (local) |
-| [`connection_api/`](connection_api/) | Tests for the top-level **`duckrun.connect()`** notebook API. `test_local_filesystem.py` is the offline, network-free regression suite (tiny synthetic tables). | `pytest tests/connection_api` (local) |
+| [`adapter/`](adapter/) | Unit/integration tests for the **dbt adapter** internals (write engine, remote discovery, the `table_exists` guard). Fast, local, no network. | `.github/workflows/tests.yml` (every push/PR) |
+| [`connection_api/`](connection_api/) | Tests for the top-level **`duckrun.connect()`** notebook API. `test_local_filesystem.py` is the offline, network-free regression suite (tiny synthetic tables). | `.github/workflows/tests.yml` (every push/PR) |
 | [`connection_api/coffeeshop/`](connection_api/coffeeshop/) | One coffee-shop scenario (dims from a public CSV generator, locally-generated fact) exercising every method, parameterized by row count: `test_coffee_local` (local fs, big — stress) and `test_coffee_onelake` (live OneLake, small — **skips** without `WAREHOUSE_PATH` + `ONELAKE_TOKEN`). Knobs: `COFFEE_LOCAL_ROWS`, `COFFEE_ONELAKE_ROWS`. | `pytest tests/connection_api/coffeeshop` (local) · `.github/workflows/coffee-stress.yml` (manual stress, `rows` input) |
 | [`conformance/`](conformance/) | The official **dbt adapter conformance suite** (`dbt-tests-adapter`) subclassed against duckrun. | `.github/workflows/conformance.yml` → `pytest tests/conformance` |
 | [`integration_tests/`](integration_tests/) | A real **dbt project** (the AEMO example) built twice against OneLake to exercise the adapter end to end. | `.github/workflows/aemo.yml` |

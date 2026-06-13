@@ -1,0 +1,40 @@
+name: tests
+
+# The fast regression gate that runs on EVERY push / PR: the dbt-adapter unit tests and the
+# connection-API (duckrun.connect) offline tests. No secrets, no network — a local-filesystem
+# Delta warehouse — so it's quick (~tens of seconds) and deterministic. This is what catches a
+# broken connect / write / read / merge / catalog before it ever reaches the heavier, gated
+# OneLake suites (aemo) or the conformance suite.
+#
+# Out of scope here (deliberately): tests/connection_api/coffeeshop/ (live OneLake needs creds;
+# the local variant pulls CSVs over the network and generates a big fact) and tests/conformance/
+# (its own workflow). Those are integration/stress, not the per-change gate.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (dbt-duckdb + duckdb + deltalake + pytest + pyarrow)
+        run: pip install -e ".[test]"
+
+      - name: Adapter unit tests + connection-API offline tests
+        run: |
+          python -m pytest \
+            tests/adapter \
+            tests/connection_api/test_local_filesystem.py \
+            -q -p no:cacheprovider
