@@ -198,34 +198,10 @@ class DuckrunAdapter(DuckDBAdapter):
 
     def _discover_via_glob(self, root_path, schema):
         """Table names under ``<root_path>/<schema>`` on a local / az:// store, via DuckDB glob."""
-        base = root_path.rstrip("/") + "/" + str(schema).strip('"')
         cursor = self._cursor()
         # az:// needs its Azure secret on the connection before the glob can authenticate.
         self._ensure_remote_secret(cursor)
-        # `*` matches one path segment (the table dir); every committed Delta table has at
-        # least one commit json (00..0.json is unreliable after cleanup_metadata()).
-        pattern = (base + "/*/_delta_log/*.json").replace("'", "''")
-        try:
-            rows = cursor.execute(
-                f"SELECT DISTINCT file FROM glob('{pattern}')"
-            ).fetchall()
-        except Exception as exc:
-            logger.debug(f"duckrun: Delta relation discovery glob failed for {pattern!r}: {exc}")
-            return []
-
-        marker = "/_delta_log/"
-        names = []
-        for (file_path,) in rows:
-            # glob returns OS-native separators (backslashes on Windows); normalize so the
-            # marker match and table-name split work regardless of platform / store.
-            fp = file_path.replace("\\", "/")
-            idx = fp.find(marker)
-            if idx == -1:
-                continue
-            name = fp[:idx].rsplit("/", 1)[-1]
-            if name and name not in names:
-                names.append(name)
-        return names
+        return remote.list_delta_tables_via_glob(cursor, root_path, schema)
 
     def _register_delta_view(self, relation):
         """Create the ``delta_scan`` view for a discovered Delta relation on the live

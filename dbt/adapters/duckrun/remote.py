@@ -28,6 +28,37 @@ def _parse_abfss(root_path: str) -> Tuple[str, str, str]:
     return filesystem, host, path.strip("/")
 
 
+def list_delta_tables_via_glob(cursor, root_path: str, schema: str) -> List[str]:
+    """Table names under ``<root_path>/<schema>`` on a local / az:// / s3:// / gs:// store, via
+    DuckDB ``glob``. ``cursor`` is any live DuckDB cursor/connection that can run ``execute`` —
+    the caller is responsible for having minted whatever store secret the glob needs first
+    (az://, s3, gcs). OneLake (``abfss://``) can't be globbed; use ``list_delta_tables`` there.
+
+    Returns ``[]`` if nothing matches or the glob errors (e.g. the schema dir doesn't exist yet)."""
+    base = root_path.rstrip("/") + "/" + str(schema).strip('"')
+    # `*` matches one path segment (the table dir); every committed Delta table has at least one
+    # commit json (00..0.json is unreliable after cleanup_metadata()).
+    pattern = (base + "/*/_delta_log/*.json").replace("'", "''")
+    try:
+        rows = cursor.execute(f"SELECT DISTINCT file FROM glob('{pattern}')").fetchall()
+    except Exception:  # missing dir / unsupported store -> no tables (caller may log)
+        return []
+
+    marker = "/_delta_log/"
+    names: List[str] = []
+    for (file_path,) in rows:
+        # glob returns OS-native separators (backslashes on Windows); normalize so the marker
+        # match and table-name split work regardless of platform / store.
+        fp = file_path.replace("\\", "/")
+        idx = fp.find(marker)
+        if idx == -1:
+            continue
+        name = fp[:idx].rsplit("/", 1)[-1]
+        if name and name not in names:
+            names.append(name)
+    return names
+
+
 def list_delta_tables(root_path: str, schema: str, storage_options) -> List[str]:
     """Immediate sub-directory names under ``<root_path>/<schema>`` on a OneLake/ADLS store
     — each a candidate Delta table. Requires a bearer token in ``storage_options``.

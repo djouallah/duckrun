@@ -377,8 +377,10 @@ def build_write_deltalake_args(
         args["partition_by"] = partition_by
     if storage_options:
         args["storage_options"] = storage_options
-    if schema_mode == "merge":
-        args["schema_mode"] = "merge"
+    # "merge" evolves the schema (adds columns); "overwrite" replaces it wholesale (overwrite
+    # mode only) — delta-rs's own schema_mode values, passed straight through.
+    if schema_mode in ("merge", "overwrite"):
+        args["schema_mode"] = schema_mode
     wp = _writer_properties()
     if wp is not None:
         args["writer_properties"] = wp
@@ -521,6 +523,7 @@ def write_delta(
     *,
     partition_by: Optional[List[str]] = None,
     merge_schema: bool = False,
+    overwrite_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
 ) -> None:
@@ -530,11 +533,19 @@ def write_delta(
       - overwrite: write, then vacuum (safe 7-day default) + cleanup_metadata
       - append:    write, then compact/vacuum/cleanup if file count exceeds threshold
       - ignore:    write only if the table does not already exist
+
+    ``merge_schema`` evolves the schema (adds columns); ``overwrite_schema`` replaces it wholesale
+    (overwrite mode only — Spark/Delta's ``overwriteSchema``). They are mutually exclusive.
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
 
-    schema_mode = "merge" if merge_schema else None
+    if merge_schema:
+        schema_mode = "merge"
+    elif overwrite_schema and mode != "append":  # schema replacement only makes sense on a rewrite
+        schema_mode = "overwrite"
+    else:
+        schema_mode = None
 
     if mode == "ignore":
         if table_exists(path, storage_options):

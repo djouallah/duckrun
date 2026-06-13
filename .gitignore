@@ -46,8 +46,11 @@ tests/*/
 .tmp
 .tmp/*/
 
-# ...but keep the committed conformance suite; only its runtime outputs are ignored.
+# ...but keep the committed test suites; only their runtime outputs are ignored.
 !tests/conformance/
+!tests/adapter/
+!tests/connection_api/
+!tests/correctness/
 tests/conformance/_run.log
 tests/conformance/_report.xml
 conformance.xml

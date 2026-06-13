@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.3.16"
+version = "0.3.17"
 description = "A dbt adapter that runs SQL in DuckDB and materializes to Delta Lake (delta_rs)."
 readme = "README.md"
 license = {text = "MIT"}
@@ -29,9 +29,15 @@ dependencies = [
     # 1.5.2+ is held back by the duckdb-delta read-side bug above.
     "duckdb==1.5.1",
     "deltalake>=1.5.0,<1.5.1",
+    # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
+    # API directly; requests is otherwise only a transitive dbt dependency.
+    "requests",
 ]
 
 [project.optional-dependencies]
+# Laptop OneLake auth for the connection API: acquire a storage token via Azure CLI / browser.
+# Not needed inside a Fabric notebook (notebookutils supplies the token) or for s3/gcs/local.
+local = ["azure-identity"]
 # Test-only; pyarrow is used to build reusable Arrow fixtures. Production duckrun stays
 # pyarrow-free (it streams DuckDB relations straight to deltalake).
 test = ["pytest>=7", "pyarrow"]
@@ -45,8 +51,9 @@ Repository = "https://github.com/djouallah/duckrun"
 Issues = "https://github.com/djouallah/duckrun/issues"
 
 [tool.setuptools.packages.find]
-# dbt uses PEP 420 namespace packages under dbt/adapters and dbt/include.
-include = ["dbt", "dbt.*"]
+# dbt uses PEP 420 namespace packages under dbt/adapters and dbt/include. `duckrun` is the
+# top-level notebook/connection API (duckrun.connect) shipped in the same distribution.
+include = ["dbt", "dbt.*", "duckrun", "duckrun.*"]
 namespaces = true
 
 [tool.setuptools.package-data]
