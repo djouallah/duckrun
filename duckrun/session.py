@@ -9,12 +9,47 @@ It is storage-neutral — local path, ``s3://``, ``gs://``, ``az://``, OneLake `
 every storage concern (token → secret, table discovery, the Delta write path) is delegated to the
 ``dbt.adapters.duckrun`` modules that already handle all of them. This module is glue.
 """
+import re
 from typing import Dict, List, Optional
 
 import duckdb
 
 from dbt.adapters.duckrun import engine, remote, secret
-from . import auth, sqlwrite
+from . import auth
+
+
+# Statements that would WRITE to a table — rejected by the read-only conn.sql() with a pointer to
+# the Spark write API. INSERT/UPDATE/DELETE/MERGE against a read-only delta_scan view error in
+# DuckDB anyway; CREATE [OR REPLACE] TABLE … is the dangerous one — it silently makes an ephemeral
+# DuckDB-local table that never reaches Delta — so it must be caught BEFORE executing. CREATE
+# TEMP/TEMPORARY TABLE and CREATE VIEW are DuckDB-local scratch by design and pass through.
+_WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
+_CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
+_CREATE_TEMP_RE = re.compile(r"^create\s+(or\s+replace\s+)?(temp|temporary)\b", re.IGNORECASE)
+
+
+def _strip_leading(query: str) -> str:
+    """Drop leading whitespace and ``--`` / ``/* */`` comments so the first keyword is visible."""
+    s = query
+    while True:
+        t = s.lstrip()
+        if t.startswith("--"):
+            nl = t.find("\n")
+            s = "" if nl == -1 else t[nl + 1:]
+        elif t.startswith("/*"):
+            end = t.find("*/")
+            s = "" if end == -1 else t[end + 2:]
+        else:
+            return t
+
+
+def _is_delta_write(query: str) -> bool:
+    """True if ``query`` is a statement that would write a Delta table (and so must go through the
+    Spark write API instead). CREATE TEMP/TEMPORARY TABLE and CREATE VIEW are NOT writes."""
+    s = _strip_leading(query)
+    if _WRITE_KEYWORD_RE.match(s):
+        return True
+    return bool(_CREATE_TABLE_RE.match(s)) and not _CREATE_TEMP_RE.match(s)
 
 
 def _qid(name: str) -> str:
@@ -169,16 +204,35 @@ class DuckSession:
     # ---- Spark-shaped surface --------------------------------------------------------------
 
     def sql(self, query: str) -> "DataFrame":
-        # CREATE TABLE AS / INSERT / DELETE / UPDATE are routed to Delta (delta_scan views are
-        # read-only); everything else passes straight through to DuckDB unchanged.
-        kind = sqlwrite.classify(query)
-        if kind is not None:
-            return sqlwrite.execute(self, kind, query)
+        """Run a **read** query and return a :class:`DataFrame`. ``conn.sql()`` is read-only: the
+        tables are registered as read-only ``delta_scan`` views, so it passes straight through to
+        DuckDB. Time-travel works for free — ``conn.sql("from delta_scan('path', version => 0)")``.
+
+        Writes go through the Spark-shaped surface, not SQL: ``df.write.saveAsTable`` (create /
+        append) and the ``conn.delta_table(name)`` handle —
+        ``.merge(...)`` / ``.delete()`` / ``.update()`` / ``.replaceWhere()``. A Delta-write
+        statement is rejected up front (not executed) — a bare DuckDB ``CREATE TABLE … AS`` would
+        otherwise silently make an ephemeral DuckDB-local table that never reaches Delta.
+        ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL still pass through.
+        """
+        if _is_delta_write(query):
+            raise ValueError(
+                "conn.sql() is read-only (Delta tables are registered as read-only views). "
+                "Use the Spark write API: df.write.saveAsTable(...) to create/append, or "
+                "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
+            )
         return DataFrame(self.con.sql(query), self)
 
     def table(self, name: str) -> "DataFrame":
         schema, table = self.resolve(name)
         return DataFrame(self.con.sql(f"SELECT * FROM {_qid(schema)}.{_qid(table)}"), self)
+
+    def delta_table(self, name: str) -> "DeltaTable":
+        """A Spark ``DeltaTable`` handle for an existing table: ``.merge(...)``, ``.delete()``,
+        ``.update()``, ``.replaceWhere()``, ``.version()``. (Reads still go through ``conn.sql`` /
+        ``conn.table``; this is the write/mutate side.) Shortcut for ``DeltaTable.forName(conn, name)``."""
+        from .delta_table import DeltaTable  # local import: delta_table imports nothing from session
+        return DeltaTable.forName(self, name)
 
     @property
     def read(self) -> "DataFrameReader":

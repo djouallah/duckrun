@@ -86,16 +86,22 @@ def test_overwrite_schema_replaces(wh):
     assert conn.table("os").count() == 1
 
 
-def test_sql_writes_persist_to_delta(wh):
-    # CREATE TABLE AS / INSERT / UPDATE / DELETE via conn.sql() must land as real Delta, visible
-    # to a brand-new connection (not just DuckDB-native tables in this session).
+def test_spark_writes_persist_to_delta(wh):
+    # create/append via saveAsTable and mutate via the DeltaTable handle must land as real Delta,
+    # visible to a brand-new connection (not DuckDB-native tables in this session). conn.sql() is
+    # read-only — these writes go through the Spark API.
     conn = duckrun.connect(wh, schema="dbo")
-    conn.sql("CREATE TABLE evt AS SELECT 1 id, 'A' grp")
-    conn.sql("INSERT INTO evt VALUES (2, 'B')")
-    conn.sql("INSERT INTO evt (grp, id) SELECT 'C', 3")   # column list reordered
-    conn.sql("UPDATE evt SET grp = 'Z' WHERE id = 1")
-    conn.sql("DELETE FROM evt WHERE id = 2")
+    conn.sql("select 1 id, 'A' grp").write.mode("overwrite").saveAsTable("evt")
+    conn.sql("select 2 id, 'B' grp").write.mode("append").saveAsTable("evt")
+    conn.sql("select 3 id, 'C' grp").write.mode("append").saveAsTable("evt")
+    evt = conn.delta_table("evt")
+    evt.update(set={"grp": "'Z'"}, where="id = 1")
+    evt.delete("id = 2")
     assert sorted(conn.sql("select * from evt").collect()) == [(1, "Z"), (3, "C")]
+
+    # a write statement through conn.sql() is rejected (read-only) — no silent DuckDB-local table
+    with pytest.raises(ValueError, match="read-only"):
+        conn.sql("CREATE TABLE evt2 AS SELECT 1 id")
 
     # real persistence: a fresh connection reads it off the store
     fresh = duckrun.connect(wh, schema="dbo")

@@ -147,7 +147,8 @@ class Plugin(BasePlugin):
         # under --full-refresh, since dbt marks each microbatch batch full_refresh in that case).
         if incremental and strategy == "microbatch":
             self._store_microbatch(
-                path, cur, name, cfg, storage_options, exists, full_refresh
+                path, cur, name, cfg, storage_options, exists, full_refresh,
+                read_version=cfg.get("read_version"),
             )
             return
 
@@ -204,6 +205,9 @@ class Plugin(BasePlugin):
                 merge_schema=evolve_schema,
                 max_spill_size=cfg.get("merge_max_spill_size"),
                 streamed_exec=(False if sx is None else bool(sx)),
+                # Pin the merge target to the version the model read (vB, captured before it read
+                # {{ this }}), so OCC validates (vB, HEAD] — the read and the commit are one snapshot.
+                read_version=cfg.get("read_version"),
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,
             )
@@ -237,11 +241,13 @@ class Plugin(BasePlugin):
             )
 
     def _store_microbatch(
-        self, path, cur, name, cfg, storage_options, exists, full_refresh
+        self, path, cur, name, cfg, storage_options, exists, full_refresh,
+        read_version=None,
     ) -> None:
         """dbt ``incremental_strategy='microbatch'``: for the current batch window
-        ``[event_time_start, event_time_end)``, delete the rows already in that window and
-        insert the batch's rows — an idempotent delete+insert keyed on the event-time range.
+        ``[event_time_start, event_time_end)``, atomically replace the rows already in that window
+        with the batch's rows (Spark ``replaceWhere`` — a single Delta commit), keyed on the
+        event-time range. ``read_version`` (the model's ``vB``) pins/fences that commit.
 
         dbt drives this by re-running the model once per batch with bounds it computes from
         ``event_time`` / ``batch_size`` / ``begin`` / ``lookback`` and passes down via the
@@ -294,9 +300,10 @@ class Plugin(BasePlugin):
                 compaction_threshold=self._compaction_threshold,
             )
         else:
-            engine.delete_insert_window(
+            engine.replace_window(
                 path, window,
                 column=event_time, start=start, end=end,
+                read_version=read_version,
                 partition_by=partition_by,
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,

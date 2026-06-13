@@ -504,6 +504,12 @@ def delta_columns(path: str, storage_options: Optional[Dict[str, str]] = None) -
     return [f.name for f in _delta_table(path, storage_options).schema().fields]
 
 
+def table_version(path: str, storage_options: Optional[Dict[str, str]] = None) -> int:
+    """Current (HEAD) Delta version of the table at ``path``. The ``vB`` a caller captures before
+    reading a source, to pin a later merge/replace to the same snapshot (Spark MERGE semantics)."""
+    return _delta_table(path, storage_options).version()
+
+
 def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:
     """Threshold-gated upkeep shared by the append / merge / delete+insert paths: once the table
     has more than ``compaction_threshold`` files, compact small files, vacuum tombstoned old
@@ -622,38 +628,79 @@ def append_if_unchanged(
     _maintain(_delta_table(path, storage_options), compaction_threshold)
 
 
-def delete_insert_window(
+def replace_where(
+    path: str,
+    data,
+    predicate: str,
+    *,
+    read_version: Optional[int] = None,
+    partition_by: Optional[List[str]] = None,
+    storage_options: Optional[Dict[str, str]] = None,
+    compaction_threshold: int = 100,
+) -> None:
+    """Spark ``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
+    replace the rows matching ``predicate`` with ``data``. One commit, not a delete-then-append
+    pair — so there is no torn-read window (a reader never sees the range emptied-but-not-refilled)
+    and no half-applied failure state.
+
+    ``predicate`` is a delta_rs/datafusion SQL expression. Keep it CAST-free: delta_rs can't
+    serialize a CAST expression back to a string ("Unable to convert expression to string").
+
+    When ``read_version`` is given, the overwrite is pinned to that snapshot and committed with
+    ``max_commit_retries=0`` (compare-and-swap): a concurrent writer that lands since ``vB`` fails
+    the commit loudly instead of silently interleaving. ``None`` keeps blind-HEAD behavior.
+    Maintenance always runs at a fresh HEAD afterward (never pinned)."""
+    args = build_write_deltalake_args(
+        path, data, "overwrite", partition_by=partition_by, storage_options=storage_options
+    )
+    args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
+    if read_version is not None:
+        # Pin to the read snapshot and disable rebasing, so a concurrent commit since vB fails this
+        # overwrite (CAS) instead of landing on top of it. storage_options live on the DeltaTable
+        # already, so drop the kwarg form (mirrors append_if_unchanged).
+        dt = _delta_table(path, storage_options)
+        dt.load_as_version(read_version)
+        args["table_or_uri"] = dt
+        args.pop("storage_options", None)
+        args["commit_properties"] = CommitProperties(max_commit_retries=0)
+    try:
+        write_deltalake(**args)
+    except CommitFailedError as e:
+        raise CommitFailedError(
+            f"replaceWhere: table '{path}' changed since version {read_version} "
+            f"(a concurrent write committed); replace refused. Re-run."
+        ) from e
+
+    # Maintenance ALWAYS at a fresh HEAD — never the pinned snapshot (a stale file list would
+    # compact/vacuum files live versions still reference and corrupt the table).
+    _maintain(_delta_table(path, storage_options), compaction_threshold)
+
+
+def replace_window(
     path: str,
     data,
     *,
     column: str,
     start: str,
     end: str,
+    read_version: Optional[int] = None,
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
 ) -> None:
-    """Microbatch delete+insert for one batch window: delete the rows already in
-    ``[start, end)`` on ``column``, then append ``data`` (the batch's rows).
-
-    This is the Delta-native equivalent of dbt's microbatch ``delete from target where
-    event_time in window; insert ...``. ``start``/``end`` are naive ``YYYY-MM-DD HH:MM:SS``
-    strings (UTC batch bounds from dbt). The column is cast to TIMESTAMP so the same
-    predicate works whether ``event_time`` is a DATE or a TIMESTAMP.
-    """
-    dt = _delta_table(path, storage_options)
-    # delta_rs parses this with datafusion and coerces the string literal to the column's
-    # type. Keep it CAST-free: delta_rs can't serialize a CAST expression back to a string
-    # ("Unable to convert expression to string"), which a wrapping CAST would trigger.
+    """Microbatch window replace: atomically replace the rows in ``[start, end)`` on ``column``
+    with ``data`` (the batch's rows) — the Delta-native equivalent of dbt's microbatch "delete the
+    window, insert the batch", as ONE atomic commit (Spark ``replaceWhere``). ``start``/``end`` are
+    naive ``YYYY-MM-DD HH:MM:SS`` strings (UTC batch bounds from dbt). Delegates to
+    :func:`replace_where` with the window predicate; ``read_version`` pins/fences the commit."""
+    # CAST-free window predicate — see replace_where. delta_rs coerces the string literals to the
+    # column's type, so this works whether event_time is a DATE or a TIMESTAMP.
     predicate = f"{column} >= '{start}' AND {column} < '{end}'"
-    dt.delete(predicate)
-
-    args = build_write_deltalake_args(
-        path, data, "append", partition_by=partition_by, storage_options=storage_options
+    replace_where(
+        path, data, predicate,
+        read_version=read_version, partition_by=partition_by,
+        storage_options=storage_options, compaction_threshold=compaction_threshold,
     )
-    write_deltalake(**args)
-
-    _maintain(_delta_table(path, storage_options), compaction_threshold)
 
 
 def delete_rows(
@@ -701,6 +748,8 @@ def merge_delta(
     merge_schema: bool = False,
     max_spill_size: Optional[int] = None,
     streamed_exec: bool = False,
+    read_version: Optional[int] = None,
+    delete_unmatched_by_source=None,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
 ) -> None:
@@ -726,6 +775,12 @@ def merge_delta(
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
       join to disk instead of OOMing. None -> default to ~40% of RAM (_default_merge_spill_size);
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
+    - read_version: pin the merge TARGET to this Delta version (the model's ``vB``), instead of
+      opening HEAD. delta_rs then validates OCC over ``(vB, HEAD]`` — the exact window the model's
+      pinned read of ``{{ this }}`` could not have seen — so the read and the commit share one
+      snapshot (Spark single-snapshot MERGE semantics). None opens HEAD (the prior behavior, still
+      safe-by-ordering). NOTE: only the merge target is pinned; the post-merge maintenance below
+      always reopens a fresh HEAD and must NEVER receive this version.
     - streamed_exec: delta_rs's flag for how it reads the source. Its default (True) STREAMS the
       source and so cannot compute source statistics, which means it cannot derive an early
       pruning predicate — it scans the *whole* target. We default it to False: collect the source
@@ -734,6 +789,10 @@ def merge_delta(
       collecting a small delta is cheap and the prune avoids a full-target scan. For a merge whose
       *source* is itself huge, pass streamed_exec=True (``merge_streamed_exec``) so it isn't
       materialized — at the cost of no pruning.
+    - delete_unmatched_by_source: Spark "WHEN NOT MATCHED BY SOURCE THEN DELETE" — also remove
+      target rows the source doesn't carry. True deletes every unmatched target row (full sync); a
+      string deletes only those matching that predicate; None (default, used by the dbt incremental
+      strategies) adds no such clause. Used by the connection-API ``df.merge`` full-sync option.
 
     After the merge, run the same threshold-gated maintenance the append/delete+insert paths
     use: when the file count exceeds ``compaction_threshold``, compact small files, vacuum
@@ -774,6 +833,10 @@ def merge_delta(
     )
 
     dt = _delta_table(path, storage_options)
+    # Pin the target to the snapshot the model read (vB) so OCC validates (vB, HEAD] — one snapshot
+    # for both the read and the commit. None leaves it at HEAD (prior safe-by-ordering behavior).
+    if read_version is not None:
+        dt.load_as_version(read_version)
     merger = dt.merge(
         source=data,
         predicate=predicate,
@@ -800,6 +863,12 @@ def merge_delta(
         else:
             merger = merger.when_matched_update_all(predicate=update_condition)
         merger = merger.when_not_matched_insert_all(predicate=insert_condition)
+    # Spark "WHEN NOT MATCHED BY SOURCE THEN DELETE": optionally remove target rows the source
+    # doesn't carry (full sync). True = all unmatched; a string = only those matching the predicate.
+    # Composes with both branches above; default None adds nothing (dbt incremental paths unaffected).
+    if delete_unmatched_by_source:
+        by_source_pred = delete_unmatched_by_source if isinstance(delete_unmatched_by_source, str) else None
+        merger = merger.when_not_matched_by_source_delete(predicate=by_source_pred)
     merger.execute()
 
     # Same threshold-gated maintenance as the append / delete+insert paths: a merged-on-every-run

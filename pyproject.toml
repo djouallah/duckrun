@@ -14,20 +14,19 @@ authors = [
 requires-python = ">=3.9"
 dependencies = [
     "dbt-duckdb>=1.8",
-    # Cap out the broken upstream Delta releases until they're fixed:
-    #  - duckdb 1.5.2+ bundles a duckdb-delta extension that fails to read a valid log with
-    #    "Generic delta kernel error: No files in log segment" (https://github.com/duckdb/
-    #    duckdb-delta/issues) — the read side (delta_scan); 1.5.1 is fine.
-    #  - deltalake 1.5.1+ has a matching delta-log regression — the write side; 1.5.0 is fine.
-    # The deltalake floor is 1.5.0 (not just a ceiling): 1.5.0 is the first release with
-    # MERGE disk-spill config (max_spill_size), which engine.merge_delta relies on to cap
-    # the merge's RAM and avoid OOM on large upserts. Combined with the <1.5.1 ceiling this
-    # pins exactly 1.5.0. Fabric preinstalls an older deltalake that satisfied the old floor,
-    # so this also forces the upgrade on `pip install duckrun` instead of needing a manual pin.
-    # Pinned to 1.5.1 (not a range): upgrading deltalake already forces a kernel restart,
-    # so we may as well move duckdb up to the newest version that still works with OneLake.
-    # 1.5.2+ is held back by the duckdb-delta read-side bug above.
-    "duckdb==1.5.1",
+    # TEMPORARY pin to a duckdb dev build — TODO: move to "==1.5.4" (or a range) once stable
+    # 1.5.4 ships (~end of month). 1.5.4.dev18 is the first build whose bundled duckdb-delta
+    # extension supports `delta_scan('...', version => N)` (duckdb-delta #312) — the version-pinned
+    # read this project now relies on to make the incremental read and the write commit resolve at
+    # ONE Delta snapshot (Spark single-snapshot MERGE parity; see the staging-read pin in
+    # _delta_core.sql and merge_delta's read_version). The earlier 1.5.2+ "No files in log segment"
+    # read regression is avoided by addressing OneLake tables via GUID (workspace_id/lakehouse_id)
+    # abfss paths, and is fixed upstream.
+    # deltalake floor stays 1.5.0 (not just a ceiling): 1.5.0 is the first release with MERGE
+    # disk-spill config (max_spill_size), which engine.merge_delta relies on to cap the merge's RAM
+    # and avoid OOM on large upserts; the matching <1.5.1 ceiling avoids the deltalake delta-log
+    # write-side regression, pinning exactly 1.5.0.
+    "duckdb==1.5.4.dev18",
     "deltalake>=1.5.0,<1.5.1",
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
     # API directly; requests is otherwise only a transitive dbt dependency.

@@ -15,6 +15,27 @@ import duckrun
 from duckrun import DeltaTable
 
 
+def _delta_scan_version_supported() -> bool:
+    """True if the installed duckdb-delta exposes `delta_scan(..., version => N)` (duckdb-delta
+    #312, ships with the 1.5.4 floor). Tests that pin a read version skip on older builds."""
+    import duckdb
+    con = duckdb.connect()
+    try:
+        con.execute("INSTALL delta; LOAD delta")
+        con.execute("SELECT * FROM delta_scan('__nope__', version => 0)")
+    except Exception as exc:  # noqa: BLE001
+        return 'named parameter "version"' not in str(exc)  # binder rejects the param → unsupported
+    finally:
+        con.close()
+    return True
+
+
+needs_version_param = pytest.mark.skipif(
+    not _delta_scan_version_supported(),
+    reason="installed duckdb-delta lacks delta_scan(version => N) (needs the 1.5.4 floor)",
+)
+
+
 @pytest.fixture
 def conn(tmp_path):
     """A connected local-fs session with a seed table `src` (dbo) and a second schema `other`."""
@@ -218,60 +239,65 @@ class TestDeltaTable:
             DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
                 .whenMatchedUpdateAll().execute()
 
-
-class TestSqlWrite:
-    """conn.sql() routes CREATE TABLE AS / INSERT / DELETE / UPDATE to Delta (delta_scan views
-    are read-only); everything else passes straight through to DuckDB."""
-
-    def test_ctas(self, conn):
-        conn.sql("CREATE TABLE w AS SELECT 1 a, 2 b")
-        assert conn.table("w").collect() == [(1, 2)]
-
-    def test_ctas_or_replace(self, conn):
-        conn.sql("CREATE TABLE w AS SELECT 1 a, 2 b")
-        conn.sql("CREATE OR REPLACE TABLE w AS SELECT 9 a")  # narrower schema, wholesale replace
-        assert conn.sql("select * from w").columns == ["a"]
-        assert conn.table("w").collect() == [(9,)]
-
-    def test_ctas_error_if_exists(self, conn):
-        with pytest.raises(ValueError):
-            conn.sql("CREATE TABLE src AS SELECT 1 a")  # src exists, plain CREATE refuses
-
-    def test_ctas_if_not_exists(self, conn):
-        conn.sql("CREATE TABLE w AS SELECT 1 a")
-        conn.sql("CREATE TABLE IF NOT EXISTS w AS SELECT 2 a")  # no-op, table kept
-        assert conn.table("w").collect() == [(1,)]
-
-    def test_insert(self, conn):
-        conn.sql("CREATE TABLE w AS SELECT 1 a, 2 b")
-        conn.sql("INSERT INTO w VALUES (3, 4)")
-        assert sorted(conn.table("w").collect()) == [(1, 2), (3, 4)]
-
-    def test_insert_with_column_list(self, conn):
-        conn.sql("CREATE TABLE w AS SELECT 1 a, 2 b")
-        conn.sql("INSERT INTO w (b, a) SELECT 30, 10")  # reordered to (a, b)
-        assert sorted(conn.table("w").collect()) == [(1, 2), (10, 30)]
-
-    def test_insert_missing_table_errors(self, conn):
-        with pytest.raises(ValueError):
-            conn.sql("INSERT INTO ghost VALUES (1)")
+    def test_version(self, conn):
+        self._seed(conn)  # one overwrite → version 0
+        assert DeltaTable.forName(conn, "dbo.m").version() == 0
 
     def test_delete(self, conn):
-        conn.sql("CREATE TABLE w AS SELECT * FROM (values (1),(2),(3)) t(a)")
-        conn.sql("DELETE FROM w WHERE a = 2")
-        assert sorted(conn.table("w").collect()) == [(1,), (3,)]
+        self._seed(conn)
+        DeltaTable.forName(conn, "dbo.m").delete("id = 2")
+        assert sorted(r[0] for r in conn.table("m").collect()) == [1, 3]
 
     def test_update(self, conn):
-        conn.sql("CREATE TABLE w AS SELECT 1 id, 10 n")
-        conn.sql("INSERT INTO w VALUES (2, 20)")
-        conn.sql("UPDATE w SET n = n + 1 WHERE id = 1")
-        assert dict(conn.sql("select id, n from w").collect()) == {1: 11, 2: 20}
+        self._seed(conn)
+        DeltaTable.forName(conn, "dbo.m").update(set={"val": "val + 1"}, where="id = 1")
+        assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
+
+    def test_replaceWhere(self, conn):
+        self._seed(conn)  # ids 1,2,3 all val=10
+        new = conn.sql("select * from (values (1,77),(2,77)) t(id, val)")
+        DeltaTable.forName(conn, "dbo.m").replaceWhere(new, "id < 3")
+        assert dict(conn.sql("select id, val from m").collect()) == {1: 77, 2: 77, 3: 10}
+
+    def test_merge_by_source_delete(self, conn):
+        # full sync: source carries ids {2,4}; matched updates, unmatched-by-source (1,3) deleted.
+        self._seed(conn)
+        src = conn.sql("select * from (values (2,99),(4,99)) t(id, val)")
+        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
+            .whenMatchedUpdateAll().whenNotMatchedInsertAll().whenNotMatchedBySourceDelete().execute()
+        assert dict(conn.sql("select id, val from m").collect()) == {2: 99, 4: 99}
+
+    def test_merge_is_pinned_by_default(self, conn):
+        # merge pins the target snapshot automatically — the caller passes nothing extra.
+        self._seed(conn)
+        src = conn.sql("select 1 id, 11 val")
+        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
+            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
+
+
+class TestSqlReadOnly:
+    """conn.sql() is read-only: reads (incl. version-pinned delta_scan) pass through; a write
+    statement raises with a pointer to the Spark write API."""
 
     def test_select_passthrough(self, conn):
-        # a plain read is untouched by the write router
         assert conn.sql("SELECT 1").fetchall() == [(1,)]
 
-    def test_multi_statement_rejected(self, conn):
-        # one write statement per call — a multi-statement string fails clearly, writes nothing
-        with pytest.raises(ValueError):
-            conn.sql("CREATE TABLE b AS SELECT 1; INSERT INTO b VALUES (2)")
+    @needs_version_param
+    def test_version_pinned_read(self, conn):
+        # write v0 then v1, then read v0 back via the passthrough — time travel for free.
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("tt")  # v0
+        conn.sql("select 2 a").write.mode("overwrite").saveAsTable("tt")  # v1
+        path = conn.table_path("dbo", "tt")
+        assert conn.sql(f"select a from delta_scan('{path}', version => 0)").fetchone()[0] == 1
+
+    @pytest.mark.parametrize("stmt", [
+        "CREATE TABLE w AS SELECT 1 a",
+        "INSERT INTO src VALUES (9, 'z')",
+        "DELETE FROM src WHERE id = 1",
+        "UPDATE src SET name = 'z'",
+        "MERGE INTO src USING src s ON src.id = s.id WHEN MATCHED THEN DELETE",
+    ])
+    def test_write_statement_rejected(self, conn, stmt):
+        with pytest.raises(ValueError, match="read-only"):
+            conn.sql(stmt)

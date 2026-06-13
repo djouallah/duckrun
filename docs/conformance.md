@@ -71,8 +71,8 @@ Every still-failing test in the card below falls into one of three categories:
 | `on_schema_change='fail'` | ✅ | raises if the model's columns drift from the table |
 | `partition_by` | ✅ | Delta partition columns |
 | `on_schema_change='sync_all_columns'` | ⚠️ | **add-only** — delta_rs can't drop columns |
-| `delete+insert` | ⚠️ | mapped to `merge` (not exact delete+insert semantics) |
-| `microbatch` strategy | ✅ | per-batch delete+insert on the `event_time` window (delta_rs delete + append) |
+| `delete+insert` | ✅ | intentional Spark-faithful **atomic MERGE**, snapshot-pinned (delta_rs has no two-commit delete+insert) |
+| `microbatch` strategy | ✅ | per-batch **atomic replaceWhere** on the `event_time` window (single Delta commit, snapshot-pinned) |
 | `merge_clauses` / `merge_update_set_expressions` / `merge_on_using_columns` | ❌ | dbt-duckdb-specific, no delta_rs equivalent — **rejected** with a clear error, never silently ignored |
 | model contracts — column name/type/count | ✅ | enforced via dbt's `assert_columns_equivalent` preflight before the write |
 | constraints — `not null` | ✅ | pre-write guard on the staged rows; a null fails the run and leaves the prior table intact |

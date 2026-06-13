@@ -61,10 +61,17 @@
        it exists, but the Delta table can't be opened at store time → a transient storage error,
        NOT a real absence) and refuse to overwrite an incremental dataset. --#}
   {%- set dbt_believes_exists = adapter.delta_table_exists(location) -%}
+  {#-- Pin the self-reference view to the captured `vB` (delta_scan version => N, requires the
+       duckdb-delta version param). This makes the model's `is_incremental()` read of `{{ this }}`
+       resolve at EXACTLY the version the write commit will validate OCC against — one snapshot for
+       the read and the commit (Spark single-snapshot MERGE semantics). Applies to every incremental
+       strategy (merge / microbatch / safeappend), all of which self-reference `{{ this }}`. When
+       read_version is None (brand-new table) there is nothing to pin — scan HEAD. --#}
   {%- if dbt_believes_exists -%}
     {%- do adapter.create_schema(target_relation) -%}
+    {%- set _loc_sql = location | replace("'", "''") -%}
     {% call statement('register_this') -%}
-      create or replace view {{ target_relation }} as select * from delta_scan('{{ location | replace("'", "''") }}')
+      create or replace view {{ target_relation }} as select * from delta_scan('{{ _loc_sql }}'{% if read_version is not none %}, version => {{ read_version }}{% endif %})
     {%- endcall %}
   {%- endif -%}
 

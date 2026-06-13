@@ -262,15 +262,28 @@ reclaimed — duckrun favors read-safety over immediate disk savings.
 ## Connection API (notebook)
 
 Besides the dbt adapter, duckrun ships a storage-neutral, PySpark-shaped `duckrun.connect()` for
-interactive/notebook use (local, S3, GCS, ADLS, OneLake): `conn.sql(...)` — with `CREATE TABLE AS`,
-`INSERT`, `UPDATE`, and `DELETE` routed to Delta — a `DataFrame` with `.write…saveAsTable()`,
-`conn.read`, `conn.catalog`, and a `DeltaTable.merge(...)` upsert builder.
+interactive/notebook use (local, S3, GCS, ADLS, OneLake). `conn.sql(...)` is **read-only** (including
+time travel — `delta_scan('…', version => N)`); writes go through the Spark surface: a `DataFrame`
+with `.write…saveAsTable()` (create / append) and a `DeltaTable` handle
+(`conn.delta_table(name)` / `DeltaTable.forName`) with `.merge(...)`, `.delete()`, `.update()`,
+`.replaceWhere()`, `.version()`, plus `conn.read` and `conn.catalog`.
+
+`merge` is **snapshot-pinned by default** — Spark's single-snapshot MERGE, with no extra arguments:
+the target version is captured and the commit is validated against it, so a concurrent writer fails
+the commit loudly instead of silently interleaving.
 
 ```python
 import duckrun
 conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")
-conn.sql("CREATE TABLE orders_copy AS SELECT * FROM orders")
+conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
 conn.table("orders_copy").show()
+
+conn.delta_table("orders").delete("region = 'eu'")   # delete / update / replaceWhere
+
+# upsert — pinned automatically, nothing to pass
+src = conn.sql("select * from updates")
+conn.delta_table("orders").merge(src, "target.id = source.id") \
+    .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 ```
 
 See [docs/connection-api.md](docs/connection-api.md) for the full per-method scorecard.

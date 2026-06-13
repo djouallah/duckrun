@@ -24,8 +24,8 @@ GROUPS = [
     ("TestDataFrame", "DataFrame"),
     ("TestDataFrameReader", "DataFrameReader (read)"),
     ("TestDataFrameWriter", "DataFrameWriter (write)"),
-    ("TestDeltaTable", "DeltaTable (merge / upsert)"),
-    ("TestSqlWrite", "SQL writes → Delta"),
+    ("TestDeltaTable", "DeltaTable (merge / delete / update / replaceWhere)"),
+    ("TestSqlReadOnly", "sql() — read-only"),
 ]
 _EMOJI = {"passed": "✅", "failed": "❌", "error": "💥", "skipped": "⏭️"}
 
@@ -33,7 +33,7 @@ _EMOJI = {"passed": "✅", "failed": "❌", "error": "💥", "skipped": "⏭️"
 SHORT = {
     "TestSession": "DuckSession", "TestCatalog": "Catalog", "TestDataFrame": "DataFrame",
     "TestDataFrameReader": "DataFrameReader", "TestDataFrameWriter": "DataFrameWriter",
-    "TestDeltaTable": "DeltaTable", "TestSqlWrite": "sql()",
+    "TestDeltaTable": "DeltaTable", "TestSqlReadOnly": "sql()",
 }
 
 # Which established API each method mirrors, so a reader can tell what's a real Spark/Delta method
@@ -45,7 +45,7 @@ _GROUP_API = {
     "TestDataFrameReader": "Spark",    # pyspark.sql.DataFrameReader
     "TestDataFrameWriter": "Spark",    # pyspark.sql.DataFrameWriter
     "TestDeltaTable": "Spark",         # delta.tables.DeltaTable — the Delta-on-Spark API (≈ Spark)
-    "TestSqlWrite": "Spark",           # spark.sql runs CREATE TABLE AS / INSERT / DELETE / UPDATE
+    "TestSqlReadOnly": "duckrun",      # read-only conn.sql + version-pinned read are duckrun behaviors
 }
 _METHOD_API = {
     ("TestSession", "sql"): "Spark", ("TestSession", "table"): "Spark",
@@ -63,20 +63,23 @@ def _api(group: str, method: str) -> str:
 def _label(test: str) -> str:
     """Map a test name to the actual API method it exercises, so the card lists *methods*, not
     test cases. e.g. test_mode_overwrite/append/ignore/error all exercise the one `mode()` method."""
+    test = test.split("[", 1)[0]  # drop a pytest parametrize suffix, e.g. foo[CASE] -> foo
     if test.startswith("mode_"):
         return "mode"
     if test.startswith("option_"):
         return "option"
-    if test.startswith("ctas"):
-        return "CREATE TABLE AS"
-    if test.startswith("insert"):
-        return "INSERT"
+    if test.startswith("merge"):  # merge_upsert / _update_columns / _insert_only / _by_source_delete / _read_version…
+        return "merge"
     if test in ("delete", "update"):
-        return test.upper()
+        return test
     if test == "select_passthrough":
         return "SELECT (passthrough)"
-    if test == "multi_statement_rejected":
-        return "multi-statement guard"
+    if test == "version_pinned_read":
+        return "version-pinned read"
+    if test == "write_statement_rejected":
+        return "read-only guard"
+    if test == "update_only_rejected":
+        return "merge"
     return {
         "format_load_delta": "format/load",
         "read_property": "read",

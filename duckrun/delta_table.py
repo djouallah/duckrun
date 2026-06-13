@@ -53,12 +53,18 @@ def _parse_condition(condition: str):
 
 
 class DeltaMergeBuilder:
-    def __init__(self, table: "DeltaTable", source, condition: str):
+    def __init__(self, table: "DeltaTable", source, condition: str,
+                 read_version: Optional[int] = None):
         self._table = table
         self._source = source  # DataFrame
         self._keys, self._predicates = _parse_condition(condition)
         self._matched = None       # None | ("all", cond) | ("cols", [cols], cond)
         self._not_matched = None   # None | ("all", cond)
+        self._by_source_delete = None  # None | True | predicate string
+        # Pin the target to this version so OCC validates (vB, HEAD]: pass the same vB you pinned
+        # the source read to (forName(...).version() → delta_scan('…', version => vB)) and source +
+        # target are ONE snapshot — exactly Spark's single-snapshot MERGE. None merges against HEAD.
+        self._read_version = read_version
 
     def whenMatchedUpdateAll(self, condition: Optional[str] = None) -> "DeltaMergeBuilder":
         self._matched = ("all", None, condition)
@@ -82,24 +88,34 @@ class DeltaMergeBuilder:
         self._not_matched = ("all", condition)
         return self
 
+    def whenNotMatchedBySourceDelete(self, condition: Optional[str] = None) -> "DeltaMergeBuilder":
+        """Spark "WHEN NOT MATCHED BY SOURCE THEN DELETE": delete target rows the source doesn't
+        carry. No ``condition`` = delete every unmatched target row (full sync); a predicate string
+        scopes the deletion."""
+        self._by_source_delete = condition if condition is not None else True
+        return self
+
     def execute(self) -> None:
-        if self._matched is None and self._not_matched is None:
-            raise ValueError("merge has no clauses; add whenMatchedUpdate*/whenNotMatchedInsertAll.")
-        if self._not_matched is None:
+        if self._matched is None and self._not_matched is None and not self._by_source_delete:
+            raise ValueError("merge has no clauses; add whenMatchedUpdate*/whenNotMatchedInsertAll/"
+                             "whenNotMatchedBySourceDelete.")
+        # delta-rs can express insert-only, upsert, and (with) by-source-delete in any combination;
+        # only a bare update-with-no-insert-and-no-delete is the unsupported degenerate case.
+        if self._not_matched is None and self._matched is not None and not self._by_source_delete:
             raise ValueError(
-                "update-only merge (no whenNotMatchedInsertAll) is not supported in v1; "
-                "add .whenNotMatchedInsertAll() for an upsert, or omit the matched clause for "
-                "insert-only."
+                "update-only merge (no whenNotMatchedInsertAll) is not supported; "
+                "add .whenNotMatchedInsertAll() for an upsert, .whenNotMatchedBySourceDelete() for "
+                "a sync, or omit the matched clause for insert-only."
             )
 
-        insert_only = self._matched is None
+        insert_only = self._matched is None and self._not_matched is not None
         update_columns = None
         update_condition = None
-        if not insert_only:
+        if self._matched is not None:
             kind, cols, update_condition = self._matched
             if kind == "cols":
                 update_columns = cols
-        insert_condition = self._not_matched[1]
+        insert_condition = self._not_matched[1] if self._not_matched is not None else None
 
         engine.merge_delta(
             self._table.path,
@@ -110,6 +126,8 @@ class DeltaMergeBuilder:
             predicates=self._predicates or None,
             update_condition=update_condition,
             insert_condition=insert_condition,
+            delete_unmatched_by_source=self._by_source_delete,
+            read_version=self._read_version,
             storage_options=self._table.storage_options,
             compaction_threshold=self._table.compaction_threshold,
         )
@@ -138,7 +156,44 @@ class DeltaTable:
         return cls(session, path)
 
     def merge(self, source, condition: str) -> DeltaMergeBuilder:
-        return DeltaMergeBuilder(self, source, condition)
+        """Begin a Spark-style merge of ``source`` into this table on ``condition``.
+
+        The merge is snapshot-pinned automatically: the table version is captured now and the
+        commit validates OCC against it, so a concurrent writer fails the commit loudly instead of
+        silently interleaving (Spark single-snapshot MERGE). Nothing for the caller to pass."""
+        return DeltaMergeBuilder(self, source, condition,
+                                 read_version=engine.table_version(self.path, self.storage_options))
+
+    def version(self) -> int:
+        """Current Delta version of the table (Spark ``DeltaTable`` history head)."""
+        return engine.table_version(self.path, self.storage_options)
+
+    def delete(self, predicate: Optional[str] = None) -> None:
+        """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
+        when ``predicate`` is None. Spark ``DeltaTable.delete``."""
+        engine.delete_rows(self.path, predicate, storage_options=self.storage_options,
+                           compaction_threshold=self.compaction_threshold)
+        self._refresh_view()
+
+    def update(self, set: Dict[str, str], where: Optional[str] = None) -> None:
+        """Set ``{column: expression}`` for rows matching ``where`` (delta_rs/datafusion SQL), or
+        every row when ``where`` is None. Spark ``DeltaTable.update``."""
+        if not set:
+            raise ValueError("update() requires a non-empty 'set' mapping of {column: expression}.")
+        engine.update_rows(self.path, set, where, storage_options=self.storage_options,
+                           compaction_threshold=self.compaction_threshold)
+        self._refresh_view()
+
+    def replaceWhere(self, source, predicate: str) -> None:
+        """Atomically replace the rows matching ``predicate`` with ``source`` (a DataFrame) — a
+        single Delta commit (Spark ``replaceWhere`` / ``INSERT OVERWRITE``). Snapshot-fenced
+        automatically: a concurrent writer since the call fails the commit loudly."""
+        rel = getattr(source, "relation", source)
+        engine.replace_where(self.path, rel, predicate,
+                             read_version=engine.table_version(self.path, self.storage_options),
+                             storage_options=self.storage_options,
+                             compaction_threshold=self.compaction_threshold)
+        self._refresh_view()
 
     def _refresh_view(self):
         # Only a forName() table maps to a registered view; forPath() has no name to refresh.

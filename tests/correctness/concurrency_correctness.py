@@ -235,8 +235,8 @@ def prebind_display(rows):
 # -------------------------------------------------------------- D. DELETE / UPDATE snapshot safety
 
 def mutate_run(op: str, concurrent: bool) -> dict:
-    """A connection-API ``conn.sql('DELETE …'/'UPDATE …')`` (engine.delete_rows / update_rows)
-    is a genuinely conflicting Delta operation, so — exactly like MERGE — delta-rs OCC fails it
+    """A connection-API ``conn.delta_table(t).delete(…)/.update(…)`` (engine.delete_rows /
+    update_rows) is a genuinely conflicting Delta operation, so — exactly like MERGE — delta-rs OCC fails it
     with CommitFailedError when a foreign commit changed the same rows after its snapshot was
     opened. No max_commit_retries hack (that was only needed for non-conflicting appends): the
     conflict detection is native. With no concurrent writer it simply commits."""
