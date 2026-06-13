@@ -476,74 +476,31 @@ The card below — every public method with a ✅ — is regenerated on every pu
 └───────────────────────────────────────┘
 ```
 
-### DuckSession — connect & query — 9/9
+### Spark / Delta-on-Spark API — 33/33 ✅
 
-| Method | Result |
-| --- | :-: |
-| `connect` | ✅ |
-| `sql` | ✅ |
-| `table` | ✅ |
-| `read_property` | ✅ |
-| `catalog_property` | ✅ |
-| `refresh` | ✅ |
-| `connection` | ✅ |
-| `table_path` | ✅ |
-| `show_tables` | ✅ |
+> Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.
 
-### Catalog (Spark catalog) — 4/4
+| Surface | Methods | Pass |
+| --- | --- | :-: |
+| `DuckSession` | `sql`, `table`, `read_property`, `catalog_property`, `show_tables` | 5/5 ✅ |
+| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase` | 4/4 ✅ |
+| `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas` | 5/5 ✅ |
+| `DataFrameReader` | `format_load_delta`, `table`, `parquet`, `csv` | 4/4 ✅ |
+| `DataFrameWriter` | `saveAsTable`, `mode_overwrite`, `mode_append`, `mode_ignore`, `mode_error`, `option_mergeSchema`, `option_overwriteSchema`, `partitionBy`, `format` | 9/9 ✅ |
+| `DeltaTable` | `forName`, `forPath`, `merge_upsert`, `merge_update_columns`, `merge_insert_only`, `update_only_rejected` | 6/6 ✅ |
 
-| Method | Result |
-| --- | :-: |
-| `listTables` | ✅ |
-| `listDatabases` | ✅ |
-| `currentDatabase` | ✅ |
-| `setCurrentDatabase` | ✅ |
+### duckrun-specific helpers — 6/6 ✅
 
-### DataFrame — 6/6
+> Conveniences with no Spark equivalent (session plumbing + two shortcuts).
 
-| Method | Result |
-| --- | :-: |
-| `collect` | ✅ |
-| `count` | ✅ |
-| `columns` | ✅ |
-| `show` | ✅ |
-| `toPandas` | ✅ |
-| `relation_passthrough` | ✅ |
-
-### DataFrameReader (read) — 5/5
-
-| Method | Result |
-| --- | :-: |
-| `format_load_delta` | ✅ |
-| `delta` | ✅ |
-| `table` | ✅ |
-| `parquet` | ✅ |
-| `csv` | ✅ |
-
-### DataFrameWriter (write) — 9/9
-
-| Method | Result |
-| --- | :-: |
-| `saveAsTable` | ✅ |
-| `mode_overwrite` | ✅ |
-| `mode_append` | ✅ |
-| `mode_ignore` | ✅ |
-| `mode_error` | ✅ |
-| `option_mergeSchema` | ✅ |
-| `option_overwriteSchema` | ✅ |
-| `partitionBy` | ✅ |
-| `format` | ✅ |
-
-### DeltaTable (merge / upsert) — 6/6
-
-| Method | Result |
-| --- | :-: |
-| `forName` | ✅ |
-| `forPath` | ✅ |
-| `merge_upsert` | ✅ |
-| `merge_update_columns` | ✅ |
-| `merge_insert_only` | ✅ |
-| `update_only_rejected` | ✅ |
+| Method | Surface | Pass |
+| --- | --- | :-: |
+| `connect` | `DuckSession` | ✅ |
+| `refresh` | `DuckSession` | ✅ |
+| `connection` | `DuckSession` | ✅ |
+| `table_path` | `DuckSession` | ✅ |
+| `relation_passthrough` | `DataFrame` | ✅ |
+| `delta` | `DataFrameReader` | ✅ |
 
 <!-- CONNECTION_API:END -->
 
