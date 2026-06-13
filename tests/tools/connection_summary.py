@@ -75,6 +75,8 @@ def _label(test: str) -> str:
         return test.upper()
     if test == "select_passthrough":
         return "SELECT (passthrough)"
+    if test == "multi_statement_rejected":
+        return "multi-statement guard"
     return {
         "format_load_delta": "format/load",
         "read_property": "read",

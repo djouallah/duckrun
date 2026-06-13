@@ -270,3 +270,8 @@ class TestSqlWrite:
     def test_select_passthrough(self, conn):
         # a plain read is untouched by the write router
         assert conn.sql("SELECT 1").fetchall() == [(1,)]
+
+    def test_multi_statement_rejected(self, conn):
+        # one write statement per call — a multi-statement string fails clearly, writes nothing
+        with pytest.raises(ValueError):
+            conn.sql("CREATE TABLE b AS SELECT 1; INSERT INTO b VALUES (2)")

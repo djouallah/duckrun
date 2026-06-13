@@ -80,6 +80,14 @@ def execute(session, kind: str, query: str):
     """Run a classified write statement against Delta and return an empty DataFrame (Spark parity:
     ``spark.sql`` returns an empty result for write statements)."""
     s = _strip_leading(query)
+    # One write statement per call. A multi-statement string would otherwise have its tail folded
+    # into the body we re-run, failing with a confusing parser/catalog error — reject it clearly
+    # instead. (DuckDB's own parser counts statements; cheap, runs only on the write path.)
+    if len(session.con.extract_statements(s)) > 1:
+        raise ValueError(
+            "conn.sql() routes one write statement at a time (CREATE TABLE AS / INSERT / "
+            "DELETE / UPDATE); got multiple. Run them in separate conn.sql() calls."
+        )
     {"ctas": _ctas, "insert": _insert, "delete": _delete, "update": _update}[kind](session, s)
     from .session import DataFrame  # local import avoids a session<->sqlwrite import cycle
     return DataFrame(session.con.sql("SELECT 1 WHERE false"), session)

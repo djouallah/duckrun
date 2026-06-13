@@ -25,12 +25,12 @@ The card below — every public method with a ✅ — is regenerated on every pu
 
 ```
 ┌───────────────────────────┐
-│ ✅ 43 passed   ❌ 0 failed  │
-│ 43 methods · 100% passing │
+│ ✅ 44 passed   ❌ 0 failed  │
+│ 44 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### Spark / Delta-on-Spark API — 37/37 ✅
+### Spark / Delta-on-Spark API — 38/38 ✅
 
 > Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.
 
@@ -42,7 +42,7 @@ The card below — every public method with a ✅ — is regenerated on every pu
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv` | 4/4 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `partitionBy`, `format` | 5/5 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `merge_upsert`, `merge_update_columns`, `merge_insert_only`, `update_only_rejected` | 6/6 ✅ |
-| `sql()` | `CREATE TABLE AS`, `INSERT`, `DELETE`, `UPDATE`, `SELECT (passthrough)` | 5/5 ✅ |
+| `sql()` | `CREATE TABLE AS`, `INSERT`, `DELETE`, `UPDATE`, `SELECT (passthrough)`, `multi-statement guard` | 6/6 ✅ |
 
 ### duckrun-specific helpers — 6/6 ✅
 
