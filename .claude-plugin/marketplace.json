@@ -1,0 +1,14 @@
+{
+  "name": "duckrun",
+  "owner": {
+    "name": "mim"
+  },
+  "description": "duckrun — a dbt adapter that runs SQL in DuckDB and materializes to Delta Lake. Skills for building dbt projects on it.",
+  "plugins": [
+    {
+      "name": "duckrun-projects",
+      "source": "./plugins/duckrun-projects",
+      "description": "How to build, configure, run, and debug dbt projects on the duckrun adapter (DuckDB executes model SQL, delta-rs writes Delta tables) — local or on S3/GCS/ADLS/OneLake (Microsoft Fabric)."
+    }
+  ]
+}

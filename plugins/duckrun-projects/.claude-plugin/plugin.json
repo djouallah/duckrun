@@ -1,0 +1,9 @@
+{
+  "name": "duckrun-projects",
+  "description": "How to build, configure, run, and debug dbt projects on the duckrun adapter (DuckDB executes model SQL, delta-rs writes Delta tables) — local or on S3/GCS/ADLS/OneLake (Microsoft Fabric).",
+  "author": {
+    "name": "mim",
+    "url": "https://github.com/djouallah/duckrun"
+  },
+  "homepage": "https://github.com/djouallah/duckrun"
+}

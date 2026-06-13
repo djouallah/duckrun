@@ -62,6 +62,10 @@ conformance.xml
 !integration_tests/**/*.csv
 !integration_tests/**/*.yml
 !integration_tests/**/*.json
+
+# Keep the Claude Code plugin marketplace manifests (the *.json rule above ignores them)
+!.claude-plugin/marketplace.json
+!plugins/**/.claude-plugin/plugin.json
 # ...except dbt's auto-generated local user file
 integration_tests/.user.yml
 
