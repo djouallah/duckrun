@@ -466,6 +466,85 @@ The card below — every public method with a ✅ — is regenerated on every pu
 [`tests/connection_api/test_method_matrix.py`](tests/connection_api/test_method_matrix.py).
 
 <!-- CONNECTION_API:START -->
+
+## duckrun connection API — method scorecard
+
+```
+┌──────────────────────────────────────────────────────┐
+│ ✅ 38 passed   ❌ 0 failed   💥 0 errors   ⏭️ 1 skipped │
+│ 39 methods · 97% passing                             │
+└──────────────────────────────────────────────────────┘
+```
+
+### DuckSession — connect & query — 9/9
+
+| Method | Result |
+| --- | :-: |
+| `connect` | ✅ |
+| `sql` | ✅ |
+| `table` | ✅ |
+| `read_property` | ✅ |
+| `catalog_property` | ✅ |
+| `refresh` | ✅ |
+| `connection` | ✅ |
+| `table_path` | ✅ |
+| `show_tables` | ✅ |
+
+### Catalog (Spark catalog) — 4/4
+
+| Method | Result |
+| --- | :-: |
+| `listTables` | ✅ |
+| `listDatabases` | ✅ |
+| `currentDatabase` | ✅ |
+| `setCurrentDatabase` | ✅ |
+
+### DataFrame — 5/6
+
+| Method | Result |
+| --- | :-: |
+| `collect` | ✅ |
+| `count` | ✅ |
+| `columns` | ✅ |
+| `show` | ✅ |
+| `toPandas` | ⏭️ |
+| `relation_passthrough` | ✅ |
+
+### DataFrameReader (read) — 5/5
+
+| Method | Result |
+| --- | :-: |
+| `format_load_delta` | ✅ |
+| `delta` | ✅ |
+| `table` | ✅ |
+| `parquet` | ✅ |
+| `csv` | ✅ |
+
+### DataFrameWriter (write) — 9/9
+
+| Method | Result |
+| --- | :-: |
+| `saveAsTable` | ✅ |
+| `mode_overwrite` | ✅ |
+| `mode_append` | ✅ |
+| `mode_ignore` | ✅ |
+| `mode_error` | ✅ |
+| `option_mergeSchema` | ✅ |
+| `option_overwriteSchema` | ✅ |
+| `partitionBy` | ✅ |
+| `format` | ✅ |
+
+### DeltaTable (merge / upsert) — 6/6
+
+| Method | Result |
+| --- | :-: |
+| `forName` | ✅ |
+| `forPath` | ✅ |
+| `merge_upsert` | ✅ |
+| `merge_update_columns` | ✅ |
+| `merge_insert_only` | ✅ |
+| `update_only_rejected` | ✅ |
+
 <!-- CONNECTION_API:END -->
 
 ## Building with an AI assistant
