@@ -1,15 +1,17 @@
 name: merge-spill
 
 # Rigorous incremental-MERGE smoke test on a big fact table: generate a large TPCH lineitem
-# (gate runs SF=20, ~120M rows) as the target Delta table, then merge several incremental batches
+# (gate runs SF=10, ~60M rows) as the target Delta table, then merge several incremental batches
 # back into it (mixed upsert, insert-only, update-only, idempotent), covering both UPDATE (matched)
 # and INSERT (key-shifted) branches, plus an append / safeappend / overwrite of the same batch for
 # comparison — the cheap streaming write paths next to the MERGE. No artificial
 # memory cgroup — the question is whether duckrun completes on the runner's real 16 GB RAM with its
 # shipping defaults on (per-merge DuckDB memory_limit + delta_rs merge spill cap + streamed_exec=
-# False so the merge prunes the target via source stats instead of scanning all ~120M rows). SF=20
-# is ~the size of the runner's RAM and only fits *because* of that pruning — it's the real stress
-# test. Runs against the pinned deltalake 1.5.0 (1.6.0's merge is broken at scale).
+# False so the merge prunes the target via source stats instead of scanning the whole target). SF=10
+# (~60M rows) is the largest fact that completes on the runner: SF=20 (~120M) builds the base fine
+# but OOM-kills the runner *during the merge* (the 1% random sample touches every target file, so
+# the merge rewrites ~the whole table and the delta_rs pool + DuckDB exceed 16 GB). Runs against the
+# pinned deltalake 1.5.0 (1.6.0's merge is broken at scale).
 #
 # Expensive (~10 min) and heavy (needs the whole runner's RAM + the big disk), so it never runs on
 # push/PR — a release is the main thing that should pay this cost. The publish workflow calls it
@@ -22,16 +24,16 @@ on:
   workflow_dispatch:
     inputs:
       sf:
-        description: "TPCH scale factor for lineitem (release gate uses 20 ≈ 120M rows)"
+        description: "TPCH scale factor for lineitem (release gate uses 10 ≈ 60M rows; SF=20 OOMs the merge)"
         required: false
-        default: "20"
+        default: "10"
 
 # Needed so the release run can commit the rendered scorecard back to README.md on main.
 permissions:
   contents: write
 
-# Serialize: never run two SF=20 merge-spill jobs at once (each needs the whole runner's RAM and
-# the big disk). Static group so concurrent release tags queue rather than race.
+# Serialize: never run two merge-spill jobs at once (each needs the whole runner's RAM and the big
+# disk). Static group so concurrent release tags queue rather than race.
 concurrency:
   group: merge-spill
   cancel-in-progress: false
@@ -40,7 +42,7 @@ jobs:
   merge-spill:
     runs-on: ubuntu-latest
     env:
-      SF: "${{ inputs.sf || '20' }}"   # release gate uses 20; a manual dispatch can pick another
+      SF: "${{ inputs.sf || '10' }}"   # release gate uses 10; a manual dispatch can pick another
       DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4
