@@ -5,7 +5,7 @@ name: conformance
 # number of standard tests are *expected* not to pass — what must not happen is a test that passes
 # on main starting to fail. The "passing on main" set lives in tests/conformance/passing_baseline.txt
 # and is auto-maintained here:
-#   - on every PR:   run the suite, fail iff a baseline test regressed (tools/conformance_baseline.py)
+#   - on every PR:   run the suite, fail iff a baseline test regressed (tests/tools/conformance_baseline.py)
 #   - on push main:  run the suite, refresh the baseline + render the card into README, commit both
 # It also publishes the at-a-glance pass/fail card to the job summary every run.
 
@@ -84,7 +84,7 @@ jobs:
 
       - name: Render conformance card
         if: always() && steps.changes.outputs.code == 'true'
-        run: python tools/conformance_summary.py conformance.xml > conformance_card.md
+        run: python tests/tools/conformance_summary.py conformance.xml > conformance_card.md
 
       - name: Publish pass/fail summary
         if: always() && steps.changes.outputs.code == 'true'
@@ -95,7 +95,7 @@ jobs:
       # until the baseline file is committed. Runs on every code change — no continue-on-error.
       - name: Gate on conformance regressions (baseline diff)
         if: steps.changes.outputs.code == 'true'
-        run: python tools/conformance_baseline.py check tests/conformance/passing_baseline.txt conformance.xml
+        run: python tests/tools/conformance_baseline.py check tests/conformance/passing_baseline.txt conformance.xml
 
       # On push to main: this run IS the latest state of main, so refresh the baseline + render the
       # card into README and commit both. That's what keeps the README card always reflecting main.
@@ -104,8 +104,8 @@ jobs:
         if: always() && steps.changes.outputs.code == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
-          python tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml
-          python tools/inject_readme.py README.md conformance_card.md CONFORMANCE
+          python tests/tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml
+          python tests/tools/inject_readme.py README.md conformance_card.md CONFORMANCE
           if git diff --quiet -- README.md tests/conformance/passing_baseline.txt; then
             echo "Conformance card + baseline unchanged."
             exit 0

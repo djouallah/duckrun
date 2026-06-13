@@ -19,7 +19,7 @@ shipping defaults — ``preserve_insertion_order=false`` (engine.configure_duckd
 per-merge DuckDB ``memory_limit`` (engine.set_merge_memory_limit) and the delta_rs merge spill
 cap, mirroring the dbt plugin's merge path.
 
-    python tools/merge_tpch_bench.py --dir /tmp/m --sf 20
+    python tests/tools/merge_tpch_bench.py --dir /tmp/m --sf 20
 
 Each scenario materializes its source to parquet so counts are stable, then asserts the row
 count moved as expected and (where relevant) the merged values landed. Exit 0 = all passed.

@@ -21,7 +21,7 @@ plugin ecosystem — and gain one extra thing: a Delta-backed `table` / `increme
 materialization that writes real Delta tables.
 
 The design rationale — why delta_rs and not DuckDB's native Delta writer, why Delta and not
-Iceberg, why a separate adapter — lives in [design_document.md](design_document.md).
+Iceberg, why a separate adapter — lives in [docs/design_document.md](docs/design_document.md).
 
 ## How it fits together
 
@@ -179,7 +179,7 @@ attempt already loaded.
 
 First run (or `--full-refresh`, or a missing table) overwrites to create the table; `safeappend`
 applies on later runs. A real example is the AEMO
-[`fct_scada`](integration_tests/models/marts/fct_scada.sql) model — the project's largest table,
+[`fct_scada`](tests/integration_tests/models/marts/fct_scada.sql) model — the project's largest table,
 which loads only not-yet-seen files and so uses `safeappend` instead of an expensive merge.
 
 ### Config options (`table` / `incremental` / `delta`)
@@ -261,7 +261,7 @@ reclaimed — duckrun favors read-safety over immediate disk savings.
 
 ## Development
 
-The `integration_tests/` directory is a small dbt project exercised by CI
+The `tests/integration_tests/` directory is a small dbt project exercised by CI
 (`.github/workflows/integration.yml`): `dbt build` runs twice against a local Delta
 `./warehouse` — a seed, a `view`, a `table`, and an `incremental` model — where the
 second build exercises the incremental merge. Verified to run with **pyarrow not

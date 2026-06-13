@@ -65,7 +65,7 @@ jobs:
         # line here for the case where it dies before writing — i.e. OOM-killed (rc 137/139).
         run: |
           set -o pipefail
-          python tools/merge_tpch_bench.py --dir "$DIR" --sf "$SF" ; rc=$?
+          python tests/tools/merge_tpch_bench.py --dir "$DIR" --sf "$SF" ; rc=$?
           if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
             {
               echo "## 🔀 Incremental MERGE test — duckrun on Delta Lake"
@@ -87,7 +87,7 @@ jobs:
         run: |
           git fetch origin main
           git checkout -B main origin/main
-          python tools/inject_readme.py README.md merge_card.md MERGE
+          python tests/tools/inject_readme.py README.md merge_card.md MERGE
           if git diff --quiet -- README.md; then
             echo "README MERGE card unchanged."
             exit 0

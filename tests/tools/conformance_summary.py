@@ -4,7 +4,7 @@ summary: an at-a-glance totals box, a per-suite pass-rate table, and a collapsib
 everything that did not pass.
 
 Used by .github/workflows/conformance.yml, and handy locally:
-    python tools/conformance_summary.py tests/conformance/_report.xml
+    python tests/tools/conformance_summary.py tests/conformance/_report.xml
 """
 import sys
 import xml.etree.ElementTree as ET

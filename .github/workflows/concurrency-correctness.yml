@@ -10,7 +10,7 @@ name: concurrency-correctness
 #      load is still seen by the source (delta_scan resolves at pull time). This is the
 #      one window OCC cannot cover; this case pins the DuckDB behavior it depends on.
 # The job exits non-zero if any invariant is ever violated, so a regression blocks the PR.
-# Read the scorecard on the run's summary page. See repro/concurrency_correctness.py.
+# Read the scorecard on the run's summary page. See tests/repro/concurrency_correctness.py.
 on:
   # The most important gate: run on EVERY pull request, and on every direct push to main
   # (state lands on main directly here, so PR-only would miss those commits). We deliberately
@@ -69,4 +69,4 @@ jobs:
       - name: Prove concurrency correctness (merge snapshot safety + safeappend)
         if: steps.changes.outputs.code == 'true'
         # Exit 0 = both invariants hold (expected). Exit 1 = a case behaved unexpectedly.
-        run: python repro/concurrency_correctness.py
+        run: python tests/repro/concurrency_correctness.py

@@ -1,7 +1,7 @@
 """
 Inject a generated Markdown card into README.md between marker comments, in place.
 
-    python tools/inject_readme.py README.md card.md CONFORMANCE
+    python tests/tools/inject_readme.py README.md card.md CONFORMANCE
 
 replaces whatever sits between `<!-- CONFORMANCE:START -->` and `<!-- CONFORMANCE:END -->`
 with the contents of card.md. The markers themselves are preserved so the next run can find

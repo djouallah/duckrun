@@ -49,7 +49,7 @@ def write_baseline(path, passed):
         f.write("# regress (start failing / erroring / skipping / disappearing). This is a\n")
         f.write("# no-regression gate, not a 100%-green target — duckrun is Delta-only.\n")
         f.write("# Regenerate after an intentional coverage change with:\n")
-        f.write("#   python tools/conformance_gate.py --write conformance.xml \\\n")
+        f.write("#   python tests/tools/conformance_gate.py --write conformance.xml \\\n")
         f.write("#     tests/conformance/baseline_passing.txt\n")
         for key in sorted(passed):
             f.write(key + "\n")
