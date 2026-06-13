@@ -470,10 +470,10 @@ The card below — every public method with a ✅ — is regenerated on every pu
 ## duckrun connection API — method scorecard
 
 ```
-┌──────────────────────────────────────────────────────┐
-│ ✅ 38 passed   ❌ 0 failed   💥 0 errors   ⏭️ 1 skipped │
-│ 39 methods · 97% passing                             │
-└──────────────────────────────────────────────────────┘
+┌───────────────────────────────────────┐
+│ ✅ 39 passed   ❌ 0 failed   💥 0 errors │
+│ 39 methods · 100% passing             │
+└───────────────────────────────────────┘
 ```
 
 ### DuckSession — connect & query — 9/9
@@ -499,7 +499,7 @@ The card below — every public method with a ✅ — is regenerated on every pu
 | `currentDatabase` | ✅ |
 | `setCurrentDatabase` | ✅ |
 
-### DataFrame — 5/6
+### DataFrame — 6/6
 
 | Method | Result |
 | --- | :-: |
@@ -507,7 +507,7 @@ The card below — every public method with a ✅ — is regenerated on every pu
 | `count` | ✅ |
 | `columns` | ✅ |
 | `show` | ✅ |
-| `toPandas` | ⏭️ |
+| `toPandas` | ✅ |
 | `relation_passthrough` | ✅ |
 
 ### DataFrameReader (read) — 5/5
