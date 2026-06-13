@@ -1,12 +1,13 @@
 """Rigorous MERGE smoke/stress test on a big fact table — run entirely through the dbt path.
 
 Generate one big TPCH ``lineitem`` (default SF=20, ~120M rows) with ``tpchgen-cli`` as parquet. A dbt
-DAG then builds a CHAIN of Delta tables, each ``ref``-ing the previous (the first model reads the
-parquet ``source``; everything downstream is ``ref`` to Delta tables duckrun writes — no manual
-convert):
+DAG then builds a CHAIN of Delta tables: the first model STREAMS the parquet ``source`` into its Delta
+table, and everything downstream is ``ref`` to Delta tables duckrun writes — no manual convert, and
+nothing ever materializes the whole fact in RAM:
 
-  lineitem (source parquet -> Delta base)
-    -> mixed_upsert        (~1% sample: ~80% UPDATE existing keys + ~20% INSERT key-shifted)
+  generate_data (python: tpchgen -> lineitem parquet; returns a tiny marker)
+    -> mixed_upsert        (seeds by streaming the parquet source; then ~1% sample:
+                            ~80% UPDATE existing keys + ~20% INSERT key-shifted)
     -> insert_only         (~5% sample key-shifted past max, future shipdate -> all INSERT)
     -> update_only         (~5% sample existing keys, 100% match -> row count unchanged)
     -> idempotent_remerge  (re-merge unchanged rows -> nothing changes)
@@ -179,15 +180,18 @@ def run(args):
         shutil.rmtree(os.path.join(args.dir, "warehouse"))
 
     b = Bench(args)
-    # The lineitem python model generates the data with tpchgen-cli itself (in the DAG); the runner
-    # only tells it the scale factor and a scratch dir to write the parquet into.
+    # The generate_data python model runs tpchgen-cli (in the DAG) to write the lineitem PARQUET; the
+    # runner only tells it the scale factor and a scratch dir. It returns a tiny marker — the data is
+    # read by the `tpch.lineitem` parquet source (sources.yml), which mixed_upsert streams from. This
+    # keeps generation and the Delta write separate: nothing collects the whole fact into RAM.
     b.env["MERGE_SPILL_SF"] = str(args.sf)
     b.env["MERGE_SPILL_GEN"] = os.path.join(args.dir, "gen")
 
-    print(f"== build base: lineitem python model generates SF={args.sf} via tpchgen, writes Delta ==",
+    print(f"== generate base: generate_data runs tpchgen SF={args.sf} -> lineitem parquet source ==",
           flush=True)
-    b.dbt("lineitem")
-    target_rows = b.count("lineitem")
+    b.dbt("generate_data")
+    gen_glob = os.path.join(b.env["MERGE_SPILL_GEN"], "lineitem", "*.parquet").replace(os.sep, "/")
+    target_rows = b.q(f"SELECT count(*) FROM read_parquet('{gen_glob}')")
     eff = b.engine._effective_mem_limit_bytes()
     cap = b.engine._default_merge_spill_size()
     print(f"== base lineitem: {target_rows:,} rows | effective_mem="

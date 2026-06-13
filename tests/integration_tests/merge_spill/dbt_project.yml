@@ -10,12 +10,14 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-# The MERGE spill benchmark runs entirely through the dbt path: a single incremental model
-# (fct_lineitem) merges a batch source into a large TPCH lineitem target on (l_orderkey,
-# l_linenumber). The big target is created cheaply by convert_to_deltalake over tpchgen's parquet
-# (metadata only, no rewrite) AT this model's own table path, so dbt sees it as existing and every
-# run is an incremental merge — never a create. The merge spill cap (merge_max_spill_size) and the
-# read-pin (the materialization macro) are therefore exercised for real, end to end.
+# The MERGE spill benchmark runs entirely through the dbt path. generate_data (a python model) runs
+# tpchgen-cli to write a large TPCH lineitem as PARQUET and returns only a tiny marker — generation
+# is decoupled from any Delta write, so the ~120M-row fact never gets staged into RAM (the OOM that a
+# python model returning the data would cause: dbt stages python models as CREATE TABLE AS SELECT *).
+# A chain of incremental models then merges batches into the fact on (l_orderkey, l_linenumber): the
+# first (mixed_upsert) seeds by STREAMING the parquet `tpch.lineitem` source (a duckrun catalog view
+# over read_parquet); each downstream op refs the previous. The merge spill cap (merge_max_spill_size)
+# and the read-pin (the materialization macro) are therefore exercised for real, end to end.
 
 vars:
   # delta_rs merge spill cap forwarded into the model config; None -> duckrun's cgroup-aware default.

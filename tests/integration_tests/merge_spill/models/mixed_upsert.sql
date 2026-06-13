@@ -18,6 +18,8 @@
   select * exclude (_r) replace ((l_orderkey + (select m from mx)) as l_orderkey, -1.0::decimal(15,2) as l_quantity)
   from s where _r < 0.2
 {% else %}
-  -- First run: seed this table from the base (chained: this op builds on lineitem).
-  select * from {{ ref('lineitem') }}
+  -- First run: seed this table by STREAMING the generated parquet straight from the source — a
+  -- duckrun catalog view over read_parquet, not a 120M-row in-memory stage. generate_data must have
+  -- produced the parquet first (the bench runs it before this model).
+  select * from {{ source('tpch', 'lineitem') }}
 {% endif %}
