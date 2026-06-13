@@ -338,9 +338,13 @@ class DataFrameWriter:
             storage_options=so,
             compaction_threshold=session.compaction_threshold,
         )
-        # Surface the (new or grown) table immediately.
+        # Surface the (new or grown) table immediately — no manual refresh() needed.
         session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(schema)}")
         session._register_view(schema, table)
+        # Re-apply the search_path: on a previously-empty warehouse the schema didn't exist at
+        # connect, so SET search_path silently no-op'd; now that it exists, unqualified names
+        # (e.g. `select * from <table>`) must resolve.
+        session._set_search_path(session._current_database)
         return table
 
 

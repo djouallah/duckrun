@@ -50,7 +50,6 @@ def test_write_modes_round_trip(wh):
     conn = duckrun.connect(wh, schema="dbo")
 
     conn.sql("select 1 as id, 'x' as v").write.mode("overwrite").saveAsTable("t3")
-    conn.refresh()
     assert conn.sql("select count(*) from t3").fetchone()[0] == 1
 
     conn.sql("select 2 as id, 'y' as v").write.mode("append").saveAsTable("t3")
@@ -70,7 +69,6 @@ def test_write_partitioned_and_merge_schema(wh):
     conn.sql("select 1 id, 'eu' region").write.mode("overwrite").partitionBy("region").saveAsTable("p")
     conn.sql("select 2 id, 'us' region, true flag") \
         .write.mode("append").option("mergeSchema", "true").partitionBy("region").saveAsTable("p")
-    conn.refresh()
     assert conn.table("p").count() == 2
     assert "flag" in [c for c in conn.sql("select * from p").columns]
 
@@ -78,14 +76,12 @@ def test_write_partitioned_and_merge_schema(wh):
 def test_overwrite_schema_replaces(wh):
     conn = duckrun.connect(wh, schema="dbo")
     conn.sql("select 1 id, 'x' a, 'y' b").write.mode("overwrite").saveAsTable("os")
-    conn.refresh()
     assert conn.sql("select * from os").columns == ["id", "a", "b"]
     # Plain overwrite with a narrower schema fails (Delta won't drop columns silently)…
     with pytest.raises(Exception):
         conn.sql("select 2 id").write.mode("overwrite").saveAsTable("os")
     # …but overwriteSchema replaces the schema wholesale.
     conn.sql("select 2 id").write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("os")
-    conn.refresh()
     assert conn.sql("select * from os").columns == ["id"]
     assert conn.table("os").count() == 1
 
@@ -101,7 +97,6 @@ def test_merge_upsert(wh):
     conn = duckrun.connect(wh, schema="dbo")
     conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
         .write.mode("overwrite").saveAsTable("m")
-    conn.refresh()
 
     src = conn.sql("select * from (values (2,99),(4,99)) t(id, val)")
     DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
@@ -116,7 +111,6 @@ def test_merge_insert_only(wh):
     conn = duckrun.connect(wh, schema="dbo")
     conn.sql("select * from (values (1,10),(2,10)) t(id, val)") \
         .write.mode("overwrite").saveAsTable("io")
-    conn.refresh()
 
     src = conn.sql("select * from (values (2,99),(3,99)) t(id, val)")
     DeltaTable.forName(conn, "dbo.io").merge(src, "target.id = source.id") \

@@ -22,8 +22,7 @@ def conn(tmp_path):
     c.sql("select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)") \
         .write.mode("overwrite").saveAsTable("src")
     c.sql("select 7 as n").write.mode("overwrite").saveAsTable("other.thing")
-    c.refresh()
-    return c
+    return c  # saveAsTable surfaces tables itself — no manual refresh needed
 
 
 class TestSession:
@@ -136,8 +135,7 @@ class TestDataFrameReader:
 class TestDataFrameWriter:
     def test_saveAsTable(self, conn):
         conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
-        conn.refresh()
-        assert conn.table("w").count() == 1
+        assert conn.table("w").count() == 1  # queryable immediately, no refresh
 
     def test_mode_overwrite(self, conn):
         conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
@@ -161,19 +159,16 @@ class TestDataFrameWriter:
     def test_option_mergeSchema(self, conn):
         conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
         conn.sql("select 2 a, 3 b").write.mode("append").option("mergeSchema", "true").saveAsTable("w")
-        conn.refresh()
         assert "b" in conn.sql("select * from w").columns
 
     def test_option_overwriteSchema(self, conn):
         conn.sql("select 1 a, 2 b").write.mode("overwrite").saveAsTable("w")
         conn.sql("select 1 a").write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("w")
-        conn.refresh()
         assert conn.sql("select * from w").columns == ["a"]
 
     def test_partitionBy(self, conn):
         conn.sql("select * from (values (1,'eu'),(2,'us')) t(id, region)") \
             .write.mode("overwrite").partitionBy("region").saveAsTable("w")
-        conn.refresh()
         assert conn.table("w").count() == 2
 
     def test_format(self, conn):
@@ -185,7 +180,6 @@ class TestDeltaTable:
     def _seed(self, conn):
         conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
             .write.mode("overwrite").saveAsTable("m")
-        conn.refresh()
 
     def test_forName(self, conn):
         self._seed(conn)
