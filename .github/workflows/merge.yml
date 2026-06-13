@@ -11,14 +11,20 @@ name: merge-spill
 # is ~the size of the runner's RAM and only fits *because* of that pruning — it's the real stress
 # test. Runs against the pinned deltalake 1.5.0 (1.6.0's merge is broken at scale).
 #
-# Expensive (~10 min) and heavy (needs the whole runner's RAM + the big disk), so it runs ONLY as
-# a release gate: the publish workflow calls it (workflow_call) on a version tag and only publishes
-# if it passes. It is deliberately NOT runnable by hand (no workflow_dispatch) and never runs on a
-# push/PR — a release is the only thing that should pay this cost. The release run also renders the
-# MERGE scorecard into README.md and commits it to main, so the card always reflects the release.
+# Expensive (~10 min) and heavy (needs the whole runner's RAM + the big disk), so it never runs on
+# push/PR — a release is the main thing that should pay this cost. The publish workflow calls it
+# (workflow_call) on a version tag and only publishes if it passes; the release run also renders the
+# MERGE scorecard into README.md and commits it to main. It can also be run by hand
+# (workflow_dispatch) with a chosen scale factor, e.g. to try a smaller/larger fact table.
 
 on:
   workflow_call:
+  workflow_dispatch:
+    inputs:
+      sf:
+        description: "TPCH scale factor for lineitem (release gate uses 20 ≈ 120M rows)"
+        required: false
+        default: "20"
 
 # Needed so the release run can commit the rendered scorecard back to README.md on main.
 permissions:
@@ -34,7 +40,7 @@ jobs:
   merge-spill:
     runs-on: ubuntu-latest
     env:
-      SF: "20"
+      SF: "${{ inputs.sf || '20' }}"   # release gate uses 20; a manual dispatch can pick another
       DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4
