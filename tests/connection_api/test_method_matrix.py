@@ -168,6 +168,11 @@ class TestDataFrameWriter:
         conn.sql("select 2 a").write.mode("append").saveAsTable("w")
         assert conn.table("w").count() == 2
 
+    def test_mode_safeappend(self, conn):
+        conn.sql("select 1 a").write.mode("safeappend").saveAsTable("w")  # missing → create
+        conn.sql("select 2 a").write.mode("safeappend").saveAsTable("w")  # unchanged → append
+        assert conn.table("w").count() == 2
+
     def test_mode_ignore(self, conn):
         conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
         conn.sql("select 2 a").write.mode("ignore").saveAsTable("w")

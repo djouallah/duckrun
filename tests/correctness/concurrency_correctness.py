@@ -32,6 +32,12 @@ C. Pre-snapshot window. A foreign commit can land AFTER the DuckDB source relati
    source would silently merge stale rows and OCC could not catch it. This case pins that pull-time
    behavior via the probe column; a regression to bind-time resolution turns it red and blocks the
    version bump.
+
+E. Connection-API safeappend (self-reference). The same B guarantee, but driven end-to-end through
+   the connection API — `conn.sql("select … from t").write.mode("safeappend").saveAsTable("t")` —
+   where the source reads the SAME table it writes to. A plain `append` silently lands on the new
+   HEAD; `safeappend` REFUSES (CommitFailedError) when a foreign commit moved the table since the
+   writer read it.
 """
 import os
 import sys
@@ -43,7 +49,12 @@ import pyarrow as pa
 from deltalake import DeltaTable
 from deltalake.exceptions import CommitFailedError
 
-from dbt.adapters.duckrun import engine
+# Run as a plain script (`python tests/correctness/…`): the editable install exposes only the `dbt`
+# namespace, not the top-level `duckrun` package, and sys.path[0] is this file's dir — so put the
+# repo root on the path before importing the connection API.
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+import duckrun  # noqa: E402
+from dbt.adapters.duckrun import engine  # noqa: E402
 
 
 def _ids(p):
@@ -296,6 +307,62 @@ def mutate_display(rows):
     return out
 
 
+# ------------------------------------------ E. connection-API safeappend (self-reference)
+
+def conn_safeappend_run(mode: str, concurrent: bool) -> dict:
+    """Same guarantee as B, but driven end-to-end through the **connection API** — and where the
+    source query reads the SAME table it writes to (``select … from t`` → ``saveAsTable('t')``).
+    ``mode`` is 'append' (no guard) or 'safeappend' (CAS). The real race: the writer captures the
+    version it read (vB), a foreign writer then commits, and safeappend's CAS must refuse the commit
+    (HEAD moved past vB) while a plain append silently lands on the new HEAD."""
+    root = tempfile.mkdtemp()
+    conn = duckrun.connect(root, schema="dbo")
+    conn.sql("select 0 as id").write.mode("overwrite").saveAsTable("t")    # v0
+    path = conn.table_path("dbo", "t")
+    so = conn.storage_options
+    cap = {"mode": mode, "concurrent": concurrent}
+    read_ver = engine.table_version(path, so)
+    cap["read_ver"] = read_ver
+    if concurrent:
+        engine.write_delta(path, _batch([7]), "append")                  # foreign writer -> v1
+    cap["head_ver"] = DeltaTable(path).version()
+
+    # Source reads the SAME table t, then appends back into it (self-reference).
+    src = conn.sql("select id + 100 as id from t")
+
+    real_tv = engine.table_version
+    if mode == "safeappend" and concurrent:
+        # safeappend fences to the version the writer read (vB); a foreign commit since then must
+        # make the CAS refuse. Force the captured version to vB to model "read vB, then it moved".
+        engine.table_version = lambda *a, **k: read_ver
+    try:
+        src.write.mode(mode).saveAsTable("t")
+        cap["outcome"], cap["final"] = "committed", _ids(path)
+    except CommitFailedError:
+        cap["outcome"], cap["final"] = "refused", _ids(path)
+    finally:
+        engine.table_version = real_tv
+    return cap
+
+
+def conn_safeappend_display(rows):
+    out = []
+    for c in rows:
+        if c["mode"] == "append":
+            ok = c["outcome"] == "committed"            # plain append has no guard — expected
+            res_md, res_txt = "⚠️ committed anyway — no version guard", "committed (no guard)"
+        elif c["concurrent"]:
+            ok = c["outcome"] == "refused"              # safeappend must refuse a moved table
+            res_md, res_txt = "🛡️ refused — `CommitFailedError`", "refused (CommitFailedError)"
+        else:
+            ok = c["outcome"] == "committed"            # unchanged -> commits
+            res_md, res_txt = "✅ committed", "committed"
+        out.append({"mode": c["mode"], "concurrent": "yes" if c["concurrent"] else "no",
+                    "read": f"v{c['read_ver']}", "head": f"v{c['head_ver']}",
+                    "res_txt": res_txt, "res_md": res_md, "ok": ok})
+    return out
+
+
 # ----------------------------------------------------------------------------- presentation
 
 def _ascii_table(headers, rows):
@@ -311,7 +378,7 @@ def _ascii_table(headers, rows):
                       *[line(r) for r in rows], rule("└", "┴", "┘")])
 
 
-def render_console(merge_disp, sa_disp, pb_disp, mut_disp, safe):
+def render_console(merge_disp, sa_disp, pb_disp, mut_disp, conn_disp, safe):
     a = _ascii_table(
         ["streamed_exec", "concurrent write", "merge target", "duckdb source", "result"],
         [[d["streamed"], d["concurrent"], d["merge"], d["duckdb"], d["res_txt"]] for d in merge_disp])
@@ -324,9 +391,13 @@ def render_console(merge_disp, sa_disp, pb_disp, mut_disp, safe):
     d = _ascii_table(
         ["operation", "concurrent write", "read", "head", "result"],
         [[x["op"], x["concurrent"], x["read"], x["head"], x["res_txt"]] for x in mut_disp])
+    e = _ascii_table(
+        ["mode", "concurrent write", "read", "head", "result"],
+        [[x["mode"], x["concurrent"], x["read"], x["head"], x["res_txt"]] for x in conn_disp])
     verdict = ("CONCURRENCY-CORRECT: merge source is always >= the merge version (gap fails loudly,\n"
                "  never silent); safeappend refuses a moved table, plain append has no guard;\n"
-               "  a pre-bound source re-reads at pull time; DELETE/UPDATE fail on a conflicting commit."
+               "  a pre-bound source re-reads at pull time; DELETE/UPDATE fail on a conflicting commit;\n"
+               "  conn-API safeappend refuses a moved table even when reading the same table it writes."
                if safe else
                "INVARIANT VIOLATED — a case behaved unexpectedly (see tables). Investigate.")
     return ("\n  duckrun — concurrency correctness\n\n"
@@ -337,10 +408,12 @@ def render_console(merge_disp, sa_disp, pb_disp, mut_disp, safe):
             "  C) pre-snapshot window — does a pre-bound source re-read at pull time?\n"
             + c + "\n\n"
             "  D) DELETE / UPDATE — do they fail on a conflicting concurrent commit (like merge)?\n"
-            + d + "\n\n  " + verdict + "\n")
+            + d + "\n\n"
+            "  E) connection-API safeappend — self-reference (read t, write t) refuses a moved table\n"
+            + e + "\n\n  " + verdict + "\n")
 
 
-def render_markdown(merge_disp, sa_disp, pb_disp, mut_disp, safe):
+def render_markdown(merge_disp, sa_disp, pb_disp, mut_disp, conn_disp, safe):
     tick = "✅" if safe else "❌"
     L = [f"## duckrun — concurrency correctness {tick}", "",
          "### A) MERGE snapshot safety", "",
@@ -387,6 +460,17 @@ def render_markdown(merge_disp, sa_disp, pb_disp, mut_disp, safe):
           "`CommitFailedError` when a foreign commit changed the same rows after the snapshot was "
           "opened. No `max_commit_retries` hack: the conflict detection is native (the hack was only "
           "needed for non-conflicting appends in `safeappend`). Uncontended, they just commit.", "",
+          "### E) connection-API safeappend — *self-reference (read `t`, write `t`)*", "",
+          "| mode | concurrent write | read | head | result |",
+          "|:---:|:---:|:---:|:---:|:---|"]
+    for d in conn_disp:
+        cc = "**yes**" if d["concurrent"] == "yes" else "no"
+        L.append(f"| `{d['mode']}` | {cc} | {d['read']} | {d['head']} | {d['res_md']} |")
+    L += ["",
+          "> Driven end-to-end through the connection API — `conn.sql(\"select … from t\")"
+          ".write.mode(m).saveAsTable(\"t\")` — where the source reads the **same table it writes**. "
+          "`safeappend` still **refuses** (`CommitFailedError`) when a foreign commit moved the table "
+          "since the writer read it, while a plain `append` silently lands on the new HEAD.", "",
           ("> ✅ **Concurrency-correct.**" if safe
            else "> ❌ **Invariant violated** — see tables above.")]
     return "\n".join(L) + "\n"
@@ -406,17 +490,22 @@ def main() -> int:
     pb_rows = [prebind_run(False), prebind_run(True)]
     mut_rows = [mutate_run("delete", False), mutate_run("delete", True),
                 mutate_run("update", False), mutate_run("update", True)]
+    conn_rows = [conn_safeappend_run("append", True),
+                 conn_safeappend_run("safeappend", False),
+                 conn_safeappend_run("safeappend", True)]
 
     merge_disp, sa_disp = merge_display(merge_rows), safeappend_display(sa_rows)
     pb_disp, mut_disp = prebind_display(pb_rows), mutate_display(mut_rows)
+    conn_disp = conn_safeappend_display(conn_rows)
     safe = (all(d["ok"] for d in merge_disp) and all(d["ok"] for d in sa_disp)
-            and all(d["ok"] for d in pb_disp) and all(d["ok"] for d in mut_disp))
+            and all(d["ok"] for d in pb_disp) and all(d["ok"] for d in mut_disp)
+            and all(d["ok"] for d in conn_disp))
 
-    print(render_console(merge_disp, sa_disp, pb_disp, mut_disp, safe))
+    print(render_console(merge_disp, sa_disp, pb_disp, mut_disp, conn_disp, safe))
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a", encoding="utf-8") as fh:
-            fh.write(render_markdown(merge_disp, sa_disp, pb_disp, mut_disp, safe))
+            fh.write(render_markdown(merge_disp, sa_disp, pb_disp, mut_disp, conn_disp, safe))
     return 0 if safe else 1
 
 

@@ -264,13 +264,15 @@ reclaimed — duckrun favors read-safety over immediate disk savings.
 Besides the dbt adapter, duckrun ships a storage-neutral, PySpark-shaped `duckrun.connect()` for
 interactive/notebook use (local, S3, GCS, ADLS, OneLake). `conn.sql(...)` is **read-only** (including
 time travel — `delta_scan('…', version => N)`); writes go through the Spark surface: a `DataFrame`
-with `.write…saveAsTable()` (create / append) and a `DeltaTable` handle
+with `.write…saveAsTable()` (modes `overwrite` / `append` / `safeappend` / `ignore`) and a `DeltaTable` handle
 (`conn.delta_table(name)` / `DeltaTable.forName`) with `.merge(...)`, `.delete()`, `.update()`,
 `.replaceWhere()`, `.version()`, plus `conn.read` and `conn.catalog`.
 
 `merge` is **snapshot-pinned by default** — Spark's single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit is validated against it, so a concurrent writer fails
-the commit loudly instead of silently interleaving.
+the commit loudly instead of silently interleaving. `mode("safeappend")` is the same optimistic,
+fail-loud append as the dbt [`safeappend`](#safeappend) strategy: it commits only if the table is
+unchanged since the call, else raises `CommitFailedError`.
 
 ```python
 import duckrun

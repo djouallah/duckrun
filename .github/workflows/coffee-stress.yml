@@ -47,9 +47,11 @@ jobs:
           # write the summary. PIPESTATUS[0] is pytest/time's exit, not tee's.
           set +e
           # GNU time gives Maximum resident set size; tee keeps the log for the summary.
+          # -s: stream the scenario's stage-by-stage narration into the log (without it pytest
+          # captures the prints and the run shows nothing).
           /usr/bin/time -v python -m pytest \
             tests/connection_api/coffeeshop/test_coffee.py::test_coffee_local \
-            -q -p no:cacheprovider 2>&1 | tee stress.log
+            -q -s -p no:cacheprovider 2>&1 | tee stress.log
           rc=${PIPESTATUS[0]}
           {
             echo "## Result"
@@ -59,8 +61,12 @@ jobs:
             echo "- wall clock: ${wall:-n/a}"
             [ -n "$peak_kb" ] && echo "- peak memory: $(awk "BEGIN{printf \"%.2f GiB\", $peak_kb/1048576}")"
             echo ""
-            echo '```'
-            tail -n 5 stress.log
+            echo "### Scenario log (stage by stage)"
+            echo '```text'
+            # The narrated stages between the scenario banners; fall back to the tail if the run
+            # crashed before printing them.
+            narr=$(sed -n '/=== coffee-shop scenario/,/=== scenario complete ===/p' stress.log)
+            if [ -n "$narr" ]; then echo "$narr"; else tail -n 20 stress.log; fi
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $rc

@@ -5,14 +5,16 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
 
 - `conn.sql(...)` — **read-only** DuckDB SQL over the discovered Delta tables, including time travel
   (`delta_scan('…', version => N)`). A write statement is rejected with a pointer to the write API.
-- a `DataFrame` with a Spark-style `.write…saveAsTable()` (create / append), plus `conn.read` and
-  `conn.catalog`.
+- a `DataFrame` with a Spark-style `.write…saveAsTable()` — modes `overwrite` / `append` /
+  `safeappend` / `ignore` — plus `conn.read` and `conn.catalog`.
 - a `DeltaTable` handle (`conn.delta_table(name)` / `DeltaTable.forName`) mirroring Delta-on-Spark:
   `.merge(...)`, `.delete()`, `.update()`, `.replaceWhere()`, `.version()`.
 
 `merge` is **snapshot-pinned by default** — Spark's single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit validates against it, so a concurrent writer fails the
-commit loudly instead of silently interleaving.
+commit loudly instead of silently interleaving. `mode("safeappend")` applies the same fail-loud
+compare-and-swap to a plain append (identical to the dbt `safeappend` strategy): it commits only if
+the table is unchanged since the call, else raises `CommitFailedError`.
 
 ```python
 import duckrun

@@ -329,9 +329,14 @@ def _csv_opt(value) -> str:
 
 
 class DataFrameWriter:
-    """Spark ``DataFrameWriter`` over delta-rs (the adapter's :func:`engine.write_delta`)."""
+    """Spark ``DataFrameWriter`` over delta-rs (the adapter's :func:`engine.write_delta`).
 
-    _MODES = {"overwrite", "append", "ignore", "error", "errorifexists"}
+    Beyond Spark's modes it adds ``"safeappend"`` — the same optimistic, fail-loud append as the
+    dbt adapter's incremental strategy: it commits only if the table version has not moved since
+    the call (compare-and-swap), else raises ``CommitFailedError``. Non-standard, but identical
+    behaviour to ``safeappend`` in dbt."""
+
+    _MODES = {"overwrite", "append", "safeappend", "ignore", "error", "errorifexists"}
 
     def __init__(self, df: DataFrame):
         self._df = df
@@ -383,20 +388,46 @@ class DataFrameWriter:
             if engine.table_exists(path, so):
                 raise ValueError(
                     f"table '{schema}.{table}' already exists (mode='error'). "
-                    f"Use mode('overwrite'), mode('append'), or mode('ignore')."
+                    f"Use mode('overwrite'), mode('append'), mode('safeappend'), or mode('ignore')."
                 )
             mode = "overwrite"
 
-        engine.write_delta(
-            path,
-            self._df.relation,
-            mode=mode,
-            partition_by=self._partition_by,
-            merge_schema=self._merge_schema,
-            overwrite_schema=self._overwrite_schema,
-            storage_options=so,
-            compaction_threshold=session.compaction_threshold,
-        )
+        if mode == "safeappend":
+            # Optimistic append, identical to the dbt safeappend strategy: pin to the version now
+            # and CAS the commit, so a writer that lands between this read and the commit fails the
+            # append (fail loud) instead of duplicating. On a missing table there is nothing to
+            # fence against, so create it via a plain append (matches dbt's first-run create).
+            if engine.table_exists(path, so):
+                engine.append_if_unchanged(
+                    path,
+                    self._df.relation,
+                    read_version=engine.table_version(path, so),
+                    partition_by=self._partition_by,
+                    merge_schema=self._merge_schema,
+                    storage_options=so,
+                    compaction_threshold=session.compaction_threshold,
+                )
+            else:
+                engine.write_delta(
+                    path,
+                    self._df.relation,
+                    mode="append",
+                    partition_by=self._partition_by,
+                    merge_schema=self._merge_schema,
+                    storage_options=so,
+                    compaction_threshold=session.compaction_threshold,
+                )
+        else:
+            engine.write_delta(
+                path,
+                self._df.relation,
+                mode=mode,
+                partition_by=self._partition_by,
+                merge_schema=self._merge_schema,
+                overwrite_schema=self._overwrite_schema,
+                storage_options=so,
+                compaction_threshold=session.compaction_threshold,
+            )
         # Surface the (new or grown) table immediately — no manual refresh() needed.
         session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(schema)}")
         session._register_view(schema, table)

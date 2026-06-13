@@ -7,6 +7,7 @@ path — only the secret/discovery backend differs — so the local run is repre
 """
 import duckdb
 import pytest
+from deltalake.exceptions import CommitFailedError
 
 import duckrun
 from duckrun import DeltaTable
@@ -62,6 +63,32 @@ def test_write_modes_round_trip(wh):
     # 'ignore' is a no-op when the table exists.
     conn.sql("select 99 as id, 'q' as v").write.mode("ignore").saveAsTable("t3")
     assert conn.table("t3").count() == 2
+
+
+def test_safeappend_creates_then_appends(wh):
+    conn = duckrun.connect(wh, schema="dbo")
+    # First run on a missing table: nothing to fence against → create via append.
+    conn.sql("select 1 id, 'a' v").write.mode("safeappend").saveAsTable("sa")
+    assert conn.table("sa").count() == 1
+    # Unchanged table → optimistic append commits and grows the table.
+    conn.sql("select 2 id, 'b' v").write.mode("safeappend").saveAsTable("sa")
+    assert sorted(conn.table("sa").collect()) == [(1, "a"), (2, "b")]
+
+
+def test_safeappend_refuses_on_concurrent_commit(wh, monkeypatch):
+    # safeappend pins to the version it read; if a writer lands before the commit, it must fail
+    # loud (CommitFailedError) instead of duplicating — identical to the dbt safeappend strategy.
+    conn = duckrun.connect(wh, schema="dbo")
+    conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("sc")
+    path = conn.table_path("dbo", "sc")
+    stale = engine.table_version(path, conn.storage_options)  # the version "as read"
+
+    # A concurrent writer commits, moving HEAD past the version safeappend will pin to.
+    engine.write_delta(path, duckdb.connect().sql("select 99 id, 'x' v"), mode="append")
+    monkeypatch.setattr(engine, "table_version", lambda *a, **k: stale)
+
+    with pytest.raises(CommitFailedError):
+        conn.sql("select 2 id, 'b' v").write.mode("safeappend").saveAsTable("sc")
 
 
 def test_write_partitioned_and_merge_schema(wh):
