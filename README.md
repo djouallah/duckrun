@@ -456,28 +456,22 @@ _The last three rows are the same batch as a plain `append` / `safeappend` / `ov
 
 <!-- MERGE:END -->
 
-## For AI agents
+## Building with an AI assistant
 
-If you are an AI agent helping someone build a duckrun project, read this file first:
+duckrun ships a guide for AI coding assistants so they get the adapter's defaults right
+(several differ from other dbt adapters). If you use **Claude Code**, install it once and
+it loads on demand when you ask a duckrun question:
 
 ```
-plugins/duckrun-projects/skills/duckrun-projects/SKILL.md
+/plugin marketplace add djouallah/duckrun
+/plugin install duckrun-projects@duckrun
 ```
 
-It is the authoritative guide to using duckrun and is written for you, not as marketing.
-Several duckrun defaults differ from other dbt adapters in ways that will cause silent
-mistakes if you assume the usual behavior — e.g. it is single-threaded by design (don't
-set `threads:`), DuckDB is in-memory with no database file (the Delta tables are the only
-state), incremental strategy defaults depend on `unique_key`, and the choice between
-`merge` and `safeappend` matters a lot for large tables. The SKILL.md covers profiles,
-materializations, incremental strategies, OneLake/Fabric, sources, contracts, and
-troubleshooting. Consult it before writing `profiles.yml` or any incremental model.
-
-The same file is published as a Claude Code skill (`duckrun-projects`) via the plugin
-marketplace in [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json), so a
-Claude Code user can load it on demand with `/plugin install duckrun-projects@duckrun`
-instead of reading the path above. Either way it's the same content; reading the file
-directly is the right move when you already have the repo checked out.
+Using a different assistant (Cursor, Copilot, Codex, …) or just have the repo checked
+out? It reads the [`AGENTS.md`](AGENTS.md) at the repo root automatically, which points to
+the full guide in
+[`plugins/duckrun-projects/skills/duckrun-projects/SKILL.md`](plugins/duckrun-projects/skills/duckrun-projects/SKILL.md).
+None of this is required to use duckrun — `pip install duckrun` is unaffected.
 
 ## License
 
