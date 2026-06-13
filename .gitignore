@@ -41,16 +41,14 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-# Test artifacts (exclude temporary test files and downloads)
-tests/*/
+# Test artifacts: only RUNTIME OUTPUTS and local scratch are ignored — NEVER test code.
+# All test source under tests/ is committed normally (no wildcard ignore + whitelist dance).
+# Local throwaway lives in ONE obvious, clearly-named place:
+tests/_local/
 .tmp
 .tmp/*/
 
-# ...but keep the committed test suites; only their runtime outputs are ignored.
-!tests/conformance/
-!tests/adapter/
-!tests/connection_api/
-!tests/correctness/
+# Conformance-suite runtime outputs (the suite's source is committed and tracked normally).
 tests/conformance/_run.log
 tests/conformance/_report.xml
 conformance.xml
