@@ -28,6 +28,35 @@ GROUPS = [
 ]
 _EMOJI = {"passed": "✅", "failed": "❌", "error": "💥", "skipped": "⏭️"}
 
+# Short surface names for the cards.
+SHORT = {
+    "TestSession": "DuckSession", "TestCatalog": "Catalog", "TestDataFrame": "DataFrame",
+    "TestDataFrameReader": "DataFrameReader", "TestDataFrameWriter": "DataFrameWriter",
+    "TestDeltaTable": "DeltaTable",
+}
+
+# Which established API each method mirrors, so a reader can tell what's a real Spark/Delta method
+# vs a duckrun-specific helper. Default per group; per-method overrides for the exceptions.
+_GROUP_API = {
+    "TestSession": "duckrun",          # the session object is duckrun's, but several entry points are Spark
+    "TestCatalog": "Spark",            # pyspark.sql.Catalog
+    "TestDataFrame": "Spark",          # pyspark.sql.DataFrame
+    "TestDataFrameReader": "Spark",    # pyspark.sql.DataFrameReader
+    "TestDataFrameWriter": "Spark",    # pyspark.sql.DataFrameWriter
+    "TestDeltaTable": "Spark",         # delta.tables.DeltaTable — the Delta-on-Spark API (≈ Spark)
+}
+_METHOD_API = {
+    ("TestSession", "sql"): "Spark", ("TestSession", "table"): "Spark",
+    ("TestSession", "read_property"): "Spark", ("TestSession", "catalog_property"): "Spark",
+    ("TestSession", "show_tables"): "Spark",
+    ("TestDataFrame", "relation_passthrough"): "duckrun",   # DuckDB relation escape hatch
+    ("TestDataFrameReader", "delta"): "duckrun",            # convenience shortcut; Spark uses format().load()
+}
+
+
+def _api(group: str, method: str) -> str:
+    return _METHOD_API.get((group, method), _GROUP_API.get(group, "duckrun"))
+
 
 def _outcome(case):
     if case.find("error") is not None:
@@ -76,20 +105,52 @@ def main(path: str, check: bool = False) -> int:
     width = max(len(headline), len(sub)) + 2
     out += ["```", "┌" + "─" * width + "┐", "│ " + headline.ljust(width - 1) + "│",
             "│ " + sub.ljust(width - 1) + "│", "└" + "─" * width + "┘", "```", ""]
-
-    # Known groups first (in declared order), then any stragglers.
+    # Split every method by its API tag into two cards: Spark/Delta-on-Spark vs duckrun-specific.
     labels = dict(GROUPS)
     ordered = [g for g, _ in GROUPS if g in by_group] + [g for g in by_group if g not in labels]
+
+    spark = []   # (surface, [(method, outcome)])
+    duck = []    # (method, surface, outcome)
     for g in ordered:
-        rows = by_group[g]
-        ok = sum(1 for _, o in rows if o == "passed")
-        out.append(f"### {labels.get(g, g)} — {ok}/{len(rows)}")
-        out.append("")
-        out.append("| Method | Result |")
-        out.append("| --- | :-: |")
-        for method, outcome in rows:
-            out.append(f"| `{method}` | {_EMOJI.get(outcome, outcome)} |")
-        out.append("")
+        surface = SHORT.get(g, g)
+        sp = []
+        for method, outcome in by_group[g]:
+            if _api(g, method) == "duckrun":
+                duck.append((method, surface, outcome))
+            else:
+                sp.append((method, outcome))
+        if sp:
+            spark.append((surface, sp))
+
+    def _cell(rows):
+        p = sum(1 for _, o in rows if o == "passed")
+        t = len(rows)
+        fails = [m for m, o in rows if o != "passed"]
+        return f"{p}/{t} ✅" if not fails else f"{p}/{t} ❌ ({', '.join(fails)})"
+
+    sp_pass = sum(1 for _, rows in spark for _, o in rows if o == "passed")
+    sp_tot = sum(len(rows) for _, rows in spark)
+    out.append(f"### Spark / Delta-on-Spark API — {sp_pass}/{sp_tot} ✅")
+    out.append("")
+    out.append("> Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.")
+    out.append("")
+    out.append("| Surface | Methods | Pass |")
+    out.append("| --- | --- | :-: |")
+    for surface, rows in spark:
+        names = ", ".join(f"`{m}`" for m, _ in rows)
+        out.append(f"| `{surface}` | {names} | {_cell(rows)} |")
+    out.append("")
+
+    d_pass = sum(1 for _, _, o in duck if o == "passed")
+    out.append(f"### duckrun-specific helpers — {d_pass}/{len(duck)} ✅")
+    out.append("")
+    out.append("> Conveniences with no Spark equivalent (session plumbing + two shortcuts).")
+    out.append("")
+    out.append("| Method | Surface | Pass |")
+    out.append("| --- | --- | :-: |")
+    for method, surface, outcome in duck:
+        out.append(f"| `{method}` | `{surface}` | {_EMOJI.get(outcome, outcome)} |")
+    out.append("")
 
     print("\n".join(out))
     return 0
