@@ -30,8 +30,8 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
-        run: pip install -e .
+      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
+        run: pip install -e ".[test]"
 
       - name: Runner specs (the box we're stressing)
         run: |
