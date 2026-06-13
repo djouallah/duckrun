@@ -85,7 +85,8 @@ class TestDataFrame:
         conn.sql("select * from src").show()  # smoke: must not raise
 
     def test_toPandas(self, conn):
-        pytest.importorskip("pandas")  # the one pandas-touching method; skip when absent
+        # toPandas() == relation.df() (Spark parity). DuckDB .df() materializes a pandas
+        # DataFrame, so pandas+numpy are required — provided by the [test] extra.
         assert list(conn.sql("select name from src order by id").toPandas()["name"]) == ["a", "b", "c"]
 
     def test_relation_passthrough(self, conn):

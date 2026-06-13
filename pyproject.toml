@@ -38,9 +38,10 @@ dependencies = [
 # Laptop OneLake auth for the connection API: acquire a storage token via Azure CLI / browser.
 # Not needed inside a Fabric notebook (notebookutils supplies the token) or for s3/gcs/local.
 local = ["azure-identity"]
-# Test-only; pyarrow is used to build reusable Arrow fixtures. Production duckrun stays
-# pyarrow-free (it streams DuckDB relations straight to deltalake).
-test = ["pytest>=7", "pyarrow"]
+# Test-only. pyarrow builds reusable Arrow fixtures; pandas is required by the DataFrame.toPandas()
+# test (DuckDB .df() materializes a pandas DataFrame, so it needs pandas+numpy). Production duckrun
+# stays pyarrow-/pandas-free — it streams DuckDB relations straight to deltalake.
+test = ["pytest>=7", "pyarrow", "pandas"]
 # Official dbt adapter conformance suite (dbt-labs/dbt-adapters). Subclassed in
 # tests/conformance/ to run the standard adapter tests against duckrun.
 conformance = ["pytest>=7", "pyarrow", "dbt-tests-adapter"]

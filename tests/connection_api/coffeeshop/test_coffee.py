@@ -111,10 +111,11 @@ def run_coffee_scenario(conn, schema, n_rows):
     assert abs(q("select sum(revenue) from mart_revenue")
                - q("select sum(sales_amount) from fact_sales")) < 1.0   # tiny rounding only
 
-    # DataFrame surface, pandas-free: .collect() (→ fetchall) and .columns (→ the DuckDB relation)
+    # DataFrame aliases: .collect() (→ fetchall), .columns, and .toPandas() (→ relation.df()).
     top = conn.sql("select product_name, sum(sales_amount) rev from fact_sales group by 1 order by rev desc limit 3")
     assert len(top.collect()) == 3
     assert top.columns == ["product_name", "rev"]
+    assert list(top.toPandas().columns) == ["product_name", "rev"]
 
     # ── write modes: append / ignore / Spark default 'error' ─────────────────────────────────────
     conn.sql("select * from fact_sales limit 1").write.mode("append").saveAsTable("fact_sales")
