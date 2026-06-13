@@ -471,19 +471,19 @@ The card below — every public method with a ✅ — is regenerated on every pu
 
 ```
 ┌───────────────────────────┐
-│ ✅ 34 passed   ❌ 0 failed  │
-│ 34 methods · 100% passing │
+│ ✅ 38 passed   ❌ 0 failed  │
+│ 38 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### Spark / Delta-on-Spark API — 28/28 ✅
+### Spark / Delta-on-Spark API — 32/32 ✅
 
 > Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.
 
 | Surface | Methods | Pass |
 | --- | --- | :-: |
 | `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
-| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase` | 4/4 ✅ |
+| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns` | 8/8 ✅ |
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas` | 5/5 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv` | 4/4 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `partitionBy`, `format` | 5/5 ✅ |
