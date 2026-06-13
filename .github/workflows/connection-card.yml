@@ -1,0 +1,77 @@
+name: connection-card
+
+# Renders the duckrun.connect() method scorecard — every public method of the connection API
+# with a ✅/❌ — the way conformance.yml does for the adapter. Runs the per-method matrix
+# (tests/connection_api/test_method_matrix.py) on a local-filesystem warehouse (no secrets, no
+# network), publishes the card to the job summary every run, and on push to main injects it into
+# the README between the CONNECTION_API markers and commits.
+#
+# Unlike conformance (which tolerates known failures via a baseline), these are duckrun's own
+# methods: they must ALL pass, so the job fails if any method does.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Serialize (static group, no cancel): the main run commits the README card, which two concurrent
+# runs can't do without a non-fast-forward.
+concurrency:
+  group: connection-card
+  cancel-in-progress: false
+
+jobs:
+  card:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need history to commit the card back to main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps
+        run: pip install -e ".[test]"
+
+      - name: Run the connection-API method matrix
+        # Render the card even if a method fails (the gate is a later step), so the summary always
+        # shows exactly which method broke.
+        continue-on-error: true
+        run: |
+          python -m pytest tests/connection_api/test_method_matrix.py \
+            -q -p no:cacheprovider --junitxml=connection.xml
+
+      - name: Render method scorecard
+        if: always()
+        run: python tests/tools/connection_summary.py connection.xml > connection_card.md
+
+      - name: Publish scorecard to job summary
+        if: always()
+        run: cat connection_card.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Inject card into README and commit (main only)
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          python tests/tools/inject_readme.py README.md connection_card.md CONNECTION_API
+          if git diff --quiet -- README.md; then
+            echo "Connection card unchanged."
+            exit 0
+          fi
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add README.md
+          git commit -m "docs: refresh connection API method scorecard [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
+
+      - name: Gate — every connection-API method must pass
+        run: python tests/tools/connection_summary.py connection.xml --check

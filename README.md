@@ -456,6 +456,18 @@ _The last three rows are the same batch as a plain `append` / `safeappend` / `ov
 
 <!-- MERGE:END -->
 
+## Connection API (notebook) — method scorecard
+
+Besides the dbt adapter, duckrun ships a storage-neutral, PySpark-shaped `duckrun.connect()` for
+interactive/notebook use (local, S3, GCS, ADLS, OneLake): `conn.sql(...)`, a `DataFrame` with
+`.write…saveAsTable()`, `conn.read`, `conn.catalog`, and a `DeltaTable.merge(...)` upsert builder.
+The card below — every public method with a ✅ — is regenerated on every push by
+[`connection-card.yml`](.github/workflows/connection-card.yml) from
+[`tests/connection_api/test_method_matrix.py`](tests/connection_api/test_method_matrix.py).
+
+<!-- CONNECTION_API:START -->
+<!-- CONNECTION_API:END -->
+
 ## Building with an AI assistant
 
 duckrun ships a guide for AI coding assistants so they get the adapter's defaults right
