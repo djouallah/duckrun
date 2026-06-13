@@ -133,3 +133,13 @@ def test_update_only_merge_rejected(wh):
         .whenMatchedUpdateAll()
     with pytest.raises(ValueError):
         builder.execute()
+
+
+def test_pandas_aliases_when_available(wh):
+    # .toPandas()/.df() are the only pandas-touching bits of the API (DuckDB materializes to
+    # pandas there, like Spark's toPandas). duckrun core never needs pandas, so this is the one
+    # test that does — skipped when it isn't installed rather than forcing the dependency.
+    pytest.importorskip("pandas")
+    conn = duckrun.connect(wh, schema="dbo")
+    pdf = conn.sql("select name from t1 order by id").toPandas()
+    assert list(pdf["name"]) == ["a", "b"]
