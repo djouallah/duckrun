@@ -456,21 +456,28 @@ _The last three rows are the same batch as a plain `append` / `safeappend` / `ov
 
 <!-- MERGE:END -->
 
-## Claude Code skill
+## For AI agents
 
-If you build duckrun projects with an AI agent, this repo ships a Claude Code skill
-(`duckrun-projects`) covering profiles, incremental strategies, OneLake/Fabric, sources,
-and troubleshooting. It's distributed as a plugin marketplace — install it once:
+If you are an AI agent helping someone build a duckrun project, read this file first:
 
 ```
-/plugin marketplace add djouallah/duckrun
-/plugin install duckrun-projects@duckrun
+plugins/duckrun-projects/skills/duckrun-projects/SKILL.md
 ```
 
-The skill loads on demand when you ask a duckrun question, and works across every Claude
-Code surface (terminal, VS Code, JetBrains). It updates when you run
-`/plugin marketplace update`. Not needed to use duckrun itself — `pip install duckrun` is
-unaffected.
+It is the authoritative guide to using duckrun and is written for you, not as marketing.
+Several duckrun defaults differ from other dbt adapters in ways that will cause silent
+mistakes if you assume the usual behavior — e.g. it is single-threaded by design (don't
+set `threads:`), DuckDB is in-memory with no database file (the Delta tables are the only
+state), incremental strategy defaults depend on `unique_key`, and the choice between
+`merge` and `safeappend` matters a lot for large tables. The SKILL.md covers profiles,
+materializations, incremental strategies, OneLake/Fabric, sources, contracts, and
+troubleshooting. Consult it before writing `profiles.yml` or any incremental model.
+
+The same file is published as a Claude Code skill (`duckrun-projects`) via the plugin
+marketplace in [`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json), so a
+Claude Code user can load it on demand with `/plugin install duckrun-projects@duckrun`
+instead of reading the path above. Either way it's the same content; reading the file
+directly is the right move when you already have the repo checked out.
 
 ## License
 
