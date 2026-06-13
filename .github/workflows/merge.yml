@@ -88,7 +88,10 @@ jobs:
       # ref, so check out main explicitly and push there. [skip ci] avoids re-triggering. Never fails
       # the release on a commit hiccup. No-op if the bench died before writing the card.
       - name: Render scorecard into docs and commit to main
-        if: always() && hashFiles('merge_card.md') != ''
+        # Only the release path (workflow_call -> caller's event is the tag push) commits the
+        # canonical card. A manual workflow_dispatch (possibly a smaller SF) shows the card in its
+        # own run summary but must NOT overwrite the release card in the docs.
+        if: always() && hashFiles('merge_card.md') != '' && github.event_name != 'workflow_dispatch'
         continue-on-error: true
         run: |
           git fetch origin main
