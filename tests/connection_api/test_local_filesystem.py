@@ -184,3 +184,110 @@ def test_toPandas(wh):
     conn = duckrun.connect(wh, schema="dbo")
     pdf = conn.sql("select name from t1 order by id").toPandas()
     assert list(pdf["name"]) == ["a", "b"]
+
+
+def test_dataframe_show(wh):
+    # .show() is the Spark print alias over the DuckDB relation: prints to stdout, returns None.
+    conn = duckrun.connect(wh, schema="dbo")
+    assert conn.sql("select * from t1 order by id").show() is None
+
+
+def test_raw_connection_escape_hatch(wh):
+    # conn.connection exposes the underlying DuckDB connection for anything the Spark surface
+    # doesn't cover — scalar queries, and reading the registered views directly.
+    conn = duckrun.connect(wh, schema="dbo")
+    assert conn.connection.execute("select 40 + 2").fetchone()[0] == 42
+    assert conn.connection.execute("select count(*) from t1").fetchone()[0] == 2
+
+
+def test_refresh_picks_up_external_writes(wh):
+    # A table created on the store after connect is invisible until refresh() re-discovers it.
+    conn = duckrun.connect(wh, schema="dbo")
+    assert "t3" not in conn.catalog.listTables()
+    _seed(wh + "/dbo/t3", "select 1 as id")
+    conn.refresh(quiet=True)
+    assert "t3" in conn.catalog.listTables()
+    assert conn.table("t3").count() == 1
+
+
+def test_reader_parquet_csv_and_table(wh, tmp_path):
+    conn = duckrun.connect(wh, schema="dbo")
+    pq = str(tmp_path / "t1.parquet")
+    csv = str(tmp_path / "t1.csv")
+    conn.connection.execute(f"COPY (select * from t1) TO '{pq}' (FORMAT parquet)")
+    conn.connection.execute(f"COPY (select * from t1) TO '{csv}' (FORMAT csv, HEADER)")
+
+    assert conn.read.parquet(pq).count() == 2
+    # csv read with an explicit option (header) routed through DataFrameReader.option.
+    assert conn.read.format("csv").option("header", True).load(csv).count() == 2
+    assert conn.read.csv(csv).count() == 2
+    # read.table is the by-name shortcut (same as conn.table).
+    assert conn.read.table("t1").count() == 2
+
+
+def test_writer_format(wh):
+    conn = duckrun.connect(wh, schema="dbo")
+    # .format('delta') is accepted (the only supported writer format)…
+    conn.sql("select 1 id").write.format("delta").mode("overwrite").saveAsTable("wf")
+    assert conn.table("wf").count() == 1
+    # …anything else is rejected up front.
+    with pytest.raises(ValueError):
+        conn.sql("select 1 id").write.format("parquet")
+
+
+def test_catalog_database_and_column_introspection(wh):
+    # A second schema folder so setCurrentDatabase / databaseExists have something to switch to.
+    _seed(wh + "/sales/orders", "select 7 as n, 'x' as label")
+    conn = duckrun.connect(wh)  # no schema → discover every schema
+
+    assert conn.catalog.databaseExists("sales") is True
+    assert conn.catalog.databaseExists("nope") is False
+    assert conn.catalog.tableExists("dbo.t1") is True
+    assert conn.catalog.tableExists("nope") is False
+    assert conn.catalog.listColumns("dbo.t1") == ["id", "name"]
+
+    conn.catalog.setCurrentDatabase("sales")
+    assert conn.catalog.currentDatabase() == "sales"
+    assert conn.catalog.tableExists("orders") is True            # resolved in the current db
+    assert conn.sql("select n from orders").fetchone()[0] == 7   # unqualified resolves to sales
+
+
+def test_delta_table_for_path_and_version(wh):
+    conn = duckrun.connect(wh, schema="dbo")
+    conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("ver")
+    path = conn.table_path("dbo", "ver")
+
+    by_name = DeltaTable.forName(conn, "dbo.ver")
+    by_path = DeltaTable.forPath(conn, path)
+    assert by_path.version() == by_name.version() == 0
+
+    conn.sql("select 2 id, 'b' v").write.mode("append").saveAsTable("ver")
+    assert DeltaTable.forPath(conn, path).version() == 1   # a new commit bumps the version
+
+
+def test_replace_where(wh):
+    # replaceWhere atomically swaps the rows matching the predicate for the source rows.
+    conn = duckrun.connect(wh, schema="dbo")
+    conn.sql("select * from (values (1,'eu'),(2,'us'),(3,'eu')) t(id, region)") \
+        .write.mode("overwrite").saveAsTable("rw")
+    new_eu = conn.sql("select 9 id, 'eu' region")
+    DeltaTable.forName(conn, "dbo.rw").replaceWhere(new_eu, "region = 'eu'")
+    assert sorted(conn.table("rw").collect()) == [(2, "us"), (9, "eu")]  # eu rows replaced, us kept
+
+
+def test_merge_update_columns_and_sync_delete(wh):
+    # whenMatchedUpdate (column-list form) + whenNotMatchedInsertAll + whenNotMatchedBySourceDelete:
+    # a full sync of the target to the source's key set.
+    conn = duckrun.connect(wh, schema="dbo")
+    conn.sql("select * from (values (1,10,'a'),(2,10,'b'),(3,10,'c')) t(id, val, note)") \
+        .write.mode("overwrite").saveAsTable("sync")
+
+    src = conn.sql("select * from (values (2,99,'X'),(4,99,'Y')) t(id, val, note)")
+    DeltaTable.forName(conn, "dbo.sync").merge(src, "target.id = source.id") \
+        .whenMatchedUpdate(set={"val": "source.val"}) \
+        .whenNotMatchedInsertAll() \
+        .whenNotMatchedBySourceDelete() \
+        .execute()
+
+    # id=2 updates val only (note 'b' preserved), id=4 inserted, ids 1 & 3 deleted (not in source).
+    assert sorted(conn.table("sync").collect()) == [(2, 99, "b"), (4, 99, "Y")]
