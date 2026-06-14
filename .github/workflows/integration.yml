@@ -5,6 +5,9 @@ name: integration tests
 #                      under tests/integration_tests/aemo/.
 #   • coffee-onelake — the connection-API coffee-shop scenario against live OneLake at a SMALL N,
 #                      at tests/connection_api/test_coffee.py. Runs automatically (gated like aemo).
+#   • sde-tutorial   — the josephmachado/simple_dbt_project port under sde_dbt_tutorial/, driven
+#                      through real dbt subprocesses. Offline/local-fs (no secrets); always runs on
+#                      push/PR.
 #
 # The SAME coffee scenario on a LOCAL warehouse at a HUGE N is its own reusable workflow now
 # (coffee-stress.yml) — a release gate in publish.yml, plus manual dispatch. The fast small-N local
@@ -18,8 +21,9 @@ name: integration tests
 # The aemo job also publishes the combined dbt-docs site to GitHub Pages: a landing page
 # (docs/site/index.html) linking the model DAGs of every integration dbt project — aemo (full catalog
 # over OneLake), merge_spill (DAG only; the 60M-row table is never built for docs, a tiny tpch parquet
-# just lets it compile) and coffee (DAG only; the dbt incarnation of the coffee-shop scenario). It
-# rebuilds when any of those projects, or the landing page, changes.
+# just lets it compile), coffee (DAG only; the dbt incarnation of the coffee-shop scenario) and
+# sde_dbt_tutorial (DAG only; the josephmachado/simple_dbt_project port — EL builds tiny raw Delta
+# tables so it can compile). It rebuilds when any of those projects, or the landing page, changes.
 on:
   push:
     branches: ["**"]
@@ -27,6 +31,7 @@ on:
       - 'tests/integration_tests/aemo/**'
       - 'tests/integration_tests/merge_spill/**'
       - 'tests/integration_tests/coffee/**'
+      - 'tests/integration_tests/sde_dbt_tutorial/**'
       - 'docs/site/**'
       - '.github/workflows/integration.yml'
   pull_request:
@@ -34,6 +39,7 @@ on:
       - 'tests/integration_tests/aemo/**'
       - 'tests/integration_tests/merge_spill/**'
       - 'tests/integration_tests/coffee/**'
+      - 'tests/integration_tests/sde_dbt_tutorial/**'
       - 'docs/site/**'
       - '.github/workflows/integration.yml'
   workflow_dispatch:
@@ -164,14 +170,34 @@ jobs:
           mkdir -p /tmp/coffee_docs_wh
           dbt docs generate --static --empty-catalog --target dev
 
+      - name: Build the sde_dbt_tutorial DAG (static, real catalog — tiny full build)
+        # The josephmachado/simple_dbt_project port. Unlike the other DAGs we can't --empty-catalog
+        # it: order_status_pivot calls dbt_utils.get_column_values('orders_obt') at parse time, so
+        # docs generate needs the gold table to actually exist. The data is tiny (~100/999/27/100
+        # rows from the vendored raw_data/ CSVs), so just do a full local build into a throwaway
+        # warehouse — that also yields a real catalog with column metadata. deps is required because
+        # dbt_packages is gitignored (not in the checkout).
+        working-directory: tests/integration_tests/sde_dbt_tutorial
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/sde_dbt_tutorial
+          DUCKRUN_WAREHOUSE: /tmp/sde_docs_wh
+        run: |
+          mkdir -p /tmp/sde_docs_wh
+          python el/extract_load_pipeline.py
+          dbt deps --target dev
+          dbt seed --target dev
+          dbt build --target dev
+          dbt docs generate --static --target dev
+
       - name: Assemble the combined docs site (landing page + per-project DAGs)
         working-directory: ${{ github.workspace }}
         run: |
           mkdir -p dbt-docs-site
           cp docs/site/index.html dbt-docs-site/index.html
-          cp tests/integration_tests/aemo/target/static_index.html        dbt-docs-site/aemo.html
-          cp tests/integration_tests/merge_spill/target/static_index.html dbt-docs-site/merge_spill.html
-          cp tests/integration_tests/coffee/target/static_index.html      dbt-docs-site/coffee.html
+          cp tests/integration_tests/aemo/target/static_index.html             dbt-docs-site/aemo.html
+          cp tests/integration_tests/merge_spill/target/static_index.html      dbt-docs-site/merge_spill.html
+          cp tests/integration_tests/coffee/target/static_index.html           dbt-docs-site/coffee.html
+          cp tests/integration_tests/sde_dbt_tutorial/target/static_index.html dbt-docs-site/sde_dbt_tutorial.html
 
       - name: Upload docs as a build artifact (available on every run)
         uses: actions/upload-artifact@v4
@@ -248,3 +274,25 @@ jobs:
 
       - name: Run the coffee-shop scenario against OneLake (small N)
         run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
+
+  sde-tutorial:
+    # The josephmachado/simple_dbt_project port (tests/integration_tests/sde_dbt_tutorial/), driven
+    # through REAL dbt subprocesses (one process per phase) so the SCD2 snapshot + merge-incremental
+    # behave as in production. Fully offline/local-fs — the EL pipeline reads the vendored raw_data/
+    # CSVs and writes a local Delta warehouse; only `dbt deps` touches the network (dbt Hub, no creds).
+    # Deterministic, so it always runs on push/PR (unlike the live-OneLake aemo/coffee jobs above);
+    # it is not part of the workflow_dispatch scenario menu.
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
+        run: pip install -e ".[test]"
+
+      - name: Run the sde_dbt_tutorial end-to-end port (two-phase real dbt run)
+        run: python -m pytest tests/integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py -q -p no:cacheprovider

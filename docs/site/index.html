@@ -45,11 +45,18 @@
       https, dedup the SCD2 product dim, generate an N-row fact partitioned by region, and a revenue
       mart. DAG only (the fact isn't built for docs).</span>
     </li>
+    <li>
+      <a href="sde_dbt_tutorial.html">sde_dbt_tutorial</a>
+      <span class="desc">The <code>josephmachado/simple_dbt_project</code> port (<code>sde_dbt_tutorial</code>):
+      raw application tables → bronze typing → a Delta-backed SCD2 snapshot of the customer dim → a
+      merge-incremental clickstream fact → the <code>orders_obt</code> gold mart joined through the
+      SCD2 validity window. DAG only.</span>
+    </li>
   </ul>
 
   <footer>
-    Rebuilt on every push to <code>main</code> that touches the <code>aemo</code> or <code>merge_spill</code>
-    projects, by the <code>integration tests</code> workflow.
+    Rebuilt on every push to <code>main</code> that touches one of the integration dbt projects,
+    by the <code>integration tests</code> workflow.
   </footer>
 </body>
 </html>
