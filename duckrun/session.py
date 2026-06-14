@@ -214,13 +214,13 @@ class DuckSession:
         free — ``conn.sql("from delta_scan('path', version => 0)")``).
 
         Delta **DML** is applied to the Delta table via delta_rs (works local AND on OneLake):
-        ``create table … as select`` (overwrite), ``insert into … select`` (append),
-        ``delete``/``update`` (delta_rs delete/update), ``alter table … add column``, and
+        ``create table … as select`` (overwrite), ``insert into … select``/``insert into … values``
+        (append), ``delete``/``update`` (delta_rs delete/update), ``alter table … add column``, and
         ``drop table`` (tombstone — marks the table dropped without deleting data; a human purges
         the files). After a DML statement the catalog is refreshed.
 
-        ``merge`` and ``insert … values`` aren't expressible via delta_rs DML here — use the
-        Spark write surface instead: ``df.write.saveAsTable(...)`` or
+        ``merge`` isn't expressible via delta_rs DML here — use the Spark write surface instead:
+        ``df.write.saveAsTable(...)`` or
         ``conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()``.
         ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
         """
@@ -230,7 +230,7 @@ class DuckSession:
             return DataFrame(self.con.sql("SELECT 'ok' AS status"), self)
         if _is_delta_write(query):
             raise ValueError(
-                "conn.sql() can't run this write via delta_rs (merge / insert…values). "
+                "conn.sql() can't run a SQL MERGE via delta_rs. "
                 "Use the Spark write API: df.write.saveAsTable(...) to create/append, or "
                 "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
             )

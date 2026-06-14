@@ -310,20 +310,24 @@ def test_sql_dml_applied_to_delta(wh):
     conn.sql("insert into items select * from (values (4,'d')) t(id, name)")
     assert conn.table("items").count() == 4
 
+    conn.sql("insert into items values (5, 'e')")                # literal VALUES, not just select
+    assert conn.table("items").count() == 5
+    assert q("select name from items where id = 5") == "e"
+
     conn.sql("update items set name = 'Z' where id = 1")
     assert q("select name from items where id = 1") == "Z"
 
     conn.sql("delete from items where id = 2")
-    assert conn.table("items").count() == 3
+    assert conn.table("items").count() == 4                     # ids 1,3,4,5 remain
     assert q("select count(*) from items where id = 2") == 0
 
     conn.sql("alter table items add column qty integer")
     assert "qty" in conn.sql("select * from items").columns
-    assert q("select count(*) from items where qty is null") == 3
+    assert q("select count(*) from items where qty is null") == 4
 
     assert deltalake.DeltaTable(path).version() >= 4           # all of the above were Delta commits
     # a fresh connection sees the same persisted state
-    assert duckrun.connect(wh, schema="dbo").table("items").count() == 3
+    assert duckrun.connect(wh, schema="dbo").table("items").count() == 4
 
 
 def test_sql_drop_tombstones_without_deleting_data(wh):

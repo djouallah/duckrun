@@ -284,9 +284,9 @@ class TestDeltaTable:
 
 class TestSqlDml:
     """conn.sql(): reads (incl. version-pinned delta_scan) pass through, and Delta DML is applied
-    via delta_rs — create-as / insert-select / update / delete / alter-add, and drop (a tombstone:
-    no data deleted). merge / insert…values aren't expressible as delta_rs DML and are directed to
-    the Spark write API."""
+    via delta_rs — create-as / insert-select / insert-values / update / delete / alter-add, and drop
+    (a tombstone: no data deleted). Only a SQL merge isn't expressible as delta_rs DML and is
+    directed to the Spark write API."""
 
     def test_select_passthrough(self, conn):
         assert conn.sql("SELECT 1").fetchall() == [(1,)]
@@ -307,6 +307,17 @@ class TestSqlDml:
         conn.sql("insert into src select * from (values (9,'z')) t(id, name)")
         assert conn.table("src").count() == 4
 
+    def test_sql_insert_values(self, conn):
+        conn.sql("insert into src values (9, 'z')")
+        assert conn.table("src").count() == 4
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
+
+    def test_sql_insert_values_named_subset(self, conn):
+        # explicit column list → unsupplied target columns are filled with NULL (schema-fill, not
+        # positional luck).
+        conn.sql("insert into src (id) values (9)")
+        assert conn.sql("select name from src where id = 9").fetchone()[0] is None
+
     def test_sql_update(self, conn):
         conn.sql("update src set name = 'Z' where id = 1")
         assert conn.sql("select name from src where id = 1").fetchone()[0] == "Z"
@@ -324,11 +335,7 @@ class TestSqlDml:
         conn.sql("drop table src")
         assert "src" not in conn.catalog.listTables()
 
-    @pytest.mark.parametrize("stmt", [
-        "INSERT INTO src VALUES (9, 'z')",
-        "MERGE INTO src USING src s ON src.id = s.id WHEN MATCHED THEN DELETE",
-    ])
-    def test_sql_unsupported_write_rejected(self, conn, stmt):
-        # merge / insert…values can't be expressed as delta_rs DML → directed to the write API.
+    def test_sql_merge_rejected(self, conn):
+        # a SQL merge can't be expressed as delta_rs DML → directed to the .merge() builder.
         with pytest.raises(ValueError):
-            conn.sql(stmt)
+            conn.sql("MERGE INTO src USING src s ON src.id = s.id WHEN MATCHED THEN DELETE")

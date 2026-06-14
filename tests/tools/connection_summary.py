@@ -25,7 +25,7 @@ GROUPS = [
     ("TestDataFrameReader", "DataFrameReader (read)"),
     ("TestDataFrameWriter", "DataFrameWriter (write)"),
     ("TestDeltaTable", "DeltaTable (merge / delete / update / replaceWhere)"),
-    ("TestSqlReadOnly", "sql() — read-only"),
+    ("TestSqlDml", "sql() — reads + Delta DML"),
 ]
 _EMOJI = {"passed": "✅", "failed": "❌", "error": "💥", "skipped": "⏭️"}
 
@@ -33,7 +33,7 @@ _EMOJI = {"passed": "✅", "failed": "❌", "error": "💥", "skipped": "⏭️"
 SHORT = {
     "TestSession": "DuckSession", "TestCatalog": "Catalog", "TestDataFrame": "DataFrame",
     "TestDataFrameReader": "DataFrameReader", "TestDataFrameWriter": "DataFrameWriter",
-    "TestDeltaTable": "DeltaTable", "TestSqlReadOnly": "sql()",
+    "TestDeltaTable": "DeltaTable", "TestSqlDml": "sql()",
 }
 
 # Which established API each method mirrors, so a reader can tell what's a real Spark/Delta method
@@ -76,6 +76,8 @@ def _label(test: str) -> str:
         return "SELECT (passthrough)"
     if test == "version_pinned_read":
         return "version-pinned read"
+    if test.startswith("sql_insert_values"):  # _insert_values / _insert_values_named_subset → one method
+        return "insert…values"
     if test.startswith("sql_"):
         return {
             "sql_create_table_as": "create table as",
@@ -84,7 +86,7 @@ def _label(test: str) -> str:
             "sql_delete": "delete",
             "sql_alter_add_column": "alter add column",
             "sql_drop_tombstone": "drop (tombstone)",
-            "sql_unsupported_write_rejected": "write guard (merge/insert…values)",
+            "sql_merge_rejected": "merge guard (→ builder)",
         }.get(test, test)
     if test == "update_only_rejected":
         return "merge"

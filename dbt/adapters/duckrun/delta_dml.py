@@ -20,9 +20,12 @@ data: delta_rs has no drop, and removing the Delta files would be a filesystem h
 object stores. The directory persists until a human purges it; a later ``create table ... as``
 overwrites the tombstone with real data and the table is live again.
 
-The seed loader's own SQL (``create table <t> (<col defs>)``, ``insert ... values``, ``COPY``) does
-not match these forms and is never intercepted; duckrun's own materializations emit ``create ...
-view`` (not ``table``), so they pass through untouched too.
+The seed loader's own SQL (``create table <t> (<col defs>)``, ``insert ... values``, ``COPY``) lands
+on a native DuckDB table, not a Delta table: ``create table (<col defs>)`` doesn't match the
+``... as select`` form, and while ``insert ... values`` now *does* match a form here, the mutate
+guard only applies it when a Delta table already exists at the target — the seed's native table has
+none, so it falls through untouched. duckrun's own materializations emit ``create ... view`` (not
+``table``), so they pass through too.
 """
 import re
 from typing import List, Optional, Tuple
@@ -61,6 +64,10 @@ _CREATE_AS = re.compile(
 )
 _INSERT_SELECT = re.compile(
     r"\s*insert\s+into\s+(?P<rel>.+?)\s+(?P<body>select\b.*)", re.I | re.S
+)
+_INSERT_VALUES = re.compile(
+    r"\s*insert\s+into\s+(?P<rel>.+?)\s*(?:\((?P<cols>[^)]*)\))?\s*values\s+(?P<body>\(.+)",
+    re.I | re.S,
 )
 _DELETE = re.compile(
     r"\s*delete\s+from\s+(?P<rel>.+?)(?:\s+where\s+(?P<where>.+))?\s*;?\s*", re.I | re.S
@@ -151,6 +158,9 @@ class _DeltaDML:
         m = _fullmatch(_INSERT_SELECT, sql)
         if m:
             return self._mutate(m, self._insert_select)
+        m = _fullmatch(_INSERT_VALUES, sql)
+        if m:
+            return self._mutate(m, self._insert_values)
         m = _fullmatch(_DELETE, sql)
         if m:
             return self._mutate(m, self._delete)
@@ -204,6 +214,33 @@ class _DeltaDML:
 
     def _insert_select(self, m, rel, schema, loc) -> None:
         data = self.cursor.sql(m.group("body"))
+        engine.write_delta(loc, data, "append", storage_options=self.so)
+
+    def _insert_values(self, m, rel, schema, loc) -> None:
+        # `insert into <rel> [(<cols>)] values (...)`: evaluate the VALUES tuples through DuckDB and
+        # project them onto the FULL target Delta schema (so append schemas match) — supplied columns
+        # come from the literals, any unsupplied target column is filled with a typed NULL.
+        loc_sql = loc.replace("'", "''")
+        template = self.cursor.sql(f"select * from delta_scan('{loc_sql}') limit 0")
+        target_cols = list(template.columns)
+        target_types = [str(t) for t in template.types]
+        by_lower = {c.lower(): c for c in target_cols}
+
+        cols = m.group("cols")
+        if cols:  # explicit column list → canonicalize to the target's casing
+            provided = [by_lower.get(c.strip().strip('"').lower(), c.strip().strip('"'))
+                        for c in cols.split(",")]
+        else:  # positional → the literals supply every target column, in order
+            provided = target_cols
+        provided_set = {c for c in provided}
+
+        quoted = ", ".join('"' + c + '"' for c in provided)
+        inner = f"(values {m.group('body')}) v({quoted})"
+        exprs = [
+            f'v."{col}"' if col in provided_set else f'cast(null as {typ}) as "{col}"'
+            for col, typ in zip(target_cols, target_types)
+        ]
+        data = self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
         engine.write_delta(loc, data, "append", storage_options=self.so)
 
     def _alter_add(self, m, rel, schema, loc) -> None:
