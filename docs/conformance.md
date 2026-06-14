@@ -25,10 +25,10 @@ Every still-failing test in the card below falls into one of three categories:
 ## dbt adapter conformance — duckrun
 
 ```
-┌────────────────────────────────────────────────────────┐
-│ ✅ 120 passed   ❌ 10 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 89% passing                                │
-└────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│ ✅ 121 passed   ❌ 9 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 90% passing                               │
+└───────────────────────────────────────────────────────┘
 ```
 
 ### By suite
@@ -37,6 +37,7 @@ Every still-failing test in the card below falls into one of three categories:
 | --- | --- | ---: | ---: | ---: | ---: | ---: |
 | `aliases` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `caching` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
+| `changing_relation_type` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `concurrency` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `empty` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `ephemeral` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
@@ -50,8 +51,7 @@ Every still-failing test in the card below falls into one of three categories:
 | `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
 | `incremental` | `████████░░` 81% | 21 | 5 | 0 | 0 | 26 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
-| `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `█████████░` **89%** | **120** | **10** | **0** | **5** | **135** |
+| **Total** | `█████████░` **90%** | **121** | **9** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -80,13 +80,6 @@ Every still-failing test in the card below falls into one of three categories:
 
 ### Not passing — details by suite
 
-<details><summary><b>changing_relation_type</b> — 1 not passing (0/1 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestChangeRelationTypesDuckDB::test_changing_materialization_changes_relation_type` | AssertionError: dbt exit state did not match expected |
-
-</details>
 <details><summary><b>incremental</b> — 5 not passing (21/26 pass)</summary>
 
 | Outcome | Test | Message |
@@ -111,7 +104,7 @@ Every still-failing test in the card below falls into one of three categories:
 
 | Outcome | Test | Message |
 | --- | --- | --- |
-| ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
+| ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: Got an unexpected relation type of table for relation swappable, expected view |
 
 </details>
 
