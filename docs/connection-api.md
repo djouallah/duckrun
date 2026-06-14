@@ -38,10 +38,10 @@ The card below — every public method with a ✅ — is regenerated on every pu
 ## duckrun connection API — method scorecard
 
 ```
-┌──────────────────────────┐
-│ ✅ 41 passed   ❌ 1 failed │
-│ 42 methods · 98% passing │
-└──────────────────────────┘
+┌───────────────────────────┐
+│ ✅ 48 passed   ❌ 0 failed  │
+│ 48 methods · 100% passing │
+└───────────────────────────┘
 ```
 
 ### Spark / Delta-on-Spark API — 33/33 ✅
@@ -57,7 +57,7 @@ The card below — every public method with a ✅ — is regenerated on every pu
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `partitionBy`, `format` | 5/5 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `merge`, `version`, `delete`, `update`, `replaceWhere` | 7/7 ✅ |
 
-### duckrun-specific helpers — 8/9 ✅
+### duckrun-specific helpers — 15/15 ✅
 
 > Conveniences with no Spark equivalent (session plumbing + two shortcuts).
 
@@ -69,8 +69,14 @@ The card below — every public method with a ✅ — is regenerated on every pu
 | `table_path` | `DuckSession` | ✅ |
 | `__getattr__` | `DataFrame` | ✅ |
 | `delta` | `DataFrameReader` | ✅ |
-| `SELECT (passthrough)` | `sql()` | ✅ |
-| `version-pinned read` | `sql()` | ✅ |
-| `read-only guard` | `sql()` | ❌ |
+| `SELECT (passthrough)` | `TestSqlDml` | ✅ |
+| `version-pinned read` | `TestSqlDml` | ✅ |
+| `create table as` | `TestSqlDml` | ✅ |
+| `insert…select` | `TestSqlDml` | ✅ |
+| `update` | `TestSqlDml` | ✅ |
+| `delete` | `TestSqlDml` | ✅ |
+| `alter add column` | `TestSqlDml` | ✅ |
+| `drop (tombstone)` | `TestSqlDml` | ✅ |
+| `write guard (merge/insert…values)` | `TestSqlDml` | ✅ |
 
 <!-- CONNECTION_API:END -->
