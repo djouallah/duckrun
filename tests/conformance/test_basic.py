@@ -24,7 +24,27 @@ from dbt.tests.adapter.basic.expected_catalog import (
     no_stats,
     expected_references_catalog,
 )
-from dbt.tests.util import run_dbt
+from dbt.tests.util import AnyInteger, AnyString, run_dbt
+
+
+def duckrun_table_stats():
+    """The stats duckrun publishes for a Delta-backed (table-materialized) model — see
+    DuckrunAdapter._with_delta_stats / issue #3. Unlike dbt-duckdb (which emits no stats, hence the
+    vendored no_stats()), duckrun reads row count / on-disk bytes / last-commit time from the Delta
+    log. Sizes and the commit timestamp vary per run, so assert them with dbt's Any* matchers."""
+    def _item(id_, label, value, description):
+        return {"id": id_, "label": label, "value": value,
+                "description": description, "include": True}
+    return {
+        "num_rows": _item("num_rows", "Row Count", AnyInteger(), "Number of rows in the table"),
+        "bytes": _item("bytes", "Approximate Size", AnyInteger(),
+                       "Approximate size of the table on disk (bytes)"),
+        "last_modified": _item("last_modified", "Last Modified", AnyString(),
+                               "Time of the most recent Delta commit (UTC)"),
+        "has_stats": {"id": "has_stats", "label": "Has Stats?", "value": True,
+                      "description": "Indicates whether there are statistics for this table",
+                      "include": False},
+    }
 
 
 catalog_relations_alpha_model_sql = """
@@ -176,7 +196,11 @@ class TestDocsGenReferencesDuckDB(BaseDocsGenReferences):
             time_type="TIMESTAMP",
             view_type="VIEW",
             table_type="BASE TABLE",
-            model_stats=no_stats(),
+            # ephemeral_summary is materialized='table' -> a Delta table -> duckrun publishes stats.
+            # view_summary (a view) and the seed/source (native, not Delta-backed) stay statless.
+            model_stats=duckrun_table_stats(),
+            seed_stats=no_stats(),
+            view_summary_stats=no_stats(),
             bigint_type="BIGINT",
         )
 

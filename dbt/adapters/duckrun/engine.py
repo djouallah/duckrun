@@ -536,6 +536,37 @@ def table_exists(path: str, storage_options: Optional[Dict[str, str]] = None) ->
         return False
 
 
+def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None):
+    """Cheap table statistics for ``dbt docs generate``, read from the Delta **log** (no data scan).
+
+    ``DeltaTable.get_add_actions()`` carries per-file ``num_records`` / ``size_bytes`` /
+    ``modification_time``; summing rows+bytes and taking the latest mtime gives the whole table's
+    stats without opening any data file. Aggregation goes through the DuckDB cursor (``cur``) via a
+    replacement scan over the arro3 table — no pyarrow dependency.
+
+    Returns ``{"num_rows", "num_bytes", "last_modified"}`` (last_modified = epoch milliseconds), or
+    ``None`` on ANY failure (a drop-tombstone, a missing table, an unreachable/credential-less remote
+    store). Best-effort by design: a statless catalog is fine, but a docs build must never break.
+    """
+    try:
+        add_actions = _delta_table(path, storage_options).get_add_actions()  # noqa: F841 (replacement scan)
+        row = cur.sql(
+            "select coalesce(sum(num_records), 0)::bigint, "
+            "coalesce(sum(size_bytes), 0)::bigint, "
+            "max(modification_time)::bigint from add_actions"
+        ).fetchone()
+    except Exception as exc:  # best-effort: docs stats must never fail catalog generation
+        logger.debug(f"duckrun: no Delta stats for {path!r}: {exc}")
+        return None
+    if row is None:
+        return None
+    return {
+        "num_rows": int(row[0]),
+        "bytes": int(row[1]),
+        "last_modified": int(row[2]) if row[2] is not None else None,
+    }
+
+
 # Delta column-metadata key under which we stash a dbt column description, and the dollar-quote
 # label used to embed arbitrary comment text (newlines, quotes, dollar signs) in COMMENT ON SQL.
 _DELTA_COMMENT_KEY = "comment"

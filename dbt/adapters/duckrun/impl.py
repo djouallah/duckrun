@@ -285,3 +285,71 @@ class DuckrunAdapter(DuckDBAdapter):
         ]
         merged.extend(discovered)
         return merged
+
+    # --- dbt docs: table stats from the Delta log -------------------------------------------------
+    # The stock catalog query (duckrun__get_catalog) emits only column metadata, so dbt-docs shows an
+    # empty Stats panel (issue #3). dbt assembles the panel from columns named
+    # stats:<key>:{label,value,description,include}; we enrich the catalog agate table with those,
+    # sourced from each relation's Delta log (engine.delta_stats — no data scan). Done in Python here
+    # rather than in SQL because byte size / last-modified live in the Delta log, not DuckDB metadata.
+    _STATS_SPEC = (
+        ("num_rows", "Row Count", "Number of rows in the table"),
+        ("bytes", "Approximate Size", "Approximate size of the table on disk (bytes)"),
+        ("last_modified", "Last Modified", "Time of the most recent Delta commit (UTC)"),
+    )
+
+    def get_catalog(self, *args, **kwargs):
+        table, exceptions = super().get_catalog(*args, **kwargs)
+        return self._with_delta_stats(table), exceptions
+
+    def get_catalog_by_relations(self, *args, **kwargs):
+        table, exceptions = super().get_catalog_by_relations(*args, **kwargs)
+        return self._with_delta_stats(table), exceptions
+
+    def _with_delta_stats(self, table):
+        """Return ``table`` with stats:* columns appended, sourced per-relation from the Delta log.
+
+        A relation with no Delta table at ``root_path/schema/name`` (a native ``view``, a
+        drop-tombstone) gets ``include=False`` stats, so dbt leaves it statless. Best-effort: if
+        anything goes wrong the original table is returned unchanged — docs must never break.
+        """
+        from datetime import datetime, timezone
+        from dbt_common.clients.agate_helper import table_from_data_flat
+        from . import engine
+
+        root_path = getattr(self.config.credentials, "root_path", "") or ""
+        if not root_path or len(table.rows) == 0:
+            return table
+        so = getattr(self.config.credentials, "storage_options", None)
+        cur = self._cursor()
+
+        cache = {}
+
+        def stats_for(schema, name):
+            key = (schema, name)
+            if key not in cache:
+                loc = (root_path.rstrip("/") + "/" + str(schema).strip('"')
+                       + "/" + str(name).strip('"'))
+                cache[key] = (None if delta_dml.is_dropped(cur, loc, so)
+                              else engine.delta_stats(cur, loc, so))
+            return cache[key]
+
+        cols = list(table.column_names)
+        stat_cols = [f"stats:{k}:{p}" for k, _, _ in self._STATS_SPEC
+                     for p in ("label", "value", "description", "include")]
+        rows = []
+        for r in table.rows:
+            d = dict(zip(cols, r))
+            st = stats_for(d.get("table_schema"), d.get("table_name"))
+            for k, label, desc in self._STATS_SPEC:
+                present = st is not None and st.get(k) is not None
+                if k == "last_modified" and present:
+                    val = datetime.fromtimestamp(st[k] / 1000, tz=timezone.utc).isoformat()
+                else:
+                    val = st.get(k) if present else None
+                d[f"stats:{k}:label"] = label
+                d[f"stats:{k}:value"] = val
+                d[f"stats:{k}:description"] = desc
+                d[f"stats:{k}:include"] = bool(present)
+            rows.append(d)
+        return table_from_data_flat(rows, cols + stat_cols)
