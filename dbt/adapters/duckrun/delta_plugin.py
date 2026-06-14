@@ -156,11 +156,22 @@ class Plugin(BasePlugin):
         # Table-like (non-incremental) models always overwrite. Incremental models
         # overwrite on first run / full-refresh, then apply the incremental strategy.
         if not incremental or full_refresh or not exists:
+            # This branch is a CREATE OR REPLACE: a table model, a --full-refresh, or a first run.
+            # When we are REPLACING an existing table (exists), allow delta_rs to replace the schema
+            # wholesale (schema_mode="overwrite") — the model SQL defines the new schema, exactly as
+            # `CREATE OR REPLACE TABLE` does on every other warehouse. Without it, delta_rs's strict
+            # overwrite keeps the OLD schema/protocol and so can't change a column's type or write a
+            # column needing a new writer feature the old table lacks (e.g. retyping to ::timestamp /
+            # timestampNtz). This is scoped to the full-rebuild replace ONLY — NOT append, safeappend,
+            # merge, or microbatch, which must keep their strict, schema-stable writes. A fresh create
+            # (not exists) doesn't need it. A user's explicit merge_schema still wins.
+            overwrite_schema = exists and not merge_schema
             with engine.mem_profile("overwrite", con=cur):
                 engine.write_delta(
                     path, data, "overwrite",
                     partition_by=partition_by,
                     merge_schema=merge_schema,
+                    overwrite_schema=overwrite_schema,
                     storage_options=storage_options,
                     compaction_threshold=self._compaction_threshold,
                 )
