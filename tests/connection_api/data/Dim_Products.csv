@@ -1,0 +1,27 @@
+record_id,product_id,name,category,subcategory,standard_cost,standard_price,from_date,to_date
+1,1,Latte,Hot,Coffee,2,4.5,2022-01-01,2023-02-28
+2,2,Cappuccino,Hot,Coffee,2.3,4.9,2022-01-01,2023-02-28
+3,3,Macchiato,Hot,Coffee,2.2,4,2022-01-01,2023-02-28
+4,4,Americano,Hot,Coffee,1.5,4.4,2022-01-01,2023-02-28
+5,5,Iced Latte,Cold,Coffee,2.9,5.5,2022-01-01,2023-02-28
+6,6,Frappe,Cold,Coffee,3.1,5.9,2022-01-01,2023-02-28
+7,7,Chamomile,Hot,Tea,0.5,3.5,2022-01-01,2023-02-28
+8,8,Green,Hot,Tea,0.7,3.1,2022-01-01,2023-02-28
+9,9,Chai,Hot,Tea,0.5,3.2,2022-01-01,2023-02-28
+10,10,Black,Hot,Tea,0.3,3,2022-01-01,2023-02-28
+11,11,Biscotti,Shelf,Pastries,1.2,3.9,2022-01-01,2023-02-28
+12,12,Pumpkin Bread,Baked,Pastries,2.5,3.95,2022-01-01,2023-02-28
+13,13,Chocolate Chip Cookies,Baked,Pastries,0.8,3.3,2022-01-01,2023-02-28
+14,1,Latte,Hot,Coffee,2.2,5.5,2023-03-01,2024-12-31
+15,2,Cappuccino,Hot,Coffee,2.4,5.9,2023-03-01,2024-12-31
+16,3,Macchiato,Hot,Coffee,2.6,4.7,2023-03-01,2024-12-31
+17,4,Americano,Hot,Coffee,1.7,4.9,2023-03-01,2024-12-31
+18,5,Iced Latte,Cold,Coffee,3.5,6.1,2023-03-01,2024-12-31
+19,6,Frappe,Cold,Coffee,3.3,6.3,2023-03-01,2024-12-31
+20,7,Chamomile,Hot,Tea,0.9,4.5,2023-03-01,2024-12-31
+21,8,Green,Hot,Tea,1.5,3.9,2023-03-01,2024-12-31
+22,9,Chai,Hot,Tea,0.9,3.4,2023-03-01,2024-12-31
+23,10,Black,Hot,Tea,0.9,3.9,2023-03-01,2024-12-31
+24,11,Biscotti,Shelf,Pastries,0.8,4.7,2023-03-01,2024-12-31
+25,12,Pumpkin Bread,Baked,Pastries,2.2,4.6,2023-03-01,2024-12-31
+26,13,Chocolate Chip Cookies,Baked,Pastries,0.7,3.7,2023-03-01,2024-12-31

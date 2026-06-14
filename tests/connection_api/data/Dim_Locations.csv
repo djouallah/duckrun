@@ -1,0 +1,1001 @@
+record_id,location_id,city,state,country,region
+1,AUSTX01,Austin,TX,USA,South
+2,HOUTX01,Houston,TX,USA,South
+3,CHATX01,Charlotte,NC,USA,Southeast
+4,LASTX01,Los Angeles,CA,USA,West
+5,AUSTX02,Austin,TX,USA,South
+6,HOUTX02,Houston,TX,USA,South
+7,CHATX02,Charlotte,NC,USA,Southeast
+8,LASTX02,Los Angeles,CA,USA,West
+9,AUSTX03,Austin,TX,USA,South
+10,HOUTX03,Houston,TX,USA,South
+11,CHATX03,Charlotte,NC,USA,Southeast
+12,LASTX03,Los Angeles,CA,USA,West
+13,AUSTX04,Austin,TX,USA,South
+14,HOUTX04,Houston,TX,USA,South
+15,CHATX04,Charlotte,NC,USA,Southeast
+16,LASTX04,Los Angeles,CA,USA,West
+17,AUSTX05,Austin,TX,USA,South
+18,HOUTX05,Houston,TX,USA,South
+19,CHATX05,Charlotte,NC,USA,Southeast
+20,LASTX05,Los Angeles,CA,USA,West
+21,AUSTX06,Austin,TX,USA,South
+22,HOUTX06,Houston,TX,USA,South
+23,CHATX06,Charlotte,NC,USA,Southeast
+24,LASTX06,Los Angeles,CA,USA,West
+25,AUSTX07,Austin,TX,USA,South
+26,HOUTX07,Houston,TX,USA,South
+27,CHATX07,Charlotte,NC,USA,Southeast
+28,LASTX07,Los Angeles,CA,USA,West
+29,AUSTX08,Austin,TX,USA,South
+30,HOUTX08,Houston,TX,USA,South
+31,CHATX08,Charlotte,NC,USA,Southeast
+32,LASTX08,Los Angeles,CA,USA,West
+33,AUSTX09,Austin,TX,USA,South
+34,HOUTX09,Houston,TX,USA,South
+35,CHATX09,Charlotte,NC,USA,Southeast
+36,LASTX09,Los Angeles,CA,USA,West
+37,AUSTX10,Austin,TX,USA,South
+38,HOUTX10,Houston,TX,USA,South
+39,CHATX10,Charlotte,NC,USA,Southeast
+40,LASTX10,Los Angeles,CA,USA,West
+41,AUSTX11,Austin,TX,USA,South
+42,HOUTX11,Houston,TX,USA,South
+43,CHATX11,Charlotte,NC,USA,Southeast
+44,LASTX11,Los Angeles,CA,USA,West
+45,AUSTX12,Austin,TX,USA,South
+46,HOUTX12,Houston,TX,USA,South
+47,CHATX12,Charlotte,NC,USA,Southeast
+48,LASTX12,Los Angeles,CA,USA,West
+49,AUSTX13,Austin,TX,USA,South
+50,HOUTX13,Houston,TX,USA,South
+51,CHATX13,Charlotte,NC,USA,Southeast
+52,LASTX13,Los Angeles,CA,USA,West
+53,AUSTX14,Austin,TX,USA,South
+54,HOUTX14,Houston,TX,USA,South
+55,CHATX14,Charlotte,NC,USA,Southeast
+56,LASTX14,Los Angeles,CA,USA,West
+57,AUSTX15,Austin,TX,USA,South
+58,HOUTX15,Houston,TX,USA,South
+59,CHATX15,Charlotte,NC,USA,Southeast
+60,LASTX15,Los Angeles,CA,USA,West
+61,AUSTX16,Austin,TX,USA,South
+62,HOUTX16,Houston,TX,USA,South
+63,CHATX16,Charlotte,NC,USA,Southeast
+64,LASTX16,Los Angeles,CA,USA,West
+65,AUSTX17,Austin,TX,USA,South
+66,HOUTX17,Houston,TX,USA,South
+67,CHATX17,Charlotte,NC,USA,Southeast
+68,LASTX17,Los Angeles,CA,USA,West
+69,AUSTX18,Austin,TX,USA,South
+70,HOUTX18,Houston,TX,USA,South
+71,CHATX18,Charlotte,NC,USA,Southeast
+72,LASTX18,Los Angeles,CA,USA,West
+73,AUSTX19,Austin,TX,USA,South
+74,HOUTX19,Houston,TX,USA,South
+75,CHATX19,Charlotte,NC,USA,Southeast
+76,LASTX19,Los Angeles,CA,USA,West
+77,AUSTX20,Austin,TX,USA,South
+78,HOUTX20,Houston,TX,USA,South
+79,CHATX20,Charlotte,NC,USA,Southeast
+80,LASTX20,Los Angeles,CA,USA,West
+81,AUSTX21,Austin,TX,USA,South
+82,HOUTX21,Houston,TX,USA,South
+83,CHATX21,Charlotte,NC,USA,Southeast
+84,LASTX21,Los Angeles,CA,USA,West
+85,AUSTX22,Austin,TX,USA,South
+86,HOUTX22,Houston,TX,USA,South
+87,CHATX22,Charlotte,NC,USA,Southeast
+88,LASTX22,Los Angeles,CA,USA,West
+89,AUSTX23,Austin,TX,USA,South
+90,HOUTX23,Houston,TX,USA,South
+91,CHATX23,Charlotte,NC,USA,Southeast
+92,LASTX23,Los Angeles,CA,USA,West
+93,AUSTX24,Austin,TX,USA,South
+94,HOUTX24,Houston,TX,USA,South
+95,CHATX24,Charlotte,NC,USA,Southeast
+96,LASTX24,Los Angeles,CA,USA,West
+97,AUSTX25,Austin,TX,USA,South
+98,HOUTX25,Houston,TX,USA,South
+99,CHATX25,Charlotte,NC,USA,Southeast
+100,LASTX25,Los Angeles,CA,USA,West
+101,AUSTX26,Austin,TX,USA,South
+102,HOUTX26,Houston,TX,USA,South
+103,CHATX26,Charlotte,NC,USA,Southeast
+104,LASTX26,Los Angeles,CA,USA,West
+105,AUSTX27,Austin,TX,USA,South
+106,HOUTX27,Houston,TX,USA,South
+107,CHATX27,Charlotte,NC,USA,Southeast
+108,LASTX27,Los Angeles,CA,USA,West
+109,AUSTX28,Austin,TX,USA,South
+110,HOUTX28,Houston,TX,USA,South
+111,CHATX28,Charlotte,NC,USA,Southeast
+112,LASTX28,Los Angeles,CA,USA,West
+113,AUSTX29,Austin,TX,USA,South
+114,HOUTX29,Houston,TX,USA,South
+115,CHATX29,Charlotte,NC,USA,Southeast
+116,LASTX29,Los Angeles,CA,USA,West
+117,AUSTX30,Austin,TX,USA,South
+118,HOUTX30,Houston,TX,USA,South
+119,CHATX30,Charlotte,NC,USA,Southeast
+120,LASTX30,Los Angeles,CA,USA,West
+121,AUSTX31,Austin,TX,USA,South
+122,HOUTX31,Houston,TX,USA,South
+123,CHATX31,Charlotte,NC,USA,Southeast
+124,LASTX31,Los Angeles,CA,USA,West
+125,AUSTX32,Austin,TX,USA,South
+126,HOUTX32,Houston,TX,USA,South
+127,CHATX32,Charlotte,NC,USA,Southeast
+128,LASTX32,Los Angeles,CA,USA,West
+129,AUSTX33,Austin,TX,USA,South
+130,HOUTX33,Houston,TX,USA,South
+131,CHATX33,Charlotte,NC,USA,Southeast
+132,LASTX33,Los Angeles,CA,USA,West
+133,AUSTX34,Austin,TX,USA,South
+134,HOUTX34,Houston,TX,USA,South
+135,CHATX34,Charlotte,NC,USA,Southeast
+136,LASTX34,Los Angeles,CA,USA,West
+137,AUSTX35,Austin,TX,USA,South
+138,HOUTX35,Houston,TX,USA,South
+139,CHATX35,Charlotte,NC,USA,Southeast
+140,LASTX35,Los Angeles,CA,USA,West
+141,AUSTX36,Austin,TX,USA,South
+142,HOUTX36,Houston,TX,USA,South
+143,CHATX36,Charlotte,NC,USA,Southeast
+144,LASTX36,Los Angeles,CA,USA,West
+145,AUSTX37,Austin,TX,USA,South
+146,HOUTX37,Houston,TX,USA,South
+147,CHATX37,Charlotte,NC,USA,Southeast
+148,LASTX37,Los Angeles,CA,USA,West
+149,AUSTX38,Austin,TX,USA,South
+150,HOUTX38,Houston,TX,USA,South
+151,CHATX38,Charlotte,NC,USA,Southeast
+152,LASTX38,Los Angeles,CA,USA,West
+153,AUSTX39,Austin,TX,USA,South
+154,HOUTX39,Houston,TX,USA,South
+155,CHATX39,Charlotte,NC,USA,Southeast
+156,LASTX39,Los Angeles,CA,USA,West
+157,AUSTX40,Austin,TX,USA,South
+158,HOUTX40,Houston,TX,USA,South
+159,CHATX40,Charlotte,NC,USA,Southeast
+160,LASTX40,Los Angeles,CA,USA,West
+161,AUSTX41,Austin,TX,USA,South
+162,HOUTX41,Houston,TX,USA,South
+163,CHATX41,Charlotte,NC,USA,Southeast
+164,LASTX41,Los Angeles,CA,USA,West
+165,AUSTX42,Austin,TX,USA,South
+166,HOUTX42,Houston,TX,USA,South
+167,CHATX42,Charlotte,NC,USA,Southeast
+168,LASTX42,Los Angeles,CA,USA,West
+169,AUSTX43,Austin,TX,USA,South
+170,HOUTX43,Houston,TX,USA,South
+171,CHATX43,Charlotte,NC,USA,Southeast
+172,LASTX43,Los Angeles,CA,USA,West
+173,AUSTX44,Austin,TX,USA,South
+174,HOUTX44,Houston,TX,USA,South
+175,CHATX44,Charlotte,NC,USA,Southeast
+176,LASTX44,Los Angeles,CA,USA,West
+177,AUSTX45,Austin,TX,USA,South
+178,HOUTX45,Houston,TX,USA,South
+179,CHATX45,Charlotte,NC,USA,Southeast
+180,LASTX45,Los Angeles,CA,USA,West
+181,AUSTX46,Austin,TX,USA,South
+182,HOUTX46,Houston,TX,USA,South
+183,CHATX46,Charlotte,NC,USA,Southeast
+184,LASTX46,Los Angeles,CA,USA,West
+185,AUSTX47,Austin,TX,USA,South
+186,HOUTX47,Houston,TX,USA,South
+187,CHATX47,Charlotte,NC,USA,Southeast
+188,LASTX47,Los Angeles,CA,USA,West
+189,AUSTX48,Austin,TX,USA,South
+190,HOUTX48,Houston,TX,USA,South
+191,CHATX48,Charlotte,NC,USA,Southeast
+192,LASTX48,Los Angeles,CA,USA,West
+193,AUSTX49,Austin,TX,USA,South
+194,HOUTX49,Houston,TX,USA,South
+195,CHATX49,Charlotte,NC,USA,Southeast
+196,LASTX49,Los Angeles,CA,USA,West
+197,AUSTX50,Austin,TX,USA,South
+198,HOUTX50,Houston,TX,USA,South
+199,CHATX50,Charlotte,NC,USA,Southeast
+200,LASTX50,Los Angeles,CA,USA,West
+201,AUSTX51,Austin,TX,USA,South
+202,HOUTX51,Houston,TX,USA,South
+203,CHATX51,Charlotte,NC,USA,Southeast
+204,LASTX51,Los Angeles,CA,USA,West
+205,AUSTX52,Austin,TX,USA,South
+206,HOUTX52,Houston,TX,USA,South
+207,CHATX52,Charlotte,NC,USA,Southeast
+208,LASTX52,Los Angeles,CA,USA,West
+209,AUSTX53,Austin,TX,USA,South
+210,HOUTX53,Houston,TX,USA,South
+211,CHATX53,Charlotte,NC,USA,Southeast
+212,LASTX53,Los Angeles,CA,USA,West
+213,AUSTX54,Austin,TX,USA,South
+214,HOUTX54,Houston,TX,USA,South
+215,CHATX54,Charlotte,NC,USA,Southeast
+216,LASTX54,Los Angeles,CA,USA,West
+217,AUSTX55,Austin,TX,USA,South
+218,HOUTX55,Houston,TX,USA,South
+219,CHATX55,Charlotte,NC,USA,Southeast
+220,LASTX55,Los Angeles,CA,USA,West
+221,AUSTX56,Austin,TX,USA,South
+222,HOUTX56,Houston,TX,USA,South
+223,CHATX56,Charlotte,NC,USA,Southeast
+224,LASTX56,Los Angeles,CA,USA,West
+225,AUSTX57,Austin,TX,USA,South
+226,HOUTX57,Houston,TX,USA,South
+227,CHATX57,Charlotte,NC,USA,Southeast
+228,LASTX57,Los Angeles,CA,USA,West
+229,AUSTX58,Austin,TX,USA,South
+230,HOUTX58,Houston,TX,USA,South
+231,CHATX58,Charlotte,NC,USA,Southeast
+232,LASTX58,Los Angeles,CA,USA,West
+233,AUSTX59,Austin,TX,USA,South
+234,HOUTX59,Houston,TX,USA,South
+235,CHATX59,Charlotte,NC,USA,Southeast
+236,LASTX59,Los Angeles,CA,USA,West
+237,AUSTX60,Austin,TX,USA,South
+238,HOUTX60,Houston,TX,USA,South
+239,CHATX60,Charlotte,NC,USA,Southeast
+240,LASTX60,Los Angeles,CA,USA,West
+241,AUSTX61,Austin,TX,USA,South
+242,HOUTX61,Houston,TX,USA,South
+243,CHATX61,Charlotte,NC,USA,Southeast
+244,LASTX61,Los Angeles,CA,USA,West
+245,AUSTX62,Austin,TX,USA,South
+246,HOUTX62,Houston,TX,USA,South
+247,CHATX62,Charlotte,NC,USA,Southeast
+248,LASTX62,Los Angeles,CA,USA,West
+249,AUSTX63,Austin,TX,USA,South
+250,HOUTX63,Houston,TX,USA,South
+251,CHATX63,Charlotte,NC,USA,Southeast
+252,LASTX63,Los Angeles,CA,USA,West
+253,AUSTX64,Austin,TX,USA,South
+254,HOUTX64,Houston,TX,USA,South
+255,CHATX64,Charlotte,NC,USA,Southeast
+256,LASTX64,Los Angeles,CA,USA,West
+257,AUSTX65,Austin,TX,USA,South
+258,HOUTX65,Houston,TX,USA,South
+259,CHATX65,Charlotte,NC,USA,Southeast
+260,LASTX65,Los Angeles,CA,USA,West
+261,AUSTX66,Austin,TX,USA,South
+262,HOUTX66,Houston,TX,USA,South
+263,CHATX66,Charlotte,NC,USA,Southeast
+264,LASTX66,Los Angeles,CA,USA,West
+265,AUSTX67,Austin,TX,USA,South
+266,HOUTX67,Houston,TX,USA,South
+267,CHATX67,Charlotte,NC,USA,Southeast
+268,LASTX67,Los Angeles,CA,USA,West
+269,AUSTX68,Austin,TX,USA,South
+270,HOUTX68,Houston,TX,USA,South
+271,CHATX68,Charlotte,NC,USA,Southeast
+272,LASTX68,Los Angeles,CA,USA,West
+273,AUSTX69,Austin,TX,USA,South
+274,HOUTX69,Houston,TX,USA,South
+275,CHATX69,Charlotte,NC,USA,Southeast
+276,LASTX69,Los Angeles,CA,USA,West
+277,AUSTX70,Austin,TX,USA,South
+278,HOUTX70,Houston,TX,USA,South
+279,CHATX70,Charlotte,NC,USA,Southeast
+280,LASTX70,Los Angeles,CA,USA,West
+281,AUSTX71,Austin,TX,USA,South
+282,HOUTX71,Houston,TX,USA,South
+283,CHATX71,Charlotte,NC,USA,Southeast
+284,LASTX71,Los Angeles,CA,USA,West
+285,AUSTX72,Austin,TX,USA,South
+286,HOUTX72,Houston,TX,USA,South
+287,CHATX72,Charlotte,NC,USA,Southeast
+288,LASTX72,Los Angeles,CA,USA,West
+289,AUSTX73,Austin,TX,USA,South
+290,HOUTX73,Houston,TX,USA,South
+291,CHATX73,Charlotte,NC,USA,Southeast
+292,LASTX73,Los Angeles,CA,USA,West
+293,AUSTX74,Austin,TX,USA,South
+294,HOUTX74,Houston,TX,USA,South
+295,CHATX74,Charlotte,NC,USA,Southeast
+296,LASTX74,Los Angeles,CA,USA,West
+297,AUSTX75,Austin,TX,USA,South
+298,HOUTX75,Houston,TX,USA,South
+299,CHATX75,Charlotte,NC,USA,Southeast
+300,LASTX75,Los Angeles,CA,USA,West
+301,AUSTX76,Austin,TX,USA,South
+302,HOUTX76,Houston,TX,USA,South
+303,CHATX76,Charlotte,NC,USA,Southeast
+304,LASTX76,Los Angeles,CA,USA,West
+305,AUSTX77,Austin,TX,USA,South
+306,HOUTX77,Houston,TX,USA,South
+307,CHATX77,Charlotte,NC,USA,Southeast
+308,LASTX77,Los Angeles,CA,USA,West
+309,AUSTX78,Austin,TX,USA,South
+310,HOUTX78,Houston,TX,USA,South
+311,CHATX78,Charlotte,NC,USA,Southeast
+312,LASTX78,Los Angeles,CA,USA,West
+313,AUSTX79,Austin,TX,USA,South
+314,HOUTX79,Houston,TX,USA,South
+315,CHATX79,Charlotte,NC,USA,Southeast
+316,LASTX79,Los Angeles,CA,USA,West
+317,AUSTX80,Austin,TX,USA,South
+318,HOUTX80,Houston,TX,USA,South
+319,CHATX80,Charlotte,NC,USA,Southeast
+320,LASTX80,Los Angeles,CA,USA,West
+321,AUSTX81,Austin,TX,USA,South
+322,HOUTX81,Houston,TX,USA,South
+323,CHATX81,Charlotte,NC,USA,Southeast
+324,LASTX81,Los Angeles,CA,USA,West
+325,AUSTX82,Austin,TX,USA,South
+326,HOUTX82,Houston,TX,USA,South
+327,CHATX82,Charlotte,NC,USA,Southeast
+328,LASTX82,Los Angeles,CA,USA,West
+329,AUSTX83,Austin,TX,USA,South
+330,HOUTX83,Houston,TX,USA,South
+331,CHATX83,Charlotte,NC,USA,Southeast
+332,LASTX83,Los Angeles,CA,USA,West
+333,AUSTX84,Austin,TX,USA,South
+334,HOUTX84,Houston,TX,USA,South
+335,CHATX84,Charlotte,NC,USA,Southeast
+336,LASTX84,Los Angeles,CA,USA,West
+337,AUSTX85,Austin,TX,USA,South
+338,HOUTX85,Houston,TX,USA,South
+339,CHATX85,Charlotte,NC,USA,Southeast
+340,LASTX85,Los Angeles,CA,USA,West
+341,AUSTX86,Austin,TX,USA,South
+342,HOUTX86,Houston,TX,USA,South
+343,CHATX86,Charlotte,NC,USA,Southeast
+344,LASTX86,Los Angeles,CA,USA,West
+345,AUSTX87,Austin,TX,USA,South
+346,HOUTX87,Houston,TX,USA,South
+347,CHATX87,Charlotte,NC,USA,Southeast
+348,LASTX87,Los Angeles,CA,USA,West
+349,AUSTX88,Austin,TX,USA,South
+350,HOUTX88,Houston,TX,USA,South
+351,CHATX88,Charlotte,NC,USA,Southeast
+352,LASTX88,Los Angeles,CA,USA,West
+353,AUSTX89,Austin,TX,USA,South
+354,HOUTX89,Houston,TX,USA,South
+355,CHATX89,Charlotte,NC,USA,Southeast
+356,LASTX89,Los Angeles,CA,USA,West
+357,AUSTX90,Austin,TX,USA,South
+358,HOUTX90,Houston,TX,USA,South
+359,CHATX90,Charlotte,NC,USA,Southeast
+360,LASTX90,Los Angeles,CA,USA,West
+361,AUSTX91,Austin,TX,USA,South
+362,HOUTX91,Houston,TX,USA,South
+363,CHATX91,Charlotte,NC,USA,Southeast
+364,LASTX91,Los Angeles,CA,USA,West
+365,AUSTX92,Austin,TX,USA,South
+366,HOUTX92,Houston,TX,USA,South
+367,CHATX92,Charlotte,NC,USA,Southeast
+368,LASTX92,Los Angeles,CA,USA,West
+369,AUSTX93,Austin,TX,USA,South
+370,HOUTX93,Houston,TX,USA,South
+371,CHATX93,Charlotte,NC,USA,Southeast
+372,LASTX93,Los Angeles,CA,USA,West
+373,AUSTX94,Austin,TX,USA,South
+374,HOUTX94,Houston,TX,USA,South
+375,CHATX94,Charlotte,NC,USA,Southeast
+376,LASTX94,Los Angeles,CA,USA,West
+377,AUSTX95,Austin,TX,USA,South
+378,HOUTX95,Houston,TX,USA,South
+379,CHATX95,Charlotte,NC,USA,Southeast
+380,LASTX95,Los Angeles,CA,USA,West
+381,AUSTX96,Austin,TX,USA,South
+382,HOUTX96,Houston,TX,USA,South
+383,CHATX96,Charlotte,NC,USA,Southeast
+384,LASTX96,Los Angeles,CA,USA,West
+385,AUSTX97,Austin,TX,USA,South
+386,HOUTX97,Houston,TX,USA,South
+387,CHATX97,Charlotte,NC,USA,Southeast
+388,LASTX97,Los Angeles,CA,USA,West
+389,AUSTX98,Austin,TX,USA,South
+390,HOUTX98,Houston,TX,USA,South
+391,CHATX98,Charlotte,NC,USA,Southeast
+392,LASTX98,Los Angeles,CA,USA,West
+393,AUSTX99,Austin,TX,USA,South
+394,HOUTX99,Houston,TX,USA,South
+395,CHATX99,Charlotte,NC,USA,Southeast
+396,LASTX99,Los Angeles,CA,USA,West
+397,AUSTX100,Austin,TX,USA,South
+398,HOUTX100,Houston,TX,USA,South
+399,CHATX100,Charlotte,NC,USA,Southeast
+400,LASTX100,Los Angeles,CA,USA,West
+401,AUSTX101,Austin,TX,USA,South
+402,HOUTX101,Houston,TX,USA,South
+403,CHATX101,Charlotte,NC,USA,Southeast
+404,LASTX101,Los Angeles,CA,USA,West
+405,AUSTX102,Austin,TX,USA,South
+406,HOUTX102,Houston,TX,USA,South
+407,CHATX102,Charlotte,NC,USA,Southeast
+408,LASTX102,Los Angeles,CA,USA,West
+409,AUSTX103,Austin,TX,USA,South
+410,HOUTX103,Houston,TX,USA,South
+411,CHATX103,Charlotte,NC,USA,Southeast
+412,LASTX103,Los Angeles,CA,USA,West
+413,AUSTX104,Austin,TX,USA,South
+414,HOUTX104,Houston,TX,USA,South
+415,CHATX104,Charlotte,NC,USA,Southeast
+416,LASTX104,Los Angeles,CA,USA,West
+417,AUSTX105,Austin,TX,USA,South
+418,HOUTX105,Houston,TX,USA,South
+419,CHATX105,Charlotte,NC,USA,Southeast
+420,LASTX105,Los Angeles,CA,USA,West
+421,AUSTX106,Austin,TX,USA,South
+422,HOUTX106,Houston,TX,USA,South
+423,CHATX106,Charlotte,NC,USA,Southeast
+424,LASTX106,Los Angeles,CA,USA,West
+425,AUSTX107,Austin,TX,USA,South
+426,HOUTX107,Houston,TX,USA,South
+427,CHATX107,Charlotte,NC,USA,Southeast
+428,LASTX107,Los Angeles,CA,USA,West
+429,AUSTX108,Austin,TX,USA,South
+430,HOUTX108,Houston,TX,USA,South
+431,CHATX108,Charlotte,NC,USA,Southeast
+432,LASTX108,Los Angeles,CA,USA,West
+433,AUSTX109,Austin,TX,USA,South
+434,HOUTX109,Houston,TX,USA,South
+435,CHATX109,Charlotte,NC,USA,Southeast
+436,LASTX109,Los Angeles,CA,USA,West
+437,AUSTX110,Austin,TX,USA,South
+438,HOUTX110,Houston,TX,USA,South
+439,CHATX110,Charlotte,NC,USA,Southeast
+440,LASTX110,Los Angeles,CA,USA,West
+441,AUSTX111,Austin,TX,USA,South
+442,HOUTX111,Houston,TX,USA,South
+443,CHATX111,Charlotte,NC,USA,Southeast
+444,LASTX111,Los Angeles,CA,USA,West
+445,AUSTX112,Austin,TX,USA,South
+446,HOUTX112,Houston,TX,USA,South
+447,CHATX112,Charlotte,NC,USA,Southeast
+448,LASTX112,Los Angeles,CA,USA,West
+449,AUSTX113,Austin,TX,USA,South
+450,HOUTX113,Houston,TX,USA,South
+451,CHATX113,Charlotte,NC,USA,Southeast
+452,LASTX113,Los Angeles,CA,USA,West
+453,AUSTX114,Austin,TX,USA,South
+454,HOUTX114,Houston,TX,USA,South
+455,CHATX114,Charlotte,NC,USA,Southeast
+456,LASTX114,Los Angeles,CA,USA,West
+457,AUSTX115,Austin,TX,USA,South
+458,HOUTX115,Houston,TX,USA,South
+459,CHATX115,Charlotte,NC,USA,Southeast
+460,LASTX115,Los Angeles,CA,USA,West
+461,AUSTX116,Austin,TX,USA,South
+462,HOUTX116,Houston,TX,USA,South
+463,CHATX116,Charlotte,NC,USA,Southeast
+464,LASTX116,Los Angeles,CA,USA,West
+465,AUSTX117,Austin,TX,USA,South
+466,HOUTX117,Houston,TX,USA,South
+467,CHATX117,Charlotte,NC,USA,Southeast
+468,LASTX117,Los Angeles,CA,USA,West
+469,AUSTX118,Austin,TX,USA,South
+470,HOUTX118,Houston,TX,USA,South
+471,CHATX118,Charlotte,NC,USA,Southeast
+472,LASTX118,Los Angeles,CA,USA,West
+473,AUSTX119,Austin,TX,USA,South
+474,HOUTX119,Houston,TX,USA,South
+475,CHATX119,Charlotte,NC,USA,Southeast
+476,LASTX119,Los Angeles,CA,USA,West
+477,AUSTX120,Austin,TX,USA,South
+478,HOUTX120,Houston,TX,USA,South
+479,CHATX120,Charlotte,NC,USA,Southeast
+480,LASTX120,Los Angeles,CA,USA,West
+481,AUSTX121,Austin,TX,USA,South
+482,HOUTX121,Houston,TX,USA,South
+483,CHATX121,Charlotte,NC,USA,Southeast
+484,LASTX121,Los Angeles,CA,USA,West
+485,AUSTX122,Austin,TX,USA,South
+486,HOUTX122,Houston,TX,USA,South
+487,CHATX122,Charlotte,NC,USA,Southeast
+488,LASTX122,Los Angeles,CA,USA,West
+489,AUSTX123,Austin,TX,USA,South
+490,HOUTX123,Houston,TX,USA,South
+491,CHATX123,Charlotte,NC,USA,Southeast
+492,LASTX123,Los Angeles,CA,USA,West
+493,AUSTX124,Austin,TX,USA,South
+494,HOUTX124,Houston,TX,USA,South
+495,CHATX124,Charlotte,NC,USA,Southeast
+496,LASTX124,Los Angeles,CA,USA,West
+497,AUSTX125,Austin,TX,USA,South
+498,HOUTX125,Houston,TX,USA,South
+499,CHATX125,Charlotte,NC,USA,Southeast
+500,LASTX125,Los Angeles,CA,USA,West
+501,AUSTX126,Austin,TX,USA,South
+502,HOUTX126,Houston,TX,USA,South
+503,CHATX126,Charlotte,NC,USA,Southeast
+504,LASTX126,Los Angeles,CA,USA,West
+505,AUSTX127,Austin,TX,USA,South
+506,HOUTX127,Houston,TX,USA,South
+507,CHATX127,Charlotte,NC,USA,Southeast
+508,LASTX127,Los Angeles,CA,USA,West
+509,AUSTX128,Austin,TX,USA,South
+510,HOUTX128,Houston,TX,USA,South
+511,CHATX128,Charlotte,NC,USA,Southeast
+512,LASTX128,Los Angeles,CA,USA,West
+513,AUSTX129,Austin,TX,USA,South
+514,HOUTX129,Houston,TX,USA,South
+515,CHATX129,Charlotte,NC,USA,Southeast
+516,LASTX129,Los Angeles,CA,USA,West
+517,AUSTX130,Austin,TX,USA,South
+518,HOUTX130,Houston,TX,USA,South
+519,CHATX130,Charlotte,NC,USA,Southeast
+520,LASTX130,Los Angeles,CA,USA,West
+521,AUSTX131,Austin,TX,USA,South
+522,HOUTX131,Houston,TX,USA,South
+523,CHATX131,Charlotte,NC,USA,Southeast
+524,LASTX131,Los Angeles,CA,USA,West
+525,AUSTX132,Austin,TX,USA,South
+526,HOUTX132,Houston,TX,USA,South
+527,CHATX132,Charlotte,NC,USA,Southeast
+528,LASTX132,Los Angeles,CA,USA,West
+529,AUSTX133,Austin,TX,USA,South
+530,HOUTX133,Houston,TX,USA,South
+531,CHATX133,Charlotte,NC,USA,Southeast
+532,LASTX133,Los Angeles,CA,USA,West
+533,AUSTX134,Austin,TX,USA,South
+534,HOUTX134,Houston,TX,USA,South
+535,CHATX134,Charlotte,NC,USA,Southeast
+536,LASTX134,Los Angeles,CA,USA,West
+537,AUSTX135,Austin,TX,USA,South
+538,HOUTX135,Houston,TX,USA,South
+539,CHATX135,Charlotte,NC,USA,Southeast
+540,LASTX135,Los Angeles,CA,USA,West
+541,AUSTX136,Austin,TX,USA,South
+542,HOUTX136,Houston,TX,USA,South
+543,CHATX136,Charlotte,NC,USA,Southeast
+544,LASTX136,Los Angeles,CA,USA,West
+545,AUSTX137,Austin,TX,USA,South
+546,HOUTX137,Houston,TX,USA,South
+547,CHATX137,Charlotte,NC,USA,Southeast
+548,LASTX137,Los Angeles,CA,USA,West
+549,AUSTX138,Austin,TX,USA,South
+550,HOUTX138,Houston,TX,USA,South
+551,CHATX138,Charlotte,NC,USA,Southeast
+552,LASTX138,Los Angeles,CA,USA,West
+553,AUSTX139,Austin,TX,USA,South
+554,HOUTX139,Houston,TX,USA,South
+555,CHATX139,Charlotte,NC,USA,Southeast
+556,LASTX139,Los Angeles,CA,USA,West
+557,AUSTX140,Austin,TX,USA,South
+558,HOUTX140,Houston,TX,USA,South
+559,CHATX140,Charlotte,NC,USA,Southeast
+560,LASTX140,Los Angeles,CA,USA,West
+561,AUSTX141,Austin,TX,USA,South
+562,HOUTX141,Houston,TX,USA,South
+563,CHATX141,Charlotte,NC,USA,Southeast
+564,LASTX141,Los Angeles,CA,USA,West
+565,AUSTX142,Austin,TX,USA,South
+566,HOUTX142,Houston,TX,USA,South
+567,CHATX142,Charlotte,NC,USA,Southeast
+568,LASTX142,Los Angeles,CA,USA,West
+569,AUSTX143,Austin,TX,USA,South
+570,HOUTX143,Houston,TX,USA,South
+571,CHATX143,Charlotte,NC,USA,Southeast
+572,LASTX143,Los Angeles,CA,USA,West
+573,AUSTX144,Austin,TX,USA,South
+574,HOUTX144,Houston,TX,USA,South
+575,CHATX144,Charlotte,NC,USA,Southeast
+576,LASTX144,Los Angeles,CA,USA,West
+577,AUSTX145,Austin,TX,USA,South
+578,HOUTX145,Houston,TX,USA,South
+579,CHATX145,Charlotte,NC,USA,Southeast
+580,LASTX145,Los Angeles,CA,USA,West
+581,AUSTX146,Austin,TX,USA,South
+582,HOUTX146,Houston,TX,USA,South
+583,CHATX146,Charlotte,NC,USA,Southeast
+584,LASTX146,Los Angeles,CA,USA,West
+585,AUSTX147,Austin,TX,USA,South
+586,HOUTX147,Houston,TX,USA,South
+587,CHATX147,Charlotte,NC,USA,Southeast
+588,LASTX147,Los Angeles,CA,USA,West
+589,AUSTX148,Austin,TX,USA,South
+590,HOUTX148,Houston,TX,USA,South
+591,CHATX148,Charlotte,NC,USA,Southeast
+592,LASTX148,Los Angeles,CA,USA,West
+593,AUSTX149,Austin,TX,USA,South
+594,HOUTX149,Houston,TX,USA,South
+595,CHATX149,Charlotte,NC,USA,Southeast
+596,LASTX149,Los Angeles,CA,USA,West
+597,AUSTX150,Austin,TX,USA,South
+598,HOUTX150,Houston,TX,USA,South
+599,CHATX150,Charlotte,NC,USA,Southeast
+600,LASTX150,Los Angeles,CA,USA,West
+601,AUSTX151,Austin,TX,USA,South
+602,HOUTX151,Houston,TX,USA,South
+603,CHATX151,Charlotte,NC,USA,Southeast
+604,LASTX151,Los Angeles,CA,USA,West
+605,AUSTX152,Austin,TX,USA,South
+606,HOUTX152,Houston,TX,USA,South
+607,CHATX152,Charlotte,NC,USA,Southeast
+608,LASTX152,Los Angeles,CA,USA,West
+609,AUSTX153,Austin,TX,USA,South
+610,HOUTX153,Houston,TX,USA,South
+611,CHATX153,Charlotte,NC,USA,Southeast
+612,LASTX153,Los Angeles,CA,USA,West
+613,AUSTX154,Austin,TX,USA,South
+614,HOUTX154,Houston,TX,USA,South
+615,CHATX154,Charlotte,NC,USA,Southeast
+616,LASTX154,Los Angeles,CA,USA,West
+617,AUSTX155,Austin,TX,USA,South
+618,HOUTX155,Houston,TX,USA,South
+619,CHATX155,Charlotte,NC,USA,Southeast
+620,LASTX155,Los Angeles,CA,USA,West
+621,AUSTX156,Austin,TX,USA,South
+622,HOUTX156,Houston,TX,USA,South
+623,CHATX156,Charlotte,NC,USA,Southeast
+624,LASTX156,Los Angeles,CA,USA,West
+625,AUSTX157,Austin,TX,USA,South
+626,HOUTX157,Houston,TX,USA,South
+627,CHATX157,Charlotte,NC,USA,Southeast
+628,LASTX157,Los Angeles,CA,USA,West
+629,AUSTX158,Austin,TX,USA,South
+630,HOUTX158,Houston,TX,USA,South
+631,CHATX158,Charlotte,NC,USA,Southeast
+632,LASTX158,Los Angeles,CA,USA,West
+633,AUSTX159,Austin,TX,USA,South
+634,HOUTX159,Houston,TX,USA,South
+635,CHATX159,Charlotte,NC,USA,Southeast
+636,LASTX159,Los Angeles,CA,USA,West
+637,AUSTX160,Austin,TX,USA,South
+638,HOUTX160,Houston,TX,USA,South
+639,CHATX160,Charlotte,NC,USA,Southeast
+640,LASTX160,Los Angeles,CA,USA,West
+641,AUSTX161,Austin,TX,USA,South
+642,HOUTX161,Houston,TX,USA,South
+643,CHATX161,Charlotte,NC,USA,Southeast
+644,LASTX161,Los Angeles,CA,USA,West
+645,AUSTX162,Austin,TX,USA,South
+646,HOUTX162,Houston,TX,USA,South
+647,CHATX162,Charlotte,NC,USA,Southeast
+648,LASTX162,Los Angeles,CA,USA,West
+649,AUSTX163,Austin,TX,USA,South
+650,HOUTX163,Houston,TX,USA,South
+651,CHATX163,Charlotte,NC,USA,Southeast
+652,LASTX163,Los Angeles,CA,USA,West
+653,AUSTX164,Austin,TX,USA,South
+654,HOUTX164,Houston,TX,USA,South
+655,CHATX164,Charlotte,NC,USA,Southeast
+656,LASTX164,Los Angeles,CA,USA,West
+657,AUSTX165,Austin,TX,USA,South
+658,HOUTX165,Houston,TX,USA,South
+659,CHATX165,Charlotte,NC,USA,Southeast
+660,LASTX165,Los Angeles,CA,USA,West
+661,AUSTX166,Austin,TX,USA,South
+662,HOUTX166,Houston,TX,USA,South
+663,CHATX166,Charlotte,NC,USA,Southeast
+664,LASTX166,Los Angeles,CA,USA,West
+665,AUSTX167,Austin,TX,USA,South
+666,HOUTX167,Houston,TX,USA,South
+667,CHATX167,Charlotte,NC,USA,Southeast
+668,LASTX167,Los Angeles,CA,USA,West
+669,AUSTX168,Austin,TX,USA,South
+670,HOUTX168,Houston,TX,USA,South
+671,CHATX168,Charlotte,NC,USA,Southeast
+672,LASTX168,Los Angeles,CA,USA,West
+673,AUSTX169,Austin,TX,USA,South
+674,HOUTX169,Houston,TX,USA,South
+675,CHATX169,Charlotte,NC,USA,Southeast
+676,LASTX169,Los Angeles,CA,USA,West
+677,AUSTX170,Austin,TX,USA,South
+678,HOUTX170,Houston,TX,USA,South
+679,CHATX170,Charlotte,NC,USA,Southeast
+680,LASTX170,Los Angeles,CA,USA,West
+681,AUSTX171,Austin,TX,USA,South
+682,HOUTX171,Houston,TX,USA,South
+683,CHATX171,Charlotte,NC,USA,Southeast
+684,LASTX171,Los Angeles,CA,USA,West
+685,AUSTX172,Austin,TX,USA,South
+686,HOUTX172,Houston,TX,USA,South
+687,CHATX172,Charlotte,NC,USA,Southeast
+688,LASTX172,Los Angeles,CA,USA,West
+689,AUSTX173,Austin,TX,USA,South
+690,HOUTX173,Houston,TX,USA,South
+691,CHATX173,Charlotte,NC,USA,Southeast
+692,LASTX173,Los Angeles,CA,USA,West
+693,AUSTX174,Austin,TX,USA,South
+694,HOUTX174,Houston,TX,USA,South
+695,CHATX174,Charlotte,NC,USA,Southeast
+696,LASTX174,Los Angeles,CA,USA,West
+697,AUSTX175,Austin,TX,USA,South
+698,HOUTX175,Houston,TX,USA,South
+699,CHATX175,Charlotte,NC,USA,Southeast
+700,LASTX175,Los Angeles,CA,USA,West
+701,AUSTX176,Austin,TX,USA,South
+702,HOUTX176,Houston,TX,USA,South
+703,CHATX176,Charlotte,NC,USA,Southeast
+704,LASTX176,Los Angeles,CA,USA,West
+705,AUSTX177,Austin,TX,USA,South
+706,HOUTX177,Houston,TX,USA,South
+707,CHATX177,Charlotte,NC,USA,Southeast
+708,LASTX177,Los Angeles,CA,USA,West
+709,AUSTX178,Austin,TX,USA,South
+710,HOUTX178,Houston,TX,USA,South
+711,CHATX178,Charlotte,NC,USA,Southeast
+712,LASTX178,Los Angeles,CA,USA,West
+713,AUSTX179,Austin,TX,USA,South
+714,HOUTX179,Houston,TX,USA,South
+715,CHATX179,Charlotte,NC,USA,Southeast
+716,LASTX179,Los Angeles,CA,USA,West
+717,AUSTX180,Austin,TX,USA,South
+718,HOUTX180,Houston,TX,USA,South
+719,CHATX180,Charlotte,NC,USA,Southeast
+720,LASTX180,Los Angeles,CA,USA,West
+721,AUSTX181,Austin,TX,USA,South
+722,HOUTX181,Houston,TX,USA,South
+723,CHATX181,Charlotte,NC,USA,Southeast
+724,LASTX181,Los Angeles,CA,USA,West
+725,AUSTX182,Austin,TX,USA,South
+726,HOUTX182,Houston,TX,USA,South
+727,CHATX182,Charlotte,NC,USA,Southeast
+728,LASTX182,Los Angeles,CA,USA,West
+729,AUSTX183,Austin,TX,USA,South
+730,HOUTX183,Houston,TX,USA,South
+731,CHATX183,Charlotte,NC,USA,Southeast
+732,LASTX183,Los Angeles,CA,USA,West
+733,AUSTX184,Austin,TX,USA,South
+734,HOUTX184,Houston,TX,USA,South
+735,CHATX184,Charlotte,NC,USA,Southeast
+736,LASTX184,Los Angeles,CA,USA,West
+737,AUSTX185,Austin,TX,USA,South
+738,HOUTX185,Houston,TX,USA,South
+739,CHATX185,Charlotte,NC,USA,Southeast
+740,LASTX185,Los Angeles,CA,USA,West
+741,AUSTX186,Austin,TX,USA,South
+742,HOUTX186,Houston,TX,USA,South
+743,CHATX186,Charlotte,NC,USA,Southeast
+744,LASTX186,Los Angeles,CA,USA,West
+745,AUSTX187,Austin,TX,USA,South
+746,HOUTX187,Houston,TX,USA,South
+747,CHATX187,Charlotte,NC,USA,Southeast
+748,LASTX187,Los Angeles,CA,USA,West
+749,AUSTX188,Austin,TX,USA,South
+750,HOUTX188,Houston,TX,USA,South
+751,CHATX188,Charlotte,NC,USA,Southeast
+752,LASTX188,Los Angeles,CA,USA,West
+753,AUSTX189,Austin,TX,USA,South
+754,HOUTX189,Houston,TX,USA,South
+755,CHATX189,Charlotte,NC,USA,Southeast
+756,LASTX189,Los Angeles,CA,USA,West
+757,AUSTX190,Austin,TX,USA,South
+758,HOUTX190,Houston,TX,USA,South
+759,CHATX190,Charlotte,NC,USA,Southeast
+760,LASTX190,Los Angeles,CA,USA,West
+761,AUSTX191,Austin,TX,USA,South
+762,HOUTX191,Houston,TX,USA,South
+763,CHATX191,Charlotte,NC,USA,Southeast
+764,LASTX191,Los Angeles,CA,USA,West
+765,AUSTX192,Austin,TX,USA,South
+766,HOUTX192,Houston,TX,USA,South
+767,CHATX192,Charlotte,NC,USA,Southeast
+768,LASTX192,Los Angeles,CA,USA,West
+769,AUSTX193,Austin,TX,USA,South
+770,HOUTX193,Houston,TX,USA,South
+771,CHATX193,Charlotte,NC,USA,Southeast
+772,LASTX193,Los Angeles,CA,USA,West
+773,AUSTX194,Austin,TX,USA,South
+774,HOUTX194,Houston,TX,USA,South
+775,CHATX194,Charlotte,NC,USA,Southeast
+776,LASTX194,Los Angeles,CA,USA,West
+777,AUSTX195,Austin,TX,USA,South
+778,HOUTX195,Houston,TX,USA,South
+779,CHATX195,Charlotte,NC,USA,Southeast
+780,LASTX195,Los Angeles,CA,USA,West
+781,AUSTX196,Austin,TX,USA,South
+782,HOUTX196,Houston,TX,USA,South
+783,CHATX196,Charlotte,NC,USA,Southeast
+784,LASTX196,Los Angeles,CA,USA,West
+785,AUSTX197,Austin,TX,USA,South
+786,HOUTX197,Houston,TX,USA,South
+787,CHATX197,Charlotte,NC,USA,Southeast
+788,LASTX197,Los Angeles,CA,USA,West
+789,AUSTX198,Austin,TX,USA,South
+790,HOUTX198,Houston,TX,USA,South
+791,CHATX198,Charlotte,NC,USA,Southeast
+792,LASTX198,Los Angeles,CA,USA,West
+793,AUSTX199,Austin,TX,USA,South
+794,HOUTX199,Houston,TX,USA,South
+795,CHATX199,Charlotte,NC,USA,Southeast
+796,LASTX199,Los Angeles,CA,USA,West
+797,AUSTX200,Austin,TX,USA,South
+798,HOUTX200,Houston,TX,USA,South
+799,CHATX200,Charlotte,NC,USA,Southeast
+800,LASTX200,Los Angeles,CA,USA,West
+801,AUSTX201,Austin,TX,USA,South
+802,HOUTX201,Houston,TX,USA,South
+803,CHATX201,Charlotte,NC,USA,Southeast
+804,LASTX201,Los Angeles,CA,USA,West
+805,AUSTX202,Austin,TX,USA,South
+806,HOUTX202,Houston,TX,USA,South
+807,CHATX202,Charlotte,NC,USA,Southeast
+808,LASTX202,Los Angeles,CA,USA,West
+809,AUSTX203,Austin,TX,USA,South
+810,HOUTX203,Houston,TX,USA,South
+811,CHATX203,Charlotte,NC,USA,Southeast
+812,LASTX203,Los Angeles,CA,USA,West
+813,AUSTX204,Austin,TX,USA,South
+814,HOUTX204,Houston,TX,USA,South
+815,CHATX204,Charlotte,NC,USA,Southeast
+816,LASTX204,Los Angeles,CA,USA,West
+817,AUSTX205,Austin,TX,USA,South
+818,HOUTX205,Houston,TX,USA,South
+819,CHATX205,Charlotte,NC,USA,Southeast
+820,LASTX205,Los Angeles,CA,USA,West
+821,AUSTX206,Austin,TX,USA,South
+822,HOUTX206,Houston,TX,USA,South
+823,CHATX206,Charlotte,NC,USA,Southeast
+824,LASTX206,Los Angeles,CA,USA,West
+825,AUSTX207,Austin,TX,USA,South
+826,HOUTX207,Houston,TX,USA,South
+827,CHATX207,Charlotte,NC,USA,Southeast
+828,LASTX207,Los Angeles,CA,USA,West
+829,AUSTX208,Austin,TX,USA,South
+830,HOUTX208,Houston,TX,USA,South
+831,CHATX208,Charlotte,NC,USA,Southeast
+832,LASTX208,Los Angeles,CA,USA,West
+833,AUSTX209,Austin,TX,USA,South
+834,HOUTX209,Houston,TX,USA,South
+835,CHATX209,Charlotte,NC,USA,Southeast
+836,LASTX209,Los Angeles,CA,USA,West
+837,AUSTX210,Austin,TX,USA,South
+838,HOUTX210,Houston,TX,USA,South
+839,CHATX210,Charlotte,NC,USA,Southeast
+840,LASTX210,Los Angeles,CA,USA,West
+841,AUSTX211,Austin,TX,USA,South
+842,HOUTX211,Houston,TX,USA,South
+843,CHATX211,Charlotte,NC,USA,Southeast
+844,LASTX211,Los Angeles,CA,USA,West
+845,AUSTX212,Austin,TX,USA,South
+846,HOUTX212,Houston,TX,USA,South
+847,CHATX212,Charlotte,NC,USA,Southeast
+848,LASTX212,Los Angeles,CA,USA,West
+849,AUSTX213,Austin,TX,USA,South
+850,HOUTX213,Houston,TX,USA,South
+851,CHATX213,Charlotte,NC,USA,Southeast
+852,LASTX213,Los Angeles,CA,USA,West
+853,AUSTX214,Austin,TX,USA,South
+854,HOUTX214,Houston,TX,USA,South
+855,CHATX214,Charlotte,NC,USA,Southeast
+856,LASTX214,Los Angeles,CA,USA,West
+857,AUSTX215,Austin,TX,USA,South
+858,HOUTX215,Houston,TX,USA,South
+859,CHATX215,Charlotte,NC,USA,Southeast
+860,LASTX215,Los Angeles,CA,USA,West
+861,AUSTX216,Austin,TX,USA,South
+862,HOUTX216,Houston,TX,USA,South
+863,CHATX216,Charlotte,NC,USA,Southeast
+864,LASTX216,Los Angeles,CA,USA,West
+865,AUSTX217,Austin,TX,USA,South
+866,HOUTX217,Houston,TX,USA,South
+867,CHATX217,Charlotte,NC,USA,Southeast
+868,LASTX217,Los Angeles,CA,USA,West
+869,AUSTX218,Austin,TX,USA,South
+870,HOUTX218,Houston,TX,USA,South
+871,CHATX218,Charlotte,NC,USA,Southeast
+872,LASTX218,Los Angeles,CA,USA,West
+873,AUSTX219,Austin,TX,USA,South
+874,HOUTX219,Houston,TX,USA,South
+875,CHATX219,Charlotte,NC,USA,Southeast
+876,LASTX219,Los Angeles,CA,USA,West
+877,AUSTX220,Austin,TX,USA,South
+878,HOUTX220,Houston,TX,USA,South
+879,CHATX220,Charlotte,NC,USA,Southeast
+880,LASTX220,Los Angeles,CA,USA,West
+881,AUSTX221,Austin,TX,USA,South
+882,HOUTX221,Houston,TX,USA,South
+883,CHATX221,Charlotte,NC,USA,Southeast
+884,LASTX221,Los Angeles,CA,USA,West
+885,AUSTX222,Austin,TX,USA,South
+886,HOUTX222,Houston,TX,USA,South
+887,CHATX222,Charlotte,NC,USA,Southeast
+888,LASTX222,Los Angeles,CA,USA,West
+889,AUSTX223,Austin,TX,USA,South
+890,HOUTX223,Houston,TX,USA,South
+891,CHATX223,Charlotte,NC,USA,Southeast
+892,LASTX223,Los Angeles,CA,USA,West
+893,AUSTX224,Austin,TX,USA,South
+894,HOUTX224,Houston,TX,USA,South
+895,CHATX224,Charlotte,NC,USA,Southeast
+896,LASTX224,Los Angeles,CA,USA,West
+897,AUSTX225,Austin,TX,USA,South
+898,HOUTX225,Houston,TX,USA,South
+899,CHATX225,Charlotte,NC,USA,Southeast
+900,LASTX225,Los Angeles,CA,USA,West
+901,AUSTX226,Austin,TX,USA,South
+902,HOUTX226,Houston,TX,USA,South
+903,CHATX226,Charlotte,NC,USA,Southeast
+904,LASTX226,Los Angeles,CA,USA,West
+905,AUSTX227,Austin,TX,USA,South
+906,HOUTX227,Houston,TX,USA,South
+907,CHATX227,Charlotte,NC,USA,Southeast
+908,LASTX227,Los Angeles,CA,USA,West
+909,AUSTX228,Austin,TX,USA,South
+910,HOUTX228,Houston,TX,USA,South
+911,CHATX228,Charlotte,NC,USA,Southeast
+912,LASTX228,Los Angeles,CA,USA,West
+913,AUSTX229,Austin,TX,USA,South
+914,HOUTX229,Houston,TX,USA,South
+915,CHATX229,Charlotte,NC,USA,Southeast
+916,LASTX229,Los Angeles,CA,USA,West
+917,AUSTX230,Austin,TX,USA,South
+918,HOUTX230,Houston,TX,USA,South
+919,CHATX230,Charlotte,NC,USA,Southeast
+920,LASTX230,Los Angeles,CA,USA,West
+921,AUSTX231,Austin,TX,USA,South
+922,HOUTX231,Houston,TX,USA,South
+923,CHATX231,Charlotte,NC,USA,Southeast
+924,LASTX231,Los Angeles,CA,USA,West
+925,AUSTX232,Austin,TX,USA,South
+926,HOUTX232,Houston,TX,USA,South
+927,CHATX232,Charlotte,NC,USA,Southeast
+928,LASTX232,Los Angeles,CA,USA,West
+929,AUSTX233,Austin,TX,USA,South
+930,HOUTX233,Houston,TX,USA,South
+931,CHATX233,Charlotte,NC,USA,Southeast
+932,LASTX233,Los Angeles,CA,USA,West
+933,AUSTX234,Austin,TX,USA,South
+934,HOUTX234,Houston,TX,USA,South
+935,CHATX234,Charlotte,NC,USA,Southeast
+936,LASTX234,Los Angeles,CA,USA,West
+937,AUSTX235,Austin,TX,USA,South
+938,HOUTX235,Houston,TX,USA,South
+939,CHATX235,Charlotte,NC,USA,Southeast
+940,LASTX235,Los Angeles,CA,USA,West
+941,AUSTX236,Austin,TX,USA,South
+942,HOUTX236,Houston,TX,USA,South
+943,CHATX236,Charlotte,NC,USA,Southeast
+944,LASTX236,Los Angeles,CA,USA,West
+945,AUSTX237,Austin,TX,USA,South
+946,HOUTX237,Houston,TX,USA,South
+947,CHATX237,Charlotte,NC,USA,Southeast
+948,LASTX237,Los Angeles,CA,USA,West
+949,AUSTX238,Austin,TX,USA,South
+950,HOUTX238,Houston,TX,USA,South
+951,CHATX238,Charlotte,NC,USA,Southeast
+952,LASTX238,Los Angeles,CA,USA,West
+953,AUSTX239,Austin,TX,USA,South
+954,HOUTX239,Houston,TX,USA,South
+955,CHATX239,Charlotte,NC,USA,Southeast
+956,LASTX239,Los Angeles,CA,USA,West
+957,AUSTX240,Austin,TX,USA,South
+958,HOUTX240,Houston,TX,USA,South
+959,CHATX240,Charlotte,NC,USA,Southeast
+960,LASTX240,Los Angeles,CA,USA,West
+961,AUSTX241,Austin,TX,USA,South
+962,HOUTX241,Houston,TX,USA,South
+963,CHATX241,Charlotte,NC,USA,Southeast
+964,LASTX241,Los Angeles,CA,USA,West
+965,AUSTX242,Austin,TX,USA,South
+966,HOUTX242,Houston,TX,USA,South
+967,CHATX242,Charlotte,NC,USA,Southeast
+968,LASTX242,Los Angeles,CA,USA,West
+969,AUSTX243,Austin,TX,USA,South
+970,HOUTX243,Houston,TX,USA,South
+971,CHATX243,Charlotte,NC,USA,Southeast
+972,LASTX243,Los Angeles,CA,USA,West
+973,AUSTX244,Austin,TX,USA,South
+974,HOUTX244,Houston,TX,USA,South
+975,CHATX244,Charlotte,NC,USA,Southeast
+976,LASTX244,Los Angeles,CA,USA,West
+977,AUSTX245,Austin,TX,USA,South
+978,HOUTX245,Houston,TX,USA,South
+979,CHATX245,Charlotte,NC,USA,Southeast
+980,LASTX245,Los Angeles,CA,USA,West
+981,AUSTX246,Austin,TX,USA,South
+982,HOUTX246,Houston,TX,USA,South
+983,CHATX246,Charlotte,NC,USA,Southeast
+984,LASTX246,Los Angeles,CA,USA,West
+985,AUSTX247,Austin,TX,USA,South
+986,HOUTX247,Houston,TX,USA,South
+987,CHATX247,Charlotte,NC,USA,Southeast
+988,LASTX247,Los Angeles,CA,USA,West
+989,AUSTX248,Austin,TX,USA,South
+990,HOUTX248,Houston,TX,USA,South
+991,CHATX248,Charlotte,NC,USA,Southeast
+992,LASTX248,Los Angeles,CA,USA,West
+993,AUSTX249,Austin,TX,USA,South
+994,HOUTX249,Houston,TX,USA,South
+995,CHATX249,Charlotte,NC,USA,Southeast
+996,LASTX249,Los Angeles,CA,USA,West
+997,AUSTX250,Austin,TX,USA,South
+998,HOUTX250,Houston,TX,USA,South
+999,CHATX250,Charlotte,NC,USA,Southeast
+1000,LASTX250,Los Angeles,CA,USA,West

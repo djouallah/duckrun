@@ -63,6 +63,8 @@ conformance.xml
 !tests/integration_tests/**/*.csv
 !tests/integration_tests/**/*.yml
 !tests/integration_tests/**/*.json
+# ...and the vendored connection-API fixtures (coffee dimension CSVs)
+!tests/connection_api/**/*.csv
 
 # Keep the Claude Code plugin marketplace manifests (the *.json rule above ignores them)
 !.claude-plugin/marketplace.json
