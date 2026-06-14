@@ -201,12 +201,15 @@ class TestCatalogRelationsDuckDB:
 
     @pytest.fixture(scope="class")
     def profiles_config_update(self, dbt_profile_target, attach_test_db, unique_schema):
+        # Run against the duckrun adapter (not vanilla duckdb): duckrun implements
+        # duckrun__get_catalog_relations, so this exercises the real adapter. The attached
+        # duckdb file holds a shadow `alpha_model` in a *different* database, proving the
+        # catalog scopes to the target database and doesn't bleed the shadow in.
         return {
             "test": {
                 "outputs": {
                     "dev": {
-                        "type": "duckdb",
-                        "path": dbt_profile_target.get("path", ":memory:"),
+                        **dbt_profile_target,
                         "schema": unique_schema,
                         "attach": [{"path": attach_test_db}],
                     }
