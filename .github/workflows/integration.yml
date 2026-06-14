@@ -8,15 +8,24 @@ name: integration tests
 # project (or this workflow) changes; coffee is manual-only stress. On a manual dispatch you pick
 # which scenario(s) to run. aemo is deliberately NOT a release gate (publish.yml) — it depends on
 # live OneLake and is prone to transient infra failures that shouldn't block a publish.
+#
+# The aemo job also publishes the combined dbt-docs site to GitHub Pages: a landing page
+# (docs/site/index.html) linking the model DAGs of every integration dbt project — aemo (full catalog
+# over OneLake) and merge_spill (DAG only; the 60M-row table is never built for docs, a tiny tpch
+# parquet just lets it compile). It also rebuilds when the merge_spill project changes.
 on:
   push:
     branches: ["**"]
     paths:
       - 'tests/integration_tests/aemo/**'
+      - 'tests/integration_tests/merge_spill/**'
+      - 'docs/site/**'
       - '.github/workflows/integration.yml'
   pull_request:
     paths:
       - 'tests/integration_tests/aemo/**'
+      - 'tests/integration_tests/merge_spill/**'
+      - 'docs/site/**'
       - '.github/workflows/integration.yml'
   workflow_dispatch:
     inputs:
@@ -30,7 +39,7 @@ on:
         required: false
         default: "20000000"
 
-# aemo's docs deploy needs Pages + OIDC; the coffee job uses none of it.
+# the docs deploy (in the aemo job) needs Pages + OIDC; the coffee job uses none of it.
 permissions:
   contents: read
   pages: write
@@ -112,14 +121,38 @@ jobs:
         # the regression gate for the "schema does not exist" bug on the abfss:// read path.
         run: dbt test --target dev --exclude tag:heavy
 
-      - name: dbt docs generate (OneLake — catalog over abfss:// Delta tables)
-        run: dbt docs generate --target dev
+      - name: dbt docs generate (aemo — static, real catalog over abfss:// Delta tables)
+        # --static bundles manifest + catalog into one self-contained static_index.html.
+        run: dbt docs generate --static --target dev
 
-      - name: Collect the static docs site (index.html + manifest + catalog)
+      - name: Build the merge_spill DAG (static, empty catalog — no 60M-row build)
+        # The merge_spill project's DAG, without paying for the heavy table. duckrun resolves the
+        # tpch.lineitem source eagerly as a view over read_parquet, so compile needs the parquet to
+        # exist — generate a tiny tpch lineitem (sf=0.01) with DuckDB's tpch extension, point the
+        # source glob at it, and --empty-catalog skips the warehouse catalog query entirely. The
+        # WAREHOUSE_PATH override shadows the job-level OneLake path so docs land on a throwaway dir.
+        working-directory: tests/integration_tests/merge_spill
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/merge_spill
+          WAREHOUSE_PATH: /tmp/ms_docs_wh
+          MERGE_SPILL_GEN: /tmp/ms_gen
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/dbt-docs-site"
-          cp target/index.html target/manifest.json target/catalog.json \
-            "$GITHUB_WORKSPACE/dbt-docs-site/"
+          mkdir -p /tmp/ms_docs_wh /tmp/ms_gen/lineitem
+          python - <<'PY'
+          import duckdb
+          con = duckdb.connect()
+          con.execute("INSTALL tpch; LOAD tpch; CALL dbgen(sf=0.01)")
+          con.execute("COPY (SELECT * FROM lineitem) TO '/tmp/ms_gen/lineitem/part0.parquet' (FORMAT parquet)")
+          PY
+          dbt docs generate --static --empty-catalog --target dev
+
+      - name: Assemble the combined docs site (landing page + per-project DAGs)
+        working-directory: ${{ github.workspace }}
+        run: |
+          mkdir -p dbt-docs-site
+          cp docs/site/index.html dbt-docs-site/index.html
+          cp tests/integration_tests/aemo/target/static_index.html        dbt-docs-site/aemo.html
+          cp tests/integration_tests/merge_spill/target/static_index.html dbt-docs-site/merge_spill.html
 
       - name: Upload docs as a build artifact (available on every run)
         uses: actions/upload-artifact@v4
@@ -135,8 +168,8 @@ jobs:
           path: dbt-docs-site
 
   deploy-docs:
-    # Publish the generated dbt docs to GitHub Pages (main only). Skipped automatically when the
-    # aemo job didn't run (e.g. a coffee-only dispatch).
+    # Publish the combined dbt-docs site (landing page + aemo & merge_spill DAGs) to GitHub Pages
+    # (main only). Skipped automatically when the aemo job didn't run (e.g. a coffee-only dispatch).
     needs: aemo
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
