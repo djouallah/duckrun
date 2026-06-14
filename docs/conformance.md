@@ -26,8 +26,8 @@ Every still-failing test in the card below falls into one of three categories:
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ ✅ 119 passed   ❌ 11 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 88% passing                                │
+│ ✅ 120 passed   ❌ 10 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 89% passing                                │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -41,17 +41,17 @@ Every still-failing test in the card below falls into one of three categories:
 | `empty` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `ephemeral` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `fast_seed` | `██████████` 100% | 4 | 0 | 0 | 0 | 4 |
+| `incremental_microbatch` | `██████████` 100% | 13 | 0 | 0 | 0 | 13 |
 | `simple_snapshot` | `██████████` 100% | 6 | 0 | 0 | 0 | 6 |
 | `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `basic` | `█████████░` 94% | 15 | 1 | 0 | 0 | 16 |
-| `incremental_microbatch` | `█████████░` 92% | 12 | 1 | 0 | 0 | 13 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
 | `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
 | `incremental` | `████████░░` 81% | 21 | 5 | 0 | 0 | 26 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `█████████░` **88%** | **119** | **11** | **0** | **5** | **135** |
+| **Total** | `█████████░` **89%** | **120** | **10** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -105,13 +105,6 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestTableConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestViewConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-
-</details>
-<details><summary><b>incremental_microbatch</b> — 1 not passing (12/13 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_inserts_new_batches` | _internal.CommitFailedError: Table features must be specified, please specify: TimestampWithoutTimezone |
 
 </details>
 <details><summary><b>basic</b> — 1 not passing (15/16 pass)</summary>
