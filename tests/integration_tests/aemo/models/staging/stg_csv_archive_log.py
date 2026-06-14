@@ -2,7 +2,7 @@ def model(dbt, session):
     # merge (upsert), not append: the model returns the full log each run, so an upsert
     # keyed on the file identity keeps the table idempotent and safe under concurrent runs
     # (re-running a file replaces its row instead of duplicating it).
-    dbt.config(materialized="incremental", unique_key=["source_type", "source_filename"], incremental_strategy="merge", schema="source")
+    dbt.config(materialized="incremental", unique_key=["source_type", "source_filename"], incremental_strategy="merge", schema="sources")
 
     import os
     import io
