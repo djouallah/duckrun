@@ -1,32 +1,26 @@
 name: integration tests
 
-# The integration suite. Two halves:
+# The integration suite: ONE job per integration dbt project, plus a final publisher.
 #
-# 1. The DOCS pipeline — one job per integration dbt project, each of which BUILDS its models for
-#    real, runs `dbt docs generate --static`, and verifies its own catalog carries Delta stats
-#    (issue #3), then uploads its static_index.html as an artifact:
-#      • docs-aemo        — the AEMO project built against live Microsoft Fabric OneLake (abfss://);
-#                           also the read-only `dbt test` abfss:// regression gate. Needs secrets.
-#      • docs-merge_spill — the incremental-MERGE project on a tiny local TPCH parquet (DAG + stats).
-#      • docs-coffee      — the connection-API coffee-shop scenario as dbt models, local.
-#      • docs-sde         — the josephmachado/simple_dbt_project port, a tiny local full build.
-#    A final `deploy-docs` job collects the four artifacts + the landing page (docs/site/index.html)
-#    and publishes the combined dbt-docs site to GitHub Pages (main only). Splitting per project
-#    means the jobs run in parallel and one project's build failing no longer kills everyone's docs.
+# Each project job does everything for that project in a single job — build its models, run
+# `dbt docs generate --static`, assert its catalog carries Delta stats (issue #3), upload its
+# static_index.html, AND run that project's live-OneLake test:
+#   • aemo        — built against live Microsoft Fabric OneLake (abfss://); the build itself is the
+#                   OneLake exercise, and a standalone `dbt test` is the abfss:// read-path gate.
+#   • merge_spill — tiny local build for the docs catalog, then the incremental-MERGE chain
+#                   (merge_tpch_bench.py) over OneLake at a SMALL scale factor. The HEAVY SF=10
+#                   (60M-row) memory-spill version stays a LOCAL release gate (merge.yml/publish.yml).
+#   • coffee      — tiny local build for the docs catalog, then the connection-API coffee scenario
+#                   (duckrun.connect) over OneLake at a SMALL N.
+#   • sde         — tiny local build for the docs catalog, then the SCD2 port driven through real
+#                   dbt subprocesses against a persistent OneLake snapshot.
 #
-# 2. Live-OneLake smoke jobs (abfss://), each into its own isolated schema on the shared lakehouse:
-#      • coffee-onelake — the connection-API coffee scenario at a SMALL N.
-#      • merge-onelake  — the incremental-MERGE chain (merge_tpch_bench.py) at a SMALL scale factor,
-#                         exercising the abfss:// merge write/read path. The HEAVY SF=10 (60M-row)
-#                         memory-spill version stays a LOCAL release gate (merge.yml / publish.yml) —
-#                         over OneLake it would be network-bound, not a memory test.
-#      • sde-tutorial   — the SCD2 port driven through real dbt subprocesses against a persistent
-#                         OneLake snapshot.
+# `deploy-docs` is the final publisher: it collects the four projects' docs artifacts + the landing
+# page (docs/site/index.html) and pushes the combined dbt-docs site to GitHub Pages (main only).
 #
-# None of these is the per-change gate (that's core.yml). The OneLake jobs run automatically only
-# when the projects / bench / this workflow change; a manual dispatch picks which scenario(s) to run.
-# They are deliberately NOT release gates — they depend on live OneLake and so are prone to transient
-# infra failures that must not block a publish.
+# None of these is the per-change gate (that's core.yml); they hit live OneLake and so are not
+# release gates. The OneLake projects share one lakehouse, so each writes an isolated schema and
+# takes a per-project concurrency lock.
 on:
   push:
     branches: ["**"]
@@ -48,41 +42,22 @@ on:
       - 'docs/site/**'
       - '.github/workflows/integration.yml'
   workflow_dispatch:
-    inputs:
-      scenario:
-        description: "Which live-OneLake scenario(s) to run on a manual dispatch"
-        type: choice
-        options: [coffee, merge, aemo, all]
-        default: coffee
 
-# The docs deploy needs Pages + OIDC; the OneLake jobs use OIDC (id-token) for the Azure login.
+# The docs deploy needs Pages + OIDC; the project jobs use OIDC (id-token) for the Azure login.
 permissions:
   contents: read
   pages: write
   id-token: write
 
 jobs:
-  # ----------------------------------------------------------------------------------------------
-  # DOCS: one job per project. Each builds for real, generates static docs, asserts its own catalog
-  # carries Delta stats (issue #3), and uploads its static_index.html for deploy-docs to assemble.
-  # ----------------------------------------------------------------------------------------------
-
-  docs-aemo:
-    # Auto on push/PR; on manual dispatch only for aemo/all. Serialize across branches: it writes a
-    # single shared OneLake lakehouse, so concurrent runs would race each other's Delta tables.
-    if: >-
-      github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'all'))
+  aemo:
+    # The AEMO project, built against live OneLake (abfss://) — the build IS the OneLake exercise,
+    # and the standalone `dbt test` is the abfss:// read-path regression gate. Then static docs.
+    # Serialize across branches: it writes a single shared OneLake lakehouse.
     runs-on: ubuntu-latest
     concurrency:
       group: aemo-onelake
       cancel-in-progress: false
-    # Real Microsoft Fabric OneLake over abfss://. This exercises the production read path end to
-    # end: delta_rs writes to OneLake, and DuckDB's azure extension reads/globs/COPYs through an
-    # ACCESS_TOKEN secret minted from the bearer_token in storage_options. It covers the bit that
-    # only breaks on a real bearer-token store: discovery globbing abfss:// for read-only commands
-    # needs the secret created at connection-open (there's no profile `secrets:` block for OneLake,
-    # only the bearer_token) — see the dbt test step.
     defaults:
       run:
         working-directory: tests/integration_tests/aemo
@@ -93,180 +68,183 @@ jobs:
       DBT_SCHEMA: mart
       download_limit: "10"
       process_limit: "1000"
-      # DuckDB azure extension's default transport fails the TLS handshake to the OneLake blob
-      # endpoint on the runner ("Problem with the SSL CA cert"); the curl transport respects the
-      # system CA bundle. Read by the on-run-start hook in dbt_project.yml.
+      # The azure extension's default transport fails the OneLake TLS handshake on the runner
+      # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
       AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
         working-directory: ${{ github.workspace }}
         run: pip install -e .
-
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
-
       - name: Acquire a fresh OneLake bearer token
-        # Bearer tokens last ~1h, so mint one per run rather than storing a stale token.
-        # OneLake authenticates with Azure Storage AAD tokens (resource storage.azure.com).
+        # Bearer tokens last ~1h, so mint one per run. OneLake takes Azure Storage AAD tokens.
         run: |
-          TOKEN=$(az account get-access-token \
-            --resource https://storage.azure.com/ \
-            --query accessToken -o tsv)
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-
       - name: Generate external sources (calendar Delta table)
-        # dim_calendar is an external Delta table read via source('aemo','dim_calendar'),
-        # not a dbt model. Build it before dbt so the source (and its tests) can resolve.
+        # dim_calendar is an external Delta table read via source('aemo','dim_calendar'), not a model.
         run: python scripts/generate_calendar.py
-
       - name: dbt build (OneLake — creates Delta tables over abfss://)
         run: dbt build --target dev --exclude tag:heavy
-
       - name: dbt test (fresh process — read-only delta_scan registration over abfss://)
-        # A standalone `dbt test` materializes nothing, so it can only pass if the adapter
-        # re-registers every Delta table on disk as a delta_scan view at run start. On a real
-        # OneLake target that discovery glob needs the Azure secret created at connection-open
-        # (there is no profile `secrets:` block for it, only the bearer_token) — this step is
-        # the regression gate for the "schema does not exist" bug on the abfss:// read path.
+        # A standalone `dbt test` materializes nothing, so it only passes if the adapter re-registers
+        # every Delta table as a delta_scan view at run start — which on OneLake needs the Azure
+        # secret created at connection-open. The regression gate for "schema does not exist".
         run: dbt test --target dev --exclude tag:heavy
-
-      - name: dbt docs generate (aemo — static, real catalog over abfss:// Delta tables)
-        # --static bundles manifest + catalog into one self-contained static_index.html.
+      - name: dbt docs generate (static, real catalog over abfss:// Delta tables)
         run: dbt docs generate --static --target dev
-
       - name: Verify the aemo catalog carries Delta table stats (issue #3)
         run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json aemo
-
       - name: Upload aemo docs
         uses: actions/upload-artifact@v4
         with:
           name: docs-aemo
           path: tests/integration_tests/aemo/target/static_index.html
 
-  docs-merge_spill:
-    if: >-
-      github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'all'))
+  merge_spill:
+    # The incremental-MERGE project: a tiny LOCAL build for the docs catalog, then the MERGE chain
+    # over OneLake at a SMALL scale factor (the abfss:// merge write/read path). The heavy SF=10
+    # memory-spill version is a local release gate (merge.yml), not this.
     runs-on: ubuntu-latest
-    # Build the merge_spill models for real so the docs catalog carries Delta stats (rows/size/
-    # last-modified), instead of an empty-catalog DAG-only render. generate_data writes a tiny tpch
-    # parquet into MERGE_SPILL_GEN, the tpch.lineitem source scans it, and the merge models build
-    # against it on a throwaway LOCAL warehouse — no OneLake, no big fact (the 60M-row spill test
-    # lives in merge.yml).
-    defaults:
-      run:
-        working-directory: tests/integration_tests/merge_spill
+    concurrency:
+      group: merge-onelake
+      cancel-in-progress: false
     env:
-      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/merge_spill
-      WAREHOUSE_PATH: /tmp/ms_docs_wh
-      MERGE_SPILL_GEN: /tmp/ms_gen
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
       - name: Install duckrun + tpchgen-cli (generate_data shells out to tpchgen)
-        working-directory: ${{ github.workspace }}
         run: |
-          pip install -e .
+          pip install -e ".[test]"
           pip install tpchgen-cli
-
       - name: dbt build + docs generate (local, tiny scale)
+        working-directory: tests/integration_tests/merge_spill
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/merge_spill
+          WAREHOUSE_PATH: /tmp/ms_docs_wh
+          MERGE_SPILL_GEN: /tmp/ms_gen
         run: |
           mkdir -p /tmp/ms_docs_wh /tmp/ms_gen
           dbt build --target dev
           dbt docs generate --static --target dev
-
       - name: Verify the merge_spill catalog carries Delta table stats (issue #3)
+        working-directory: tests/integration_tests/merge_spill
         run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json merge_spill
-
       - name: Upload merge_spill docs
         uses: actions/upload-artifact@v4
         with:
           name: docs-merge_spill
           path: tests/integration_tests/merge_spill/target/static_index.html
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Run the MERGE chain against OneLake (small scale factor)
+        # --warehouse abfss://… + --target onelake routes the whole chain to OneLake; --sf 1 keeps
+        # the fact small (network-bound, not a memory test). DBT_SCHEMA isolates it from aemo.
+        env:
+          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          DBT_SCHEMA: merge_spill_it
+        run: >-
+          python tests/tools/merge_tpch_bench.py
+          --dir /tmp/merge_onelake
+          --warehouse "$WAREHOUSE_PATH"
+          --target onelake
+          --sf 1
 
-  docs-coffee:
-    if: >-
-      github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'all'))
+  coffee:
+    # The coffee-shop project: a LOCAL build for the docs catalog, then the connection-API coffee
+    # scenario (duckrun.connect) over OneLake at a SMALL N, into an isolated schema.
     runs-on: ubuntu-latest
-    # Build the coffee-shop models for real on a throwaway local warehouse so the docs catalog
-    # carries Delta stats. The models read the dim CSVs via read_csv_auto at run time; no network.
-    defaults:
-      run:
-        working-directory: tests/integration_tests/coffee
+    concurrency:
+      group: coffee-onelake
+      cancel-in-progress: false
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
-      WAREHOUSE_PATH: /tmp/coffee_docs_wh
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
-        working-directory: ${{ github.workspace }}
-        run: pip install -e .
-
+      - name: Install duckrun + pytest
+        run: pip install -e ".[test]"
       - name: dbt build + docs generate (local)
+        working-directory: tests/integration_tests/coffee
+        env:
+          WAREHOUSE_PATH: /tmp/coffee_docs_wh
         run: |
           mkdir -p /tmp/coffee_docs_wh
           dbt build --target dev
           dbt docs generate --static --target dev
-
       - name: Verify the coffee catalog carries Delta table stats (issue #3)
+        working-directory: tests/integration_tests/coffee
         run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json coffee
-
       - name: Upload coffee docs
         uses: actions/upload-artifact@v4
         with:
           name: docs-coffee
           path: tests/integration_tests/coffee/target/static_index.html
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Run the coffee-shop scenario against OneLake (small N)
+        env:
+          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          DUCKRUN_IT_SCHEMA: duckrun_conn_it
+          COFFEE_ONELAKE_ROWS: "2000"
+        run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
 
-  docs-sde:
-    if: >-
-      github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'all'))
+  sde:
+    # The josephmachado/simple_dbt_project port: a tiny LOCAL full build for the docs catalog
+    # (order_status_pivot needs the gold table to exist at parse time, so it can't be DAG-only),
+    # then the SCD2 port driven through real dbt subprocesses against a persistent OneLake snapshot.
     runs-on: ubuntu-latest
-    # The josephmachado/simple_dbt_project port. Unlike the other DAGs we can't --empty-catalog it:
-    # order_status_pivot calls dbt_utils.get_column_values('orders_obt') at parse time, so docs
-    # generate needs the gold table to actually exist. The data is tiny (~100/999/27/100 rows from
-    # the vendored raw_data/ CSVs), so just do a full local build into a throwaway warehouse — that
-    # also yields a real catalog with column metadata. deps is required because dbt_packages is
-    # gitignored (not in the checkout).
-    defaults:
-      run:
-        working-directory: tests/integration_tests/sde_dbt_tutorial
+    concurrency:
+      group: sde-onelake
+      cancel-in-progress: false
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/sde_dbt_tutorial
-      DUCKRUN_WAREHOUSE: /tmp/sde_docs_wh
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-
-      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
-        working-directory: ${{ github.workspace }}
-        run: pip install -e .
-
+      - name: Install duckrun + pytest
+        run: pip install -e ".[test]"
       - name: EL + dbt build + docs generate (local, tiny full build)
+        working-directory: tests/integration_tests/sde_dbt_tutorial
+        env:
+          DUCKRUN_WAREHOUSE: /tmp/sde_docs_wh
         run: |
           mkdir -p /tmp/sde_docs_wh
           python el/extract_load_pipeline.py
@@ -274,23 +252,36 @@ jobs:
           dbt seed --target dev
           dbt build --target dev
           dbt docs generate --static --target dev
-
       - name: Verify the sde_dbt_tutorial catalog carries Delta table stats (issue #3)
+        working-directory: tests/integration_tests/sde_dbt_tutorial
         run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json sde_dbt_tutorial
-
       - name: Upload sde_dbt_tutorial docs
         uses: actions/upload-artifact@v4
         with:
           name: docs-sde
           path: tests/integration_tests/sde_dbt_tutorial/target/static_index.html
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Run the sde_dbt_tutorial SCD2 port against OneLake (stateful, real dbt subprocesses)
+        env:
+          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+        run: python -m pytest tests/integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py -q -s -p no:cacheprovider
 
   deploy-docs:
-    # Assemble the combined dbt-docs site (landing page + the four per-project DAGs) and publish it
-    # to GitHub Pages (main only). `needs` all four doc jobs, so a manual dispatch that didn't run
-    # them (or any doc job failing) skips publishing automatically. On feature branches / PRs the
-    # four per-project artifacts (docs-aemo, docs-merge_spill, docs-coffee, docs-sde) are still
-    # available individually from their own jobs.
-    needs: [docs-aemo, docs-merge_spill, docs-coffee, docs-sde]
+    # The final publisher: collect the four projects' docs artifacts + the landing page and push the
+    # combined dbt-docs site to GitHub Pages (main only). `needs` all four, so any project job failing
+    # (or a non-main branch) skips publishing automatically; PR/feature runs still get the four
+    # per-project artifacts from their own jobs.
+    needs: [aemo, merge_spill, coffee, sde]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
@@ -298,13 +289,11 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
-
       - name: Download all per-project docs artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: docs-*
           path: docs-artifacts
-
       - name: Assemble the combined docs site (landing page + per-project DAGs)
         run: |
           mkdir -p dbt-docs-site
@@ -313,168 +302,10 @@ jobs:
           cp docs-artifacts/docs-merge_spill/static_index.html dbt-docs-site/merge_spill.html
           cp docs-artifacts/docs-coffee/static_index.html      dbt-docs-site/coffee.html
           cp docs-artifacts/docs-sde/static_index.html         dbt-docs-site/sde_dbt_tutorial.html
-
       - name: Package docs for Pages
         uses: actions/upload-pages-artifact@v3
         with:
           path: dbt-docs-site
-
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
-
-  # ----------------------------------------------------------------------------------------------
-  # Live-OneLake smoke jobs (abfss://), each into its own isolated schema on the shared lakehouse.
-  # ----------------------------------------------------------------------------------------------
-
-  coffee-onelake:
-    # The connection-API coffee scenario (duckrun.connect) against live OneLake at a SMALL row count —
-    # the network dominates, so a tiny fact is enough to exercise the abfss:// read/write path.
-    # Writes into an isolated schema (duckrun_conn_it) so it never collides with aemo sharing the
-    # same lakehouse, and it is deliberately NOT a deploy-docs dependency — a OneLake hiccup here
-    # must not block publishing the DAGs.
-    if: >-
-      github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'coffee' || inputs.scenario == 'all'))
-    runs-on: ubuntu-latest
-    concurrency:
-      group: coffee-onelake
-      cancel-in-progress: false
-    env:
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
-      DUCKRUN_IT_SCHEMA: duckrun_conn_it
-      COFFEE_ONELAKE_ROWS: "2000"
-      # curl transport: the azure extension's default fails the OneLake TLS handshake on the runner.
-      AZURE_TRANSPORT_OPTION_TYPE: curl
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
-        run: pip install -e ".[test]"
-
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: Acquire a fresh OneLake bearer token
-        # Per-run token (they last ~1h). OneLake authenticates with Azure Storage AAD tokens.
-        run: |
-          TOKEN=$(az account get-access-token \
-            --resource https://storage.azure.com/ \
-            --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-
-      - name: Run the coffee-shop scenario against OneLake (small N)
-        run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
-
-  merge-onelake:
-    # The incremental-MERGE chain (merge_tpch_bench.py) against live OneLake at a SMALL scale factor.
-    # This exercises the abfss:// MERGE write/read path end to end through the dbt path — every op in
-    # the chain (mixed upsert / insert-only / update-only / idempotent / append / safeappend /
-    # overwrite) writes Delta to OneLake, and the bench's verification queries delta_scan it back. The
-    # HEAVY SF=10 (60M-row) memory-spill version stays a LOCAL release gate (merge.yml / publish.yml):
-    # over OneLake it is network-bound, not a memory test. Writes into an isolated schema
-    # (merge_spill_it) so it never collides with aemo, and is deliberately NOT a deploy-docs
-    # dependency. The bench seeds each table with --full-refresh, so a persisted prior run is fine.
-    if: >-
-      github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'merge' || inputs.scenario == 'all'))
-    runs-on: ubuntu-latest
-    concurrency:
-      group: merge-onelake
-      cancel-in-progress: false
-    env:
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
-      DBT_SCHEMA: merge_spill_it
-      # curl transport: the azure extension's default fails the OneLake TLS handshake on the runner.
-      AZURE_TRANSPORT_OPTION_TYPE: curl
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + tpchgen-cli (generate_data shells out to tpchgen)
-        run: |
-          pip install -e ".[test]"
-          pip install tpchgen-cli
-
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token \
-            --resource https://storage.azure.com/ \
-            --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-
-      - name: Run the MERGE chain against OneLake (small scale factor)
-        # --warehouse abfss://… + --target onelake routes the whole chain to OneLake; --sf 1 keeps
-        # the fact small (network-bound, not a memory test). --dir is only a local scratch dir for
-        # the generated tpch parquet.
-        run: >-
-          python tests/tools/merge_tpch_bench.py
-          --dir /tmp/merge_onelake
-          --warehouse "$WAREHOUSE_PATH"
-          --target onelake
-          --sf 1
-
-  sde-tutorial:
-    # The josephmachado/simple_dbt_project port (tests/integration_tests/sde_dbt_tutorial/), driven
-    # through REAL dbt subprocesses (one process per phase) against a PERSISTENT Microsoft Fabric
-    # OneLake warehouse (abfss://…/Tables/sde_dbt_tutorial). The test drives a controlled source
-    # change and asserts SCD2 invariants (one open version per key, contiguous validity windows,
-    # idempotent rebuild) on a long-lived snapshot — the way SCD2 actually behaves in production,
-    # not from a throwaway empty start. Gated like the other live-OneLake jobs (auto on push/PR);
-    # a concurrency lock keeps overlapping runs from racing on the shared snapshot.
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    concurrency:
-      group: sde-onelake
-      cancel-in-progress: false
-    env:
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
-      # curl transport: the azure extension's default fails the OneLake TLS handshake on the runner.
-      AZURE_TRANSPORT_OPTION_TYPE: curl
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
-        run: pip install -e ".[test]"
-
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token \
-            --resource https://storage.azure.com/ \
-            --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-
-      - name: Run the sde_dbt_tutorial SCD2 port against OneLake (stateful, real dbt subprocesses)
-        run: python -m pytest tests/integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py -q -s -p no:cacheprovider
