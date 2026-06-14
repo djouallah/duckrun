@@ -12,12 +12,18 @@ in two incarnations that share the same scenario:
 
 The two dimension tables (`Dim_Locations.csv`, `Dim_Products.csv`) come from **Josue Bogran's**
 [coffeeshopdatageneratorv2](https://github.com/JosueBogran/coffeeshopdatageneratorv2)
-(MIT License, © Josue Bogran). All credit for the coffee-shop dataset goes to him.
+(MIT License, © Josue Bogran). All credit for the coffee-shop dataset goes to him. The fact table is
+generated locally (random order lines), not taken from upstream.
 
-We do **not** vendor the files: the models read them straight from the upstream repo over `https`
-(`read_csv_auto('https://raw.githubusercontent.com/JosueBogran/coffeeshopdatageneratorv2/main/…')`),
-so the data is always the upstream version. The fact table is generated locally (random order lines),
-not taken from upstream.
+Two consumers, two ways of reading the same data:
+
+- **Connection-API scenario** (`tests/connection_api/test_coffee.py`) reads **vendored** copies under
+  [`tests/connection_api/data/`](../../connection_api/data/) — so the scenario, and the `coffee-stress`
+  release gate that runs it, never touch the network (legit, repeatable stress numbers).
+- **This dbt project** reads the CSVs straight from upstream over `https`
+  (`read_csv_auto('https://raw.githubusercontent.com/JosueBogran/coffeeshopdatageneratorv2/main/…')`).
+  In CI it is only docs-built (`--empty-catalog`, models never execute), so it never actually fetches;
+  a local `dbt build` does, and always gets the current upstream version.
 
 ## The DAG
 

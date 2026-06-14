@@ -2,8 +2,9 @@ name: coffee-stress
 
 # Stress the connection API (duckrun.connect) at scale: how big a coffee-shop fact can a standard
 # GitHub-hosted runner sustain end to end — ingest the dims, generate an N-row fact, partitioned
-# Delta write, mart, append, merge, insert-only — on a LOCAL filesystem warehouse (no OneLake, no
-# network bottleneck beyond the dimension CSVs). N is an input.
+# Delta write, mart, append, merge, insert-only — on a LOCAL filesystem warehouse. Fully offline: the
+# dimension CSVs are vendored (tests/connection_api/data/), so the timing/memory numbers are legit and
+# no upstream fetch can block the gate. N is an input.
 #
 # Like merge-spill, this is a release gate: the publish workflow calls it (workflow_call) on a version
 # tag and only publishes if it passes, so a connection-API regression that only shows up at scale

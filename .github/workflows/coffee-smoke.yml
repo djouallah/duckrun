@@ -2,8 +2,8 @@ name: coffee smoke
 
 # A fast, automatic smoke of the connection-API coffee-shop scenario (duckrun.connect) on a LOCAL
 # filesystem warehouse at a SMALL row count — the per-change guard that the end-to-end scenario still
-# works. Runs whenever the connection API source or the scenario file changes. It pulls the dimension
-# CSVs over https, so it needs network (which is why it lives here, not in the offline core.yml gate).
+# works. Runs whenever the connection API source or the scenario file changes. The dimension CSVs are
+# vendored (tests/connection_api/data/), so it is fully offline.
 #
 # The two heavier siblings are elsewhere: the millions-of-rows local STRESS run is the manual `coffee`
 # job in integration.yml, and the live-OneLake variant is the `coffee-onelake` job there (gated like

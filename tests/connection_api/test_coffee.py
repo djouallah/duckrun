@@ -17,7 +17,8 @@ OneLake target (no Azure ids hardcoded — same convention as the `aemo` workflo
   WAREHOUSE_PATH   abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>/Tables
   ONELAKE_TOKEN    storage bearer token (resource https://storage.azure.com/)
 
-Dimensions come from Josue Bogran's coffeeshopdatageneratorv2 CSVs (read over https); the fact is
+Dimensions come from Josue Bogran's coffeeshopdatageneratorv2 CSVs, vendored under data/ (MIT — see
+data/README.md) so the scenario never touches the network; the fact is
 generated locally in DuckDB. ``Dim_Products.csv`` is SCD2 (``product_id`` repeats across validity
 windows), so the scenario first dedups it to a current, unique-key ``products`` table — which makes
 the fact join 1:1 and gives the merge a legitimate key. Re-runnable: stable names + overwrite
@@ -40,7 +41,10 @@ try:
 except Exception:
     pass
 
-GH = "https://raw.githubusercontent.com/JosueBogran/coffeeshopdatageneratorv2/main/"
+# Dimension CSVs are vendored under data/ (see data/README.md) so the scenario — and the
+# coffee-stress release gate that runs it — never depend on the network. Forward-slash path so the
+# DuckDB read_csv_auto string is valid on Windows too.
+DATA = (os.path.dirname(os.path.abspath(__file__)) + "/data").replace(os.sep, "/")
 
 
 @contextmanager
@@ -64,15 +68,14 @@ ONELAKE_SCHEMA = os.environ.get("DUCKRUN_IT_SCHEMA", "duckrun_conn_it")
 def run_coffee_scenario(conn, schema, n_rows):
     """Exercise the full connection-API surface against ``conn`` with an ``n_rows`` fact table."""
     q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731 — scalar helper
-    conn.connection.execute("INSTALL httpfs; LOAD httpfs;")  # read the dim CSVs over https
 
     print(f"\n=== coffee-shop scenario | schema='{schema}' | {n_rows:,} fact rows "
           f"| warehouse={getattr(conn, 'root_path', '?')} ===", flush=True)
 
     # ── ingest dimensions: DataFrameReader.csv → Delta ───────────────────────────────────────────
-    with _step(1, "ingest dimensions: read Dim_Locations / Dim_Products CSVs over https → Delta") as say:
-        conn.read.csv(GH + "Dim_Locations.csv").write.mode("overwrite").saveAsTable("dim_locations")
-        conn.read.csv(GH + "Dim_Products.csv").write.mode("overwrite").saveAsTable("dim_products")
+    with _step(1, "ingest dimensions: read vendored Dim_Locations / Dim_Products CSVs → Delta") as say:
+        conn.read.csv(DATA + "/Dim_Locations.csv").write.mode("overwrite").saveAsTable("dim_locations")
+        conn.read.csv(DATA + "/Dim_Products.csv").write.mode("overwrite").saveAsTable("dim_products")
         assert conn.table("dim_locations").count() == 1000
         assert conn.table("dim_products").count() == 26   # SCD2 rows (product_id repeats)
         say("dim_locations=1,000 rows, dim_products=26 SCD2 rows")
