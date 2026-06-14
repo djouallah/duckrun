@@ -25,10 +25,10 @@ Every still-failing test in the card below falls into one of three categories:
 ## dbt adapter conformance — duckrun
 
 ```
-┌────────────────────────────────────────────────────────┐
-│ ✅ 120 passed   ❌ 10 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 89% passing                                │
-└────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│ ✅ 123 passed   ❌ 7 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 91% passing                               │
+└───────────────────────────────────────────────────────┘
 ```
 
 ### By suite
@@ -38,6 +38,7 @@ Every still-failing test in the card below falls into one of three categories:
 | `aliases` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `caching` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `concurrency` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
+| `constraints` | `██████████` 100% | 17 | 0 | 0 | 0 | 17 |
 | `empty` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `ephemeral` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `fast_seed` | `██████████` 100% | 4 | 0 | 0 | 0 | 4 |
@@ -47,11 +48,10 @@ Every still-failing test in the card below falls into one of three categories:
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `basic` | `█████████░` 94% | 15 | 1 | 0 | 0 | 16 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
-| `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
 | `incremental` | `████████░░` 81% | 21 | 5 | 0 | 0 | 26 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `█████████░` **89%** | **120** | **10** | **0** | **5** | **135** |
+| **Total** | `█████████░` **91%** | **123** | **7** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -96,15 +96,6 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestIncrementalMerge::test_merge_custom_clauses` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestIncrementalMergeValidation::test_ducklake_valid_single_update` | AssertionError: dbt exit state did not match expected |
-
-</details>
-<details><summary><b>constraints</b> — 3 not passing (14/17 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestTableConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestViewConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
 
 </details>
 <details><summary><b>basic</b> — 1 not passing (15/16 pass)</summary>
