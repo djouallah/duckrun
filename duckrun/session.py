@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 import duckdb
 
-from dbt.adapters.duckrun import engine, remote, secret
+from dbt.adapters.duckrun import delta_dml, engine, remote, secret
 from . import auth
 
 
@@ -164,6 +164,10 @@ class DuckSession:
                 continue
             self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(schema)}")
             for table in tables:
+                # Hide drop-tombstones (a `drop table` overwrites the table to a one-column marker;
+                # no data is deleted, the files persist, but the table must not surface).
+                if delta_dml.is_dropped(self.con, self.table_path(schema, table), self.storage_options):
+                    continue
                 self._register_view(schema, table)
                 registered.append(f"{schema}.{table}")
 
@@ -204,20 +208,29 @@ class DuckSession:
     # ---- Spark-shaped surface --------------------------------------------------------------
 
     def sql(self, query: str) -> "DataFrame":
-        """Run a **read** query and return a :class:`DataFrame`. ``conn.sql()`` is read-only: the
-        tables are registered as read-only ``delta_scan`` views, so it passes straight through to
-        DuckDB. Time-travel works for free — ``conn.sql("from delta_scan('path', version => 0)")``.
+        """Run a query and return a :class:`DataFrame`.
 
-        Writes go through the Spark-shaped surface, not SQL: ``df.write.saveAsTable`` (create /
-        append) and the ``conn.delta_table(name)`` handle —
-        ``.merge(...)`` / ``.delete()`` / ``.update()`` / ``.replaceWhere()``. A Delta-write
-        statement is rejected up front (not executed) — a bare DuckDB ``CREATE TABLE … AS`` would
-        otherwise silently make an ephemeral DuckDB-local table that never reaches Delta.
-        ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL still pass through.
+        Reads pass straight through to DuckDB over the ``delta_scan`` views (time-travel works for
+        free — ``conn.sql("from delta_scan('path', version => 0)")``).
+
+        Delta **DML** is applied to the Delta table via delta_rs (works local AND on OneLake):
+        ``create table … as select`` (overwrite), ``insert into … select`` (append),
+        ``delete``/``update`` (delta_rs delete/update), ``alter table … add column``, and
+        ``drop table`` (tombstone — marks the table dropped without deleting data; a human purges
+        the files). After a DML statement the catalog is refreshed.
+
+        ``merge`` and ``insert … values`` aren't expressible via delta_rs DML here — use the
+        Spark write surface instead: ``df.write.saveAsTable(...)`` or
+        ``conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()``.
+        ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
         """
+        if delta_dml.handle(self.con, self.root_path, self.storage_options, query,
+                            default_schema=self._current_database):
+            self.refresh(quiet=True)
+            return DataFrame(self.con.sql("SELECT 'ok' AS status"), self)
         if _is_delta_write(query):
             raise ValueError(
-                "conn.sql() is read-only (Delta tables are registered as read-only views). "
+                "conn.sql() can't run this write via delta_rs (merge / insert…values). "
                 "Use the Spark write API: df.write.saveAsTable(...) to create/append, or "
                 "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
             )

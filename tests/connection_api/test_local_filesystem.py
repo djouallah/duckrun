@@ -5,6 +5,7 @@ discovery + catalog, the ``DataFrameWriter`` save modes, the ``DataFrameReader``
 ``DeltaTable.merge`` upsert builder. Storage-neutrality (s3/gcs/abfss) shares this exact code
 path — only the secret/discovery backend differs — so the local run is representative.
 """
+import deltalake
 import duckdb
 import pytest
 from deltalake.exceptions import CommitFailedError
@@ -12,6 +13,7 @@ from deltalake.exceptions import CommitFailedError
 import duckrun
 from duckrun import DeltaTable
 from dbt.adapters.duckrun import engine
+from dbt.adapters.duckrun.delta_dml import TOMBSTONE_COLUMN
 
 
 def _seed(path, sql):
@@ -126,9 +128,10 @@ def test_spark_writes_persist_to_delta(wh):
     evt.delete("id = 2")
     assert sorted(conn.sql("select * from evt").collect()) == [(1, "Z"), (3, "C")]
 
-    # a write statement through conn.sql() is rejected (read-only) — no silent DuckDB-local table
-    with pytest.raises(ValueError, match="read-only"):
-        conn.sql("CREATE TABLE evt2 AS SELECT 1 id")
+    # conn.sql() applies create/insert/update/delete/alter/drop as delta_rs DML (see the DML tests
+    # below); only merge / insert…values can't be expressed that way and are directed to the API.
+    with pytest.raises(ValueError):
+        conn.sql("merge into evt using evt s on s.id = evt.id when matched then update set grp = 'z'")
 
     # real persistence: a fresh connection reads it off the store
     fresh = duckrun.connect(wh, schema="dbo")
@@ -291,3 +294,57 @@ def test_merge_update_columns_and_sync_delete(wh):
 
     # id=2 updates val only (note 'b' preserved), id=4 inserted, ids 1 & 3 deleted (not in source).
     assert sorted(conn.table("sync").collect()) == [(2, 99, "b"), (4, 99, "Y")]
+
+
+def test_sql_dml_applied_to_delta(wh):
+    # conn.sql() applies Delta DML via delta_rs (no native DuckDB tables): create-as / insert-select
+    # / update / delete / alter-add. Every step lands as real Delta, visible to a fresh connection.
+    conn = duckrun.connect(wh, schema="dbo")
+    q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731
+    path = conn.table_path("dbo", "items")
+
+    conn.sql("create table items as select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)")
+    assert conn.table("items").count() == 3
+    assert deltalake.DeltaTable.is_deltatable(path)            # real Delta, not a native table
+
+    conn.sql("insert into items select * from (values (4,'d')) t(id, name)")
+    assert conn.table("items").count() == 4
+
+    conn.sql("update items set name = 'Z' where id = 1")
+    assert q("select name from items where id = 1") == "Z"
+
+    conn.sql("delete from items where id = 2")
+    assert conn.table("items").count() == 3
+    assert q("select count(*) from items where id = 2") == 0
+
+    conn.sql("alter table items add column qty integer")
+    assert "qty" in conn.sql("select * from items").columns
+    assert q("select count(*) from items where qty is null") == 3
+
+    assert deltalake.DeltaTable(path).version() >= 4           # all of the above were Delta commits
+    # a fresh connection sees the same persisted state
+    assert duckrun.connect(wh, schema="dbo").table("items").count() == 3
+
+
+def test_sql_drop_tombstones_without_deleting_data(wh):
+    # `drop table` marks the table dropped (a one-column tombstone, via delta_rs) WITHOUT deleting
+    # data: the table leaves the catalog, the files stay, and a later create-as revives it.
+    conn = duckrun.connect(wh, schema="dbo")
+    conn.sql("create table items as select * from (values (1,'a'),(2,'b')) t(id, name)")
+    path = conn.table_path("dbo", "items")
+    assert "items" in conn.catalog.listTables()
+
+    conn.sql("drop table items")
+    assert "items" not in conn.catalog.listTables()           # gone from the catalog
+    with pytest.raises(Exception):
+        conn.table("items")                                   # view unregistered
+    assert deltalake.DeltaTable.is_deltatable(path)           # NOT deleted — files remain
+    assert [f.name for f in deltalake.DeltaTable(path).schema().fields] == [TOMBSTONE_COLUMN]
+
+    # discovery on a brand-new connection also hides the tombstone
+    assert "items" not in duckrun.connect(wh, schema="dbo").catalog.listTables()
+
+    # recreate over the tombstone -> live again with the real schema (marker cleared)
+    conn.sql("create table items as select * from (values (10,'x')) t(id, name)")
+    assert conn.table("items").count() == 1
+    assert [f.name for f in deltalake.DeltaTable(path).schema().fields] == ["id", "name"]

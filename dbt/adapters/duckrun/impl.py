@@ -13,6 +13,7 @@ from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
 from dbt.adapters.duckdb.impl import DuckDBAdapter
 
+from dbt.adapters.duckrun import delta_dml
 from dbt.adapters.duckrun import remote
 from dbt.adapters.duckrun import secret
 from dbt.adapters.duckrun.credentials import DuckrunCredentials
@@ -245,6 +246,22 @@ class DuckrunAdapter(DuckDBAdapter):
             in_memory = []
 
         discovered = self._discover_delta_relations(schema_relation)
+        if not discovered:
+            return in_memory
+
+        # Hide drop-tombstones: a `drop table` overwrites the table to a one-column marker (no data
+        # deleted). Such a table must not surface as a relation. Check before registering.
+        root_path = getattr(self.config.credentials, "root_path", "") or ""
+        so = getattr(self.config.credentials, "storage_options", None)
+        cur = self._cursor()
+        live = []
+        for rel in discovered:
+            loc = (root_path.rstrip("/") + "/" + str(rel.schema).strip('"')
+                   + "/" + str(rel.identifier).strip('"'))
+            if delta_dml.is_dropped(cur, loc, so):
+                continue
+            live.append(rel)
+        discovered = live
         if not discovered:
             return in_memory
 
