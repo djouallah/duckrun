@@ -23,11 +23,21 @@
     ul.dags .src a { font-size: 0.85rem; font-weight: 500; }
     footer { margin-top: 2.5rem; color: #888; font-size: 0.85rem; }
     code { background: #8882; padding: 0.1rem 0.35rem; border-radius: 4px; }
+    figure.shot { margin: 1.75rem 0 2rem; }
+    figure.shot img { width: 100%; display: block; border: 1px solid #8884; border-radius: 10px; }
+    figure.shot figcaption { color: #777; font-size: 0.9rem; margin-top: 0.55rem; text-align: center; }
   </style>
 </head>
 <body>
   <h1>duckrun — dbt model DAGs</h1>
   <p class="lede">Generated dbt documentation for the integration dbt projects (DuckDB → Delta Lake via delta-rs).</p>
+
+  <figure class="shot">
+    <img src="duckrun_dbt_output.png"
+         alt="dbt models materialized by duckrun as Delta tables in a Microsoft Fabric OneLake lakehouse">
+    <figcaption>The DAGs below, materialized — duckrun writes each dbt model as a Delta table,
+    here in a Microsoft Fabric OneLake lakehouse.</figcaption>
+  </figure>
 
   <ul class="dags">
     <li>

@@ -298,6 +298,7 @@ jobs:
         run: |
           mkdir -p dbt-docs-site
           cp docs/site/index.html                              dbt-docs-site/index.html
+          cp docs/site/duckrun_dbt_output.png                  dbt-docs-site/duckrun_dbt_output.png
           cp docs-artifacts/docs-aemo/static_index.html        dbt-docs-site/aemo.html
           cp docs-artifacts/docs-merge_spill/static_index.html dbt-docs-site/merge_spill.html
           cp docs-artifacts/docs-coffee/static_index.html      dbt-docs-site/coffee.html
