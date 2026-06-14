@@ -45,7 +45,7 @@ _GROUP_API = {
     "TestDataFrameReader": "Spark",    # pyspark.sql.DataFrameReader
     "TestDataFrameWriter": "Spark",    # pyspark.sql.DataFrameWriter
     "TestDeltaTable": "Spark",         # delta.tables.DeltaTable — the Delta-on-Spark API (≈ Spark)
-    "TestSqlReadOnly": "duckrun",      # read-only conn.sql + version-pinned read are duckrun behaviors
+    "TestSqlDml": "duckrun",           # conn.sql reads + delta_rs DML routing are duckrun behaviors
 }
 _METHOD_API = {
     ("TestSession", "sql"): "Spark", ("TestSession", "table"): "Spark",
@@ -76,8 +76,16 @@ def _label(test: str) -> str:
         return "SELECT (passthrough)"
     if test == "version_pinned_read":
         return "version-pinned read"
-    if test == "write_statement_rejected":
-        return "read-only guard"
+    if test.startswith("sql_"):
+        return {
+            "sql_create_table_as": "create table as",
+            "sql_insert_select": "insert…select",
+            "sql_update": "update",
+            "sql_delete": "delete",
+            "sql_alter_add_column": "alter add column",
+            "sql_drop_tombstone": "drop (tombstone)",
+            "sql_unsupported_write_rejected": "write guard (merge/insert…values)",
+        }.get(test, test)
     if test == "update_only_rejected":
         return "merge"
     return {

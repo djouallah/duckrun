@@ -282,9 +282,11 @@ class TestDeltaTable:
         assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
 
 
-class TestSqlReadOnly:
-    """conn.sql() is read-only: reads (incl. version-pinned delta_scan) pass through; a write
-    statement raises with a pointer to the Spark write API."""
+class TestSqlDml:
+    """conn.sql(): reads (incl. version-pinned delta_scan) pass through, and Delta DML is applied
+    via delta_rs — create-as / insert-select / update / delete / alter-add, and drop (a tombstone:
+    no data deleted). merge / insert…values aren't expressible as delta_rs DML and are directed to
+    the Spark write API."""
 
     def test_select_passthrough(self, conn):
         assert conn.sql("SELECT 1").fetchall() == [(1,)]
@@ -297,13 +299,36 @@ class TestSqlReadOnly:
         path = conn.table_path("dbo", "tt")
         assert conn.sql(f"select a from delta_scan('{path}', version => 0)").fetchone()[0] == 1
 
+    def test_sql_create_table_as(self, conn):
+        conn.sql("create table cta as select * from (values (1),(2)) t(x)")
+        assert conn.table("cta").count() == 2
+
+    def test_sql_insert_select(self, conn):
+        conn.sql("insert into src select * from (values (9,'z')) t(id, name)")
+        assert conn.table("src").count() == 4
+
+    def test_sql_update(self, conn):
+        conn.sql("update src set name = 'Z' where id = 1")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "Z"
+
+    def test_sql_delete(self, conn):
+        conn.sql("delete from src where id = 1")
+        assert conn.table("src").count() == 2
+
+    def test_sql_alter_add_column(self, conn):
+        conn.sql("alter table src add column qty integer")
+        assert "qty" in conn.sql("select * from src").columns
+
+    def test_sql_drop_tombstone(self, conn):
+        # drop is a tombstone (no data deleted); the table leaves the catalog.
+        conn.sql("drop table src")
+        assert "src" not in conn.catalog.listTables()
+
     @pytest.mark.parametrize("stmt", [
-        "CREATE TABLE w AS SELECT 1 a",
         "INSERT INTO src VALUES (9, 'z')",
-        "DELETE FROM src WHERE id = 1",
-        "UPDATE src SET name = 'z'",
         "MERGE INTO src USING src s ON src.id = s.id WHEN MATCHED THEN DELETE",
     ])
-    def test_write_statement_rejected(self, conn, stmt):
-        with pytest.raises(ValueError, match="read-only"):
+    def test_sql_unsupported_write_rejected(self, conn, stmt):
+        # merge / insert…values can't be expressed as delta_rs DML → directed to the write API.
+        with pytest.raises(ValueError):
             conn.sql(stmt)
