@@ -1,0 +1,8 @@
+# dbt + duckrun generated artifacts
+target/
+dbt_packages/
+logs/
+package-lock.yml
+*.duckdb
+warehouse/
+__pycache__/

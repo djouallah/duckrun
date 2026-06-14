@@ -1,0 +1,12 @@
+---
+sde_dbt_tutorial:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      threads: 1            # duckrun is not thread-safe on the Delta write path
+      schema: main
+      # Local Delta warehouse. delta_rs writes land as <root_path>/<schema>/<model>;
+      # existing Delta tables are surfaced back as delta_scan views by the adapter, so
+      # {{ this }} / is_incremental() resolve across the two-phase run.
+      root_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}"

@@ -1,0 +1,25 @@
+---
+version: 2
+sources:
+  - name: raw
+    description: >
+      Application data landed by the EL step (el/extract_load_pipeline.py) as Delta tables.
+      duckrun resolves each plugin source as a CREATE OR REPLACE VIEW over delta_scan, so the
+      bronze models stream straight off the Delta files.
+    tables:
+      - name: raw_customer
+        meta:
+          plugin: duckrun
+          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/raw/raw_customer"
+      - name: raw_orders
+        meta:
+          plugin: duckrun
+          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/raw/raw_orders"
+      - name: raw_state
+        meta:
+          plugin: duckrun
+          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/raw/raw_state"
+      - name: raw_clickstream
+        meta:
+          plugin: duckrun
+          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/raw/raw_clickstream"
