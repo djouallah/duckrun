@@ -6,6 +6,7 @@ connection (``configure_connection``), and on ``store()`` hands the model relati
 straight to delta_rs. DuckDB relations expose the Arrow C-stream interface, which
 deltalake 1.x consumes directly, so there is no pyarrow dependency.
 """
+import re
 from typing import Any, Optional
 
 from dbt.adapters.duckdb.plugins import BasePlugin
@@ -201,7 +202,7 @@ class Plugin(BasePlugin):
                     insert_only=(strategy == "insert"),
                     update_columns=cfg.get("merge_update_columns"),
                     exclude_columns=cfg.get("merge_exclude_columns"),
-                    predicates=self._merge_predicates(cfg),
+                    predicates=self._merge_predicates(cfg, data.columns),
                     update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
                     insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
                     merge_schema=evolve_schema,
@@ -470,16 +471,37 @@ class Plugin(BasePlugin):
             return None
         return str(expr).replace("DBT_INTERNAL_DEST", "target").replace("DBT_INTERNAL_SOURCE", "source")
 
+    @staticmethod
+    def _qualify_predicate(expr, columns):
+        """Prefix bare references to known target columns with ``target.``.
+
+        duckrun folds ``incremental_predicates`` into the merge condition
+        (``target.k = source.k AND <predicate>``). A bare column there (e.g. ``id != 2``) exists
+        on BOTH the source and target, so delta_rs rejects it as an ambiguous reference. dbt's
+        ``incremental_predicates`` constrain the existing/target rows (the delete+insert delete, the
+        merge ON), so we qualify bare column tokens to ``target.``. Only exact column-name tokens
+        that aren't already qualified (preceded by ``.``) or quoted/literal are rewritten — literals
+        and functions (e.g. ``current_date``, which is not a column) are left untouched."""
+        if not expr or not columns:
+            return expr
+        # Longest names first so a column that's a prefix of another isn't partially matched.
+        for col in sorted({str(c) for c in columns}, key=len, reverse=True):
+            # whole-word col, not preceded by '.', a word char, or a quote (already qualified/quoted).
+            pattern = re.compile(r'(?<![.\w"\'])' + re.escape(col) + r'\b', re.I)
+            expr = pattern.sub(lambda m: "target." + m.group(0), expr)
+        return expr
+
     @classmethod
-    def _merge_predicates(cls, cfg: dict):
+    def _merge_predicates(cls, cfg: dict, columns=None):
         """dbt ``incremental_predicates`` (or ``predicates``), with dbt's standard merge
-        aliases rewritten to the ones delta_rs uses here."""
+        aliases rewritten to the ones delta_rs uses here and bare column refs qualified to
+        ``target.`` (see ``_qualify_predicate``)."""
         preds = cfg.get("incremental_predicates") or cfg.get("predicates")
         if not preds:
             return None
         if isinstance(preds, str):
             preds = [preds]
-        return [cls._rewrite_merge_aliases(p) for p in preds]
+        return [cls._qualify_predicate(cls._rewrite_merge_aliases(p), columns) for p in preds]
 
     @staticmethod
     def _resolve_schema_change(on_schema_change, path, data, storage_options) -> bool:
