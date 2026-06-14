@@ -6,7 +6,12 @@ sde_dbt_tutorial:
       type: duckrun
       threads: 1            # duckrun is not thread-safe on the Delta write path
       schema: main
-      # Local Delta warehouse. delta_rs writes land as <root_path>/<schema>/<model>;
+      # Persistent Delta warehouse. delta_rs writes land as <root_path>/<schema>/<model>;
       # existing Delta tables are surfaced back as delta_scan views by the adapter, so
-      # {{ this }} / is_incremental() resolve across the two-phase run.
+      # {{ this }} / is_incremental() resolve across separate dbt processes. In CI this is a
+      # live Microsoft Fabric OneLake path (abfss://…/Tables/sde_dbt_tutorial); the SCD2 snapshot
+      # and merge models persist across runs exactly as in production. ONELAKE_TOKEN is empty
+      # (and ignored) for a local filesystem root_path.
       root_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}"
+      storage_options:
+        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"

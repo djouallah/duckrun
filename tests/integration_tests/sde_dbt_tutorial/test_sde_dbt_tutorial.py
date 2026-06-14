@@ -1,34 +1,61 @@
-"""End-to-end port of josephmachado/simple_dbt_project onto the duckrun adapter.
+"""End-to-end port of josephmachado/simple_dbt_project onto the duckrun adapter, run against a
+**persistent** Microsoft Fabric OneLake warehouse (abfss://) — the way the SCD2 snapshot and the
+merge-incremental model actually behave in production.
 
-Drives REAL dbt (via subprocess, one process per phase) so the SCD2 snapshot and the
-merge-incremental model behave as they do in production — separate processes, not the same-process
-harness artifact that the conformance suite documents. Asserts the upstream qa_script.sh invariants:
+Unlike a throwaway local run, the warehouse here is long-lived and shared across CI runs, so the
+test does NOT assume an empty starting state. Instead it drives a *controlled* source change and
+asserts the SCD2 invariants that must hold no matter how much history has accumulated:
 
-  phase 1 (initial load):  customer_id=82 -> 1 snapshot row,  fct_clickstream = 100
-  phase 2 (append new):    customer_id=82 -> 2 snapshot rows,  fct_clickstream = 110
+  * a key always has exactly one CURRENT version (dbt_valid_to = the 9999-12-31 sentinel);
+  * applying an update opens a new current version carrying the new attribute value, and adds
+    exactly one row;
+  * the previously-current version is CLOSED at the instant the new one opens — contiguous,
+    non-overlapping validity windows;
+  * a no-op rebuild adds nothing (snapshots are idempotent).
 
-The whole flow is one test: seed/build, validate, append, build, validate.
+Real dbt runs in a fresh subprocess per phase, so {{ this }} / is_incremental() / the snapshot
+MERGE resolve across processes exactly as in production.
+
+Skips unless OneLake is configured (WAREHOUSE_PATH=abfss://…/Tables and ONELAKE_TOKEN).
 """
 import os
 import subprocess
 import sys
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
-import duckdb
+import duckrun
 import pytest
 
 PROJECT_DIR = Path(__file__).parent
+EL = PROJECT_DIR / "el"
 DBT = [sys.executable, "-m", "dbt.cli.main"]
 
+WAREHOUSE_PATH = os.environ.get("WAREHOUSE_PATH")
+ONELAKE_TOKEN = os.environ.get("ONELAKE_TOKEN") or os.environ.get("AZURE_STORAGE_TOKEN")
 
-def _env(warehouse: Path) -> dict:
+pytestmark = pytest.mark.skipif(
+    not (WAREHOUSE_PATH and WAREHOUSE_PATH.startswith("abfss://") and ONELAKE_TOKEN),
+    reason="OneLake not configured (set WAREHOUSE_PATH=abfss://…/Tables and ONELAKE_TOKEN)",
+)
+
+# sde gets its own namespace under the shared lakehouse so its generic schema names
+# (raw / main / snapshots) never collide with the aemo or coffee scenarios.
+ROOT = (WAREHOUSE_PATH.rstrip("/") + "/sde_dbt_tutorial") if WAREHOUSE_PATH else None
+
+
+def _storage_options() -> dict:
+    return {"bearer_token": ONELAKE_TOKEN}
+
+
+def _env() -> dict:
     env = dict(os.environ)
-    env["DUCKRUN_WAREHOUSE"] = warehouse.as_posix()
+    env["DUCKRUN_WAREHOUSE"] = ROOT
     return env
 
 
 def _run(cmd, env):
-    """Run a command in the project dir; surface stdout/stderr on failure."""
     res = subprocess.run(cmd, cwd=PROJECT_DIR, env=env, capture_output=True, text=True)
     if res.returncode != 0:
         raise AssertionError(
@@ -43,44 +70,86 @@ def _dbt(args, env):
                               "--profiles-dir", str(PROJECT_DIR)], env)
 
 
-def _delta(warehouse: Path, schema: str, table: str) -> str:
-    return (warehouse / schema / table).as_posix()
+def _scalar(con, sql):
+    return con.sql(sql).fetchone()[0]
 
 
-def _scalar(sql: str):
-    return duckdb.sql(sql).fetchone()[0]
+def test_sde_dbt_tutorial_scd2_stateful():
+    env = _env()
+    con = duckrun.connect(ROOT, storage_options=_storage_options())
 
+    snap = f"{ROOT}/snapshots/dim_customer"
+    obt = f"{ROOT}/main/orders_obt"
+    base_csv = (PROJECT_DIR / "raw_data" / "customer.csv").as_posix()
+    key = "82"
 
-def _count(path: str) -> int:
-    return _scalar(f"select count(*) from delta_scan('{path}')")
+    # CURRENT version of a key = the open row, whose dbt_valid_to is the 9999-12-31 sentinel.
+    # Cast to varchar everywhere: the year-9999 sentinel overflows pandas' ns timestamps, and
+    # string equality is enough to test contiguity of the validity windows.
+    def versions(c):
+        return _scalar(c, f"select count(*) from delta_scan('{snap}') where customer_id = '{key}'")
 
+    def current_count(c):
+        return _scalar(c, f"""
+            select count(*) from delta_scan('{snap}')
+            where customer_id = '{key}' and cast(dbt_valid_to as varchar) like '9999-12-31%'
+        """)
 
-def test_sde_dbt_tutorial_end_to_end(tmp_path):
-    wh = tmp_path / "wh"
-    env = _env(wh)
+    def current_row(c):
+        return _scalar(c, f"""
+            select city || '|' || cast(dbt_valid_from as varchar) from delta_scan('{snap}')
+            where customer_id = '{key}' and cast(dbt_valid_to as varchar) like '9999-12-31%'
+        """)
 
-    clickstream = _delta(wh, "main", "fct_clickstream")
-    dim_customer = _delta(wh, "snapshots", "dim_customer")
-
-    # ---- phase 1: initial EL -> deps/seed/build ------------------------------------------------
-    _run([sys.executable, str(PROJECT_DIR / "el" / "extract_load_pipeline.py")], env)
+    # ---- baseline: bring the warehouse to a known-built state (idempotent on a persistent store) --
+    _run([sys.executable, str(EL / "extract_load_pipeline.py")], env)
     _dbt(["deps"], env)
     _dbt(["seed"], env)
     _dbt(["build"], env)
 
-    assert _count(clickstream) == 100
-    assert _scalar(f"select count(*) from delta_scan('{dim_customer}') where customer_id = '82'") == 1
+    # SCD2 invariant that holds regardless of accumulated history: exactly one current version.
+    assert current_count(con) == 1, "a key must have exactly one open SCD2 version"
+    versions_before = versions(con)
 
-    # ---- phase 2: append new data -> build (separate process) ----------------------------------
-    _run([sys.executable, str(PROJECT_DIR / "el" / "load_new_data.py")], env)
+    # ---- the change: the source system updates customer 82 (new city + newer datetime_updated) ----
+    # A unique marker + wall-clock timestamp guarantee the update is strictly newer than anything
+    # already snapshotted, so the timestamp strategy opens a new version on a long-lived table.
+    marker = "scd2-" + uuid.uuid4().hex[:8]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    updated = con.sql(f"""
+        select customer_id, zipcode,
+               case when customer_id = '{key}' then '{marker}' else city end as city,
+               state_code, datetime_created,
+               case when customer_id = '{key}' then '{now}' else datetime_updated end
+                   as datetime_updated
+        from read_csv_auto('{base_csv}', all_varchar = true, header = true)
+    """)
+    updated.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("raw.raw_customer")
     _dbt(["build"], env)
 
-    assert _count(clickstream) == 110
-    assert _scalar(f"select count(*) from delta_scan('{dim_customer}') where customer_id = '82'") == 2
+    # exactly one new version opened, carrying the new attribute, with the old version closed.
+    assert versions(con) == versions_before + 1, "an update must add exactly one SCD2 version"
+    assert current_count(con) == 1, "still exactly one open version after the update"
 
-    # ---- gold OBT built and joined through the SCD2 validity window -----------------------------
-    obt = _delta(wh, "main", "orders_obt")
-    assert _count(obt) > 0
+    city, new_from = current_row(con).split("|", 1)
+    assert city == marker, "the open version must carry the updated attribute"
+
+    # Contiguity: the previously-current row is closed exactly when the new one opens (no gap/overlap).
+    closed_at_boundary = _scalar(con, f"""
+        select count(*) from delta_scan('{snap}')
+        where customer_id = '{key}' and cast(dbt_valid_to as varchar) = '{new_from}'
+    """)
+    assert closed_at_boundary == 1, "prior version must close exactly when the new one opens"
+
+    # ---- idempotency: a no-op rebuild adds no version and leaves the open row intact --------------
+    versions_after = versions(con)
+    _dbt(["build"], env)
+    assert versions(con) == versions_after, "a no-op rebuild must not open a new version"
+    assert current_count(con) == 1
+    assert current_row(con).split("|", 1)[0] == marker
+
+    # ---- the gold OBT still builds and joins through the SCD2 validity window ---------------------
+    assert _scalar(con, f"select count(*) from delta_scan('{obt}')") > 0
 
 
 if __name__ == "__main__":

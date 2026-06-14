@@ -277,13 +277,21 @@ jobs:
 
   sde-tutorial:
     # The josephmachado/simple_dbt_project port (tests/integration_tests/sde_dbt_tutorial/), driven
-    # through REAL dbt subprocesses (one process per phase) so the SCD2 snapshot + merge-incremental
-    # behave as in production. Fully offline/local-fs — the EL pipeline reads the vendored raw_data/
-    # CSVs and writes a local Delta warehouse; only `dbt deps` touches the network (dbt Hub, no creds).
-    # Deterministic, so it always runs on push/PR (unlike the live-OneLake aemo/coffee jobs above);
-    # it is not part of the workflow_dispatch scenario menu.
+    # through REAL dbt subprocesses (one process per phase) against a PERSISTENT Microsoft Fabric
+    # OneLake warehouse (abfss://…/Tables/sde_dbt_tutorial). The test drives a controlled source
+    # change and asserts SCD2 invariants (one open version per key, contiguous validity windows,
+    # idempotent rebuild) on a long-lived snapshot — the way SCD2 actually behaves in production,
+    # not from a throwaway empty start. Gated like the other live-OneLake jobs (auto on push/PR);
+    # a concurrency lock keeps overlapping runs from racing on the shared snapshot.
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    concurrency:
+      group: sde-onelake
+      cancel-in-progress: false
+    env:
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+      # curl transport: the azure extension's default fails the OneLake TLS handshake on the runner.
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
 
@@ -294,5 +302,20 @@ jobs:
       - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
         run: pip install -e ".[test]"
 
-      - name: Run the sde_dbt_tutorial end-to-end port (two-phase real dbt run)
-        run: python -m pytest tests/integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py -q -p no:cacheprovider
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token \
+            --resource https://storage.azure.com/ \
+            --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Run the sde_dbt_tutorial SCD2 port against OneLake (stateful, real dbt subprocesses)
+        run: python -m pytest tests/integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py -q -s -p no:cacheprovider

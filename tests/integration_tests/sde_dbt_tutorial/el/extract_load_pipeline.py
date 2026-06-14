@@ -24,8 +24,14 @@ FILES = {
 }
 
 
+def _storage_options():
+    # OneLake (abfss://) authenticates with a storage bearer token; a local root needs none.
+    token = os.environ.get("ONELAKE_TOKEN") or os.environ.get("AZURE_STORAGE_TOKEN")
+    return {"bearer_token": token} if token else None
+
+
 def main():
-    con = duckrun.connect(ROOT)
+    con = duckrun.connect(ROOT, storage_options=_storage_options())
     for table, csv_name in FILES.items():
         path = os.path.join(HERE, "raw_data", csv_name).replace("\\", "/")
         df = con.read.option("all_varchar", True).option("header", True).csv(path)
