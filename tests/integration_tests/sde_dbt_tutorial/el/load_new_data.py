@@ -9,11 +9,13 @@ to on the second ``dbt build``:
     second row.
   * ``clickstream_incremental.csv`` is 10 brand-new ``event_id``s (101-110) -> the merge-incremental
     ``fct_clickstream`` grows 100 -> 110.
+
+Uses duckrun's connection API (read CSV -> Spark-style ``.write.mode("append").saveAsTable``) rather
+than poking duckdb/deltalake directly, mirroring extract_load_pipeline.py.
 """
 import os
 
-import duckdb
-from deltalake import write_deltalake
+import duckrun
 
 HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT = os.environ.get("DUCKRUN_WAREHOUSE", os.path.join(HERE, "warehouse"))
@@ -24,21 +26,14 @@ FILES = {
 }
 
 
-def _read_csv(con, csv_name):
-    path = os.path.join(HERE, "raw_data", csv_name).replace("\\", "/")
-    return con.execute(
-        f"select * from read_csv_auto('{path}', all_varchar=true, header=true)"
-    ).to_arrow_table()
-
-
 def main():
-    con = duckdb.connect()
+    con = duckrun.connect(ROOT)
     for table, csv_name in FILES.items():
-        tbl = _read_csv(con, csv_name)
-        dest = os.path.join(ROOT, "raw", table)
-        write_deltalake(dest, tbl, mode="append")
-        print(f"{table}: appended {tbl.num_rows} rows -> {dest}")
-    con.close()
+        path = os.path.join(HERE, "raw_data", csv_name).replace("\\", "/")
+        df = con.read.option("all_varchar", True).option("header", True).csv(path)
+        rows = df.count()
+        df.write.mode("append").saveAsTable(f"raw.{table}")
+        print(f"{table}: appended {rows} rows -> raw.{table}")
 
 
 if __name__ == "__main__":
