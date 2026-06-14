@@ -19,6 +19,8 @@
     ul.dags a { font-size: 1.15rem; font-weight: 600; text-decoration: none; }
     ul.dags a:hover { text-decoration: underline; }
     ul.dags .desc { display: block; color: #777; font-weight: 400; font-size: 0.95rem; margin-top: 0.35rem; }
+    ul.dags .src { display: inline-block; margin-top: 0.5rem; font-size: 0.85rem; font-weight: 400; color: #888; }
+    ul.dags .src a { font-size: 0.85rem; font-weight: 500; }
     footer { margin-top: 2.5rem; color: #888; font-size: 0.85rem; }
     code { background: #8882; padding: 0.1rem 0.35rem; border-radius: 4px; }
   </style>
@@ -32,18 +34,21 @@
       <a href="aemo.html">aemo</a>
       <span class="desc">The AEMO dbt project built against live Microsoft Fabric OneLake (<code>abfss://</code>).
       Full catalog with column metadata over the real Delta tables.</span>
+      <span class="src">source: <a href="https://github.com/djouallah/dbt_fabric_python_delta">djouallah/dbt_fabric_python_delta</a></span>
     </li>
     <li>
       <a href="merge_spill.html">merge_spill</a>
       <span class="desc">The incremental-MERGE spill benchmark project (<code>merge_spill_bench</code>): a chain of
       merge / append / overwrite ops on a big TPCH <code>lineitem</code>. DAG only (catalog is empty —
       the 60M-row table is not built for docs).</span>
+      <span class="src">source: <a href="https://github.com/djouallah/duckrun/tree/main/tests/integration_tests/merge_spill">djouallah/duckrun</a></span>
     </li>
     <li>
       <a href="coffee.html">coffee</a>
       <span class="desc">The coffee-shop scenario (<code>coffee_shop</code>): ingest two dimension CSVs over
       https, dedup the SCD2 product dim, generate an N-row fact partitioned by region, and a revenue
       mart. DAG only (the fact isn't built for docs).</span>
+      <span class="src">dimension data: <a href="https://github.com/JosueBogran/coffeeshopdatageneratorv2">JosueBogran/coffeeshopdatageneratorv2</a></span>
     </li>
     <li>
       <a href="sde_dbt_tutorial.html">sde_dbt_tutorial</a>
@@ -51,6 +56,7 @@
       raw application tables → bronze typing → a Delta-backed SCD2 snapshot of the customer dim → a
       merge-incremental clickstream fact → the <code>orders_obt</code> gold mart joined through the
       SCD2 validity window. DAG only.</span>
+      <span class="src">source: <a href="https://github.com/josephmachado/simple_dbt_project">josephmachado/simple_dbt_project</a></span>
     </li>
   </ul>
 
