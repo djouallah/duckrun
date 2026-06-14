@@ -236,8 +236,14 @@ class _DeltaDML:
 
         quoted = ", ".join('"' + c + '"' for c in provided)
         inner = f"(values {m.group('body')}) v({quoted})"
+        # Cast every projected column to the TARGET column's type — both supplied values and the
+        # typed NULLs — so the appended Arrow schema matches the table exactly. This is also what a
+        # plain SQL INSERT does (a literal is coerced to the column type), and it stops a literal
+        # whose inferred type is wider than the column (e.g. a ::timestamp into a DATE column) from
+        # forcing delta_rs to add a new writer feature on append (TimestampWithoutTimezone).
         exprs = [
-            f'v."{col}"' if col in provided_set else f'cast(null as {typ}) as "{col}"'
+            f'cast(v."{col}" as {typ}) as "{col}"' if col in provided_set
+            else f'cast(null as {typ}) as "{col}"'
             for col, typ in zip(target_cols, target_types)
         ]
         data = self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
