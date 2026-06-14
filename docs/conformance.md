@@ -26,8 +26,8 @@ Every still-failing test in the card below falls into one of three categories:
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ ✅ 113 passed   ❌ 17 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 84% passing                                │
+│ ✅ 117 passed   ❌ 13 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 87% passing                                │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -44,14 +44,14 @@ Every still-failing test in the card below falls into one of three categories:
 | `simple_snapshot` | `██████████` 100% | 6 | 0 | 0 | 0 | 6 |
 | `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
+| `incremental_microbatch` | `█████████░` 92% | 12 | 1 | 0 | 0 | 13 |
 | `basic` | `█████████░` 88% | 14 | 2 | 0 | 0 | 16 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
 | `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
 | `incremental` | `████████░░` 77% | 20 | 6 | 0 | 0 | 26 |
-| `incremental_microbatch` | `██████░░░░` 62% | 8 | 5 | 0 | 0 | 13 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `████████░░` **84%** | **113** | **17** | **0** | **5** | **135** |
+| **Total** | `█████████░` **87%** | **117** | **13** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -87,17 +87,6 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestChangeRelationTypesDuckDB::test_changing_materialization_changes_relation_type` | AssertionError: dbt exit state did not match expected |
 
 </details>
-<details><summary><b>incremental_microbatch</b> — 5 not passing (8/13 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_inserts_new_batches` | _duckdb.CatalogException: Catalog Error: microbatch_exec_input is not an table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_date_event_time` | _duckdb.CatalogException: Catalog Error: microbatch_event_date_input is not an table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_hour_batch_size` | _duckdb.CatalogException: Catalog Error: microbatch_batch_hour_input is not an table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_supports_month_batch_size` | _duckdb.CatalogException: Catalog Error: microbatch_batch_month_input is not an table |
-| ❌ | `TestMicrobatchScenarios::test_microbatch_reprocesses_existing_batch` | _duckdb.CatalogException: Catalog Error: microbatch_reprocess_input is not an table |
-
-</details>
 <details><summary><b>incremental</b> — 6 not passing (20/26 pass)</summary>
 
 | Outcome | Test | Message |
@@ -125,6 +114,13 @@ Every still-failing test in the card below falls into one of three categories:
 | --- | --- | --- |
 | ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestCatalogRelationsDuckDB::test_get_catalog_relations` | AssertionError: dbt exit state did not match expected |
+
+</details>
+<details><summary><b>incremental_microbatch</b> — 1 not passing (12/13 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestMicrobatchScenarios::test_microbatch_inserts_new_batches` | _internal.CommitFailedError: Table features must be specified, please specify: TimestampWithoutTimezone |
 
 </details>
 
