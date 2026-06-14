@@ -8,17 +8,21 @@ reflects the latest `main` — which may be ahead of the published PyPI release.
 
 Every still-failing test in the card below falls into one of three categories:
 
-- **delta-rs API gap** — the write the test needs isn't supported by `deltalake==1.5.0`, e.g.
-  the `constraints` `correct_column_data_types` cases require writing a `TIMESTAMP`-without-timezone
-  column (`timestampNtz`), a Delta writer feature we don't enable because it bumps the table
-  protocol and can break DirectLake/older readers.
-- **view-backed relation limit** — duckrun surfaces each Delta table as a `delta_scan` view, so
-  tests that mutate the relation in place (several `incremental_microbatch` fixtures `UPDATE` the
-  view; `changing_relation_type` swaps a table for a view) can't be satisfied without a physical
-  table.
-- **deliberate scope-out** — e.g. `TestCatalogRelationsDuckDB` forces a `type: duckdb` profile and
-  exercises `get_catalog_relations`, which this pinned dbt-duckdb doesn't implement — outside the
-  duckrun adapter entirely.
+- **no persistent views** — the open Delta format (and `deltalake==1.5.0`) has no *view* primitive;
+  a view exists only in some engine's catalog, never on disk. duckrun's durable artifact is always a
+  Delta *table*, so a `materialized='view'` model is just a transient DuckDB catalog view, and the
+  tests that swap a model's materialization `table → view` (`TestSimpleMaterializationsDuckDB::test_base`,
+  `changing_relation_type`) have no durable home to land in. Satisfying them would mean rewriting
+  Delta data on a mere materialization change — deliberately not done.
+- **deliberate rejection of silently-divergent merge configs** — `merge_clauses`,
+  `merge_update_set_expressions`, and `merge_on_using_columns` are dbt-duckdb-specific and have no
+  delta-rs equivalent. duckrun raises a clear error rather than accept them and quietly run a plain
+  upsert (a silent-divergence data bug), so `test_merge_with_set_expressions`,
+  `test_merge_custom_clauses`, and `test_ducklake_valid_single_update` stay red on purpose.
+- **delta-rs capability limit** — `on_schema_change='sync_all_columns'` requires *dropping* columns,
+  which delta-rs can't do (it's add-only), so duckrun's schema evolution is add-only; and
+  `QuotingFalse` expects a hard compile error for unquoted identifiers with spaces, which DuckDB and
+  delta-rs simply permit.
 
 <!-- CONFORMANCE:START -->
 
