@@ -35,6 +35,7 @@ The harness drives `dbt run` in-process (dbtRunner) and, for case 2, simulates "
 committed right now" by landing a foreign Delta commit on the same table at the moment the merge
 fires — the only deterministic way to put a commit inside the (vB, HEAD] window from a test.
 """
+import json
 import os
 from pathlib import Path
 
@@ -123,3 +124,30 @@ def test_run_succeeds_when_the_writer_commits_before_the_run(tmp_path):
     DeltaTable(path).update(predicate="id = 1", updates={"value": "999"})   # foreign commit -> v1
     assert _dbt(wh).success                        # vB = v1; no conflict; merge commits on top of v1
     assert _rows(path) == {**_seed_rows(), 1: 111}   # our update applied over v1
+
+
+# ------------------------------------- 4. dbt docs: the catalog carries Delta stats (issue #3)
+
+def _docs_generate(warehouse: str) -> object:
+    """In-process `dbt docs generate` against the local-fs warehouse (mirrors `_dbt`)."""
+    os.environ["WAREHOUSE_PATH"] = warehouse
+    os.environ["DBT_SCHEMA"] = SCHEMA
+    return dbtRunner().invoke(
+        ["docs", "generate", "--project-dir", PROJECT_DIR, "--profiles-dir", PROJECT_DIR]
+    )
+
+
+def test_docs_generate_reports_delta_stats(tmp_path):
+    """A Delta-backed (incremental) model must surface row/byte/last-modified stats in the catalog —
+    duckrun reads them from the Delta log (issue #3), so `dbt docs generate` is no longer statless."""
+    wh, _ = _warehouse(tmp_path)
+    assert _dbt(wh).success                          # build the `events` Delta table
+    assert _docs_generate(wh).success
+    catalog = json.loads((Path(PROJECT_DIR) / "target" / "catalog.json").read_text())
+    events = next(n for uid, n in catalog["nodes"].items() if uid.endswith(".events"))
+    s = events["stats"]
+    assert s.get("has_stats", {}).get("value") is True, "events has no stats"
+    for k in ("num_rows", "bytes", "last_modified"):
+        assert s.get(k, {}).get("include") is True, f"missing stat {k!r}"
+    assert isinstance(s["num_rows"]["value"], int) and s["num_rows"]["value"] > 0
+    assert isinstance(s["bytes"]["value"], int)

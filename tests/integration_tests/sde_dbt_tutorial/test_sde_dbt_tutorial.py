@@ -18,6 +18,7 @@ MERGE resolve across processes exactly as in production.
 
 Skips unless OneLake is configured (WAREHOUSE_PATH=abfss://…/Tables and ONELAKE_TOKEN).
 """
+import json
 import os
 import subprocess
 import sys
@@ -74,6 +75,21 @@ def _dbt(args, env):
 
 def _scalar(con, sql):
     return con.sql(sql).fetchone()[0]
+
+
+def assert_catalog_has_delta_stats(catalog_path):
+    """`dbt docs generate` must publish row/byte/last-modified stats for Delta-backed models
+    (issue #3). At least one model reports stats, and each reported stat is shaped right. Native
+    views / drop-tombstones stay statless, so we assert "some node", not "every node"."""
+    catalog = json.loads(Path(catalog_path).read_text())
+    statted = {uid: n["stats"] for uid, n in catalog.get("nodes", {}).items()
+               if n.get("stats", {}).get("has_stats", {}).get("value")}
+    assert statted, f"no model reported Delta stats in {catalog_path}"
+    for uid, s in statted.items():
+        for k in ("num_rows", "bytes", "last_modified"):
+            assert s.get(k, {}).get("include") is True, f"{uid} missing stat {k!r}"
+        assert isinstance(s["num_rows"]["value"], int), f"{uid} num_rows not an int"
+        assert isinstance(s["bytes"]["value"], int), f"{uid} bytes not an int"
 
 
 def test_sde_dbt_tutorial_scd2_stateful():
@@ -152,6 +168,12 @@ def test_sde_dbt_tutorial_scd2_stateful():
 
     # ---- the gold OBT still builds and joins through the SCD2 validity window ---------------------
     assert _scalar(con, f"select count(*) from delta_scan('{obt}')") > 0
+
+    # ---- dbt docs: the catalog carries Delta stats (issue #3), here over LIVE OneLake -------------
+    # This is the remote path the issue flagged as empty; delta_stats reads the Delta log via
+    # delta-rs with the OneLake bearer token, so the published catalog now has rows/size/last-modified.
+    _dbt(["docs", "generate"], env)
+    assert_catalog_has_delta_stats(PROJECT_DIR / "target" / "catalog.json")
 
 
 if __name__ == "__main__":

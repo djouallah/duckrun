@@ -189,6 +189,27 @@ jobs:
           dbt build --target dev
           dbt docs generate --static --target dev
 
+      - name: Verify the real catalogs carry Delta table stats (issue #3)
+        # aemo and sde_dbt_tutorial build real Delta tables, so their published catalog must show
+        # row count / size / last-modified (duckrun reads these from the Delta log). This guards the
+        # exact regression #3 reported — a statless catalog over OneLake. merge_spill and coffee are
+        # --empty-catalog DAGs (no warehouse catalog), so they're intentionally excluded.
+        working-directory: ${{ github.workspace }}
+        run: |
+          python - <<'PY'
+          import json, sys
+          for proj in ("aemo", "sde_dbt_tutorial"):
+              cat = json.load(open(f"tests/integration_tests/{proj}/target/catalog.json"))
+              statted = {u: n["stats"] for u, n in cat["nodes"].items()
+                         if n.get("stats", {}).get("has_stats", {}).get("value")}
+              if not statted:
+                  sys.exit(f"{proj}: no model reported Delta stats in catalog.json")
+              for uid, s in statted.items():
+                  for k in ("num_rows", "bytes", "last_modified"):
+                      assert s.get(k, {}).get("include") is True, f"{proj}:{uid} missing stat {k!r}"
+              print(f"{proj}: {len(statted)} model(s) with Delta stats")
+          PY
+
       - name: Assemble the combined docs site (landing page + per-project DAGs)
         working-directory: ${{ github.workspace }}
         run: |
