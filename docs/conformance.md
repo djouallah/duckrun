@@ -26,8 +26,8 @@ Every still-failing test in the card below falls into one of three categories:
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ ✅ 117 passed   ❌ 13 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 87% passing                                │
+│ ✅ 119 passed   ❌ 11 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 88% passing                                │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -44,14 +44,14 @@ Every still-failing test in the card below falls into one of three categories:
 | `simple_snapshot` | `██████████` 100% | 6 | 0 | 0 | 0 | 6 |
 | `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
+| `basic` | `█████████░` 94% | 15 | 1 | 0 | 0 | 16 |
 | `incremental_microbatch` | `█████████░` 92% | 12 | 1 | 0 | 0 | 13 |
-| `basic` | `█████████░` 88% | 14 | 2 | 0 | 0 | 16 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
 | `constraints` | `████████░░` 82% | 14 | 3 | 0 | 0 | 17 |
+| `incremental` | `████████░░` 81% | 21 | 5 | 0 | 0 | 26 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
-| `incremental` | `████████░░` 77% | 20 | 6 | 0 | 0 | 26 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `█████████░` **87%** | **117** | **13** | **0** | **5** | **135** |
+| **Total** | `█████████░` **88%** | **119** | **11** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -87,11 +87,10 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestChangeRelationTypesDuckDB::test_changing_materialization_changes_relation_type` | AssertionError: dbt exit state did not match expected |
 
 </details>
-<details><summary><b>incremental</b> — 6 not passing (20/26 pass)</summary>
+<details><summary><b>incremental</b> — 5 not passing (21/26 pass)</summary>
 
 | Outcome | Test | Message |
 | --- | --- | --- |
-| ❌ | `TestIncrementalPredicates::test__incremental_predicates` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
 | ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
 | ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | AssertionError: dbt exit state did not match expected |
@@ -108,19 +107,18 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestIncrementalConstraintsColumnsEqual::test__constraints_correct_column_data_types` | AssertionError: dbt exit state did not match expected |
 
 </details>
-<details><summary><b>basic</b> — 2 not passing (14/16 pass)</summary>
-
-| Outcome | Test | Message |
-| --- | --- | --- |
-| ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestCatalogRelationsDuckDB::test_get_catalog_relations` | AssertionError: dbt exit state did not match expected |
-
-</details>
 <details><summary><b>incremental_microbatch</b> — 1 not passing (12/13 pass)</summary>
 
 | Outcome | Test | Message |
 | --- | --- | --- |
 | ❌ | `TestMicrobatchScenarios::test_microbatch_inserts_new_batches` | _internal.CommitFailedError: Table features must be specified, please specify: TimestampWithoutTimezone |
+
+</details>
+<details><summary><b>basic</b> — 1 not passing (15/16 pass)</summary>
+
+| Outcome | Test | Message |
+| --- | --- | --- |
+| ❌ | `TestSimpleMaterializationsDuckDB::test_base` | AssertionError: dbt exit state did not match expected |
 
 </details>
 
