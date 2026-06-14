@@ -39,6 +39,12 @@
       merge / append / overwrite ops on a big TPCH <code>lineitem</code>. DAG only (catalog is empty —
       the 60M-row table is not built for docs).</span>
     </li>
+    <li>
+      <a href="coffee.html">coffee</a>
+      <span class="desc">The coffee-shop scenario (<code>coffee_shop</code>): ingest two dimension CSVs over
+      https, dedup the SCD2 product dim, generate an N-row fact partitioned by region, and a revenue
+      mart. DAG only (the fact isn't built for docs).</span>
+    </li>
   </ul>
 
   <footer>

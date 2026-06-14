@@ -1,0 +1,36 @@
+name: 'coffee_shop'
+version: '1.0.0'
+
+profile: 'coffee_shop'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# The dbt incarnation of the coffee-shop scenario (the connection-API version lives next to this in
+# test_coffee.py). Same pipeline as a real DAG: ingest the two dimension CSVs over https, dedup the
+# SCD2 product dim to a current unique-key table, generate an N-row fact joined 1:1 to the dims and
+# partitioned by region, then a revenue mart. N comes from COFFEE_ROWS (env) so CI can crank it; docs
+# only compile, so the network/build is never touched when generating the DAG.
+
+on-run-start:
+  # read the dimension CSVs over https. DuckDB autoloads httpfs for https URLs, but be explicit so a
+  # locked-down runner without autoinstall still works. Only run/build hit this — docs just compile.
+  - "INSTALL httpfs"
+  - "LOAD httpfs"
+
+vars:
+  # github raw base for Josue Bogran's coffeeshopdatageneratorv2 dimension CSVs.
+  coffee_csv_base: "https://raw.githubusercontent.com/JosueBogran/coffeeshopdatageneratorv2/main"
+
+models:
+  coffee_shop:
+    staging:
+      +materialized: table
+    dimensions:
+      +materialized: table
+    marts:
+      +materialized: table

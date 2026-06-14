@@ -1,0 +1,46 @@
+version: 2
+
+models:
+  - name: dim_locations
+    description: >
+      Store-location dimension read straight from Dim_Locations.csv over https (1,000 rows).
+      Provides region, which the fact is partitioned by.
+    columns:
+      - name: location_id
+        description: Natural key for a store location.
+      - name: region
+        description: Sales region; the fact_sales partition column.
+
+  - name: dim_products
+    description: >
+      Raw SCD2 product dimension over https (26 rows). product_id repeats across validity windows
+      (from_date / to_date) — not a unique key until deduped by the `products` model.
+
+  - name: products
+    description: >
+      Current, unique-key product dimension: the latest validity window per product_id. Makes the
+      fact join 1:1.
+    columns:
+      - name: product_id
+        description: Unique product key after SCD2 dedup.
+        data_tests: [unique, not_null]
+
+  - name: fact_sales
+    description: >
+      Generated coffee-shop order-line fact (COFFEE_ROWS rows), joined 1:1 to the dims and written
+      partitioned by region.
+    columns:
+      - name: order_line_id
+        description: Unique order-line id.
+        data_tests: [unique, not_null]
+      - name: product_id
+        description: FK to products.
+        data_tests:
+          - relationships:
+              arguments:
+                to: ref('products')
+                field: product_id
+
+  - name: mart_revenue
+    description: >
+      Revenue by product category x season. Reconciles exactly to fact_sales.sales_amount.

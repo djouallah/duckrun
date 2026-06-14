@@ -11,20 +11,23 @@ name: integration tests
 #
 # The aemo job also publishes the combined dbt-docs site to GitHub Pages: a landing page
 # (docs/site/index.html) linking the model DAGs of every integration dbt project — aemo (full catalog
-# over OneLake) and merge_spill (DAG only; the 60M-row table is never built for docs, a tiny tpch
-# parquet just lets it compile). It also rebuilds when the merge_spill project changes.
+# over OneLake), merge_spill (DAG only; the 60M-row table is never built for docs, a tiny tpch parquet
+# just lets it compile) and coffee (DAG only; the dbt incarnation of the coffee-shop scenario). It
+# rebuilds when any of those projects, or the landing page, changes.
 on:
   push:
     branches: ["**"]
     paths:
       - 'tests/integration_tests/aemo/**'
       - 'tests/integration_tests/merge_spill/**'
+      - 'tests/integration_tests/coffee/**'
       - 'docs/site/**'
       - '.github/workflows/integration.yml'
   pull_request:
     paths:
       - 'tests/integration_tests/aemo/**'
       - 'tests/integration_tests/merge_spill/**'
+      - 'tests/integration_tests/coffee/**'
       - 'docs/site/**'
       - '.github/workflows/integration.yml'
   workflow_dispatch:
@@ -146,6 +149,19 @@ jobs:
           PY
           dbt docs generate --static --empty-catalog --target dev
 
+      - name: Build the coffee DAG (static, empty catalog — no build, no network beyond docs)
+        # The dbt incarnation of the coffee-shop scenario. Pure compile: its models read the dim CSVs
+        # via read_csv_auto (only at run time), so docs need neither the build nor a real warehouse —
+        # just a throwaway WAREHOUSE_PATH shadowing the job-level OneLake path. --empty-catalog skips
+        # the catalog query entirely.
+        working-directory: tests/integration_tests/coffee
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
+          WAREHOUSE_PATH: /tmp/coffee_docs_wh
+        run: |
+          mkdir -p /tmp/coffee_docs_wh
+          dbt docs generate --static --empty-catalog --target dev
+
       - name: Assemble the combined docs site (landing page + per-project DAGs)
         working-directory: ${{ github.workspace }}
         run: |
@@ -153,6 +169,7 @@ jobs:
           cp docs/site/index.html dbt-docs-site/index.html
           cp tests/integration_tests/aemo/target/static_index.html        dbt-docs-site/aemo.html
           cp tests/integration_tests/merge_spill/target/static_index.html dbt-docs-site/merge_spill.html
+          cp tests/integration_tests/coffee/target/static_index.html      dbt-docs-site/coffee.html
 
       - name: Upload docs as a build artifact (available on every run)
         uses: actions/upload-artifact@v4

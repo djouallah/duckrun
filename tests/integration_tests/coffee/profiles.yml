@@ -1,0 +1,13 @@
+coffee_shop:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      threads: 1
+      schema: "{{ env_var('DBT_SCHEMA', 'dbo') }}"
+      # Local-filesystem Delta warehouse by default (no OneLake needed). delta_rs writes land at
+      # <root_path>/<schema>/<model>; existing tables come back as delta_scan views so ref() resolves.
+      # Point WAREHOUSE_PATH at an abfss:// Tables path + set ONELAKE_TOKEN to run it against OneLake.
+      root_path: "{{ env_var('WAREHOUSE_PATH') }}"
+      storage_options:
+        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"
