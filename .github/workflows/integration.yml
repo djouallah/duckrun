@@ -5,12 +5,15 @@ name: integration tests
 #                      under tests/integration_tests/aemo/.
 #   • coffee-onelake — the connection-API coffee-shop scenario against live OneLake at a SMALL N,
 #                      at tests/connection_api/test_coffee.py. Runs automatically (gated like aemo).
-#   • coffee-stress  — the SAME scenario on a LOCAL warehouse at a HUGE N — manual stress, dispatch only.
 #
-# None is the per-change gate (that's core.yml). aemo and coffee-onelake run automatically only when
-# the aemo/merge_spill/coffee projects or this workflow change; coffee-stress is manual-only. On a
-# manual dispatch you pick which scenario(s) to run. aemo is deliberately NOT a release gate
-# (publish.yml) — it depends on live OneLake and is prone to transient infra failures.
+# The SAME coffee scenario on a LOCAL warehouse at a HUGE N is its own reusable workflow now
+# (coffee-stress.yml) — a release gate in publish.yml, plus manual dispatch. The fast small-N local
+# smoke is coffee-smoke.yml.
+#
+# None of these is the per-change gate (that's core.yml). aemo and coffee-onelake run automatically
+# only when the aemo/merge_spill/coffee projects or this workflow change. On a manual dispatch you
+# pick which scenario(s) to run. aemo is deliberately NOT a release gate (publish.yml) — it depends
+# on live OneLake and is prone to transient infra failures.
 #
 # The aemo job also publishes the combined dbt-docs site to GitHub Pages: a landing page
 # (docs/site/index.html) linking the model DAGs of every integration dbt project — aemo (full catalog
@@ -36,16 +39,12 @@ on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: "Which scenario(s) to run"
+        description: "Which scenario(s) to run (aemo and/or the small coffee-onelake check)"
         type: choice
         options: [coffee, aemo, both]
         default: coffee
-      rows:
-        description: "coffee: fact rows to generate (COFFEE_LOCAL_ROWS)"
-        required: false
-        default: "20000000"
 
-# the docs deploy (in the aemo job) needs Pages + OIDC; the coffee job uses none of it.
+# the docs deploy (in the aemo job) needs Pages + OIDC; the coffee-onelake job uses none of it.
 permissions:
   contents: read
   pages: write
@@ -249,63 +248,3 @@ jobs:
 
       - name: Run the coffee-shop scenario against OneLake (small N)
         run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
-
-  coffee-stress:
-    # Manual stress only: how big can a standard GitHub-hosted runner sustain for the connection
-    # API? Runs tests/connection_api/test_coffee.py::test_coffee_local — the full scenario
-    # (ingest dims, generate an N-row fact, partitioned Delta write, mart, append, merge, insert-only)
-    # against a LOCAL filesystem warehouse (no OneLake, no network bottleneck), with N as an input.
-    if: github.event_name == 'workflow_dispatch' && (inputs.scenario == 'coffee' || inputs.scenario == 'both')
-    runs-on: ubuntu-latest
-    concurrency:
-      group: coffee-stress
-      cancel-in-progress: true
-    env:
-      COFFEE_LOCAL_ROWS: ${{ inputs.rows }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
-        run: pip install -e ".[test]"
-
-      - name: Runner specs (the box we're stressing)
-        run: |
-          echo "## Runner specs" >> "$GITHUB_STEP_SUMMARY"
-          echo "- rows requested: **$COFFEE_LOCAL_ROWS**" >> "$GITHUB_STEP_SUMMARY"
-          echo "- CPUs: $(nproc)" >> "$GITHUB_STEP_SUMMARY"
-          echo "- memory: $(free -h | awk '/Mem:/{print $2}')" >> "$GITHUB_STEP_SUMMARY"
-          echo "- free disk: $(df -h / | awk 'NR==2{print $4}')" >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Run the local coffee-shop scenario at N rows (timed, with peak memory)
-        run: |
-          # Don't let a failed run (e.g. OOM at huge N — the experiment) abort before we
-          # write the summary. PIPESTATUS[0] is pytest/time's exit, not tee's.
-          set +e
-          # GNU time gives Maximum resident set size; tee keeps the log for the summary.
-          # -s: stream the scenario's stage-by-stage narration into the log (without it pytest
-          # captures the prints and the run shows nothing).
-          /usr/bin/time -v python -m pytest \
-            tests/connection_api/test_coffee.py::test_coffee_local \
-            -q -s -p no:cacheprovider 2>&1 | tee stress.log
-          rc=${PIPESTATUS[0]}
-          {
-            echo "## Result"
-            peak_kb=$(grep -i "Maximum resident set size" stress.log | grep -oE '[0-9]+' | tail -1)
-            wall=$(grep -iE "Elapsed \(wall clock\)" stress.log | sed 's/.*: //')
-            echo "- exit code: $rc"
-            echo "- wall clock: ${wall:-n/a}"
-            [ -n "$peak_kb" ] && echo "- peak memory: $(awk "BEGIN{printf \"%.2f GiB\", $peak_kb/1048576}")"
-            echo ""
-            echo "### Scenario log (stage by stage)"
-            echo '```text'
-            # The narrated stages between the scenario banners; fall back to the tail if the run
-            # crashed before printing them.
-            narr=$(sed -n '/=== coffee-shop scenario/,/=== scenario complete ===/p' stress.log)
-            if [ -n "$narr" ]; then echo "$narr"; else tail -n 20 stress.log; fi
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-          exit $rc

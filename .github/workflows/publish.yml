@@ -14,12 +14,12 @@ concurrency:
   group: publish
   cancel-in-progress: false
 
-# A release must pass core tests + conformance + merge-spill before publishing. Each is a reusable
-# workflow run as a gate job here. conformance and merge-spill render their scorecard into README and
-# commit it to main, so those call jobs grant contents:write (a reusable workflow can only use
-# permissions the caller grants); core tests just run pytest, so read is enough. conformance and
-# merge-spill use a static concurrency group, so a tag-time call queues behind any in-flight
-# push-to-main run rather than racing it.
+# A release must pass core tests + conformance + merge-spill + coffee-stress before publishing. Each
+# is a reusable workflow run as a gate job here. conformance and merge-spill render their scorecard
+# into README and commit it to main, so those call jobs grant contents:write (a reusable workflow can
+# only use permissions the caller grants); core tests and coffee-stress just run pytest, so read is
+# enough. conformance, merge-spill and coffee-stress use a static concurrency group, so a tag-time
+# call queues behind any in-flight push-to-main run rather than racing it.
 # aemo is deliberately NOT a release gate: it depends on live OneLake/AEMO data and so is prone to
 # transient infra failures that would needlessly block a publish. It still runs on its own.
 jobs:
@@ -36,8 +36,12 @@ jobs:
       contents: write
     uses: ./.github/workflows/merge.yml
 
+  # The connection-API scenario at scale (5M rows, local). No scorecard to commit, so read is enough.
+  coffee-stress:
+    uses: ./.github/workflows/coffee-stress.yml
+
   publish:
-    needs: [core, conformance, merge-spill]
+    needs: [core, conformance, merge-spill, coffee-stress]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
