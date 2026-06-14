@@ -2,8 +2,8 @@
 
 Upstream (josephmachado/simple_dbt_project) wrote raw tables into a DuckDB file. On duckrun the
 warehouse is Delta, and sources are resolved as delta_scan views, so raw lives as Delta tables at
-``<DUCKRUN_WAREHOUSE>/raw/<name>``. Columns are read as VARCHAR so the schema is stable across the
-phase-2 append (el/load_new_data.py); the bronze models do the typing (``::timestamp`` etc.).
+``<DUCKRUN_WAREHOUSE>/raw/<name>``. Columns are read as VARCHAR so the schema is stable across
+re-runs and later source updates; the bronze models do the typing (``::timestamp`` etc.).
 
 This is just the EL half of the same dbt+Delta stack the models run on, so it uses duckrun's own
 connection API (read CSV -> Spark-style ``.write.saveAsTable``) rather than poking duckdb/deltalake
