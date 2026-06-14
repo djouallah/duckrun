@@ -2,8 +2,9 @@
 
 Upstream (josephmachado/simple_dbt_project) wrote raw tables into a DuckDB file. On duckrun the
 warehouse is Delta, and sources are resolved as delta_scan views, so raw lives as Delta tables at
-``<DUCKRUN_WAREHOUSE>/raw/<name>``. Columns are read as VARCHAR so the schema is stable across
-re-runs and later source updates; the bronze models do the typing (``::timestamp`` etc.).
+``<DUCKRUN_WAREHOUSE>/sde_raw/<name>`` (the sde_-prefixed schema keeps it from colliding with the
+other scenarios that share the lakehouse). Columns are read as VARCHAR so the schema is stable
+across re-runs and later source updates; the bronze models do the typing (``::timestamp`` etc.).
 
 This is just the EL half of the same dbt+Delta stack the models run on, so it uses duckrun's own
 connection API (read CSV -> Spark-style ``.write.saveAsTable``) rather than poking duckdb/deltalake
@@ -36,8 +37,8 @@ def main():
         path = os.path.join(HERE, "raw_data", csv_name).replace("\\", "/")
         df = con.read.option("all_varchar", True).option("header", True).csv(path)
         rows = df.count()
-        df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"raw.{table}")
-        print(f"{table}: wrote {rows} rows -> raw.{table}")
+        df.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(f"sde_raw.{table}")
+        print(f"{table}: wrote {rows} rows -> sde_raw.{table}")
 
 
 if __name__ == "__main__":

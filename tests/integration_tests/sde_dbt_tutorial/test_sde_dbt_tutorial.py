@@ -40,9 +40,11 @@ pytestmark = pytest.mark.skipif(
     reason="OneLake not configured (set WAREHOUSE_PATH=abfss://…/Tables and ONELAKE_TOKEN)",
 )
 
-# sde gets its own namespace under the shared lakehouse so its generic schema names
-# (raw / main / snapshots) never collide with the aemo or coffee scenarios.
-ROOT = (WAREHOUSE_PATH.rstrip("/") + "/sde_dbt_tutorial") if WAREHOUSE_PATH else None
+# Root is the lakehouse Tables path itself: for OneLake, duckrun treats the first segment after
+# /Tables as the SCHEMA, so a nested project subfolder can't work. sde isolates from the aemo and
+# coffee scenarios that share the lakehouse by sde_-prefixed schema names (sde_raw / sde_main /
+# sde_snapshots) instead.
+ROOT = WAREHOUSE_PATH
 
 
 def _storage_options() -> dict:
@@ -78,8 +80,8 @@ def test_sde_dbt_tutorial_scd2_stateful():
     env = _env()
     con = duckrun.connect(ROOT, storage_options=_storage_options())
 
-    snap = f"{ROOT}/snapshots/dim_customer"
-    obt = f"{ROOT}/main/orders_obt"
+    snap = f"{ROOT}/sde_snapshots/dim_customer"
+    obt = f"{ROOT}/sde_main/orders_obt"
     base_csv = (PROJECT_DIR / "raw_data" / "customer.csv").as_posix()
     key = "82"
 
@@ -124,7 +126,7 @@ def test_sde_dbt_tutorial_scd2_stateful():
                    as datetime_updated
         from read_csv_auto('{base_csv}', all_varchar = true, header = true)
     """)
-    updated.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("raw.raw_customer")
+    updated.write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("sde_raw.raw_customer")
     _dbt(["build"], env)
 
     # exactly one new version opened, carrying the new attribute, with the old version closed.

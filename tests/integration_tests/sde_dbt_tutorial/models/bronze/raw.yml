@@ -10,16 +10,16 @@ sources:
       - name: raw_customer
         meta:
           plugin: duckrun
-          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/raw/raw_customer"
+          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/sde_raw/raw_customer"
       - name: raw_orders
         meta:
           plugin: duckrun
-          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/raw/raw_orders"
+          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/sde_raw/raw_orders"
       - name: raw_state
         meta:
           plugin: duckrun
-          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/raw/raw_state"
+          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/sde_raw/raw_state"
       - name: raw_clickstream
         meta:
           plugin: duckrun
-          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/raw/raw_clickstream"
+          delta_table_path: "{{ env_var('DUCKRUN_WAREHOUSE', './warehouse') }}/sde_raw/raw_clickstream"

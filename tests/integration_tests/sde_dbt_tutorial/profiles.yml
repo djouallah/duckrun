@@ -5,7 +5,7 @@ sde_dbt_tutorial:
     dev:
       type: duckrun
       threads: 1            # duckrun is not thread-safe on the Delta write path
-      schema: main
+      schema: sde_main
       # Persistent Delta warehouse. delta_rs writes land as <root_path>/<schema>/<model>;
       # existing Delta tables are surfaced back as delta_scan views by the adapter, so
       # {{ this }} / is_incremental() resolve across separate dbt processes. In CI this is a
