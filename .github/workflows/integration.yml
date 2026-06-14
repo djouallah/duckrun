@@ -1,29 +1,32 @@
 name: integration tests
 
-# The integration suite. Jobs:
-#   • aemo           — the AEMO dbt project built against live Microsoft Fabric OneLake (abfss://),
-#                      under tests/integration_tests/aemo/.
-#   • coffee-onelake — the connection-API coffee-shop scenario against live OneLake at a SMALL N,
-#                      at tests/connection_api/test_coffee.py. Runs automatically (gated like aemo).
-#   • sde-tutorial   — the josephmachado/simple_dbt_project port under sde_dbt_tutorial/, driven
-#                      through real dbt subprocesses. Offline/local-fs (no secrets); always runs on
-#                      push/PR.
+# The integration suite. Two halves:
 #
-# The SAME coffee scenario on a LOCAL warehouse at a HUGE N is its own reusable workflow now
-# (coffee-stress.yml) — a release gate in publish.yml, plus manual dispatch. The fast small-N local
-# smoke is coffee-smoke.yml.
+# 1. The DOCS pipeline — one job per integration dbt project, each of which BUILDS its models for
+#    real, runs `dbt docs generate --static`, and verifies its own catalog carries Delta stats
+#    (issue #3), then uploads its static_index.html as an artifact:
+#      • docs-aemo        — the AEMO project built against live Microsoft Fabric OneLake (abfss://);
+#                           also the read-only `dbt test` abfss:// regression gate. Needs secrets.
+#      • docs-merge_spill — the incremental-MERGE project on a tiny local TPCH parquet (DAG + stats).
+#      • docs-coffee      — the connection-API coffee-shop scenario as dbt models, local.
+#      • docs-sde         — the josephmachado/simple_dbt_project port, a tiny local full build.
+#    A final `deploy-docs` job collects the four artifacts + the landing page (docs/site/index.html)
+#    and publishes the combined dbt-docs site to GitHub Pages (main only). Splitting per project
+#    means the jobs run in parallel and one project's build failing no longer kills everyone's docs.
 #
-# None of these is the per-change gate (that's core.yml). aemo and coffee-onelake run automatically
-# only when the aemo/merge_spill/coffee projects or this workflow change. On a manual dispatch you
-# pick which scenario(s) to run. aemo is deliberately NOT a release gate (publish.yml) — it depends
-# on live OneLake and is prone to transient infra failures.
+# 2. Live-OneLake smoke jobs (abfss://), each into its own isolated schema on the shared lakehouse:
+#      • coffee-onelake — the connection-API coffee scenario at a SMALL N.
+#      • merge-onelake  — the incremental-MERGE chain (merge_tpch_bench.py) at a SMALL scale factor,
+#                         exercising the abfss:// merge write/read path. The HEAVY SF=10 (60M-row)
+#                         memory-spill version stays a LOCAL release gate (merge.yml / publish.yml) —
+#                         over OneLake it would be network-bound, not a memory test.
+#      • sde-tutorial   — the SCD2 port driven through real dbt subprocesses against a persistent
+#                         OneLake snapshot.
 #
-# The aemo job also publishes the combined dbt-docs site to GitHub Pages: a landing page
-# (docs/site/index.html) linking the model DAGs of every integration dbt project — aemo (full catalog
-# over OneLake), merge_spill (DAG only; the 60M-row table is never built for docs, a tiny tpch parquet
-# just lets it compile), coffee (DAG only; the dbt incarnation of the coffee-shop scenario) and
-# sde_dbt_tutorial (DAG only; the josephmachado/simple_dbt_project port — EL builds tiny raw Delta
-# tables so it can compile). It rebuilds when any of those projects, or the landing page, changes.
+# None of these is the per-change gate (that's core.yml). The OneLake jobs run automatically only
+# when the projects / bench / this workflow change; a manual dispatch picks which scenario(s) to run.
+# They are deliberately NOT release gates — they depend on live OneLake and so are prone to transient
+# infra failures that must not block a publish.
 on:
   push:
     branches: ["**"]
@@ -32,6 +35,7 @@ on:
       - 'tests/integration_tests/merge_spill/**'
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/sde_dbt_tutorial/**'
+      - 'tests/tools/merge_tpch_bench.py'
       - 'docs/site/**'
       - '.github/workflows/integration.yml'
   pull_request:
@@ -40,31 +44,36 @@ on:
       - 'tests/integration_tests/merge_spill/**'
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/sde_dbt_tutorial/**'
+      - 'tests/tools/merge_tpch_bench.py'
       - 'docs/site/**'
       - '.github/workflows/integration.yml'
   workflow_dispatch:
     inputs:
       scenario:
-        description: "Which scenario(s) to run (aemo and/or the small coffee-onelake check)"
+        description: "Which live-OneLake scenario(s) to run on a manual dispatch"
         type: choice
-        options: [coffee, aemo, both]
+        options: [coffee, merge, aemo, all]
         default: coffee
 
-# the docs deploy (in the aemo job) needs Pages + OIDC; the coffee-onelake job uses none of it.
+# The docs deploy needs Pages + OIDC; the OneLake jobs use OIDC (id-token) for the Azure login.
 permissions:
   contents: read
   pages: write
   id-token: write
 
 jobs:
-  aemo:
-    # Auto on aemo-project / workflow changes (push & PR); on manual dispatch only when selected.
+  # ----------------------------------------------------------------------------------------------
+  # DOCS: one job per project. Each builds for real, generates static docs, asserts its own catalog
+  # carries Delta stats (issue #3), and uploads its static_index.html for deploy-docs to assemble.
+  # ----------------------------------------------------------------------------------------------
+
+  docs-aemo:
+    # Auto on push/PR; on manual dispatch only for aemo/all. Serialize across branches: it writes a
+    # single shared OneLake lakehouse, so concurrent runs would race each other's Delta tables.
     if: >-
       github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'both'))
+      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'all'))
     runs-on: ubuntu-latest
-    # Serialize across branches: the job writes a single shared OneLake lakehouse (and there is one
-    # Pages deployment), so concurrent runs would race each other's Delta tables / files.
     concurrency:
       group: aemo-onelake
       cancel-in-progress: false
@@ -136,44 +145,128 @@ jobs:
         # --static bundles manifest + catalog into one self-contained static_index.html.
         run: dbt docs generate --static --target dev
 
-      - name: Build merge_spill (real catalog + stats)
-        # Build the merge_spill models for real so the docs catalog carries Delta stats (rows/size/
-        # last-modified), instead of the empty-catalog DAG-only render. generate_data writes the tpch
-        # parquet into MERGE_SPILL_GEN at its configured scale, the tpch.lineitem source scans it, and
-        # the merge models build against it on a throwaway local warehouse.
+      - name: Verify the aemo catalog carries Delta table stats (issue #3)
+        run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json aemo
+
+      - name: Upload aemo docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-aemo
+          path: tests/integration_tests/aemo/target/static_index.html
+
+  docs-merge_spill:
+    if: >-
+      github.event_name == 'push' || github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'all'))
+    runs-on: ubuntu-latest
+    # Build the merge_spill models for real so the docs catalog carries Delta stats (rows/size/
+    # last-modified), instead of an empty-catalog DAG-only render. generate_data writes a tiny tpch
+    # parquet into MERGE_SPILL_GEN, the tpch.lineitem source scans it, and the merge models build
+    # against it on a throwaway LOCAL warehouse — no OneLake, no big fact (the 60M-row spill test
+    # lives in merge.yml).
+    defaults:
+      run:
         working-directory: tests/integration_tests/merge_spill
-        env:
-          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/merge_spill
-          WAREHOUSE_PATH: /tmp/ms_docs_wh
-          MERGE_SPILL_GEN: /tmp/ms_gen
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/merge_spill
+      WAREHOUSE_PATH: /tmp/ms_docs_wh
+      MERGE_SPILL_GEN: /tmp/ms_gen
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + tpchgen-cli (generate_data shells out to tpchgen)
+        working-directory: ${{ github.workspace }}
+        run: |
+          pip install -e .
+          pip install tpchgen-cli
+
+      - name: dbt build + docs generate (local, tiny scale)
         run: |
           mkdir -p /tmp/ms_docs_wh /tmp/ms_gen
           dbt build --target dev
           dbt docs generate --static --target dev
 
-      - name: Build coffee (real catalog + stats)
-        # Build the coffee-shop models for real on a throwaway local warehouse so the docs catalog
-        # carries Delta stats. The models read the dim CSVs via read_csv_auto at run time; no network.
+      - name: Verify the merge_spill catalog carries Delta table stats (issue #3)
+        run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json merge_spill
+
+      - name: Upload merge_spill docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-merge_spill
+          path: tests/integration_tests/merge_spill/target/static_index.html
+
+  docs-coffee:
+    if: >-
+      github.event_name == 'push' || github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'all'))
+    runs-on: ubuntu-latest
+    # Build the coffee-shop models for real on a throwaway local warehouse so the docs catalog
+    # carries Delta stats. The models read the dim CSVs via read_csv_auto at run time; no network.
+    defaults:
+      run:
         working-directory: tests/integration_tests/coffee
-        env:
-          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
-          WAREHOUSE_PATH: /tmp/coffee_docs_wh
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
+      WAREHOUSE_PATH: /tmp/coffee_docs_wh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
+        working-directory: ${{ github.workspace }}
+        run: pip install -e .
+
+      - name: dbt build + docs generate (local)
         run: |
           mkdir -p /tmp/coffee_docs_wh
           dbt build --target dev
           dbt docs generate --static --target dev
 
-      - name: Build the sde_dbt_tutorial DAG (static, real catalog — tiny full build)
-        # The josephmachado/simple_dbt_project port. Unlike the other DAGs we can't --empty-catalog
-        # it: order_status_pivot calls dbt_utils.get_column_values('orders_obt') at parse time, so
-        # docs generate needs the gold table to actually exist. The data is tiny (~100/999/27/100
-        # rows from the vendored raw_data/ CSVs), so just do a full local build into a throwaway
-        # warehouse — that also yields a real catalog with column metadata. deps is required because
-        # dbt_packages is gitignored (not in the checkout).
+      - name: Verify the coffee catalog carries Delta table stats (issue #3)
+        run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json coffee
+
+      - name: Upload coffee docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-coffee
+          path: tests/integration_tests/coffee/target/static_index.html
+
+  docs-sde:
+    if: >-
+      github.event_name == 'push' || github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'aemo' || inputs.scenario == 'all'))
+    runs-on: ubuntu-latest
+    # The josephmachado/simple_dbt_project port. Unlike the other DAGs we can't --empty-catalog it:
+    # order_status_pivot calls dbt_utils.get_column_values('orders_obt') at parse time, so docs
+    # generate needs the gold table to actually exist. The data is tiny (~100/999/27/100 rows from
+    # the vendored raw_data/ CSVs), so just do a full local build into a throwaway warehouse — that
+    # also yields a real catalog with column metadata. deps is required because dbt_packages is
+    # gitignored (not in the checkout).
+    defaults:
+      run:
         working-directory: tests/integration_tests/sde_dbt_tutorial
-        env:
-          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/sde_dbt_tutorial
-          DUCKRUN_WAREHOUSE: /tmp/sde_docs_wh
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/sde_dbt_tutorial
+      DUCKRUN_WAREHOUSE: /tmp/sde_docs_wh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
+        working-directory: ${{ github.workspace }}
+        run: pip install -e .
+
+      - name: EL + dbt build + docs generate (local, tiny full build)
         run: |
           mkdir -p /tmp/sde_docs_wh
           python el/extract_load_pipeline.py
@@ -182,73 +275,67 @@ jobs:
           dbt build --target dev
           dbt docs generate --static --target dev
 
-      - name: Verify every catalog carries Delta table stats (issue #3)
-        # Every project now builds real Delta tables, so its published catalog must show row count /
-        # size / last-modified (duckrun reads these from the Delta log). Guards the exact regression
-        # #3 reported — a statless catalog — across all four published projects.
-        working-directory: ${{ github.workspace }}
-        run: |
-          python - <<'PY'
-          import json, sys
-          for proj in ("aemo", "sde_dbt_tutorial", "merge_spill", "coffee"):
-              cat = json.load(open(f"tests/integration_tests/{proj}/target/catalog.json"))
-              statted = {u: n["stats"] for u, n in cat["nodes"].items()
-                         if n.get("stats", {}).get("has_stats", {}).get("value")}
-              if not statted:
-                  sys.exit(f"{proj}: no model reported Delta stats in catalog.json")
-              for uid, s in statted.items():
-                  for k in ("num_rows", "bytes", "last_modified"):
-                      assert s.get(k, {}).get("include") is True, f"{proj}:{uid} missing stat {k!r}"
-              print(f"{proj}: {len(statted)} model(s) with Delta stats")
-          PY
+      - name: Verify the sde_dbt_tutorial catalog carries Delta table stats (issue #3)
+        run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json sde_dbt_tutorial
 
-      - name: Assemble the combined docs site (landing page + per-project DAGs)
-        working-directory: ${{ github.workspace }}
-        run: |
-          mkdir -p dbt-docs-site
-          cp docs/site/index.html dbt-docs-site/index.html
-          cp tests/integration_tests/aemo/target/static_index.html             dbt-docs-site/aemo.html
-          cp tests/integration_tests/merge_spill/target/static_index.html      dbt-docs-site/merge_spill.html
-          cp tests/integration_tests/coffee/target/static_index.html           dbt-docs-site/coffee.html
-          cp tests/integration_tests/sde_dbt_tutorial/target/static_index.html dbt-docs-site/sde_dbt_tutorial.html
-
-      - name: Upload docs as a build artifact (available on every run)
+      - name: Upload sde_dbt_tutorial docs
         uses: actions/upload-artifact@v4
         with:
-          name: dbt-docs
-          path: dbt-docs-site
-
-      - name: Package docs for Pages
-        # Only the default branch publishes; PR/feature runs still get the artifact above.
-        if: github.ref == 'refs/heads/main'
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: dbt-docs-site
+          name: docs-sde
+          path: tests/integration_tests/sde_dbt_tutorial/target/static_index.html
 
   deploy-docs:
-    # Publish the combined dbt-docs site (landing page + aemo, merge_spill & coffee DAGs) to GitHub
-    # Pages (main only). Skipped automatically when the aemo job didn't run (e.g. a coffee dispatch).
-    needs: aemo
+    # Assemble the combined dbt-docs site (landing page + the four per-project DAGs) and publish it
+    # to GitHub Pages (main only). `needs` all four doc jobs, so a manual dispatch that didn't run
+    # them (or any doc job failing) skips publishing automatically. On feature branches / PRs the
+    # four per-project artifacts (docs-aemo, docs-merge_spill, docs-coffee, docs-sde) are still
+    # available individually from their own jobs.
+    needs: [docs-aemo, docs-merge_spill, docs-coffee, docs-sde]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all per-project docs artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: docs-*
+          path: docs-artifacts
+
+      - name: Assemble the combined docs site (landing page + per-project DAGs)
+        run: |
+          mkdir -p dbt-docs-site
+          cp docs/site/index.html                              dbt-docs-site/index.html
+          cp docs-artifacts/docs-aemo/static_index.html        dbt-docs-site/aemo.html
+          cp docs-artifacts/docs-merge_spill/static_index.html dbt-docs-site/merge_spill.html
+          cp docs-artifacts/docs-coffee/static_index.html      dbt-docs-site/coffee.html
+          cp docs-artifacts/docs-sde/static_index.html         dbt-docs-site/sde_dbt_tutorial.html
+
+      - name: Package docs for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dbt-docs-site
+
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4
 
+  # ----------------------------------------------------------------------------------------------
+  # Live-OneLake smoke jobs (abfss://), each into its own isolated schema on the shared lakehouse.
+  # ----------------------------------------------------------------------------------------------
+
   coffee-onelake:
     # The connection-API coffee scenario (duckrun.connect) against live OneLake at a SMALL row count —
-    # the network dominates, so a tiny fact is enough to exercise the abfss:// read/write path. Gated
-    # exactly like the aemo job (auto on push/PR, plus a coffee/both dispatch) so live-OneLake hits
-    # stay limited to project changes. Writes into an isolated schema (duckrun_conn_it) so it never
-    # collides with aemo sharing the same lakehouse, and it is deliberately NOT a deploy-docs
-    # dependency — a OneLake hiccup here must not block publishing the DAGs.
+    # the network dominates, so a tiny fact is enough to exercise the abfss:// read/write path.
+    # Writes into an isolated schema (duckrun_conn_it) so it never collides with aemo sharing the
+    # same lakehouse, and it is deliberately NOT a deploy-docs dependency — a OneLake hiccup here
+    # must not block publishing the DAGs.
     if: >-
       github.event_name == 'push' || github.event_name == 'pull_request' ||
-      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'coffee' || inputs.scenario == 'both'))
+      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'coffee' || inputs.scenario == 'all'))
     runs-on: ubuntu-latest
     concurrency:
       group: coffee-onelake
@@ -287,6 +374,65 @@ jobs:
 
       - name: Run the coffee-shop scenario against OneLake (small N)
         run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
+
+  merge-onelake:
+    # The incremental-MERGE chain (merge_tpch_bench.py) against live OneLake at a SMALL scale factor.
+    # This exercises the abfss:// MERGE write/read path end to end through the dbt path — every op in
+    # the chain (mixed upsert / insert-only / update-only / idempotent / append / safeappend /
+    # overwrite) writes Delta to OneLake, and the bench's verification queries delta_scan it back. The
+    # HEAVY SF=10 (60M-row) memory-spill version stays a LOCAL release gate (merge.yml / publish.yml):
+    # over OneLake it is network-bound, not a memory test. Writes into an isolated schema
+    # (merge_spill_it) so it never collides with aemo, and is deliberately NOT a deploy-docs
+    # dependency. The bench seeds each table with --full-refresh, so a persisted prior run is fine.
+    if: >-
+      github.event_name == 'push' || github.event_name == 'pull_request' ||
+      (github.event_name == 'workflow_dispatch' && (inputs.scenario == 'merge' || inputs.scenario == 'all'))
+    runs-on: ubuntu-latest
+    concurrency:
+      group: merge-onelake
+      cancel-in-progress: false
+    env:
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+      DBT_SCHEMA: merge_spill_it
+      # curl transport: the azure extension's default fails the OneLake TLS handshake on the runner.
+      AZURE_TRANSPORT_OPTION_TYPE: curl
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + tpchgen-cli (generate_data shells out to tpchgen)
+        run: |
+          pip install -e ".[test]"
+          pip install tpchgen-cli
+
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token \
+            --resource https://storage.azure.com/ \
+            --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Run the MERGE chain against OneLake (small scale factor)
+        # --warehouse abfss://… + --target onelake routes the whole chain to OneLake; --sf 1 keeps
+        # the fact small (network-bound, not a memory test). --dir is only a local scratch dir for
+        # the generated tpch parquet.
+        run: >-
+          python tests/tools/merge_tpch_bench.py
+          --dir /tmp/merge_onelake
+          --warehouse "$WAREHOUSE_PATH"
+          --target onelake
+          --sf 1
 
   sde-tutorial:
     # The josephmachado/simple_dbt_project port (tests/integration_tests/sde_dbt_tutorial/), driven

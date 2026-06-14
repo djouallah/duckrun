@@ -93,22 +93,32 @@ def _child_rss_peak_mb(pid):
 class Bench:
     def __init__(self, args):
         self.args = args
-        self.root = os.path.join(args.dir, "warehouse")
+        # --warehouse abfss://… points the whole chain at OneLake (the small-N integration job);
+        # the default is the local <dir>/warehouse the heavy SF=10 gate uses. Schema comes from
+        # DBT_SCHEMA so the OneLake job can write into an isolated schema (no aemo collision).
+        self.remote = bool(args.warehouse and args.warehouse.startswith("abfss://"))
+        self.root = args.warehouse if args.warehouse else os.path.join(args.dir, "warehouse")
+        self.schema = os.environ.get("DBT_SCHEMA", SCHEMA)
         self.con = duckdb.connect()
         self.con.execute("INSTALL delta; LOAD delta;")
         from dbt.adapters.duckrun import engine
         self.engine = engine
         engine.configure_duckdb_session(self.con)
+        if self.remote:
+            # The verification queries below delta_scan abfss://… directly, so this connection
+            # needs the same Azure secret + transport the adapter mints at connection-open.
+            from dbt.adapters.duckrun import secret
+            secret.ensure_azure_secret(self.con, {"bearer_token": os.environ.get("ONELAKE_TOKEN", "")})
         self.peak_mb = None  # child-process peak RSS of the most recent dbt() call
         self.env = dict(os.environ)
         self.env["WAREHOUSE_PATH"] = self.root
-        self.env["DBT_SCHEMA"] = SCHEMA
+        self.env["DBT_SCHEMA"] = self.schema
         # Turn on the adapter's in-process memory profiler so each child `dbt run` logs the
         # DuckDB-vs-delta_rs(+Arrow) split for its write/merge (see engine.mem_profile).
         self.env["DUCKRUN_MEM_PROFILE"] = "1"
 
     def path(self, model):
-        return os.path.join(self.root, SCHEMA, model).replace(os.sep, "/")
+        return os.path.join(self.root, self.schema, model).replace(os.sep, "/")
 
     def count(self, model):
         return self.con.execute(f"SELECT count(*) FROM delta_scan('{self.path(model)}')").fetchone()[0]
@@ -116,16 +126,21 @@ class Bench:
     def q(self, sql):
         return self.con.execute(sql).fetchone()[0]
 
-    def dbt(self, model):
+    def dbt(self, model, full_refresh=False):
         """One `dbt run --select <model>`; returns elapsed seconds and stashes the child process's
         peak RSS on self.peak_mb. Raises on non-zero exit.
 
         The merge runs in this spawned child (DuckDB + delta_rs both load into the dbt process), so
         we poll the CHILD's /proc RSS while it runs — the harness's own RSS never sees the merge.
         With DUCKRUN_MEM_PROFILE set in the env, the child also logs the DuckDB-vs-delta_rs split.
+
+        ``full_refresh`` forces a fresh (re)create of the table — used to seed each chain model on
+        OneLake, where tables persist across CI runs (local runs start from an rmtree'd warehouse).
         """
-        cmd = ["dbt", "run", "--select", model,
+        cmd = ["dbt", "run", "--select", model, "--target", self.args.target,
                "--project-dir", PROJECT_DIR, "--profiles-dir", PROJECT_DIR]
+        if full_refresh:
+            cmd.append("--full-refresh")
         if self.args.spill_size is not None:
             cmd += ["--vars", f"{{merge_max_spill_size: {self.args.spill_size}}}"]
         t = time.time()
@@ -142,8 +157,10 @@ class Bench:
         return time.time() - t
 
     def seed(self, model):
-        """First run: seed this op's table from ref(previous) — no op applied yet."""
-        self.dbt(model)
+        """First run: seed this op's table from ref(previous) — no op applied yet. On OneLake the
+        table may survive from a prior CI run, so force a full-refresh to recreate it fresh (locally
+        the warehouse was rmtree'd at the start, so a plain run already creates it)."""
+        self.dbt(model, full_refresh=self.remote)
 
     # -- per-op scenarios: seed already done; run the increment and verify by querying the table --
 
@@ -219,8 +236,11 @@ class Bench:
 
 
 def run(args):
-    if os.path.exists(os.path.join(args.dir, "warehouse")):
-        shutil.rmtree(os.path.join(args.dir, "warehouse"))
+    # Local runs start from a clean warehouse; the OneLake job can't rmtree a remote store, so it
+    # relies on the per-seed --full-refresh (Bench.seed) to recreate each table fresh instead.
+    if not (args.warehouse and args.warehouse.startswith("abfss://")):
+        if os.path.exists(os.path.join(args.dir, "warehouse")):
+            shutil.rmtree(os.path.join(args.dir, "warehouse"))
 
     b = Bench(args)
     # The generate_data python model runs tpchgen-cli (in the DAG) to write the lineitem PARQUET; the
@@ -342,6 +362,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dir", required=True)
     ap.add_argument("--sf", type=float, default=20.0, help="target fact table scale factor")
+    ap.add_argument("--warehouse", default=None,
+                    help="Delta warehouse root. An abfss://… path runs the whole chain against "
+                         "OneLake (the small-N integration job); default is the local <dir>/warehouse "
+                         "the heavy SF=10 gate uses.")
+    ap.add_argument("--target", default="dev",
+                    help="dbt target/profile output (use 'onelake' with --warehouse abfss://…)")
     ap.add_argument("--spill-size", type=int, default=None, dest="spill_size",
                     help="merge_max_spill_size override (bytes); default uses duckrun's cgroup-aware cap")
     ap.set_defaults(func=run)
