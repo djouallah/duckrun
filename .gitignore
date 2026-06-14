@@ -77,6 +77,8 @@ tests/integration_tests/*/dbt_packages/
 tests/integration_tests/*/logs/
 # The MERGE benchmark scorecard the runner writes to cwd (injected into the README in CI)
 merge_card.md
+# The snapshot-pin scorecard the runner writes to cwd (injected into docs/snapshot-pin.md in CI)
+snapshot_pin_card.md
 
 # dbt logs written to the repo root (e.g. running dbt with --project-dir)
 logs/

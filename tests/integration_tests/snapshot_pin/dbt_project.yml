@@ -1,0 +1,20 @@
+name: 'snapshot_pin'
+version: '1.0.0'
+
+profile: 'snapshot_pin'
+
+model-paths: ["models"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# A tiny incremental MERGE model used to demonstrate, through a real `dbt run`, duckrun's
+# single-snapshot pin: before the model runs, duckrun captures the target's Delta version `vB`,
+# pins the model's `{{ this }}` read to it (delta_scan('...', version => vB)) AND validates the
+# merge commit's OCC over (vB, HEAD]. The test harness (test_snapshot_pin.py) drives the runs and
+# simulates a concurrent writer to show why that pin makes a run fail that would otherwise have
+# silently committed (and vice versa).
+models:
+  snapshot_pin:
+    +materialized: incremental

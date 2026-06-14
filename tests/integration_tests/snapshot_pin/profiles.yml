@@ -1,0 +1,10 @@
+snapshot_pin:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      threads: 1
+      # Local-filesystem Delta warehouse: delta_rs writes land at <root_path>/<schema>/<model>.
+      # The harness sets WAREHOUSE_PATH to a fresh tmp dir per test, so each run is isolated.
+      schema: "{{ env_var('DBT_SCHEMA', 'main') }}"
+      root_path: "{{ env_var('WAREHOUSE_PATH') }}"

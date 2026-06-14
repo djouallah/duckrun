@@ -44,3 +44,13 @@ jobs:
             tests/adapter \
             tests/connection_api/test_local_filesystem.py \
             -q -p no:cacheprovider
+
+      - name: Snapshot-pin dbt integration test (single-snapshot MERGE through a real dbt run)
+        # Drives `dbt run` in-process against a local-fs warehouse and simulates a concurrent writer
+        # to prove the read/write snapshot pin: a commit landing mid-run makes the run fail loudly
+        # (no silent lost update), while the same commit landing before the run just succeeds.
+        # Offline and deterministic, so it belongs on the per-change gate next to the unit tests.
+        run: |
+          python -m pytest \
+            tests/integration_tests/snapshot_pin/test_snapshot_pin.py \
+            -q -p no:cacheprovider
