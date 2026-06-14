@@ -136,39 +136,32 @@ jobs:
         # --static bundles manifest + catalog into one self-contained static_index.html.
         run: dbt docs generate --static --target dev
 
-      - name: Build the merge_spill DAG (static, empty catalog — no 60M-row build)
-        # The merge_spill project's DAG, without paying for the heavy table. duckrun resolves the
-        # tpch.lineitem source eagerly as a view over read_parquet, so compile needs the parquet to
-        # exist — generate a tiny tpch lineitem (sf=0.01) with DuckDB's tpch extension, point the
-        # source glob at it, and --empty-catalog skips the warehouse catalog query entirely. The
-        # WAREHOUSE_PATH override shadows the job-level OneLake path so docs land on a throwaway dir.
+      - name: Build merge_spill (real catalog + stats)
+        # Build the merge_spill models for real so the docs catalog carries Delta stats (rows/size/
+        # last-modified), instead of the empty-catalog DAG-only render. generate_data writes the tpch
+        # parquet into MERGE_SPILL_GEN at its configured scale, the tpch.lineitem source scans it, and
+        # the merge models build against it on a throwaway local warehouse.
         working-directory: tests/integration_tests/merge_spill
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/merge_spill
           WAREHOUSE_PATH: /tmp/ms_docs_wh
           MERGE_SPILL_GEN: /tmp/ms_gen
         run: |
-          mkdir -p /tmp/ms_docs_wh /tmp/ms_gen/lineitem
-          python - <<'PY'
-          import duckdb
-          con = duckdb.connect()
-          con.execute("INSTALL tpch; LOAD tpch; CALL dbgen(sf=0.01)")
-          con.execute("COPY (SELECT * FROM lineitem) TO '/tmp/ms_gen/lineitem/part0.parquet' (FORMAT parquet)")
-          PY
-          dbt docs generate --static --empty-catalog --target dev
+          mkdir -p /tmp/ms_docs_wh /tmp/ms_gen
+          dbt build --target dev
+          dbt docs generate --static --target dev
 
-      - name: Build the coffee DAG (static, empty catalog — no build, no network beyond docs)
-        # The dbt incarnation of the coffee-shop scenario. Pure compile: its models read the dim CSVs
-        # via read_csv_auto (only at run time), so docs need neither the build nor a real warehouse —
-        # just a throwaway WAREHOUSE_PATH shadowing the job-level OneLake path. --empty-catalog skips
-        # the catalog query entirely.
+      - name: Build coffee (real catalog + stats)
+        # Build the coffee-shop models for real on a throwaway local warehouse so the docs catalog
+        # carries Delta stats. The models read the dim CSVs via read_csv_auto at run time; no network.
         working-directory: tests/integration_tests/coffee
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
           WAREHOUSE_PATH: /tmp/coffee_docs_wh
         run: |
           mkdir -p /tmp/coffee_docs_wh
-          dbt docs generate --static --empty-catalog --target dev
+          dbt build --target dev
+          dbt docs generate --static --target dev
 
       - name: Build the sde_dbt_tutorial DAG (static, real catalog — tiny full build)
         # The josephmachado/simple_dbt_project port. Unlike the other DAGs we can't --empty-catalog
@@ -189,16 +182,15 @@ jobs:
           dbt build --target dev
           dbt docs generate --static --target dev
 
-      - name: Verify the real catalogs carry Delta table stats (issue #3)
-        # aemo and sde_dbt_tutorial build real Delta tables, so their published catalog must show
-        # row count / size / last-modified (duckrun reads these from the Delta log). This guards the
-        # exact regression #3 reported — a statless catalog over OneLake. merge_spill and coffee are
-        # --empty-catalog DAGs (no warehouse catalog), so they're intentionally excluded.
+      - name: Verify every catalog carries Delta table stats (issue #3)
+        # Every project now builds real Delta tables, so its published catalog must show row count /
+        # size / last-modified (duckrun reads these from the Delta log). Guards the exact regression
+        # #3 reported — a statless catalog — across all four published projects.
         working-directory: ${{ github.workspace }}
         run: |
           python - <<'PY'
           import json, sys
-          for proj in ("aemo", "sde_dbt_tutorial"):
+          for proj in ("aemo", "sde_dbt_tutorial", "merge_spill", "coffee"):
               cat = json.load(open(f"tests/integration_tests/{proj}/target/catalog.json"))
               statted = {u: n["stats"] for u, n in cat["nodes"].items()
                          if n.get("stats", {}).get("has_stats", {}).get("value")}
