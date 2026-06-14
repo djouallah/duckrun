@@ -9,10 +9,10 @@ name: core tests
 # Runs on EVERY push / PR, and as a release gate (workflow_call from publish.yml). Catches a broken
 # connect / write / read / merge / catalog before it reaches the heavier, gated suites.
 #
-# Out of scope here (deliberately): tests/integration_tests/ — the aemo dbt project (live OneLake)
-# and the coffee scenario (coffee/; local variant pulls CSVs over the network and generates a big
-# fact, OneLake variant needs creds), both under integration.yml — plus tests/conformance/ (its own
-# workflow). Those are integration/stress, not the per-change gate.
+# Out of scope here (deliberately): the aemo dbt project (tests/integration_tests/aemo/, live OneLake)
+# and the coffee stress scenario (tests/connection_api/test_coffee.py; local variant pulls CSVs over
+# the network and generates a big fact, OneLake variant needs creds), both under integration.yml —
+# plus tests/conformance/ (its own workflow). Those are integration/stress, not the per-change gate.
 
 on:
   push:

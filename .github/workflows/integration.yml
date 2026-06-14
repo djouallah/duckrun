@@ -1,8 +1,10 @@
 name: integration tests
 
-# The integration suite, both scenarios under tests/integration_tests/:
-#   • aemo   — the AEMO dbt project built against live Microsoft Fabric OneLake (abfss://).
-#   • coffee — the connection-API coffee-shop scenario on a local warehouse, as a sizable stress run.
+# The integration suite, two scenarios:
+#   • aemo   — the AEMO dbt project built against live Microsoft Fabric OneLake (abfss://),
+#              under tests/integration_tests/aemo/.
+#   • coffee — the connection-API coffee-shop scenario on a local warehouse, as a sizable stress run,
+#              at tests/connection_api/test_coffee.py.
 #
 # Neither is the per-change gate (that's core.yml). aemo runs automatically only when the aemo
 # project (or this workflow) changes; coffee is manual-only stress. On a manual dispatch you pick
@@ -200,7 +202,7 @@ jobs:
 
   coffee:
     # Manual stress only: how big can a standard GitHub-hosted runner sustain for the connection
-    # API? Runs tests/integration_tests/coffee/test_coffee.py::test_coffee_local — the full scenario
+    # API? Runs tests/connection_api/test_coffee.py::test_coffee_local — the full scenario
     # (ingest dims, generate an N-row fact, partitioned Delta write, mart, append, merge, insert-only)
     # against a LOCAL filesystem warehouse (no OneLake, no network bottleneck), with N as an input.
     if: github.event_name == 'workflow_dispatch' && (inputs.scenario == 'coffee' || inputs.scenario == 'both')
@@ -237,7 +239,7 @@ jobs:
           # -s: stream the scenario's stage-by-stage narration into the log (without it pytest
           # captures the prints and the run shows nothing).
           /usr/bin/time -v python -m pytest \
-            tests/integration_tests/coffee/test_coffee.py::test_coffee_local \
+            tests/connection_api/test_coffee.py::test_coffee_local \
             -q -s -p no:cacheprovider 2>&1 | tee stress.log
           rc=${PIPESTATUS[0]}
           {
