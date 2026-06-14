@@ -12,8 +12,6 @@ process. We do the same for plugin sources here: instead of registering a Python
 ``CREATE OR REPLACE VIEW <source> AS <scan sql>``. No pyarrow, no copying the source into a table,
 and no dependence on dbt-duckdb's per-cursor relation re-registration.
 """
-import re
-
 from dbt.adapters.duckdb.environments.local import (
     DuckDBConnectionWrapper,
     DuckDBCursorWrapper,
@@ -21,32 +19,6 @@ from dbt.adapters.duckdb.environments.local import (
 )
 
 from . import delta_dml
-
-
-def _ddl_retry_for_object_type(sql, exc):
-    """A duckrun ``materialized='table'`` model is physically a DuckDB ``delta_scan`` *view*, but
-    duckrun reports it to dbt as a table. So when dbt swaps a model's materialization (table->view)
-    it renames/drops the old relation with table DDL (``alter table ... rename``, ``drop table``),
-    and DuckDB refuses: "Can only modify view with ALTER VIEW statement". Same the other way for a
-    real table. Detect that mismatch from the error and return the statement with the object keyword
-    swapped (table<->view) to retry once; None if it isn't this case.
-
-    The verb is matched anywhere, not anchored: dbt prepends a ``/* {...} */`` query comment, so the
-    statement doesn't start with the verb. ``count=1`` rewrites only the leading DDL keyword. DuckDB
-    phrases the two mismatches differently, so we pull the *actual* object type out of each message
-    and force the statement's verb to it."""
-    msg = str(exc).lower()
-    # DROP mismatch: "... is of type View, trying to drop type Table"
-    m = re.search(r"is of type (table|view), trying to drop type (table|view)", msg)
-    if m:
-        new = re.sub(r"\bdrop\s+(?:table|view)\b", "drop " + m.group(1), sql, count=1, flags=re.I)
-        return new if new != sql else None
-    # ALTER mismatch: "Can only modify view with ALTER VIEW statement"
-    m = re.search(r"can only modify (table|view) with alter (?:table|view)", msg)
-    if m:
-        new = re.sub(r"\balter\s+(?:table|view)\b", "alter " + m.group(1), sql, count=1, flags=re.I)
-        return new if new != sql else None
-    return None
 
 
 class DuckrunCursorWrapper(DuckDBCursorWrapper):
@@ -74,15 +46,7 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
                 sql,
             ):
                 return self._cursor  # applied to Delta; nothing to run on DuckDB
-        try:
-            return super().execute(sql, bindings)
-        except Exception as exc:
-            # dbt aimed table DDL at a delta_scan view (or vice versa) — retry with the keyword
-            # swapped. See _ddl_retry_for_object_type.
-            retry = _ddl_retry_for_object_type(sql, exc) if bindings is None else None
-            if retry is None:
-                raise
-            return super().execute(retry, bindings)
+        return super().execute(sql, bindings)
 
 
 class DuckrunEnvironment(LocalEnvironment):
