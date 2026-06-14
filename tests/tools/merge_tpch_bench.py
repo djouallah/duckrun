@@ -72,6 +72,24 @@ def _peak_rss_mb():
     return None
 
 
+def _child_rss_peak_mb(pid):
+    """Peak RSS (MB) of another process via /proc/<pid>/status VmHWM (the kernel's own high-water,
+    falling back to the current VmRSS). None off Linux or once the process is gone. The whole merge
+    runs in the spawned `dbt run` child, so this — not _peak_rss_mb() on the harness — is what
+    measures the merge's real memory."""
+    try:
+        with open(f"/proc/{pid}/status") as fh:
+            hwm = rss = None
+            for line in fh:
+                if line.startswith("VmHWM:"):
+                    hwm = int(line.split()[1]) // 1024
+                elif line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) // 1024
+            return hwm if hwm is not None else rss
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 class Bench:
     def __init__(self, args):
         self.args = args
@@ -81,9 +99,13 @@ class Bench:
         from dbt.adapters.duckrun import engine
         self.engine = engine
         engine.configure_duckdb_session(self.con)
+        self.peak_mb = None  # child-process peak RSS of the most recent dbt() call
         self.env = dict(os.environ)
         self.env["WAREHOUSE_PATH"] = self.root
         self.env["DBT_SCHEMA"] = SCHEMA
+        # Turn on the adapter's in-process memory profiler so each child `dbt run` logs the
+        # DuckDB-vs-delta_rs(+Arrow) split for its write/merge (see engine.mem_profile).
+        self.env["DUCKRUN_MEM_PROFILE"] = "1"
 
     def path(self, model):
         return os.path.join(self.root, SCHEMA, model).replace(os.sep, "/")
@@ -95,13 +117,28 @@ class Bench:
         return self.con.execute(sql).fetchone()[0]
 
     def dbt(self, model):
-        """One `dbt run --select <model>`; returns elapsed seconds. Raises on non-zero exit."""
+        """One `dbt run --select <model>`; returns elapsed seconds and stashes the child process's
+        peak RSS on self.peak_mb. Raises on non-zero exit.
+
+        The merge runs in this spawned child (DuckDB + delta_rs both load into the dbt process), so
+        we poll the CHILD's /proc RSS while it runs — the harness's own RSS never sees the merge.
+        With DUCKRUN_MEM_PROFILE set in the env, the child also logs the DuckDB-vs-delta_rs split.
+        """
         cmd = ["dbt", "run", "--select", model,
                "--project-dir", PROJECT_DIR, "--profiles-dir", PROJECT_DIR]
         if self.args.spill_size is not None:
             cmd += ["--vars", f"{{merge_max_spill_size: {self.args.spill_size}}}"]
         t = time.time()
-        subprocess.run(cmd, check=True, env=self.env)
+        proc = subprocess.Popen(cmd, env=self.env)
+        peak = 0
+        while proc.poll() is None:
+            cur = _child_rss_peak_mb(proc.pid)
+            if cur is not None and cur > peak:
+                peak = cur
+            time.sleep(0.05)
+        self.peak_mb = peak or None
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(proc.returncode, cmd)
         return time.time() - t
 
     def seed(self, model):
@@ -120,6 +157,7 @@ class Bench:
         return {"name": "Mixed upsert", "src": batch, "upd": batch - ins, "ins": ins,
                 "before": before, "after": after, "expected": before + ins, "dt": dt,
                 "count_ok": after == before + ins, "verify_ok": (batch - ins) > 0 and ins > 0,
+                "peak_mb": self.peak_mb,
                 "verify": "existing keys updated (l_quantity=-1), key-shifted rows inserted"}
 
     def insert_only(self, model):
@@ -133,6 +171,7 @@ class Bench:
         return {"name": "Insert-only (future shipdate)", "src": ins, "upd": 0, "ins": ins,
                 "before": before, "after": after, "expected": before + ins, "dt": dt,
                 "count_ok": after == before + ins, "verify_ok": ins > 0 and future_past_max == ins,
+                "peak_mb": self.peak_mb,
                 "verify": f"{ins:,} rows carry the 2035 shipdate, all key-shifted (== inserts)"}
 
     def update_only(self, model):
@@ -143,6 +182,7 @@ class Bench:
         return {"name": "Update-only (100% match)", "src": marked, "upd": marked, "ins": 0,
                 "before": before, "after": after, "expected": before, "dt": dt,
                 "count_ok": after == before, "verify_ok": marked > 0,
+                "peak_mb": self.peak_mb,
                 "verify": "row count unchanged; sampled rows carry l_quantity=-2"}
 
     def idempotent(self, model):
@@ -153,6 +193,7 @@ class Bench:
         return {"name": "Idempotent re-merge", "src": 0, "upd": 0, "ins": 0,
                 "before": before, "after": after, "expected": before, "dt": dt,
                 "count_ok": after == before, "verify_ok": after == before,
+                "peak_mb": self.peak_mb,
                 "verify": "re-merging unchanged rows changed nothing"}
 
     def appendish(self, model, label):
@@ -163,6 +204,7 @@ class Bench:
         return {"name": f"{label} (no merge)", "src": appended, "upd": 0, "ins": appended,
                 "before": before, "after": after, "expected": before + appended, "dt": dt,
                 "count_ok": after == before + appended and appended > 0, "verify_ok": appended > 0,
+                "peak_mb": self.peak_mb,
                 "verify": f"appended {appended:,} key-shifted rows — no target scan"}
 
     def overwrite(self, model, prev_model):
@@ -172,6 +214,7 @@ class Bench:
         return {"name": "Overwrite (no merge)", "src": after, "upd": 0, "ins": after,
                 "before": before, "after": after, "expected": after, "dt": dt,
                 "count_ok": 0 < after < before, "verify_ok": 0 < after < before,
+                "peak_mb": self.peak_mb,
                 "verify": f"table replaced with the {after:,}-row batch (no target scan)"}
 
 
@@ -228,8 +271,12 @@ def run(args):
             print(f"   FAIL: value check failed ({r['verify']})", file=sys.stderr)
 
     final_rows = b.count("safeappend_only")
-    peak = _peak_rss_mb()
-    print(f"== done: peakRSS={peak}MB (chain tail grew to {final_rows:,} rows) ==", flush=True)
+    # The merges run in the spawned `dbt run` children, so the headline peak is the worst child RSS
+    # across the ops — not _peak_rss_mb() on this harness, which only ever runs verification queries.
+    child_peaks = [r["peak_mb"] for r in results if r.get("peak_mb")]
+    peak = max(child_peaks) if child_peaks else _peak_rss_mb()
+    peak_s = f"{peak}MB" if peak is not None else "n/a (child /proc sampling is Linux-only)"
+    print(f"== done: peak child RSS={peak_s} (chain tail grew to {final_rows:,} rows) ==", flush=True)
     _write_summary(setup, results, final_rows, peak, ok)
     if not ok:
         sys.exit(2)
@@ -273,13 +320,14 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
     def _m(n):
         return f"{n/1_000_000:.1f}M"
 
-    L += ["### Results (row counts in millions)",
-          "| Operation | Increment | Updates | Inserts | Before | After | Expected | Count ✓ | Values ✓ | Time |",
-          "|---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|"]
+    L += ["### Results (row counts in millions; peak RSS is the `dbt run` child's, per op)",
+          "| Operation | Increment | Updates | Inserts | Before | After | Expected | Count ✓ | Values ✓ | Peak RSS | Time |",
+          "|---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|---:|"]
     for r in results:
+        peak = f"{r['peak_mb']:,} MB" if r.get("peak_mb") else "n/a"
         L.append(f"| {r['name']} | {_m(r['src'])} | {_m(r['upd'])} | {_m(r['ins'])} | {_m(r['before'])} | "
                  f"{_m(r['after'])} | {_m(r['expected'])} | {'✅' if r['count_ok'] else '❌'} | "
-                 f"{'✅' if r['verify_ok'] else '❌'} | {r['dt']:.1f}s |")
+                 f"{'✅' if r['verify_ok'] else '❌'} | {peak} | {r['dt']:.1f}s |")
     L += [""]
     verdict = (f"**Result: ✅ all operations correct.** The chain tail reached **{final_rows:,} rows**, "
                f"peak memory **{peak_s}** — duckrun stayed within the runner's RAM and every "

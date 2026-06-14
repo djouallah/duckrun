@@ -155,13 +155,14 @@ class Plugin(BasePlugin):
         # Table-like (non-incremental) models always overwrite. Incremental models
         # overwrite on first run / full-refresh, then apply the incremental strategy.
         if not incremental or full_refresh or not exists:
-            engine.write_delta(
-                path, data, "overwrite",
-                partition_by=partition_by,
-                merge_schema=merge_schema,
-                storage_options=storage_options,
-                compaction_threshold=self._compaction_threshold,
-            )
+            with engine.mem_profile("overwrite", con=cur):
+                engine.write_delta(
+                    path, data, "overwrite",
+                    partition_by=partition_by,
+                    merge_schema=merge_schema,
+                    storage_options=storage_options,
+                    compaction_threshold=self._compaction_threshold,
+                )
             return
 
         # Resolve the incremental strategy: default to merge when a unique_key is
@@ -194,31 +195,33 @@ class Plugin(BasePlugin):
             # prune the target (right for small incremental deltas into a large table). A model
             # whose source is itself huge can set merge_streamed_exec=true to stream it instead.
             sx = cfg.get("merge_streamed_exec")
-            engine.merge_delta(
-                path, data, unique_key,
-                insert_only=(strategy == "insert"),
-                update_columns=cfg.get("merge_update_columns"),
-                exclude_columns=cfg.get("merge_exclude_columns"),
-                predicates=self._merge_predicates(cfg),
-                update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
-                insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
-                merge_schema=evolve_schema,
-                max_spill_size=cfg.get("merge_max_spill_size"),
-                streamed_exec=(False if sx is None else bool(sx)),
-                # Pin the merge target to the version the model read (vB, captured before it read
-                # {{ this }}), so OCC validates (vB, HEAD] — the read and the commit are one snapshot.
-                read_version=cfg.get("read_version"),
-                storage_options=storage_options,
-                compaction_threshold=self._compaction_threshold,
-            )
+            with engine.mem_profile("merge", con=cur):
+                engine.merge_delta(
+                    path, data, unique_key,
+                    insert_only=(strategy == "insert"),
+                    update_columns=cfg.get("merge_update_columns"),
+                    exclude_columns=cfg.get("merge_exclude_columns"),
+                    predicates=self._merge_predicates(cfg),
+                    update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
+                    insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
+                    merge_schema=evolve_schema,
+                    max_spill_size=cfg.get("merge_max_spill_size"),
+                    streamed_exec=(False if sx is None else bool(sx)),
+                    # Pin the merge target to the version the model read (vB, captured before it read
+                    # {{ this }}), so OCC validates (vB, HEAD] — read and commit are one snapshot.
+                    read_version=cfg.get("read_version"),
+                    storage_options=storage_options,
+                    compaction_threshold=self._compaction_threshold,
+                )
         elif strategy == "append":
-            engine.write_delta(
-                path, data, "append",
-                partition_by=partition_by,
-                merge_schema=merge_schema,
-                storage_options=storage_options,
-                compaction_threshold=self._compaction_threshold,
-            )
+            with engine.mem_profile("append", con=cur):
+                engine.write_delta(
+                    path, data, "append",
+                    partition_by=partition_by,
+                    merge_schema=merge_schema,
+                    storage_options=storage_options,
+                    compaction_threshold=self._compaction_threshold,
+                )
         elif strategy == "safeappend":
             # Optimistic append: commit only if the table version has not moved since the model
             # *started* (read_version, captured before it read {{ this }}), else fail so dbt errors
@@ -226,14 +229,15 @@ class Plugin(BasePlugin):
             # is what closes the read→write gap: a writer that commits any time during the build
             # makes this fail instead of appending a duplicate. No dedup — that's the SQL's job.
             # Compare-and-swap via delta_rs max_commit_retries=0 (see engine).
-            engine.append_if_unchanged(
-                path, data,
-                read_version=cfg.get("read_version"),
-                partition_by=partition_by,
-                merge_schema=merge_schema,
-                storage_options=storage_options,
-                compaction_threshold=self._compaction_threshold,
-            )
+            with engine.mem_profile("safeappend", con=cur):
+                engine.append_if_unchanged(
+                    path, data,
+                    read_version=cfg.get("read_version"),
+                    partition_by=partition_by,
+                    merge_schema=merge_schema,
+                    storage_options=storage_options,
+                    compaction_threshold=self._compaction_threshold,
+                )
         else:
             raise ValueError(
                 f"Unknown incremental_strategy '{strategy}'. "

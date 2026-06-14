@@ -196,6 +196,133 @@ def _effective_mem_limit_source() -> str:
     return "physical RAM"
 
 
+# --------------------------------------------------------------- memory profiling (opt-in)
+# A merge that OOMs has three suspects sharing one process: DuckDB (producing the source), the
+# Arrow buffers delta_rs collects when streamed_exec=False, and delta_rs's own merge pool. RSS
+# alone can't tell them apart. With DUCKRUN_MEM_PROFILE set, mem_profile() samples this process's
+# RSS *and* DuckDB's own allocation through a write/merge and logs the split, so "who's the slob"
+# is measured, not inferred. Off by default: no thread, no samples, no overhead in production.
+
+def _proc_rss_bytes() -> Optional[int]:
+    """Resident set size of THIS process in bytes — the number the OOM-killer actually watches;
+    None if it can't be read. Linux: VmRSS from /proc/self/status. Windows: WorkingSetSize."""
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) * 1024  # value is in kB
+    except (OSError, ValueError, IndexError):
+        pass
+    try:  # Windows: GetProcessMemoryInfo -> WorkingSetSize
+        from ctypes import wintypes
+
+        class _PMC(ctypes.Structure):
+            _fields_ = [("cb", ctypes.c_ulong), ("PageFaultCount", ctypes.c_ulong)] + [
+                (n, ctypes.c_size_t) for n in (
+                    "PeakWorkingSetSize", "WorkingSetSize", "QuotaPeakPagedPoolUsage",
+                    "QuotaPagedPoolUsage", "QuotaPeakNonPagedPoolUsage", "QuotaNonPagedPoolUsage",
+                    "PagefileUsage", "PeakPagefileUsage")
+            ]
+        # argtypes are required: GetCurrentProcess returns the pseudo-handle (-1), which overflows
+        # ctypes' default int marshalling unless the parameter is typed as a HANDLE.
+        k32 = ctypes.windll.kernel32
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi = ctypes.windll.psapi
+        psapi.GetProcessMemoryInfo.argtypes = [wintypes.HANDLE, ctypes.POINTER(_PMC), ctypes.c_ulong]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+        p = _PMC()
+        p.cb = ctypes.sizeof(_PMC)
+        if psapi.GetProcessMemoryInfo(k32.GetCurrentProcess(), ctypes.byref(p), p.cb):
+            return int(p.WorkingSetSize)
+    except Exception:
+        pass
+    return None
+
+
+def _duckdb_mem_bytes(con):
+    """(allocated_bytes, temp_spill_bytes) DuckDB currently holds, via duckdb_memory(); None on any
+    error. Runs on a *separate* cursor so it's safe to call while another query streams on `con` —
+    and this is a diagnostic-only path, so it must never raise into the real write/merge."""
+    if con is None:
+        return None
+    try:
+        cur = con.cursor()  # duckdb's cursor() is a new connection on the same instance
+        row = cur.execute(
+            "SELECT coalesce(sum(memory_usage_bytes), 0), "
+            "coalesce(sum(temporary_storage_bytes), 0) FROM duckdb_memory()"
+        ).fetchone()
+        return (int(row[0]), int(row[1]))
+    except Exception:
+        return None
+
+
+class _MemSampler:
+    """Background RSS / DuckDB-memory sampler for one write or merge. See mem_profile()."""
+
+    def __init__(self, label: str, con=None, interval: float = 0.1):
+        self.label = label
+        self.con = con
+        self.interval = interval
+        self._thread = None
+        self._stop = None
+        self.samples = 0
+        self.peak_rss = 0
+        self.duckdb_at_rss_peak = None        # DuckDB alloc at the instant RSS peaked
+        self.duckdb_spill_at_rss_peak = None
+        self.peak_duckdb = 0                  # DuckDB's own high-water, independently
+
+    def __enter__(self):
+        if not os.environ.get("DUCKRUN_MEM_PROFILE"):
+            return self  # disabled: no thread, no overhead
+        import threading
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name=f"duckrun-mem-{self.label}", daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while not self._stop.is_set():
+            rss = _proc_rss_bytes()
+            dd = _duckdb_mem_bytes(self.con)
+            self.samples += 1
+            if dd is not None and dd[0] > self.peak_duckdb:
+                self.peak_duckdb = dd[0]
+            if rss is not None and rss > self.peak_rss:
+                self.peak_rss = rss
+                if dd is not None:
+                    self.duckdb_at_rss_peak, self.duckdb_spill_at_rss_peak = dd
+            self._stop.wait(self.interval)
+
+    def __exit__(self, *exc):
+        if self._thread is None:
+            return False
+        self._stop.set()
+        self._thread.join(timeout=2.0)
+
+        def mb(n):
+            return "n/a" if n is None else f"{n / 2 ** 20:,.0f} MB"
+
+        non_duck = None
+        if self.peak_rss and self.duckdb_at_rss_peak is not None:
+            non_duck = max(0, self.peak_rss - self.duckdb_at_rss_peak)
+        logger.info(
+            f"mem[{self.label}]: peak RSS={mb(self.peak_rss)} | "
+            f"DuckDB peak={mb(self.peak_duckdb)} "
+            f"(at RSS-peak {mb(self.duckdb_at_rss_peak)}, spill {mb(self.duckdb_spill_at_rss_peak)}) | "
+            f"non-DuckDB~={mb(non_duck)} (delta_rs + Arrow) | samples={self.samples}"
+        )
+        return False
+
+
+def mem_profile(label: str, con=None, interval: float = 0.1):
+    """Context manager that profiles a write/merge's memory when DUCKRUN_MEM_PROFILE is set, else a
+    no-op. Wraps an engine call so RSS, DuckDB's allocation, and the delta_rs/Arrow remainder are
+    measured for that phase and logged once on exit. `con` (the DuckDB connection) enables the
+    DuckDB-vs-delta_rs split; omit it to log RSS only. Diagnostic only — never affects the write."""
+    return _MemSampler(label, con=con, interval=interval)
+
+
 # How the effective memory limit is split between the two big consumers that can peak at the
 # same time during a merge — DuckDB (producing the source relation) and delta_rs (the merge
 # pool). They share one cap, so the shares must sum *under* 1.0 or we've just moved the OOM; each
