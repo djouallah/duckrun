@@ -37,11 +37,12 @@ permissions:
   contents: write
 
 jobs:
-  offline:
-    # duckrun's core public surfaces, tested offline on a local-filesystem Delta warehouse.
+  adapter:
+    # duckrun's core public surfaces (dbt adapter internals + the duckrun.connect() API),
+    # tested on a local-filesystem Delta warehouse.
     runs-on: ubuntu-latest
     concurrency:
-      group: cores-offline-${{ github.ref }}
+      group: cores-adapter-${{ github.ref }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
