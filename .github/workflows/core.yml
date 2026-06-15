@@ -6,6 +6,8 @@ name: core tests
 #                                                      engine, remote discovery, table_exists guard).
 #   • tests/connection_api/test_local_filesystem.py  — the duckrun.connect() API end to end
 #                                                      (write modes, reader, catalog, merge/delete/update).
+#   • tests/connection_api/test_sql_dml.py            — the conn.sql raw-DML supported/unsupported
+#                                                      matrix (create/insert/update/delete/temp/view).
 # Runs on EVERY push / PR, and as a release gate (workflow_call from publish.yml). Catches a broken
 # connect / write / read / merge / catalog before it reaches the heavier, gated suites.
 #
@@ -43,6 +45,7 @@ jobs:
           python -m pytest \
             tests/adapter \
             tests/connection_api/test_local_filesystem.py \
+            tests/connection_api/test_sql_dml.py \
             -q -p no:cacheprovider
 
       - name: Snapshot-pin dbt integration test (single-snapshot MERGE through a real dbt run)
