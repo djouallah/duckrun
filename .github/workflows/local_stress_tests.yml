@@ -2,7 +2,7 @@ name: local_stress_tests
 
 # The heavy, LOCAL-filesystem stress runs, collected as one workflow. Both take ~10 min and the
 # whole runner's RAM, so they NEVER run on push/PR: they are RELEASE GATES (workflow_call from
-# pypi.yml — a tag publishes only if they pass) and can be run by hand (workflow_dispatch) to find
+# publish.yml — a tag publishes only if they pass) and can be run by hand (workflow_dispatch) to find
 # the ceiling. Each is its own job (own runner + install), and each serializes via a static group.
 #
 # Jobs:

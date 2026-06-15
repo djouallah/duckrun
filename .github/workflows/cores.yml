@@ -19,7 +19,7 @@ name: cores
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • coffee-smoke            — fast connect/read/write/merge smoke at a small row count.
 #
-# Runs on EVERY push / PR, and as a release gate (workflow_call from pypi.yml). Out of scope here
+# Runs on EVERY push / PR, and as a release gate (workflow_call from publish.yml). Out of scope here
 # (deliberately): the live-OneLake projects (integration_tests_onelake.yml) and the heavy local
 # stress runs (local_stress_tests.yml) — those are integration/stress, not the per-change gate.
 
@@ -27,7 +27,7 @@ on:
   push:
     branches: ["**"]
   pull_request:
-  # Callable as a release gate from pypi.yml.
+  # Callable as a release gate from publish.yml.
   workflow_call:
 
 # The card jobs (conformance, connection-card, snapshot-pin) commit their rendered scorecards
