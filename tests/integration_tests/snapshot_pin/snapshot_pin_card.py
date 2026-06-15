@@ -19,8 +19,8 @@ to (HEAD = no effective pin, vs vB = the real pin).
     python tests/integration_tests/snapshot_pin/snapshot_pin_card.py
 
 Prints an ASCII timeline to the console and, in CI, writes the same as Markdown to the GitHub
-Actions step summary ($GITHUB_STEP_SUMMARY) and to snapshot_pin_card.md (for injection into
-docs/snapshot-pin.md). Exit 0 iff the demonstration holds.
+Actions step summary ($GITHUB_STEP_SUMMARY) and to docs/snapshot_pin_card.md (for injection into
+docs/snapshot-pin.md). Run from the repo root. Exit 0 iff the demonstration holds.
 """
 import os
 import sys
@@ -258,7 +258,7 @@ def main() -> int:
 
     print(render_console(no_pin, pin, all_ok))
     card = render_markdown(no_pin, pin, all_ok)
-    with open("snapshot_pin_card.md", "w", encoding="utf-8", newline="\n") as fh:
+    with open("docs/snapshot_pin_card.md", "w", encoding="utf-8", newline="\n") as fh:
         fh.write(card)
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:

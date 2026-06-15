@@ -305,7 +305,7 @@ def run(args):
 
 def _write_summary(setup, results, final_rows, peak, all_ok):
     card = _build_card(setup, results, final_rows, peak, all_ok)
-    with open("merge_card.md", "w", encoding="utf-8", newline="\n") as fh:
+    with open("docs/merge_card.md", "w", encoding="utf-8", newline="\n") as fh:
         fh.write(card + "\n")
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:

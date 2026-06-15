@@ -55,10 +55,10 @@ jobs:
       - name: Inject the card into docs and commit to main
         # Only a push to main updates the canonical card in the docs; PRs/branches just show it in
         # their own run summary. Never fail the run on a commit hiccup. [skip ci] avoids re-trigger.
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && hashFiles('snapshot_pin_card.md') != ''
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && hashFiles('docs/snapshot_pin_card.md') != ''
         continue-on-error: true
         run: |
-          python tests/tools/inject_readme.py docs/snapshot-pin.md snapshot_pin_card.md SNAPSHOT-PIN
+          python tests/tools/inject_readme.py docs/snapshot-pin.md docs/snapshot_pin_card.md SNAPSHOT-PIN
           if git diff --quiet -- docs/snapshot-pin.md; then
             echo "docs snapshot-pin card unchanged."
             exit 0
