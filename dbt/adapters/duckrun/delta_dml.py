@@ -21,11 +21,33 @@ object stores. The directory persists until a human purges it; a later ``create 
 overwrites the tombstone with real data and the table is live again.
 
 The seed loader's own SQL (``create table <t> (<col defs>)``, ``insert ... values``, ``COPY``) lands
-on a native DuckDB table, not a Delta table: ``create table (<col defs>)`` doesn't match the
-``... as select`` form, and while ``insert ... values`` now *does* match a form here, the mutate
-guard only applies it when a Delta table already exists at the target — the seed's native table has
-none, so it falls through untouched. duckrun's own materializations emit ``create ... view`` (not
-``table``), so they pass through too.
+on a native DuckDB table, not a Delta table: bare ``create table (<col defs>)`` becomes a Delta
+table only when a ``default_schema`` is set (the connection API), and the dbt/cursor path passes
+None — so the seed's table stays native. ``insert ... values`` *does* match a form here, but the
+mutate guard only applies it when a Delta table already exists at the target — the seed's native
+table has none, so it falls through untouched. duckrun's own materializations emit ``create ...
+view`` (not ``table``), so they pass through too.
+
+Supported / unsupported (what reaches delta_rs):
+
+    create [or replace] table x [if not exists] as <query>   Delta overwrite (query: select/with/(…))
+    create table x (<col defs>)                               empty Delta table (connection API only)
+    create temp/temporary table …                            native DuckDB (pass through)  ── invariant:
+    create view …                                            native DuckDB (pass through)  ── only TEMP
+                                                                                            and VIEW are
+                                                                                            native; every
+                                                                                            other CREATE
+                                                                                            TABLE is Delta
+    insert into x [(cols)] select …                          Delta append (projected onto target schema)
+    insert into x [(cols)] values …                          Delta append (projected onto target schema)
+    [with …] insert into x select …                          Delta append (CTE re-attached to the body)
+    delete from x [where …]                                  delta_rs delete
+    update x set … [where …]                                 delta_rs update
+    alter table x add column …                               Delta overwrite (widen schema)
+    drop table x                                             tombstone (no data deleted)
+    merge … / update … from / delete … using / multi-stmt   NOT handled here — the connection API
+                                                             (session.sql) rejects them with a clear
+                                                             error; the dbt path never emits them.
 """
 import re
 from typing import List, Optional, Tuple
@@ -58,12 +80,24 @@ def is_dropped(con, location: str, storage_options=None) -> bool:
         return False
 
 # --- statement matchers (leading-anchored, DOTALL so multi-line bodies match) ----------------
+# `create [or replace] table [if not exists] <rel> as <query>`. The body is ANY query text (a bare
+# `select …`, a `with … select …` CTE, or a parenthesised `(select …)`); it's handed to DuckDB
+# verbatim so anything DuckDB accepts after `as` works.
 _CREATE_AS = re.compile(
-    r"\s*create\s+table\s+(?:if\s+not\s+exists\s+)?(?P<rel>.+?)\s+as\s+(?P<body>select\b.*)",
+    r"\s*create\s+(?:or\s+replace\s+)?table\s+(?P<ine>if\s+not\s+exists\s+)?"
+    r"(?P<rel>.+?)\s+as\s+(?P<body>.+)",
+    re.I | re.S,
+)
+# `create [or replace] table [if not exists] <rel> (<col defs>)` — no `as`. Connection-API only
+# (see _create_coldefs): materializes an EMPTY Delta table so `CREATE TABLE` is always Delta-backed.
+_CREATE_COLDEFS = re.compile(
+    r"\s*create\s+(?:or\s+replace\s+)?table\s+(?:if\s+not\s+exists\s+)?"
+    r"(?P<rel>.+?)\s*\((?P<defs>.+)\)\s*;?\s*",
     re.I | re.S,
 )
 _INSERT_SELECT = re.compile(
-    r"\s*insert\s+into\s+(?P<rel>.+?)\s+(?P<body>select\b.*)", re.I | re.S
+    r"\s*insert\s+into\s+(?P<rel>.+?)\s*(?:\((?P<cols>[^)]*)\))?\s+(?P<body>select\b.*)",
+    re.I | re.S,
 )
 _INSERT_VALUES = re.compile(
     r"\s*insert\s+into\s+(?P<rel>.+?)\s*(?:\((?P<cols>[^)]*)\))?\s*values\s+(?P<body>\(.+)",
@@ -83,6 +117,67 @@ _ALTER_ADD = re.compile(
 _DROP = re.compile(
     r"\s*drop\s+table\s+(?:if\s+exists\s+)?(?P<rel>[^\s;]+)\s*;?\s*", re.I | re.S
 )
+# `create temp/temporary table …` is DuckDB-local scratch by design and must NEVER be captured —
+# checked first in try_handle so it always passes through to native DuckDB (the invariant: only
+# CREATE TEMP TABLE is native; every other CREATE TABLE is Delta-backed).
+_CREATE_TEMP_RE = re.compile(r"\s*create\s+(?:or\s+replace\s+)?(?:temp|temporary)\b", re.I)
+# CTE/whitespace handling: a leading `with …` block followed by a top-level INSERT/UPDATE/DELETE.
+# leading `\b` is load-bearing: _find_top_level tries this at every depth-0 index, so without it the
+# verb would match inside an identifier (e.g. `update` within `last_update`).
+_LEADING_WITH = re.compile(r"\s*with\b", re.I)
+_DRIVING_DML = re.compile(r"\b(?:insert\s+into|update|delete\s+from)\b", re.I)
+
+
+def _strip_leading(query: str) -> str:
+    """Drop leading whitespace and ``--`` / ``/* */`` comments so the first keyword is visible."""
+    s = query
+    while True:
+        t = s.lstrip()
+        if t.startswith("--"):
+            nl = t.find("\n")
+            s = "" if nl == -1 else t[nl + 1:]
+        elif t.startswith("/*"):
+            end = t.find("*/")
+            s = "" if end == -1 else t[end + 2:]
+        else:
+            return t
+
+
+def _find_top_level(s: str, pattern) -> int:
+    """Index of the first ``pattern`` match at paren-depth 0 and outside quotes, else -1.
+
+    Lets us tell a top-level clause (the ``FROM`` of ``UPDATE … FROM``, the verb after a leading
+    ``WITH``) from the same keyword nested in a subquery, without a full SQL parser."""
+    depth, quote, i, n = 0, None, 0, len(s)
+    while i < n:
+        ch = s[i]
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif depth == 0 and pattern.match(s, i):
+            return i
+        i += 1
+    return -1
+
+
+def _split_leading_with(sql: str) -> Tuple[str, str]:
+    """``(with_clause, remainder)`` for ``WITH … <INSERT/UPDATE/DELETE> …``; ``('', sql)`` otherwise.
+
+    So ``WITH c AS (…) INSERT INTO t SELECT … FROM c`` reaches the matchers (which anchor on the
+    verb) and the CTE is preserved when the body is evaluated. A leading ``WITH`` that drives a
+    plain ``SELECT`` (a read) is left untouched."""
+    if not _LEADING_WITH.match(sql):
+        return "", sql
+    idx = _find_top_level(sql, _DRIVING_DML)
+    if idx <= 0:
+        return "", sql
+    return sql[:idx].rstrip(), sql[idx:]
 
 
 def _fullmatch(pattern, sql):
@@ -127,6 +222,7 @@ class _DeltaDML:
         self.root_path = root_path.rstrip("/")
         self.so = storage_options
         self.default_schema = default_schema
+        self._with_clause = ""  # a leading `WITH …` preceding an INSERT, prepended to the body
 
     def _loc(self, schema: str, identifier: str) -> str:
         return f"{self.root_path}/{schema}/{identifier}"
@@ -152,9 +248,15 @@ class _DeltaDML:
         )
 
     def try_handle(self, sql: str) -> bool:
+        # CREATE TEMP/TEMPORARY TABLE is native DuckDB scratch by design — never capture it.
+        if _CREATE_TEMP_RE.match(sql):
+            return False
         m = _fullmatch(_CREATE_AS, sql)
         if m and "__duckrun" not in m.group("rel"):
             return self._create_as(m)
+        m = _fullmatch(_CREATE_COLDEFS, sql)
+        if m and "__duckrun" not in m.group("rel"):
+            return self._create_coldefs(m)
         m = _fullmatch(_INSERT_SELECT, sql)
         if m:
             return self._mutate(m, self._insert_select)
@@ -175,16 +277,44 @@ class _DeltaDML:
             return self._drop(m)
         return False
 
-    # -- create table <rel> as <select>: always materialize as a duckrun Delta table -----------
+    # -- create table <rel> as <query>: always materialize as a duckrun Delta table ------------
     def _create_as(self, m) -> bool:
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
+        # `if not exists` over a live (non-tombstone) table is a no-op — just (re)surface the view.
+        if m.group("ine") and self._exists(loc) and not is_dropped(self.cursor, loc, self.so):
+            self._refresh_view(rel, schema, loc)
+            return True
         data = self.cursor.sql(m.group("body"))
         # overwrite_schema so this replaces a prior table (or a drop-tombstone) wholesale — a live
         # table is recreated with the real schema, clearing any tombstone marker.
         engine.write_delta(loc, data, "overwrite", overwrite_schema=True, storage_options=self.so)
+        self._refresh_view(rel, schema, loc)
+        return True
+
+    # -- create table <rel> (<col defs>): an EMPTY Delta table (connection API only) -----------
+    def _create_coldefs(self, m) -> bool:
+        # Only the connection API (which carries a current database) makes a bare `CREATE TABLE
+        # (col defs)` a Delta table — so `CREATE TABLE` is always Delta-backed there. The dbt/cursor
+        # path passes default_schema=None: the seed loader emits this exact form and RELIES on it
+        # landing as a native DuckDB table, so we pass through untouched.
+        if self.default_schema is None:
+            return False
+        rel = m.group("rel").strip()
+        schema, identifier, loc = self._resolve(rel)
+        if not loc:
+            return False
+        # Let DuckDB parse the column defs (types, constraints, nested parens) by building the table
+        # as a TEMP, then take a 0-row typed relation from it and write that as an empty Delta table.
+        tmp = f"__duckrun_empty_{abs(hash((schema, identifier))) & 0xFFFFFFFF}"
+        self.cursor.execute(f'create or replace temp table "{tmp}" ({m.group("defs")})')
+        try:
+            empty = self.cursor.sql(f'select * from "{tmp}" limit 0')
+            engine.write_delta(loc, empty, "overwrite", overwrite_schema=True, storage_options=self.so)
+        finally:
+            self.cursor.execute(f'drop table if exists "{tmp}"')
         self._refresh_view(rel, schema, loc)
         return True
 
@@ -194,6 +324,8 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc or not self._exists(loc):
             return False  # native relation (e.g. the test's `fact`/`seed`) -> let DuckDB handle it
+        if self._with_clause and op != self._insert_select:
+            return False  # `WITH … UPDATE/DELETE` can't be expressed through a delta_rs predicate
         op(m, rel, schema, loc)
         self._refresh_view(rel, schema, loc)
         return True
@@ -213,34 +345,48 @@ class _DeltaDML:
         )
 
     def _insert_select(self, m, rel, schema, loc) -> None:
-        data = self.cursor.sql(m.group("body"))
-        engine.write_delta(loc, data, "append", storage_options=self.so)
+        body = m.group("body")
+        if self._with_clause:  # `WITH … INSERT INTO t SELECT …`: re-attach the CTE to the body
+            body = f"{self._with_clause} {body}"
+        cols = m.group("cols")
+        if cols:  # `insert into t (a, b) select …` → project the query onto the named columns
+            self._append_projected(loc, self._provided(cols), f"({body})")
+        else:  # column count/order already matches the target → append as-is
+            engine.write_delta(loc, self.cursor.sql(body), "append", storage_options=self.so)
 
     def _insert_values(self, m, rel, schema, loc) -> None:
-        # `insert into <rel> [(<cols>)] values (...)`: evaluate the VALUES tuples through DuckDB and
-        # project them onto the FULL target Delta schema (so append schemas match) — supplied columns
-        # come from the literals, any unsupplied target column is filled with a typed NULL.
+        # `insert into <rel> [(<cols>)] values (...)`: the literals supply every target column when
+        # no list is given, in order; otherwise the named columns.
+        cols = m.group("cols")
+        provided = self._provided(cols) if cols else None
+        self._append_projected(loc, provided, f"(values {m.group('body')})")
+
+    @staticmethod
+    def _provided(cols: str) -> List[str]:
+        return [c.strip().strip('"') for c in cols.split(",")]
+
+    def _append_projected(self, loc, provided, derived: str) -> None:
+        """Append a ``derived`` table (a ``(values …)`` tuple list or a ``(select …)`` subquery) to
+        the Delta table at ``loc``, projecting its columns onto the FULL target schema: supplied
+        columns come from ``derived`` (positional when ``provided`` is None), any unsupplied target
+        column is a typed NULL, and every projected column is cast to the target column's type so
+        the appended Arrow schema matches the table exactly (what a plain SQL INSERT does, and it
+        stops a literal wider than the column from forcing delta_rs to add a new writer feature on
+        append)."""
         loc_sql = loc.replace("'", "''")
         template = self.cursor.sql(f"select * from delta_scan('{loc_sql}') limit 0")
         target_cols = list(template.columns)
         target_types = [str(t) for t in template.types]
         by_lower = {c.lower(): c for c in target_cols}
 
-        cols = m.group("cols")
-        if cols:  # explicit column list → canonicalize to the target's casing
-            provided = [by_lower.get(c.strip().strip('"').lower(), c.strip().strip('"'))
-                        for c in cols.split(",")]
-        else:  # positional → the literals supply every target column, in order
+        if provided is None:  # positional → every target column, in order
             provided = target_cols
-        provided_set = {c for c in provided}
+        else:  # explicit column list → canonicalize to the target's casing
+            provided = [by_lower.get(c.lower(), c) for c in provided]
+        provided_set = set(provided)
 
         quoted = ", ".join('"' + c + '"' for c in provided)
-        inner = f"(values {m.group('body')}) v({quoted})"
-        # Cast every projected column to the TARGET column's type — both supplied values and the
-        # typed NULLs — so the appended Arrow schema matches the table exactly. This is also what a
-        # plain SQL INSERT does (a literal is coerced to the column type), and it stops a literal
-        # whose inferred type is wider than the column (e.g. a ::timestamp into a DATE column) from
-        # forcing delta_rs to add a new writer feature on append (TimestampWithoutTimezone).
+        inner = f"{derived} v({quoted})"
         exprs = [
             f'cast(v."{col}" as {typ}) as "{col}"' if col in provided_set
             else f'cast(null as {typ}) as "{col}"'
@@ -290,8 +436,12 @@ def handle(cursor, root_path, storage_options, sql: str, default_schema=None) ->
     """
     if not root_path:
         return False
+    sql = _strip_leading(sql)  # so leading comments/whitespace don't hide the verb
+    with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
     # Cheap pre-filter: only the candidate DML verbs.
-    head = sql.lstrip()[:7].lower()
+    head = body[:7].lower()
     if not head.startswith(("delete", "update", "insert", "create", "alter", "drop")):
         return False
-    return _DeltaDML(cursor, root_path, storage_options, default_schema).try_handle(sql)
+    dml = _DeltaDML(cursor, root_path, storage_options, default_schema)
+    dml._with_clause = with_clause
+    return dml.try_handle(body)

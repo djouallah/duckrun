@@ -27,20 +27,63 @@ _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
 _CREATE_TEMP_RE = re.compile(r"^create\s+(or\s+replace\s+)?(temp|temporary)\b", re.IGNORECASE)
 
+# DML forms that genuinely can't be expressed through delta_rs (delta_dml.handle never applies them):
+# rejected up front with a form-specific pointer rather than letting DuckDB raise a cryptic error on
+# the read-only delta_scan view (or, for UPDATE … FROM, silently mangling the SET clause).
+# leading `\b`: _find_top_level probes every depth-0 index (see delta_dml._find_top_level).
+_TOP_FROM = re.compile(r"\bfrom\b", re.IGNORECASE)
+_TOP_USING = re.compile(r"\busing\b", re.IGNORECASE)
+_strip_leading = delta_dml._strip_leading  # shared comment/whitespace stripper
 
-def _strip_leading(query: str) -> str:
-    """Drop leading whitespace and ``--`` / ``/* */`` comments so the first keyword is visible."""
-    s = query
-    while True:
-        t = s.lstrip()
-        if t.startswith("--"):
-            nl = t.find("\n")
-            s = "" if nl == -1 else t[nl + 1:]
-        elif t.startswith("/*"):
-            end = t.find("*/")
-            s = "" if end == -1 else t[end + 2:]
-        else:
-            return t
+_MERGE_MSG = (
+    "conn.sql() can't run a SQL MERGE via delta_rs. Use the Spark write API: "
+    "df.write.saveAsTable(...) to create/append, or "
+    "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
+)
+_UPDATE_FROM_MSG = (
+    "conn.sql() can't run UPDATE … FROM via delta_rs. Rewrite the SET values as correlated "
+    "subqueries, or use conn.delta_table(name).update(...)/.merge(...)."
+)
+_DELETE_USING_MSG = (
+    "conn.sql() can't run DELETE … USING via delta_rs. Rewrite the predicate as a correlated "
+    "subquery (DELETE … WHERE … IN (SELECT …)), or use conn.delta_table(name).delete(...)/.merge(...)."
+)
+_MULTI_MSG = (
+    "conn.sql() runs one statement at a time — split the batch into separate conn.sql() calls."
+)
+
+
+def _unsupported_dml(query: str) -> Optional[str]:
+    """An error message if ``query`` is a DML form duckrun can't route to delta_rs, else None."""
+    s = _strip_leading(query)
+    low = s.lower()
+    if low.startswith("merge"):
+        return _MERGE_MSG
+    if low.startswith("update") and delta_dml._find_top_level(s, _TOP_FROM) != -1:
+        return _UPDATE_FROM_MSG
+    if low.startswith("delete") and delta_dml._find_top_level(s, _TOP_USING) != -1:
+        return _DELETE_USING_MSG
+    if re.match(r"(insert|update|delete|merge|create|alter|drop)\b", low) and _is_multi_statement(s):
+        return _MULTI_MSG
+    return None
+
+
+def _is_multi_statement(s: str) -> bool:
+    """True if ``s`` holds more than one statement (a top-level ``;`` with anything after it)."""
+    depth, quote = 0, None
+    for i, ch in enumerate(s):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+        elif ch == ";" and depth == 0 and s[i + 1:].strip():
+            return True
+    return False
 
 
 def _is_delta_write(query: str) -> bool:
@@ -224,13 +267,16 @@ class DuckSession:
         ``conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()``.
         ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
         """
+        unsupported = _unsupported_dml(query)
+        if unsupported:
+            raise ValueError(unsupported)
         if delta_dml.handle(self.con, self.root_path, self.storage_options, query,
                             default_schema=self._current_database):
             self.refresh(quiet=True)
             return DataFrame(self.con.sql("SELECT 'ok' AS status"), self)
         if _is_delta_write(query):
             raise ValueError(
-                "conn.sql() can't run a SQL MERGE via delta_rs. "
+                "conn.sql() can't write a Delta table from raw SQL here. "
                 "Use the Spark write API: df.write.saveAsTable(...) to create/append, or "
                 "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
             )
