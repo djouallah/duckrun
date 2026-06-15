@@ -3,7 +3,7 @@ Render a JUnit XML report (from `pytest --junitxml`) as a Markdown "card" for th
 summary: an at-a-glance totals box, a per-suite pass-rate table, and a collapsible list of
 everything that did not pass.
 
-Used by .github/workflows/conformance.yml, and handy locally:
+Used by the `conformance` job in .github/workflows/cores.yml, and handy locally:
     python tests/tools/conformance_summary.py tests/conformance/_report.xml
 """
 import sys

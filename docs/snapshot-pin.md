@@ -14,7 +14,7 @@ Together this is Spark single-snapshot MERGE semantics: the read and the write a
 of the table. Lakehouses don't guarantee a single writer (a job double-fires, two pipelines touch
 the same table), so this matters in practice.
 
-The [`snapshot-pin`](../.github/workflows/snapshot-pin.yml) workflow proves it through a **real
+The `snapshot-pin` job in [`cores.yml`](../.github/workflows/cores.yml) proves it through a **real
 `dbt run`**: it runs the same concurrent-writer race twice against an incremental MERGE model —
 once *without* the pin (the old behaviour: read/commit against HEAD) and once *with* it — and walks
 the table's Delta versions so you can see, version by version, where the unpinned path silently

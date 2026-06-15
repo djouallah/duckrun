@@ -1,0 +1,172 @@
+name: local_stress_tests
+
+# The heavy, LOCAL-filesystem stress runs, collected as one workflow. Both take ~10 min and the
+# whole runner's RAM, so they NEVER run on push/PR: they are RELEASE GATES (workflow_call from
+# pypi.yml — a tag publishes only if they pass) and can be run by hand (workflow_dispatch) to find
+# the ceiling. Each is its own job (own runner + install), and each serializes via a static group.
+#
+# Jobs:
+#   • merge-spill   — generate a large TPCH lineitem (gate SF=10 ≈ 60M rows) and merge several
+#                     incremental batches back into it (mixed / insert-only / update-only /
+#                     idempotent), plus append / safeappend / overwrite for comparison, on the
+#                     runner's real RAM with duckrun's shipping defaults. Pinned deltalake 1.5.0
+#                     (1.6.0's merge is broken at scale). Renders the MERGE scorecard into docs and
+#                     commits to main on the release path.
+#   • coffee-stress — the connection API (duckrun.connect) at scale (gate 5M rows): ingest dims,
+#                     generate the fact, partitioned Delta write, mart, append, merge, insert-only.
+#                     Writes a data-engineer-readable report (rows / wall clock / peak memory) to
+#                     the run summary.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      sf:
+        description: "merge-spill: TPCH scale factor for lineitem (gate uses 10 ≈ 60M rows; SF=20 OOMs the merge)"
+        required: false
+        default: "10"
+      rows:
+        description: "coffee-stress: fact rows to generate (gate uses 5,000,000)"
+        required: false
+        default: "20000000"
+
+# Needed so the release run can commit the rendered MERGE scorecard back to README on main.
+permissions:
+  contents: write
+
+jobs:
+  merge-spill:
+    runs-on: ubuntu-latest
+    # Serialize: never run two merge-spill jobs at once (each needs the whole runner's RAM and the big
+    # disk). Static group so concurrent release tags queue rather than race.
+    concurrency:
+      group: merge-spill
+      cancel-in-progress: false
+    env:
+      SF: "${{ inputs.sf || '10' }}"   # release gate uses 10; a manual dispatch can pick another
+      DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + tpchgen-cli
+        run: |
+          pip install -e ".[test]"
+          pip install tpchgen-cli
+
+      - name: Show RAM / disk / deltalake version (must be 1.5.0)
+        run: |
+          free -h
+          df -h /mnt /
+          DLV=$(python -c "import deltalake; print(deltalake.__version__)")
+          echo "deltalake $DLV"
+          python -c "import deltalake,sys; sys.exit(0 if deltalake.__version__.startswith('1.5.') else 1)"
+          echo "DLV=$DLV" >> "$GITHUB_ENV"
+
+      - name: Prepare big disk dir
+        run: sudo mkdir -p "$DIR" && sudo chown "$(id -u):$(id -g)" "$DIR"
+
+      - name: Generate fact + run merge scenarios
+        # The bench writes the detailed, data-engineer-readable report straight to
+        # $GITHUB_STEP_SUMMARY on completion (pass or assertion-fail). We only add a fallback
+        # line here for the case where it dies before writing — i.e. OOM-killed (rc 137/139).
+        run: |
+          set -o pipefail
+          python tests/tools/merge_tpch_bench.py --dir "$DIR" --sf "$SF" ; rc=$?
+          if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
+            {
+              echo "## 🔀 Incremental MERGE test — duckrun on Delta Lake"
+              echo
+              echo "Mixed / insert-only / update-only merges into a SF=${SF} lineitem table on the runner's real RAM."
+              echo
+              echo "**Result: 💀 OOM-killed (rc=$rc)** — duckrun's defaults did not keep the merge under the runner's RAM."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
+
+      # Render the scorecard the bench just wrote (docs/merge_card.md) into docs/merge-benchmark.md
+      # and commit it to main, so the MERGE card always reflects the latest release. The release runs on a tag
+      # ref, so check out main explicitly and push there. [skip ci] avoids re-triggering. Never fails
+      # the release on a commit hiccup. No-op if the bench died before writing the card.
+      - name: Render scorecard into docs and commit to main
+        # Only the release path (workflow_call -> caller's event is the tag push) commits the
+        # canonical card. A manual workflow_dispatch (possibly a smaller SF) shows the card in its
+        # own run summary but must NOT overwrite the release card in the docs.
+        if: always() && hashFiles('docs/merge_card.md') != '' && github.event_name != 'workflow_dispatch'
+        continue-on-error: true
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python tests/tools/inject_readme.py docs/merge-benchmark.md docs/merge_card.md MERGE
+          if git diff --quiet -- docs/merge-benchmark.md; then
+            echo "docs MERGE card unchanged."
+            exit 0
+          fi
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/merge-benchmark.md
+          git commit -m "docs: update MERGE scorecard [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
+
+  coffee-stress:
+    runs-on: ubuntu-latest
+    # Serialize: one coffee-stress at a time (it can take the whole runner's RAM at large N). Static
+    # group so a tag-time gate call queues behind any in-flight dispatch rather than racing it.
+    concurrency:
+      group: coffee-stress
+      cancel-in-progress: false
+    env:
+      # release gate (workflow_call, no inputs) -> 5M; a manual dispatch picks its own (default 20M).
+      COFFEE_LOCAL_ROWS: "${{ inputs.rows || '5000000' }}"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
+        run: pip install -e ".[test]"
+
+      - name: Runner specs (the box we're stressing)
+        run: |
+          echo "## Runner specs" >> "$GITHUB_STEP_SUMMARY"
+          echo "- rows requested: **$COFFEE_LOCAL_ROWS**" >> "$GITHUB_STEP_SUMMARY"
+          echo "- CPUs: $(nproc)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- memory: $(free -h | awk '/Mem:/{print $2}')" >> "$GITHUB_STEP_SUMMARY"
+          echo "- free disk: $(df -h / | awk 'NR==2{print $4}')" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run the local coffee-shop scenario at N rows (timed, with peak memory)
+        run: |
+          # Don't let a failed run (e.g. OOM at huge N — the experiment) abort before we
+          # write the summary. PIPESTATUS[0] is pytest/time's exit, not tee's.
+          set +e
+          # GNU time gives Maximum resident set size; tee keeps the log for the summary.
+          # -s: stream the scenario's stage-by-stage narration into the log (without it pytest
+          # captures the prints and the run shows nothing).
+          /usr/bin/time -v python -m pytest \
+            tests/connection_api/test_coffee.py::test_coffee_local \
+            -q -s -p no:cacheprovider 2>&1 | tee stress.log
+          rc=${PIPESTATUS[0]}
+          {
+            echo "## Result"
+            peak_kb=$(grep -i "Maximum resident set size" stress.log | grep -oE '[0-9]+' | tail -1)
+            wall=$(grep -iE "Elapsed \(wall clock\)" stress.log | sed 's/.*: //')
+            echo "- exit code: $rc"
+            echo "- wall clock: ${wall:-n/a}"
+            [ -n "$peak_kb" ] && echo "- peak memory: $(awk "BEGIN{printf \"%.2f GiB\", $peak_kb/1048576}")"
+            echo ""
+            echo "### Scenario log (stage by stage)"
+            echo '```text'
+            # The narrated stages between the scenario banners; fall back to the tail if the run
+            # crashed before printing them.
+            narr=$(sed -n '/=== coffee-shop scenario/,/=== scenario complete ===/p' stress.log)
+            if [ -n "$narr" ]; then echo "$narr"; else tail -n 20 stress.log; fi
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $rc

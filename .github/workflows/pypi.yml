@@ -1,0 +1,57 @@
+name: pypi
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Default token scope for jobs that don't override it below.
+permissions:
+  contents: read
+
+# One release at a time.
+concurrency:
+  group: pypi
+  cancel-in-progress: false
+
+# A release must pass cores + local_stress_tests before publishing. Each is a reusable workflow run
+# as a gate job here. Both render scorecards into README and commit them to main (cores: conformance
+# + connection-API + snapshot-pin cards; local_stress_tests: the MERGE card), so both call jobs grant
+# contents:write (a reusable workflow can only use permissions the caller grants). cores' card jobs
+# and local_stress_tests both use static concurrency groups, so a tag-time call queues behind any
+# in-flight push-to-main run rather than racing it.
+# integration_tests_onelake is deliberately NOT a release gate: it depends on live OneLake/AEMO data
+# and so is prone to transient infra failures that would needlessly block a publish. It still runs on
+# its own.
+jobs:
+  cores:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/cores.yml
+
+  local-stress:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/local_stress_tests.yml
+
+  publish:
+    needs: [cores, local-stress]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for trusted publishing
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build tools
+        run: pip install build
+
+      - name: Build package
+        run: python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

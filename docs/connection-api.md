@@ -58,7 +58,7 @@ Leading `--` / `/* … */` comments are fine. The exact behaviour is pinned, sta
 in [`tests/connection_api/test_sql_dml.py`](../tests/connection_api/test_sql_dml.py).
 
 The card below — every public method with a ✅ — is regenerated on every push by
-[`connection-card.yml`](../.github/workflows/connection-card.yml) from
+the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from
 [`tests/connection_api/test_method_matrix.py`](../tests/connection_api/test_method_matrix.py).
 
 <!-- CONNECTION_API:START -->

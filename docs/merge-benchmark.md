@@ -1,6 +1,6 @@
 # Incremental MERGE benchmark
 
-The [`merge-spill`](../.github/workflows/merge.yml) workflow builds a large TPCH `lineitem`
+The `merge-spill` job in [`local_stress_tests.yml`](../.github/workflows/local_stress_tests.yml) builds a large TPCH `lineitem`
 fact table (the release gate runs scale factor **20**, ~120M rows) and runs four merge
 shapes against it — mixed upsert, insert-only, update-only, and an idempotent re-merge —
 plus a plain `append`, `safeappend`, and `overwrite` of the same batch for comparison, on a

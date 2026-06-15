@@ -1,0 +1,348 @@
+name: cores
+
+# Every OFFLINE test surface, collected as one workflow so the Actions tab shows a single
+# "cores" run instead of a wall of separate CI files. Each test is still its own job (its own
+# runner + pip install — parallel and isolated); nothing is merged into a single mega-job and
+# no test is dropped or weakened. Local-filesystem Delta only: no secrets, no network.
+#
+# Jobs:
+#   • offline                 — the dbt adapter internals + the duckrun.connect() API end to end
+#                               (write modes, reader, catalog, merge/delete/update), the conn.sql
+#                               raw-DML matrix, engine-level snapshot-pin correctness, and the
+#                               single-snapshot MERGE through a real in-process dbt run.
+#   • conformance             — the official dbt adapter conformance suite, gated on REGRESSIONS
+#                               only (baseline diff). Refreshes the README card on push to main.
+#   • connection-card         — the duckrun.connect() per-method ✅/❌ scorecard; every method
+#                               must pass. Refreshes the README card on push to main.
+#   • concurrency-correctness — proves MERGE snapshot safety + safeappend CAS + pre-snapshot window.
+#   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
+#                               dbt run (also a guard). Refreshes docs on push to main.
+#   • coffee-smoke            — fast connect/read/write/merge smoke at a small row count.
+#
+# Runs on EVERY push / PR, and as a release gate (workflow_call from pypi.yml). Out of scope here
+# (deliberately): the live-OneLake projects (integration_tests_onelake.yml) and the heavy local
+# stress runs (local_stress_tests.yml) — those are integration/stress, not the per-change gate.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  # Callable as a release gate from pypi.yml.
+  workflow_call:
+
+# The card jobs (conformance, connection-card, snapshot-pin) commit their rendered scorecards
+# back to main, so the workflow needs write. No workflow-level concurrency: the card jobs use
+# their own STATIC, no-cancel groups (below) so their main commits never race or get cancelled.
+permissions:
+  contents: write
+
+jobs:
+  offline:
+    # duckrun's core public surfaces, tested offline on a local-filesystem Delta warehouse.
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cores-offline-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (dbt-duckdb + duckdb + deltalake + pytest + pyarrow)
+        run: pip install -e ".[test]"
+
+      - name: Adapter unit tests + connection-API offline tests
+        run: |
+          python -m pytest \
+            tests/adapter \
+            tests/connection_api/test_local_filesystem.py \
+            tests/connection_api/test_sql_dml.py \
+            tests/correctness/test_snapshot_pinning.py \
+            -q -p no:cacheprovider
+
+      - name: Snapshot-pin dbt integration test (single-snapshot MERGE through a real dbt run)
+        # Drives `dbt run` in-process against a local-fs warehouse and simulates a concurrent writer
+        # to prove the read/write snapshot pin: a commit landing mid-run makes the run fail loudly
+        # (no silent lost update), while the same commit landing before the run just succeeds.
+        # Offline and deterministic, so it belongs on the per-change gate next to the unit tests.
+        run: |
+          python -m pytest \
+            tests/integration_tests/snapshot_pin/test_snapshot_pin.py \
+            -q -p no:cacheprovider
+
+  conformance:
+    # The official dbt adapter conformance suite (dbt-labs/dbt-adapters). REQUIRED check, gated on
+    # REGRESSIONS only: duckrun is Delta-only, so some standard tests are expected not to pass — what
+    # must not happen is a test that passes on main starting to fail. Baseline lives in
+    # tests/conformance/passing_baseline.txt and is auto-maintained here.
+    runs-on: ubuntu-latest
+    # Serialize (STATIC group, no cancel): the README card + baseline commits on main can't tolerate
+    # two at once (the second push would be a non-fast-forward), and a tag's release-gate call must
+    # wait behind any in-flight push-to-main run rather than race it.
+    concurrency:
+      group: conformance
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need history to diff what changed (docs-only self-skip) and to commit back to main.
+          fetch-depth: 0
+
+      # The conformance result is a property of the code, not the docs. If a change touches nothing
+      # but Markdown, skip the (multi-minute) install + suite and report green — the required check
+      # is still satisfied and a docs change can't regress conformance. Any non-.md change runs it.
+      - name: Detect whether code changed (vs docs-only)
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change — skipping the conformance suite."
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.changes.outputs.code == 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + conformance deps (dbt-tests-adapter)
+        if: steps.changes.outputs.code == 'true'
+        run: pip install -e ".[conformance]"
+
+      - name: Run official dbt adapter conformance suite
+        if: steps.changes.outputs.code == 'true'
+        # Per-test pass/fail is informational (duckrun can't pass every standard test); the gate is
+        # the baseline-diff step below. continue-on-error so a known failure doesn't stop the job
+        # before we render the card and run the regression check.
+        continue-on-error: true
+        run: |
+          pytest tests/conformance --tb=no -rA -p no:cacheprovider \
+            --continue-on-collection-errors --junitxml=conformance.xml
+
+      - name: Render conformance card
+        if: always() && steps.changes.outputs.code == 'true'
+        run: python tests/tools/conformance_summary.py conformance.xml > docs/conformance_card.md
+
+      - name: Publish pass/fail summary
+        if: always() && steps.changes.outputs.code == 'true'
+        run: cat docs/conformance_card.md >> "$GITHUB_STEP_SUMMARY"
+
+      # THE GATE: fail iff a test that passes on main (tests/conformance/passing_baseline.txt) is no
+      # longer passing here. Known failures are tolerated; new passes never block. No-op (green)
+      # until the baseline file is committed. Runs on every code change — no continue-on-error.
+      - name: Gate on conformance regressions (baseline diff)
+        if: steps.changes.outputs.code == 'true'
+        run: python tests/tools/conformance_baseline.py check tests/conformance/passing_baseline.txt conformance.xml
+
+      # On push to main: this run IS the latest state of main, so refresh the baseline + render the
+      # card into the docs and commit both. That's what keeps the card always reflecting main.
+      # [skip ci] avoids re-triggering. Never fails the push on a commit hiccup.
+      # IMPORTANT: no `always()` — this must run ONLY when the gate above passed. Otherwise a
+      # regression on main would auto-lower the baseline (drop the now-failing test) and commit it,
+      # silently absorbing the very regression the gate just caught.
+      - name: Refresh baseline + render card into docs and commit (main only)
+        if: steps.changes.outputs.code == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          python tests/tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml
+          python tests/tools/inject_readme.py docs/conformance.md docs/conformance_card.md CONFORMANCE
+          if git diff --quiet -- docs/conformance.md tests/conformance/passing_baseline.txt; then
+            echo "Conformance card + baseline unchanged."
+            exit 0
+          fi
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/conformance.md tests/conformance/passing_baseline.txt
+          git commit -m "docs: refresh conformance card + baseline [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
+
+  connection-card:
+    # The duckrun.connect() per-method scorecard. Unlike conformance (which tolerates known failures
+    # via a baseline), these are duckrun's own methods: they must ALL pass, so the job fails if any
+    # method does. Refreshes the README card on push to main.
+    runs-on: ubuntu-latest
+    # Serialize (static group, no cancel): the main run commits the README card, which two concurrent
+    # runs can't do without a non-fast-forward.
+    concurrency:
+      group: connection-card
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need history to commit the card back to main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps
+        run: pip install -e ".[test]"
+
+      - name: Run the connection-API method matrix
+        # Render the card even if a method fails (the gate is a later step), so the summary always
+        # shows exactly which method broke.
+        continue-on-error: true
+        run: |
+          python -m pytest tests/connection_api/test_method_matrix.py \
+            -q -p no:cacheprovider --junitxml=connection.xml
+
+      - name: Render method scorecard
+        if: always()
+        run: python tests/tools/connection_summary.py connection.xml > docs/connection_card.md
+
+      - name: Publish scorecard to job summary
+        if: always()
+        run: cat docs/connection_card.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Inject card into docs and commit (main only)
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          python tests/tools/inject_readme.py docs/connection-api.md docs/connection_card.md CONNECTION_API
+          if git diff --quiet -- docs/connection-api.md; then
+            echo "Connection card unchanged."
+            exit 0
+          fi
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/connection-api.md
+          git commit -m "docs: refresh connection API method scorecard [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
+
+      - name: Gate — every connection-API method must pass
+        run: python tests/tools/connection_summary.py connection.xml --check
+
+  concurrency-correctness:
+    name: concurrency correctness
+    # Proves duckrun's concurrency-correctness: MERGE snapshot safety, safeappend CAS, and the
+    # pre-snapshot window. Exits non-zero if any invariant is ever violated, so a regression blocks
+    # the PR. REQUIRED check — runs on every push/PR (no paths filter; a filtered-out required check
+    # never reports and stays stuck "Expected"). The expensive steps self-skip on docs-only changes.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the previous commit(s) so we can diff what changed (push uses event.before).
+          fetch-depth: 0
+
+      # Concurrency correctness is a property of the code, not the docs. If a change touches
+      # nothing but Markdown, skip the (multi-minute) install + repro and just report green —
+      # the required check is still satisfied. Any non-.md change runs the full proof.
+      - name: Detect whether code changed (vs docs-only)
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          # First push to a new branch (or unknown base) -> run the full proof to be safe.
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change — skipping the concurrency-correctness proof."
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.changes.outputs.code == 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (duckdb + deltalake + pyarrow)
+        if: steps.changes.outputs.code == 'true'
+        run: pip install -e ".[test]"
+
+      - name: Prove concurrency correctness (merge snapshot safety + safeappend)
+        if: steps.changes.outputs.code == 'true'
+        # Exit 0 = both invariants hold (expected). Exit 1 = a case behaved unexpectedly.
+        run: python tests/correctness/concurrency_correctness.py
+
+  snapshot-pin:
+    # Renders the "DuckDB snapshot pin — version by version" scorecard from a real dbt run, running
+    # the same concurrent-writer race with and without the pin. Exits non-zero if the pin's guarantee
+    # regresses, so it is also a guard. Cheap and offline (~1 min). Refreshes docs on push to main.
+    runs-on: ubuntu-latest
+    concurrency:
+      group: snapshot-pin-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps
+        run: pip install -e ".[test]"
+
+      - name: Render the snapshot-pin scorecard (also writes the run summary)
+        # Exit 0 = the demonstration holds (unpinned loses the update, pinned preserves it).
+        # Exit non-zero = the pin's guarantee regressed -> the run fails.
+        run: python tests/integration_tests/snapshot_pin/snapshot_pin_card.py
+
+      - name: Inject the card into docs and commit to main
+        # Only a push to main updates the canonical card in the docs; PRs/branches just show it in
+        # their own run summary. Never fail the run on a commit hiccup. [skip ci] avoids re-trigger.
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && hashFiles('docs/snapshot_pin_card.md') != ''
+        continue-on-error: true
+        run: |
+          python tests/tools/inject_readme.py docs/snapshot-pin.md docs/snapshot_pin_card.md SNAPSHOT-PIN
+          if git diff --quiet -- docs/snapshot-pin.md; then
+            echo "docs snapshot-pin card unchanged."
+            exit 0
+          fi
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/snapshot-pin.md
+          git commit -m "docs: update snapshot-pin scorecard [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
+
+  coffee-smoke:
+    # A fast, automatic smoke of the connection-API coffee-shop scenario (duckrun.connect) on a LOCAL
+    # filesystem warehouse at a SMALL row count — the per-change guard that the end-to-end scenario
+    # still works. The dimension CSVs are vendored, so it is fully offline. The heavy local STRESS
+    # variant lives in local_stress_tests.yml; the live-OneLake variant in integration_tests_onelake.yml.
+    runs-on: ubuntu-latest
+    env:
+      COFFEE_LOCAL_ROWS: "2000"   # small + fast; the stress workflow is where you crank N
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
+        run: pip install -e ".[test]"
+
+      - name: Run the local coffee-shop scenario (small N)
+        # -s streams the scenario's stage-by-stage narration into the job log.
+        run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider

@@ -1,4 +1,4 @@
-name: integration tests
+name: integration_tests_onelake
 
 # The integration suite: ONE job per integration dbt project, plus a final publisher.
 #
@@ -9,7 +9,7 @@ name: integration tests
 #                   OneLake exercise, and a standalone `dbt test` is the abfss:// read-path gate.
 #   • merge_spill — tiny local build for the docs catalog, then the incremental-MERGE chain
 #                   (merge_tpch_bench.py) over OneLake at a SMALL scale factor. The HEAVY SF=10
-#                   (60M-row) memory-spill version stays a LOCAL release gate (merge.yml/publish.yml).
+#                   (60M-row) memory-spill version stays a LOCAL release gate (local_stress_tests.yml).
 #   • coffee      — tiny local build for the docs catalog, then the connection-API coffee scenario
 #                   (duckrun.connect) over OneLake at a SMALL N.
 #   • sde         — tiny local build for the docs catalog, then the SCD2 port driven through real
@@ -18,7 +18,7 @@ name: integration tests
 # `deploy-docs` is the final publisher: it collects the four projects' docs artifacts + the landing
 # page (docs/site/index.html) and pushes the combined dbt-docs site to GitHub Pages (main only).
 #
-# None of these is the per-change gate (that's core.yml); they hit live OneLake and so are not
+# None of these is the per-change gate (that's cores.yml); they hit live OneLake and so are not
 # release gates. The OneLake projects share one lakehouse, so each writes an isolated schema and
 # takes a per-project concurrency lock.
 on:
@@ -31,7 +31,7 @@ on:
       - 'tests/integration_tests/sde_dbt_tutorial/**'
       - 'tests/tools/merge_tpch_bench.py'
       - 'docs/site/**'
-      - '.github/workflows/integration.yml'
+      - '.github/workflows/integration_tests_onelake.yml'
   pull_request:
     paths:
       - 'tests/integration_tests/aemo/**'
@@ -40,7 +40,7 @@ on:
       - 'tests/integration_tests/sde_dbt_tutorial/**'
       - 'tests/tools/merge_tpch_bench.py'
       - 'docs/site/**'
-      - '.github/workflows/integration.yml'
+      - '.github/workflows/integration_tests_onelake.yml'
   workflow_dispatch:
 
 # The docs deploy needs Pages + OIDC; the project jobs use OIDC (id-token) for the Azure login.

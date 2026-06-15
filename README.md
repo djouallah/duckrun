@@ -322,7 +322,7 @@ None of this is required to use duckrun — `pip install duckrun` is unaffected.
 
 **Testing.** `tests/integration_tests/aemo/` is a small dbt project built against OneLake, and
 `tests/integration_tests/coffee/` is the connection-API coffee-shop scenario / stress test (CI:
-[`integration.yml`](.github/workflows/integration.yml)); `tests/conformance/`
+[`integration_tests_onelake.yml`](.github/workflows/integration_tests_onelake.yml)); `tests/conformance/`
 runs the official suite (above); `tests/correctness/` proves the concurrency guarantees. The cards
 in those docs are rendered live by CI, so they always reflect the latest `main`.
 

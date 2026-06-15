@@ -2,7 +2,7 @@
 
 `tests/conformance/` runs the official dbt adapter test suite
 ([`dbt-tests-adapter`](https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-tests-adapter))
-against duckrun ([`.github/workflows/conformance.yml`](../.github/workflows/conformance.yml)).
+against duckrun ([`.github/workflows/cores.yml`](../.github/workflows/cores.yml), `conformance` job).
 The card below is published to the job summary and regenerated on every push to `main`, so it
 reflects the latest `main` — which may be ahead of the published PyPI release.
 
