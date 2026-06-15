@@ -49,17 +49,17 @@ jobs:
 
       - name: Render method scorecard
         if: always()
-        run: python tests/tools/connection_summary.py connection.xml > connection_card.md
+        run: python tests/tools/connection_summary.py connection.xml > docs/connection_card.md
 
       - name: Publish scorecard to job summary
         if: always()
-        run: cat connection_card.md >> "$GITHUB_STEP_SUMMARY"
+        run: cat docs/connection_card.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Inject card into docs and commit (main only)
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
-          python tests/tools/inject_readme.py docs/connection-api.md connection_card.md CONNECTION_API
+          python tests/tools/inject_readme.py docs/connection-api.md docs/connection_card.md CONNECTION_API
           if git diff --quiet -- docs/connection-api.md; then
             echo "Connection card unchanged."
             exit 0

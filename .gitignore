@@ -81,6 +81,9 @@ tests/integration_tests/*/logs/
 docs/merge_card.md
 # The snapshot-pin scorecard the runner writes (injected into docs/snapshot-pin.md in CI)
 docs/snapshot_pin_card.md
+# CI-only scorecards: rendered from test XML and injected into the docs/*.md beside them
+docs/conformance_card.md
+docs/connection_card.md
 
 # dbt logs written to the repo root (e.g. running dbt with --project-dir)
 logs/
