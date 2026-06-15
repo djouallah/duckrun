@@ -8,6 +8,8 @@ name: core tests
 #                                                      (write modes, reader, catalog, merge/delete/update).
 #   • tests/connection_api/test_sql_dml.py            — the conn.sql raw-DML supported/unsupported
 #                                                      matrix (create/insert/update/delete/temp/view).
+#   • tests/correctness/test_snapshot_pinning.py      — engine-level snapshot-pin correctness (Issue
+#                                                      #1: merge OCC window, replaceWhere CAS, no-pin maintenance).
 # Runs on EVERY push / PR, and as a release gate (workflow_call from publish.yml). Catches a broken
 # connect / write / read / merge / catalog before it reaches the heavier, gated suites.
 #
@@ -46,6 +48,7 @@ jobs:
             tests/adapter \
             tests/connection_api/test_local_filesystem.py \
             tests/connection_api/test_sql_dml.py \
+            tests/correctness/test_snapshot_pinning.py \
             -q -p no:cacheprovider
 
       - name: Snapshot-pin dbt integration test (single-snapshot MERGE through a real dbt run)
