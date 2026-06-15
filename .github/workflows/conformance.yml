@@ -98,10 +98,13 @@ jobs:
         run: python tests/tools/conformance_baseline.py check tests/conformance/passing_baseline.txt conformance.xml
 
       # On push to main: this run IS the latest state of main, so refresh the baseline + render the
-      # card into README and commit both. That's what keeps the README card always reflecting main.
+      # card into the docs and commit both. That's what keeps the card always reflecting main.
       # [skip ci] avoids re-triggering. Never fails the push on a commit hiccup.
+      # IMPORTANT: no `always()` — this must run ONLY when the gate above passed. Otherwise a
+      # regression on main would auto-lower the baseline (drop the now-failing test) and commit it,
+      # silently absorbing the very regression the gate just caught.
       - name: Refresh baseline + render card into docs and commit (main only)
-        if: always() && steps.changes.outputs.code == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: steps.changes.outputs.code == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
           python tests/tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml

@@ -84,7 +84,7 @@ def is_dropped(con, location: str, storage_options=None) -> bool:
 # `select …`, a `with … select …` CTE, or a parenthesised `(select …)`); it's handed to DuckDB
 # verbatim so anything DuckDB accepts after `as` works.
 _CREATE_AS = re.compile(
-    r"\s*create\s+(?:or\s+replace\s+)?table\s+(?P<ine>if\s+not\s+exists\s+)?"
+    r"\s*create\s+(?P<orrep>or\s+replace\s+)?table\s+(?P<ine>if\s+not\s+exists\s+)?"
     r"(?P<rel>.+?)\s+as\s+(?P<body>.+)",
     re.I | re.S,
 )
@@ -282,6 +282,16 @@ class _DeltaDML:
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
         if not loc:
+            return False
+        # dbt/cursor path (no default_schema): keep the ORIGINAL narrow interception — only a plain
+        # `create table … as select …` routes to Delta. The wider forms (`or replace`, a CTE or a
+        # parenthesised body) are a connection-API affordance; on the dbt path they must stay native
+        # so dbt keeps owning the relation. dbt-internal CTAS like store_failures' `create table … as
+        # (select …)` is a real TABLE dbt later drops/recreates — turning it into a delta_scan VIEW
+        # breaks that ("Existing object … is of type View, trying to drop type Table").
+        if self.default_schema is None and (
+            m.group("orrep") or not re.match(r"select\b", m.group("body").lstrip(), re.I)
+        ):
             return False
         # `if not exists` over a live (non-tombstone) table is a no-op — just (re)surface the view.
         if m.group("ine") and self._exists(loc) and not is_dropped(self.cursor, loc, self.so):
