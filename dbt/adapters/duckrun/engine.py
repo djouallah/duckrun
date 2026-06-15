@@ -732,6 +732,23 @@ def write_delta(
         _maintain(dt, compaction_threshold)
 
 
+def create_empty_delta(
+    path: str,
+    schema,
+    *,
+    mode: str = "error",
+    storage_options: Optional[Dict[str, str]] = None,
+) -> None:
+    """Create an EMPTY Delta table at ``path`` from an Arrow ``schema`` (no data files).
+
+    Used by the connection API's bare ``CREATE TABLE (col defs)``: it logs a ``CREATE TABLE``
+    operation rather than a ``WRITE``/``Overwrite``, which is what a create — not an overwrite —
+    should record. ``mode`` follows delta-rs: ``error`` (fail if the table exists), ``overwrite``
+    (replace an existing table or drop-tombstone), or ``ignore`` (no-op if it exists).
+    """
+    DeltaTable.create(path, schema, mode=mode, storage_options=storage_options)
+
+
 def append_if_unchanged(
     path: str,
     data,

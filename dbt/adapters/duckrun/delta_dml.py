@@ -30,8 +30,11 @@ view`` (not ``table``), so they pass through too.
 
 Supported / unsupported (what reaches delta_rs):
 
-    create [or replace] table x [if not exists] as <query>   Delta overwrite (query: select/with/(…))
-    create table x (<col defs>)                               empty Delta table (connection API only)
+    create [or replace] table x [if not exists] as <query>   Delta CTAS (query: select/with/(…)); a
+                                                              plain create errors if x is live, `or
+                                                              replace` overwrites, `if not exists` no-ops
+    create [or replace] table x [if not exists] (<col defs>)  empty Delta table (connection API only);
+                                                              logs a CREATE TABLE op, same exists rules
     create temp/temporary table …                            native DuckDB (pass through)  ── invariant:
     create view …                                            native DuckDB (pass through)  ── only TEMP
                                                                                             and VIEW are
@@ -91,7 +94,7 @@ _CREATE_AS = re.compile(
 # `create [or replace] table [if not exists] <rel> (<col defs>)` — no `as`. Connection-API only
 # (see _create_coldefs): materializes an EMPTY Delta table so `CREATE TABLE` is always Delta-backed.
 _CREATE_COLDEFS = re.compile(
-    r"\s*create\s+(?:or\s+replace\s+)?table\s+(?:if\s+not\s+exists\s+)?"
+    r"\s*create\s+(?P<orrep>or\s+replace\s+)?table\s+(?P<ine>if\s+not\s+exists\s+)?"
     r"(?P<rel>.+?)\s*\((?P<defs>.+)\)\s*;?\s*",
     re.I | re.S,
 )
@@ -293,10 +296,18 @@ class _DeltaDML:
             m.group("orrep") or not re.match(r"select\b", m.group("body").lstrip(), re.I)
         ):
             return False
+        live = self._exists(loc) and not is_dropped(self.cursor, loc, self.so)
         # `if not exists` over a live (non-tombstone) table is a no-op — just (re)surface the view.
-        if m.group("ine") and self._exists(loc) and not is_dropped(self.cursor, loc, self.so):
+        if m.group("ine") and live:
             self._refresh_view(rel, schema, loc)
             return True
+        # Connection API: a plain `create table` must NOT silently clobber a live table — that's what
+        # `or replace` is for. (The dbt/cursor path keeps overwriting: dbt owns idempotent re-runs.)
+        if self.default_schema is not None and live and not m.group("orrep"):
+            raise ValueError(
+                f"table {schema}.{identifier} already exists — "
+                f"use CREATE OR REPLACE TABLE to replace it"
+            )
         data = self.cursor.sql(m.group("body"))
         # overwrite_schema so this replaces a prior table (or a drop-tombstone) wholesale — a live
         # table is recreated with the real schema, clearing any tombstone marker.
@@ -316,15 +327,27 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
+        live = self._exists(loc) and not is_dropped(self.cursor, loc, self.so)
+        if m.group("ine") and live:                       # IF NOT EXISTS over a live table → no-op
+            self._refresh_view(rel, schema, loc)
+            return True
+        if live and not m.group("orrep"):                 # plain CREATE over a live table → error
+            raise ValueError(
+                f"table {schema}.{identifier} already exists — "
+                f"use CREATE OR REPLACE TABLE to replace it"
+            )
         # Let DuckDB parse the column defs (types, constraints, nested parens) by building the table
-        # as a TEMP, then take a 0-row typed relation from it and write that as an empty Delta table.
+        # as a TEMP, then take its Arrow schema and create an EMPTY Delta table from it. DeltaTable.create
+        # logs a CREATE TABLE operation (not a WRITE/Overwrite). A live table or a drop-tombstone already
+        # has files at ``loc``, so it must be replaced (overwrite); otherwise create-if-absent (error).
         tmp = f"__duckrun_empty_{abs(hash((schema, identifier))) & 0xFFFFFFFF}"
         self.cursor.execute(f'create or replace temp table "{tmp}" ({m.group("defs")})')
         try:
-            empty = self.cursor.sql(f'select * from "{tmp}" limit 0')
-            engine.write_delta(loc, empty, "overwrite", overwrite_schema=True, storage_options=self.so)
+            arrow_schema = self.cursor.sql(f'select * from "{tmp}" limit 0').arrow().schema
         finally:
             self.cursor.execute(f'drop table if exists "{tmp}"')
+        mode = "overwrite" if self._exists(loc) else "error"
+        engine.create_empty_delta(loc, arrow_schema, mode=mode, storage_options=self.so)
         self._refresh_view(rel, schema, loc)
         return True
 

@@ -26,6 +26,8 @@ CASES = [
     ("create_if_not_exists_noop","create table if not exists items as select 99 id, 'x' as name",             DELTA,  ("items", "select count(*) from items", 3)),
     ("create_coldefs_empty",     "create table e (id integer, name varchar)",                                 DELTA,  ("e", "select count(*) from e", 0)),
     ("create_coldefs_nested",    "create table money (id integer, amount decimal(10, 2))",                    DELTA,  ("money", "select count(*) from money", 0)),
+    ("create_as_exists_errors",  "create table items as select 1 id, 'a' as name",                            ERROR,  "already exists"),
+    ("create_coldefs_exists",    "create table items (id integer)",                                           ERROR,  "already exists"),
     ("insert_select",            "insert into items select * from (values (4,'d')) t(id, name)",               DELTA,  ("items", "select count(*) from items", 4)),
     ("insert_select_collist",    "insert into items (name, id) select 'd', 4",                                DELTA,  ("items", "select id from items where name = 'd'", 4)),
     ("insert_values",            "insert into items values (5, 'e')",                                         DELTA,  ("items", "select name from items where id = 5", "e")),
@@ -79,6 +81,15 @@ def test_sql_dml(conn, sql, outcome, detail):
     table, probe, expected = detail   # DELTA
     assert deltalake.DeltaTable.is_deltatable(conn.table_path("dbo", table))
     assert conn.sql(probe).fetchone()[0] == expected
+
+
+def test_create_coldefs_logs_create_table_op(conn):
+    # A bare CREATE TABLE must record a CREATE TABLE operation, NOT a WRITE/Overwrite — overwrite
+    # semantics belong to CREATE OR REPLACE. The first commit is the create.
+    conn.sql("create table fresh (i integer)")
+    dt = deltalake.DeltaTable(conn.table_path("dbo", "fresh"))
+    first = dt.history(1000)[-1]   # history is newest-first; the create is the oldest entry
+    assert first["operation"] == "CREATE TABLE", first["operation"]
 
 
 @pytest.mark.xfail(strict=True, reason="WITH … UPDATE can't be expressed through a delta_rs predicate")
