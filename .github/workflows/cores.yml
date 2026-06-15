@@ -58,7 +58,6 @@ jobs:
           python -m pytest \
             tests/adapter \
             tests/connection_api/test_local_filesystem.py \
-            tests/connection_api/test_sql_dml.py \
             tests/correctness/test_snapshot_pinning.py \
             -q -p no:cacheprovider
 
@@ -70,6 +69,29 @@ jobs:
         run: |
           python -m pytest \
             tests/integration_tests/snapshot_pin/test_snapshot_pin.py \
+            -q -p no:cacheprovider
+
+  sql-dml:
+    # The conn.sql raw-DML supported/unsupported matrix (create/insert/update/delete/temp/view),
+    # pinning the CREATE TABLE=Delta vs TEMP+VIEW=native invariant. Offline, local-fs Delta.
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cores-sql-dml-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (dbt-duckdb + duckdb + deltalake + pytest + pyarrow)
+        run: pip install -e ".[test]"
+
+      - name: conn.sql raw-DML support matrix
+        run: |
+          python -m pytest \
+            tests/connection_api/test_sql_dml.py \
             -q -p no:cacheprovider
 
   conformance:
