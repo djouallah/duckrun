@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.3.17.dev5"
+version = "0.3.17.dev6"
 description = "A dbt adapter that runs SQL in DuckDB and materializes to Delta Lake (delta_rs)."
 readme = "README.md"
 license = {text = "MIT"}
@@ -21,8 +21,7 @@ dependencies = [
     # fails at `from dbt.cli.main import dbtRunner`. Declared directly because we only depend on
     # dbt-core transitively, so the ceiling has to live here to bite.
     "dbt-core>=1.8,<2.0",
-    # TEMPORARY pin to a duckdb dev build — TODO: move to "==1.5.4" (or a range) once stable
-    # 1.5.4 ships (~end of month). 1.5.4.dev18 is the first build whose bundled duckdb-delta
+    # Floor at the 1.5.4 stable release. 1.5.4 is the first stable build whose bundled duckdb-delta
     # extension supports `delta_scan('...', version => N)` (duckdb-delta #312) — the version-pinned
     # read this project now relies on to make the incremental read and the write commit resolve at
     # ONE Delta snapshot (Spark single-snapshot MERGE parity; see the staging-read pin in
@@ -33,7 +32,7 @@ dependencies = [
     # disk-spill config (max_spill_size), which engine.merge_delta relies on to cap the merge's RAM
     # and avoid OOM on large upserts; the matching <1.5.1 ceiling avoids the deltalake delta-log
     # write-side regression, pinning exactly 1.5.0.
-    "duckdb==1.5.4.dev18",
+    "duckdb>=1.5.4",
     "deltalake>=1.5.0,<1.5.1",
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
     # API directly; requests is otherwise only a transitive dbt dependency.
