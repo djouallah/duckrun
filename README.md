@@ -6,9 +6,13 @@
 > not affiliated with, endorsed by, or supported by any employer or vendor. No warranty —
 > use it at your own risk.
 
-**duckrun** is a [dbt](https://www.getdbt.com/) adapter that runs your model SQL in
-**DuckDB** and writes the results to **Delta Lake** using
-[`delta_rs`](https://delta-io.github.io/delta-rs/) (the `deltalake` Python package).
+**duckrun** runs SQL in [DuckDB](https://duckdb.org/) and writes
+[**Delta Lake**](https://delta-io.github.io/delta-rs/) via delta_rs. It gives you:
+
+- a [**dbt**](https://www.getdbt.com/) adapter that materializes models as Delta tables;
+- a **`connect()`** helper to write Delta straight from SQL in a notebook;
+- **full snapshot isolation** from read to write — concurrent writers fail loud, never interleave.
+
 duckrun itself is just glue — it owns none of the heavy lifting. The real work is done
 by **DuckDB** (executes the SQL), **delta-rs** (writes the Delta table), **Arrow** (the
 zero-copy (kind of) bridge that hands query results from DuckDB to delta-rs), and **dbt** (orchestrates
@@ -65,12 +69,14 @@ my_project:
       # No `threads:` needed — duckrun always runs single-threaded.
       # DuckDB runs in-memory by default — the Delta tables are the only state.
       # Default Delta location for models that don't set config(location=...).
-      root_path: './warehouse'   # local path, or s3://..., gs://..., abfss://...
+      # OneLake — address by GUID, not friendly names (see "OneLake: use GUID paths" below):
+      root_path: "abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables"
+      # Or any other store: './warehouse' (local), 's3://...', 'gs://...'.
       # storage_options: {}      # passed through to deltalake for remote stores
 ```
 
 Persisted models are written to `<root_path>/<schema>/<model>` (e.g.
-`./warehouse/dbo/orders`), or to an explicit `config(location=...)`.
+`.../Tables/dbo/orders`), or to an explicit `config(location=...)`.
 
 ### OneLake: use GUID paths for now
 
@@ -348,6 +354,25 @@ None of this is required to use duckrun — `pip install duckrun` is unaffected.
 [`integration_tests_onelake.yml`](.github/workflows/integration_tests_onelake.yml)); `tests/conformance/`
 runs the official suite (above); `tests/correctness/` proves the concurrency guarantees. The cards
 in those docs are rendered live by CI, so they always reflect the latest `main`.
+
+## Limitations
+
+These are core design trade-offs, not bugs — they're inherent to gluing DuckDB to delta_rs and
+won't be "fixed" away:
+
+- **A single dbt run is single-threaded — but concurrency works fine.** This is purely a dbt-adapter
+  implementation detail: *within one dbt process* models run with `threads: 1`, because the
+  in-process delta_rs write path isn't thread-safe (parallel writes to a table in the *same* process
+  collide). It is **not** a limit on concurrent writers. Multiple independent writers — separate dbt
+  runs, notebooks, jobs, whatever — writing the same tables at the same time is fully supported and
+  safe: every write uses optimistic concurrency (snapshot-pinned MERGE, `safeappend` compare-and-swap,
+  fail-loud on a conflicting commit). So you can absolutely run many writers in parallel; you just
+  can't multi-thread the models *inside a single* dbt invocation.
+- **Two engines share one machine's memory.** DuckDB executes the SQL and delta_rs materializes the
+  Delta table — two separate memory systems in the same process, each with its own pool. Under heavy
+  memory pressure (large merges especially) the budget has to be split between them, and getting that
+  split right is fragile: delta_rs's merge spill-to-disk is itself flaky, and coordinating two
+  systems that don't know about each other's allocations is the hard, unavoidable part of this design.
 
 ## License
 
