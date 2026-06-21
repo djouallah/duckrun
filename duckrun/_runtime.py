@@ -1,10 +1,11 @@
 """Runtime version guardrail.
 
-duckrun needs a recent ``duckdb`` (>= 1.5.4, where ``delta_scan`` gained the ``version => N``
-parameter used for snapshot-pinned reads) and ``deltalake`` (>= 1.5.0, for the merge ``max_spill_size``
-cap). In a notebook these can already be imported at an earlier version when ``duckrun`` is first
-used: ``pip install duckrun --upgrade`` writes the new wheels to disk, but the already-loaded modules
-stay bound until the kernel restarts. A user who skips the restart would keep running on the older
+duckrun needs ``duckdb`` >= 1.5.4 — the release where ``delta_scan`` gained its ``version => N``
+parameter (used for snapshot-pinned reads) — and ``deltalake`` >= 1.5.0 (for the merge
+``max_spill_size`` cap). A Microsoft Fabric Python notebook ships a *stable* ``duckdb`` release,
+which trails the newest one, so the ``duckdb`` already imported in the kernel may predate 1.5.4.
+``pip install duckrun --upgrade`` writes the new wheels to disk, but the already-loaded modules stay
+bound until the kernel restarts — so a user who skips the restart would keep running on the older
 modules, quietly losing snapshot-pinned reads and the spill cap.
 
 This check turns that into a loud, actionable error. It inspects the *loaded* versions (not the
@@ -30,9 +31,9 @@ _REMEDY = (
 def check_runtime_versions():
     """Raise ``RuntimeError`` if the *loaded* duckdb/deltalake are older than duckrun requires.
 
-    Catches the Fabric "installed but forgot ``restartPython()``" footgun: the kernel keeps the
-    stale preinstalled versions bound until restart. Idempotent and cheap; called at each entry
-    point (``duckrun.connect()`` and the dbt connection open).
+    Catches the notebook "installed but forgot ``restartPython()``" case: the kernel keeps the
+    older duckdb/deltalake bound until restart. Idempotent and cheap; called at each entry point
+    (``duckrun.connect()`` and the dbt connection open).
     """
     import duckdb
     import deltalake

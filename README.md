@@ -40,10 +40,10 @@ That single install pulls in `dbt-duckdb` (and therefore `duckdb`) plus `deltala
 
 ### In a Microsoft Fabric Python notebook
 
-duckrun needs a recent `duckdb` (≥ 1.5.4) — that's the build where `delta_scan` gained its
-`version => N` parameter, which duckrun uses for snapshot-pinned reads. If an earlier `duckdb` is
-already imported into the kernel, a plain install won't swap it in on its own: upgrade, then
-restart the Python kernel so the new version loads.
+duckrun needs `duckdb` ≥ 1.5.4 — the release where `delta_scan` gained its `version => N`
+parameter, which duckrun uses for snapshot-pinned reads. Fabric notebooks ship a **stable**
+`duckdb` release, which trails the newest one, so the `duckdb` already loaded in the kernel may
+predate 1.5.4. Upgrade, then restart the Python kernel so the new version loads.
 
 ```python
 !pip install duckrun --upgrade
