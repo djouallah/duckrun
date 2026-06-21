@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>duckrun — pure SQL on Delta (the connection API)</title>
+  <style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         max-width: 900px; margin: 0 auto; padding: 2.5rem 1.25rem; line-height: 1.5; }
+  a.back { font-size: 0.9rem; text-decoration: none; color: #888; }
+  h1 { margin: 0.4rem 0 0.2rem; }
+  h1 .tag { font-size: 0.7rem; font-weight: 700; color: #fff; background: #c0392b;
+            padding: 0.12rem 0.5rem; border-radius: 6px; vertical-align: middle; margin-left: 0.4rem; }
+  p.lede { color: #777; margin-top: 0; }
+  section { border-top: 1px solid #8883; padding: 0.6rem 0 0.4rem; }
+  h3 { margin: 0.8rem 0 0.5rem; font-size: 1.05rem; }
+  h3 .n { display: inline-block; min-width: 1.4rem; color: #c0392b; font-variant-numeric: tabular-nums; }
+  pre.sql, pre.py { background: #8881; border-left: 3px solid #c0392b88; border-radius: 4px;
+        padding: 0.6rem 0.8rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.4; margin: 0.5rem 0; }
+  pre.py { border-left-color: #2d7d4688; }
+  p.note { color: #555; margin: 0.4rem 0; font-size: 0.92rem; }
+  p.note::before { content: "→ "; color: #888; }
+  p.tcap { color: #888; font-size: 0.82rem; margin: 0.6rem 0 0.2rem; }
+  table.data { border-collapse: collapse; font-size: 0.85rem; margin: 0.2rem 0 0.8rem; }
+  table.data th, table.data td { border: 1px solid #8884; padding: 0.3rem 0.6rem; text-align: left; white-space: nowrap; }
+  table.data th { background: #8882; font-weight: 600; }
+  table.card { width: 100%; }
+  table.card td:not(:first-child), table.card th:not(:first-child) { text-align: right; }
+  table.card td:first-child { font-weight: 600; }
+  footer { margin-top: 2rem; color: #888; font-size: 0.85rem; }
+  code { background: #8882; padding: 0.1rem 0.35rem; border-radius: 4px; }
+</style>
+</head>
+<body>
+  <a class="back" href="index.html">← duckrun docs</a>
+  <h1>pure SQL — the connection API<span class="tag">not a dbt project</span></h1>
+  <p class="lede">Actual run · 20,000-row sample of live NYC TLC Yellow-Taxi 2024-01 → local Delta · 2026-06-21 UTC. Every statement below ran through <code>conn.sql(...)</code>
+  against live NYC&nbsp;TLC data, landing real Delta — the SQL and its actual output, top to bottom.</p>
+  <h2 style="margin-bottom:0.2rem">Run scorecard — <span style="font-weight:400">✅ all operations correct</span></h2>
+  <table class="data card">
+  <thead><tr><th>Operation</th><th>Rows</th><th>Before</th><th>After</th><th>Expected</th><th>Count&nbsp;✓</th><th>Values&nbsp;✓</th><th>Time</th></tr></thead>
+  <tbody>
+    <tr><td>Load zones (CSV→Delta)</td><td>+265</td><td>0</td><td>265</td><td>265</td><td>✅</td><td>✅</td><td>0.8s</td></tr>
+    <tr><td>Land trips sample</td><td>+20,000</td><td>0</td><td>20,000</td><td>20,000</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
+    <tr><td>Write zone-summary mart</td><td>+7</td><td>0</td><td>7</td><td>7</td><td>✅</td><td>✅</td><td>0.1s</td></tr>
+    <tr><td>Write surge mart (ASOF)</td><td>+20,000</td><td>0</td><td>20,000</td><td>20,000</td><td>✅</td><td>✅</td><td>0.1s</td></tr>
+    <tr><td>INSERT append (+100)</td><td>+100</td><td>20,000</td><td>20,100</td><td>20,100</td><td>✅</td><td>✅</td><td>0.1s</td></tr>
+    <tr><td>SQL upsert (1 upd, 1 ins)</td><td>+1</td><td>172</td><td>173</td><td>173</td><td>✅</td><td>✅</td><td>0.3s</td></tr>
+    <tr><td>DELETE Cash trips</td><td>-2,972</td><td>20,100</td><td>17,128</td><td>17,128</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
+    <tr><td>Concurrent MERGE clash</td><td>+0</td><td>173</td><td>173</td><td>173</td><td>✅</td><td>✅</td><td>0.3s</td></tr>
+  </tbody>
+</table>
+  
+<section>
+  <h3><span class="n">1</span> real dimension off the web: taxi-zone lookup CSV (https) → Delta &#x27;zones&#x27;</h3>
+  <pre class="sql">CREATE OR REPLACE TABLE zones AS
+SELECT &quot;LocationID&quot;::INT AS zone_id, &quot;Borough&quot; AS borough,
+       &quot;Zone&quot; AS zone, &quot;service_zone&quot; AS service_zone
+FROM read_csv_auto(&#x27;https://d37ci6vzurychx.cloudfront.net/misc/taxi_zone_lookup.csv&#x27;)</pre>
+  <p class="tcap">zones (first 6 of a real 265-zone dimension)</p>
+  <table class="data"><thead><tr><th>zone_id</th><th>borough</th><th>zone</th></tr></thead><tbody><tr><td>1</td><td>EWR</td><td>Newark Airport</td></tr><tr><td>2</td><td>Queens</td><td>Jamaica Bay</td></tr><tr><td>3</td><td>Bronx</td><td>Allerton/Pelham Gardens</td></tr><tr><td>4</td><td>Manhattan</td><td>Alphabet City</td></tr><tr><td>5</td><td>Staten Island</td><td>Arden Heights</td></tr><tr><td>6</td><td>Staten Island</td><td>Arrochar/Fort Wadsworth</td></tr></tbody></table>
+  <p class="note">265 zones loaded</p>
+</section>
+
+<section>
+  <h3><span class="n">2</span> register the live month: read_parquet yellow_tripdata_2024-01 (https, ~50MB) → TEMP TABLE &#x27;trips_raw&#x27;</h3>
+  <pre class="sql">CREATE TEMP TABLE trips_raw AS
+SELECT
+    t.tpep_pickup_datetime  AS pickup_ts,
+    t.&quot;PULocationID&quot;::INT    AS zone_id,
+    z.borough                AS borough,
+    z.zone                   AS zone,
+    CASE t.payment_type WHEN 1 THEN &#x27;Credit&#x27; WHEN 2 THEN &#x27;Cash&#x27;
+         WHEN 3 THEN &#x27;NoCharge&#x27; WHEN 4 THEN &#x27;Dispute&#x27; ELSE &#x27;Other&#x27; END AS payment,
+    t.fare_amount::DOUBLE    AS fare,
+    t.tip_amount::DOUBLE     AS tip,
+    t.trip_distance::DOUBLE  AS distance,
+    t.total_amount::DOUBLE   AS total,
+    hour(t.tpep_pickup_datetime) AS pickup_hour
+FROM read_parquet(&#x27;https://d37ci6vzurychx.cloudfront.net/trip-data/yellow_tripdata_2024-01.parquet&#x27;) t
+JOIN zones z ON z.zone_id = t.&quot;PULocationID&quot;
+WHERE t.fare_amount &gt; 0 AND t.trip_distance &gt; 0
+  AND t.tpep_pickup_datetime &gt;= TIMESTAMP &#x27;2024-01-01&#x27;
+  AND t.tpep_pickup_datetime &lt;  TIMESTAMP &#x27;2024-02-01&#x27;</pre>
+  <p class="note">2,869,697 clean trips for 2024-01 — all compute in-engine; nothing written to Delta yet</p>
+</section>
+
+<section>
+  <h3><span class="n">3</span> land a bounded sample → Delta &#x27;trips&#x27; (CREATE TABLE AS … USING SAMPLE 20,000)</h3>
+  <pre class="sql">CREATE OR REPLACE TABLE trips AS
+SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
+FROM trips_raw USING SAMPLE 20000 ROWS</pre>
+  <p class="note">20,000 rows landed as Delta version 0; fare&gt;0 verified</p>
+</section>
+
+<section>
+  <h3><span class="n">4</span> fancy SQL — QUALIFY: top-3 pickup zones by revenue WITHIN each borough</h3>
+  <pre class="sql">SELECT borough, zone, round(sum(total), 0)::BIGINT AS revenue, count(*) AS trips
+FROM trips GROUP BY borough, zone
+QUALIFY row_number() OVER (PARTITION BY borough ORDER BY sum(total) DESC) &lt;= 3
+ORDER BY borough, revenue DESC</pre>
+  <p class="tcap">top-3 zones per borough (QUALIFY)</p>
+  <table class="data"><thead><tr><th>borough</th><th>zone</th><th>revenue $</th><th>trips</th></tr></thead><tbody><tr><td>Bronx</td><td>Mott Haven/Port Morris</td><td>145</td><td>6</td></tr><tr><td>Bronx</td><td>Melrose South</td><td>112</td><td>3</td></tr><tr><td>Bronx</td><td>West Concourse</td><td>102</td><td>2</td></tr><tr><td>Brooklyn</td><td>Williamsburg (South Side)</td><td>319</td><td>8</td></tr><tr><td>Brooklyn</td><td>Williamsburg (North Side)</td><td>317</td><td>12</td></tr><tr><td>Brooklyn</td><td>Park Slope</td><td>282</td><td>8</td></tr><tr><td>EWR</td><td>Newark Airport</td><td>16</td><td>1</td></tr><tr><td>Manhattan</td><td>Midtown Center</td><td>22,501</td><td>950</td></tr><tr><td>Manhattan</td><td>Times Sq/Theatre District</td><td>19,872</td><td>724</td></tr><tr><td>Manhattan</td><td>Upper East Side South</td><td>18,911</td><td>961</td></tr><tr><td>N/A</td><td>Outside of NYC</td><td>798</td><td>8</td></tr><tr><td>Queens</td><td>JFK Airport</td><td>78,668</td><td>973</td></tr><tr><td>Queens</td><td>LaGuardia Airport</td><td>39,503</td><td>601</td></tr><tr><td>Queens</td><td>East Elmhurst</td><td>5,362</td><td>85</td></tr><tr><td>Unknown</td><td>N/A</td><td>2,008</td><td>76</td></tr></tbody></table>
+  <p class="note">15 rows — one window pass, no self-join</p>
+</section>
+
+<section>
+  <h3><span class="n">5</span> fancy SQL — PIVOT: total fare by payment across time-of-day bands</h3>
+  <pre class="sql">PIVOT (
+    SELECT CASE WHEN pickup_hour &lt; 6 THEN &#x27;0 night&#x27; WHEN pickup_hour &lt; 12 THEN &#x27;1 morning&#x27;
+                WHEN pickup_hour &lt; 18 THEN &#x27;2 afternoon&#x27; ELSE &#x27;3 evening&#x27; END AS band,
+           payment, fare
+    FROM trips
+) ON payment USING round(sum(fare), 0)::BIGINT GROUP BY band ORDER BY band</pre>
+  <p class="tcap">fare $ by payment × time-of-day (PIVOT)</p>
+  <table class="data"><thead><tr><th>band</th><th>Cash</th><th>Credit</th><th>Dispute</th><th>NoCharge</th><th>Other</th></tr></thead><tbody><tr><td>0 night</td><td>4160</td><td>20466</td><td>505</td><td>129</td><td>3158</td></tr><tr><td>1 morning</td><td>11394</td><td>65823</td><td>948</td><td>365</td><td>4759</td></tr><tr><td>2 afternoon</td><td>23672</td><td>111876</td><td>1324</td><td>439</td><td>3730</td></tr><tr><td>3 evening</td><td>14876</td><td>94366</td><td>1104</td><td>207</td><td>4732</td></tr></tbody></table>
+  <p class="note">payment values turned into columns by PIVOT</p>
+</section>
+
+<section>
+  <h3><span class="n">6</span> fancy SQL — ROLLUP: fare subtotals by (borough, payment) with super-aggregates</h3>
+  <pre class="sql">SELECT coalesce(borough, &#x27;— ALL —&#x27;) AS borough, coalesce(payment, &#x27;— ALL —&#x27;) AS payment,
+       round(sum(fare), 0)::BIGINT AS fare, count(*) AS trips
+FROM trips GROUP BY ROLLUP (borough, payment)
+ORDER BY borough, payment</pre>
+  <p class="tcap">ROLLUP subtotals (&#x27;— ALL —&#x27; = super-aggregate)</p>
+  <table class="data"><thead><tr><th>borough</th><th>payment</th><th>fare $</th><th>trips</th></tr></thead><tbody><tr><td>Bronx</td><td>Cash</td><td>9</td><td>1</td></tr><tr><td>Bronx</td><td>Credit</td><td>1,038</td><td>32</td></tr><tr><td>Bronx</td><td>Other</td><td>84</td><td>4</td></tr><tr><td>Bronx</td><td>— ALL —</td><td>1,130</td><td>37</td></tr><tr><td>Brooklyn</td><td>Cash</td><td>319</td><td>11</td></tr><tr><td>Brooklyn</td><td>Credit</td><td>2,866</td><td>91</td></tr><tr><td>Brooklyn</td><td>NoCharge</td><td>18</td><td>1</td></tr><tr><td>Brooklyn</td><td>Other</td><td>1,172</td><td>41</td></tr><tr><td>Brooklyn</td><td>— ALL —</td><td>4,374</td><td>144</td></tr><tr><td>EWR</td><td>Credit</td><td>15</td><td>1</td></tr><tr><td>EWR</td><td>— ALL —</td><td>15</td><td>1</td></tr><tr><td>Manhattan</td><td>Cash</td><td>36,059</td><td>2,560</td></tr><tr><td>Manhattan</td><td>Credit</td><td>213,069</td><td>14,469</td></tr><tr><td>Manhattan</td><td>Dispute</td><td>2,328</td><td>143</td></tr><tr><td>Manhattan</td><td>NoCharge</td><td>736</td><td>55</td></tr><tr><td>Manhattan</td><td>Other</td><td>14,020</td><td>712</td></tr><tr><td>Manhattan</td><td>— ALL —</td><td>266,212</td><td>17,939</td></tr><tr><td>N/A</td><td>Credit</td><td>587</td><td>5</td></tr><tr><td>N/A</td><td>Other</td><td>112</td><td>3</td></tr><tr><td>N/A</td><td>— ALL —</td><td>699</td><td>8</td></tr><tr><td>Queens</td><td>Cash</td><td>17,303</td><td>373</td></tr><tr><td>Queens</td><td>Credit</td><td>73,991</td><td>1,351</td></tr><tr><td>Queens</td><td>Dispute</td><td>1,553</td><td>29</td></tr><tr><td>Queens</td><td>NoCharge</td><td>354</td><td>11</td></tr><tr><td>Queens</td><td>Other</td><td>992</td><td>31</td></tr><tr><td>Queens</td><td>— ALL —</td><td>94,193</td><td>1,795</td></tr><tr><td>Unknown</td><td>Cash</td><td>411</td><td>12</td></tr><tr><td>Unknown</td><td>Credit</td><td>965</td><td>62</td></tr><tr><td>Unknown</td><td>NoCharge</td><td>33</td><td>2</td></tr><tr><td>Unknown</td><td>— ALL —</td><td>1,409</td><td>76</td></tr><tr><td>— ALL —</td><td>— ALL —</td><td>368,032</td><td>20,000</td></tr></tbody></table>
+  <p class="note">31 rows incl. per-borough and grand totals</p>
+</section>
+
+<section>
+  <h3><span class="n">7</span> fancy SQL — LIST/STRUCT: per-borough top-zone array + fare quantiles → mart</h3>
+  <pre class="sql">SELECT borough,
+       (list(struct_pack(zone := zone, rev := rev) ORDER BY rev DESC))[1:3] AS top3_zones
+FROM (SELECT borough, zone, round(sum(total), 0)::BIGINT AS rev FROM trips GROUP BY borough, zone)
+GROUP BY borough ORDER BY borough</pre>
+  <p class="tcap">nested LIST&lt;STRUCT&gt; per borough</p>
+  <table class="data"><thead><tr><th>borough</th><th>top3_zones (LIST&lt;STRUCT&gt;)</th></tr></thead><tbody><tr><td>Bronx</td><td>[{&#x27;zone&#x27;: &#x27;Mott Haven/Port Morris&#x27;, &#x27;rev&#x27;: 145}, {&#x27;zone&#x27;: &#x27;Melrose South&#x27;, &#x27;rev&#x27;: 112}, {&#x27;zone&#x27;: &#x27;West Concourse&#x27;, &#x27;rev&#x27;: 102}]</td></tr><tr><td>Brooklyn</td><td>[{&#x27;zone&#x27;: &#x27;Williamsburg (South Side)&#x27;, &#x27;rev&#x27;: 319}, {&#x27;zone&#x27;: &#x27;Williamsburg (North Side)&#x27;, &#x27;rev&#x27;: 317}, {&#x27;zone&#x27;: &#x27;Park Slope&#x27;, &#x27;rev&#x27;: 282}]</td></tr><tr><td>EWR</td><td>[{&#x27;zone&#x27;: &#x27;Newark Airport&#x27;, &#x27;rev&#x27;: 16}]</td></tr><tr><td>Manhattan</td><td>[{&#x27;zone&#x27;: &#x27;Midtown Center&#x27;, &#x27;rev&#x27;: 22501}, {&#x27;zone&#x27;: &#x27;Times Sq/Theatre District&#x27;, &#x27;rev&#x27;: 19872}, {&#x27;zone&#x27;: &#x27;Upper East Side South&#x27;, &#x27;rev&#x27;: 18911}]</td></tr><tr><td>N/A</td><td>[{&#x27;zone&#x27;: &#x27;Outside of NYC&#x27;, &#x27;rev&#x27;: 798}]</td></tr><tr><td>Queens</td><td>[{&#x27;zone&#x27;: &#x27;JFK Airport&#x27;, &#x27;rev&#x27;: 78668}, {&#x27;zone&#x27;: &#x27;LaGuardia Airport&#x27;, &#x27;rev&#x27;: 39503}, {&#x27;zone&#x27;: &#x27;East Elmhurst&#x27;, &#x27;rev&#x27;: 5362}]</td></tr><tr><td>Unknown</td><td>[{&#x27;zone&#x27;: &#x27;N/A&#x27;, &#x27;rev&#x27;: 2008}]</td></tr></tbody></table>
+  <pre class="sql">CREATE OR REPLACE TABLE mart_zone_summary AS
+WITH ranked AS (
+    SELECT borough, zone, round(sum(total), 0)::BIGINT AS rev,
+           row_number() OVER (PARTITION BY borough ORDER BY sum(total) DESC) AS rn
+    FROM trips GROUP BY borough, zone
+), pct AS (
+    SELECT borough, round(quantile_cont(fare, 0.5), 2) AS fare_p50,
+           round(quantile_cont(fare, 0.9), 2) AS fare_p90,
+           round(quantile_cont(fare, 0.99), 2) AS fare_p99
+    FROM trips GROUP BY borough
+)
+SELECT p.borough, r.zone AS top_zone, r.rev AS top_zone_rev,
+       p.fare_p50, p.fare_p90, p.fare_p99
+FROM pct p JOIN ranked r ON r.borough = p.borough AND r.rn = 1
+ORDER BY p.borough</pre>
+  <p class="tcap">mart_zone_summary (flattened for Delta)</p>
+  <table class="data"><thead><tr><th>borough</th><th>top_zone</th><th>rev $</th><th>p50</th><th>p90</th><th>p99</th></tr></thead><tbody><tr><td>Bronx</td><td>Mott Haven/Port Morris</td><td>145</td><td>30.5</td><td>48.1</td><td>64.74</td></tr><tr><td>Brooklyn</td><td>Williamsburg (South Side)</td><td>319</td><td>26.3</td><td>56.56</td><td>83.68</td></tr><tr><td>EWR</td><td>Newark Airport</td><td>16</td><td>15.0</td><td>15.0</td><td>15.0</td></tr><tr><td>Manhattan</td><td>Midtown Center</td><td>22501</td><td>12.1</td><td>25.4</td><td>70.0</td></tr><tr><td>N/A</td><td>Outside of NYC</td><td>798</td><td>71.93</td><td>154.1</td><td>183.71</td></tr><tr><td>Queens</td><td>JFK Airport</td><td>78668</td><td>49.9</td><td>70.0</td><td>148.03</td></tr><tr><td>Unknown</td><td>N/A</td><td>2008</td><td>11.4</td><td>40.45</td><td>94.73</td></tr></tbody></table>
+  <p class="note">7 borough rows written (nested types shown, mart flattened on purpose)</p>
+</section>
+
+<section>
+  <h3><span class="n">8</span> fancy SQL — ASOF JOIN: snap each trip to the latest surge multiplier by pickup time</h3>
+  <pre class="sql">CREATE TEMP TABLE surge_card AS
+SELECT * FROM (VALUES (TIME &#x27;00:00&#x27;, 1.00), (TIME &#x27;07:00&#x27;, 1.25), (TIME &#x27;10:00&#x27;, 1.00),
+                      (TIME &#x27;16:00&#x27;, 1.40), (TIME &#x27;20:00&#x27;, 1.15)) v(valid_from, multiplier)</pre>
+  <pre class="sql">CREATE OR REPLACE TABLE mart_surged AS
+SELECT t.zone_id, t.borough, t.payment, t.pickup_ts, t.fare AS base_fare,
+       s.multiplier, round(t.fare * s.multiplier, 2) AS surged_fare
+FROM trips t ASOF JOIN surge_card s ON t.pickup_ts::TIME &gt;= s.valid_from</pre>
+  <p class="tcap">ASOF surge applied (sample of priced trips)</p>
+  <table class="data"><thead><tr><th>borough</th><th>payment</th><th>base</th><th>×</th><th>surged</th></tr></thead><tbody><tr><td>Queens</td><td>Credit</td><td>300.0</td><td>1.40</td><td>420.0</td></tr><tr><td>Queens</td><td>Credit</td><td>251.5</td><td>1.40</td><td>352.1</td></tr><tr><td>Queens</td><td>Cash</td><td>147.9</td><td>1.40</td><td>207.06</td></tr><tr><td>N/A</td><td>Credit</td><td>120.0</td><td>1.40</td><td>168.0</td></tr><tr><td>Manhattan</td><td>Credit</td><td>110.0</td><td>1.40</td><td>154.0</td></tr><tr><td>Queens</td><td>Dispute</td><td>101.7</td><td>1.40</td><td>142.38</td></tr></tbody></table>
+  <p class="note">20,000 trips priced; each snapped to the latest surge band ≤ its pickup time</p>
+</section>
+
+<section>
+  <h3><span class="n">9</span> Spark Catalog: the Delta tables this demo has landed</h3>
+  <p class="tcap">tables in &#x27;dbo&#x27;</p>
+  <table class="data"><thead><tr><th>table</th></tr></thead><tbody><tr><td>mart_surged</td></tr><tr><td>mart_zone_summary</td></tr><tr><td>trips</td></tr><tr><td>zones</td></tr></tbody></table>
+  <p class="note">4 tables: [&#x27;mart_surged&#x27;, &#x27;mart_zone_summary&#x27;, &#x27;trips&#x27;, &#x27;zones&#x27;]</p>
+</section>
+
+<section>
+  <h3><span class="n">10</span> raw-DML INSERT: append a 100-row late-arriving batch to &#x27;trips&#x27;</h3>
+  <pre class="sql">INSERT INTO trips
+SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
+FROM trips_raw USING SAMPLE 100 ROWS</pre>
+  <p class="note">20,000 → 20,100 rows</p>
+</section>
+
+<section>
+  <h3><span class="n">11</span> SQL-only upsert on &#x27;zone_stats&#x27;: DELETE literal keys + INSERT (1 update, 1 insert)</h3>
+  <pre class="sql">CREATE OR REPLACE TABLE zone_stats AS
+SELECT zone_id, any_value(zone) AS zone, count(*) AS trips, round(avg(fare), 2) AS avg_fare
+FROM trips GROUP BY zone_id</pre>
+  <pre class="sql">DELETE FROM zone_stats WHERE zone_id = 132 OR zone_id = 999</pre>
+  <pre class="sql">INSERT INTO zone_stats VALUES (132, &#x27;JFK Airport&#x27;, 984, 68.15), (999, &#x27;NEW Demo Zone&#x27;, 1, 7.77)</pre>
+  <p class="note">zone 132 avg 63.15→68.15 (updated), zone 999 inserted; 172 → 173 rows</p>
+</section>
+
+<section>
+  <h3><span class="n">12</span> raw-DML DELETE + time travel: drop &#x27;Cash&#x27; trips, then read the landed snapshot</h3>
+  <pre class="sql">DELETE FROM trips WHERE payment = &#x27;Cash&#x27;</pre>
+  <pre class="sql">SELECT count(*) FROM delta_scan(&#x27;C:/Users/MDJOUA~1/AppData/Local/Temp/taxidemo_8cmr_z_y/dbo/trips&#x27;, version =&gt; 0)</pre>
+  <p class="tcap">time travel: current vs landed snapshot</p>
+  <table class="data"><thead><tr><th>before</th><th>Cash deleted</th><th>after (now)</th><th>at landed ver</th></tr></thead><tbody><tr><td>20,100</td><td>2,972</td><td>17,128</td><td>20,000</td></tr></tbody></table>
+  <p class="note">deleted 2,972 Cash trips (20,100 → 17,128); delta_scan(version =&gt; 0) still sees 20,000</p>
+</section>
+
+<section>
+  <h3><span class="n">13</span> concurrent MERGE clash (Spark DeltaTable.merge): two writers, one snapshot — the stale one is refused</h3>
+  <pre class="py"># Spark builder API (conn.sql rejects MERGE) — both writers pin the SAME version:
+writer_A = DeltaTable.forName(conn, "zone_stats").merge(srcA, "target.zone_id = source.zone_id") \
+    .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcA sets avg → 100.0
+writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, "target.zone_id = source.zone_id") \
+    .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcB sets avg → 200.0
+writer_A.execute()   # wins, advances the table version
+writer_B.execute()   # stale snapshot → CommitFailedError</pre>
+  <p class="note">both writers built against zone 132 (avg 68.15) at the same snapshot</p>
+  <p class="tcap">two concurrent MERGEs against one snapshot</p>
+  <table class="data"><thead><tr><th>writer</th><th>intended avg</th><th>outcome</th></tr></thead><tbody><tr><td>A — fresh snapshot</td><td>100.0</td><td>committed ✅</td></tr><tr><td>B — stale snapshot</td><td>200.0</td><td>refused ✅</td></tr></tbody></table>
+  <p class="note">snapshot isolation held: zone 132 avg = 100.0 (writer A won); writer B refused — a concurrent transactions added new data.</p>
+</section>
+  <footer>Generated by
+    <a href="https://github.com/djouallah/duckrun/blob/main/tests/connection_api/demo_taxi.py">demo_taxi.py</a>
+    — re-published from a live OneLake run by the integration-tests workflow.</footer>
+</body>
+</html>

@@ -268,17 +268,17 @@ jobs:
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
-          DUCKRUN_TAXI_CARD: docs/taxi_card.html   # the demo writes its real-run scorecard here
+          DUCKRUN_TAXI_PAGE: taxi_run.html   # the demo writes its full SQL+results HTML report here
         run: python tests/connection_api/demo_taxi.py
 
-      - name: Upload this run's scorecard for deploy-docs to splice into the live page
-        # Named docs-* so deploy-docs picks it up with its existing `pattern: docs-*` download. No
-        # commit-back: deploy-docs injects it at publish time, so the page shows THIS run — no lag.
-        if: always() && hashFiles('docs/taxi_card.html') != ''
+      - name: Upload this run's HTML report for deploy-docs to publish as taxi.html
+        # Named docs-* so deploy-docs picks it up with its existing `pattern: docs-*` download. The
+        # report IS this run's page (no commit-back, no lag); deploy-docs copies it over taxi.html.
+        if: always() && hashFiles('taxi_run.html') != ''
         uses: actions/upload-artifact@v4
         with:
-          name: docs-taxi-card
-          path: docs/taxi_card.html
+          name: docs-taxi-page
+          path: taxi_run.html
           if-no-files-found: warn
 
   sde:
@@ -367,13 +367,15 @@ jobs:
           cp docs-artifacts/docs-merge_spill/static_index.html dbt-docs-site/merge_spill.html
           cp docs-artifacts/docs-coffee/static_index.html      dbt-docs-site/coffee.html
           cp docs-artifacts/docs-sde/static_index.html         dbt-docs-site/sde_dbt_tutorial.html
-          # Splice THIS run's taxi scorecard into the page being published (not a commit-back), so the
-          # live site always shows the run it was deployed from. No-op if the demo didn't emit a card.
-          if [ -f docs-artifacts/docs-taxi-card/taxi_card.html ]; then
-            python3 tests/tools/inject_readme.py dbt-docs-site/index.html docs-artifacts/docs-taxi-card/taxi_card.html TAXI
-            echo "taxi scorecard injected into the published page."
+          # The connection-API report: ship the committed page, then overwrite it with THIS run's
+          # report if the taxi job produced one — so the live taxi.html shows the run it was deployed
+          # from (no commit-back, no lag). The committed copy is the fallback if the demo didn't run.
+          cp docs/site/taxi.html                               dbt-docs-site/taxi.html
+          if [ -f docs-artifacts/docs-taxi-page/taxi_run.html ]; then
+            cp docs-artifacts/docs-taxi-page/taxi_run.html     dbt-docs-site/taxi.html
+            echo "published THIS run's taxi report."
           else
-            echo "no taxi card artifact — publishing the placeholder."
+            echo "no taxi report artifact — publishing the committed taxi.html."
           fi
       - name: Package docs for Pages
         uses: actions/upload-pages-artifact@v3

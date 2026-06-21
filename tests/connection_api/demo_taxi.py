@@ -16,6 +16,9 @@ Heavy read+compute runs in-engine over the *full* month (millions of rows, local
 bounded **sample** plus compact marts are written over the network to OneLake, so the network is not
 the bottleneck.
 
+Besides the console narration, the run can emit a **standalone HTML report** — every statement and
+its actual result, top to bottom — when ``DUCKRUN_TAXI_PAGE`` is set (CI publishes it as taxi.html).
+
 OneLake only (this is what "the sample lakehouse" means here) — set, with no Azure ids in code:
 
     WAREHOUSE_PATH   abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables
@@ -25,6 +28,7 @@ Knobs (all env-overridable):
     DUCKRUN_TAXI_SCHEMA   schema to write into        (default: duckrun_taxi_demo)
     TAXI_MONTH            which month to read, YYYY-MM (default: 2024-01 — pinned, deterministic)
     TAXI_SAMPLE_ROWS      rows landed to Delta         (default: 50000)
+    DUCKRUN_TAXI_PAGE     write the HTML report to this path (optional)
 """
 import html
 import os
@@ -53,27 +57,61 @@ TAXI_MONTH = os.environ.get("TAXI_MONTH", "2024-01")
 SAMPLE_ROWS = int(os.environ.get("TAXI_SAMPLE_ROWS", "50000"))
 
 
+# ── HTML report accumulator ──────────────────────────────────────────────────────────────────────
+# Every helper below narrates to the console AND appends to _DOC, so the same run that prints the
+# scorecard also produces a standalone "SQL + results, top to bottom" page (written if DUCKRUN_TAXI_PAGE).
+_DOC = []
+
+
+def _emit(fragment):
+    _DOC.append(fragment)
+
+
 # ── narration + rendering helpers ────────────────────────────────────────────────────────────────
 @contextmanager
 def _step(n, label):
-    """Narrate and time one stage of the demo. Run the script to watch it build, stage by stage."""
+    """Narrate and time one stage of the demo (console), and open a <section> in the HTML report."""
     print(f"\n[{n}] {label}", flush=True)
+    _emit(f'\n<section>\n  <h3><span class="n">{n}</span> {html.escape(label)}</h3>')
     t = time.perf_counter()
-    yield lambda detail: print(f"      -> {detail}", flush=True)
+
+    def say(detail):
+        print(f"      -> {detail}", flush=True)
+        _emit(f'  <p class="note">{html.escape(detail)}</p>')
+
+    yield say
+    _emit("</section>")
     print(f"      ({time.perf_counter() - t:.2f}s)", flush=True)
 
 
-def _table(rows, headers, title=None):
-    """Render rows as a titled ASCII box. ``rows`` is an iterable of tuples/lists; values are
-    stringified. Feed it small, already-LIMITed result sets."""
-    cells = [[str(h) for h in headers]] + [[str(c) for c in r] for r in rows]
-    w = [max(len(row[i]) for row in cells) for i in range(len(headers))]
-    edge = lambda l, m, r: l + m.join("─" * (w[i] + 2) for i in range(len(headers))) + r
-    fmt = lambda row: "  │ " + " │ ".join(row[i].ljust(w[i]) for i in range(len(headers))) + " │"
-    out = ([title] if title else []) + ["  " + edge("┌", "┬", "┐"), fmt(cells[0]), "  " + edge("├", "┼", "┤")]
-    out += [fmt(row) for row in cells[1:]]
-    out.append("  " + edge("└", "┴", "┘"))
-    print("\n".join(out), flush=True)
+def _sql(conn, stmt, retry=False):
+    """Echo the exact SQL (console + HTML report), then run it through ``conn.sql()`` and return the
+    relation. One statement per call: duckrun routes each to delta-rs individually and rejects
+    ``;``-separated batches."""
+    clean = textwrap.dedent(stmt).strip()
+    print("      ┄┄ SQL ┄┄", flush=True)
+    print("\n".join("      │ " + line for line in clean.splitlines()), flush=True)
+    _emit(f'  <pre class="sql">{html.escape(clean)}</pre>')
+    return _read_retry(conn, clean) if retry else conn.sql(clean)
+
+
+def _table(rows, headers, title=None, echo=True):
+    """Render rows as a titled ASCII box (console, when ``echo``) AND an HTML table (report). ``rows``
+    is an iterable of tuples/lists; values are stringified. Feed it small, already-LIMITed sets."""
+    rows = [list(r) for r in rows]
+    if echo:
+        cells = [[str(h) for h in headers]] + [[str(c) for c in r] for r in rows]
+        w = [max(len(row[i]) for row in cells) for i in range(len(headers))]
+        edge = lambda l, m, r: l + m.join("─" * (w[i] + 2) for i in range(len(headers))) + r
+        fmt = lambda row: "  │ " + " │ ".join(row[i].ljust(w[i]) for i in range(len(headers))) + " │"
+        out = ([title] if title else []) + ["  " + edge("┌", "┬", "┐"), fmt(cells[0]), "  " + edge("├", "┼", "┤")]
+        out += [fmt(row) for row in cells[1:]]
+        out.append("  " + edge("└", "┴", "┘"))
+        print("\n".join(out), flush=True)
+    th = "".join(f"<th>{html.escape(str(h))}</th>" for h in headers)
+    body = "".join("<tr>" + "".join(f"<td>{html.escape(str(c))}</td>" for c in r) + "</tr>" for r in rows)
+    cap = f'  <p class="tcap">{html.escape(title.strip())}</p>\n' if title else ""
+    _emit(f'{cap}  <table class="data"><thead><tr>{th}</tr></thead><tbody>{body}</tbody></table>')
 
 
 def _row(name, before, after, expected, count_ok, values_ok, dt):
@@ -82,35 +120,32 @@ def _row(name, before, after, expected, count_ok, values_ok, dt):
 
 
 def _scorecard(results):
-    """Final card — same visual vocabulary as the merge-spill card (✅/❌, timings), demo columns."""
+    """Final card to the console — correctness + timing for every write/mutation op."""
     rows = [(
         r["name"], f"{r['after'] - r['before']:+,}", f"{r['before']:,}", f"{r['after']:,}",
         f"{r['expected']:,}", "✅" if r["count_ok"] else "❌", "✅" if r["values_ok"] else "❌",
         f"{r['dt']:.1f}s",
     ) for r in results]
     _table(rows, ["Operation", "Rows", "Before", "After", "Expected", "Count ✓", "Values ✓", "Time"],
-           "\n  📊 Results — duckrun connection API on Delta (SQL-first)")
+           "\n  📊 Results — duckrun connection API on Delta (SQL-first)", echo=True)
+    # _table already appended an HTML copy; drop it so the report uses the styled scorecard instead.
+    _DOC.pop()
     ok = all(r["count_ok"] and r["values_ok"] for r in results)
     print("\n  ✅ all operations correct." if ok
           else "\n  ❌ one or more operations were wrong — see the ❌ cells above.", flush=True)
 
 
-def _scorecard_html(results, caption):
-    """Same scorecard, as an HTML fragment to splice into the docs page (matches inject_readme.py's
-    marker convention). This is a REAL run's numbers — not a hand-written table."""
-    ok = all(r["count_ok"] and r["values_ok"] for r in results)
+def _scorecard_html(results):
+    """The scorecard as a styled HTML table for the report page (a REAL run's numbers)."""
     head = ("<th>Operation</th><th>Rows</th><th>Before</th><th>After</th>"
             "<th>Expected</th><th>Count&nbsp;✓</th><th>Values&nbsp;✓</th><th>Time</th>")
     body = "\n".join(
         "    <tr><td>{n}</td><td>{r:+,}</td><td>{b:,}</td><td>{a:,}</td><td>{e:,}</td>"
         "<td>{c}</td><td>{v}</td><td>{t:.1f}s</td></tr>".format(
             n=html.escape(x["name"]), r=x["after"] - x["before"], b=x["before"], a=x["after"],
-            e=x["expected"], c="✅" if x["count_ok"] else "❌", v="✅" if x["values_ok"] else "❌",
-            t=x["dt"])
+            e=x["expected"], c="✅" if x["count_ok"] else "❌", v="✅" if x["values_ok"] else "❌", t=x["dt"])
         for x in results)
-    verdict = "✅ all operations correct" if ok else "❌ some operations failed"
-    return (f'<p class="demo-cap">{html.escape(caption)} — <strong>{verdict}</strong></p>\n'
-            f'<table class="demo card">\n  <thead><tr>{head}</tr></thead>\n  <tbody>\n'
+    return (f'<table class="data card">\n  <thead><tr>{head}</tr></thead>\n  <tbody>\n'
             f'{body}\n  </tbody>\n</table>')
 
 
@@ -129,16 +164,6 @@ def _read_retry(conn, sql, attempts=3, base=3):
             time.sleep(wait)
 
 
-def _ddl(conn, stmt, retry=False):
-    """Echo the exact SQL we're about to run (this is a demo — show the data engineer the statement,
-    with literals substituted), then execute it through ``conn.sql()``. One statement per call:
-    duckrun routes each to delta-rs individually and rejects ``;``-separated batches."""
-    clean = textwrap.dedent(stmt).strip()
-    print("      ┄┄ SQL ┄┄", flush=True)
-    print("\n".join("      │ " + line for line in clean.splitlines()), flush=True)
-    return _read_retry(conn, clean) if retry else conn.sql(clean)
-
-
 def _month_bounds(ym):
     """'2024-01' -> ('2024-01-01', '2024-02-01') as half-open [start, end) timestamp bounds."""
     y, m = (int(x) for x in ym.split("-"))
@@ -146,10 +171,66 @@ def _month_bounds(ym):
     return f"{y:04d}-{m:02d}-01", f"{ny:04d}-{nm:02d}-01"
 
 
+_PAGE_CSS = """
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         max-width: 900px; margin: 0 auto; padding: 2.5rem 1.25rem; line-height: 1.5; }
+  a.back { font-size: 0.9rem; text-decoration: none; color: #888; }
+  h1 { margin: 0.4rem 0 0.2rem; }
+  h1 .tag { font-size: 0.7rem; font-weight: 700; color: #fff; background: #c0392b;
+            padding: 0.12rem 0.5rem; border-radius: 6px; vertical-align: middle; margin-left: 0.4rem; }
+  p.lede { color: #777; margin-top: 0; }
+  section { border-top: 1px solid #8883; padding: 0.6rem 0 0.4rem; }
+  h3 { margin: 0.8rem 0 0.5rem; font-size: 1.05rem; }
+  h3 .n { display: inline-block; min-width: 1.4rem; color: #c0392b; font-variant-numeric: tabular-nums; }
+  pre.sql, pre.py { background: #8881; border-left: 3px solid #c0392b88; border-radius: 4px;
+        padding: 0.6rem 0.8rem; overflow-x: auto; font-size: 0.82rem; line-height: 1.4; margin: 0.5rem 0; }
+  pre.py { border-left-color: #2d7d4688; }
+  p.note { color: #555; margin: 0.4rem 0; font-size: 0.92rem; }
+  p.note::before { content: "→ "; color: #888; }
+  p.tcap { color: #888; font-size: 0.82rem; margin: 0.6rem 0 0.2rem; }
+  table.data { border-collapse: collapse; font-size: 0.85rem; margin: 0.2rem 0 0.8rem; }
+  table.data th, table.data td { border: 1px solid #8884; padding: 0.3rem 0.6rem; text-align: left; white-space: nowrap; }
+  table.data th { background: #8882; font-weight: 600; }
+  table.card { width: 100%; }
+  table.card td:not(:first-child), table.card th:not(:first-child) { text-align: right; }
+  table.card td:first-child { font-weight: 600; }
+  footer { margin-top: 2rem; color: #888; font-size: 0.85rem; }
+  code { background: #8882; padding: 0.1rem 0.35rem; border-radius: 4px; }
+"""
+
+
+def _page_html(scorecard, body, caption, ok):
+    verdict = "✅ all operations correct" if ok else "❌ some operations failed"
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>duckrun — pure SQL on Delta (the connection API)</title>
+  <style>{_PAGE_CSS}</style>
+</head>
+<body>
+  <a class="back" href="index.html">← duckrun docs</a>
+  <h1>pure SQL — the connection API<span class="tag">not a dbt project</span></h1>
+  <p class="lede">{html.escape(caption)}. Every statement below ran through <code>conn.sql(...)</code>
+  against live NYC&nbsp;TLC data, landing real Delta — the SQL and its actual output, top to bottom.</p>
+  <h2 style="margin-bottom:0.2rem">Run scorecard — <span style="font-weight:400">{verdict}</span></h2>
+  {scorecard}
+  {body}
+  <footer>Generated by
+    <a href="https://github.com/djouallah/duckrun/blob/main/tests/connection_api/demo_taxi.py">demo_taxi.py</a>
+    — re-published from a live OneLake run by the integration-tests workflow.</footer>
+</body>
+</html>
+"""
+
+
 # ── the scenario ─────────────────────────────────────────────────────────────────────────────────
 def run_taxi_demo(conn, schema):
     """The whole SQL-first showcase against ``conn``. Importable so it runs the same against a local
     warehouse (de-risking) or live OneLake (the demo)."""
+    _DOC.clear()
     q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731 — scalar helper
     start, end = _month_bounds(TAXI_MONTH)
     trips_parquet = f"{CF}/trip-data/yellow_tripdata_{TAXI_MONTH}.parquet"
@@ -161,7 +242,7 @@ def run_taxi_demo(conn, schema):
     # 1 ── real dimension off the web → Delta ─────────────────────────────────────────────────────
     with _step(1, "real dimension off the web: taxi-zone lookup CSV (https) → Delta 'zones'") as say:
         t0 = time.perf_counter()
-        _ddl(conn, f"""
+        _sql(conn, f"""
             CREATE OR REPLACE TABLE zones AS
             SELECT "LocationID"::INT AS zone_id, "Borough" AS borough,
                    "Zone" AS zone, "service_zone" AS service_zone
@@ -177,7 +258,7 @@ def run_taxi_demo(conn, schema):
     # 2 ── register the live month as a TEMP TABLE (full month, in-engine, read once) ──────────────
     with _step(2, f"register the live month: read_parquet yellow_tripdata_{TAXI_MONTH} (https, ~50MB) "
                   "→ TEMP TABLE 'trips_raw'") as say:
-        _ddl(conn, f"""
+        _sql(conn, f"""
             CREATE TEMP TABLE trips_raw AS
             SELECT
                 t.tpep_pickup_datetime  AS pickup_ts,
@@ -203,7 +284,7 @@ def run_taxi_demo(conn, schema):
     # 3 ── land a bounded sample → Delta 'trips' (CREATE TABLE AS … USING SAMPLE) ──────────────────
     with _step(3, f"land a bounded sample → Delta 'trips' (CREATE TABLE AS … USING SAMPLE {SAMPLE_ROWS:,})") as say:
         t0 = time.perf_counter()
-        _ddl(conn, f"""
+        _sql(conn, f"""
             CREATE OR REPLACE TABLE trips AS
             SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
             FROM trips_raw USING SAMPLE {SAMPLE_ROWS} ROWS
@@ -217,7 +298,7 @@ def run_taxi_demo(conn, schema):
 
     # 4 ── fancy SQL: QUALIFY window-rank ─────────────────────────────────────────────────────────
     with _step(4, "fancy SQL — QUALIFY: top-3 pickup zones by revenue WITHIN each borough") as say:
-        rows = conn.sql("""
+        rows = _sql(conn, """
             SELECT borough, zone, round(sum(total), 0)::BIGINT AS revenue, count(*) AS trips
             FROM trips GROUP BY borough, zone
             QUALIFY row_number() OVER (PARTITION BY borough ORDER BY sum(total) DESC) <= 3
@@ -229,7 +310,7 @@ def run_taxi_demo(conn, schema):
 
     # 5 ── fancy SQL: PIVOT ───────────────────────────────────────────────────────────────────────
     with _step(5, "fancy SQL — PIVOT: total fare by payment across time-of-day bands") as say:
-        df = conn.sql("""
+        df = _sql(conn, """
             PIVOT (
                 SELECT CASE WHEN pickup_hour < 6 THEN '0 night' WHEN pickup_hour < 12 THEN '1 morning'
                             WHEN pickup_hour < 18 THEN '2 afternoon' ELSE '3 evening' END AS band,
@@ -242,7 +323,7 @@ def run_taxi_demo(conn, schema):
 
     # 6 ── fancy SQL: ROLLUP super-aggregates ─────────────────────────────────────────────────────
     with _step(6, "fancy SQL — ROLLUP: fare subtotals by (borough, payment) with super-aggregates") as say:
-        rows = conn.sql("""
+        rows = _sql(conn, """
             SELECT coalesce(borough, '— ALL —') AS borough, coalesce(payment, '— ALL —') AS payment,
                    round(sum(fare), 0)::BIGINT AS fare, count(*) AS trips
             FROM trips GROUP BY ROLLUP (borough, payment)
@@ -254,15 +335,18 @@ def run_taxi_demo(conn, schema):
 
     # 7 ── fancy SQL: LIST/STRUCT nested types; write a flattened mart ─────────────────────────────
     with _step(7, "fancy SQL — LIST/STRUCT: per-borough top-zone array + fare quantiles → mart") as say:
-        print("      nested LIST<STRUCT> preview (DuckDB native types):", flush=True)
-        conn.sql("""
+        nested = _sql(conn, """
             SELECT borough,
                    (list(struct_pack(zone := zone, rev := rev) ORDER BY rev DESC))[1:3] AS top3_zones
             FROM (SELECT borough, zone, round(sum(total), 0)::BIGINT AS rev FROM trips GROUP BY borough, zone)
             GROUP BY borough ORDER BY borough
-        """).show()
+        """)
+        print("      nested LIST<STRUCT> preview:", flush=True)
+        nested.show()
+        _table([(b, str(z)) for b, z in nested.collect()],
+               ["borough", "top3_zones (LIST<STRUCT>)"], "  nested LIST<STRUCT> per borough", echo=False)
         t0 = time.perf_counter()
-        _ddl(conn, """
+        _sql(conn, """
             CREATE OR REPLACE TABLE mart_zone_summary AS
             WITH ranked AS (
                 SELECT borough, zone, round(sum(total), 0)::BIGINT AS rev,
@@ -288,13 +372,13 @@ def run_taxi_demo(conn, schema):
 
     # 8 ── fancy SQL: ASOF JOIN to a surge rate-card ──────────────────────────────────────────────
     with _step(8, "fancy SQL — ASOF JOIN: snap each trip to the latest surge multiplier by pickup time") as say:
-        _ddl(conn, """
+        _sql(conn, """
             CREATE TEMP TABLE surge_card AS
             SELECT * FROM (VALUES (TIME '00:00', 1.00), (TIME '07:00', 1.25), (TIME '10:00', 1.00),
                                   (TIME '16:00', 1.40), (TIME '20:00', 1.15)) v(valid_from, multiplier)
         """)
         t0 = time.perf_counter()
-        _ddl(conn, """
+        _sql(conn, """
             CREATE OR REPLACE TABLE mart_surged AS
             SELECT t.zone_id, t.borough, t.payment, t.pickup_ts, t.fare AS base_fare,
                    s.multiplier, round(t.fare * s.multiplier, 2) AS surged_fare
@@ -319,7 +403,7 @@ def run_taxi_demo(conn, schema):
     with _step(10, "raw-DML INSERT: append a 100-row late-arriving batch to 'trips'") as say:
         t0 = time.perf_counter()
         before = q("SELECT count(*) FROM trips")
-        _ddl(conn, """
+        _sql(conn, """
             INSERT INTO trips
             SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
             FROM trips_raw USING SAMPLE 100 ROWS
@@ -331,7 +415,7 @@ def run_taxi_demo(conn, schema):
 
     # 11 ── SQL-only upsert: DELETE affected keys + INSERT (1 update, 1 insert) ────────────────────
     with _step(11, "SQL-only upsert on 'zone_stats': DELETE literal keys + INSERT (1 update, 1 insert)") as say:
-        _ddl(conn, """
+        _sql(conn, """
             CREATE OR REPLACE TABLE zone_stats AS
             SELECT zone_id, any_value(zone) AS zone, count(*) AS trips, round(avg(fare), 2) AS avg_fare
             FROM trips GROUP BY zone_id
@@ -345,8 +429,8 @@ def run_taxi_demo(conn, schema):
         new_avg = round(old_avg + 5.0, 2)
         # delta-rs DELETE predicates take literals, not IN (SELECT …) — so we key the DELETE on literal
         # ids captured above, then INSERT the recomputed/new rows. That is the SQL-only upsert.
-        _ddl(conn, f"DELETE FROM zone_stats WHERE zone_id = {target} OR zone_id = 999")
-        _ddl(conn, f"INSERT INTO zone_stats VALUES "
+        _sql(conn, f"DELETE FROM zone_stats WHERE zone_id = {target} OR zone_id = 999")
+        _sql(conn, f"INSERT INTO zone_stats VALUES "
                    f"({target}, '{tgt_zone}', {tgt_trips}, {new_avg}), (999, 'NEW Demo Zone', 1, 7.77)")
         after = q("SELECT count(*) FROM zone_stats")
         upd_ok = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {target}") == new_avg
@@ -360,14 +444,14 @@ def run_taxi_demo(conn, schema):
         t0 = time.perf_counter()
         before = q("SELECT count(*) FROM trips")
         cash = q("SELECT count(*) FROM trips WHERE payment = 'Cash'")
-        _ddl(conn, "DELETE FROM trips WHERE payment = 'Cash'")
+        _sql(conn, "DELETE FROM trips WHERE payment = 'Cash'")
         after = q("SELECT count(*) FROM trips")
         still = q("SELECT count(*) FROM trips WHERE payment = 'Cash'")
         results.append(_row("DELETE Cash trips", before, after, before - cash, after == before - cash, still == 0,
                             time.perf_counter() - t0))
         path = conn.table_path(schema, "trips").replace("\\", "/")
         try:   # the cool path: DuckDB delta_scan version travel
-            at_landed = q(f"SELECT count(*) FROM delta_scan('{path}', version => {v_landed})")
+            at_landed = _sql(conn, f"SELECT count(*) FROM delta_scan('{path}', version => {v_landed})").fetchone()[0]
             how = f"delta_scan(version => {v_landed})"
         except Exception:  # fall back to delta-rs if this DuckDB build lacks the version param
             from deltalake import DeltaTable as _DLT
@@ -389,10 +473,17 @@ def run_taxi_demo(conn, schema):
         old_avg = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {busiest}")
         before = q("SELECT count(*) FROM zone_stats")
         cond = "target.zone_id = source.zone_id"
-        srcA = conn.sql(f"SELECT zone_id, zone, trips, 100.00::DOUBLE AS avg_fare FROM zone_stats WHERE zone_id = {busiest}")
-        srcB = conn.sql(f"SELECT zone_id, zone, trips, 200.00::DOUBLE AS avg_fare FROM zone_stats WHERE zone_id = {busiest}")
         # Spark API on purpose — conn.sql rejects MERGE. .merge() snapshot-pins at BUILD time, so both
         # writers capture the SAME version before either commits: exactly two concurrent writers.
+        _emit('  <pre class="py"># Spark builder API (conn.sql rejects MERGE) — both writers pin the SAME version:\n'
+              f'writer_A = DeltaTable.forName(conn, "zone_stats").merge(srcA, "{cond}") \\\n'
+              '    .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcA sets avg → 100.0\n'
+              f'writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, "{cond}") \\\n'
+              '    .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcB sets avg → 200.0\n'
+              'writer_A.execute()   # wins, advances the table version\n'
+              'writer_B.execute()   # stale snapshot → CommitFailedError</pre>')
+        srcA = conn.sql(f"SELECT zone_id, zone, trips, 100.00::DOUBLE AS avg_fare FROM zone_stats WHERE zone_id = {busiest}")
+        srcB = conn.sql(f"SELECT zone_id, zone, trips, 200.00::DOUBLE AS avg_fare FROM zone_stats WHERE zone_id = {busiest}")
         writer_A = DeltaTable.forName(conn, "zone_stats").merge(srcA, cond).whenMatchedUpdateAll().whenNotMatchedInsertAll()
         writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, cond).whenMatchedUpdateAll().whenNotMatchedInsertAll()
         say(f"both writers built against zone {busiest} (avg {old_avg}) at the same snapshot")
@@ -414,16 +505,16 @@ def run_taxi_demo(conn, schema):
 
     _scorecard(results)
 
-    # Emit the HTML scorecard for the docs page when asked (CI sets DUCKRUN_TAXI_CARD). The docs
-    # 'taxi' card is this fragment spliced in by inject_readme.py — always a real run's numbers.
-    card_path = os.environ.get("DUCKRUN_TAXI_CARD")
-    if card_path:
+    # Emit the standalone HTML report when asked (CI sets DUCKRUN_TAXI_PAGE → published as taxi.html).
+    page_path = os.environ.get("DUCKRUN_TAXI_PAGE")
+    if page_path:
         target = "OneLake" if str(getattr(conn, "root_path", "")).startswith(("abfss://", "az://")) else "local Delta"
-        caption = (f"Actual run: {SAMPLE_ROWS:,}-row sample of live NYC TLC Yellow-Taxi "
-                   f"{TAXI_MONTH} → {target}, {datetime.now(timezone.utc):%Y-%m-%d} UTC")
-        with open(card_path, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(_scorecard_html(results, caption))
-        print(f"  wrote HTML scorecard → {card_path}", flush=True)
+        caption = (f"Actual run · {SAMPLE_ROWS:,}-row sample of live NYC TLC Yellow-Taxi {TAXI_MONTH} "
+                   f"→ {target} · {datetime.now(timezone.utc):%Y-%m-%d} UTC")
+        ok = all(r["count_ok"] and r["values_ok"] for r in results)
+        with open(page_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_page_html(_scorecard_html(results), "\n".join(_DOC), caption, ok))
+        print(f"  wrote HTML report → {page_path}", flush=True)
 
     print(f"\n=== demo complete: {schema} ===", flush=True)
 
