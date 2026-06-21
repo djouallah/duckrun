@@ -107,7 +107,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.clearCache` | — | 🚫 | No Spark caching — by design. |
 | `catalog.dropTempView` | `conn.sql("DROP VIEW name")` | ➖ | TODO |
 | `catalog.refreshTable` | `conn.refresh()` | ➖ | TODO |
-| `catalog.recoverPartitions` | — | 🚫 | No Spark runtime — by design. |
+| `catalog.recoverPartitions` | — | ➖ | TODO (delta-rs gap) |
 
 ## `DeltaTable` (Delta-on-Spark) ↔ `conn.delta_table(name)` / `DeltaTable`
 
