@@ -131,7 +131,7 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.update(set, where)` | `.update(set=…, where=…)` | ✅ | |
 | `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `.replaceWhere(source, predicate)` | ✅ | One atomic Delta commit. |
 | `.history()` | `.version()` | 🟡 | duckrun exposes just the current version head. |
-| `spark.read.option("versionAsOf", N)` | `conn.sql("… delta_scan(path, version => N)")` | ✅ | Time-travel reads go through SQL. |
+| `spark.read.option("versionAsOf", N)` | `conn.sql("… delta_scan(path, version => N)")` | ➖ | TODO |
 | `.vacuum()` | — | 🚫 | Maintenance op — use `deltalake` / delta-rs directly against the table path. |
 | `.optimize()` | — | 🚫 | Compaction — use `deltalake` / delta-rs directly. |
 | `.generate()` | — | 🚫 | Manifest generation — use `deltalake` / delta-rs directly. |
