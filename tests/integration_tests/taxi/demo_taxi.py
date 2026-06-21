@@ -8,9 +8,12 @@ DuckDB's fancy SQL (QUALIFY, PIVOT, ROLLUP, LIST/STRUCT, ASOF JOIN) and closes w
 scorecard. ``test_coffee.py`` already covers the Spark-style builder API on generated data; this is
 the SQL-first, real-data counterpart.
 
-The one deliberate non-SQL step is the finale: a **concurrent MERGE clash** staged through the
-Spark ``DeltaTable.merge`` builder (``conn.sql`` rejects ``MERGE`` on purpose) — two writers pinned
-to one snapshot, the stale one refused with ``CommitFailedError``, proving snapshot isolation.
+The demo is split in two parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql``.
+**Part 2** switches to the Spark API on the same connection — the ``DataFrameWriter`` writing Delta by
+**path** (``.mode("overwrite"/"append").save(path)``, read back with ``conn.read.delta(path)``), closing
+with a **concurrent MERGE clash** staged through the Spark ``DeltaTable.merge`` builder (``conn.sql``
+rejects ``MERGE`` on purpose) — two writers pinned to one snapshot, the stale one refused with
+``CommitFailedError``, proving snapshot isolation.
 
 Heavy read+compute runs in-engine over the *full* month (millions of rows, local CPU); only a
 bounded **sample** plus compact marts are written over the network to OneLake, so the network is not
@@ -68,6 +71,13 @@ def _emit(fragment):
 
 
 # ── narration + rendering helpers ────────────────────────────────────────────────────────────────
+def _part(label, blurb):
+    """Open a top-level part of the demo (console banner + an <h2> divider in the HTML report).
+    Used to split the SQL-first steps from the Spark-API steps."""
+    print(f"\n══ {label} ══  {blurb}", flush=True)
+    _emit(f'\n<h2 class="part">{html.escape(label)}</h2>\n  <p class="lede">{html.escape(blurb)}</p>')
+
+
 @contextmanager
 def _step(n, label):
     """Narrate and time one stage of the demo (console), and open a <section> in the HTML report."""
@@ -193,6 +203,8 @@ _PAGE_CSS = """
   h1 { margin: 0.4rem 0 0.2rem; }
   h1 .tag { font-size: 0.7rem; font-weight: 700; color: #fff; background: #c0392b;
             padding: 0.12rem 0.5rem; border-radius: 6px; vertical-align: middle; margin-left: 0.4rem; }
+  h2.part { margin: 2rem 0 0.2rem; padding-bottom: 0.3rem; border-bottom: 2px solid #c0392b88;
+            font-size: 1.25rem; }
   p.lede { color: #777; margin-top: 0; }
   section { border-top: 1px solid #8883; padding: 0.6rem 0 0.4rem; }
   h3 { margin: 0.8rem 0 0.5rem; font-size: 1.05rem; }
@@ -221,14 +233,15 @@ def _page_html(scorecard, body, caption, ok):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>duckrun — pure SQL on Delta (the connection API)</title>
+  <title>duckrun — the connection API on Delta (SQL &amp; Spark)</title>
   <style>{_PAGE_CSS}</style>
 </head>
 <body>
   <a class="back" href="index.html">← duckrun docs</a>
-  <h1>pure SQL — the connection API<span class="tag">not a dbt project</span></h1>
-  <p class="lede">{html.escape(caption)}. Every statement below ran through <code>conn.sql(...)</code>
-  against live NYC&nbsp;TLC data, landing real Delta — the SQL and its actual output, top to bottom.</p>
+  <h1>the connection API — SQL &amp; Spark<span class="tag">not a dbt project</span></h1>
+  <p class="lede">{html.escape(caption)}. Part 1 runs raw SQL through <code>conn.sql(...)</code>; Part 2 uses
+  the Spark <code>DataFrameWriter</code>/<code>DeltaTable</code> API to write by path — both against live
+  NYC&nbsp;TLC data, landing real Delta, top to bottom.</p>
   <h2 style="margin-bottom:0.2rem">Run scorecard — <span style="font-weight:400">{verdict}</span></h2>
   {scorecard}
   {body}
@@ -252,6 +265,10 @@ def run_taxi_demo(conn, schema):
 
     print(f"\n=== NYC taxi live demo | schema='{schema}' | month={TAXI_MONTH} | "
           f"sample={SAMPLE_ROWS:,} | warehouse={getattr(conn, 'root_path', '?')} ===", flush=True)
+
+    _part("Part 1 · pure SQL through conn.sql",
+          "Every statement in this part is raw SQL handed to conn.sql(...) — reads, CREATE TABLE AS, "
+          "INSERT, DELETE, time travel — each landing real Delta via delta-rs.")
 
     # 1 ── real dimension off the web → Delta ─────────────────────────────────────────────────────
     with _step(1, "real dimension off the web: taxi-zone lookup CSV (https) → Delta 'zones'") as say:
@@ -397,9 +414,49 @@ def run_taxi_demo(conn, schema):
                ["before", "Cash deleted", "after (now)", "at landed ver"], "  time travel: current vs landed snapshot")
         say(f"deleted {cash:,} Cash trips ({before:,} → {after:,}); {how} still sees {at_landed:,}")
 
-    # 9 ── concurrent MERGE clash — Spark builder API, snapshot isolation ──────────────────────────
-    with _step(9, "concurrent MERGE clash (Spark DeltaTable.merge): two writers, one snapshot — "
-                  "the stale one is refused") as say:
+    _part("Part 2 · the Spark API — write Delta by path",
+          "Same connection, no SQL DML: the Spark DataFrameWriter and DeltaTable builder. Writes are "
+          "addressed by a storage PATH (local / s3:// / gs:// / abfss://), not a catalog name.")
+
+    # 9 ── Spark write by PATH: df.write.mode('overwrite').save(path) ──────────────────────────────
+    with _step(9, "Spark write by path: df.write.mode('overwrite').save(path) → a bare Delta dir "
+                  "(no catalog name)") as say:
+        t0 = time.perf_counter()
+        by_path = conn.table_path(schema, "borough_hourly")     # any store works: local / s3:// / abfss://
+        by_path_q = by_path.replace("\\", "/")
+        _emit('  <pre class="py"># Spark DataFrameWriter — addressed by a storage PATH, not a schema.table name:\n'
+              'df = conn.sql("SELECT borough, pickup_hour, count(*) AS trips "\n'
+              '              "FROM trips GROUP BY borough, pickup_hour")\n'
+              'df.write.format("delta").mode("overwrite").save(path)   # land Delta at the path\n'
+              'conn.read.delta(path).count()                           # read it back BY PATH</pre>')
+        df = conn.sql("SELECT borough, pickup_hour, count(*) AS trips "
+                      "FROM trips GROUP BY borough, pickup_hour")
+        df.write.format("delta").mode("overwrite").save(by_path)
+        n_path = conn.read.delta(by_path).count()
+        results.append(_row("Spark save by path (overwrite)", 0, n_path, n_path, n_path > 0, n_path > 0,
+                            time.perf_counter() - t0))
+        top = conn.sql(f"SELECT borough, pickup_hour, trips FROM delta_scan('{by_path_q}') "
+                       "ORDER BY trips DESC LIMIT 5").collect()
+        _table([(b, h, f"{tr:,}") for b, h, tr in top], ["borough", "pickup_hour", "trips"],
+               "  read back by path — conn.read.delta(path) / delta_scan(path)")
+        say(f"{n_path} (borough, hour) rows written to a bare Delta path and read back by path")
+
+    # 10 ── Spark append by PATH: df.write.mode('append').save(path) — grow the same dir ───────────
+    with _step(10, "Spark append by path: df.write.mode('append').save(path) — grow the same Delta dir") as say:
+        t0 = time.perf_counter()
+        before = conn.read.delta(by_path).count()
+        _emit('  <pre class="py">extra = conn.sql("SELECT \'EWR\' AS borough, 25 AS pickup_hour, 1 AS trips")\n'
+              'extra.write.format("delta").mode("append").save(path)   # append to the SAME path</pre>')
+        extra = conn.sql("SELECT 'EWR' AS borough, 25 AS pickup_hour, 1 AS trips")
+        extra.write.format("delta").mode("append").save(by_path)
+        after = conn.read.delta(by_path).count()
+        results.append(_row("Spark append by path", before, after, before + 1, after == before + 1,
+                            after - before == 1, time.perf_counter() - t0))
+        say(f"{before:,} → {after:,} rows (appended by path)")
+
+    # 11 ── concurrent MERGE clash — Spark builder API, snapshot isolation ─────────────────────────
+    with _step(11, "concurrent MERGE clash (Spark DeltaTable.merge): two writers, one snapshot — "
+                   "the stale one is refused") as say:
         from duckrun import DeltaTable
         from deltalake.exceptions import CommitFailedError
         t0 = time.perf_counter()

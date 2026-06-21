@@ -404,6 +404,18 @@ class DataFrame:
     def count(self) -> int:
         return self.relation.aggregate("count(*)").fetchone()[0]
 
+    def createOrReplaceTempView(self, name: str) -> "DataFrame":
+        """Register this DataFrame as a session-scoped view named ``name``, so it can be queried by
+        name via ``conn.sql("select * from name")`` (Spark ``createOrReplaceTempView``).
+
+        This is the path-read counterpart to ``saveAsTable``: ``conn.read.delta(path)`` returns a
+        DataFrame but registers nothing, so this is how a by-path read becomes queryable by name. The
+        view is **native DuckDB and ephemeral** — it is not a Delta table, is not written to storage,
+        and does not appear in ``conn.catalog``; use ``saveAsTable`` to persist as Delta. Returns
+        ``self`` so it chains."""
+        self.relation.create_view(name, replace=True)
+        return self
+
     def __getattr__(self, name):
         # Only reached for attributes not found on DataFrame itself.
         return getattr(self.relation, name)
