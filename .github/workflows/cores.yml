@@ -351,4 +351,4 @@ jobs:
 
       - name: Run the local coffee-shop scenario (small N)
         # -s streams the scenario's stage-by-stage narration into the job log.
-        run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider
+        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider

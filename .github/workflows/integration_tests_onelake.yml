@@ -225,7 +225,7 @@ jobs:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DUCKRUN_IT_SCHEMA: duckrun_conn_it
           COFFEE_ONELAKE_ROWS: "2000"
-        run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
+        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
 
       - name: Connect over a FRIENDLY-name OneLake path (delta-kernel #307 error-hygiene gate)
         # Same lakehouse as above, addressed by friendly workspace/lakehouse names instead of GUIDs.
@@ -234,7 +234,7 @@ jobs:
         # CREATE VIEW SQL) and carries the GUID workaround. The GUID jobs above can't cover this.
         env:
           WAREHOUSE_PATH_FRIENDLY: abfss://tpch@onelake.dfs.fabric.microsoft.com/duckrun.Lakehouse/Tables
-        run: python -m pytest tests/connection_api/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
+        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
 
   taxi:
     # The SQL-first NYC-taxi showcase: a runnable demo (not a gate) that reads real live NYC TLC

@@ -150,7 +150,7 @@ jobs:
           # -s: stream the scenario's stage-by-stage narration into the log (without it pytest
           # captures the prints and the run shows nothing).
           /usr/bin/time -v python -m pytest \
-            tests/connection_api/test_coffee.py::test_coffee_local \
+            tests/integration_tests/coffee/test_coffee.py::test_coffee_local \
             -q -s -p no:cacheprovider 2>&1 | tee stress.log
           rc=${PIPESTATUS[0]}
           {

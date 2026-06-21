@@ -10,8 +10,8 @@ clean-targets:
   - "target"
   - "dbt_packages"
 
-# The dbt incarnation of the coffee-shop scenario (the connection-API version lives at
-# tests/connection_api/test_coffee.py). Same pipeline as a real DAG: ingest the two dimension CSVs over https, dedup the
+# The dbt incarnation of the coffee-shop scenario (the connection-API version lives alongside this,
+# at tests/integration_tests/coffee/test_coffee.py). Same pipeline as a real DAG: ingest the two dimension CSVs over https, dedup the
 # SCD2 product dim to a current unique-key table, generate an N-row fact joined 1:1 to the dims and
 # partitioned by region, then a revenue mart. N comes from COFFEE_ROWS (env) so CI can crank it; docs
 # only compile, so the network/build is never touched when generating the DAG.
