@@ -232,6 +232,16 @@ jobs:
           WAREHOUSE_PATH_FRIENDLY: abfss://tpch@onelake.dfs.fabric.microsoft.com/duckrun.Lakehouse/Tables
         run: python -m pytest tests/connection_api/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
 
+      - name: NYC taxi live demo (SQL-first connection-API showcase, OneLake)
+        # A runnable demo, not a gate — it reads real live NYC TLC data over https, so a flaky
+        # source must not redden this job. Writes to its own schema so it never collides with the
+        # coffee tables in the shared lakehouse.
+        continue-on-error: true
+        env:
+          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
+        run: python tests/connection_api/demo_taxi.py
+
   sde:
     # The josephmachado/simple_dbt_project port: a tiny LOCAL full build for the docs catalog
     # (order_status_pivot needs the gold table to exist at parse time, so it can't be DAG-only),
