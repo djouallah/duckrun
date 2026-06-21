@@ -121,18 +121,3 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.history()` | `.version()` | 🟡 | duckrun exposes just the current version head. |
 | `spark.read.option("versionAsOf", N)` | `conn.sql("… delta_scan(path, version => N)")` | ✅ | Time-travel reads go through SQL. |
 | `.vacuum()` / `.generate()` / `.restoreToVersion()` / `.optimize()` / `.clone()` / `convertToDelta` | — | 🚫 | Maintenance ops — reach for `deltalake` / delta-rs directly against the table path. |
-
-## By design — not gaps
-
-The 🚫 rows above are choices, not a backlog:
-
-- **No DataFrame transform builder** — duckrun is SQL-first. `select` / `filter` / `groupBy` / `join`
-  / `withColumn` and friends are written as SQL through `conn.sql(...)`; the `DataFrame` is a
-  relation handle, not a query builder.
-- **No Spark-runtime surface** — `sparkContext`, `conf`, broadcast, Spark-side UDF registration,
-  caching/persistence. There is no cluster: it's DuckDB in-process. (Register UDFs on the raw DuckDB
-  `conn.connection` when you need them.)
-- **No cluster/maintenance ops in this surface** — `OPTIMIZE`, `VACUUM`, Z-ordering, etc. — use
-  `deltalake` / delta-rs directly against the table path.
-
-Only the ➖ rows are candidates that could be wired up if there's demand.
