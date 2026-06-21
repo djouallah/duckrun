@@ -846,3 +846,87 @@ def test_with_prefixed_update_parked(tmp_path):
     c = _seed(str(tmp_path / "wh"))
     c.sql("with bump as (select 1 id) update items set name = 'Z' where id in (select id from bump)")
     assert c.sql("select name from items where id = 1").fetchone()[0] == "Z"
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# KNOWN GAPS — operations duckrun ACCEPTS and runs, but where the result is silently wrong/surprising.
+#
+# These are the "should arguably fail (or fence), but passes" cases: a user does something reasonable,
+# gets no error, and lands corrupted or junk data. Each test pins the CURRENT (wrong-but-real)
+# behaviour so a future fix becomes a deliberate, test-visible decision — the same convention as the
+# strict-xfail parked test above. Per the no-gaming rule, nothing here is weakened to fake a pass; the
+# assertion IS the unwelcome behaviour. None of this endorses the behaviour as correct.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+def test_sql_upsert_idiom_is_not_atomic_under_a_concurrent_writer(tmp_path):
+    """The SQL upsert idiom (DELETE literal keys + INSERT, EQUIV['upsert']) is TWO separate, unfenced
+    delta-rs commits. A concurrent writer that touches the same key between the DELETE and the INSERT
+    is not detected: the INSERT blindly appends at HEAD, producing a duplicate key. The Spark
+    `DeltaTable.merge` this idiom mirrors auto-pins and would raise CommitFailedError instead
+    (test_pinned_merge_refuses_on_foreign_commit). conn.sql DML does not fence."""
+    wh = str(tmp_path / "wh")
+    c = _seed(wh)
+    path = c.table_path("dbo", "items")
+
+    c.sql("delete from items where id = 2")
+    # A concurrent writer lands a row for the SAME key the upsert is about to re-insert.
+    engine.write_delta(path, duckdb.connect().sql("select 2 as id, 'FOREIGN' as name"), mode="append")
+    c.sql("insert into items values (2, 'B')")   # blind append at HEAD — no conflict raised
+
+    # Both rows for id=2 survive: the upsert silently lost its uniqueness invariant.
+    assert _select(wh, "select name from items where id = 2") == sorted([("B",), ("FOREIGN",)])
+
+
+def test_read_then_write_across_two_sql_calls_is_not_snapshot_bound(tmp_path):
+    """A value read in one conn.sql call and used by a later conn.sql write is NOT one snapshot. A
+    concurrent writer between the read and the write is invisible to the write, so a read-modify-write
+    computes off stale state with no error — here a stale max(id)+1 collides with a row a concurrent
+    writer already claimed, yielding a duplicate key. Single Spark ops are fenced; this manual
+    two-call pattern is not (the conn-API read→write pinning gap)."""
+    wh = str(tmp_path / "wh")
+    c = _seed(wh)
+    path = c.table_path("dbo", "items")
+
+    next_id = c.sql("select max(id) + 1 from items").fetchone()[0]   # reads 4 at this snapshot
+    # A concurrent writer claims id=4 before our write lands.
+    engine.write_delta(path, duckdb.connect().sql("select 4 as id, 'FOREIGN' as name"), mode="append")
+    c.sql(f"insert into items values ({next_id}, 'mine')")          # blindly reuses id=4
+
+    assert _select(wh, "select name from items where id = 4") == sorted([("FOREIGN",), ("mine",)])
+
+
+def test_insert_values_silently_coerces_a_fractional_literal(tmp_path):
+    """_append_projected casts every literal to the target column's type with no validation. A
+    fractional literal inserted into an INTEGER column is silently coerced to an integer (fraction
+    dropped) rather than rejected or preserved — the kind of implicit narrowing a stricter warehouse
+    would refuse."""
+    wh = str(tmp_path / "wh")
+    _seed(wh).sql("insert into wide (id, name, qty) values (7, 'g', 3.9)")  # wide.qty is INTEGER
+
+    landed = _select(wh, "select qty from wide where id = 7")[0][0]
+    assert isinstance(landed, int) and landed in (3, 4)   # silently coerced; the 0.9 is gone
+    assert _dtypes(wh, "wide")["qty"] in ("INTEGER", "BIGINT", "HUGEINT")
+
+
+def test_sql_dml_on_an_unknown_table_gives_a_misdirecting_message(tmp_path):
+    """An UPDATE whose target is not a known Delta table is rejected with the generic "use the Spark
+    write API" message — which misdirects: the real problem is a missing/typo'd table, not the wrong
+    API, and the offending table name is never echoed. A user debugging a typo gets no "no such table"
+    signal."""
+    c = _seed(str(tmp_path / "wh"))
+    with pytest.raises(ValueError) as ei:
+        c.sql("update does_not_exist set name = 'x' where id = 1")
+    assert "does_not_exist" not in str(ei.value)   # the offending name is never surfaced
+
+
+def test_drop_then_read_by_path_returns_the_tombstone_row(tmp_path):
+    """`drop table` overwrites the table to a one-column tombstone and hides it from discovery, but
+    reading it BY PATH bypasses discovery: conn.read.delta(path) returns the junk one-column tombstone
+    row instead of erroring or yielding the (still-on-disk) dropped data."""
+    wh = str(tmp_path / "wh")
+    c = _seed(wh)
+    path = c.table_path("dbo", "items")
+    c.sql("drop table items")
+
+    df = c.read.delta(path)
+    assert df.columns == [TOMBSTONE_COLUMN]   # a single junk marker, not the dropped data, not empty
+    assert df.count() == 1
