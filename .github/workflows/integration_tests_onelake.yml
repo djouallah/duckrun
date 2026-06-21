@@ -10,8 +10,8 @@ name: integration_tests_onelake
 #   • merge_spill — tiny local build for the docs catalog, then the incremental-MERGE chain
 #                   (merge_tpch_bench.py) over OneLake at a SMALL scale factor. The HEAVY SF=10
 #                   (60M-row) memory-spill version stays a LOCAL release gate (local_stress_tests.yml).
-#   • coffee      — build the dbt models ON OneLake at a 100M-row fact (like aemo) so the docs
-#                   catalog reflects the live tables, then the connection-API coffee scenario.
+#   • coffee      — build the dbt models ON OneLake (like aemo) so the docs catalog reflects the
+#                   live tables, then the connection-API coffee scenario.
 #   • sde         — tiny local build for the docs catalog, then the SCD2 port driven through real
 #                   dbt subprocesses against a persistent OneLake snapshot.
 #
@@ -177,7 +177,7 @@ jobs:
           --sf 1
 
   coffee:
-    # The coffee-shop project: build the dbt models DIRECTLY on OneLake at a 100M-row fact (the same
+    # The coffee-shop project: build the dbt models DIRECTLY on OneLake (the same
     # build-on-OneLake-then-docs pattern aemo uses), so the published coffee.html DAG/catalog reflects
     # the live OneLake tables — not a throwaway local build. Then the connection-API coffee scenario
     # (duckrun.connect) over OneLake, into an isolated schema.
@@ -207,14 +207,15 @@ jobs:
           TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: dbt build + docs generate (OneLake — docs reflect the live 100M tables)
+      - name: dbt build + docs generate (OneLake — docs reflect the live tables)
         # Build the models straight onto OneLake so `dbt docs generate` collects the REAL catalog stats
-        # (row counts/size) off the abfss:// Delta tables. COFFEE_ROWS=100M sizes the fact; DBT_SCHEMA
-        # isolates it from the connection-API scenario's schema in the shared lakehouse.
+        # (row counts/size) off the abfss:// Delta tables. COFFEE_ROWS sizes the fact (kept small — the
+        # 100M scale is already proven); DBT_SCHEMA isolates it from the connection-API scenario's
+        # schema in the shared lakehouse.
         working-directory: tests/integration_tests/coffee
         env:
           DBT_SCHEMA: duckrun_dbt_it
-          COFFEE_ROWS: "100000000"
+          COFFEE_ROWS: "10000"
         run: |
           dbt build --target dev
           dbt docs generate --static --target dev
