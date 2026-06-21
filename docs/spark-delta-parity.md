@@ -37,7 +37,10 @@ that says *which mapped methods actually pass their tests*; this page says *what
 | `spark.createDataFrame(rows)` | `conn.sql("SELECT * FROM (VALUES …) t(…)")` | 🚫 | SQL-first by design — build data with SQL, not a Python constructor. |
 | `spark.range(n)` | `conn.sql("SELECT … FROM range(n)")` | 🚫 | SQL-first by design. |
 | — | `conn.delta_table(name)` | 🟡 | duckrun shortcut for `DeltaTable.forName(conn, name)`. |
-| — | `conn.table_path(schema, table)` / `conn.resolve(name)` / `conn.refresh()` / `conn.connection` | 🟡 | duckrun plumbing: locate a table's storage path, re-discover the catalog, and the DuckDB escape hatch. |
+| — | `conn.table_path(schema, table)` | 🟡 | duckrun plumbing: locate a table's storage path. |
+| — | `conn.resolve(name)` | 🟡 | duckrun plumbing: resolve a name to `(schema, table)`. |
+| — | `conn.refresh()` | 🟡 | duckrun plumbing: re-discover the catalog. |
+| — | `conn.connection` | 🟡 | The raw DuckDB connection — escape hatch. |
 
 ## `DataFrame`
 
@@ -54,7 +57,9 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `df.count()` | `df.count()` | ✅ | |
 | `df.show()` | `df.show()` | ✅ | |
 | `df.createOrReplaceTempView(name)` | `df.createOrReplaceTempView(name)` | ✅ | Native, ephemeral DuckDB view — not Delta, not in `conn.catalog`. |
-| `df.columns` / `df.dtypes` | (passthrough) | 🟡 | Not reimplemented — `__getattr__` forwards to the wrapped DuckDB relation. `columns` is a list of names (like Spark); `dtypes` returns DuckDB types, not Spark `(name, type)` tuples. (`df.schema` is not exposed.) |
+| `df.columns` | (passthrough) | 🟡 | Not reimplemented — `__getattr__` forwards to the DuckDB relation; a list of names, like Spark. |
+| `df.dtypes` | (passthrough) | 🟡 | Passthrough to the DuckDB relation — returns DuckDB types, not Spark `(name, type)` tuples. |
+| `df.schema` | — | 🚫 | Not exposed (the DuckDB relation has no `schema`). |
 
 ## `DataFrameReader` (`conn.read`)
 
@@ -68,8 +73,10 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `read.csv(path)` | `read.csv(path)` | ✅ | |
 | `read.table(name)` | `read.table(name)` | ✅ | |
 | `read.schema(…)` | — | 🚫 | DuckDB infers the schema — by design. |
-| `read.json` / `read.orc` | — | ➖ | Could be wired (DuckDB reads both). |
-| `read.jdbc` / `read.text` | — | 🚫 | No JDBC layer; `text` is not a lakehouse format. |
+| `read.json` | — | ➖ | Could be wired (DuckDB reads JSON). |
+| `read.orc` | — | ➖ | Could be wired (DuckDB reads ORC). |
+| `read.jdbc` | — | 🚫 | No JDBC layer. |
+| `read.text` | — | 🚫 | `text` is not a lakehouse format. |
 
 ## `DataFrameWriter` (`df.write`)
 
@@ -83,7 +90,8 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `write.saveAsTable(name)` | `write.saveAsTable(name)` | ✅ | Write Delta by **catalog name**. |
 | — | `write.mode("safeappend")` | 🟡 | duckrun extra: a fail-loud compare-and-swap append (no Spark equivalent). |
 | `write.insertInto(name)` | `df.write.mode("append").saveAsTable(name)` | 🚫 | Covered by `saveAsTable` + `mode` — by design. |
-| `write.bucketBy` / `sortBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
+| `write.bucketBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
+| `write.sortBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 
 ## `Catalog` (`conn.catalog`)
 
@@ -97,7 +105,11 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.tableExists(t, db)` | `catalog.tableExists(t, db)` | ✅ | |
 | `catalog.databaseExists(db)` | `catalog.databaseExists(db)` | ✅ | |
 | `catalog.listFunctions()` | — | ➖ | Could be added from DuckDB's function catalog. |
-| `catalog.cacheTable` / `clearCache` / `dropTempView` / `refreshTable` / `recoverPartitions` | — | 🚫 | No Spark caching/runtime — by design. |
+| `catalog.cacheTable` | — | 🚫 | No Spark caching — by design. |
+| `catalog.clearCache` | — | 🚫 | No Spark caching — by design. |
+| `catalog.dropTempView` | — | 🚫 | No Spark runtime — by design. |
+| `catalog.refreshTable` | — | 🚫 | No Spark runtime — by design. |
+| `catalog.recoverPartitions` | — | 🚫 | No Spark runtime — by design. |
 
 ## `DeltaTable` (Delta-on-Spark) ↔ `conn.delta_table(name)` / `DeltaTable`
 
@@ -114,7 +126,9 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.whenMatchedUpdateAll()` | `.whenMatchedUpdateAll()` | ✅ | |
 | `.whenNotMatchedInsertAll()` | `.whenNotMatchedInsertAll()` | ✅ | |
 | `.whenNotMatchedBySourceDelete()` | `.whenNotMatchedBySourceDelete()` | ✅ | |
-| `.whenMatchedDelete()` / `.whenNotMatchedInsert(values=…)` / `.whenNotMatchedBySourceUpdate(set=…)` | — | ➖ | The implemented clauses are the common upsert + sync-delete subset; the rest can be added. |
+| `.whenMatchedDelete()` | — | ➖ | Not yet — the implemented clauses are the common upsert + sync-delete subset. |
+| `.whenNotMatchedInsert(values=…)` | — | ➖ | Not yet — `whenNotMatchedInsertAll` is implemented. |
+| `.whenNotMatchedBySourceUpdate(set=…)` | — | ➖ | Not yet — `whenNotMatchedBySourceDelete` is implemented. |
 | `.delete(predicate)` | `.delete(predicate)` | ✅ | delta-rs predicates take literals (not `IN (SELECT …)`). |
 | `.update(set, where)` | `.update(set=…, where=…)` | ✅ | |
 | `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `.replaceWhere(source, predicate)` | ✅ | One atomic Delta commit. |
