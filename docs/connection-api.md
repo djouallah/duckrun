@@ -73,9 +73,9 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 └───────────────────────────┘
 ```
 
-### DataFrame / `DeltaTable` API — 36/36 ✅
+### DataFrame API — 36/36 ✅
 
-> Methods that mirror the DataFrame API (and Delta Lake's `DeltaTable` API) 1:1.
+> Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
 | Surface | Methods | Pass |
 | --- | --- | :-: |
