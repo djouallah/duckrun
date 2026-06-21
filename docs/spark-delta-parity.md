@@ -88,7 +88,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `write.save(path)` | `write.save(path)` | ✅ | Write Delta by **path**. |
 | `write.saveAsTable(name)` | `write.saveAsTable(name)` | ✅ | Write Delta by **catalog name**. |
 | — | `write.mode("safeappend")` | 🟡 | duckrun extra: a fail-loud compare-and-swap append (no Spark equivalent). |
-| `write.insertInto(name)` | `df.write.mode("append").saveAsTable(name)` | 🚫 | Covered by `saveAsTable` + `mode` — by design. |
+| `write.insertInto(name)` | `df.write.mode("append").saveAsTable(name)` | 🟡 | Same capability via `saveAsTable` + `mode("append")`; no separate `insertInto`. |
 | `write.bucketBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 | `write.sortBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 
