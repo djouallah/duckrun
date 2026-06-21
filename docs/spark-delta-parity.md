@@ -34,8 +34,8 @@ that says *which mapped methods actually pass their tests*; this page says *what
 | `spark.table(name)` | `conn.table(name)` | ✅ | |
 | `spark.read` | `conn.read` | ✅ | → `DataFrameReader`. |
 | `spark.catalog` | `conn.catalog` | ✅ | → `Catalog` (see below). |
-| `spark.createDataFrame(rows)` | `conn.sql("SELECT * FROM (VALUES …) t(…)")` | 🚫 | SQL-first by design — build data with SQL, not a Python constructor. |
-| `spark.range(n)` | `conn.sql("SELECT … FROM range(n)")` | 🚫 | SQL-first by design. |
+| `spark.createDataFrame(rows)` | `conn.sql("SELECT * FROM (VALUES …) t(…)")` | ✅ | Build rows with SQL `VALUES`. |
+| `spark.range(n)` | `conn.sql("SELECT … FROM range(n)")` | ✅ | Via SQL `range(n)`. |
 | — | `conn.delta_table(name)` | 🟡 | duckrun shortcut for `DeltaTable.forName(conn, name)`. |
 | — | `conn.table_path(schema, table)` | 🟡 | duckrun plumbing: locate a table's storage path. |
 | — | `conn.resolve(name)` | 🟡 | duckrun plumbing: resolve a name to `(schema, table)`. |
@@ -59,7 +59,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `df.createOrReplaceTempView(name)` | `df.createOrReplaceTempView(name)` | ✅ | Native, ephemeral DuckDB view — not Delta, not in `conn.catalog`. |
 | `df.columns` | (passthrough) | 🟡 | Not reimplemented — `__getattr__` forwards to the DuckDB relation; a list of names, like Spark. |
 | `df.dtypes` | (passthrough) | 🟡 | Passthrough to the DuckDB relation — returns DuckDB types, not Spark `(name, type)` tuples. |
-| `df.schema` | — | 🚫 | Not exposed (the DuckDB relation has no `schema`). |
+| `df.schema` | — | ➖ | Not exposed yet; could be derived from `columns` + `dtypes`. |
 
 ## `DataFrameReader` (`conn.read`)
 
@@ -88,7 +88,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `write.save(path)` | `write.save(path)` | ✅ | Write Delta by **path**. |
 | `write.saveAsTable(name)` | `write.saveAsTable(name)` | ✅ | Write Delta by **catalog name**. |
 | — | `write.mode("safeappend")` | 🟡 | duckrun extra: a fail-loud compare-and-swap append (no Spark equivalent). |
-| `write.insertInto(name)` | `df.write.mode("append").saveAsTable(name)` | 🟡 | Same capability via `saveAsTable` + `mode("append")`; no separate `insertInto`. |
+| `write.insertInto(name)` | `df.write.mode("append").saveAsTable(name)` | ✅ | Append by name via `saveAsTable` + `mode("append")`. |
 | `write.bucketBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 | `write.sortBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 
@@ -106,7 +106,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.cacheTable` | — | 🚫 | No Spark caching — by design. |
 | `catalog.clearCache` | — | 🚫 | No Spark caching — by design. |
 | `catalog.dropTempView` | `conn.sql("DROP VIEW name")` | ➖ | Temp views are native DuckDB (`createOrReplaceTempView`) — drop one today with `DROP VIEW`; a dedicated method could be added. |
-| `catalog.refreshTable` | — | 🚫 | No Spark runtime — by design. |
+| `catalog.refreshTable` | `conn.refresh()` | ✅ | `conn.refresh()` re-discovers the catalog. |
 | `catalog.recoverPartitions` | — | 🚫 | No Spark runtime — by design. |
 
 ## `DeltaTable` (Delta-on-Spark) ↔ `conn.delta_table(name)` / `DeltaTable`
