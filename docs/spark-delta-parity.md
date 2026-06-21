@@ -55,7 +55,6 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `df.show()` | `df.show()` | ✅ | |
 | `df.createOrReplaceTempView(name)` | `df.createOrReplaceTempView(name)` | ✅ | Native, ephemeral DuckDB view — not Delta, not in `conn.catalog`. |
 | `df.columns` / `df.schema` / `df.dtypes` | (passthrough) | 🟡 | Reached via `__getattr__` to the wrapped DuckDB relation. |
-| `df.select` / `filter` / `groupBy` / `join` / `withColumn` / `orderBy` / `agg` / … | `conn.sql(...)` | 🚫 | **SQL-first by design** — express transforms in SQL, not a fluent builder. |
 
 ## `DataFrameReader` (`conn.read`)
 
