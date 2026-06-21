@@ -54,7 +54,7 @@ WAREHOUSE_PATH = os.environ.get("WAREHOUSE_PATH")
 ONELAKE_TOKEN = os.environ.get("ONELAKE_TOKEN") or os.environ.get("AZURE_STORAGE_TOKEN")
 TAXI_SCHEMA = os.environ.get("DUCKRUN_TAXI_SCHEMA", "duckrun_taxi_demo")
 TAXI_MONTH = os.environ.get("TAXI_MONTH", "2024-01")
-SAMPLE_ROWS = int(os.environ.get("TAXI_SAMPLE_ROWS", "50000"))
+SAMPLE_ROWS = int(os.environ.get("TAXI_SAMPLE_ROWS", "2000000"))
 
 
 # ── HTML report accumulator ──────────────────────────────────────────────────────────────────────
@@ -190,7 +190,7 @@ _PAGE_CSS = """
   p.note::before { content: "→ "; color: #888; }
   p.tcap { color: #888; font-size: 0.82rem; margin: 0.6rem 0 0.2rem; }
   table.data { border-collapse: collapse; font-size: 0.85rem; margin: 0.2rem 0 0.8rem; }
-  table.data th, table.data td { border: 1px solid #8884; padding: 0.3rem 0.6rem; text-align: left; white-space: nowrap; }
+  table.data th, table.data td { border: 1px solid #8884; padding: 0.3rem 0.6rem; text-align: left; word-break: break-word; }
   table.data th { background: #8882; font-weight: 600; }
   table.card { width: 100%; }
   table.card td:not(:first-child), table.card th:not(:first-child) { text-align: right; }
@@ -296,111 +296,31 @@ def run_taxi_demo(conn, schema):
                             time.perf_counter() - t0))
         say(f"{n_trips:,} rows landed as Delta version {v_landed}; fare>0 verified")
 
-    # 4 ── fancy SQL: QUALIFY window-rank ─────────────────────────────────────────────────────────
-    with _step(4, "fancy SQL — QUALIFY: top-3 pickup zones by revenue WITHIN each borough") as say:
-        rows = _sql(conn, """
-            SELECT borough, zone, round(sum(total), 0)::BIGINT AS revenue, count(*) AS trips
+    # 4 ── a simple transform written back as a Delta table (one mart, plain SQL) ──────────────────
+    with _step(4, "transform → Delta: revenue by borough & zone → table 'mart_zone_revenue'") as say:
+        t0 = time.perf_counter()
+        _sql(conn, """
+            CREATE OR REPLACE TABLE mart_zone_revenue AS
+            SELECT borough, zone, count(*) AS trips, round(sum(total), 2) AS revenue
             FROM trips GROUP BY borough, zone
-            QUALIFY row_number() OVER (PARTITION BY borough ORDER BY sum(total) DESC) <= 3
-            ORDER BY borough, revenue DESC
-        """).collect()
-        _table([(b, z, f"{rev:,}", f"{tr:,}") for b, z, rev, tr in rows],
-               ["borough", "zone", "revenue $", "trips"], "  top-3 zones per borough (QUALIFY)")
-        say(f"{len(rows)} rows — one window pass, no self-join")
-
-    # 5 ── fancy SQL: PIVOT ───────────────────────────────────────────────────────────────────────
-    with _step(5, "fancy SQL — PIVOT: total fare by payment across time-of-day bands") as say:
-        df = _sql(conn, """
-            PIVOT (
-                SELECT CASE WHEN pickup_hour < 6 THEN '0 night' WHEN pickup_hour < 12 THEN '1 morning'
-                            WHEN pickup_hour < 18 THEN '2 afternoon' ELSE '3 evening' END AS band,
-                       payment, fare
-                FROM trips
-            ) ON payment USING round(sum(fare), 0)::BIGINT GROUP BY band ORDER BY band
         """)
-        _table(df.collect(), df.columns, "  fare $ by payment × time-of-day (PIVOT)")
-        say("payment values turned into columns by PIVOT")
+        n_mart = q("SELECT count(*) FROM mart_zone_revenue")
+        results.append(_row("Write revenue mart", 0, n_mart, n_mart, True, n_mart > 0, time.perf_counter() - t0))
+        _table([(b, z, f"{tr:,}", f"{rev:,.0f}") for b, z, tr, rev in conn.sql(
+                    """SELECT borough, zone, trips, revenue FROM mart_zone_revenue
+                       ORDER BY revenue DESC LIMIT 8""").collect()],
+               ["borough", "zone", "trips", "revenue $"], "  top zones by revenue (mart_zone_revenue)")
+        say(f"{n_mart} (borough, zone) rows written to Delta")
 
-    # 6 ── fancy SQL: ROLLUP super-aggregates ─────────────────────────────────────────────────────
-    with _step(6, "fancy SQL — ROLLUP: fare subtotals by (borough, payment) with super-aggregates") as say:
-        rows = _sql(conn, """
-            SELECT coalesce(borough, '— ALL —') AS borough, coalesce(payment, '— ALL —') AS payment,
-                   round(sum(fare), 0)::BIGINT AS fare, count(*) AS trips
-            FROM trips GROUP BY ROLLUP (borough, payment)
-            ORDER BY borough, payment
-        """).collect()
-        _table([(b, p, f"{fr:,}", f"{tr:,}") for b, p, fr, tr in rows],
-               ["borough", "payment", "fare $", "trips"], "  ROLLUP subtotals ('— ALL —' = super-aggregate)")
-        say(f"{len(rows)} rows incl. per-borough and grand totals")
-
-    # 7 ── fancy SQL: LIST/STRUCT nested types; write a flattened mart ─────────────────────────────
-    with _step(7, "fancy SQL — LIST/STRUCT: per-borough top-zone array + fare quantiles → mart") as say:
-        nested = _sql(conn, """
-            SELECT borough,
-                   (list(struct_pack(zone := zone, rev := rev) ORDER BY rev DESC))[1:3] AS top3_zones
-            FROM (SELECT borough, zone, round(sum(total), 0)::BIGINT AS rev FROM trips GROUP BY borough, zone)
-            GROUP BY borough ORDER BY borough
-        """)
-        print("      nested LIST<STRUCT> preview:", flush=True)
-        nested.show()
-        _table([(b, str(z)) for b, z in nested.collect()],
-               ["borough", "top3_zones (LIST<STRUCT>)"], "  nested LIST<STRUCT> per borough", echo=False)
-        t0 = time.perf_counter()
-        _sql(conn, """
-            CREATE OR REPLACE TABLE mart_zone_summary AS
-            WITH ranked AS (
-                SELECT borough, zone, round(sum(total), 0)::BIGINT AS rev,
-                       row_number() OVER (PARTITION BY borough ORDER BY sum(total) DESC) AS rn
-                FROM trips GROUP BY borough, zone
-            ), pct AS (
-                SELECT borough, round(quantile_cont(fare, 0.5), 2) AS fare_p50,
-                       round(quantile_cont(fare, 0.9), 2) AS fare_p90,
-                       round(quantile_cont(fare, 0.99), 2) AS fare_p99
-                FROM trips GROUP BY borough
-            )
-            SELECT p.borough, r.zone AS top_zone, r.rev AS top_zone_rev,
-                   p.fare_p50, p.fare_p90, p.fare_p99
-            FROM pct p JOIN ranked r ON r.borough = p.borough AND r.rn = 1
-            ORDER BY p.borough
-        """)
-        n_mart = q("SELECT count(*) FROM mart_zone_summary")
-        results.append(_row("Write zone-summary mart", 0, n_mart, n_mart, True, n_mart > 0, time.perf_counter() - t0))
-        _table(conn.sql("""SELECT borough, top_zone, top_zone_rev, fare_p50, fare_p90, fare_p99
-                           FROM mart_zone_summary ORDER BY borough""").collect(),
-               ["borough", "top_zone", "rev $", "p50", "p90", "p99"], "  mart_zone_summary (flattened for Delta)")
-        say(f"{n_mart} borough rows written (nested types shown, mart flattened on purpose)")
-
-    # 8 ── fancy SQL: ASOF JOIN to a surge rate-card ──────────────────────────────────────────────
-    with _step(8, "fancy SQL — ASOF JOIN: snap each trip to the latest surge multiplier by pickup time") as say:
-        _sql(conn, """
-            CREATE TEMP TABLE surge_card AS
-            SELECT * FROM (VALUES (TIME '00:00', 1.00), (TIME '07:00', 1.25), (TIME '10:00', 1.00),
-                                  (TIME '16:00', 1.40), (TIME '20:00', 1.15)) v(valid_from, multiplier)
-        """)
-        t0 = time.perf_counter()
-        _sql(conn, """
-            CREATE OR REPLACE TABLE mart_surged AS
-            SELECT t.zone_id, t.borough, t.payment, t.pickup_ts, t.fare AS base_fare,
-                   s.multiplier, round(t.fare * s.multiplier, 2) AS surged_fare
-            FROM trips t ASOF JOIN surge_card s ON t.pickup_ts::TIME >= s.valid_from
-        """)
-        n_surged = q("SELECT count(*) FROM mart_surged")
-        n_now = q("SELECT count(*) FROM trips")
-        results.append(_row("Write surge mart (ASOF)", 0, n_surged, n_now, n_surged == n_now, True,
-                            time.perf_counter() - t0))
-        _table(conn.sql("""SELECT borough, payment, base_fare, multiplier, surged_fare FROM mart_surged
-                           ORDER BY multiplier DESC, surged_fare DESC LIMIT 6""").collect(),
-               ["borough", "payment", "base", "×", "surged"], "  ASOF surge applied (sample of priced trips)")
-        say(f"{n_surged:,} trips priced; each snapped to the latest surge band ≤ its pickup time")
-
-    # 9 ── catalog ────────────────────────────────────────────────────────────────────────────────
-    with _step(9, "Spark Catalog: the Delta tables this demo has landed") as say:
+    # 5 ── catalog WITH each table's real Delta location ───────────────────────────────────────────
+    with _step(5, "Spark Catalog: the Delta tables this demo landed — with their real storage locations") as say:
         tbls = sorted(conn.catalog.listTables())
-        _table([(t,) for t in tbls], ["table"], f"  tables in '{schema}'")
-        say(f"{len(tbls)} tables: {tbls}")
+        _table([(t, conn.table_path(schema, t)) for t in tbls], ["table", "location (real Delta dir)"],
+               f"  tables in '{schema}'")
+        say(f"{len(tbls)} Delta tables — each a real directory with a _delta_log at the location shown")
 
-    # 10 ── raw-DML INSERT (append a late-arriving batch) ─────────────────────────────────────────
-    with _step(10, "raw-DML INSERT: append a 100-row late-arriving batch to 'trips'") as say:
+    # 6 ── raw-DML INSERT (append a late-arriving batch) ──────────────────────────────────────────
+    with _step(6, "raw-DML INSERT: append a 100-row late-arriving batch to 'trips'") as say:
         t0 = time.perf_counter()
         before = q("SELECT count(*) FROM trips")
         _sql(conn, """
@@ -413,8 +333,8 @@ def run_taxi_demo(conn, schema):
                             after - before == 100, time.perf_counter() - t0))
         say(f"{before:,} → {after:,} rows")
 
-    # 11 ── SQL-only upsert: DELETE affected keys + INSERT (1 update, 1 insert) ────────────────────
-    with _step(11, "SQL-only upsert on 'zone_stats': DELETE literal keys + INSERT (1 update, 1 insert)") as say:
+    # 7 ── SQL-only upsert: DELETE affected keys + INSERT (1 update, 1 insert) ─────────────────────
+    with _step(7, "SQL-only upsert on 'zone_stats': DELETE literal keys + INSERT (1 update, 1 insert)") as say:
         _sql(conn, """
             CREATE OR REPLACE TABLE zone_stats AS
             SELECT zone_id, any_value(zone) AS zone, count(*) AS trips, round(avg(fare), 2) AS avg_fare
@@ -439,8 +359,8 @@ def run_taxi_demo(conn, schema):
                             upd_ok and ins_ok, time.perf_counter() - t0))
         say(f"zone {target} avg {old_avg}→{new_avg} (updated), zone 999 inserted; {before:,} → {after:,} rows")
 
-    # 12 ── raw-DML DELETE + time-travel read ─────────────────────────────────────────────────────
-    with _step(12, "raw-DML DELETE + time travel: drop 'Cash' trips, then read the landed snapshot") as say:
+    # 8 ── raw-DML DELETE + time-travel read ──────────────────────────────────────────────────────
+    with _step(8, "raw-DML DELETE + time travel: drop 'Cash' trips, then read the landed snapshot") as say:
         t0 = time.perf_counter()
         before = q("SELECT count(*) FROM trips")
         cash = q("SELECT count(*) FROM trips WHERE payment = 'Cash'")
@@ -463,9 +383,9 @@ def run_taxi_demo(conn, schema):
                ["before", "Cash deleted", "after (now)", "at landed ver"], "  time travel: current vs landed snapshot")
         say(f"deleted {cash:,} Cash trips ({before:,} → {after:,}); {how} still sees {at_landed:,}")
 
-    # 13 ── concurrent MERGE clash — Spark builder API, snapshot isolation ─────────────────────────
-    with _step(13, "concurrent MERGE clash (Spark DeltaTable.merge): two writers, one snapshot — "
-                   "the stale one is refused") as say:
+    # 9 ── concurrent MERGE clash — Spark builder API, snapshot isolation ──────────────────────────
+    with _step(9, "concurrent MERGE clash (Spark DeltaTable.merge): two writers, one snapshot — "
+                  "the stale one is refused") as say:
         from duckrun import DeltaTable
         from deltalake.exceptions import CommitFailedError
         t0 = time.perf_counter()
