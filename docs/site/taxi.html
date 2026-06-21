@@ -41,13 +41,13 @@
   <table class="data card">
   <thead><tr><th>Operation</th><th>Rows</th><th>Before</th><th>After</th><th>Expected</th><th>Count&nbsp;✓</th><th>Values&nbsp;✓</th><th>Time</th></tr></thead>
   <tbody>
-    <tr><td>Load zones (CSV→Delta)</td><td>+265</td><td>0</td><td>265</td><td>265</td><td>✅</td><td>✅</td><td>0.3s</td></tr>
-    <tr><td>Land trips sample</td><td>+2,000,000</td><td>0</td><td>2,000,000</td><td>2,000,000</td><td>✅</td><td>✅</td><td>7.9s</td></tr>
-    <tr><td>Write revenue mart</td><td>+252</td><td>0</td><td>252</td><td>252</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
+    <tr><td>Load zones (CSV→Delta)</td><td>+265</td><td>0</td><td>265</td><td>265</td><td>✅</td><td>✅</td><td>0.6s</td></tr>
+    <tr><td>Land trips sample</td><td>+2,000,000</td><td>0</td><td>2,000,000</td><td>2,000,000</td><td>✅</td><td>✅</td><td>9.2s</td></tr>
+    <tr><td>Write revenue mart</td><td>+251</td><td>0</td><td>251</td><td>251</td><td>✅</td><td>✅</td><td>0.3s</td></tr>
     <tr><td>INSERT append (+100)</td><td>+100</td><td>2,000,000</td><td>2,000,100</td><td>2,000,100</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
-    <tr><td>SQL upsert (1 upd, 1 ins)</td><td>+1</td><td>253</td><td>254</td><td>254</td><td>✅</td><td>✅</td><td>0.3s</td></tr>
-    <tr><td>DELETE Cash trips</td><td>-294,560</td><td>2,000,100</td><td>1,705,540</td><td>1,705,540</td><td>✅</td><td>✅</td><td>1.1s</td></tr>
-    <tr><td>Concurrent MERGE clash</td><td>+0</td><td>254</td><td>254</td><td>254</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
+    <tr><td>SQL upsert (1 upd, 1 ins)</td><td>+1</td><td>252</td><td>253</td><td>253</td><td>✅</td><td>✅</td><td>0.5s</td></tr>
+    <tr><td>DELETE Cash trips</td><td>-294,508</td><td>2,000,100</td><td>1,705,592</td><td>1,705,592</td><td>✅</td><td>✅</td><td>2.1s</td></tr>
+    <tr><td>Concurrent MERGE clash</td><td>+0</td><td>253</td><td>253</td><td>253</td><td>✅</td><td>✅</td><td>0.5s</td></tr>
   </tbody>
 </table>
   
@@ -99,14 +99,14 @@ FROM trips_raw USING SAMPLE 2000000 ROWS</pre>
 SELECT borough, zone, count(*) AS trips, round(sum(total), 2) AS revenue
 FROM trips GROUP BY borough, zone</pre>
   <p class="tcap">top zones by revenue (mart_zone_revenue)</p>
-  <table class="data"><thead><tr><th>borough</th><th>zone</th><th>trips</th><th>revenue $</th></tr></thead><tbody><tr><td>Queens</td><td>JFK Airport</td><td>96,254</td><td>7,788,398</td></tr><tr><td>Queens</td><td>LaGuardia Airport</td><td>61,273</td><td>4,070,094</td></tr><tr><td>Manhattan</td><td>Midtown Center</td><td>97,640</td><td>2,339,701</td></tr><tr><td>Manhattan</td><td>Upper East Side South</td><td>97,637</td><td>1,932,546</td></tr><tr><td>Manhattan</td><td>Times Sq/Theatre District</td><td>71,765</td><td>1,928,501</td></tr><tr><td>Manhattan</td><td>Upper East Side North</td><td>93,409</td><td>1,892,204</td></tr><tr><td>Manhattan</td><td>Penn Station/Madison Sq West</td><td>70,978</td><td>1,711,340</td></tr><tr><td>Manhattan</td><td>Midtown East</td><td>72,702</td><td>1,697,577</td></tr></tbody></table>
-  <p class="note">252 (borough, zone) rows written to Delta</p>
+  <table class="data"><thead><tr><th>borough</th><th>zone</th><th>trips</th><th>revenue $</th></tr></thead><tbody><tr><td>Queens</td><td>JFK Airport</td><td>96,352</td><td>7,784,696</td></tr><tr><td>Queens</td><td>LaGuardia Airport</td><td>61,214</td><td>4,060,324</td></tr><tr><td>Manhattan</td><td>Midtown Center</td><td>97,569</td><td>2,339,430</td></tr><tr><td>Manhattan</td><td>Upper East Side South</td><td>97,567</td><td>1,933,218</td></tr><tr><td>Manhattan</td><td>Times Sq/Theatre District</td><td>71,670</td><td>1,931,992</td></tr><tr><td>Manhattan</td><td>Upper East Side North</td><td>93,368</td><td>1,891,903</td></tr><tr><td>Manhattan</td><td>Penn Station/Madison Sq West</td><td>71,177</td><td>1,712,107</td></tr><tr><td>Manhattan</td><td>Midtown East</td><td>72,676</td><td>1,693,600</td></tr></tbody></table>
+  <p class="note">251 (borough, zone) rows written to Delta</p>
 </section>
 
 <section>
   <h3><span class="n">5</span> Spark Catalog: the Delta tables this demo landed — with their real storage locations</h3>
   <p class="tcap">tables in &#x27;dbo&#x27;</p>
-  <table class="data"><thead><tr><th>table</th><th>location (real Delta dir)</th></tr></thead><tbody><tr><td>mart_zone_revenue</td><td>…/taxidemo_t3xrxr0r/dbo/mart_zone_revenue</td></tr><tr><td>trips</td><td>…/taxidemo_t3xrxr0r/dbo/trips</td></tr><tr><td>zones</td><td>…/taxidemo_t3xrxr0r/dbo/zones</td></tr></tbody></table>
+  <table class="data"><thead><tr><th>table</th><th>location (real Delta dir)</th></tr></thead><tbody><tr><td>mart_zone_revenue</td><td>…/taxidemo_9yoqx797/dbo/mart_zone_revenue</td></tr><tr><td>trips</td><td>…/taxidemo_9yoqx797/dbo/trips</td></tr><tr><td>zones</td><td>…/taxidemo_9yoqx797/dbo/zones</td></tr></tbody></table>
   <p class="note">3 Delta tables — each a real directory with a _delta_log at the location shown</p>
 </section>
 
@@ -124,17 +124,17 @@ FROM trips_raw USING SAMPLE 100 ROWS</pre>
 SELECT zone_id, any_value(zone) AS zone, count(*) AS trips, round(avg(fare), 2) AS avg_fare
 FROM trips GROUP BY zone_id</pre>
   <pre class="sql">DELETE FROM zone_stats WHERE zone_id = 161 OR zone_id = 999</pre>
-  <pre class="sql">INSERT INTO zone_stats VALUES (161, &#x27;Midtown Center&#x27;, 97645, 20.51), (999, &#x27;NEW Demo Zone&#x27;, 1, 7.77)</pre>
-  <p class="note">zone 161 avg 15.51→20.51 (updated), zone 999 inserted; 253 → 254 rows</p>
+  <pre class="sql">INSERT INTO zone_stats VALUES (161, &#x27;Midtown Center&#x27;, 97573, 20.52), (999, &#x27;NEW Demo Zone&#x27;, 1, 7.77)</pre>
+  <p class="note">zone 161 avg 15.52→20.52 (updated), zone 999 inserted; 252 → 253 rows</p>
 </section>
 
 <section>
   <h3><span class="n">8</span> raw-DML DELETE + time travel: drop &#x27;Cash&#x27; trips, then read the landed snapshot</h3>
   <pre class="sql">DELETE FROM trips WHERE payment = &#x27;Cash&#x27;</pre>
-  <pre class="sql">SELECT count(*) FROM delta_scan(&#x27;C:/Users/MDJOUA~1/AppData/Local/Temp/taxidemo_t3xrxr0r/dbo/trips&#x27;, version =&gt; 0)</pre>
+  <pre class="sql">SELECT count(*) FROM delta_scan(&#x27;C:/Users/MDJOUA~1/AppData/Local/Temp/taxidemo_9yoqx797/dbo/trips&#x27;, version =&gt; 0)</pre>
   <p class="tcap">time travel: current vs landed snapshot</p>
-  <table class="data"><thead><tr><th>before</th><th>Cash deleted</th><th>after (now)</th><th>at landed ver</th></tr></thead><tbody><tr><td>2,000,100</td><td>294,560</td><td>1,705,540</td><td>2,000,000</td></tr></tbody></table>
-  <p class="note">deleted 294,560 Cash trips (2,000,100 → 1,705,540); delta_scan(version =&gt; 0) still sees 2,000,000</p>
+  <table class="data"><thead><tr><th>before</th><th>Cash deleted</th><th>after (now)</th><th>at landed ver</th></tr></thead><tbody><tr><td>2,000,100</td><td>294,508</td><td>1,705,592</td><td>2,000,000</td></tr></tbody></table>
+  <p class="note">deleted 294,508 Cash trips (2,000,100 → 1,705,592); delta_scan(version =&gt; 0) still sees 2,000,000</p>
 </section>
 
 <section>
@@ -146,13 +146,13 @@ writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, "target.zone_id = 
     .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcB sets avg → 200.0
 writer_A.execute()   # wins, advances the table version
 writer_B.execute()   # stale snapshot → CommitFailedError</pre>
-  <p class="note">both writers built against zone 161 (avg 20.51) at the same snapshot</p>
+  <p class="note">both writers built against zone 161 (avg 20.52) at the same snapshot</p>
   <p class="tcap">two concurrent MERGEs against one snapshot</p>
   <table class="data"><thead><tr><th>writer</th><th>intended avg</th><th>outcome</th></tr></thead><tbody><tr><td>A — fresh snapshot</td><td>100.0</td><td>committed ✅</td></tr><tr><td>B — stale snapshot</td><td>200.0</td><td>refused ✅</td></tr></tbody></table>
   <p class="note">snapshot isolation held: zone 161 avg = 100.0 (writer A won); writer B refused — a concurrent transactions added new data.</p>
 </section>
   <footer>Generated by
-    <a href="https://github.com/djouallah/duckrun/blob/main/tests/connection_api/demo_taxi.py">demo_taxi.py</a>
+    <a href="https://github.com/djouallah/duckrun/blob/main/tests/integration_tests/taxi/demo_taxi.py">demo_taxi.py</a>
     — re-published from a live OneLake run by the integration-tests workflow.</footer>
 </body>
 </html>
