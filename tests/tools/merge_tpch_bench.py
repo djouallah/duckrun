@@ -94,7 +94,7 @@ class Bench:
     def __init__(self, args):
         self.args = args
         # --warehouse abfss://… points the whole chain at OneLake (the small-N integration job);
-        # the default is the local <dir>/warehouse the heavy SF=10 gate uses. Schema comes from
+        # the default is the local <dir>/warehouse the heavy SF=20 gate uses. Schema comes from
         # DBT_SCHEMA so the OneLake job can write into an isolated schema (no aemo collision).
         self.remote = bool(args.warehouse and args.warehouse.startswith("abfss://"))
         self.root = args.warehouse if args.warehouse else os.path.join(args.dir, "warehouse")
@@ -365,7 +365,7 @@ def main():
     ap.add_argument("--warehouse", default=None,
                     help="Delta warehouse root. An abfss://… path runs the whole chain against "
                          "OneLake (the small-N integration job); default is the local <dir>/warehouse "
-                         "the heavy SF=10 gate uses.")
+                         "the heavy SF=20 gate uses.")
     ap.add_argument("--target", default="dev",
                     help="dbt target/profile output (use 'onelake' with --warehouse abfss://…)")
     ap.add_argument("--spill-size", type=int, default=None, dest="spill_size",

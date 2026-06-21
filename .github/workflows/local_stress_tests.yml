@@ -22,9 +22,9 @@ on:
   workflow_dispatch:
     inputs:
       sf:
-        description: "merge-spill: TPCH scale factor for lineitem (gate uses 10 ≈ 60M rows; SF=20 OOMs the merge)"
+        description: "merge-spill: TPCH scale factor for lineitem (gate uses 20 ≈ 120M rows)"
         required: false
-        default: "10"
+        default: "20"
       rows:
         description: "coffee-stress: fact rows to generate (gate uses 5,000,000)"
         required: false
@@ -43,7 +43,7 @@ jobs:
       group: merge-spill
       cancel-in-progress: false
     env:
-      SF: "${{ inputs.sf || '10' }}"   # release gate uses 10; a manual dispatch can pick another
+      SF: "${{ inputs.sf || '20' }}"   # release gate uses 20; a manual dispatch can pick another
       DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4
