@@ -220,6 +220,23 @@ class TestDataFrameWriter:
         with pytest.raises(ValueError):
             conn.sql("select 1 a").write.format("parquet").saveAsTable("w")  # only delta
 
+    def test_save_by_path(self, conn, tmp_path):
+        p = (tmp_path / "by_path").as_posix()
+        conn.sql("select 1 a").write.mode("overwrite").save(p)  # no catalog name
+        assert conn.read.delta(p).count() == 1  # read back BY PATH, not as a table
+
+    def test_save_modes(self, conn, tmp_path):
+        p = (tmp_path / "modes").as_posix()
+        conn.sql("select 1 a").write.mode("overwrite").save(p)
+        conn.sql("select 2 a").write.mode("append").save(p)
+        assert conn.read.delta(p).count() == 2
+
+    def test_save_mode_error_when_exists(self, conn, tmp_path):
+        p = (tmp_path / "err").as_posix()
+        conn.sql("select 1 a").write.mode("overwrite").save(p)
+        with pytest.raises(ValueError):
+            conn.sql("select 2 a").write.save(p)  # default error, path exists
+
 
 class TestDeltaTable:
     def _seed(self, conn):

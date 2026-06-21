@@ -483,17 +483,17 @@ class DataFrameWriter:
         self._partition_by = list(cols)
         return self
 
-    def saveAsTable(self, name: str) -> str:
+    def _write(self, path: str, descr: str) -> None:
+        """Apply the configured mode to the Delta table at ``path`` (storage-neutral). ``descr``
+        names the target in the mode='error' message. Shared by saveAsTable and save."""
         session = self._df.session
-        schema, table = session.resolve(name)
-        path = session.table_path(schema, table)
         so = session.storage_options
 
         mode = self._mode
         if mode in ("error", "errorifexists"):
             if engine.table_exists(path, so):
                 raise ValueError(
-                    f"table '{schema}.{table}' already exists (mode='error'). "
+                    f"{descr} already exists (mode='error'). "
                     f"Use mode('overwrite'), mode('append'), mode('safeappend'), or mode('ignore')."
                 )
             mode = "overwrite"
@@ -534,6 +534,22 @@ class DataFrameWriter:
                 storage_options=so,
                 compaction_threshold=session.compaction_threshold,
             )
+
+    def save(self, path: str) -> str:
+        """Spark ``df.write.save(path)`` — write to a Delta table by PATH, not catalog name.
+
+        Storage-neutral (local / s3:// / gs:// / az:// / abfss://). Unlike :meth:`saveAsTable`,
+        the result is addressed only by ``path`` — there is no schema.table name to register a
+        view for — so it is read back with ``conn.read.delta(path)`` / ``delta_scan('<path>')``,
+        not as an unqualified table. Returns ``path``."""
+        self._write(path, f"delta table at '{path}'")
+        return path
+
+    def saveAsTable(self, name: str) -> str:
+        session = self._df.session
+        schema, table = session.resolve(name)
+        path = session.table_path(schema, table)
+        self._write(path, f"table '{schema}.{table}'")
         # Surface the (new or grown) table immediately — no manual refresh() needed.
         session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(schema)}")
         session._register_view(schema, table)
