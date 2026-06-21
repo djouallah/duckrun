@@ -94,26 +94,14 @@
     (bar the concurrency finale). Each step leans on DuckDB SQL the dbt path never needs.
   </p>
 
-  <!-- The scorecard below is spliced in from an actual demo run by the integration-tests workflow
-       (tests/tools/inject_readme.py … TAXI). Do not hand-edit between the markers. -->
+  <!-- The scorecard below is injected from THIS run's demo by the deploy-docs job (it downloads the
+       taxi-card artifact and runs inject_readme.py … TAXI before publishing), so the live page always
+       shows the run it was deployed from. The placeholder is what shows before the first deploy. -->
   <!-- TAXI:START -->
 
-<p class="demo-cap">Actual run: 50,000-row sample of live NYC TLC Yellow-Taxi 2024-01 → local Delta, 2026-06-21 UTC — <strong>✅ all operations correct</strong></p>
-<table class="demo card">
-  <thead><tr><th>Operation</th><th>Rows</th><th>Before</th><th>After</th><th>Expected</th><th>Count&nbsp;✓</th><th>Values&nbsp;✓</th><th>Time</th></tr></thead>
-  <tbody>
-    <tr><td>Load zones (CSV→Delta)</td><td>+265</td><td>0</td><td>265</td><td>265</td><td>✅</td><td>✅</td><td>0.7s</td></tr>
-    <tr><td>Land trips sample</td><td>+50,000</td><td>0</td><td>50,000</td><td>50,000</td><td>✅</td><td>✅</td><td>0.4s</td></tr>
-    <tr><td>Write zone-summary mart</td><td>+6</td><td>0</td><td>6</td><td>6</td><td>✅</td><td>✅</td><td>0.1s</td></tr>
-    <tr><td>Write surge mart (ASOF)</td><td>+50,000</td><td>0</td><td>50,000</td><td>50,000</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
-    <tr><td>INSERT append (+100)</td><td>+100</td><td>50,000</td><td>50,100</td><td>50,100</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
-    <tr><td>SQL upsert (1 upd, 1 ins)</td><td>+1</td><td>205</td><td>206</td><td>206</td><td>✅</td><td>✅</td><td>0.4s</td></tr>
-    <tr><td>DELETE Cash trips</td><td>-7,271</td><td>50,100</td><td>42,829</td><td>42,829</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
-    <tr><td>Concurrent MERGE clash</td><td>+0</td><td>206</td><td>206</td><td>206</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
-  </tbody>
-</table>
+  <p class="demo-cap">The scorecard from the latest live OneLake run is injected here at deploy time.</p>
 
-<!-- TAXI:END -->
+  <!-- TAXI:END -->
 
   <p class="demo-cap">Every statement, and the DuckDB SQL it leans on:</p>
   <table class="demo ops">
