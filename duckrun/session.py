@@ -106,6 +106,40 @@ def _qlit(text: str) -> str:
     return str(text).replace("'", "''")
 
 
+def _strip_query_context(msg: str) -> str:
+    """DuckDB appends the offending statement to errors as ``\\nLINE N: <sql>\\n   ^``. When that
+    statement is one duckrun generated internally (the ``delta_scan`` view), echoing it back is
+    noise that makes the failure look like it's about the caller's input. Keep the real error
+    text; drop the generated-SQL context."""
+    idx = msg.find("\nLINE ")
+    return msg[:idx].rstrip() if idx != -1 else msg
+
+
+_GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def _onelake_guid_hint(root_path: str) -> Optional[str]:
+    """Workaround note for the OneLake ``delta_scan`` bug, shown only when a friendly-name
+    ``abfss://`` path is involved. OneLake's delta_scan can fail to enumerate a valid table's
+    ``_delta_log`` when the path uses friendly workspace/lakehouse names (duckdb-delta#307); the
+    GUID form reads fine. Returns ``None`` for non-abfss paths or paths already using GUIDs (no
+    point nagging those)."""
+    if not remote.is_abfss(root_path):
+        return None
+    workspace, _host, path = remote._parse_abfss(root_path)
+    lakehouse = path.split("/", 1)[0] if path else ""
+    if lakehouse.lower().endswith(".lakehouse"):
+        lakehouse = lakehouse[: -len(".Lakehouse")]
+    if _GUID.match(workspace) and _GUID.match(lakehouse):
+        return None
+    return (
+        "OneLake's delta_scan can fail to read a valid table's _delta_log when the abfss path uses "
+        "friendly names — a known upstream issue (duckdb-delta#307). Until it's fixed, use the "
+        "workspace and lakehouse GUIDs, e.g. "
+        "abfss://<workspace-guid>@onelake.dfs.fabric.microsoft.com/<lakehouse-guid>/Tables"
+    )
+
+
 def _split_root_schema(path: str, schema: Optional[str]):
     """Normalize ``path`` into ``(root_path, schema)``.
 
@@ -228,10 +262,22 @@ class DuckSession:
 
     def _register_view(self, schema: str, table: str):
         path = f"{self.root_path.rstrip('/')}/{schema}/{table}"
-        self.con.execute(
-            f"CREATE OR REPLACE VIEW {_qid(schema)}.{_qid(table)} AS "
-            f"SELECT * FROM delta_scan('{_qlit(path)}')"
-        )
+        try:
+            self.con.execute(
+                f"CREATE OR REPLACE VIEW {_qid(schema)}.{_qid(table)} AS "
+                f"SELECT * FROM delta_scan('{_qlit(path)}')"
+            )
+        except Exception as exc:
+            # delta_scan failed reading the table. Keep the real engine error (it's the signal —
+            # e.g. the OneLake "No files in log segment" delta-kernel bug), but drop DuckDB's echo
+            # of the CREATE VIEW statement *we* generated, and say which table/path it was. Suppress
+            # the chained original (`from None`) so the noisy SQL echo doesn't reappear in tracebacks.
+            hint = _onelake_guid_hint(self.root_path)
+            raise RuntimeError(
+                f"duckrun: could not read Delta table {schema}.{table} at '{path}':\n"
+                f"{_strip_query_context(str(exc))}"
+                + (f"\n\n{hint}" if hint else "")
+            ) from None
 
     def _set_search_path(self, schema: str):
         try:

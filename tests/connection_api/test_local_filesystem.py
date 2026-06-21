@@ -31,6 +31,40 @@ def wh(tmp_path):
     return str(root)
 
 
+def test_unreadable_table_error_drops_generated_sql(wh):
+    # A folder discovered as a table whose delta_scan fails (here a _delta_log with a non-commit
+    # json -> "No files in log segment", the same failure mode as the OneLake delta-kernel bug)
+    # must surface the REAL engine error and the table location — but NOT echo the internal
+    # `CREATE OR REPLACE VIEW ... delta_scan(...)` statement duckrun generated. Regression for
+    # the confusing connect() traceback (duckdb-delta#307).
+    import os
+    broken_log = os.path.join(wh, "dbo", "broken", "_delta_log")
+    os.makedirs(broken_log, exist_ok=True)
+    with open(os.path.join(broken_log, "stray.json"), "w") as fh:
+        fh.write("{}\n")  # matches the discovery glob but isn't a valid commit
+
+    with pytest.raises(RuntimeError) as ei:
+        duckrun.connect(wh, schema="dbo")
+    msg = str(ei.value)
+    assert "dbo.broken" in msg                       # location named
+    assert ("log segment" in msg or "IO Error" in msg)  # real engine signal kept
+    assert "CREATE OR REPLACE VIEW" not in msg       # generated-SQL echo gone
+
+
+def test_onelake_guid_hint():
+    from duckrun.session import _onelake_guid_hint
+
+    friendly = "abfss://tpch@onelake.dfs.fabric.microsoft.com/duckrun.Lakehouse/Tables"
+    hint = _onelake_guid_hint(friendly)
+    assert hint is not None
+    assert "duckdb-delta#307" in hint and "GUID" in hint
+
+    guid = ("abfss://11111111-1111-1111-1111-111111111111@onelake.dfs.fabric.microsoft.com/"
+            "22222222-2222-2222-2222-222222222222/Tables")
+    assert _onelake_guid_hint(guid) is None           # already GUIDs -> no nag
+    assert _onelake_guid_hint("./wh") is None          # non-abfss -> no hint
+
+
 def test_discovery_and_catalog(wh):
     conn = duckrun.connect(wh, schema="dbo")
     assert set(conn.catalog.listTables()) == {"t1", "t2"}

@@ -233,3 +233,32 @@ def test_coffee_onelake():
     """Live OneLake, small fact table — the network dominates, so keep the row count tiny."""
     conn = duckrun.connect(WAREHOUSE_PATH, storage_options={"bearer_token": ONELAKE_TOKEN}, schema=ONELAKE_SCHEMA)
     run_coffee_scenario(conn, ONELAKE_SCHEMA, ONELAKE_ROWS)
+
+
+# A friendly-name abfss path (workspace/lakehouse names instead of GUIDs) over the SAME lakehouse.
+# OneLake's delta_scan can't enumerate a valid table's _delta_log via friendly names
+# (duckdb-delta#307); GUID paths read fine. This is the live gate for the connect() error hygiene:
+# when delta_scan fails, the message must keep the real engine error but NOT echo the internal
+# `CREATE OR REPLACE VIEW ... delta_scan(...)` SQL, and must carry the GUID workaround hint.
+WAREHOUSE_PATH_FRIENDLY = os.environ.get("WAREHOUSE_PATH_FRIENDLY")
+
+
+@pytest.mark.skipif(
+    not (WAREHOUSE_PATH_FRIENDLY and WAREHOUSE_PATH_FRIENDLY.startswith("abfss://") and ONELAKE_TOKEN),
+    reason="friendly-name OneLake path not configured (set WAREHOUSE_PATH_FRIENDLY=abfss://<name>@…/<name>.Lakehouse/Tables)",
+)
+def test_onelake_friendly_name_connect_error_is_clean():
+    """Connect over a friendly-name OneLake path (no schema → discover every table). Either it
+    connects (upstream fixed / nothing unreadable) or it fails with the duckrun-shaped error —
+    in which case the message must NOT leak the generated CREATE VIEW SQL and MUST point at the
+    GUID workaround. Locks the fix end-to-end on live OneLake, which the GUID-only jobs can't."""
+    try:
+        conn = duckrun.connect(WAREHOUSE_PATH_FRIENDLY, storage_options={"bearer_token": ONELAKE_TOKEN})
+    except RuntimeError as exc:
+        msg = str(exc)
+        print(f"\nfriendly-name connect failed as expected (delta-kernel #307):\n{msg}", flush=True)
+        assert "CREATE OR REPLACE VIEW" not in msg, "internal delta_scan SQL must not leak into the error"
+        assert "duckdb-delta#307" in msg, "the GUID workaround hint must be present"
+        assert "log segment" in msg or "IO Error" in msg, "the real engine error must be preserved"
+        return
+    print(f"\nfriendly-name connect succeeded — discovered: {conn.catalog.listTables()}", flush=True)

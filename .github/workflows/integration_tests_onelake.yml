@@ -223,6 +223,15 @@ jobs:
           COFFEE_ONELAKE_ROWS: "2000"
         run: python -m pytest tests/connection_api/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
 
+      - name: Connect over a FRIENDLY-name OneLake path (delta-kernel #307 error-hygiene gate)
+        # Same lakehouse as above, addressed by friendly workspace/lakehouse names instead of GUIDs.
+        # OneLake's delta_scan can't read a valid table's _delta_log via friendly names — so this
+        # exercises the connect() failure path live and proves the error stays clean (no leaked
+        # CREATE VIEW SQL) and carries the GUID workaround. The GUID jobs above can't cover this.
+        env:
+          WAREHOUSE_PATH_FRIENDLY: abfss://tpch@onelake.dfs.fabric.microsoft.com/duckrun.Lakehouse/Tables
+        run: python -m pytest tests/connection_api/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
+
   sde:
     # The josephmachado/simple_dbt_project port: a tiny LOCAL full build for the docs catalog
     # (order_status_pivot needs the gold table to exist at parse time, so it can't be DAG-only),
