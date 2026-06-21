@@ -55,11 +55,12 @@ express are rejected up front with a pointer to the write API, rather than faili
 | multiple statements in one call | rejected → one statement per `conn.sql()` |
 
 Leading `--` / `/* … */` comments are fine. The exact behaviour is pinned, statement-by-statement,
-in [`tests/connection_api/test_sql_dml.py`](../tests/connection_api/test_sql_dml.py).
+in [`tests/connection_api/test_connection_api.py`](../tests/connection_api/test_connection_api.py)
+(the cross-API write-correctness matrix + the `TestSqlDml` class).
 
 The card below — every public method with a ✅ — is regenerated on every push by
-the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from
-[`tests/connection_api/test_method_matrix.py`](../tests/connection_api/test_method_matrix.py).
+the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from the `Test*` classes of
+[`tests/connection_api/test_connection_api.py`](../tests/connection_api/test_connection_api.py).
 
 <!-- CONNECTION_API:START -->
 

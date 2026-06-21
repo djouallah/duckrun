@@ -1,6 +1,6 @@
 """
-Render the duckrun.connect() method matrix (pytest --junitxml from
-tests/connection_api/test_method_matrix.py) as a Markdown scorecard for the GitHub job summary
+Render the duckrun.connect() method matrix (pytest --junitxml from the Test* classes of
+tests/connection_api/test_connection_api.py) as a Markdown scorecard for the GitHub job summary
 and the README: a totals box plus, per API surface, every method with a ✅/❌/⏭️.
 
     python tests/tools/connection_summary.py connection.xml            # print the card
@@ -110,7 +110,7 @@ def _outcome(case):
 
 
 def _group(classname: str) -> str:
-    return classname.split(".")[-1]  # "...test_method_matrix.TestSession" -> "TestSession"
+    return classname.split(".")[-1]  # "...test_connection_api.TestSession" -> "TestSession"
 
 
 def _method(name: str) -> str:

@@ -6,14 +6,16 @@ name: cores
 # no test is dropped or weakened. Local-filesystem Delta only: no secrets, no network.
 #
 # Jobs:
-#   • offline                 — the dbt adapter internals + the duckrun.connect() API end to end
-#                               (write modes, reader, catalog, merge/delete/update), the conn.sql
-#                               raw-DML matrix, engine-level snapshot-pin correctness, and the
-#                               single-snapshot MERGE through a real in-process dbt run.
+#   • adapter                 — the dbt adapter internals + the WHOLE duckrun.connect() suite
+#                               (tests/connection_api/test_connection_api.py: the per-method matrix,
+#                               the local-fs contract/discovery tests, the conn.sql raw-DML matrix,
+#                               AND the cross-API write-correctness matrix), engine-level snapshot-pin
+#                               correctness, and the single-snapshot MERGE through a real dbt run.
 #   • conformance             — the official dbt adapter conformance suite, gated on REGRESSIONS
 #                               only (baseline diff). Refreshes the README card on push to main.
-#   • connection-card         — the duckrun.connect() per-method ✅/❌ scorecard; every method
-#                               must pass. Refreshes the README card on push to main.
+#   • connection-card         — the duckrun.connect() per-method ✅/❌ scorecard, rendered from the
+#                               Test* classes of that same suite; every method must pass. Refreshes
+#                               the README card on push to main.
 #   • concurrency-correctness — proves MERGE snapshot safety + safeappend CAS + pre-snapshot window.
 #   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
 #                               dbt run (also a guard). Refreshes docs on push to main.
@@ -55,10 +57,12 @@ jobs:
         run: pip install -e ".[test]"
 
       - name: Adapter unit tests + connection-API offline tests
+        # The whole connection-API suite (per-method matrix + local-fs contract + the cross-API
+        # write-correctness matrix) lives in one file now; run it ALL on every change.
         run: |
           python -m pytest \
             tests/adapter \
-            tests/connection_api/test_local_filesystem.py \
+            tests/connection_api/test_connection_api.py \
             tests/correctness/test_snapshot_pinning.py \
             -q -p no:cacheprovider
 
@@ -70,29 +74,6 @@ jobs:
         run: |
           python -m pytest \
             tests/integration_tests/snapshot_pin/test_snapshot_pin.py \
-            -q -p no:cacheprovider
-
-  sql-dml:
-    # The conn.sql raw-DML supported/unsupported matrix (create/insert/update/delete/temp/view),
-    # pinning the CREATE TABLE=Delta vs TEMP+VIEW=native invariant. Offline, local-fs Delta.
-    runs-on: ubuntu-latest
-    concurrency:
-      group: cores-sql-dml-${{ github.ref }}
-      cancel-in-progress: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + test deps (dbt-duckdb + duckdb + deltalake + pytest + pyarrow)
-        run: pip install -e ".[test]"
-
-      - name: conn.sql raw-DML support matrix
-        run: |
-          python -m pytest \
-            tests/connection_api/test_sql_dml.py \
             -q -p no:cacheprovider
 
   conformance:
@@ -218,11 +199,13 @@ jobs:
         run: pip install -e ".[test]"
 
       - name: Run the connection-API method matrix
-        # Render the card even if a method fails (the gate is a later step), so the summary always
-        # shows exactly which method broke.
+        # The matrix is the per-method Test* classes in the merged suite; -k selects ONLY those so
+        # the scorecard counts methods, not the write-correctness / contract functions in the same
+        # file (which run in the `adapter` job). Render even on failure (the gate is a later step).
         continue-on-error: true
         run: |
-          python -m pytest tests/connection_api/test_method_matrix.py \
+          python -m pytest tests/connection_api/test_connection_api.py \
+            -k "TestSession or TestCatalog or TestDataFrame or TestDataFrameReader or TestDataFrameWriter or TestDeltaTable or TestSqlDml" \
             -q -p no:cacheprovider --junitxml=connection.xml
 
       - name: Render method scorecard
