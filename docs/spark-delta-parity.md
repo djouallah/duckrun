@@ -54,7 +54,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `df.count()` | `df.count()` | ✅ | |
 | `df.show()` | `df.show()` | ✅ | |
 | `df.createOrReplaceTempView(name)` | `df.createOrReplaceTempView(name)` | ✅ | Native, ephemeral DuckDB view — not Delta, not in `conn.catalog`. |
-| `df.columns` / `df.schema` / `df.dtypes` | (passthrough) | 🟡 | Reached via `__getattr__` to the wrapped DuckDB relation. |
+| `df.columns` / `df.dtypes` | (passthrough) | 🟡 | Not reimplemented — `__getattr__` forwards to the wrapped DuckDB relation. `columns` is a list of names (like Spark); `dtypes` returns DuckDB types, not Spark `(name, type)` tuples. (`df.schema` is not exposed.) |
 
 ## `DataFrameReader` (`conn.read`)
 
