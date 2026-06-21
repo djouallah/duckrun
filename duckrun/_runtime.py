@@ -1,14 +1,14 @@
 """Runtime version guardrail.
 
-duckrun pins exact ``duckdb`` / ``deltalake`` versions (see ``pyproject.toml``), but in a
-Microsoft Fabric Python notebook those packages come **preinstalled** at older versions and are
-already imported into the kernel. ``pip install duckrun --upgrade`` writes the new wheels to disk,
-but the already-loaded modules stay bound until the kernel restarts — so a user who skips the
-restart silently keeps running on stale ``duckdb`` / ``deltalake``, losing snapshot-pinned reads
-(``delta_scan(..., version => N)``) and the merge spill cap (``max_spill_size``).
+duckrun needs a recent ``duckdb`` (>= 1.5.4, where ``delta_scan`` gained the ``version => N``
+parameter used for snapshot-pinned reads) and ``deltalake`` (>= 1.5.0, for the merge ``max_spill_size``
+cap). In a notebook these can already be imported at an earlier version when ``duckrun`` is first
+used: ``pip install duckrun --upgrade`` writes the new wheels to disk, but the already-loaded modules
+stay bound until the kernel restarts. A user who skips the restart would keep running on the older
+modules, quietly losing snapshot-pinned reads and the spill cap.
 
-This check turns that silent degradation into a loud, actionable error. It inspects the *loaded*
-versions (not the pin), so it fires exactly on the forgot-to-restart case.
+This check turns that into a loud, actionable error. It inspects the *loaded* versions (not the
+pin), so it fires exactly on the forgot-to-restart case.
 """
 from packaging.version import Version
 
@@ -37,13 +37,14 @@ def check_runtime_versions():
     import duckdb
     import deltalake
 
-    stale = []
+    too_old = []
     if Version(duckdb.__version__) < Version(_MIN_DUCKDB):
-        stale.append(f"duckdb {duckdb.__version__} (need >= {_MIN_DUCKDB})")
+        too_old.append(f"duckdb {duckdb.__version__} (need >= {_MIN_DUCKDB})")
     if Version(deltalake.__version__) < Version(_MIN_DELTALAKE):
-        stale.append(f"deltalake {deltalake.__version__} (need >= {_MIN_DELTALAKE})")
+        too_old.append(f"deltalake {deltalake.__version__} (need >= {_MIN_DELTALAKE})")
 
-    if stale:
+    if too_old:
         raise RuntimeError(
-            "duckrun: this kernel has stale " + " and ".join(stale) + " loaded.\n" + _REMEDY
+            "duckrun needs a newer " + " and ".join(too_old) + " than the kernel has loaded.\n"
+            + _REMEDY
         )

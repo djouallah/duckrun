@@ -40,17 +40,18 @@ That single install pulls in `dbt-duckdb` (and therefore `duckdb`) plus `deltala
 
 ### In a Microsoft Fabric Python notebook
 
-Fabric preinstalls **older** `duckdb` / `deltalake` than duckrun requires, and they're already
-imported into the kernel — so a plain install won't take effect. Upgrade, then restart the Python
-kernel so the new versions load:
+duckrun needs a recent `duckdb` (≥ 1.5.4) — that's the build where `delta_scan` gained its
+`version => N` parameter, which duckrun uses for snapshot-pinned reads. If an earlier `duckdb` is
+already imported into the kernel, a plain install won't swap it in on its own: upgrade, then
+restart the Python kernel so the new version loads.
 
 ```python
 !pip install duckrun --upgrade
 notebookutils.session.restartPython()
 ```
 
-If you skip the restart, duckrun fails loud at `connect()` (and on `dbt run`) telling you to
-restart — it won't silently run on the stale preinstalled versions.
+If you skip the restart, duckrun fails loud at `connect()` (and on `dbt run`) and tells you to
+restart — it won't quietly run on the older `duckdb`/`deltalake` still bound in the kernel.
 
 ## Configure your profile
 
