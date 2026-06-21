@@ -26,6 +26,8 @@ from ._runtime import check_runtime_versions
 # TEMP/TEMPORARY TABLE and CREATE VIEW are DuckDB-local scratch by design and pass through.
 _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
+_DML_TARGET_RE = re.compile(
+    r"^(?:insert\s+into|delete\s+from|update)\s+(?P<rel>\"?[\w.]+\"?)", re.IGNORECASE)
 _CREATE_TEMP_RE = re.compile(r"^create\s+(or\s+replace\s+)?(temp|temporary)\b", re.IGNORECASE)
 
 # DML forms that genuinely can't be expressed through delta_rs (delta_dml.handle never applies them):
@@ -94,6 +96,34 @@ def _is_delta_write(query: str) -> bool:
     if _WRITE_KEYWORD_RE.match(s):
         return True
     return bool(_CREATE_TABLE_RE.match(s)) and not _CREATE_TEMP_RE.match(s)
+
+
+def _delta_write_message(query: str) -> str:
+    """The error for a raw-SQL write conn.sql() can't route to delta_rs. For an INSERT/UPDATE/DELETE
+    whose target isn't a discovered Delta table — the common cause being a typo or a table written
+    out-of-band before refresh() — name the table and give form-appropriate guidance, instead of the
+    generic 'use the Spark write API' redirect (which misdirects: for UPDATE/DELETE the problem is the
+    missing table, not the API)."""
+    s = _strip_leading(query)
+    m = _DML_TARGET_RE.match(s)
+    if m:
+        rel = m.group("rel").strip('"')
+        verb = s.split(None, 1)[0].lower()
+        if verb in ("update", "delete"):
+            return (
+                f"conn.sql(): no Delta table '{rel}' to {verb}. conn.sql() DML only targets a "
+                f"discovered Delta table — check the name, or call conn.refresh() if it was just "
+                f"written out-of-band."
+            )
+        return (  # insert into a table that doesn't exist yet
+            f"conn.sql(): no Delta table '{rel}' to insert into. Create it first with "
+            f"df.write.saveAsTable('{rel}'), then insert."
+        )
+    return (  # a CREATE … AS that didn't resolve, or any other unrouted Delta write
+        "conn.sql() can't write a Delta table from raw SQL here. "
+        "Use the Spark write API: df.write.saveAsTable(...) to create/append, or "
+        "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
+    )
 
 
 def _qid(name: str) -> str:
@@ -322,11 +352,7 @@ class DuckSession:
             self.refresh(quiet=True)
             return DataFrame(self.con.sql("SELECT 'ok' AS status"), self)
         if _is_delta_write(query):
-            raise ValueError(
-                "conn.sql() can't write a Delta table from raw SQL here. "
-                "Use the Spark write API: df.write.saveAsTable(...) to create/append, or "
-                "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
-            )
+            raise ValueError(_delta_write_message(query))
         return DataFrame(self.con.sql(query), self)
 
     def table(self, name: str) -> "DataFrame":
