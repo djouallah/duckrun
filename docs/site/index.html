@@ -26,6 +26,15 @@
     figure.shot { margin: 1.75rem 0 2rem; }
     figure.shot img { width: 100%; display: block; border: 1px solid #8884; border-radius: 10px; }
     figure.shot figcaption { color: #777; font-size: 0.9rem; margin-top: 0.55rem; text-align: center; }
+    h2.demo-h { margin-top: 2.75rem; margin-bottom: 0.35rem; }
+    h2.demo-h .tag { font-size: 0.68rem; font-weight: 700; color: #fff; background: #c0392b;
+      padding: 0.12rem 0.5rem; border-radius: 6px; vertical-align: middle; margin-left: 0.4rem; }
+    p.demo-lede { color: #777; margin-top: 0; font-size: 0.95rem; }
+    table.demo { border-collapse: collapse; width: 100%; font-size: 0.88rem; margin: 1rem 0 0.6rem; }
+    table.demo th, table.demo td { border: 1px solid #8884; padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
+    table.demo th { background: #8882; font-weight: 600; }
+    table.demo td:first-child, table.demo th:first-child { text-align: right; color: #888; width: 1.5rem; }
+    p.demo-note { color: #777; font-size: 0.9rem; }
   </style>
 </head>
 <body>
@@ -71,6 +80,38 @@
       <span class="src">source: <a href="https://github.com/josephmachado/simple_dbt_project">josephmachado/simple_dbt_project</a></span>
     </li>
   </ul>
+
+  <h2 class="demo-h">pure SQL — the connection API<span class="tag">not a dbt project</span></h2>
+  <p class="demo-lede">
+    Everything above is dbt. This one isn't:
+    <a href="https://github.com/djouallah/duckrun/blob/main/tests/connection_api/demo_taxi.py"><code>demo_taxi.py</code></a>
+    is a runnable showcase of <code>duckrun.connect()</code> that reads <strong>live</strong> NYC TLC
+    Yellow-Taxi data (Parquet + zone CSV, ~3M rows/month) straight off <code>https</code> and lands it into
+    Delta on OneLake using nothing but <code>conn.sql(...)</code> — pure SQL, no dbt, no Python builders
+    (bar the concurrency finale). Each step leans on DuckDB SQL the dbt path never needs:
+  </p>
+  <table class="demo">
+    <thead><tr><th>#</th><th>Statement — pure SQL via <code>conn.sql</code></th><th>What it shows</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td><code>CREATE TABLE AS … read_csv_auto('https://…')</code></td><td>live taxi-zone CSV → a Delta dimension</td></tr>
+      <tr><td>2</td><td><code>CREATE TEMP TABLE … read_parquet('https://…')</code></td><td>a whole ~3M-row month read in-engine (nothing written yet)</td></tr>
+      <tr><td>3</td><td><code>CREATE OR REPLACE TABLE … USING SAMPLE n ROWS</code></td><td>land a bounded Delta fact table</td></tr>
+      <tr><td>4</td><td><code>… QUALIFY row_number() OVER (…) ≤ 3</code></td><td>top-3 zones per borough — one window pass, no self-join</td></tr>
+      <tr><td>5</td><td><code>PIVOT (…) ON payment USING sum(fare)</code></td><td>payment × time-of-day cross-tab</td></tr>
+      <tr><td>6</td><td><code>GROUP BY ROLLUP (borough, payment)</code></td><td>subtotals + grand-total super-aggregates</td></tr>
+      <tr><td>7</td><td><code>list(struct_pack(…) ORDER BY …)[1:3]</code>, <code>quantile_cont(…, [.5,.9,.99])</code></td><td>LIST/STRUCT nested types &amp; array quantiles</td></tr>
+      <tr><td>8</td><td><code>… ASOF JOIN surge_card ON pickup_ts ≥ valid_from</code></td><td>snap each trip to the latest surge band before it</td></tr>
+      <tr><td>9</td><td><code>INSERT INTO trips SELECT …</code></td><td>append a late-arriving batch (delta-rs)</td></tr>
+      <tr><td>10</td><td><code>DELETE … (literal keys) </code> + <code>INSERT …</code></td><td>a SQL-only upsert — no <code>MERGE</code> needed</td></tr>
+      <tr><td>11</td><td><code>SELECT … FROM delta_scan('…', version =&gt; N)</code></td><td>time-travel read of the landed snapshot</td></tr>
+      <tr><td>12</td><td><code>DeltaTable.merge</code> × 2 <em>(the one Spark-API step)</em></td><td>two concurrent writers, one snapshot → the stale one is refused with <code>CommitFailedError</code></td></tr>
+    </tbody>
+  </table>
+  <p class="demo-note">
+    Step 12 is the lone exception to pure SQL: <code>conn.sql</code> doesn't accept <code>MERGE</code> yet
+    (<a href="https://github.com/djouallah/duckrun/issues/4">#4</a>), so the concurrency clash uses the
+    Spark <code>DeltaTable.merge</code> builder — proving snapshot isolation holds.
+  </p>
 
   <footer>
     Rebuilt on every push to <code>main</code> that touches one of the integration dbt projects,
