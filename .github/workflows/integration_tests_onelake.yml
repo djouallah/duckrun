@@ -10,8 +10,8 @@ name: integration_tests_onelake
 #   • merge_spill — tiny local build for the docs catalog, then the incremental-MERGE chain
 #                   (merge_tpch_bench.py) over OneLake at a SMALL scale factor. The HEAVY SF=10
 #                   (60M-row) memory-spill version stays a LOCAL release gate (local_stress_tests.yml).
-#   • coffee      — tiny local build for the docs catalog, then the connection-API coffee scenario
-#                   (duckrun.connect) over OneLake at a 100M-row fact (a heavy abfss:// write/merge).
+#   • coffee      — build the dbt models ON OneLake at a 100M-row fact (like aemo) so the docs
+#                   catalog reflects the live tables, then the connection-API coffee scenario.
 #   • sde         — tiny local build for the docs catalog, then the SCD2 port driven through real
 #                   dbt subprocesses against a persistent OneLake snapshot.
 #
@@ -177,8 +177,10 @@ jobs:
           --sf 1
 
   coffee:
-    # The coffee-shop project: a LOCAL build for the docs catalog, then the connection-API coffee
-    # scenario (duckrun.connect) over OneLake at a 100M-row fact, into an isolated schema.
+    # The coffee-shop project: build the dbt models DIRECTLY on OneLake at a 100M-row fact (the same
+    # build-on-OneLake-then-docs pattern aemo uses), so the published coffee.html DAG/catalog reflects
+    # the live OneLake tables — not a throwaway local build. Then the connection-API coffee scenario
+    # (duckrun.connect) over OneLake, into an isolated schema.
     runs-on: ubuntu-latest
     concurrency:
       group: coffee-onelake
@@ -186,6 +188,7 @@ jobs:
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
       AZURE_TRANSPORT_OPTION_TYPE: curl
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -193,22 +196,6 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun + pytest
         run: pip install -e ".[test]"
-      - name: dbt build + docs generate (local)
-        working-directory: tests/integration_tests/coffee
-        env:
-          WAREHOUSE_PATH: /tmp/coffee_docs_wh
-        run: |
-          mkdir -p /tmp/coffee_docs_wh
-          dbt build --target dev
-          dbt docs generate --static --target dev
-      - name: Verify the coffee catalog carries Delta table stats (issue #3)
-        working-directory: tests/integration_tests/coffee
-        run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json coffee
-      - name: Upload coffee docs
-        uses: actions/upload-artifact@v4
-        with:
-          name: docs-coffee
-          path: tests/integration_tests/coffee/target/static_index.html
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
@@ -220,11 +207,29 @@ jobs:
           TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Run the coffee-shop scenario against OneLake (100M-row fact)
+      - name: dbt build + docs generate (OneLake — docs reflect the live 100M tables)
+        # Build the models straight onto OneLake so `dbt docs generate` collects the REAL catalog stats
+        # (row counts/size) off the abfss:// Delta tables. COFFEE_ROWS=100M sizes the fact; DBT_SCHEMA
+        # isolates it from the connection-API scenario's schema in the shared lakehouse.
+        working-directory: tests/integration_tests/coffee
         env:
-          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          DBT_SCHEMA: duckrun_dbt_it
+          COFFEE_ROWS: "100000000"
+        run: |
+          dbt build --target dev
+          dbt docs generate --static --target dev
+      - name: Verify the coffee catalog carries Delta table stats (issue #3)
+        working-directory: tests/integration_tests/coffee
+        run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json coffee
+      - name: Upload coffee docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-coffee
+          path: tests/integration_tests/coffee/target/static_index.html
+      - name: Run the coffee-shop scenario against OneLake (connection-API smoke)
+        env:
           DUCKRUN_IT_SCHEMA: duckrun_conn_it
-          COFFEE_ONELAKE_ROWS: "100000000"
+          COFFEE_ONELAKE_ROWS: "2000"
         run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
 
       - name: Connect over a FRIENDLY-name OneLake path (delta-kernel #307 error-hygiene gate)
