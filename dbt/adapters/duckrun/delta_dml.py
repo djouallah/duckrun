@@ -129,6 +129,11 @@ _CREATE_TEMP_RE = re.compile(r"\s*create\s+(?:or\s+replace\s+)?(?:temp|temporary
 # verb would match inside an identifier (e.g. `update` within `last_update`).
 _LEADING_WITH = re.compile(r"\s*with\b", re.I)
 _DRIVING_DML = re.compile(r"\b(?:insert\s+into|update|delete\s+from)\b", re.I)
+# DuckDB numeric type names (DECIMAL(p,s) matches on the prefix). Used to scope the lossy-narrowing
+# guard to numeric→numeric casts only, leaving the intentional timestamp/string alignment untouched.
+_NUMERIC_TYPE_RE = re.compile(
+    r"^(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|UHUGEINT|"
+    r"FLOAT|REAL|DOUBLE|DECIMAL)\b", re.I)
 
 
 def _strip_leading(query: str) -> str:
@@ -382,10 +387,10 @@ class _DeltaDML:
         if self._with_clause:  # `WITH … INSERT INTO t SELECT …`: re-attach the CTE to the body
             body = f"{self._with_clause} {body}"
         cols = m.group("cols")
-        if cols:  # `insert into t (a, b) select …` → project the query onto the named columns
-            self._append_projected(loc, self._provided(cols), f"({body})")
-        else:  # column count/order already matches the target → append as-is
-            engine.write_delta(loc, self.cursor.sql(body), "append", storage_options=self.so)
+        # Always project onto the target schema — a column list maps by name, no list maps
+        # positionally. Routing both through _append_projected gives one place for the intentional
+        # type alignment AND the lossy-numeric-narrowing guard (so `insert … select 3.9` is caught too).
+        self._append_projected(loc, self._provided(cols) if cols else None, f"({body})")
 
     def _insert_values(self, m, rel, schema, loc) -> None:
         # `insert into <rel> [(<cols>)] values (...)`: the literals supply every target column when
@@ -420,6 +425,7 @@ class _DeltaDML:
 
         quoted = ", ".join('"' + c + '"' for c in provided)
         inner = f"{derived} v({quoted})"
+        self._reject_lossy_numeric_narrowing(inner, provided, dict(zip(target_cols, target_types)))
         exprs = [
             f'cast(v."{col}" as {typ}) as "{col}"' if col in provided_set
             else f'cast(null as {typ}) as "{col}"'
@@ -427,6 +433,43 @@ class _DeltaDML:
         ]
         data = self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
         engine.write_delta(loc, data, "append", storage_options=self.so)
+
+    def _reject_lossy_numeric_narrowing(self, inner: str, provided, ttype) -> None:
+        """Fail loud when a supplied numeric value would be SILENTLY changed by the cast onto its
+        target column — e.g. inserting 3.9 into an INTEGER column (which lands 4). The cast in
+        :meth:`_append_projected` aligns types ON PURPOSE — timestamp ntz, int widening — and those are
+        lossless and intended, so this guard only fires for a numeric→numeric cast where the value does
+        NOT survive a round-trip through the target type. Non-numeric casts (timestamps, strings) are
+        deliberately left untouched. Raises ``ValueError`` naming the column and an example value.
+
+        Costs one extra evaluation of ``inner`` (trivial for VALUES; a second scan for ``insert …
+        select`` — acceptable to turn silent corruption into a loud error)."""
+        src = self.cursor.sql(
+            "select " + ", ".join(f'v."{c}"' for c in provided) + f" from {inner} limit 0")
+        stype = {c: str(t) for c, t in zip(provided, src.types)}
+        checks = []  # (col, lossy-predicate) for numeric→numeric casts that could narrow
+        for col in provided:
+            s, t = stype[col], ttype[col]
+            if s == t or not (_NUMERIC_TYPE_RE.match(s) and _NUMERIC_TYPE_RE.match(t)):
+                continue
+            # round-trip through the target type; try_cast so the probe itself never throws — an
+            # out-of-range value becomes NULL → distinct → flagged, same as a fractional loss.
+            checks.append(
+                (col, f'try_cast(try_cast(v."{col}" as {t}) as {s}) is distinct from v."{col}"'))
+        if not checks:
+            return
+        sel = ", ".join(
+            f'count(*) filter (where {pred}) as "n{i}", '
+            f'any_value(v."{col}") filter (where {pred}) as "ex{i}"'
+            for i, (col, pred) in enumerate(checks))
+        row = self.cursor.sql(f"select {sel} from {inner}").fetchone()
+        for i, (col, _) in enumerate(checks):
+            n, ex = row[2 * i], row[2 * i + 1]
+            if n:
+                raise ValueError(
+                    f"INSERT would silently narrow {n} value(s) for column '{col}' into "
+                    f"{ttype[col]} (e.g. {ex!r}). Cast explicitly in the SELECT/VALUES if intended."
+                )
 
     def _alter_add(self, m, rel, schema, loc) -> None:
         col = m.group("col").strip().strip('"')

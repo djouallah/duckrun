@@ -745,6 +745,35 @@ def test_partial_insert_null_fills_and_keeps_type(tmp_path):
     assert _dtypes(wh, "wide")["qty"] in ("INTEGER", "BIGINT", "HUGEINT")
 
 
+# The lossy-numeric guard: INSERT fails loud when a numeric value would be SILENTLY changed by the
+# cast onto its target column (e.g. 3.9 → INTEGER lands 4). The intentional alignment — timestamp ntz,
+# int widening, whole-number decimals — is untouched. (wide.qty is INTEGER.)
+@pytest.mark.parametrize("stmt", [
+    "insert into wide (id, name, qty) values (7, 'g', 3.9)",            # fractional → INTEGER
+    "insert into wide (id, name, qty) values (7, 'g', 9999999999999)",  # out of INTEGER range
+    "insert into wide select 7, 'g', 3.9",                             # same loss via a SELECT body
+], ids=["values_fractional", "values_out_of_range", "select_fractional"])
+def test_insert_rejects_lossy_numeric_narrowing(tmp_path, stmt):
+    with pytest.raises(ValueError, match="silently narrow"):
+        _seed(str(tmp_path / "wh")).sql(stmt)
+
+
+def test_insert_allows_whole_number_decimal(tmp_path):
+    # 4.0 → INTEGER loses nothing (round-trips), so it is allowed and lands 4.
+    wh = str(tmp_path / "wh")
+    _seed(wh).sql("insert into wide (id, name, qty) values (7, 'g', 4.0)")
+    assert _select(wh, "select qty from wide where id = 7") == [(4,)]
+
+
+def test_insert_allows_widening_numeric(tmp_path):
+    # An int literal into a BIGINT column is a lossless widening — not flagged.
+    wh = str(tmp_path / "wh")
+    c = duckrun.connect(wh, schema="dbo")
+    c.sql("select cast(1 as bigint) as id").write.mode("overwrite").saveAsTable("big")
+    c.sql("insert into big values (2)")
+    assert _dump(wh, "big")[1] == sorted([(1,), (2,)], key=_k)
+
+
 # Tier 2 — single-API ops; inline golden expected, read back via a fresh connection.
 def test_replace_where_spark_only(tmp_path):
     wh = str(tmp_path / "wh")
