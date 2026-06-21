@@ -20,10 +20,10 @@ batch. It gates every release; the latest scorecard is rendered live below.
 | | |
 |---|---|
 | Engine | duckrun &middot; DuckDB 1.5.4 &middot; delta_rs 1.5.0 |
-| Target fact table | TPCH `lineitem`, scale factor **10.0** → **59,986,052 rows** |
+| Target fact table | TPCH `lineitem`, scale factor **20.0** → **119,994,608 rows** |
 | Primary key (merge on) | `(l_orderkey, l_linenumber)` |
-| Effective memory | 14897 MB (runner RAM, no artificial limit) |
-| Merge spill cap | 8938 MB — delta_rs `max_spill_size` |
+| Effective memory | 14923 MB (runner RAM, no artificial limit) |
+| Merge spill cap | 8954 MB — delta_rs `max_spill_size` |
 
 ### The operations (a chain — each builds on the previous via `ref`)
 1. **Mixed upsert (~1% sample):** ~80% existing keys → UPDATE, ~20% key-shifted → INSERT.
@@ -37,14 +37,14 @@ batch. It gates every release; the latest scorecard is rendered live below.
 ### Results (row counts in millions; peak RSS is the `dbt run` child's, per op)
 | Operation | Increment | Updates | Inserts | Before | After | Expected | Count ✓ | Values ✓ | Peak RSS | Time |
 |---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|---:|
-| Mixed upsert | 0.6M | 0.5M | 0.1M | 60.0M | 60.1M | 60.1M | ✅ | ✅ | 3,906 MB | 85.1s |
-| Insert-only (future shipdate) | 3.0M | 0.0M | 3.0M | 60.1M | 63.1M | 63.1M | ✅ | ✅ | 2,569 MB | 12.7s |
-| Update-only (100% match) | 3.2M | 3.2M | 0.0M | 63.1M | 63.1M | 63.1M | ✅ | ✅ | 5,307 MB | 91.9s |
-| Idempotent re-merge | 0.0M | 0.0M | 0.0M | 63.1M | 63.1M | 63.1M | ✅ | ✅ | 4,711 MB | 88.5s |
-| Append (no merge) | 3.2M | 0.0M | 3.2M | 63.1M | 66.3M | 66.3M | ✅ | ✅ | 1,162 MB | 12.2s |
-| Safeappend (no merge) | 3.3M | 0.0M | 3.3M | 66.3M | 69.6M | 69.6M | ✅ | ✅ | 1,180 MB | 12.3s |
-| Overwrite (no merge) | 3.5M | 0.0M | 3.5M | 69.6M | 3.5M | 3.5M | ✅ | ✅ | 1,134 MB | 12.5s |
+| Mixed upsert | 1.2M | 1.0M | 0.2M | 120.0M | 120.2M | 120.2M | ✅ | ✅ | 4,945 MB | 196.6s |
+| Insert-only (future shipdate) | 6.0M | 0.0M | 6.0M | 120.2M | 126.2M | 126.2M | ✅ | ✅ | 3,608 MB | 34.9s |
+| Update-only (100% match) | 6.3M | 6.3M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 6,746 MB | 202.7s |
+| Idempotent re-merge | 0.0M | 0.0M | 0.0M | 126.2M | 126.2M | 126.2M | ✅ | ✅ | 6,308 MB | 157.4s |
+| Append (no merge) | 6.3M | 0.0M | 6.3M | 126.2M | 132.6M | 132.6M | ✅ | ✅ | 1,564 MB | 32.4s |
+| Safeappend (no merge) | 6.6M | 0.0M | 6.6M | 132.6M | 139.2M | 139.2M | ✅ | ✅ | 1,547 MB | 34.8s |
+| Overwrite (no merge) | 7.0M | 0.0M | 7.0M | 139.2M | 7.0M | 7.0M | ✅ | ✅ | 1,668 MB | 31.2s |
 
-**Result: ✅ all operations correct.** The chain tail reached **69,576,971 rows**, peak memory **5,307 MB** — duckrun stayed within the runner's RAM and every update/insert landed through the dbt path.
+**Result: ✅ all operations correct.** The chain tail reached **139,183,841 rows**, peak memory **6,746 MB** — duckrun stayed within the runner's RAM and every update/insert landed through the dbt path.
 
 <!-- MERGE:END -->
