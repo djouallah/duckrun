@@ -240,6 +240,11 @@ jobs:
     # schema so it never collides with the coffee tables in the shared lakehouse. Its own job so it
     # shows up as a visible node; non-fatal so a flaky live source can't redden the run.
     runs-on: ubuntu-latest
+    # contents: write so the actual-run scorecard can be committed back into the docs page;
+    # id-token for the OIDC Azure login (a job-level permissions block replaces the top-level set).
+    permissions:
+      contents: write
+      id-token: write
     concurrency:
       group: taxi-onelake
       cancel-in-progress: false
@@ -268,7 +273,31 @@ jobs:
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
+          DUCKRUN_TAXI_CARD: docs/taxi_card.html   # the demo writes its real-run scorecard here
         run: python tests/connection_api/demo_taxi.py
+
+      - name: Splice the actual-run scorecard into the docs page and commit to main
+        # Only commit the canonical card on a push to main; PRs/dispatch just run the demo. No-op if
+        # the demo died before writing the card. Never fails the run on a git hiccup. [skip ci] avoids
+        # re-triggering. Mirrors the MERGE-card step in local_stress_tests.yml.
+        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('docs/taxi_card.html') != ''
+        continue-on-error: true
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python tests/tools/inject_readme.py docs/site/index.html docs/taxi_card.html TAXI
+          if git diff --quiet -- docs/site/index.html; then
+            echo "docs taxi card unchanged."
+            exit 0
+          fi
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/site/index.html
+          git commit -m "docs: update NYC-taxi pure-SQL scorecard [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
 
   sde:
     # The josephmachado/simple_dbt_project port: a tiny LOCAL full build for the docs catalog

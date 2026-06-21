@@ -33,7 +33,10 @@
     table.demo { border-collapse: collapse; width: 100%; font-size: 0.88rem; margin: 1rem 0 0.6rem; }
     table.demo th, table.demo td { border: 1px solid #8884; padding: 0.4rem 0.6rem; text-align: left; vertical-align: top; }
     table.demo th { background: #8882; font-weight: 600; }
-    table.demo td:first-child, table.demo th:first-child { text-align: right; color: #888; width: 1.5rem; }
+    table.ops td:first-child, table.ops th:first-child { text-align: right; color: #888; width: 1.5rem; }
+    table.card td:not(:first-child), table.card th:not(:first-child) { text-align: right; white-space: nowrap; }
+    table.card td:first-child { font-weight: 600; }
+    p.demo-cap { color: #777; font-size: 0.85rem; margin: 1rem 0 0.2rem; }
     p.demo-note { color: #777; font-size: 0.9rem; }
   </style>
 </head>
@@ -88,9 +91,32 @@
     is a runnable showcase of <code>duckrun.connect()</code> that reads <strong>live</strong> NYC TLC
     Yellow-Taxi data (Parquet + zone CSV, ~3M rows/month) straight off <code>https</code> and lands it into
     Delta on OneLake using nothing but <code>conn.sql(...)</code> — pure SQL, no dbt, no Python builders
-    (bar the concurrency finale). Each step leans on DuckDB SQL the dbt path never needs:
+    (bar the concurrency finale). Each step leans on DuckDB SQL the dbt path never needs.
   </p>
-  <table class="demo">
+
+  <!-- The scorecard below is spliced in from an actual demo run by the integration-tests workflow
+       (tests/tools/inject_readme.py … TAXI). Do not hand-edit between the markers. -->
+  <!-- TAXI:START -->
+
+<p class="demo-cap">Actual run: 50,000-row sample of live NYC TLC Yellow-Taxi 2024-01 → local Delta, 2026-06-21 UTC — <strong>✅ all operations correct</strong></p>
+<table class="demo card">
+  <thead><tr><th>Operation</th><th>Rows</th><th>Before</th><th>After</th><th>Expected</th><th>Count&nbsp;✓</th><th>Values&nbsp;✓</th><th>Time</th></tr></thead>
+  <tbody>
+    <tr><td>Load zones (CSV→Delta)</td><td>+265</td><td>0</td><td>265</td><td>265</td><td>✅</td><td>✅</td><td>0.7s</td></tr>
+    <tr><td>Land trips sample</td><td>+50,000</td><td>0</td><td>50,000</td><td>50,000</td><td>✅</td><td>✅</td><td>0.4s</td></tr>
+    <tr><td>Write zone-summary mart</td><td>+6</td><td>0</td><td>6</td><td>6</td><td>✅</td><td>✅</td><td>0.1s</td></tr>
+    <tr><td>Write surge mart (ASOF)</td><td>+50,000</td><td>0</td><td>50,000</td><td>50,000</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
+    <tr><td>INSERT append (+100)</td><td>+100</td><td>50,000</td><td>50,100</td><td>50,100</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
+    <tr><td>SQL upsert (1 upd, 1 ins)</td><td>+1</td><td>205</td><td>206</td><td>206</td><td>✅</td><td>✅</td><td>0.4s</td></tr>
+    <tr><td>DELETE Cash trips</td><td>-7,271</td><td>50,100</td><td>42,829</td><td>42,829</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
+    <tr><td>Concurrent MERGE clash</td><td>+0</td><td>206</td><td>206</td><td>206</td><td>✅</td><td>✅</td><td>0.2s</td></tr>
+  </tbody>
+</table>
+
+<!-- TAXI:END -->
+
+  <p class="demo-cap">Every statement, and the DuckDB SQL it leans on:</p>
+  <table class="demo ops">
     <thead><tr><th>#</th><th>Statement — pure SQL via <code>conn.sql</code></th><th>What it shows</th></tr></thead>
     <tbody>
       <tr><td>1</td><td><code>CREATE TABLE AS … read_csv_auto('https://…')</code></td><td>live taxi-zone CSV → a Delta dimension</td></tr>

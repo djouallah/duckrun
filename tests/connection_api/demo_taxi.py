@@ -26,11 +26,13 @@ Knobs (all env-overridable):
     TAXI_MONTH            which month to read, YYYY-MM (default: 2024-01 — pinned, deterministic)
     TAXI_SAMPLE_ROWS      rows landed to Delta         (default: 50000)
 """
+import html
 import os
 import sys
 import textwrap
 import time
 from contextlib import contextmanager
+from datetime import datetime, timezone
 
 import duckrun
 
@@ -91,6 +93,25 @@ def _scorecard(results):
     ok = all(r["count_ok"] and r["values_ok"] for r in results)
     print("\n  ✅ all operations correct." if ok
           else "\n  ❌ one or more operations were wrong — see the ❌ cells above.", flush=True)
+
+
+def _scorecard_html(results, caption):
+    """Same scorecard, as an HTML fragment to splice into the docs page (matches inject_readme.py's
+    marker convention). This is a REAL run's numbers — not a hand-written table."""
+    ok = all(r["count_ok"] and r["values_ok"] for r in results)
+    head = ("<th>Operation</th><th>Rows</th><th>Before</th><th>After</th>"
+            "<th>Expected</th><th>Count&nbsp;✓</th><th>Values&nbsp;✓</th><th>Time</th>")
+    body = "\n".join(
+        "    <tr><td>{n}</td><td>{r:+,}</td><td>{b:,}</td><td>{a:,}</td><td>{e:,}</td>"
+        "<td>{c}</td><td>{v}</td><td>{t:.1f}s</td></tr>".format(
+            n=html.escape(x["name"]), r=x["after"] - x["before"], b=x["before"], a=x["after"],
+            e=x["expected"], c="✅" if x["count_ok"] else "❌", v="✅" if x["values_ok"] else "❌",
+            t=x["dt"])
+        for x in results)
+    verdict = "✅ all operations correct" if ok else "❌ some operations failed"
+    return (f'<p class="demo-cap">{html.escape(caption)} — <strong>{verdict}</strong></p>\n'
+            f'<table class="demo card">\n  <thead><tr>{head}</tr></thead>\n  <tbody>\n'
+            f'{body}\n  </tbody>\n</table>')
 
 
 def _read_retry(conn, sql, attempts=3, base=3):
@@ -392,6 +413,18 @@ def run_taxi_demo(conn, schema):
             f"writer B refused — {errline.split(':')[-1].strip() or 'CommitFailedError'}")
 
     _scorecard(results)
+
+    # Emit the HTML scorecard for the docs page when asked (CI sets DUCKRUN_TAXI_CARD). The docs
+    # 'taxi' card is this fragment spliced in by inject_readme.py — always a real run's numbers.
+    card_path = os.environ.get("DUCKRUN_TAXI_CARD")
+    if card_path:
+        target = "OneLake" if str(getattr(conn, "root_path", "")).startswith(("abfss://", "az://")) else "local Delta"
+        caption = (f"Actual run: {SAMPLE_ROWS:,}-row sample of live NYC TLC Yellow-Taxi "
+                   f"{TAXI_MONTH} → {target}, {datetime.now(timezone.utc):%Y-%m-%d} UTC")
+        with open(card_path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(_scorecard_html(results, caption))
+        print(f"  wrote HTML scorecard → {card_path}", flush=True)
+
     print(f"\n=== demo complete: {schema} ===", flush=True)
 
 
