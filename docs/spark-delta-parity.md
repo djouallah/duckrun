@@ -36,7 +36,6 @@ that says *which mapped methods actually pass their tests*; this page says *what
 | `spark.catalog` | `conn.catalog` | ✅ | → `Catalog` (see below). |
 | `spark.createDataFrame(rows)` | `conn.sql("SELECT * FROM (VALUES …) t(…)")` | 🚫 | SQL-first by design — build data with SQL, not a Python constructor. |
 | `spark.range(n)` | `conn.sql("SELECT … FROM range(n)")` | 🚫 | SQL-first by design. |
-| `spark.conf` / `spark.sparkContext` / `spark.udf` / `spark.stop()` | — | 🚫 | No Spark runtime to configure — by design. (UDFs: register on `conn.connection`, the raw DuckDB connection.) |
 | — | `conn.delta_table(name)` | 🟡 | duckrun shortcut for `DeltaTable.forName(conn, name)`. |
 | — | `conn.table_path(schema, table)` / `conn.resolve(name)` / `conn.refresh()` / `conn.connection` | 🟡 | duckrun plumbing: locate a table's storage path, re-discover the catalog, and the DuckDB escape hatch. |
 
