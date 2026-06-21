@@ -8,6 +8,10 @@ DuckDB's fancy SQL (QUALIFY, PIVOT, ROLLUP, LIST/STRUCT, ASOF JOIN) and closes w
 scorecard. ``test_coffee.py`` already covers the Spark-style builder API on generated data; this is
 the SQL-first, real-data counterpart.
 
+The one deliberate non-SQL step is the finale: a **concurrent MERGE clash** staged through the
+Spark ``DeltaTable.merge`` builder (``conn.sql`` rejects ``MERGE`` on purpose) — two writers pinned
+to one snapshot, the stale one refused with ``CommitFailedError``, proving snapshot isolation.
+
 Heavy read+compute runs in-engine over the *full* month (millions of rows, local CPU); only a
 bounded **sample** plus compact marts are written over the network to OneLake, so the network is not
 the bottleneck.
@@ -24,6 +28,7 @@ Knobs (all env-overridable):
 """
 import os
 import sys
+import textwrap
 import time
 from contextlib import contextmanager
 
@@ -103,6 +108,16 @@ def _read_retry(conn, sql, attempts=3, base=3):
             time.sleep(wait)
 
 
+def _ddl(conn, stmt, retry=False):
+    """Echo the exact SQL we're about to run (this is a demo — show the data engineer the statement,
+    with literals substituted), then execute it through ``conn.sql()``. One statement per call:
+    duckrun routes each to delta-rs individually and rejects ``;``-separated batches."""
+    clean = textwrap.dedent(stmt).strip()
+    print("      ┄┄ SQL ┄┄", flush=True)
+    print("\n".join("      │ " + line for line in clean.splitlines()), flush=True)
+    return _read_retry(conn, clean) if retry else conn.sql(clean)
+
+
 def _month_bounds(ym):
     """'2024-01' -> ('2024-01-01', '2024-02-01') as half-open [start, end) timestamp bounds."""
     y, m = (int(x) for x in ym.split("-"))
@@ -125,12 +140,12 @@ def run_taxi_demo(conn, schema):
     # 1 ── real dimension off the web → Delta ─────────────────────────────────────────────────────
     with _step(1, "real dimension off the web: taxi-zone lookup CSV (https) → Delta 'zones'") as say:
         t0 = time.perf_counter()
-        _read_retry(conn, f"""
+        _ddl(conn, f"""
             CREATE OR REPLACE TABLE zones AS
             SELECT "LocationID"::INT AS zone_id, "Borough" AS borough,
                    "Zone" AS zone, "service_zone" AS service_zone
             FROM read_csv_auto('{ZONE_CSV}')
-        """)
+        """, retry=True)
         n_zones = q("SELECT count(*) FROM zones")
         nulls = q("SELECT count(*) FROM zones WHERE borough IS NULL")
         results.append(_row("Load zones (CSV→Delta)", 0, n_zones, n_zones, True, nulls == 0, time.perf_counter() - t0))
@@ -141,7 +156,7 @@ def run_taxi_demo(conn, schema):
     # 2 ── register the live month as a TEMP TABLE (full month, in-engine, read once) ──────────────
     with _step(2, f"register the live month: read_parquet yellow_tripdata_{TAXI_MONTH} (https, ~50MB) "
                   "→ TEMP TABLE 'trips_raw'") as say:
-        _read_retry(conn, f"""
+        _ddl(conn, f"""
             CREATE TEMP TABLE trips_raw AS
             SELECT
                 t.tpep_pickup_datetime  AS pickup_ts,
@@ -160,14 +175,14 @@ def run_taxi_demo(conn, schema):
             WHERE t.fare_amount > 0 AND t.trip_distance > 0
               AND t.tpep_pickup_datetime >= TIMESTAMP '{start}'
               AND t.tpep_pickup_datetime <  TIMESTAMP '{end}'
-        """)
+        """, retry=True)
         n_full = q("SELECT count(*) FROM trips_raw")
         say(f"{n_full:,} clean trips for {TAXI_MONTH} — all compute in-engine; nothing written to Delta yet")
 
     # 3 ── land a bounded sample → Delta 'trips' (CREATE TABLE AS … USING SAMPLE) ──────────────────
     with _step(3, f"land a bounded sample → Delta 'trips' (CREATE TABLE AS … USING SAMPLE {SAMPLE_ROWS:,})") as say:
         t0 = time.perf_counter()
-        conn.sql(f"""
+        _ddl(conn, f"""
             CREATE OR REPLACE TABLE trips AS
             SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
             FROM trips_raw USING SAMPLE {SAMPLE_ROWS} ROWS
@@ -226,7 +241,7 @@ def run_taxi_demo(conn, schema):
             GROUP BY borough ORDER BY borough
         """).show()
         t0 = time.perf_counter()
-        conn.sql("""
+        _ddl(conn, """
             CREATE OR REPLACE TABLE mart_zone_summary AS
             WITH ranked AS (
                 SELECT borough, zone, round(sum(total), 0)::BIGINT AS rev,
@@ -252,13 +267,13 @@ def run_taxi_demo(conn, schema):
 
     # 8 ── fancy SQL: ASOF JOIN to a surge rate-card ──────────────────────────────────────────────
     with _step(8, "fancy SQL — ASOF JOIN: snap each trip to the latest surge multiplier by pickup time") as say:
-        conn.sql("""
+        _ddl(conn, """
             CREATE TEMP TABLE surge_card AS
             SELECT * FROM (VALUES (TIME '00:00', 1.00), (TIME '07:00', 1.25), (TIME '10:00', 1.00),
                                   (TIME '16:00', 1.40), (TIME '20:00', 1.15)) v(valid_from, multiplier)
         """)
         t0 = time.perf_counter()
-        conn.sql("""
+        _ddl(conn, """
             CREATE OR REPLACE TABLE mart_surged AS
             SELECT t.zone_id, t.borough, t.payment, t.pickup_ts, t.fare AS base_fare,
                    s.multiplier, round(t.fare * s.multiplier, 2) AS surged_fare
@@ -283,7 +298,7 @@ def run_taxi_demo(conn, schema):
     with _step(10, "raw-DML INSERT: append a 100-row late-arriving batch to 'trips'") as say:
         t0 = time.perf_counter()
         before = q("SELECT count(*) FROM trips")
-        conn.sql("""
+        _ddl(conn, """
             INSERT INTO trips
             SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
             FROM trips_raw USING SAMPLE 100 ROWS
@@ -295,7 +310,7 @@ def run_taxi_demo(conn, schema):
 
     # 11 ── SQL-only upsert: DELETE affected keys + INSERT (1 update, 1 insert) ────────────────────
     with _step(11, "SQL-only upsert on 'zone_stats': DELETE literal keys + INSERT (1 update, 1 insert)") as say:
-        conn.sql("""
+        _ddl(conn, """
             CREATE OR REPLACE TABLE zone_stats AS
             SELECT zone_id, any_value(zone) AS zone, count(*) AS trips, round(avg(fare), 2) AS avg_fare
             FROM trips GROUP BY zone_id
@@ -309,9 +324,9 @@ def run_taxi_demo(conn, schema):
         new_avg = round(old_avg + 5.0, 2)
         # delta-rs DELETE predicates take literals, not IN (SELECT …) — so we key the DELETE on literal
         # ids captured above, then INSERT the recomputed/new rows. That is the SQL-only upsert.
-        conn.sql(f"DELETE FROM zone_stats WHERE zone_id = {target} OR zone_id = 999")
-        conn.sql(f"INSERT INTO zone_stats VALUES "
-                 f"({target}, '{tgt_zone}', {tgt_trips}, {new_avg}), (999, 'NEW Demo Zone', 1, 7.77)")
+        _ddl(conn, f"DELETE FROM zone_stats WHERE zone_id = {target} OR zone_id = 999")
+        _ddl(conn, f"INSERT INTO zone_stats VALUES "
+                   f"({target}, '{tgt_zone}', {tgt_trips}, {new_avg}), (999, 'NEW Demo Zone', 1, 7.77)")
         after = q("SELECT count(*) FROM zone_stats")
         upd_ok = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {target}") == new_avg
         ins_ok = q("SELECT count(*) FROM zone_stats WHERE zone_id = 999") == 1
@@ -324,7 +339,7 @@ def run_taxi_demo(conn, schema):
         t0 = time.perf_counter()
         before = q("SELECT count(*) FROM trips")
         cash = q("SELECT count(*) FROM trips WHERE payment = 'Cash'")
-        conn.sql("DELETE FROM trips WHERE payment = 'Cash'")
+        _ddl(conn, "DELETE FROM trips WHERE payment = 'Cash'")
         after = q("SELECT count(*) FROM trips")
         still = q("SELECT count(*) FROM trips WHERE payment = 'Cash'")
         results.append(_row("DELETE Cash trips", before, after, before - cash, after == before - cash, still == 0,
@@ -342,6 +357,39 @@ def run_taxi_demo(conn, schema):
         _table([(f"{before:,}", f"{cash:,}", f"{after:,}", f"{at_landed:,}")],
                ["before", "Cash deleted", "after (now)", "at landed ver"], "  time travel: current vs landed snapshot")
         say(f"deleted {cash:,} Cash trips ({before:,} → {after:,}); {how} still sees {at_landed:,}")
+
+    # 13 ── concurrent MERGE clash — Spark builder API, snapshot isolation ─────────────────────────
+    with _step(13, "concurrent MERGE clash (Spark DeltaTable.merge): two writers, one snapshot — "
+                   "the stale one is refused") as say:
+        from duckrun import DeltaTable
+        from deltalake.exceptions import CommitFailedError
+        t0 = time.perf_counter()
+        busiest = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")
+        old_avg = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {busiest}")
+        before = q("SELECT count(*) FROM zone_stats")
+        cond = "target.zone_id = source.zone_id"
+        srcA = conn.sql(f"SELECT zone_id, zone, trips, 100.00::DOUBLE AS avg_fare FROM zone_stats WHERE zone_id = {busiest}")
+        srcB = conn.sql(f"SELECT zone_id, zone, trips, 200.00::DOUBLE AS avg_fare FROM zone_stats WHERE zone_id = {busiest}")
+        # Spark API on purpose — conn.sql rejects MERGE. .merge() snapshot-pins at BUILD time, so both
+        # writers capture the SAME version before either commits: exactly two concurrent writers.
+        writer_A = DeltaTable.forName(conn, "zone_stats").merge(srcA, cond).whenMatchedUpdateAll().whenNotMatchedInsertAll()
+        writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, cond).whenMatchedUpdateAll().whenNotMatchedInsertAll()
+        say(f"both writers built against zone {busiest} (avg {old_avg}) at the same snapshot")
+        writer_A.execute()  # writer A wins the race, advancing the table version
+        try:
+            writer_B.execute()  # writer B is now one version behind → OCC must refuse it
+            clashed, errline = False, ""
+        except CommitFailedError as e:
+            clashed, errline = True, str(e).splitlines()[0]
+        final_avg = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {busiest}")
+        after = q("SELECT count(*) FROM zone_stats")
+        _table([("A — fresh snapshot", "100.0", "committed ✅"),
+                ("B — stale snapshot", "200.0", "refused ✅" if clashed else "committed ❌ (UNSAFE)")],
+               ["writer", "intended avg", "outcome"], "  two concurrent MERGEs against one snapshot")
+        results.append(_row("Concurrent MERGE clash", before, after, before, after == before,
+                            clashed and final_avg == 100.0, time.perf_counter() - t0))
+        say(f"snapshot isolation held: zone {busiest} avg = {final_avg} (writer A won); "
+            f"writer B refused — {errline.split(':')[-1].strip() or 'CommitFailedError'}")
 
     _scorecard(results)
     print(f"\n=== demo complete: {schema} ===", flush=True)
