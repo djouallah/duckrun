@@ -1,4 +1,4 @@
-"""duckrun — a storage-neutral, Spark-shaped connection over a Delta lakehouse.
+"""duckrun — a storage-neutral, DataFrame-style connection over a Delta lakehouse.
 
     import duckrun
     conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")

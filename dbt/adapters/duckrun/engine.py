@@ -95,12 +95,12 @@ def _available_ram_bytes() -> Optional[int]:
     """Physical RAM the kernel reports as currently allocatable (free + reclaimable),
     cross-platform; None if it can't be determined.
 
-    On a busy shared box — a Fabric notebook sharing the node with the Spark runtime and a
+    On a busy shared box — a Fabric notebook sharing the node with another runtime and a
     background DuckDB job — this sits far below *total* RAM, and it's the number the budget must
     respect: total RAM would overcommit a process that doesn't own the whole node. Read FRESH on
     every call (no startup snapshot): _effective_mem_limit_bytes() is sampled right before each
     job (e.g. at the top of merge_delta, before the source relation is materialized), so the cap
-    reflects the memory actually free at that moment — after whatever earlier models, a Spark
+    reflects the memory actually free at that moment — after whatever earlier models, a co-tenant
     runtime, or a background DuckDB job have already taken — instead of a stale value frozen at
     connection setup.
     """
@@ -119,7 +119,7 @@ def _available_ram_bytes() -> Optional[int]:
 
 def _cgroup_mem_limit_bytes() -> Optional[int]:
     """Memory limit imposed by the current cgroup (i.e. a container), or None if unlimited
-    or not on Linux. This is what matters on Fabric/Spark/k8s, where physical RAM is the
+    or not on Linux. This is what matters on Fabric/k8s, where physical RAM is the
     host's but the kernel OOM-kills us at the (much lower) container limit.
 
     cgroup v2: the tightest finite ``memory.max`` walking up our cgroup to the root.
@@ -169,13 +169,13 @@ def _effective_mem_limit_bytes() -> Optional[int]:
     of them can be determined.
 
     Sampled per job (right before each merge, before its source is materialized) rather than once
-    at startup — so the cap tracks the memory actually free *now*, after earlier models / a Spark
-    runtime / a background DuckDB job have taken their share, instead of a stale connection-time
+    at startup — so the cap tracks the memory actually free *now*, after earlier models / a co-tenant
+    job have taken their share, instead of a stale connection-time
     snapshot.
 
     The available-RAM term is also what catches Fabric: there the cgroup is the unlimited *root*
     (`/proc/self/cgroup` = `0::/`, `memory.max` = `max`), so the cap would otherwise fall back to
-    *total* node RAM — ignoring that the Spark runtime, the kernel, and any background DuckDB job
+    *total* node RAM — ignoring that another runtime, the kernel, and any background DuckDB job
     already hold most of it. Available RAM reflects that pressure; total RAM does not."""
     vals = [v for v in (_total_ram_bytes(), _cgroup_mem_limit_bytes(),
                         _available_ram_bytes()) if v]
@@ -338,7 +338,7 @@ _MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size
 # Write path (overwrite/append/safeappend/microbatch): DuckDB runs alone — no competing delta_rs
 # merge pool — so it gets the bulk of the cap, not a 0.3 share. But it must still be BOUNDED to the
 # effective limit, because DuckDB's own default memory_limit is 80% of *physical* RAM, and on a
-# container (Fabric/Spark/k8s) physical RAM is the whole node, not our slice — so the default
+# container (Fabric/k8s) physical RAM is the whole node, not our slice — so the default
 # overcommits and the kernel OOM-kills us. 0.7 of the effective limit (which folds in available RAM,
 # the only signal that reflects the container on Fabric where the cgroup is the unlimited root)
 # leaves ~30% for the Arrow source stream, the Parquet writer, and page cache outside DuckDB's pool.
@@ -664,7 +664,7 @@ def delta_columns(path: str, storage_options: Optional[Dict[str, str]] = None) -
 
 def table_version(path: str, storage_options: Optional[Dict[str, str]] = None) -> int:
     """Current (HEAD) Delta version of the table at ``path``. The ``vB`` a caller captures before
-    reading a source, to pin a later merge/replace to the same snapshot (Spark MERGE semantics)."""
+    reading a source, to pin a later merge/replace to the same snapshot (single-snapshot MERGE semantics)."""
     return _delta_table(path, storage_options).version()
 
 
@@ -699,7 +699,7 @@ def write_delta(
       - ignore:    write only if the table does not already exist
 
     ``merge_schema`` evolves the schema (adds columns); ``overwrite_schema`` replaces it wholesale
-    (overwrite mode only — Spark/Delta's ``overwriteSchema``). They are mutually exclusive.
+    (overwrite mode only — Delta's ``overwriteSchema``). They are mutually exclusive.
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
@@ -813,7 +813,7 @@ def replace_where(
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
 ) -> None:
-    """Spark ``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
+    """``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
     replace the rows matching ``predicate`` with ``data``. One commit, not a delete-then-append
     pair — so there is no torn-read window (a reader never sees the range emptied-but-not-refilled)
     and no half-applied failure state.
@@ -865,7 +865,7 @@ def replace_window(
 ) -> None:
     """Microbatch window replace: atomically replace the rows in ``[start, end)`` on ``column``
     with ``data`` (the batch's rows) — the Delta-native equivalent of dbt's microbatch "delete the
-    window, insert the batch", as ONE atomic commit (Spark ``replaceWhere``). ``start``/``end`` are
+    window, insert the batch", as ONE atomic commit (``replaceWhere``). ``start``/``end`` are
     naive ``YYYY-MM-DD HH:MM:SS`` strings (UTC batch bounds from dbt). Delegates to
     :func:`replace_where` with the window predicate; ``read_version`` pins/fences the commit."""
     # CAST-free window predicate — see replace_where. delta_rs coerces the string literals to the
@@ -952,8 +952,8 @@ def merge_delta(
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
     - read_version (REQUIRED): pin the merge TARGET to this Delta version (the model's ``vB``).
       delta_rs then validates OCC over ``(vB, HEAD]`` — the exact window the model's pinned read of
-      ``{{ this }}`` could not have seen — so the read and the commit share one snapshot (Spark
-      single-snapshot MERGE semantics). None is rejected: a merge always has an existing target, so
+      ``{{ this }}`` could not have seen — so the read and the commit share one snapshot
+      (single-snapshot MERGE semantics). None is rejected: a merge always has an existing target, so
       the caller always read a version; merging against HEAD instead would reopen the read->write
       gap. NOTE: only the merge target is pinned; the post-merge maintenance below always reopens a
       fresh HEAD and must NEVER receive this version.
@@ -965,7 +965,7 @@ def merge_delta(
       collecting a small delta is cheap and the prune avoids a full-target scan. For a merge whose
       *source* is itself huge, pass streamed_exec=True (``merge_streamed_exec``) so it isn't
       materialized — at the cost of no pruning.
-    - delete_unmatched_by_source: Spark "WHEN NOT MATCHED BY SOURCE THEN DELETE" — also remove
+    - delete_unmatched_by_source: the "WHEN NOT MATCHED BY SOURCE THEN DELETE" form — also remove
       target rows the source doesn't carry. True deletes every unmatched target row (full sync); a
       string deletes only those matching that predicate; None (default, used by the dbt incremental
       strategies) adds no such clause. Used by the connection-API ``df.merge`` full-sync option.
@@ -1046,7 +1046,7 @@ def merge_delta(
         else:
             merger = merger.when_matched_update_all(predicate=update_condition)
         merger = merger.when_not_matched_insert_all(predicate=insert_condition)
-    # Spark "WHEN NOT MATCHED BY SOURCE THEN DELETE": optionally remove target rows the source
+    # "WHEN NOT MATCHED BY SOURCE THEN DELETE": optionally remove target rows the source
     # doesn't carry (full sync). True = all unmatched; a string = only those matching the predicate.
     # Composes with both branches above; default None adds nothing (dbt incremental paths unaffected).
     if delete_unmatched_by_source:

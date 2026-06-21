@@ -6,7 +6,7 @@ in two incarnations that share the same scenario:
 | Incarnation | Where | What it covers |
 |---|---|---|
 | **dbt project** (this dir) | `tests/integration_tests/coffee/` | the model DAG — ingest → dedup → fact → mart |
-| **connection API** (`duckrun.connect`) | `tests/integration_tests/coffee/test_coffee.py` | the Spark-style surface, plus a millions-of-rows stress run |
+| **connection API** (`duckrun.connect`) | `tests/integration_tests/coffee/test_coffee.py` | the DataFrame-style surface, plus a millions-of-rows stress run |
 
 ## Credit — dimension data
 

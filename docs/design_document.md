@@ -174,7 +174,7 @@ gets the bulk — clamped to `_WRITE_MEM_FRACTION` (**0.7**) of the effective li
 
 The effective limit (`_effective_mem_limit_bytes`) is the **tightest of physical RAM, the
 cgroup/container cap, and the RAM actually free**, sampled fresh per job. It is cgroup-aware
-on purpose: on Fabric/Spark/k8s, DuckDB's own default (80% of *physical* RAM) sees the whole
+on purpose: on Fabric/k8s, DuckDB's own default (80% of *physical* RAM) sees the whole
 node, not our slice, so without this clamp the kernel OOM-kills us.
 
 This is a coordination layer that exists *only* because two independent processes split one

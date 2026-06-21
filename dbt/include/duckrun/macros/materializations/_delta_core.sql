@@ -64,7 +64,7 @@
   {#-- Pin the self-reference view to the captured `vB` (delta_scan version => N, requires the
        duckdb-delta version param). This makes the model's `is_incremental()` read of `{{ this }}`
        resolve at EXACTLY the version the write commit will validate OCC against — one snapshot for
-       the read and the commit (Spark single-snapshot MERGE semantics). Applies to every incremental
+       the read and the commit (single-snapshot MERGE semantics). Applies to every incremental
        strategy (merge / microbatch / safeappend), all of which self-reference `{{ this }}`. When
        read_version is None (brand-new table) there is nothing to pin — scan HEAD. --#}
   {%- if dbt_believes_exists -%}

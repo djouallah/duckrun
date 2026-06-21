@@ -12,14 +12,14 @@
    Storage-neutrality (s3/gcs/abfss) shares this exact code path — only the secret/discovery backend
    differs — so the local run is representative.
 
-3. **Write-correctness matrix** (``test_sql_equals_spark`` + the Tier-2/3/4 functions) — does *our
+3. **Write-correctness matrix** (``test_sql_equals_dataframe`` + the Tier-2/3/4 functions) — does *our
    glue* land the right Delta data? The load-bearing oracle is **cross-API equivalence**: the same
-   logical write expressed via the SQL API and the Spark API must land byte-identical Delta data, so
+   logical write expressed via the SQL API and the DataFrame API must land byte-identical Delta data, so
    a bug in either path shows up as a mismatch with almost no hand-maintained expected values. Every
    assertion reads back through a **fresh** ``duckrun.connect`` — which only sees real Delta on disk
    (discovery globs ``_delta_log``), subsuming the old ``is_deltatable`` boundary check.
 
-All local, network-free, serial (duckrun's write path is single-writer). No DAT, no Spark engine.
+All local, network-free, serial (duckrun's write path is single-writer). No DAT, no external engine.
 """
 import duckdb
 import deltalake
@@ -142,7 +142,7 @@ class TestDataFrame:
         conn.sql("select * from src").show()  # smoke: must not raise
 
     def test_toPandas(self, conn):
-        # toPandas() == relation.df() (Spark parity). DuckDB .df() materializes a pandas
+        # toPandas() == relation.df() (DataFrame-API parity). DuckDB .df() materializes a pandas
         # DataFrame, so pandas+numpy are required — provided by the [test] extra.
         assert list(conn.sql("select name from src order by id").toPandas()["name"]) == ["a", "b", "c"]
 
@@ -321,7 +321,7 @@ class TestSqlDml:
     """conn.sql(): reads (incl. version-pinned delta_scan) pass through, and Delta DML is applied
     via delta_rs — create-as / insert-select / insert-values / update / delete / alter-add, and drop
     (a tombstone: no data deleted). Only a SQL merge isn't expressible as delta_rs DML and is
-    directed to the Spark write API."""
+    directed to the DataFrame write API."""
 
     def test_select_passthrough(self, conn):
         assert conn.sql("SELECT 1").fetchall() == [(1,)]
@@ -455,7 +455,7 @@ def test_write_modes_round_trip(wh):
     conn.sql("select 2 as id, 'y' as v").write.mode("append").saveAsTable("t3")
     assert conn.table("t3").count() == 2
 
-    # Spark default mode is 'error' → refuse to clobber an existing table.
+    # the default mode is 'error' → refuse to clobber an existing table.
     with pytest.raises(ValueError):
         conn.sql("select 3 as id, 'z' as v").write.saveAsTable("t3")
 
@@ -490,10 +490,10 @@ def test_safeappend_refuses_on_concurrent_commit(wh, monkeypatch):
         conn.sql("select 2 id, 'b' v").write.mode("safeappend").saveAsTable("sc")
 
 
-def test_spark_writes_persist_to_delta(wh):
+def test_dataframe_writes_persist_to_delta(wh):
     # create/append via saveAsTable and mutate via the DeltaTable handle must land as real Delta,
     # visible to a brand-new connection (not DuckDB-native tables in this session). conn.sql() is
-    # read-only for Delta writes — these go through the Spark API.
+    # read-only for Delta writes — these go through the DataFrame API.
     conn = duckrun.connect(wh, schema="dbo")
     conn.sql("select 1 id, 'A' grp").write.mode("overwrite").saveAsTable("evt")
     conn.sql("select 2 id, 'B' grp").write.mode("append").saveAsTable("evt")
@@ -539,20 +539,20 @@ def test_update_only_merge_rejected(wh):
 
 def test_toPandas(wh):
     # .toPandas()/.df() are the only pandas-touching bits of the API (DuckDB materializes to a
-    # pandas DataFrame, like Spark's toPandas). pandas is in the [test] extra so this runs for real.
+    # pandas DataFrame, like the DataFrame API's toPandas). pandas is in the [test] extra so this runs for real.
     conn = duckrun.connect(wh, schema="dbo")
     pdf = conn.sql("select name from t1 order by id").toPandas()
     assert list(pdf["name"]) == ["a", "b"]
 
 
 def test_dataframe_show(wh):
-    # .show() is the Spark print alias over the DuckDB relation: prints to stdout, returns None.
+    # .show() is the print alias over the DuckDB relation: prints to stdout, returns None.
     conn = duckrun.connect(wh, schema="dbo")
     assert conn.sql("select * from t1 order by id").show() is None
 
 
 def test_raw_connection_escape_hatch(wh):
-    # conn.connection exposes the underlying DuckDB connection for anything the Spark surface
+    # conn.connection exposes the underlying DuckDB connection for anything the DataFrame surface
     # doesn't cover — scalar queries, and reading the registered views directly.
     conn = duckrun.connect(wh, schema="dbo")
     assert conn.connection.execute("select 40 + 2").fetchone()[0] == 42
@@ -625,7 +625,7 @@ def test_delta_table_for_path_and_version(wh):
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
-# 3. Write-correctness matrix — cross-API equivalence is the oracle (SQL ≡ Spark → byte-identical).
+# 3. Write-correctness matrix — cross-API equivalence is the oracle (SQL ≡ DataFrame → byte-identical).
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 def _k(row):
     """Order-insensitive, None-safe sort key for a row of mixed scalars."""
@@ -660,43 +660,43 @@ def _dtypes(wh, name):
 
 
 # Tier 1 — cross-API equivalence (the core oracle). Each pair expresses the SAME logical write via
-# the SQL API and the Spark API against the same seed; `expected` (in items column order) anchors it.
+# the SQL API and the DataFrame API against the same seed; `expected` (in items column order) anchors it.
 EQUIV = [
     dict(id="overwrite", table="items",
          sql=["create or replace table items as select * from (values (9,'z'),(8,'y')) t(id, name)"],
-         spark=lambda c: c.sql("select * from (values (9,'z'),(8,'y')) t(id, name)")
+         dataframe=lambda c: c.sql("select * from (values (9,'z'),(8,'y')) t(id, name)")
                           .write.mode("overwrite").saveAsTable("items"),
          expected=[(9, "z"), (8, "y")]),
     dict(id="append_select", table="items",
          sql=["insert into items select * from (values (4,'d')) t(id, name)"],
-         spark=lambda c: c.sql("select * from (values (4,'d')) t(id, name)")
+         dataframe=lambda c: c.sql("select * from (values (4,'d')) t(id, name)")
                           .write.mode("append").saveAsTable("items"),
          expected=[(1, "a"), (2, "b"), (3, "c"), (4, "d")]),
     dict(id="append_values", table="items",
          sql=["insert into items values (5, 'e')"],
-         spark=lambda c: c.sql("select 5 id, 'e' as name").write.mode("append").saveAsTable("items"),
+         dataframe=lambda c: c.sql("select 5 id, 'e' as name").write.mode("append").saveAsTable("items"),
          expected=[(1, "a"), (2, "b"), (3, "c"), (5, "e")]),
     dict(id="append_collist_reordered", table="items",
-         # SQL maps by name from a reordered column list; Spark appends an in-order df — both land id=4,name='d'.
+         # SQL maps by name from a reordered column list; the DataFrame API appends an in-order df — both land id=4,name='d'.
          sql=["insert into items (name, id) select 'd', 4"],
-         spark=lambda c: c.sql("select 4 id, 'd' as name").write.mode("append").saveAsTable("items"),
+         dataframe=lambda c: c.sql("select 4 id, 'd' as name").write.mode("append").saveAsTable("items"),
          expected=[(1, "a"), (2, "b"), (3, "c"), (4, "d")]),
     dict(id="with_prefixed_insert", table="items",
          sql=["with s as (select 8 id, 'h' as name) insert into items select * from s"],
-         spark=lambda c: c.sql("select 8 id, 'h' as name").write.mode("append").saveAsTable("items"),
+         dataframe=lambda c: c.sql("select 8 id, 'h' as name").write.mode("append").saveAsTable("items"),
          expected=[(1, "a"), (2, "b"), (3, "c"), (8, "h")]),
     dict(id="update_predicate", table="items",
          sql=["update items set name = 'Z' where id = 1"],
-         spark=lambda c: c.delta_table("items").update(set={"name": "'Z'"}, where="id = 1"),
+         dataframe=lambda c: c.delta_table("items").update(set={"name": "'Z'"}, where="id = 1"),
          expected=[(1, "Z"), (2, "b"), (3, "c")]),
     dict(id="delete_predicate", table="items",
          sql=["delete from items where id = 2"],
-         spark=lambda c: c.delta_table("items").delete("id = 2"),
+         dataframe=lambda c: c.delta_table("items").delete("id = 2"),
          expected=[(1, "a"), (3, "c")]),
     dict(id="upsert", table="items",
          # SQL upsert = delete literal keys + insert (delta-rs DELETE takes literals, not IN (SELECT)).
          sql=["delete from items where id = 2 or id = 4", "insert into items values (2, 'B'), (4, 'D')"],
-         spark=lambda c: DeltaTable.forName(c, "items")
+         dataframe=lambda c: DeltaTable.forName(c, "items")
              .merge(c.sql("select * from (values (2,'B'),(4,'D')) t(id, name)"), "target.id = source.id")
              .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(),
          expected=[(1, "a"), (2, "B"), (3, "c"), (4, "D")]),
@@ -704,19 +704,19 @@ EQUIV = [
 
 
 @pytest.mark.parametrize("case", EQUIV, ids=[c["id"] for c in EQUIV])
-def test_sql_equals_spark(tmp_path, case):
+def test_sql_equals_dataframe(tmp_path, case):
     a, b = str(tmp_path / "A"), str(tmp_path / "B")
     ca = _seed(a)
     for stmt in case["sql"]:
         ca.sql(stmt)
-    case["spark"](_seed(b))
+    case["dataframe"](_seed(b))
 
     dump_a, dump_b = _dump(a, case["table"]), _dump(b, case["table"])
-    assert dump_a == dump_b, f"SQL≠Spark for {case['id']}: {dump_a} vs {dump_b}"
+    assert dump_a == dump_b, f"SQL≠DataFrame for {case['id']}: {dump_a} vs {dump_b}"
     assert dump_a[1] == sorted(case["expected"], key=_k)   # anchor: agreeing-but-wrong can't pass
 
 
-# Tier 1b — SQL-routing forms with no Spark equivalent; the assertion is the persisted data.
+# Tier 1b — SQL-routing forms with no DataFrame-API equivalent; the assertion is the persisted data.
 @pytest.mark.parametrize("stmt,table,cols,rows", [
     ("-- build it\ncreate table cm as select 1 id", "cm", ["id"], [(1,)]),
     ("/* note */ insert into items values (4, 'd')", "items", ["id", "name"],
@@ -775,7 +775,7 @@ def test_insert_allows_widening_numeric(tmp_path):
 
 
 # Tier 2 — single-API ops; inline golden expected, read back via a fresh connection.
-def test_replace_where_spark_only(tmp_path):
+def test_replace_where_dataframe_only(tmp_path):
     wh = str(tmp_path / "wh")
     c = _seed(wh)
     c.sql("select * from (values (1,'eu'),(2,'us'),(3,'eu')) t(id, region)") \
@@ -784,7 +784,7 @@ def test_replace_where_spark_only(tmp_path):
     assert _dump(wh, "rw")[1] == sorted([(2, "us"), (9, "eu")], key=_k)
 
 
-def test_merge_sync_delete_spark_only(tmp_path):
+def test_merge_sync_delete_dataframe_only(tmp_path):
     wh = str(tmp_path / "wh")
     c = _seed(wh)
     c.sql("select * from (values (1,10,'a'),(2,10,'b'),(3,10,'c')) t(id, val, note)") \
@@ -797,7 +797,7 @@ def test_merge_sync_delete_spark_only(tmp_path):
     assert _dump(wh, "sync")[1] == sorted([(2, 99, "b"), (4, 99, "Y")], key=_k)
 
 
-def test_partition_and_merge_schema_spark_only(tmp_path):
+def test_partition_and_merge_schema_dataframe_only(tmp_path):
     wh = str(tmp_path / "wh")
     c = _seed(wh)
     c.sql("select 1 id, 'eu' region").write.mode("overwrite").partitionBy("region").saveAsTable("p")
@@ -808,7 +808,7 @@ def test_partition_and_merge_schema_spark_only(tmp_path):
         sorted([(1, "eu", None), (2, "us", True)], key=_k)
 
 
-def test_overwrite_schema_spark_only(tmp_path):
+def test_overwrite_schema_dataframe_only(tmp_path):
     wh = str(tmp_path / "wh")
     c = _seed(wh)
     c.sql("select 1 id, 'x' a, 'y' b").write.mode("overwrite").saveAsTable("os")

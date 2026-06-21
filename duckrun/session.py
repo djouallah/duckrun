@@ -1,9 +1,9 @@
-"""A PySpark-shaped, storage-neutral connection over a Delta lakehouse.
+"""A DataFrame-style, storage-neutral connection over a Delta lakehouse.
 
 ``duckrun.connect(path)`` opens a DuckDB connection, discovers the Delta tables under the store,
 registers each as a ``delta_scan`` view, and hands back a :class:`DuckSession` whose surface
-mirrors a ``SparkSession``: ``.sql()``, ``.table()``, ``.read``, ``.catalog``, and a
-``DataFrame`` with a Spark ``.write…saveAsTable()``.
+offers ``.sql()``, ``.table()``, ``.read``, ``.catalog``, and a
+``DataFrame`` with a ``.write…saveAsTable()``.
 
 It is storage-neutral — local path, ``s3://``, ``gs://``, ``az://``, OneLake ``abfss://`` — because
 every storage concern (token → secret, table discovery, the Delta write path) is delegated to the
@@ -20,7 +20,7 @@ from ._runtime import check_runtime_versions
 
 
 # Statements that would WRITE to a table — rejected by the read-only conn.sql() with a pointer to
-# the Spark write API. INSERT/UPDATE/DELETE/MERGE against a read-only delta_scan view error in
+# the DataFrame write API. INSERT/UPDATE/DELETE/MERGE against a read-only delta_scan view error in
 # DuckDB anyway; CREATE [OR REPLACE] TABLE … is the dangerous one — it silently makes an ephemeral
 # DuckDB-local table that never reaches Delta — so it must be caught BEFORE executing. CREATE
 # TEMP/TEMPORARY TABLE and CREATE VIEW are DuckDB-local scratch by design and pass through.
@@ -39,7 +39,7 @@ _TOP_USING = re.compile(r"\busing\b", re.IGNORECASE)
 _strip_leading = delta_dml._strip_leading  # shared comment/whitespace stripper
 
 _MERGE_MSG = (
-    "conn.sql() can't run a SQL MERGE via delta_rs. Use the Spark write API: "
+    "conn.sql() can't run a SQL MERGE via delta_rs. Use the DataFrame write API: "
     "df.write.saveAsTable(...) to create/append, or "
     "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
 )
@@ -91,7 +91,7 @@ def _is_multi_statement(s: str) -> bool:
 
 def _is_delta_write(query: str) -> bool:
     """True if ``query`` is a statement that would write a Delta table (and so must go through the
-    Spark write API instead). CREATE TEMP/TEMPORARY TABLE and CREATE VIEW are NOT writes."""
+    DataFrame write API instead). CREATE TEMP/TEMPORARY TABLE and CREATE VIEW are NOT writes."""
     s = _strip_leading(query)
     if _WRITE_KEYWORD_RE.match(s):
         return True
@@ -102,7 +102,7 @@ def _delta_write_message(query: str) -> str:
     """The error for a raw-SQL write conn.sql() can't route to delta_rs. For an INSERT/UPDATE/DELETE
     whose target isn't a discovered Delta table — the common cause being a typo or a table written
     out-of-band before refresh() — name the table and give form-appropriate guidance, instead of the
-    generic 'use the Spark write API' redirect (which misdirects: for UPDATE/DELETE the problem is the
+    generic 'use the DataFrame write API' redirect (which misdirects: for UPDATE/DELETE the problem is the
     missing table, not the API)."""
     s = _strip_leading(query)
     m = _DML_TARGET_RE.match(s)
@@ -121,7 +121,7 @@ def _delta_write_message(query: str) -> str:
         )
     return (  # a CREATE … AS that didn't resolve, or any other unrouted Delta write
         "conn.sql() can't write a Delta table from raw SQL here. "
-        "Use the Spark write API: df.write.saveAsTable(...) to create/append, or "
+        "Use the DataFrame write API: df.write.saveAsTable(...) to create/append, or "
         "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
     )
 
@@ -197,7 +197,7 @@ def _split_root_schema(path: str, schema: Optional[str]):
 
 
 class DuckSession:
-    """A SparkSession-like handle bound to one Delta lakehouse root."""
+    """A session handle bound to one Delta lakehouse root."""
 
     def __init__(self, path: str, storage_options: Optional[Dict[str, str]],
                  schema: Optional[str], compaction_threshold: int):
@@ -325,7 +325,7 @@ class DuckSession:
             return schema, table
         return self._current_database, name
 
-    # ---- Spark-shaped surface --------------------------------------------------------------
+    # ---- DataFrame-style surface --------------------------------------------------------------
 
     def sql(self, query: str) -> "DataFrame":
         """Run a query and return a :class:`DataFrame`.
@@ -339,7 +339,7 @@ class DuckSession:
         ``drop table`` (tombstone — marks the table dropped without deleting data; a human purges
         the files). After a DML statement the catalog is refreshed.
 
-        ``merge`` isn't expressible via delta_rs DML here — use the Spark write surface instead:
+        ``merge`` isn't expressible via delta_rs DML here — use the DataFrame write API instead:
         ``df.write.saveAsTable(...)`` or
         ``conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()``.
         ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
@@ -360,7 +360,7 @@ class DuckSession:
         return DataFrame(self.con.sql(f"SELECT * FROM {_qid(schema)}.{_qid(table)}"), self)
 
     def delta_table(self, name: str) -> "DeltaTable":
-        """A Spark ``DeltaTable`` handle for an existing table: ``.merge(...)``, ``.delete()``,
+        """A ``DeltaTable`` handle for an existing table: ``.merge(...)``, ``.delete()``,
         ``.update()``, ``.replaceWhere()``, ``.version()``. (Reads still go through ``conn.sql`` /
         ``conn.table``; this is the write/mutate side.) Shortcut for ``DeltaTable.forName(conn, name)``."""
         from .delta_table import DeltaTable  # local import: delta_table imports nothing from session
@@ -377,7 +377,7 @@ class DuckSession:
 
 
 class DataFrame:
-    """Wraps a DuckDB relation; exposes a Spark-style ``.write`` plus a few Spark aliases.
+    """Wraps a DuckDB relation; exposes a DataFrame-style ``.write`` plus a few DataFrame aliases.
 
     Anything not defined here falls through to the underlying DuckDB relation, so ``.df()``,
     ``.arrow()``, ``.fetchall()``, ``.fetchnumpy()`` etc. all keep working.
@@ -391,7 +391,7 @@ class DataFrame:
     def write(self) -> "DataFrameWriter":
         return DataFrameWriter(self)
 
-    # Spark aliases over the DuckDB relation.
+    # DataFrame aliases over the DuckDB relation.
     def show(self, *a, **k):
         return self.relation.show(*a, **k)
 
@@ -406,7 +406,7 @@ class DataFrame:
 
     def createOrReplaceTempView(self, name: str) -> "DataFrame":
         """Register this DataFrame as a session-scoped view named ``name``, so it can be queried by
-        name via ``conn.sql("select * from name")`` (Spark ``createOrReplaceTempView``).
+        name via ``conn.sql("select * from name")`` (the ``createOrReplaceTempView`` API).
 
         This is the path-read counterpart to ``saveAsTable``: ``conn.read.delta(path)`` returns a
         DataFrame but registers nothing, so this is how a by-path read becomes queryable by name. The
@@ -422,7 +422,7 @@ class DataFrame:
 
 
 class DataFrameReader:
-    """Spark ``DataFrameReader``: read a path/table into a :class:`DataFrame` without it having to
+    """``DataFrameReader``: read a path/table into a :class:`DataFrame` without it having to
     be a pre-registered view. Storage-neutral via the session's already-minted secret."""
 
     def __init__(self, session: DuckSession):
@@ -473,9 +473,9 @@ def _csv_opt(value) -> str:
 
 
 class DataFrameWriter:
-    """Spark ``DataFrameWriter`` over delta-rs (the adapter's :func:`engine.write_delta`).
+    """``DataFrameWriter`` over delta-rs (the adapter's :func:`engine.write_delta`).
 
-    Beyond Spark's modes it adds ``"safeappend"`` — the same optimistic, fail-loud append as the
+    Beyond the standard modes it adds ``"safeappend"`` — the same optimistic, fail-loud append as the
     dbt adapter's incremental strategy: it commits only if the table version has not moved since
     the call (compare-and-swap), else raises ``CommitFailedError``. Non-standard, but identical
     behaviour to ``safeappend`` in dbt."""
@@ -485,7 +485,7 @@ class DataFrameWriter:
     def __init__(self, df: DataFrame):
         self._df = df
         self._format = "delta"
-        self._mode = "error"  # Spark's default SaveMode
+        self._mode = "error"  # the default SaveMode
         self._merge_schema = False
         self._overwrite_schema = False
         self._partition_by: Optional[List[str]] = None
@@ -574,7 +574,7 @@ class DataFrameWriter:
             )
 
     def save(self, path: str) -> str:
-        """Spark ``df.write.save(path)`` — write to a Delta table by PATH, not catalog name.
+        """``df.write.save(path)`` — write to a Delta table by PATH, not catalog name.
 
         Storage-neutral (local / s3:// / gs:// / az:// / abfss://). Unlike :meth:`saveAsTable`,
         the result is addressed only by ``path`` — there is no schema.table name to register a
@@ -599,7 +599,7 @@ class DataFrameWriter:
 
 
 class Catalog:
-    """A small Spark ``Catalog`` over the discovered schemas/views."""
+    """A small ``Catalog`` over the discovered schemas/views."""
 
     def __init__(self, session: DuckSession):
         self.session = session
@@ -659,7 +659,7 @@ class Catalog:
 
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
             schema: Optional[str] = None, compaction_threshold: int = 100) -> DuckSession:
-    """Open a storage-neutral, Spark-shaped session over a Delta lakehouse.
+    """Open a storage-neutral, DataFrame-style session over a Delta lakehouse.
 
     Args:
         path: the lakehouse root, or (OneLake) ``…/Tables`` or ``…/Tables/<schema>``. Works with a

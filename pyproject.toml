@@ -24,7 +24,7 @@ dependencies = [
     # duckdb floor is 1.5.4 with a <1.6.0 cap (a floor, NOT an exact pin): 1.5.4 is the first
     # stable build whose bundled duckdb-delta extension supports `delta_scan('...', version => N)`
     # (duckdb-delta #312) — the version-pinned read this project relies on to make the incremental
-    # read and the write commit resolve at ONE Delta snapshot (Spark single-snapshot MERGE parity;
+    # read and the write commit resolve at ONE Delta snapshot (single-snapshot MERGE parity;
     # see the staging-read pin in _delta_core.sql and merge_delta's read_version). Stable 1.5.x
     # patches above the floor are fine. The <1.6.0 cap matters because this project resolves with
     # pip --pre (to pick up dbt pre-releases) and --pre is global: an open floor would let pip pull

@@ -262,7 +262,7 @@ class Plugin(BasePlugin):
     ) -> None:
         """dbt ``incremental_strategy='microbatch'``: for the current batch window
         ``[event_time_start, event_time_end)``, atomically replace the rows already in that window
-        with the batch's rows (Spark ``replaceWhere`` — a single Delta commit), keyed on the
+        with the batch's rows (``replaceWhere`` — a single Delta commit), keyed on the
         event-time range. ``read_version`` (the model's ``vB``) pins/fences that commit.
 
         dbt drives this by re-running the model once per batch with bounds it computes from

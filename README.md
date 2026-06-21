@@ -290,18 +290,18 @@ reclaimed — duckrun favors read-safety over immediate disk savings.
 
 ## Connection API (notebook)
 
-Besides the dbt adapter, duckrun ships a storage-neutral, PySpark-shaped `duckrun.connect()` for
+Besides the dbt adapter, duckrun ships a storage-neutral, DataFrame-style `duckrun.connect()` for
 interactive/notebook use (local, S3, GCS, ADLS, OneLake). `conn.sql(...)` runs reads (including time
 travel — `delta_scan('…', version => N)`) and applies **raw SQL DML** (`create table … as`, `insert`,
 `update`, `delete`, `alter add column`, `drop`) straight to the Delta table via delta_rs — every
 `CREATE TABLE` is Delta-backed, only `CREATE TEMP TABLE`/`CREATE VIEW` stay native DuckDB, and forms
 delta_rs can't express (`MERGE`, `UPDATE … FROM`, multi-statement) are rejected with a pointer to the
-write API. Writes also go through the Spark surface: a `DataFrame` with `.write…saveAsTable()` (modes
+write API. Writes also go through the DataFrame API: a `DataFrame` with `.write…saveAsTable()` (modes
 `overwrite` / `append` / `safeappend` / `ignore`) and a `DeltaTable` handle (`conn.delta_table(name)`
 / `DeltaTable.forName`) with `.merge(...)`, `.delete()`, `.update()`, `.replaceWhere()`, `.version()`,
 plus `conn.read` and `conn.catalog`. See [the DML matrix](docs/connection-api.md#raw-sql-dml-through-connsql).
 
-`merge` is **snapshot-pinned by default** — Spark's single-snapshot MERGE, with no extra arguments:
+`merge` is **snapshot-pinned by default** — single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit is validated against it, so a concurrent writer fails
 the commit loudly instead of silently interleaving. `mode("safeappend")` is the same optimistic,
 fail-loud append as the dbt [`safeappend`](#safeappend) strategy: it commits only if the table is

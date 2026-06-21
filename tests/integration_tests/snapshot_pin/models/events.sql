@@ -17,8 +17,8 @@
 -- (the duckdb-delta `version => N` param, which is why duckdb is pinned to the 1.5.4 floor). So
 -- this SELECT sees the target exactly as it was at vB, NOT whatever a concurrent writer may have
 -- committed since the run began. The merge that follows is likewise pinned to vB, so its commit is
--- validated against the window (vB, HEAD] — read and write agree on one snapshot (Spark MERGE
--- parity). `value < 0` never matches, so every batch row survives the filter: the point is simply
+-- validated against the window (vB, HEAD] — read and write agree on one snapshot (single-snapshot MERGE
+-- semantics). `value < 0` never matches, so every batch row survives the filter: the point is simply
 -- that the read goes through the pinned snapshot.
 select id::bigint as id, value::bigint as value
 from (values (1, 111)) as t(id, value)

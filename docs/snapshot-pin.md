@@ -10,7 +10,7 @@ model runs, then anchors both sides of the run to it:
 - **Write pin** — the merge target is opened at the same `vB`, and delta-rs validates the commit
   over the window `(vB, HEAD]`. A foreign commit inside that window makes the merge refuse.
 
-Together this is Spark single-snapshot MERGE semantics: the read and the write agree on one version
+Together this is single-snapshot MERGE semantics: the read and the write agree on one version
 of the table. Lakehouses don't guarantee a single writer (a job double-fires, two pipelines touch
 the same table), so this matters in practice.
 

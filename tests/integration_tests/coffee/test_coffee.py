@@ -127,8 +127,8 @@ def run_coffee_scenario(conn, schema, n_rows):
         regions = q("select count(distinct region) from fact_sales")
         say(f"fact_sales={n_rows:,} rows across {regions} region partitions (1:1 joins, no rows dropped)")
 
-    # ── catalog (Spark Catalog) ──────────────────────────────────────────────────────────────────
-    with _step(4, "Spark Catalog: currentDatabase / listDatabases / listTables / SHOW TABLES") as say:
+    # ── catalog (Catalog) ──────────────────────────────────────────────────────────────────
+    with _step(4, "Catalog: currentDatabase / listDatabases / listTables / SHOW TABLES") as say:
         assert conn.catalog.currentDatabase() == schema
         assert schema in conn.catalog.listDatabases()
         assert {"products", "fact_sales", "dim_locations"} <= set(conn.catalog.listTables())
@@ -155,7 +155,7 @@ def run_coffee_scenario(conn, schema, n_rows):
         assert list(top.toPandas().columns) == ["product_name", "rev"]
         say(f"top product by revenue: {top.collect()[0][0]} (${top.collect()[0][1]:,.2f})")
 
-    # ── write modes: append / ignore / Spark default 'error' ─────────────────────────────────────
+    # ── write modes: append / ignore / default 'error' ─────────────────────────────────────
     with _step(6, "write modes: append (+1 row), ignore (no-op), default 'error' (refuses clobber)") as say:
         conn.sql("select * from fact_sales limit 1").write.mode("append").saveAsTable("fact_sales")
         assert conn.table("fact_sales").count() == n_rows + 1

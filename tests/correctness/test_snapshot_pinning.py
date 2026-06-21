@@ -7,7 +7,7 @@ connection-API matrix (skipped on older builds).
 
 Covered:
   - merge_delta(read_version=vB): a foreign commit in (vB, HEAD] fails the merge loudly; without a
-    concurrent writer it commits. This is the Spark single-snapshot MERGE window.
+    concurrent writer it commits. This is the single-snapshot MERGE window.
   - replace_where: a SINGLE atomic Delta commit (replaceWhere) — not a delete-then-append pair —
     and CAS-fenced when pinned.
   - maintenance is NEVER pinned: _maintain takes no version parameter (structural guard against the

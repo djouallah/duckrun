@@ -17,7 +17,7 @@ WHAT DUCKRUN DOES ON EVERY INCREMENTAL RUN (see _delta_core.sql + engine.merge_d
                    over the window (vB, HEAD]. If another writer committed into that window while
                    the model was running, the merge REFUSES to commit (a Delta commit conflict).
 
-  Together: the read and the write agree on ONE version of the table — Spark single-snapshot MERGE
+  Together: the read and the write agree on ONE version of the table — single-snapshot MERGE
   semantics. (The delta-rs OCC internals are unit-tested in tests/correctness/test_snapshot_pinning.py;
   this file is the end-to-end "why it matters to a `dbt run`" layer.)
 

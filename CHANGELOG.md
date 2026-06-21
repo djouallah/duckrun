@@ -107,6 +107,6 @@ All notable changes to this project will be documented in this file.
 ### Changed
 - Refactored writer code to eliminate duplication between `writer.py` and `runner.py`
   - Single source of truth for Delta Lake write configuration
-  - Both Spark-style API (`.write.saveAsTable()`) and pipeline runner (`run()`) now share the same compression logic
+  - Both DataFrame-style API (`.write.saveAsTable()`) and pipeline runner (`run()`) now share the same compression logic
 
 

@@ -1,18 +1,18 @@
 # Connection API (notebook)
 
-Besides the dbt adapter, duckrun ships a storage-neutral, PySpark-shaped `duckrun.connect()` for
+Besides the dbt adapter, duckrun ships a storage-neutral, DataFrame-style `duckrun.connect()` for
 interactive/notebook use (local, S3, GCS, ADLS, OneLake):
 
 - `conn.sql(...)` — DuckDB SQL over the discovered Delta tables, including time travel
   (`delta_scan('…', version => N)`). Reads pass straight through; **raw DML** (`create table … as`,
   `insert`, `update`, `delete`, `alter add column`, `drop`) is applied to the Delta table via
   delta_rs (works local AND on OneLake) — see the [DML matrix](#raw-sql-dml-through-connsql) below.
-- a `DataFrame` with a Spark-style `.write…saveAsTable()` — modes `overwrite` / `append` /
+- a `DataFrame` with a DataFrame-style `.write…saveAsTable()` — modes `overwrite` / `append` /
   `safeappend` / `ignore` — plus `conn.read` and `conn.catalog`.
-- a `DeltaTable` handle (`conn.delta_table(name)` / `DeltaTable.forName`) mirroring Delta-on-Spark:
+- a `DeltaTable` handle (`conn.delta_table(name)` / `DeltaTable.forName`) mirroring the `DeltaTable` API:
   `.merge(...)`, `.delete()`, `.update()`, `.replaceWhere()`, `.version()`.
 
-`merge` is **snapshot-pinned by default** — Spark's single-snapshot MERGE, with no extra arguments:
+`merge` is **snapshot-pinned by default** — single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit validates against it, so a concurrent writer fails the
 commit loudly instead of silently interleaving. `mode("safeappend")` applies the same fail-loud
 compare-and-swap to a plain append (identical to the dbt `safeappend` strategy): it commits only if
@@ -73,9 +73,9 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 └───────────────────────────┘
 ```
 
-### Spark / Delta-on-Spark API — 36/36 ✅
+### DataFrame / `DeltaTable` API — 36/36 ✅
 
-> Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.
+> Methods that mirror the DataFrame API (and Delta Lake's `DeltaTable` API) 1:1.
 
 | Surface | Methods | Pass |
 | --- | --- | :-: |
@@ -88,7 +88,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ### duckrun-specific helpers — 16/16 ✅
 
-> Conveniences with no Spark equivalent (session plumbing + two shortcuts).
+> Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).
 
 | Method | Surface | Pass |
 | --- | --- | :-: |

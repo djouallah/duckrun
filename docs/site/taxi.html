@@ -104,7 +104,7 @@ FROM trips GROUP BY borough, zone</pre>
 </section>
 
 <section>
-  <h3><span class="n">5</span> Spark Catalog: the Delta tables this demo landed — with their real storage locations</h3>
+  <h3><span class="n">5</span> Catalog: the Delta tables this demo landed — with their real storage locations</h3>
   <p class="tcap">tables in &#x27;dbo&#x27;</p>
   <table class="data"><thead><tr><th>table</th><th>location (real Delta dir)</th></tr></thead><tbody><tr><td>mart_zone_revenue</td><td>…/taxidemo_9yoqx797/dbo/mart_zone_revenue</td></tr><tr><td>trips</td><td>…/taxidemo_9yoqx797/dbo/trips</td></tr><tr><td>zones</td><td>…/taxidemo_9yoqx797/dbo/zones</td></tr></tbody></table>
   <p class="note">3 Delta tables — each a real directory with a _delta_log at the location shown</p>
@@ -138,8 +138,8 @@ FROM trips GROUP BY zone_id</pre>
 </section>
 
 <section>
-  <h3><span class="n">9</span> concurrent MERGE clash (Spark DeltaTable.merge): two writers, one snapshot — the stale one is refused</h3>
-  <pre class="py"># Spark builder API (conn.sql rejects MERGE) — both writers pin the SAME version:
+  <h3><span class="n">9</span> concurrent MERGE clash (DataFrame DeltaTable.merge): two writers, one snapshot — the stale one is refused</h3>
+  <pre class="py"># DataFrame builder API (conn.sql rejects MERGE) — both writers pin the SAME version:
 writer_A = DeltaTable.forName(conn, "zone_stats").merge(srcA, "target.zone_id = source.zone_id") \
     .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcA sets avg → 100.0
 writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, "target.zone_id = source.zone_id") \

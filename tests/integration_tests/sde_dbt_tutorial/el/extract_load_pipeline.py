@@ -7,7 +7,7 @@ other scenarios that share the lakehouse). Columns are read as VARCHAR so the sc
 across re-runs and later source updates; the bronze models do the typing (``::timestamp`` etc.).
 
 This is just the EL half of the same dbt+Delta stack the models run on, so it uses duckrun's own
-connection API (read CSV -> Spark-style ``.write.saveAsTable``) rather than poking duckdb/deltalake
+connection API (read CSV -> DataFrame-style ``.write.saveAsTable``) rather than poking duckdb/deltalake
 directly — same pyarrow-free write path the adapter uses.
 """
 import os

@@ -20,7 +20,7 @@ except Exception:
 # API surface order + friendly labels, keyed by the matrix's test class names.
 GROUPS = [
     ("TestSession", "DuckSession — connect & query"),
-    ("TestCatalog", "Catalog (Spark catalog)"),
+    ("TestCatalog", "Catalog"),
     ("TestDataFrame", "DataFrame"),
     ("TestDataFrameReader", "DataFrameReader (read)"),
     ("TestDataFrameWriter", "DataFrameWriter (write)"),
@@ -36,23 +36,23 @@ SHORT = {
     "TestDeltaTable": "DeltaTable", "TestSqlDml": "sql()",
 }
 
-# Which established API each method mirrors, so a reader can tell what's a real Spark/Delta method
+# Which established API each method mirrors, so a reader can tell what's a real DataFrame/Delta method
 # vs a duckrun-specific helper. Default per group; per-method overrides for the exceptions.
 _GROUP_API = {
-    "TestSession": "duckrun",          # the session object is duckrun's, but several entry points are Spark
-    "TestCatalog": "Spark",            # pyspark.sql.Catalog
-    "TestDataFrame": "Spark",          # pyspark.sql.DataFrame
-    "TestDataFrameReader": "Spark",    # pyspark.sql.DataFrameReader
-    "TestDataFrameWriter": "Spark",    # pyspark.sql.DataFrameWriter
-    "TestDeltaTable": "Spark",         # delta.tables.DeltaTable — the Delta-on-Spark API (≈ Spark)
-    "TestSqlDml": "duckrun",           # conn.sql reads + delta_rs DML routing are duckrun behaviors
+    "TestSession": "duckrun",            # the session object is duckrun's, but several entry points mirror the DataFrame API
+    "TestCatalog": "DataFrame",          # Catalog
+    "TestDataFrame": "DataFrame",        # DataFrame
+    "TestDataFrameReader": "DataFrame",  # DataFrameReader
+    "TestDataFrameWriter": "DataFrame",  # DataFrameWriter
+    "TestDeltaTable": "DataFrame",       # delta.tables.DeltaTable — the Delta DataFrame API
+    "TestSqlDml": "duckrun",             # conn.sql reads + delta_rs DML routing are duckrun behaviors
 }
 _METHOD_API = {
-    ("TestSession", "sql"): "Spark", ("TestSession", "table"): "Spark",
-    ("TestSession", "read_property"): "Spark", ("TestSession", "catalog_property"): "Spark",
-    ("TestSession", "show_tables"): "Spark",
+    ("TestSession", "sql"): "DataFrame", ("TestSession", "table"): "DataFrame",
+    ("TestSession", "read_property"): "DataFrame", ("TestSession", "catalog_property"): "DataFrame",
+    ("TestSession", "show_tables"): "DataFrame",
     ("TestDataFrame", "relation_passthrough"): "duckrun",   # DuckDB relation escape hatch
-    ("TestDataFrameReader", "delta"): "duckrun",            # convenience shortcut; Spark uses format().load()
+    ("TestDataFrameReader", "delta"): "duckrun",            # convenience shortcut; the DataFrame API uses format().load()
 }
 
 
@@ -139,9 +139,9 @@ def main(path: str, check: bool = False) -> int:
 
     # Roll tests up into the actual API methods (the four mode_* tests are ONE `mode` method, etc.),
     # preserving order within each surface; a method passes iff all its tests passed. Then split by
-    # API tag into two cards: Spark/Delta-on-Spark vs duckrun-specific.
+    # API tag into two cards: DataFrame API vs duckrun-specific.
     ordered = [g for g, _ in GROUPS if g in by_group] + [g for g in by_group if g not in dict(GROUPS)]
-    spark = []   # (surface, [(method, ok)])
+    dataframe = []   # (surface, [(method, ok)])
     duck = []    # (method, surface, ok)
     m_pass = m_tot = 0
     for g in ordered:
@@ -160,7 +160,7 @@ def main(path: str, check: bool = False) -> int:
             m_pass += 1 if ok else 0
             (duck.append((lab, surface, ok)) if agg[lab]["api"] == "duckrun" else sp.append((lab, ok)))
         if sp:
-            spark.append((surface, sp))
+            dataframe.append((surface, sp))
 
     m_fail = m_tot - m_pass
     pct = round(100 * m_pass / m_tot) if m_tot else 0
@@ -176,15 +176,15 @@ def main(path: str, check: bool = False) -> int:
         fails = [m for m, ok in rows if not ok]
         return f"{p}/{len(rows)} ✅" if not fails else f"{p}/{len(rows)} ❌ ({', '.join(fails)})"
 
-    sp_pass = sum(1 for _, rows in spark for _, ok in rows if ok)
-    sp_tot = sum(len(rows) for _, rows in spark)
-    out.append(f"### Spark / Delta-on-Spark API — {sp_pass}/{sp_tot} ✅")
+    sp_pass = sum(1 for _, rows in dataframe for _, ok in rows if ok)
+    sp_tot = sum(len(rows) for _, rows in dataframe)
+    out.append(f"### DataFrame API — {sp_pass}/{sp_tot} ✅")
     out.append("")
-    out.append("> Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.")
+    out.append("> Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.")
     out.append("")
     out.append("| Surface | Methods | Pass |")
     out.append("| --- | --- | :-: |")
-    for surface, rows in spark:
+    for surface, rows in dataframe:
         names = ", ".join(f"`{m}`" for m, _ in rows)
         out.append(f"| `{surface}` | {names} | {_cell(rows)} |")
     out.append("")
@@ -192,7 +192,7 @@ def main(path: str, check: bool = False) -> int:
     d_pass = sum(1 for _, _, ok in duck if ok)
     out.append(f"### duckrun-specific helpers — {d_pass}/{len(duck)} ✅")
     out.append("")
-    out.append("> Conveniences with no Spark equivalent (session plumbing + two shortcuts).")
+    out.append("> Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).")
     out.append("")
     out.append("| Method | Surface | Pass |")
     out.append("| --- | --- | :-: |")

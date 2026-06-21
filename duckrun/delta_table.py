@@ -1,6 +1,6 @@
 """A Delta-Lake-shaped ``DeltaTable.merge(...)`` upsert builder.
 
-Mirrors the Spark/Delta ``DeltaTable`` merge API and runs on the adapter's
+Mirrors the Delta ``DeltaTable`` merge API and runs on the adapter's
 :func:`engine.merge_delta`, so it inherits the cgroup-aware spill caps and post-merge
 compaction/vacuum. This is the upsert path — ``saveAsTable`` deliberately does not merge.
 
@@ -63,7 +63,7 @@ class DeltaMergeBuilder:
         self._by_source_delete = None  # None | True | predicate string
         # Pin the target to this version so OCC validates (vB, HEAD]: pass the same vB you pinned
         # the source read to (forName(...).version() → delta_scan('…', version => vB)) and source +
-        # target are ONE snapshot — exactly Spark's single-snapshot MERGE. None merges against HEAD.
+        # target are ONE snapshot — exactly a single-snapshot MERGE. None merges against HEAD.
         self._read_version = read_version
 
     def whenMatchedUpdateAll(self, condition: Optional[str] = None) -> "DeltaMergeBuilder":
@@ -89,7 +89,7 @@ class DeltaMergeBuilder:
         return self
 
     def whenNotMatchedBySourceDelete(self, condition: Optional[str] = None) -> "DeltaMergeBuilder":
-        """Spark "WHEN NOT MATCHED BY SOURCE THEN DELETE": delete target rows the source doesn't
+        """The "WHEN NOT MATCHED BY SOURCE THEN DELETE" form: delete target rows the source doesn't
         carry. No ``condition`` = delete every unmatched target row (full sync); a predicate string
         scopes the deletion."""
         self._by_source_delete = condition if condition is not None else True
@@ -156,28 +156,28 @@ class DeltaTable:
         return cls(session, path)
 
     def merge(self, source, condition: str) -> DeltaMergeBuilder:
-        """Begin a Spark-style merge of ``source`` into this table on ``condition``.
+        """Begin a DataFrame-style merge of ``source`` into this table on ``condition``.
 
         The merge is snapshot-pinned automatically: the table version is captured now and the
         commit validates OCC against it, so a concurrent writer fails the commit loudly instead of
-        silently interleaving (Spark single-snapshot MERGE). Nothing for the caller to pass."""
+        silently interleaving (single-snapshot MERGE). Nothing for the caller to pass."""
         return DeltaMergeBuilder(self, source, condition,
                                  read_version=engine.table_version(self.path, self.storage_options))
 
     def version(self) -> int:
-        """Current Delta version of the table (Spark ``DeltaTable`` history head)."""
+        """Current Delta version of the table (``DeltaTable`` history head)."""
         return engine.table_version(self.path, self.storage_options)
 
     def delete(self, predicate: Optional[str] = None) -> None:
         """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
-        when ``predicate`` is None. Spark ``DeltaTable.delete``."""
+        when ``predicate`` is None. ``DeltaTable.delete``."""
         engine.delete_rows(self.path, predicate, storage_options=self.storage_options,
                            compaction_threshold=self.compaction_threshold)
         self._refresh_view()
 
     def update(self, set: Dict[str, str], where: Optional[str] = None) -> None:
         """Set ``{column: expression}`` for rows matching ``where`` (delta_rs/datafusion SQL), or
-        every row when ``where`` is None. Spark ``DeltaTable.update``."""
+        every row when ``where`` is None. ``DeltaTable.update``."""
         if not set:
             raise ValueError("update() requires a non-empty 'set' mapping of {column: expression}.")
         engine.update_rows(self.path, set, where, storage_options=self.storage_options,
@@ -186,7 +186,7 @@ class DeltaTable:
 
     def replaceWhere(self, source, predicate: str) -> None:
         """Atomically replace the rows matching ``predicate`` with ``source`` (a DataFrame) — a
-        single Delta commit (Spark ``replaceWhere`` / ``INSERT OVERWRITE``). Snapshot-fenced
+        single Delta commit (``replaceWhere`` / ``INSERT OVERWRITE``). Snapshot-fenced
         automatically: a concurrent writer since the call fails the commit loudly."""
         rel = getattr(source, "relation", source)
         engine.replace_where(self.path, rel, predicate,
