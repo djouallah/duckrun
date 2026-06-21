@@ -164,6 +164,20 @@ def _read_retry(conn, sql, attempts=3, base=3):
             time.sleep(wait)
 
 
+def _trim_loc(path):
+    """Trim a table location for display: keep the scheme but elide the GUID-heavy middle, e.g.
+    'abfss://<ws>@onelake…/<lh>/Tables/duckrun_taxi_demo/trips' -> 'abfss://…/Tables/duckrun_taxi_demo/trips'.
+    Local paths collapse to their last few segments."""
+    p = str(path).replace("\\", "/")
+    if "://" in p:
+        scheme = p.split("://", 1)[0]
+        if "/Tables/" in p:
+            return f"{scheme}://…/Tables/{p.split('/Tables/', 1)[1]}"
+        return f"{scheme}://…/" + "/".join(p.split("/")[-2:])
+    segs = [s for s in p.split("/") if s]
+    return "…/" + "/".join(segs[-3:])
+
+
 def _month_bounds(ym):
     """'2024-01' -> ('2024-01-01', '2024-02-01') as half-open [start, end) timestamp bounds."""
     y, m = (int(x) for x in ym.split("-"))
@@ -315,7 +329,7 @@ def run_taxi_demo(conn, schema):
     # 5 ── catalog WITH each table's real Delta location ───────────────────────────────────────────
     with _step(5, "Spark Catalog: the Delta tables this demo landed — with their real storage locations") as say:
         tbls = sorted(conn.catalog.listTables())
-        _table([(t, conn.table_path(schema, t)) for t in tbls], ["table", "location (real Delta dir)"],
+        _table([(t, _trim_loc(conn.table_path(schema, t))) for t in tbls], ["table", "location (real Delta dir)"],
                f"  tables in '{schema}'")
         say(f"{len(tbls)} Delta tables — each a real directory with a _delta_log at the location shown")
 
