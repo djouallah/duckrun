@@ -16,6 +16,7 @@ import duckdb
 
 from dbt.adapters.duckrun import delta_dml, engine, remote, secret
 from . import auth
+from ._runtime import check_runtime_versions
 
 
 # Statements that would WRITE to a table — rejected by the read-only conn.sql() with a pointer to
@@ -573,4 +574,5 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
         >>> conn.sql("SHOW TABLES").show()
         >>> conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
     """
+    check_runtime_versions()  # fail loud if Fabric's stale duckdb/deltalake are still loaded
     return DuckSession(path, storage_options, schema, compaction_threshold)

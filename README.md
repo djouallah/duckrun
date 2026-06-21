@@ -38,6 +38,20 @@ pip install duckrun
 
 That single install pulls in `dbt-duckdb` (and therefore `duckdb`) plus `deltalake`.
 
+### In a Microsoft Fabric Python notebook
+
+Fabric preinstalls **older** `duckdb` / `deltalake` than duckrun requires, and they're already
+imported into the kernel — so a plain install won't take effect. Upgrade, then restart the Python
+kernel so the new versions load:
+
+```python
+!pip install duckrun --upgrade
+notebookutils.session.restartPython()
+```
+
+If you skip the restart, duckrun fails loud at `connect()` (and on `dbt run`) telling you to
+restart — it won't silently run on the stale preinstalled versions.
+
 ## Configure your profile
 
 ```yaml
@@ -57,6 +71,14 @@ my_project:
 Persisted models are written to `<root_path>/<schema>/<model>` (e.g.
 `./warehouse/dbo/orders`), or to an explicit `config(location=...)`.
 
+### OneLake: use GUID paths for now
+
+Address OneLake tables by **workspace GUID + lakehouse GUID**, not friendly names —
+`abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables/...`. This
+sidesteps an upstream `duckdb-delta` read bug ("No files in log segment") that is **already fixed
+upstream but still rolling out to production OneLake**. Friendly-name paths will work again once
+the fix finishes deploying.
+
 ### Fabric Lakehouse without a schema
 
 A schema-less Lakehouse (tables straight under `Tables/`, no `Tables/<schema>/` grouping) is
@@ -66,7 +88,7 @@ let the schema fill that slot:
 
 ```yaml
       schema: Tables
-      root_path: "abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>.Lakehouse"
+      root_path: "abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>"
 ```
 
 Since models are written to `<root_path>/<schema>/<model>`, this lands them at
@@ -280,7 +302,7 @@ unchanged since the call, else raises `CommitFailedError`.
 
 ```python
 import duckrun
-conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")
+conn = duckrun.connect("abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables/dbo")
 conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
 conn.table("orders_copy").show()
 

@@ -32,6 +32,10 @@ class DuckrunConnectionManager(DuckDBConnectionManager):
 
     @classmethod
     def open(cls, connection):
+        # Fail loud if the kernel still has Fabric's stale duckdb/deltalake loaded (installed an
+        # upgrade but skipped notebookutils.session.restartPython()). Lazy import: same wheel.
+        from duckrun._runtime import check_runtime_versions
+        check_runtime_versions()
         # duckrun runs single-threaded, so it uses ONE DuckDB connection for the whole run
         # (DuckrunEnvironment) instead of dbt-duckdb's per-handle cursors — see environment.py.
         # Pre-seed the base class's singleton _ENV with it for the local case; remote/MotherDuck
