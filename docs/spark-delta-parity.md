@@ -105,7 +105,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.databaseExists(db)` | `catalog.databaseExists(db)` | ✅ | |
 | `catalog.cacheTable` | — | 🚫 | No Spark caching — by design. |
 | `catalog.clearCache` | — | 🚫 | No Spark caching — by design. |
-| `catalog.dropTempView` | — | 🚫 | No Spark runtime — by design. |
+| `catalog.dropTempView` | `conn.sql("DROP VIEW name")` | ➖ | Temp views are native DuckDB (`createOrReplaceTempView`) — drop one today with `DROP VIEW`; a dedicated method could be added. |
 | `catalog.refreshTable` | — | 🚫 | No Spark runtime — by design. |
 | `catalog.recoverPartitions` | — | 🚫 | No Spark runtime — by design. |
 
