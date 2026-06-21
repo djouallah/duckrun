@@ -12,6 +12,9 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
 - a `DeltaTable` handle (`conn.delta_table(name)` / `DeltaTable.forName`) mirroring the `DeltaTable` API:
   `.merge(...)`, `.delete()`, `.update()`, `.replaceWhere()`, `.version()`.
 
+For a method-by-method map of this surface against PySpark / Delta-on-Spark — including the gaps and
+what's intentionally out of scope — see [Coverage vs the Spark / Delta API](spark-delta-parity.md).
+
 `merge` is **snapshot-pinned by default** — single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit validates against it, so a concurrent writer fails the
 commit loudly instead of silently interleaving. `mode("safeappend")` applies the same fail-loud
