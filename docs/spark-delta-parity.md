@@ -103,7 +103,6 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.setCurrentDatabase(db)` | `catalog.setCurrentDatabase(db)` | ✅ | |
 | `catalog.tableExists(t, db)` | `catalog.tableExists(t, db)` | ✅ | |
 | `catalog.databaseExists(db)` | `catalog.databaseExists(db)` | ✅ | |
-| `catalog.listFunctions()` | — | ➖ | Could be added from DuckDB's function catalog. |
 | `catalog.cacheTable` | — | 🚫 | No Spark caching — by design. |
 | `catalog.clearCache` | — | 🚫 | No Spark caching — by design. |
 | `catalog.dropTempView` | — | 🚫 | No Spark runtime — by design. |
