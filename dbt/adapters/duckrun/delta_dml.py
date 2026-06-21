@@ -401,11 +401,12 @@ class _DeltaDML:
     def _append_projected(self, loc, provided, derived: str) -> None:
         """Append a ``derived`` table (a ``(values …)`` tuple list or a ``(select …)`` subquery) to
         the Delta table at ``loc``, projecting its columns onto the FULL target schema: supplied
-        columns come from ``derived`` (positional when ``provided`` is None), any unsupplied target
-        column is a typed NULL, and every projected column is cast to the target column's type so
-        the appended Arrow schema matches the table exactly (what a plain SQL INSERT does, and it
-        stops a literal wider than the column from forcing delta_rs to add a new writer feature on
-        append)."""
+        columns come from ``derived`` (positional when ``provided`` is None) and pass through with
+        DuckDB's own types; any unsupplied target column is filled with a typed NULL so the column is
+        present. duckrun does NOT cast the supplied values to the target column's type — DuckDB
+        produces the Arrow and delta_rs writes it, nothing more. Any type adaptation (or rejection) is
+        delta_rs's own, so a real mismatch surfaces from delta_rs rather than being silently coerced
+        by a duckrun cast."""
         loc_sql = loc.replace("'", "''")
         template = self.cursor.sql(f"select * from delta_scan('{loc_sql}') limit 0")
         target_cols = list(template.columns)
@@ -421,8 +422,8 @@ class _DeltaDML:
         quoted = ", ".join('"' + c + '"' for c in provided)
         inner = f"{derived} v({quoted})"
         exprs = [
-            f'cast(v."{col}" as {typ}) as "{col}"' if col in provided_set
-            else f'cast(null as {typ}) as "{col}"'
+            f'v."{col}"' if col in provided_set        # supplied → pass through, no cast
+            else f'cast(null as {typ}) as "{col}"'     # omitted → typed NULL, just to present the column
             for col, typ in zip(target_cols, target_types)
         ]
         data = self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
