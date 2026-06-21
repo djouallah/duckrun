@@ -34,8 +34,8 @@ that says *which mapped methods actually pass their tests*; this page says *what
 | `spark.table(name)` | `conn.table(name)` | ✅ | |
 | `spark.read` | `conn.read` | ✅ | → `DataFrameReader`. |
 | `spark.catalog` | `conn.catalog` | ✅ | → `Catalog` (see below). |
-| `spark.createDataFrame(rows)` | `conn.sql("SELECT * FROM (VALUES …) t(…)")` | ✅ | Build rows with SQL `VALUES`. |
-| `spark.range(n)` | `conn.sql("SELECT … FROM range(n)")` | ✅ | Via SQL `range(n)`. |
+| `spark.createDataFrame(rows)` | `conn.sql("SELECT * FROM (VALUES …) t(…)")` | ➖ | TODO |
+| `spark.range(n)` | `conn.sql("SELECT … FROM range(n)")` | ➖ | TODO |
 | — | `conn.delta_table(name)` | 🟡 | duckrun shortcut for `DeltaTable.forName(conn, name)`. |
 | — | `conn.table_path(schema, table)` | 🟡 | duckrun plumbing: locate a table's storage path. |
 | — | `conn.resolve(name)` | 🟡 | duckrun plumbing: resolve a name to `(schema, table)`. |
@@ -59,7 +59,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `df.createOrReplaceTempView(name)` | `df.createOrReplaceTempView(name)` | ✅ | Native, ephemeral DuckDB view — not Delta, not in `conn.catalog`. |
 | `df.columns` | (passthrough) | 🟡 | Not reimplemented — `__getattr__` forwards to the DuckDB relation; a list of names, like Spark. |
 | `df.dtypes` | (passthrough) | 🟡 | Passthrough to the DuckDB relation — returns DuckDB types, not Spark `(name, type)` tuples. |
-| `df.schema` | — | ➖ | Not exposed yet; could be derived from `columns` + `dtypes`. |
+| `df.schema` | — | ➖ | TODO |
 
 ## `DataFrameReader` (`conn.read`)
 
@@ -72,10 +72,10 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `read.parquet(path)` | `read.parquet(path)` | ✅ | |
 | `read.csv(path)` | `read.csv(path)` | ✅ | |
 | `read.table(name)` | `read.table(name)` | ✅ | |
-| `read.schema(…)` | — | 🚫 | DuckDB infers the schema — by design. |
-| `read.json` | — | ➖ | Could be wired (DuckDB reads JSON). |
-| `read.orc` | — | ➖ | Could be wired (DuckDB reads ORC). |
-| `read.text` | — | 🚫 | `text` is not a lakehouse format. |
+| `read.schema(…)` | — | ➖ | TODO |
+| `read.json` | — | ➖ | TODO |
+| `read.orc` | — | ➖ | TODO |
+| `read.text` | — | ➖ | TODO |
 
 ## `DataFrameWriter` (`df.write`)
 
@@ -105,8 +105,8 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.databaseExists(db)` | `catalog.databaseExists(db)` | ✅ | |
 | `catalog.cacheTable` | — | 🚫 | No Spark caching — by design. |
 | `catalog.clearCache` | — | 🚫 | No Spark caching — by design. |
-| `catalog.dropTempView` | `conn.sql("DROP VIEW name")` | ➖ | Temp views are native DuckDB (`createOrReplaceTempView`) — drop one today with `DROP VIEW`; a dedicated method could be added. |
-| `catalog.refreshTable` | `conn.refresh()` | ✅ | `conn.refresh()` re-discovers the catalog. |
+| `catalog.dropTempView` | `conn.sql("DROP VIEW name")` | ➖ | TODO |
+| `catalog.refreshTable` | `conn.refresh()` | ➖ | TODO |
 | `catalog.recoverPartitions` | — | 🚫 | No Spark runtime — by design. |
 
 ## `DeltaTable` (Delta-on-Spark) ↔ `conn.delta_table(name)` / `DeltaTable`
@@ -124,17 +124,17 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.whenMatchedUpdateAll()` | `.whenMatchedUpdateAll()` | ✅ | |
 | `.whenNotMatchedInsertAll()` | `.whenNotMatchedInsertAll()` | ✅ | |
 | `.whenNotMatchedBySourceDelete()` | `.whenNotMatchedBySourceDelete()` | ✅ | |
-| `.whenMatchedDelete()` | — | ➖ | Not yet — the implemented clauses are the common upsert + sync-delete subset. |
-| `.whenNotMatchedInsert(values=…)` | — | ➖ | Not yet — `whenNotMatchedInsertAll` is implemented. |
-| `.whenNotMatchedBySourceUpdate(set=…)` | — | ➖ | Not yet — `whenNotMatchedBySourceDelete` is implemented. |
+| `.whenMatchedDelete()` | — | ➖ | TODO |
+| `.whenNotMatchedInsert(values=…)` | — | ➖ | TODO |
+| `.whenNotMatchedBySourceUpdate(set=…)` | — | ➖ | TODO |
 | `.delete(predicate)` | `.delete(predicate)` | ✅ | delta-rs predicates take literals (not `IN (SELECT …)`). |
 | `.update(set, where)` | `.update(set=…, where=…)` | ✅ | |
-| `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `.replaceWhere(source, predicate)` | ✅ | One atomic Delta commit. |
-| `.history()` | `.version()` | 🟡 | duckrun exposes just the current version head. |
+| `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `.replaceWhere(source, predicate)` | ➖ | TODO |
+| `.history()` | `.version()` | ➖ | TODO |
 | `spark.read.option("versionAsOf", N)` | `conn.sql("… delta_scan(path, version => N)")` | ➖ | TODO |
-| `.vacuum()` | — | 🚫 | Maintenance op — use `deltalake` / delta-rs directly against the table path. |
-| `.optimize()` | — | 🚫 | Compaction — use `deltalake` / delta-rs directly. |
-| `.generate()` | — | 🚫 | Manifest generation — use `deltalake` / delta-rs directly. |
-| `.restoreToVersion()` | — | 🚫 | Use `deltalake` / delta-rs directly. |
-| `.clone()` | — | 🚫 | Use `deltalake` / delta-rs directly. |
-| `convertToDelta` | — | 🚫 | Use `deltalake` / delta-rs directly. |
+| `.vacuum()` | — | ➖ | TODO |
+| `.optimize()` | — | ➖ | TODO |
+| `.generate()` | — | ➖ | TODO |
+| `.restoreToVersion()` | — | ➖ | TODO |
+| `.clone()` | — | ➖ | TODO |
+| `convertToDelta` | — | ➖ | TODO |
