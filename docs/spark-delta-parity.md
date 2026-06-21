@@ -75,7 +75,6 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `read.schema(…)` | — | 🚫 | DuckDB infers the schema — by design. |
 | `read.json` | — | ➖ | Could be wired (DuckDB reads JSON). |
 | `read.orc` | — | ➖ | Could be wired (DuckDB reads ORC). |
-| `read.jdbc` | — | 🚫 | No JDBC layer. |
 | `read.text` | — | 🚫 | `text` is not a lakehouse format. |
 
 ## `DataFrameWriter` (`df.write`)
