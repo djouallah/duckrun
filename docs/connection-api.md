@@ -68,12 +68,12 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 49 passed   ❌ 0 failed  │
-│ 49 methods · 100% passing │
+│ ✅ 52 passed   ❌ 0 failed  │
+│ 52 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### Spark / Delta-on-Spark API — 33/33 ✅
+### Spark / Delta-on-Spark API — 36/36 ✅
 
 > Methods that mirror PySpark (and Delta Lake's `DeltaTable` on Spark) 1:1.
 
@@ -83,7 +83,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns` | 8/8 ✅ |
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas` | 5/5 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv` | 4/4 ✅ |
-| `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `partitionBy`, `format` | 5/5 ✅ |
+| `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 8/8 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `merge`, `version`, `delete`, `update`, `replaceWhere` | 7/7 ✅ |
 
 ### duckrun-specific helpers — 16/16 ✅
