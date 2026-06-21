@@ -176,8 +176,8 @@ def run_coffee_scenario(conn, schema, n_rows):
         say("evt columns after mergeSchema append: " + str(conn.sql("select * from evt").columns))
 
     # ── read API straight off the store by path ──────────────────────────────────────────────────
-    with _step(8, "read API by path: conn.read.delta(path) / conn.read.format('delta').load(path)") as say:
-        assert conn.read.delta(conn.table_path(schema, "products")).count() == n_products
+    with _step(8, "read API by path: conn.read.format('delta').load(path)") as say:
+        assert conn.read.format("delta").load(conn.table_path(schema, "products")).count() == n_products
         assert conn.read.format("delta").load(conn.table_path(schema, "fact_sales")).count() == n_rows + 1
         say(f"read products={n_products}, fact_sales={n_rows + 1:,} straight off the store")
 

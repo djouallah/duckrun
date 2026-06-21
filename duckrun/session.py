@@ -408,7 +408,7 @@ class DataFrame:
         """Register this DataFrame as a session-scoped view named ``name``, so it can be queried by
         name via ``conn.sql("select * from name")`` (the ``createOrReplaceTempView`` API).
 
-        This is the path-read counterpart to ``saveAsTable``: ``conn.read.delta(path)`` returns a
+        This is the path-read counterpart to ``saveAsTable``: ``conn.read.format("delta").load(path)`` returns a
         DataFrame but registers nothing, so this is how a by-path read becomes queryable by name. The
         view is **native DuckDB and ephemeral** — it is not a Delta table, is not written to storage,
         and does not appear in ``conn.catalog``; use ``saveAsTable`` to persist as Delta. Returns
@@ -450,9 +450,6 @@ class DataFrameReader:
         else:
             raise ValueError(f"Unsupported read format '{fmt}'. Use 'delta', 'parquet', or 'csv'.")
         return DataFrame(self.session.con.sql(f"SELECT * FROM {scan}"), self.session)
-
-    def delta(self, path: str) -> DataFrame:
-        return self.format("delta").load(path)
 
     def parquet(self, path: str) -> DataFrame:
         return self.format("parquet").load(path)
@@ -578,7 +575,7 @@ class DataFrameWriter:
 
         Storage-neutral (local / s3:// / gs:// / az:// / abfss://). Unlike :meth:`saveAsTable`,
         the result is addressed only by ``path`` — there is no schema.table name to register a
-        view for — so it is read back with ``conn.read.delta(path)`` / ``delta_scan('<path>')``,
+        view for — so it is read back with ``conn.read.format("delta").load(path)`` / ``delta_scan('<path>')``,
         not as an unqualified table. Returns ``path``."""
         self._write(path, f"delta table at '{path}'")
         return path

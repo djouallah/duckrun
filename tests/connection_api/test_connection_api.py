@@ -155,9 +155,6 @@ class TestDataFrameReader:
     def test_format_load_delta(self, conn):
         assert conn.read.format("delta").load(conn.table_path("dbo", "src")).count() == 3
 
-    def test_delta(self, conn):
-        assert conn.read.delta(conn.table_path("dbo", "src")).count() == 3
-
     def test_table(self, conn):
         assert conn.read.table("src").count() == 3
 
@@ -223,13 +220,13 @@ class TestDataFrameWriter:
     def test_save_by_path(self, conn, tmp_path):
         p = (tmp_path / "by_path").as_posix()
         conn.sql("select 1 a").write.mode("overwrite").save(p)  # no catalog name
-        assert conn.read.delta(p).count() == 1  # read back BY PATH, not as a table
+        assert conn.read.format("delta").load(p).count() == 1  # read back BY PATH, not as a table
 
     def test_save_modes(self, conn, tmp_path):
         p = (tmp_path / "modes").as_posix()
         conn.sql("select 1 a").write.mode("overwrite").save(p)
         conn.sql("select 2 a").write.mode("append").save(p)
-        assert conn.read.delta(p).count() == 2
+        assert conn.read.format("delta").load(p).count() == 2
 
     def test_save_mode_error_when_exists(self, conn, tmp_path):
         p = (tmp_path / "err").as_posix()
@@ -511,7 +508,7 @@ def test_dataframe_writes_persist_to_delta(wh):
 def test_read_api(wh):
     conn = duckrun.connect(wh, schema="dbo")
     t1_path = conn.table_path("dbo", "t1")
-    assert conn.read.delta(t1_path).count() == 2
+    assert conn.read.format("delta").load(t1_path).count() == 2
     assert conn.read.format("delta").load(t1_path).count() == 2
 
 

@@ -378,7 +378,7 @@ won't be "fixed" away:
   table x")` overwrites the table with a one-column tombstone marker and unregisters it. The table
   vanishes from `conn.catalog` and discovery, and a later `create table x as …` revives the path with
   real data, but the **files are not reclaimed** (a human purges them). One consequence: reading the
-  path *directly* (`conn.read.delta("…/x")`) bypasses discovery and returns the one-row tombstone
+  path *directly* (`conn.read.format("delta").load("…/x")`) bypasses discovery and returns the one-row tombstone
   marker rather than erroring — address dropped tables by name, not by path.
 
 ## License

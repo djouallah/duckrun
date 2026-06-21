@@ -68,7 +68,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `read.format(fmt)` | `read.format(fmt)` | ✅ | `delta` (default), `parquet`, `csv`. |
 | `read.option(k, v)` | `read.option(k, v)` | ✅ | |
 | `read.load(path)` | `read.load(path)` | ✅ | Honors the chosen `format`. |
-| `read.format("delta").load(path)` | `read.delta(path)` | 🟡 | duckrun convenience shortcut for the common case. |
+| `read.format("delta").load(path)` | `read.format("delta").load(path)` | ✅ | Identical — `delta` is the default format. |
 | `read.parquet(path)` | `read.parquet(path)` | ✅ | |
 | `read.csv(path)` | `read.csv(path)` | ✅ | |
 | `read.table(name)` | `read.table(name)` | ✅ | |

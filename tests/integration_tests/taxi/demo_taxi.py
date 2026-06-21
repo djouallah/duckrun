@@ -10,7 +10,7 @@ the SQL-first, real-data counterpart.
 
 The demo is split in two parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql``.
 **Part 2** switches to the DataFrame API on the same connection — the ``DataFrameWriter`` writing Delta by
-**path** (``.mode("overwrite"/"append").save(path)``, read back with ``conn.read.delta(path)``), closing
+**path** (``.mode("overwrite"/"append").save(path)``, read back with ``conn.read.format("delta").load(path)``), closing
 with a **concurrent MERGE clash** staged through the DataFrame ``DeltaTable.merge`` builder (``conn.sql``
 rejects ``MERGE`` on purpose) — two writers pinned to one snapshot, the stale one refused with
 ``CommitFailedError``, proving snapshot isolation.
@@ -428,7 +428,7 @@ def run_taxi_demo(conn, schema):
               '              "FROM trips GROUP BY borough, pickup_hour")\n'
               'df.write.format("delta").mode("overwrite").save(path)   # land Delta at the path\n'
               '# a by-path read registers nothing — name it so conn.sql can query it BY NAME:\n'
-              'conn.read.delta(path).createOrReplaceTempView("borough_hourly_v")\n'
+              'conn.read.format("delta").load(path).createOrReplaceTempView("borough_hourly_v")\n'
               'conn.sql("SELECT * FROM borough_hourly_v ORDER BY trips DESC LIMIT 5")</pre>')
         df = conn.sql("SELECT borough, pickup_hour, count(*) AS trips "
                       "FROM trips GROUP BY borough, pickup_hour")
@@ -436,25 +436,25 @@ def run_taxi_demo(conn, schema):
         # createOrReplaceTempView: the by-path read is a DataFrame that registers nothing in the
         # catalog, so register it as a session view to make it queryable by name (the path-read
         # counterpart to saveAsTable). The view is native/ephemeral — not Delta, not in conn.catalog.
-        n_path = conn.read.delta(by_path).createOrReplaceTempView("borough_hourly_v").count()
+        n_path = conn.read.format("delta").load(by_path).createOrReplaceTempView("borough_hourly_v").count()
         results.append(_row("DataFrame save by path (overwrite)", 0, n_path, n_path, n_path > 0, n_path > 0,
                             time.perf_counter() - t0))
         top = conn.sql("SELECT borough, pickup_hour, trips FROM borough_hourly_v "
                        "ORDER BY trips DESC LIMIT 5").collect()
         _table([(b, h, f"{tr:,}") for b, h, tr in top], ["borough", "pickup_hour", "trips"],
-               "  read back by path — conn.read.delta(path).createOrReplaceTempView('borough_hourly_v')")
+               "  read back by path — conn.read.format("delta").load(path).createOrReplaceTempView('borough_hourly_v')")
         say(f"{n_path} (borough, hour) rows written to a bare Delta path, registered as a temp view, "
             "and queried by name")
 
     # 10 ── DataFrame append by PATH: df.write.mode('append').save(path) — grow the same dir ───────────
     with _step(10, "DataFrame append by path: df.write.mode('append').save(path) — grow the same Delta dir") as say:
         t0 = time.perf_counter()
-        before = conn.read.delta(by_path).count()
+        before = conn.read.format("delta").load(by_path).count()
         _emit('  <pre class="py">extra = conn.sql("SELECT \'EWR\' AS borough, 25 AS pickup_hour, 1 AS trips")\n'
               'extra.write.format("delta").mode("append").save(path)   # append to the SAME path</pre>')
         extra = conn.sql("SELECT 'EWR' AS borough, 25 AS pickup_hour, 1 AS trips")
         extra.write.format("delta").mode("append").save(by_path)
-        after = conn.read.delta(by_path).count()
+        after = conn.read.format("delta").load(by_path).count()
         results.append(_row("DataFrame append by path", before, after, before + 1, after == before + 1,
                             after - before == 1, time.perf_counter() - t0))
         say(f"{before:,} → {after:,} rows (appended by path)")
