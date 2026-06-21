@@ -11,7 +11,7 @@ name: integration_tests_onelake
 #                   (merge_tpch_bench.py) over OneLake at a SMALL scale factor. The HEAVY SF=10
 #                   (60M-row) memory-spill version stays a LOCAL release gate (local_stress_tests.yml).
 #   • coffee      — tiny local build for the docs catalog, then the connection-API coffee scenario
-#                   (duckrun.connect) over OneLake at a SMALL N.
+#                   (duckrun.connect) over OneLake at a 100M-row fact (a heavy abfss:// write/merge).
 #   • sde         — tiny local build for the docs catalog, then the SCD2 port driven through real
 #                   dbt subprocesses against a persistent OneLake snapshot.
 #
@@ -178,7 +178,7 @@ jobs:
 
   coffee:
     # The coffee-shop project: a LOCAL build for the docs catalog, then the connection-API coffee
-    # scenario (duckrun.connect) over OneLake at a SMALL N, into an isolated schema.
+    # scenario (duckrun.connect) over OneLake at a 100M-row fact, into an isolated schema.
     runs-on: ubuntu-latest
     concurrency:
       group: coffee-onelake
@@ -220,11 +220,11 @@ jobs:
           TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Run the coffee-shop scenario against OneLake (small N)
+      - name: Run the coffee-shop scenario against OneLake (100M-row fact)
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DUCKRUN_IT_SCHEMA: duckrun_conn_it
-          COFFEE_ONELAKE_ROWS: "2000"
+          COFFEE_ONELAKE_ROWS: "100000000"
         run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
 
       - name: Connect over a FRIENDLY-name OneLake path (delta-kernel #307 error-hygiene gate)
