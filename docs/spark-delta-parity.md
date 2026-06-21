@@ -103,8 +103,8 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.setCurrentDatabase(db)` | `catalog.setCurrentDatabase(db)` | ✅ | |
 | `catalog.tableExists(t, db)` | `catalog.tableExists(t, db)` | ✅ | |
 | `catalog.databaseExists(db)` | `catalog.databaseExists(db)` | ✅ | |
-| `catalog.cacheTable` | — | 🚫 | No Spark caching — by design. |
-| `catalog.clearCache` | — | 🚫 | No Spark caching — by design. |
+| `catalog.cacheTable` | — | ➖ | TODO |
+| `catalog.clearCache` | — | ➖ | TODO |
 | `catalog.dropTempView` | `conn.sql("DROP VIEW name")` | ➖ | TODO |
 | `catalog.refreshTable` | `conn.refresh()` | ➖ | TODO |
 | `catalog.recoverPartitions` | — | ➖ | TODO (delta-rs gap) |
