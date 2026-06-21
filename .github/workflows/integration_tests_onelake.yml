@@ -29,6 +29,7 @@ on:
       - 'tests/integration_tests/merge_spill/**'
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/sde_dbt_tutorial/**'
+      - 'tests/connection_api/**'
       - 'tests/tools/merge_tpch_bench.py'
       - 'docs/site/**'
       - '.github/workflows/integration_tests_onelake.yml'
@@ -38,6 +39,7 @@ on:
       - 'tests/integration_tests/merge_spill/**'
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/sde_dbt_tutorial/**'
+      - 'tests/connection_api/**'
       - 'tests/tools/merge_tpch_bench.py'
       - 'docs/site/**'
       - '.github/workflows/integration_tests_onelake.yml'
@@ -232,10 +234,36 @@ jobs:
           WAREHOUSE_PATH_FRIENDLY: abfss://tpch@onelake.dfs.fabric.microsoft.com/duckrun.Lakehouse/Tables
         run: python -m pytest tests/connection_api/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
 
+  taxi:
+    # The SQL-first NYC-taxi showcase: a runnable demo (not a gate) that reads real live NYC TLC
+    # Yellow Taxi data over https and lands it into OneLake via conn.sql(...) DML, into its own
+    # schema so it never collides with the coffee tables in the shared lakehouse. Its own job so it
+    # shows up as a visible node; non-fatal so a flaky live source can't redden the run.
+    runs-on: ubuntu-latest
+    concurrency:
+      group: taxi-onelake
+      cancel-in-progress: false
+    env:
+      AZURE_TRANSPORT_OPTION_TYPE: curl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun (pulls duckdb + deltalake)
+        run: pip install -e .
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: NYC taxi live demo (SQL-first connection-API showcase, OneLake)
-        # A runnable demo, not a gate — it reads real live NYC TLC data over https, so a flaky
-        # source must not redden this job. Writes to its own schema so it never collides with the
-        # coffee tables in the shared lakehouse.
         continue-on-error: true
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
