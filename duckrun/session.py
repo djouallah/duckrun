@@ -865,6 +865,7 @@ class DataFrameReader:
         self.session = session
         self._format = "delta"
         self._options: Dict[str, str] = {}
+        self._schema = None
 
     def format(self, fmt: str) -> "DataFrameReader":
         self._format = fmt.lower()
@@ -874,8 +875,43 @@ class DataFrameReader:
         self._options[key] = value
         return self
 
+    def schema(self, schema) -> "DataFrameReader":
+        """Supply an explicit read schema (Spark's ``read.schema``) — a DDL string
+        (``"id int, name string"``) or a :class:`StructType`. Applies to ``csv`` / ``json``, where
+        it both **names and types** the columns and turns off type sniffing (and skips the header
+        row), matching Spark's override. ``delta`` / ``parquet`` carry their own schema, so setting
+        one for them is rejected rather than silently ignored."""
+        self._schema = schema
+        return self
+
+    def _columns_arg(self) -> str:
+        """Render the stored schema as a DuckDB ``columns={'n': 'TYPE', …}`` argument. A StructType
+        maps field→type directly; a DDL string is parsed robustly by letting DuckDB build a throwaway
+        temp table and reading back its column names and types (handles ``DECIMAL(10,2)``, nested
+        types, etc. that naive comma-splitting would break)."""
+        s = self._schema
+        if isinstance(s, StructType):
+            pairs = [(f.name, f.dataType) for f in s.fields]
+        elif isinstance(s, str):
+            con = self.session.con
+            tmp = "__duckrun_schema_probe"
+            con.execute(f'create or replace temp table "{tmp}" ({s})')
+            try:
+                rel = con.sql(f'select * from "{tmp}" limit 0')
+                pairs = list(zip(rel.columns, [str(t) for t in rel.types]))
+            finally:
+                con.execute(f'drop table if exists "{tmp}"')
+        else:
+            raise ValueError("read.schema(...) must be a DDL string or a StructType.")
+        cols = ", ".join(f"'{_qlit(n)}': '{_qlit(t)}'" for n, t in pairs)
+        return f"columns={{{cols}}}"
+
     def load(self, path: str) -> DataFrame:
         fmt = self._format
+        if self._schema is not None and fmt in ("delta", "parquet"):
+            raise ValueError(
+                f"read.schema(...) applies to csv/json only; {fmt} carries its own schema."
+            )
         if fmt == "delta":
             # Time travel mirrors spark.read.option("versionAsOf", N): pin the read to that Delta
             # version via duckdb-delta's `version =>` parameter. timestampAsOf has no delta_scan
@@ -897,10 +933,16 @@ class DataFrameReader:
         elif fmt == "parquet":
             scan = f"read_parquet('{_qlit(path)}')"
         elif fmt == "json":
-            scan = f"read_json_auto('{_qlit(path)}')"
+            if self._schema is not None:
+                scan = f"read_json('{_qlit(path)}', {self._columns_arg()})"
+            else:
+                scan = f"read_json_auto('{_qlit(path)}')"
         elif fmt == "csv":
             opts = "".join(f", {k}={_csv_opt(v)}" for k, v in self._options.items())
-            scan = f"read_csv_auto('{_qlit(path)}'{opts})"
+            if self._schema is not None:
+                scan = f"read_csv('{_qlit(path)}', {self._columns_arg()}{opts})"
+            else:
+                scan = f"read_csv_auto('{_qlit(path)}'{opts})"
         else:
             raise ValueError(f"Unsupported read format '{fmt}'. Use 'delta', 'parquet', 'json', or 'csv'.")
         return DataFrame(self.session.con.sql(f"SELECT * FROM {scan}"), self.session)

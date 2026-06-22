@@ -290,6 +290,32 @@ class TestDataFrameReader:
         p.write_text('{"a": 1, "b": 2}\n{"a": 3, "b": 4}\n')
         assert conn.read.json(p.as_posix()).count() == 2
 
+    def test_schema_csv_ddl(self, conn, tmp_path):
+        # explicit schema names + types the columns and skips the header (Spark override).
+        p = tmp_path / "s.csv"
+        p.write_text("a,b\n1,2\n3,4\n")
+        df = conn.read.schema("x int, y bigint").option("header", True).csv(p.as_posix())
+        assert df.schema.simpleString() == "struct<x:INTEGER,y:BIGINT>"
+        assert df.collect() == [(1, 2), (3, 4)]
+
+    def test_schema_ddl_with_comma_type(self, conn, tmp_path):
+        # DECIMAL(10,2) would break naive comma-splitting; DuckDB parses it for us.
+        p = tmp_path / "d.csv"
+        p.write_text("1,2.50\n")
+        df = conn.read.schema("id int, price decimal(10,2)").csv(p.as_posix())
+        assert df.schema.simpleString() == "struct<id:INTEGER,price:DECIMAL(10,2)>"
+
+    def test_schema_json_struct(self, conn, tmp_path):
+        # schema may be a StructType lifted from another frame
+        st = conn.sql("select 1::int as id, 2.5::double as amt").schema
+        p = tmp_path / "s.json"
+        p.write_text('{"id": 7, "amt": 1.5}\n')
+        assert conn.read.schema(st).json(p.as_posix()).collect() == [(7, 1.5)]
+
+    def test_schema_rejected_for_delta(self, conn):
+        with pytest.raises(ValueError):
+            conn.read.schema("x int").format("delta").load(conn._table_path("dbo", "src"))
+
     @needs_version_param
     def test_versionAsOf(self, conn):
         # spark.read.format("delta").option("versionAsOf", N).load(path) — time travel.

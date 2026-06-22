@@ -93,7 +93,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `read.table(name)` | `read.table(name)` | ✅ | |
 | `read.option("versionAsOf", N).load(path)` | `read.option("versionAsOf", N).load(path)` | ✅ | Time travel via duckdb-delta `version =>`. |
 | `read.option("timestampAsOf", ts)` | — | 🚫 | duckdb-delta time-travels by version only; rejected (use `versionAsOf`). |
-| `read.schema(…)` | — | ➖ | TODO |
+| `read.schema(…)` | `read.schema(ddl_or_StructType)` | 🟡 | Applies to `csv` / `json` via DuckDB `columns={…}` — names + types the columns, turns off sniffing, skips the header (Spark override). A DDL string or a `StructType` (e.g. another frame's `df.schema`). Rejected for `delta` / `parquet`, which carry their own schema. |
 | `read.json` | `read.json(path)` / `read.format("json").load(path)` | ✅ | DuckDB `read_json_auto`. |
 | `read.orc` | — | 🚫 | DuckDB has no native ORC reader; no engine to back it. |
 | `read.text` | — | 🚫 | Spark yields one row per line (`value` column); DuckDB's `read_text` returns the whole file as one value — different shape, so rejected rather than faked. |
