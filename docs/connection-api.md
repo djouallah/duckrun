@@ -5,7 +5,7 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
 
 - `conn.sql(...)` — DuckDB SQL over the discovered Delta tables, including time travel
   (`delta_scan('…', version => N)`). Reads pass straight through; **raw DML** (`create table … as`,
-  `insert`, `update`, `delete`, `alter add column`, `drop`) is applied to the Delta table via
+  `insert`, `update`, `delete`, `alter add column`, `drop`, `merge`) is applied to the Delta table via
   delta_rs (works local AND on OneLake) — see the [DML matrix](#raw-sql-dml-through-connsql) below.
 - a `DataFrame` with a DataFrame-style `.write…saveAsTable()` — modes `overwrite` / `append` /
   `safeappend` / `ignore`, plus `option("replaceWhere", …)` for an atomic slice overwrite — plus
