@@ -389,11 +389,12 @@ won't be "fixed" away:
   memory pressure (large merges especially) the budget has to be split between them, and getting that
   split right is fragile: delta_rs's merge spill-to-disk is itself flaky, and coordinating two
   systems that don't know about each other's allocations is the hard, unavoidable part of this design.
-- **`DROP TABLE` is a soft tombstone, not a physical delete.** delta_rs has no `DROP`, and removing the
-  Delta files directly would be a filesystem hack that fails on object stores — so `conn.sql("drop
-  table x")` overwrites the table with a one-column tombstone marker and unregisters it. The table
-  vanishes from `conn.catalog` and discovery, and a later `create table x as …` revives the path with
-  real data, but the **files are not reclaimed** (a human purges them). One consequence: reading the
+- **`DROP TABLE` is a soft tombstone, not a physical delete.** delta_rs has no `DROP`, and duckrun
+  **deliberately will not delete your data files** — as a precaution it leaves that to you — so
+  `conn.sql("drop table x")` overwrites the table with a one-column tombstone marker and unregisters
+  it. The table vanishes from `conn.catalog` and discovery, and a later `create table x as …` revives
+  the path with real data, but the **files are not reclaimed** (you purge them yourself when you're
+  sure). One consequence: reading the
   path *directly* (`conn.read.format("delta").load("…/x")`) bypasses discovery and returns the one-row tombstone
   marker rather than erroring — address dropped tables by name, not by path.
 
