@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>duckrun — multi-catalog (lakehouse + warehouse + local)</title>
+  <title>duckrun — multi-catalog (warehouse + lakehouse + local)</title>
   <style>
   :root { color-scheme: light dark; }
   body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
@@ -27,98 +27,96 @@
   table.data { border-collapse: collapse; font-size: 0.85rem; margin: 0.2rem 0 0.8rem; }
   table.data th, table.data td { border: 1px solid #8884; padding: 0.3rem 0.6rem; text-align: left; word-break: break-word; }
   table.data th { background: #8882; font-weight: 600; }
-  table.card { width: 100%; }
-  table.card td:not(:first-child), table.card th:not(:first-child) { text-align: right; }
-  table.card td:first-child { font-weight: 600; }
-  footer { margin-top: 2rem; color: #888; font-size: 0.85rem; }
   code { background: #8882; padding: 0.1rem 0.35rem; border-radius: 4px; }
+  footer { margin-top: 2rem; color: #888; font-size: 0.85rem; }
 </style>
 </head>
 <body>
   <a class="back" href="index.html">← duckrun docs</a>
-  <h1>multi-catalog — one session, three lakehouses<span class="tag">not a dbt project</span></h1>
-  <p class="lede">Actual run · writable local Delta lakehouse + read-only Fabric Warehouse + local scratch · 2026-06-22 UTC. <code>conn.attach(...)</code> binds a writable OneLake lakehouse,
-  a <strong>read-only</strong> Fabric Warehouse, and a local scratch dir as three catalogs; a single
-  <code>conn.sql</code> JOINs across them as <code>catalog.schema.table</code>, and the mart is written
-  back to the lakehouse. Per-catalog <code>read_only</code> fences the warehouse.</p>
-  <h2 style="margin-bottom:0.2rem">Run scorecard — <span style="font-weight:400">✅ all operations correct</span></h2>
-  <table class="data card">
-  <thead><tr><th>Operation</th><th>Rows</th><th>Before</th><th>After</th><th>Expected</th><th>Count&nbsp;✓</th><th>Values&nbsp;✓</th><th>Time</th></tr></thead>
-  <tbody>
-    <tr><td>Read-only fence (warehouse)</td><td>+0</td><td>0</td><td>0</td><td>0</td><td>✅</td><td>✅</td><td>0.0s</td></tr>
-    <tr><td>Seed regional_demand (aemo)</td><td>+120</td><td>0</td><td>120</td><td>120</td><td>✅</td><td>✅</td><td>0.1s</td></tr>
-    <tr><td>Write lookup (scratch)</td><td>+5</td><td>0</td><td>5</td><td>5</td><td>✅</td><td>✅</td><td>0.0s</td></tr>
-    <tr><td>Write mart back (aemo)</td><td>+5</td><td>0</td><td>5</td><td>5</td><td>✅</td><td>✅</td><td>0.1s</td></tr>
-  </tbody>
-</table>
+  <h1>multi-catalog — one session, three catalogs<span class="tag">not a dbt project</span></h1>
+  <p class="lede">Actual run · a read-only warehouse + a writable OneLake lakehouse + a local catalog · 2026-06-22 UTC. A Fabric <strong>Warehouse</strong> and a <strong>Lakehouse</strong>
+  are the same thing to duckrun — Delta in OneLake — except the warehouse is <strong>locked to writes</strong>.
+  <code>conn.attach(...)</code> binds them (plus a local folder) as catalogs; every table is named
+  <code>catalog.schema.table</code>, and a single <code>conn.sql</code> joins across all three. Tokens are
+  automatic on OneLake — no credentials in the code.</p>
   
-<h2 class="part">Part 1 · attach three catalogs of different kinds to one session</h2>
-  <p class="lede">A writable OneLake lakehouse (the primary), a read-only Fabric Warehouse, and a local scratch dir — bound as catalogs, addressed as catalog.schema.table.</p>
+<h2 class="part">One session, three catalogs</h2>
+  <p class="lede">A writable lakehouse (primary), a read-only warehouse, and a local folder — bound with conn.attach. On OneLake the token is automatic (nothing to pass in a Fabric notebook).</p>
 
 <section>
-  <h3><span class="n">1</span> attach: a read-only Fabric Warehouse + a writable local scratch catalog</h3>
-  <pre class="py"># the warehouse is read-only (managed by the SQL engine — not writable via OneLake):
-conn.attach(warehouse_path, name=&quot;warehouse&quot;, storage_options={&quot;bearer_token&quot;: tok},
-            read_only=True)
-# a local scratch dir, writable (inherits the session default):
-conn.attach(scratch_path, name=&quot;scratch&quot;)</pre>
-  <p class="tcap">three catalogs, one session</p>
-  <table class="data"><thead><tr><th>catalog</th><th>role</th><th>storage</th><th>mode</th></tr></thead><tbody><tr><td>aemo</td><td>primary (aemo)</td><td>local fs</td><td>writable</td></tr><tr><td>warehouse</td><td>warehouse</td><td>local fs</td><td>read-only</td></tr><tr><td>scratch</td><td>scratch</td><td>local fs</td><td>writable</td></tr></tbody></table>
-  <p class="note">current catalog is &#x27;aemo&#x27; (writable); &#x27;warehouse&#x27; attached read-only; &#x27;scratch&#x27; on local fs</p>
+  <h3><span class="n">1</span> attach a read-only warehouse + a local catalog (OneLake tokens are automatic)</h3>
+  <pre class="py"># a Warehouse is just a Lakehouse that is locked to writes — attach it read-only.
+# OneLake tokens are acquired automatically (Fabric notebook / env / az login):
+conn.attach(warehouse_path, name=&quot;warehouse&quot;, schema=&quot;mart&quot;, read_only=True)
+conn.attach(local_path,     name=&quot;local&quot;)   # a plain local folder, writable</pre>
+  <p class="tcap">conn.catalog.listCatalogs()</p>
+  <table class="data"><thead><tr><th>catalog</th><th>mode</th><th>storage</th></tr></thead><tbody><tr><td>lakehouse</td><td>primary</td><td>OneLake (abfss)</td></tr><tr><td>warehouse</td><td>read-only</td><td>OneLake (abfss)</td></tr><tr><td>local</td><td>writable</td><td>local</td></tr></tbody></table>
+  <p class="note">three catalogs bound to one session; &#x27;lakehouse&#x27; is writable, &#x27;warehouse&#x27; is read-only</p>
 </section>
 
 <section>
-  <h3><span class="n">2</span> per-catalog read-only: a write into the warehouse catalog is refused</h3>
-  <pre class="py"># the session is writable, but the warehouse catalog is read_only=True:
-conn.sql(&quot;select 1 as x&quot;).write.mode(&quot;overwrite&quot;).saveAsTable(&quot;warehouse.dbo.nope&quot;)
-#  -&gt; PermissionError (fenced before any Delta write is attempted)</pre>
-  <p class="tcap">the read-only fence</p>
-  <table class="data"><thead><tr><th>catalog</th><th>attempted</th><th>outcome</th></tr></thead><tbody><tr><td>warehouse (read-only)</td><td>saveAsTable</td><td>refused ✅</td></tr></tbody></table>
-  <p class="note">write refused: catalog &#x27;warehouse&#x27; is read-only — cannot write a Delta table. duckrun opens read-only by </p>
+  <h3><span class="n">2</span> list EVERY table across all catalogs — the three-part catalog.schema.table name</h3>
+  <pre class="py"># one session sees all three catalogs; every table has a three-part name:
+conn.sql(&quot;&quot;&quot;SELECT table_catalog, table_schema, table_name
+            FROM information_schema.tables
+            WHERE table_schema NOT IN (&#x27;information_schema&#x27;,&#x27;pg_catalog&#x27;,&#x27;main&#x27;)
+            ORDER BY 1, 2, 3&quot;&quot;&quot;)</pre>
+  <p class="tcap">every table the session can see, three-part named</p>
+  <table class="data"><thead><tr><th>catalog</th><th>fully-qualified name (catalog.schema.table)</th></tr></thead><tbody><tr><td>lakehouse</td><td>lakehouse.mart.dim_duid</td></tr><tr><td>lakehouse</td><td>lakehouse.mart.fct_summary</td></tr><tr><td>lakehouse</td><td>lakehouse.mart.xxxx</td></tr><tr><td>warehouse</td><td>warehouse.mart.dim_calendar</td></tr><tr><td>warehouse</td><td>warehouse.mart.dim_duid</td></tr><tr><td>warehouse</td><td>warehouse.mart.fct_summary</td></tr></tbody></table>
+  <p class="note">6 tables across 3 catalogs — the warehouse and lakehouse expose the SAME mart tables; only the warehouse is read-only</p>
 </section>
 
 <section>
-  <h3><span class="n">3</span> read the warehouse (read-only): list its Delta tables, sample a row count</h3>
-  <p class="tcap">warehouse catalog contents (read-only)</p>
-  <table class="data"><thead><tr><th>schema</th><th>table</th></tr></thead><tbody><tr><td>dbo</td><td>dim_region</td></tr></tbody></table>
-  <p class="note">warehouse exposes 1 Delta table(s); sampled dbo.dim_region = 1 rows; switched back to the lakehouse</p>
-</section>
-
-<h2 class="part">Part 2 · write across catalogs, then JOIN and write the mart back to the lakehouse</h2>
-  <p class="lede">Seed the writable lakehouse and the local scratch catalog, JOIN across them in one conn.sql, and write the result BACK to the aemo lakehouse as a new Delta table.</p>
-
-<section>
-  <h3><span class="n">4</span> seed the aemo lakehouse: &#x27;multicatalog_demo.regional_demand&#x27; (5 regions × 24 hours)</h3>
-  <pre class="sql">CREATE OR REPLACE TABLE multicatalog_demo.regional_demand AS
-SELECT r.region, h.hour,
-       round(500 + 300 * sin((h.hour + ascii(r.region)) / 3.0) + 40 * ascii(r.region), 1) AS demand_mw
-FROM (VALUES (&#x27;A&#x27;), (&#x27;B&#x27;), (&#x27;C&#x27;), (&#x27;D&#x27;), (&#x27;E&#x27;)) r(region)
-CROSS JOIN range(0, 24) h(hour)</pre>
-  <p class="note">120 rows written to the aemo lakehouse</p>
+  <h3><span class="n">3</span> the three ways to name a table: catalog.schema.table → schema.table → table</h3>
+  <pre class="py"># 3-part — fully qualified, works from anywhere (cross-catalog):
+conn.sql(&quot;SELECT * FROM warehouse.mart.fct_summary LIMIT 5&quot;)
+# 2-part — schema.table, in the current catalog:
+conn.catalog.setCurrentCatalog(&quot;warehouse&quot;); conn.sql(&quot;SELECT * FROM mart.fct_summary LIMIT 5&quot;)
+# 1-part — bare table, in the current catalog + database:
+conn.catalog.setCurrentDatabase(&quot;mart&quot;);      conn.sql(&quot;SELECT * FROM fct_summary LIMIT 5&quot;)</pre>
+  <p class="tcap">the same warehouse table, three naming conventions — identical on a bounded probe</p>
+  <table class="data"><thead><tr><th>naming</th><th>reference</th><th>rows (100k sample probe)</th></tr></thead><tbody><tr><td>3-part</td><td>warehouse.mart.fct_summary</td><td>100,000</td></tr><tr><td>2-part</td><td>mart.fct_summary (current catalog)</td><td>100,000</td></tr><tr><td>1-part</td><td>fct_summary (current catalog + db)</td><td>100,000</td></tr></tbody></table>
+  <p class="note">all three names resolve to the same table (probed on a 100k-row sample, not the full fact)</p>
 </section>
 
 <section>
-  <h3><span class="n">5</span> cross-catalog write: df.write.saveAsTable(&#x27;scratch.dbo.region_lookup&#x27;) — local fs</h3>
-  <pre class="py">lookup = conn.sql(&quot;SELECT * FROM (VALUES …) t(region, region_name, state)&quot;)
-lookup.write.mode(&quot;overwrite&quot;).saveAsTable(&quot;scratch.dbo.region_lookup&quot;)</pre>
-  <p class="note">5 rows written under the scratch root (…/mp/tmprhuvr3p0/scratch/dbo/region_lookup)</p>
+  <h3><span class="n">4</span> a Warehouse is locked to writes — the read-only fence refuses a write into it</h3>
+  <pre class="py">conn.sql(&quot;SELECT 1 AS x&quot;).write.mode(&quot;overwrite&quot;).saveAsTable(&quot;warehouse.mart.nope&quot;)
+#  -&gt; PermissionError: catalog &#x27;warehouse&#x27; is read-only</pre>
+  <p class="tcap">the same write, two catalogs</p>
+  <table class="data"><thead><tr><th>catalog</th><th>mode</th><th>write attempt</th></tr></thead><tbody><tr><td>warehouse</td><td>read-only</td><td>refused ✅</td></tr><tr><td>lakehouse</td><td>writable</td><td>allowed ✅</td></tr></tbody></table>
+  <p class="note">the warehouse refuses writes (locked); the lakehouse accepts them</p>
+</section>
+
+<h2 class="part">A pipeline across all three catalogs</h2>
+  <p class="lede">Facts from the warehouse, the DUID dimension from the lakehouse, a carbon-factor lookup from the local catalog — joined in one query and written back to the lakehouse.</p>
+
+<section>
+  <h3><span class="n">5</span> write a carbon-factor lookup into the LOCAL catalog (local.dbo.fuel_factors)</h3>
+  <pre class="py">lookup = conn.sql(&quot;SELECT * FROM (VALUES …) t(fuel, co2_kg_per_mwh)&quot;)
+lookup.write.mode(&quot;overwrite&quot;).saveAsTable(&quot;local.dbo.fuel_factors&quot;)</pre>
+  <p class="note">15 fuel factors written to the local catalog</p>
 </section>
 
 <section>
-  <h3><span class="n">6</span> cross-catalog JOIN → write back: &#x27;multicatalog_demo.mart_region_demand&#x27; in the aemo lakehouse</h3>
-  <pre class="py"># one query spans the writable lakehouse (regional_demand) and the local scratch
-# catalog (region_lookup); the result is written back to the lakehouse by name:
-mart = conn.sql(&quot;&quot;&quot;
-    SELECT k.state, k.region_name,
-           round(sum(d.demand_mw), 1) AS total_mw,
-           round(avg(d.demand_mw), 1) AS avg_mw
-    FROM multicatalog_demo.regional_demand d
-    JOIN scratch.dbo.region_lookup k ON k.region = d.region
-    GROUP BY k.state, k.region_name&quot;&quot;&quot;)
-mart.write.mode(&quot;overwrite&quot;).saveAsTable(&quot;multicatalog_demo.mart_region_demand&quot;)</pre>
-  <p class="tcap">mart_region_demand — lakehouse ⋈ local scratch, written back to the lakehouse</p>
-  <table class="data"><thead><tr><th>state</th><th>region</th><th>total MW</th><th>avg MW</th></tr></thead><tbody><tr><td>TAS</td><td>Tasmania</td><td>76,883</td><td>3,204</td></tr><tr><td>SA</td><td>South Australia</td><td>75,940</td><td>3,164</td></tr><tr><td>QLD</td><td>Queensland</td><td>75,144</td><td>3,131</td></tr><tr><td>VIC</td><td>Victoria</td><td>74,478</td><td>3,103</td></tr><tr><td>NSW</td><td>New South Wales</td><td>73,908</td><td>3,080</td></tr></tbody></table>
-  <p class="note">5 rows written back to the aemo lakehouse (…/emo/multicatalog_demo/mart_region_demand)</p>
+  <h3><span class="n">6</span> JOIN all three → write &#x27;multicatalog_demo.mart_generation_by_state&#x27; back to the lakehouse</h3>
+  <pre class="py"># facts: WAREHOUSE (read-only) · DUID dim: LAKEHOUSE · carbon factor: LOCAL
+mart = conn.sql(f&quot;&quot;&quot;
+    WITH facts AS (   -- a bounded sample, not the whole 100M+-row fact
+        SELECT DUID, mw, price FROM warehouse.mart.fct_summary LIMIT 200000
+    )
+    SELECT d.State,
+           round(sum(f.mw), 0)                              AS total_mw,
+           round(avg(f.price), 2)                           AS avg_price,
+           round(sum(f.mw * coalesce(lf.co2_kg_per_mwh,0))/1000.0, 1) AS est_tonnes_co2
+    FROM facts f
+    JOIN mart.dim_duid d                ON d.DUID = f.DUID
+    LEFT JOIN local.dbo.fuel_factors lf ON lower(lf.fuel) = lower(d.FuelSourceDescriptor)
+    GROUP BY d.State&quot;&quot;&quot;)
+mart.write.mode(&quot;overwrite&quot;).saveAsTable(&quot;multicatalog_demo.mart_generation_by_state&quot;)</pre>
+  <p class="tcap">multicatalog_demo.mart_generation_by_state — warehouse ⋈ lakehouse ⋈ local (200,000-row fact sample)</p>
+  <table class="data"><thead><tr><th>state</th><th>total MW</th><th>avg price $</th><th>est t CO₂</th></tr></thead><tbody><tr><td>Queensland</td><td>2,927,844</td><td>104.94</td><td>644,304</td></tr><tr><td>Victoria</td><td>2,253,936</td><td>98.41</td><td>433,265</td></tr><tr><td>New South Wales</td><td>2,071,641</td><td>98.83</td><td>451,617</td></tr><tr><td>South Australia</td><td>995,708</td><td>128.82</td><td>447,044</td></tr><tr><td>Tasmania</td><td>747,277</td><td>84.74</td><td>43,236</td></tr></tbody></table>
+  <p class="note">mart written back to the lakehouse (abfss://…/Tables/multicatalog_demo/mart_generation_by_state) — joined a 200,000-row fact sample(warehouse) + dim(lakehouse) + factors(local)</p>
 </section>
   <footer>Generated by
     <a href="https://github.com/djouallah/duckrun/blob/main/tests/integration_tests/multicatalog/demo_multicatalog.py">demo_multicatalog.py</a>

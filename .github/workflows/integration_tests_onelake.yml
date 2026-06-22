@@ -318,7 +318,8 @@ jobs:
         run: |
           TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          # The demo passes NO credentials (automatic on OneLake); duckrun.auth picks up AZURE_STORAGE_TOKEN.
+          echo "AZURE_STORAGE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Multi-catalog live demo (lakehouse + read-only warehouse + local scratch)
         continue-on-error: true
         env:

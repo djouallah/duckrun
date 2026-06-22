@@ -1,23 +1,20 @@
 """Local de-risk for the multi-catalog demo — network-free, always runs.
 
-The live showcase (``demo_multicatalog.main``) binds three OneLake catalogs; this test exercises the
-exact same ``run_multicatalog_demo`` code path against three **local** directories (a writable primary,
-a read-only "warehouse", a writable scratch) and asserts the load-bearing invariants: the read-only
-fence holds, the lookup lands under the scratch root, and the mart is written back under the primary
-(aemo) root. Storage-neutrality means this local run is representative of the OneLake run — only the
-secret/discovery backend differs.
+The live showcase (``demo_multicatalog.main``) binds three OneLake catalogs; this runs the exact same
+``run_multicatalog_demo`` code path against three **local** directories — a writable lakehouse (the
+primary), a read-only "warehouse" seeded with the facts, and a writable local catalog — and asserts the
+pipeline JOINs across all three (warehouse facts ⋈ lakehouse dim ⋈ local lookup) and writes the mart
+back under the lakehouse root. Storage-neutrality means the local run is representative of OneLake.
 """
 import importlib.util
 import pathlib
 
 import deltalake
 import duckdb
-import pytest
 
 import duckrun
 from dbt.adapters.duckrun import engine
 
-# Load the sibling demo by file path so the test doesn't depend on tests/ being an importable package.
 _spec = importlib.util.spec_from_file_location(
     "demo_multicatalog", pathlib.Path(__file__).with_name("demo_multicatalog.py"))
 demo = importlib.util.module_from_spec(_spec)
@@ -32,27 +29,32 @@ def _seed(path, sql):
 
 
 def test_multicatalog_local_derisk(tmp_path):
-    aemo = str(tmp_path / "aemo")        # writable primary (stands in for the OneLake lakehouse)
-    warehouse = str(tmp_path / "warehouse")  # read-only reference (stands in for the Fabric Warehouse)
-    scratch = str(tmp_path / "scratch")  # writable local scratch catalog
-    # pre-seed the read-only "warehouse" so the read step has a table to list + sample.
-    _seed(warehouse + "/dbo/dim_region", "select 'A' as region, 'NSW' as state")
+    lakehouse = str(tmp_path / "lakehouse")   # writable primary (the OneLake lakehouse stand-in)
+    warehouse = str(tmp_path / "warehouse")   # read-only facts (the Fabric Warehouse stand-in)
+    local = str(tmp_path / "local")           # writable local catalog
 
-    conn = duckrun.connect(aemo, schema=SCHEMA, read_only=False)
-    results = demo.run_multicatalog_demo(conn, warehouse, None, scratch, SCHEMA)
-    by = {r["name"]: r for r in results}
+    # The lakehouse owns the DUID dimension; the warehouse owns the facts (both under `mart`).
+    _seed(lakehouse + "/mart/dim_duid",
+          "SELECT * FROM (VALUES ('D1','New South Wales','Black coal'),"
+          "('D2','Victoria','Wind'),('D3','Queensland','Natural gas')) t(DUID, State, FuelSourceDescriptor)")
+    _seed(warehouse + "/mart/fct_summary",
+          "SELECT * FROM (VALUES (DATE '2024-01-01','D1',500.0,80.0),"
+          "(DATE '2024-01-01','D2',200.0,75.0),(DATE '2024-01-01','D3',300.0,90.0)) t(date, DUID, mw, price)")
 
-    # every operation correct
-    assert all(r["count_ok"] and r["values_ok"] for r in results), by
-    # the read-only fence refused the warehouse write
-    assert by["Read-only fence (warehouse)"]["values_ok"]
-    # the lookup physically landed under the scratch root; the mart under the aemo root
-    assert by["Write lookup (scratch)"]["values_ok"]
-    assert by["Write mart back (aemo)"]["values_ok"]
-    assert deltalake.DeltaTable.is_deltatable(f"{aemo}/{SCHEMA}/mart_region_demand")
-    assert deltalake.DeltaTable.is_deltatable(f"{scratch}/dbo/region_lookup")
-    # the mart joined lakehouse + scratch into one row per region
-    assert conn.sql(f"select count(*) from {SCHEMA}.mart_region_demand").fetchone()[0] == 5
+    conn = duckrun.connect(lakehouse, schema=demo.REMOTE_SCHEMA, read_only=False)
+    demo.run_multicatalog_demo(conn, warehouse, local, SCHEMA)
+
+    # the joined mart was written BACK under the lakehouse root (not the warehouse / local).
+    assert deltalake.DeltaTable.is_deltatable(f"{lakehouse}/{SCHEMA}/mart_generation_by_state")
+    assert deltalake.DeltaTable.is_deltatable(f"{local}/dbo/fuel_factors")
+    out = {s: (mw, co2) for s, mw, co2 in conn.sql(
+        f"SELECT State, total_mw, est_tonnes_co2 FROM {SCHEMA}.mart_generation_by_state").collect()}
+    assert set(out) == {"New South Wales", "Victoria", "Queensland"}      # 3 states, joined via dim
+    assert out["New South Wales"] == (500, 450.0)   # 500 MW black coal × 900 kg/MWh = 450 t
+    assert out["Victoria"][1] == 0.0                # wind → zero-carbon (local factor)
+    # the warehouse stayed read-only: the fence write left no 'nope' table behind.
+    conn.catalog.setCurrentCatalog("warehouse")
+    assert "nope" not in conn.catalog.listTables("mart")
     conn.stop()
 
 
@@ -60,11 +62,13 @@ def test_multicatalog_demo_writes_html(tmp_path, monkeypatch):
     # the HTML report is emitted when DUCKRUN_MULTICAT_PAGE is set (what CI publishes as multicatalog.html).
     page = tmp_path / "report.html"
     monkeypatch.setenv("DUCKRUN_MULTICAT_PAGE", str(page))
-    aemo, warehouse, scratch = (str(tmp_path / n) for n in ("aemo", "warehouse", "scratch"))
-    _seed(warehouse + "/dbo/dim_region", "select 'A' as region, 'NSW' as state")
-    conn = duckrun.connect(aemo, schema=SCHEMA, read_only=False)
-    demo.run_multicatalog_demo(conn, warehouse, None, scratch, SCHEMA)
+    lakehouse, warehouse, local = (str(tmp_path / n) for n in ("lakehouse", "warehouse", "local"))
+    _seed(lakehouse + "/mart/dim_duid", "SELECT 'D1' AS DUID, 'Victoria' AS State, 'Wind' AS FuelSourceDescriptor")
+    _seed(warehouse + "/mart/fct_summary", "SELECT DATE '2024-01-01' AS date, 'D1' AS DUID, 10.0 AS mw, 50.0 AS price")
+    conn = duckrun.connect(lakehouse, schema=demo.REMOTE_SCHEMA, read_only=False)
+    demo.run_multicatalog_demo(conn, warehouse, local, SCHEMA)
     conn.stop()
     body = page.read_text(encoding="utf-8")
-    assert "multi-catalog" in body and "read-only" in body
-    assert "mart_region_demand" in body
+    assert "catalog.schema.table" in body          # the key three-part naming visual
+    assert "warehouse.mart.fct_summary" in body     # cross-catalog reference shown
+    assert "mart_generation_by_state" in body       # the written-back mart
