@@ -40,16 +40,17 @@ _strip_leading = delta_dml._strip_leading  # shared comment/whitespace stripper
 
 _MERGE_MSG = (
     "conn.sql() can't run a SQL MERGE via delta_rs. Use the DataFrame write API: "
-    "df.write.saveAsTable(...) to create/append, or "
-    "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
+    "df.write.saveAsTable(...) to create/append, df.write.option('replaceWhere', …) to overwrite "
+    "a slice, or DeltaTable.forName(conn, name).merge(...)/.delete()/.update()."
 )
 _UPDATE_FROM_MSG = (
     "conn.sql() can't run UPDATE … FROM via delta_rs. Rewrite the SET values as correlated "
-    "subqueries, or use conn.delta_table(name).update(...)/.merge(...)."
+    "subqueries, or use DeltaTable.forName(conn, name).update(...)/.merge(...)."
 )
 _DELETE_USING_MSG = (
     "conn.sql() can't run DELETE … USING via delta_rs. Rewrite the predicate as a correlated "
-    "subquery (DELETE … WHERE … IN (SELECT …)), or use conn.delta_table(name).delete(...)/.merge(...)."
+    "subquery (DELETE … WHERE … IN (SELECT …)), or use "
+    "DeltaTable.forName(conn, name).delete(...)/.merge(...)."
 )
 _MULTI_MSG = (
     "conn.sql() runs one statement at a time — split the batch into separate conn.sql() calls."
@@ -121,8 +122,9 @@ def _delta_write_message(query: str) -> str:
         )
     return (  # a CREATE … AS that didn't resolve, or any other unrouted Delta write
         "conn.sql() can't write a Delta table from raw SQL here. "
-        "Use the DataFrame write API: df.write.saveAsTable(...) to create/append, or "
-        "conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()."
+        "Use the DataFrame write API: df.write.saveAsTable(...) to create/append, "
+        "df.write.option('replaceWhere', …) to overwrite a slice, or "
+        "DeltaTable.forName(conn, name).merge(...)/.delete()/.update()."
     )
 
 
@@ -274,7 +276,7 @@ class DuckSession:
             for table in tables:
                 # Hide drop-tombstones (a `drop table` overwrites the table to a one-column marker;
                 # no data is deleted, the files persist, but the table must not surface).
-                if delta_dml.is_dropped(self.con, self.table_path(schema, table), self.storage_options):
+                if delta_dml.is_dropped(self.con, self._table_path(schema, table), self.storage_options):
                     continue
                 self._register_view(schema, table)
                 registered.append(f"{schema}.{table}")
@@ -315,10 +317,10 @@ class DuckSession:
         except Exception:  # an empty/absent schema shouldn't abort connect
             pass
 
-    def table_path(self, schema: str, table: str) -> str:
+    def _table_path(self, schema: str, table: str) -> str:
         return f"{self.root_path.rstrip('/')}/{schema}/{table}"
 
-    def resolve(self, name: str):
+    def _resolve(self, name: str):
         """Split a possibly-qualified ``db.table`` into ``(schema, table)`` using the current db."""
         if "." in name:
             schema, table = name.split(".", 1)
@@ -341,7 +343,7 @@ class DuckSession:
 
         ``merge`` isn't expressible via delta_rs DML here — use the DataFrame write API instead:
         ``df.write.saveAsTable(...)`` or
-        ``conn.delta_table(name).merge(...)/.delete()/.update()/.replaceWhere()``.
+        ``DeltaTable.forName(conn, name).merge(...)/.delete()/.update()``.
         ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
         """
         unsupported = _unsupported_dml(query)
@@ -356,23 +358,16 @@ class DuckSession:
         return DataFrame(self.con.sql(query), self)
 
     def table(self, name: str) -> "DataFrame":
-        schema, table = self.resolve(name)
+        schema, table = self._resolve(name)
         return DataFrame(self.con.sql(f"SELECT * FROM {_qid(schema)}.{_qid(table)}"), self)
-
-    def delta_table(self, name: str) -> "DeltaTable":
-        """A ``DeltaTable`` handle for an existing table: ``.merge(...)``, ``.delete()``,
-        ``.update()``, ``.replaceWhere()``, ``.version()``. (Reads still go through ``conn.sql`` /
-        ``conn.table``; this is the write/mutate side.) Shortcut for ``DeltaTable.forName(conn, name)``."""
-        from .delta_table import DeltaTable  # local import: delta_table imports nothing from session
-        return DeltaTable.forName(self, name)
 
     @property
     def read(self) -> "DataFrameReader":
         return DataFrameReader(self)
 
     @property
-    def connection(self):
-        """The underlying DuckDB connection (escape hatch)."""
+    def _connection(self):
+        """The underlying DuckDB connection (internal escape hatch)."""
         return self.con
 
 
@@ -441,7 +436,23 @@ class DataFrameReader:
     def load(self, path: str) -> DataFrame:
         fmt = self._format
         if fmt == "delta":
-            scan = f"delta_scan('{_qlit(path)}')"
+            # Time travel mirrors spark.read.option("versionAsOf", N): pin the read to that Delta
+            # version via duckdb-delta's `version =>` parameter. timestampAsOf has no delta_scan
+            # equivalent in this build, so reject it rather than silently ignoring it.
+            if "timestampAsOf" in self._options:
+                raise ValueError(
+                    "read.option('timestampAsOf', …) is not supported — duckdb-delta time-travels "
+                    "by version only. Use option('versionAsOf', N)."
+                )
+            version = self._options.get("versionAsOf")
+            if version is not None:
+                try:
+                    version = int(version)
+                except (TypeError, ValueError):
+                    raise ValueError(f"versionAsOf must be an integer Delta version, got {version!r}.")
+                scan = f"delta_scan('{_qlit(path)}', version => {version})"
+            else:
+                scan = f"delta_scan('{_qlit(path)}')"
         elif fmt == "parquet":
             scan = f"read_parquet('{_qlit(path)}')"
         elif fmt == "csv":
@@ -486,6 +497,7 @@ class DataFrameWriter:
         self._merge_schema = False
         self._overwrite_schema = False
         self._partition_by: Optional[List[str]] = None
+        self._replace_where: Optional[str] = None
 
     def format(self, fmt: str) -> "DataFrameWriter":
         if fmt.lower() != "delta":
@@ -501,6 +513,12 @@ class DataFrameWriter:
         return self
 
     def option(self, key: str, value) -> "DataFrameWriter":
+        if key == "replaceWhere":
+            # Atomically replace the rows matching this predicate with the written data, in a single
+            # Delta commit (the delta-spark replaceWhere / INSERT OVERWRITE form). Requires
+            # mode('overwrite'); snapshot-fenced at write time so a concurrent writer fails loudly.
+            self._replace_where = str(value)
+            return self
         truthy = str(value).lower() in ("true", "1")
         if key == "mergeSchema":
             self._merge_schema = truthy
@@ -508,7 +526,8 @@ class DataFrameWriter:
             self._overwrite_schema = truthy
         else:
             raise ValueError(
-                f"Unsupported write option '{key}'. Supported: 'mergeSchema', 'overwriteSchema'."
+                "Unsupported write option '{}'. Supported: 'mergeSchema', 'overwriteSchema', "
+                "'replaceWhere'.".format(key)
             )
         return self
 
@@ -523,6 +542,25 @@ class DataFrameWriter:
         names the target in the mode='error' message. Shared by saveAsTable and save."""
         session = self._df.session
         so = session.storage_options
+
+        if self._replace_where is not None:
+            # df.write.option("replaceWhere", pred).mode("overwrite").save()/saveAsTable() — a single
+            # Delta commit that swaps only the matching partition/rows. Snapshot-fenced: pin the
+            # version now and CAS the commit, so a concurrent writer fails loudly.
+            if self._mode != "overwrite":
+                raise ValueError(
+                    "option('replaceWhere', …) requires mode('overwrite'), got mode('%s')." % self._mode
+                )
+            engine.replace_where(
+                path,
+                self._df.relation,
+                self._replace_where,
+                read_version=engine.table_version(path, so),
+                partition_by=self._partition_by,
+                storage_options=so,
+                compaction_threshold=session.compaction_threshold,
+            )
+            return
 
         mode = self._mode
         if mode in ("error", "errorifexists"):
@@ -582,8 +620,8 @@ class DataFrameWriter:
 
     def saveAsTable(self, name: str) -> str:
         session = self._df.session
-        schema, table = session.resolve(name)
-        path = session.table_path(schema, table)
+        schema, table = session._resolve(name)
+        path = session._table_path(schema, table)
         self._write(path, f"table '{schema}.{table}'")
         # Surface the (new or grown) table immediately — no manual refresh() needed.
         session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(schema)}")
@@ -593,6 +631,23 @@ class DataFrameWriter:
         # (e.g. `select * from <table>`) must resolve.
         session._set_search_path(session._current_database)
         return table
+
+    def insertInto(self, name: str, overwrite: bool = False) -> str:
+        """``df.write.insertInto(name)`` — append into an **existing** Delta table by catalog name
+        (Spark's insertInto verb). Like Spark, the target must already exist — this errors instead
+        of creating it (use :meth:`saveAsTable` to create). ``overwrite=True`` replaces all rows.
+        Columns are matched as delta-rs appends them (by name); the configured ``mode()`` is ignored
+        in favour of the insert/overwrite semantics."""
+        session = self._df.session
+        schema, table = session._resolve(name)
+        path = session._table_path(schema, table)
+        if not engine.table_exists(path, session.storage_options):
+            raise ValueError(
+                f"insertInto target '{schema}.{table}' does not exist; create it first with "
+                f"df.write.saveAsTable('{name}')."
+            )
+        self._mode = "overwrite" if overwrite else "append"
+        return self.saveAsTable(name)
 
 
 class Catalog:
@@ -627,7 +682,7 @@ class Catalog:
 
     def tableExists(self, tableName: str, dbName: Optional[str] = None) -> bool:
         self.session.refresh(quiet=True)  # safe: reflect on-store truth, not stale views
-        schema, table = self.session.resolve(tableName)
+        schema, table = self.session._resolve(tableName)
         if dbName is not None:
             schema = dbName
         rows = self.session.con.execute(
@@ -643,7 +698,7 @@ class Catalog:
 
     def listColumns(self, tableName: str, dbName: Optional[str] = None) -> List[str]:
         self.session.refresh(quiet=True)
-        schema, table = self.session.resolve(tableName)
+        schema, table = self.session._resolve(tableName)
         if dbName is not None:
             schema = dbName
         rows = self.session.con.execute(

@@ -85,10 +85,10 @@ class TestSession:
         assert conn.refresh() is conn
 
     def test_connection(self, conn):
-        assert conn.connection.execute("select 1").fetchone()[0] == 1
+        assert conn._connection.execute("select 1").fetchone()[0] == 1
 
     def test_table_path(self, conn):
-        assert conn.table_path("dbo", "src").endswith("dbo/src")
+        assert conn._table_path("dbo", "src").endswith("dbo/src")
 
     def test_show_tables(self, conn):
         assert "src" in {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
@@ -153,20 +153,34 @@ class TestDataFrame:
 
 class TestDataFrameReader:
     def test_format_load_delta(self, conn):
-        assert conn.read.format("delta").load(conn.table_path("dbo", "src")).count() == 3
+        assert conn.read.format("delta").load(conn._table_path("dbo", "src")).count() == 3
 
     def test_table(self, conn):
         assert conn.read.table("src").count() == 3
 
     def test_parquet(self, conn, tmp_path):
         p = tmp_path / "s.parquet"
-        conn.connection.execute(f"copy (select 1 a, 2 b) to '{p.as_posix()}' (format parquet)")
+        conn._connection.execute(f"copy (select 1 a, 2 b) to '{p.as_posix()}' (format parquet)")
         assert conn.read.parquet(p.as_posix()).count() == 1
 
     def test_csv(self, conn, tmp_path):
         p = tmp_path / "s.csv"
         p.write_text("x,y\n1,2\n3,4\n")
         assert conn.read.option("header", True).csv(p.as_posix()).count() == 2
+
+    @needs_version_param
+    def test_versionAsOf(self, conn):
+        # spark.read.format("delta").option("versionAsOf", N).load(path) — time travel.
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("tt")   # v0
+        conn.sql("select 2 a").write.mode("append").saveAsTable("tt")      # v1
+        path = conn._table_path("dbo", "tt")
+        assert conn.read.format("delta").option("versionAsOf", 0).load(path).count() == 1
+        assert conn.read.format("delta").option("versionAsOf", 1).load(path).count() == 2
+
+    def test_timestampAsOf_rejected(self, conn):
+        with pytest.raises(ValueError):
+            conn.read.format("delta").option("timestampAsOf", "2024-01-01") \
+                .load(conn._table_path("dbo", "src"))
 
 
 class TestDataFrameWriter:
@@ -208,6 +222,31 @@ class TestDataFrameWriter:
         conn.sql("select 1 a").write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("w")
         assert conn.sql("select * from w").columns == ["a"]
 
+    def test_option_replaceWhere(self, conn):
+        # df.write.option("replaceWhere", pred).mode("overwrite") — atomic slice swap.
+        conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
+            .write.mode("overwrite").saveAsTable("rw")
+        conn.sql("select * from (values (1,77),(2,77)) t(id, val)") \
+            .write.option("replaceWhere", "id < 3").mode("overwrite").saveAsTable("rw")
+        assert dict(conn.sql("select id, val from rw").collect()) == {1: 77, 2: 77, 3: 10}
+
+    def test_option_replaceWhere_requires_overwrite(self, conn):
+        conn.sql("select 1 id, 10 val").write.mode("overwrite").saveAsTable("rw2")
+        with pytest.raises(ValueError):
+            conn.sql("select 1 id, 77 val").write.option("replaceWhere", "id = 1") \
+                .mode("append").saveAsTable("rw2")
+
+    def test_insertInto(self, conn):
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("ii")
+        conn.sql("select 2 a").write.insertInto("ii")               # append into existing
+        assert sorted(r[0] for r in conn.table("ii").collect()) == [1, 2]
+        conn.sql("select 9 a").write.insertInto("ii", overwrite=True)  # replace all
+        assert conn.table("ii").collect() == [(9,)]
+
+    def test_insertInto_requires_existing(self, conn):
+        with pytest.raises(ValueError):
+            conn.sql("select 1 a").write.insertInto("nope")
+
     def test_partitionBy(self, conn):
         conn.sql("select * from (values (1,'eu'),(2,'us')) t(id, region)") \
             .write.mode("overwrite").partitionBy("region").saveAsTable("w")
@@ -245,7 +284,7 @@ class TestDeltaTable:
         assert DeltaTable.forName(conn, "dbo.m").path.endswith("dbo/m")
 
     def test_forPath(self, conn):
-        assert DeltaTable.forPath(conn, conn.table_path("dbo", "src")).path.endswith("dbo/src")
+        assert DeltaTable.forPath(conn, conn._table_path("dbo", "src")).path.endswith("dbo/src")
 
     def test_merge_upsert(self, conn):
         self._seed(conn)
@@ -288,14 +327,8 @@ class TestDeltaTable:
 
     def test_update(self, conn):
         self._seed(conn)
-        DeltaTable.forName(conn, "dbo.m").update(set={"val": "val + 1"}, where="id = 1")
+        DeltaTable.forName(conn, "dbo.m").update(condition="id = 1", set={"val": "val + 1"})
         assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
-
-    def test_replaceWhere(self, conn):
-        self._seed(conn)  # ids 1,2,3 all val=10
-        new = conn.sql("select * from (values (1,77),(2,77)) t(id, val)")
-        DeltaTable.forName(conn, "dbo.m").replaceWhere(new, "id < 3")
-        assert dict(conn.sql("select id, val from m").collect()) == {1: 77, 2: 77, 3: 10}
 
     def test_merge_by_source_delete(self, conn):
         # full sync: source carries ids {2,4}; matched updates, unmatched-by-source (1,3) deleted.
@@ -328,7 +361,7 @@ class TestSqlDml:
         # write v0 then v1, then read v0 back via the passthrough — time travel for free.
         conn.sql("select 1 a").write.mode("overwrite").saveAsTable("tt")  # v0
         conn.sql("select 2 a").write.mode("overwrite").saveAsTable("tt")  # v1
-        path = conn.table_path("dbo", "tt")
+        path = conn._table_path("dbo", "tt")
         assert conn.sql(f"select a from delta_scan('{path}', version => 0)").fetchone()[0] == 1
 
     def test_sql_create_table_as(self, conn):
@@ -476,7 +509,7 @@ def test_safeappend_refuses_on_concurrent_commit(wh, monkeypatch):
     # loud (CommitFailedError) instead of duplicating — identical to the dbt safeappend strategy.
     conn = duckrun.connect(wh, schema="dbo")
     conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("sc")
-    path = conn.table_path("dbo", "sc")
+    path = conn._table_path("dbo", "sc")
     stale = engine.table_version(path, conn.storage_options)  # the version "as read"
 
     # A concurrent writer commits, moving HEAD past the version safeappend will pin to.
@@ -495,8 +528,8 @@ def test_dataframe_writes_persist_to_delta(wh):
     conn.sql("select 1 id, 'A' grp").write.mode("overwrite").saveAsTable("evt")
     conn.sql("select 2 id, 'B' grp").write.mode("append").saveAsTable("evt")
     conn.sql("select 3 id, 'C' grp").write.mode("append").saveAsTable("evt")
-    evt = conn.delta_table("evt")
-    evt.update(set={"grp": "'Z'"}, where="id = 1")
+    evt = DeltaTable.forName(conn, "evt")
+    evt.update(condition="id = 1", set={"grp": "'Z'"})
     evt.delete("id = 2")
     assert sorted(conn.sql("select * from evt").collect()) == [(1, "Z"), (3, "C")]
 
@@ -507,7 +540,7 @@ def test_dataframe_writes_persist_to_delta(wh):
 
 def test_read_api(wh):
     conn = duckrun.connect(wh, schema="dbo")
-    t1_path = conn.table_path("dbo", "t1")
+    t1_path = conn._table_path("dbo", "t1")
     assert conn.read.format("delta").load(t1_path).count() == 2
     assert conn.read.format("delta").load(t1_path).count() == 2
 
@@ -549,11 +582,11 @@ def test_dataframe_show(wh):
 
 
 def test_raw_connection_escape_hatch(wh):
-    # conn.connection exposes the underlying DuckDB connection for anything the DataFrame surface
+    # conn._connection exposes the underlying DuckDB connection for anything the DataFrame surface
     # doesn't cover — scalar queries, and reading the registered views directly.
     conn = duckrun.connect(wh, schema="dbo")
-    assert conn.connection.execute("select 40 + 2").fetchone()[0] == 42
-    assert conn.connection.execute("select count(*) from t1").fetchone()[0] == 2
+    assert conn._connection.execute("select 40 + 2").fetchone()[0] == 42
+    assert conn._connection.execute("select count(*) from t1").fetchone()[0] == 2
 
 
 def test_refresh_picks_up_external_writes(wh):
@@ -570,8 +603,8 @@ def test_reader_parquet_csv_and_table(wh, tmp_path):
     conn = duckrun.connect(wh, schema="dbo")
     pq = str(tmp_path / "t1.parquet")
     csv = str(tmp_path / "t1.csv")
-    conn.connection.execute(f"COPY (select * from t1) TO '{pq}' (FORMAT parquet)")
-    conn.connection.execute(f"COPY (select * from t1) TO '{csv}' (FORMAT csv, HEADER)")
+    conn._connection.execute(f"COPY (select * from t1) TO '{pq}' (FORMAT parquet)")
+    conn._connection.execute(f"COPY (select * from t1) TO '{csv}' (FORMAT csv, HEADER)")
 
     assert conn.read.parquet(pq).count() == 2
     # csv read with an explicit option (header) routed through DataFrameReader.option.
@@ -611,7 +644,7 @@ def test_catalog_database_and_column_introspection(wh):
 def test_delta_table_for_path_and_version(wh):
     conn = duckrun.connect(wh, schema="dbo")
     conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("ver")
-    path = conn.table_path("dbo", "ver")
+    path = conn._table_path("dbo", "ver")
 
     by_name = DeltaTable.forName(conn, "dbo.ver")
     by_path = DeltaTable.forPath(conn, path)
@@ -684,11 +717,11 @@ EQUIV = [
          expected=[(1, "a"), (2, "b"), (3, "c"), (8, "h")]),
     dict(id="update_predicate", table="items",
          sql=["update items set name = 'Z' where id = 1"],
-         dataframe=lambda c: c.delta_table("items").update(set={"name": "'Z'"}, where="id = 1"),
+         dataframe=lambda c: DeltaTable.forName(c, "items").update(condition="id = 1", set={"name": "'Z'"}),
          expected=[(1, "Z"), (2, "b"), (3, "c")]),
     dict(id="delete_predicate", table="items",
          sql=["delete from items where id = 2"],
-         dataframe=lambda c: c.delta_table("items").delete("id = 2"),
+         dataframe=lambda c: DeltaTable.forName(c, "items").delete("id = 2"),
          expected=[(1, "a"), (3, "c")]),
     dict(id="upsert", table="items",
          # SQL upsert = delete literal keys + insert (delta-rs DELETE takes literals, not IN (SELECT)).
@@ -777,7 +810,8 @@ def test_replace_where_dataframe_only(tmp_path):
     c = _seed(wh)
     c.sql("select * from (values (1,'eu'),(2,'us'),(3,'eu')) t(id, region)") \
         .write.mode("overwrite").saveAsTable("rw")
-    DeltaTable.forName(c, "rw").replaceWhere(c.sql("select 9 id, 'eu' region"), "region = 'eu'")
+    c.sql("select 9 id, 'eu' region").write.option("replaceWhere", "region = 'eu'") \
+        .mode("overwrite").saveAsTable("rw")
     assert _dump(wh, "rw")[1] == sorted([(2, "us"), (9, "eu")], key=_k)
 
 
@@ -832,7 +866,7 @@ def test_create_coldefs_empty_and_logs_create_table(tmp_path):
     assert _dump(wh, "money") == (["id", "amount"], [])
     # A bare CREATE TABLE records a CREATE TABLE op, NOT a WRITE/Overwrite (that's CREATE OR REPLACE).
     c.sql("create table fresh (i integer)")
-    dt = deltalake.DeltaTable(c.table_path("dbo", "fresh"))
+    dt = deltalake.DeltaTable(c._table_path("dbo", "fresh"))
     assert dt.history(1000)[-1]["operation"] == "CREATE TABLE"   # history newest-first; oldest = create
 
 
@@ -841,7 +875,7 @@ def test_drop_tombstones_without_deleting_data(tmp_path):
     # gone from the catalog, files stay, and a later create-as revives it with the real schema.
     wh = str(tmp_path / "wh")
     c = _seed(wh)
-    path = c.table_path("dbo", "items")
+    path = c._table_path("dbo", "items")
     c.sql("drop table items")
     assert "items" not in c.catalog.listTables()
     with pytest.raises(Exception):
@@ -863,7 +897,7 @@ def test_native_passthrough_not_delta(tmp_path, stmt, name):
     c = _seed(wh)
     c.sql(stmt)
     assert c.sql(f"select count(*) from {name}").fetchone()[0] is not None   # queryable now
-    assert not deltalake.DeltaTable.is_deltatable(c.table_path("dbo", name))  # but not Delta
+    assert not deltalake.DeltaTable.is_deltatable(c._table_path("dbo", name))  # but not Delta
     assert name not in duckrun.connect(wh, schema="dbo").catalog.listTables()  # and not persisted
 
 

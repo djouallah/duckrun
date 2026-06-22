@@ -177,8 +177,8 @@ def run_coffee_scenario(conn, schema, n_rows):
 
     # ── read API straight off the store by path ──────────────────────────────────────────────────
     with _step(8, "read API by path: conn.read.format('delta').load(path)") as say:
-        assert conn.read.format("delta").load(conn.table_path(schema, "products")).count() == n_products
-        assert conn.read.format("delta").load(conn.table_path(schema, "fact_sales")).count() == n_rows + 1
+        assert conn.read.format("delta").load(conn._table_path(schema, "products")).count() == n_products
+        assert conn.read.format("delta").load(conn._table_path(schema, "fact_sales")).count() == n_rows + 1
         say(f"read products={n_products}, fact_sales={n_rows + 1:,} straight off the store")
 
     # ── MERGE / upsert: a price-list update (DeltaTable.merge → engine.merge_delta) on 'products' ─

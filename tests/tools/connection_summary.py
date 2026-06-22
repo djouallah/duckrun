@@ -24,7 +24,7 @@ GROUPS = [
     ("TestDataFrame", "DataFrame"),
     ("TestDataFrameReader", "DataFrameReader (read)"),
     ("TestDataFrameWriter", "DataFrameWriter (write)"),
-    ("TestDeltaTable", "DeltaTable (merge / delete / update / replaceWhere)"),
+    ("TestDeltaTable", "DeltaTable (merge / delete / update / version)"),
     ("TestSqlDml", "sql() — reads + Delta DML"),
 ]
 _EMOJI = {"passed": "✅", "failed": "❌", "error": "💥", "skipped": "⏭️"}

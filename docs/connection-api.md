@@ -8,9 +8,10 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   `insert`, `update`, `delete`, `alter add column`, `drop`) is applied to the Delta table via
   delta_rs (works local AND on OneLake) — see the [DML matrix](#raw-sql-dml-through-connsql) below.
 - a `DataFrame` with a DataFrame-style `.write…saveAsTable()` — modes `overwrite` / `append` /
-  `safeappend` / `ignore` — plus `conn.read` and `conn.catalog`.
-- a `DeltaTable` handle (`conn.delta_table(name)` / `DeltaTable.forName`) mirroring the `DeltaTable` API:
-  `.merge(...)`, `.delete()`, `.update()`, `.replaceWhere()`, `.version()`.
+  `safeappend` / `ignore`, plus `option("replaceWhere", …)` for an atomic slice overwrite — plus
+  `conn.read` and `conn.catalog`.
+- a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
+  `.merge(...)`, `.delete()`, `.update()`, `.version()`.
 
 For a method-by-method map of this surface against PySpark / Delta-on-Spark — what maps 1:1, what's
 duckrun-flavored, and what's deliberately out of scope (SQL-first, no Spark runtime — by design) —
@@ -28,10 +29,15 @@ conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse
 conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
 conn.table("orders_copy").show()
 
-conn.delta_table("orders").delete("region = 'eu'")   # delete / update / replaceWhere
+from duckrun import DeltaTable
+DeltaTable.forName(conn, "orders").delete("region = 'eu'")   # delete / update / version
+
+# overwrite just one slice, atomically
+conn.sql("select * from corrections").write.option("replaceWhere", "region = 'eu'") \
+    .mode("overwrite").saveAsTable("orders")
 
 src = conn.sql("select * from updates")
-conn.delta_table("orders").merge(src, "target.id = source.id") \
+DeltaTable.forName(conn, "orders").merge(src, "target.id = source.id") \
     .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()   # pinned automatically
 ```
 
@@ -54,8 +60,8 @@ express are rejected up front with a pointer to the write API, rather than faili
 | `ALTER TABLE x ADD COLUMN …` | Delta overwrite, widening the schema |
 | `DROP TABLE x` | **tombstone** — marks the table dropped (a one-column marker) without deleting data; files persist for a human to purge, a later `create … as` revives it |
 | `CREATE TEMP/TEMPORARY TABLE …`, `CREATE VIEW …` | **native DuckDB** — ephemeral, session-local; not a Delta artifact |
-| `MERGE …` | rejected → use `conn.delta_table(name).merge(...)` or `df.write.saveAsTable(...)` |
-| `UPDATE … FROM`, `DELETE … USING` | rejected → rewrite as a correlated subquery, or use `conn.delta_table(...)` |
+| `MERGE …` | rejected → use `DeltaTable.forName(conn, name).merge(...)` or `df.write.saveAsTable(...)` |
+| `UPDATE … FROM`, `DELETE … USING` | rejected → rewrite as a correlated subquery, or use `DeltaTable.forName(conn, name)` |
 | multiple statements in one call | rejected → one statement per `conn.sql()` |
 
 Leading `--` / `/* … */` comments are fine. The exact behaviour is pinned, statement-by-statement,

@@ -36,11 +36,7 @@ that says *which mapped methods actually pass their tests*; this page says *what
 | `spark.catalog` | `conn.catalog` | ✅ | → `Catalog` (see below). |
 | `spark.createDataFrame(rows)` | `conn.sql("SELECT * FROM (VALUES …) t(…)")` | ➖ | TODO |
 | `spark.range(n)` | `conn.sql("SELECT … FROM range(n)")` | ➖ | TODO |
-| — | `conn.delta_table(name)` | 🟡 | duckrun shortcut for `DeltaTable.forName(conn, name)`. |
-| — | `conn.table_path(schema, table)` | 🟡 | duckrun plumbing: locate a table's storage path. |
-| — | `conn.resolve(name)` | 🟡 | duckrun plumbing: resolve a name to `(schema, table)`. |
 | — | `conn.refresh()` | 🟡 | duckrun plumbing: re-discover the catalog. |
-| — | `conn.connection` | 🟡 | The raw DuckDB connection — escape hatch. |
 
 ## `DataFrame`
 
@@ -72,6 +68,8 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `read.parquet(path)` | `read.parquet(path)` | ✅ | |
 | `read.csv(path)` | `read.csv(path)` | ✅ | |
 | `read.table(name)` | `read.table(name)` | ✅ | |
+| `read.option("versionAsOf", N).load(path)` | `read.option("versionAsOf", N).load(path)` | ✅ | Time travel via duckdb-delta `version =>`. |
+| `read.option("timestampAsOf", ts)` | — | 🚫 | duckdb-delta time-travels by version only; rejected (use `versionAsOf`). |
 | `read.schema(…)` | — | ➖ | TODO |
 | `read.json` | — | ➖ | TODO |
 | `read.orc` | — | ➖ | TODO |
@@ -88,7 +86,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `write.save(path)` | `write.save(path)` | ✅ | Write Delta by **path**. |
 | `write.saveAsTable(name)` | `write.saveAsTable(name)` | ✅ | Write Delta by **catalog name**. |
 | — | `write.mode("safeappend")` | 🟡 | duckrun extra: a fail-loud compare-and-swap append (no Spark equivalent). |
-| `write.insertInto(name)` | `df.write.mode("append").saveAsTable(name)` | ➖ | TODO |
+| `write.insertInto(name)` | `write.insertInto(name)` | ✅ | Appends to an **existing** table (errors if missing); `overwrite=True` replaces all rows. |
 | `write.bucketBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 | `write.sortBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 
@@ -109,7 +107,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.refreshTable` | `conn.refresh()` | ➖ | TODO |
 | `catalog.recoverPartitions` | — | ➖ | TODO (delta-rs gap) |
 
-## `DeltaTable` (Delta-on-Spark) ↔ `conn.delta_table(name)` / `DeltaTable`
+## `DeltaTable` (Delta-on-Spark) ↔ `DeltaTable.forName(conn, name)`
 
 The write/mutate side. **`merge` is snapshot-pinned by default** (single-snapshot MERGE): the target
 version is captured at build time and the commit validates against it, so a concurrent writer fails
@@ -127,11 +125,11 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.whenMatchedDelete()` | — | ➖ | TODO |
 | `.whenNotMatchedInsert(values=…)` | — | ➖ | TODO |
 | `.whenNotMatchedBySourceUpdate(set=…)` | — | ➖ | TODO |
-| `.delete(predicate)` | `.delete(predicate)` | ✅ | delta-rs predicates take literals (not `IN (SELECT …)`). |
-| `.update(set, where)` | `.update(set=…, where=…)` | ✅ | |
-| `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `.replaceWhere(source, predicate)` | ➖ | TODO |
-| `.history()` | `.version()` | ➖ | TODO |
-| `spark.read.option("versionAsOf", N)` | `conn.sql("… delta_scan(path, version => N)")` | ➖ | TODO |
+| `.delete(predicate)` | `.delete(predicate)` | ✅ | delta-rs param name (`predicate`); takes literals, not `IN (SELECT …)`. |
+| `.update(condition, set)` | `.update(condition=…, set=…)` | ✅ | delta-spark signature. |
+| `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `df.write.option("replaceWhere", pred).mode("overwrite").save()` / `.saveAsTable()` | ✅ | Single atomic commit; snapshot-fenced. |
+| `.history()` | `.version()` | 🟡 | duckrun exposes delta-rs `DeltaTable.version()` (an int); full `.history()` is ➖ TODO. |
+| `spark.read.option("versionAsOf", N)` | `conn.read.option("versionAsOf", N).load(path)` (or `conn.sql("… delta_scan(path, version => N)")`) | ✅ | See the DataFrameReader table. |
 | `.vacuum()` | — | ➖ | TODO |
 | `.optimize()` | — | ➖ | TODO |
 | `.generate()` | — | ➖ | TODO |

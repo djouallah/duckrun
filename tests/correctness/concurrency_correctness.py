@@ -101,7 +101,7 @@ def safeappend_display(rows):
 # -------------------------------------------------------------- D. DELETE / UPDATE snapshot safety
 
 def mutate_run(op: str, concurrent: bool) -> dict:
-    """A connection-API ``conn.delta_table(t).delete(…)/.update(…)`` (engine.delete_rows /
+    """A connection-API ``DeltaTable.forName(conn, t).delete(…)/.update(…)`` (engine.delete_rows /
     update_rows) is a genuinely conflicting Delta operation, so — exactly like MERGE — delta-rs OCC fails it
     with CommitFailedError when a foreign commit changed the same rows after its snapshot was
     opened. No max_commit_retries hack (that was only needed for non-conflicting appends): the
@@ -173,7 +173,7 @@ def conn_safeappend_run(mode: str, concurrent: bool) -> dict:
     root = tempfile.mkdtemp()
     conn = duckrun.connect(root, schema="dbo")
     conn.sql("select 0 as id").write.mode("overwrite").saveAsTable("t")    # v0
-    path = conn.table_path("dbo", "t")
+    path = conn._table_path("dbo", "t")
     so = conn.storage_options
     cap = {"mode": mode, "concurrent": concurrent}
     read_ver = engine.table_version(path, so)

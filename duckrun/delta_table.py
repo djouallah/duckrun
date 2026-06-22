@@ -70,8 +70,11 @@ class DeltaMergeBuilder:
         self._matched = ("all", None, condition)
         return self
 
-    def whenMatchedUpdate(self, set: Dict[str, str], condition: Optional[str] = None
-                          ) -> "DeltaMergeBuilder":
+    def whenMatchedUpdate(self, condition: Optional[str] = None,
+                          set: Optional[Dict[str, str]] = None) -> "DeltaMergeBuilder":
+        if not set:
+            raise ValueError("whenMatchedUpdate requires a non-empty 'set' mapping; "
+                             "use whenMatchedUpdateAll() to copy every column.")
         cols = []
         for col, expr in set.items():
             norm = str(expr).strip().lower()
@@ -148,8 +151,8 @@ class DeltaTable:
 
     @classmethod
     def forName(cls, session, name: str) -> "DeltaTable":
-        schema, table = session.resolve(name)
-        return cls(session, session.table_path(schema, table), schema, table)
+        schema, table = session._resolve(name)
+        return cls(session, session._table_path(schema, table), schema, table)
 
     @classmethod
     def forPath(cls, session, path: str) -> "DeltaTable":
@@ -175,24 +178,13 @@ class DeltaTable:
                            compaction_threshold=self.compaction_threshold)
         self._refresh_view()
 
-    def update(self, set: Dict[str, str], where: Optional[str] = None) -> None:
-        """Set ``{column: expression}`` for rows matching ``where`` (delta_rs/datafusion SQL), or
-        every row when ``where`` is None. ``DeltaTable.update``."""
+    def update(self, condition: Optional[str] = None, set: Optional[Dict[str, str]] = None) -> None:
+        """Set ``{column: expression}`` for rows matching ``condition`` (delta_rs/datafusion SQL), or
+        every row when ``condition`` is None. Mirrors delta-spark ``DeltaTable.update``."""
         if not set:
             raise ValueError("update() requires a non-empty 'set' mapping of {column: expression}.")
-        engine.update_rows(self.path, set, where, storage_options=self.storage_options,
+        engine.update_rows(self.path, set, condition, storage_options=self.storage_options,
                            compaction_threshold=self.compaction_threshold)
-        self._refresh_view()
-
-    def replaceWhere(self, source, predicate: str) -> None:
-        """Atomically replace the rows matching ``predicate`` with ``source`` (a DataFrame) — a
-        single Delta commit (``replaceWhere`` / ``INSERT OVERWRITE``). Snapshot-fenced
-        automatically: a concurrent writer since the call fails the commit loudly."""
-        rel = getattr(source, "relation", source)
-        engine.replace_where(self.path, rel, predicate,
-                             read_version=engine.table_version(self.path, self.storage_options),
-                             storage_options=self.storage_options,
-                             compaction_threshold=self.compaction_threshold)
         self._refresh_view()
 
     def _refresh_view(self):

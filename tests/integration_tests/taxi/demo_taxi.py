@@ -42,6 +42,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import duckrun
+from duckrun import DeltaTable
 
 # The scenario prints box-drawing chars and ✅/❌; force utf-8 so a Windows cp1252 console doesn't
 # crash when watching the demo.
@@ -320,7 +321,7 @@ def run_taxi_demo(conn, schema):
             SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
             FROM trips_raw USING SAMPLE {SAMPLE_ROWS} ROWS
         """)
-        v_landed = conn.delta_table("trips").version()   # the snapshot we'll time-travel back to
+        v_landed = DeltaTable.forName(conn, "trips").version()   # the snapshot we'll time-travel back to
         n_trips = q("SELECT count(*) FROM trips")
         bad = q("SELECT count(*) FROM trips WHERE fare <= 0")
         results.append(_row("Land trips sample", 0, n_trips, SAMPLE_ROWS, n_trips == SAMPLE_ROWS, bad == 0,
@@ -346,7 +347,7 @@ def run_taxi_demo(conn, schema):
     # 5 ── catalog WITH each table's real Delta location ───────────────────────────────────────────
     with _step(5, "Catalog: the Delta tables this demo landed — with their real storage locations") as say:
         tbls = sorted(conn.catalog.listTables())
-        _table([(t, _trim_loc(conn.table_path(schema, t))) for t in tbls], ["table", "location (real Delta dir)"],
+        _table([(t, _trim_loc(conn._table_path(schema, t))) for t in tbls], ["table", "location (real Delta dir)"],
                f"  tables in '{schema}'")
         say(f"{len(tbls)} Delta tables — each a real directory with a _delta_log at the location shown")
 
@@ -400,29 +401,25 @@ def run_taxi_demo(conn, schema):
         still = q("SELECT count(*) FROM trips WHERE payment = 'Cash'")
         results.append(_row("DELETE Cash trips", before, after, before - cash, after == before - cash, still == 0,
                             time.perf_counter() - t0))
-        path = conn.table_path(schema, "trips").replace("\\", "/")
-        try:   # the cool path: DuckDB delta_scan version travel
-            at_landed = _sql(conn, f"SELECT count(*) FROM delta_scan('{path}', version => {v_landed})").fetchone()[0]
-            how = f"delta_scan(version => {v_landed})"
-        except Exception:  # fall back to delta-rs if this DuckDB build lacks the version param
-            from deltalake import DeltaTable as _DLT
-            _dt = _DLT(path, storage_options=conn.storage_options)
-            _dt.load_as_version(v_landed)
-            at_landed = _dt.to_pyarrow_dataset().count_rows()
-            how = f"delta-rs load_as_version({v_landed})"
+        path = conn._table_path(schema, "trips").replace("\\", "/")
+        _emit('  <pre class="py"># canonical Spark time travel — read the snapshot we landed at, by version:\n'
+              f'conn.read.format("delta").option("versionAsOf", {v_landed}).load(path).count()</pre>')
+        at_landed = conn.read.format("delta").option("versionAsOf", v_landed).load(path).count()
+        how = f'read.option("versionAsOf", {v_landed})'
         _table([(f"{before:,}", f"{cash:,}", f"{after:,}", f"{at_landed:,}")],
                ["before", "Cash deleted", "after (now)", "at landed ver"], "  time travel: current vs landed snapshot")
         say(f"deleted {cash:,} Cash trips ({before:,} → {after:,}); {how} still sees {at_landed:,}")
 
-    _part("Part 2 · the DataFrame API — write Delta by path",
-          "Same connection, no SQL DML: the DataFrameWriter and DeltaTable builder. Writes are "
-          "addressed by a storage PATH (local / s3:// / gs:// / abfss://), not a catalog name.")
+    _part("Part 2 · the DataFrame & Delta API — write & mutate without SQL",
+          "Same connection, no SQL DML: the DataFrameWriter, the Spark write verbs "
+          "(save / insertInto / replaceWhere), and the DeltaTable builder (update / delete / merge). "
+          "Writes are addressed by storage PATH (local / s3:// / gs:// / abfss://) or by catalog NAME.")
 
     # 9 ── DataFrame write by PATH: df.write.mode('overwrite').save(path) ──────────────────────────────
     with _step(9, "DataFrame write by path: df.write.mode('overwrite').save(path) → a bare Delta dir "
                   "(no catalog name)") as say:
         t0 = time.perf_counter()
-        by_path = conn.table_path(schema, "borough_hourly")     # any store works: local / s3:// / abfss://
+        by_path = conn._table_path(schema, "borough_hourly")     # any store works: local / s3:// / abfss://
         _emit('  <pre class="py"># DataFrameWriter — addressed by a storage PATH, not a schema.table name:\n'
               'df = conn.sql("SELECT borough, pickup_hour, count(*) AS trips "\n'
               '              "FROM trips GROUP BY borough, pickup_hour")\n'
@@ -442,7 +439,7 @@ def run_taxi_demo(conn, schema):
         top = conn.sql("SELECT borough, pickup_hour, trips FROM borough_hourly_v "
                        "ORDER BY trips DESC LIMIT 5").collect()
         _table([(b, h, f"{tr:,}") for b, h, tr in top], ["borough", "pickup_hour", "trips"],
-               "  read back by path — conn.read.format("delta").load(path).createOrReplaceTempView('borough_hourly_v')")
+               "  read back by path — conn.read.format('delta').load(path).createOrReplaceTempView('borough_hourly_v')")
         say(f"{n_path} (borough, hour) rows written to a bare Delta path, registered as a temp view, "
             "and queried by name")
 
@@ -459,10 +456,66 @@ def run_taxi_demo(conn, schema):
                             after - before == 1, time.perf_counter() - t0))
         say(f"{before:,} → {after:,} rows (appended by path)")
 
-    # 11 ── concurrent MERGE clash — DataFrame builder API, snapshot isolation ─────────────────────────
-    with _step(11, "concurrent MERGE clash (DataFrame DeltaTable.merge): two writers, one snapshot — "
+    # 11 ── DeltaTable mutate API: update(condition, set) + delete(predicate) ───────────────────────────
+    with _step(11, "DeltaTable mutate API: DeltaTable.forName(conn, 'zone_stats').update(...) + .delete(...)") as say:
+        t0 = time.perf_counter()
+        z = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")
+        before = q("SELECT count(*) FROM zone_stats")
+        _emit('  <pre class="py">dt = DeltaTable.forName(conn, "zone_stats")\n'
+              f'dt.update(condition="zone_id = {z}", set={{"avg_fare": "42.0"}})   # set one row\n'
+              'dt.delete("zone_id = 999")                                  # drop the demo zone</pre>')
+        dt = DeltaTable.forName(conn, "zone_stats")
+        dt.update(condition=f"zone_id = {z}", set={"avg_fare": "42.0"})
+        dt.delete("zone_id = 999")
+        after = q("SELECT count(*) FROM zone_stats")
+        upd_ok = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {z}") == 42.0
+        del_ok = q("SELECT count(*) FROM zone_stats WHERE zone_id = 999") == 0
+        results.append(_row("DeltaTable update + delete", before, after, before - 1, after == before - 1,
+                            upd_ok and del_ok, time.perf_counter() - t0))
+        say(f"zone {z} avg → 42.0 (update), zone 999 removed (delete); {before:,} → {after:,} rows")
+
+    # 12 ── df.write.insertInto(name): append into an EXISTING table by catalog name ─────────────────────
+    with _step(12, "df.write.insertInto('zone_stats'): the Spark insertInto verb — append by name") as say:
+        t0 = time.perf_counter()
+        dup_id = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")
+        before = q("SELECT count(*) FROM zone_stats")
+        # source rows are SELECT *'d straight from the table, so the Delta schema matches exactly.
+        _emit('  <pre class="py"># Spark insertInto — append rows into an existing table by name:\n'
+              f'dup = conn.sql("SELECT * FROM zone_stats WHERE zone_id = {dup_id}")\n'
+              'dup.write.insertInto("zone_stats")   # errors if the table does not exist</pre>')
+        dup = conn.sql(f"SELECT * FROM zone_stats WHERE zone_id = {dup_id}")
+        dup.write.insertInto("zone_stats")
+        after = q("SELECT count(*) FROM zone_stats")
+        ins_ok = q(f"SELECT count(*) FROM zone_stats WHERE zone_id = {dup_id}") == 2
+        results.append(_row("DataFrame insertInto (+1)", before, after, before + 1, after == before + 1,
+                            ins_ok, time.perf_counter() - t0))
+        say(f"appended a copy of zone {dup_id} by name; {before:,} → {after:,} rows")
+
+    # 13 ── df.write.option('replaceWhere', …): atomic slice overwrite by name ──────────────────────────
+    with _step(13, "df.write.option('replaceWhere', pred).mode('overwrite').saveAsTable('zone_stats'): "
+                   "atomic slice swap") as say:
+        t0 = time.perf_counter()
+        z = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")
+        before = q("SELECT count(*) FROM zone_stats")
+        matched = q(f"SELECT count(*) FROM zone_stats WHERE zone_id = {z}")  # may be >1 after step 12
+        # source = one row, same schema (one column overridden), atomically replacing the whole slice.
+        _emit('  <pre class="py">new = conn.sql(f"SELECT * REPLACE (55.5::DOUBLE AS avg_fare) "\n'
+              '               f"FROM zone_stats WHERE zone_id = {z} LIMIT 1")\n'
+              'new.write.option("replaceWhere", f"zone_id = {z}").mode("overwrite").saveAsTable("zone_stats")</pre>')
+        new = conn.sql(f"SELECT * REPLACE (55.5::DOUBLE AS avg_fare) FROM zone_stats WHERE zone_id = {z} LIMIT 1")
+        new.write.option("replaceWhere", f"zone_id = {z}").mode("overwrite").saveAsTable("zone_stats")
+        after = q("SELECT count(*) FROM zone_stats")
+        expected = before - matched + 1   # the matched slice collapses to the single source row
+        rw_ok = (q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {z}") == 55.5
+                 and q(f"SELECT count(*) FROM zone_stats WHERE zone_id = {z}") == 1)
+        results.append(_row("DataFrame replaceWhere (slice swap)", before, after, expected, after == expected,
+                            rw_ok, time.perf_counter() - t0))
+        say(f"zone {z} slice ({matched} row(s)) replaced atomically by 1 row (avg → 55.5); "
+            f"{before:,} → {after:,} rows")
+
+    # 14 ── concurrent MERGE clash — DataFrame builder API, snapshot isolation ─────────────────────────
+    with _step(14, "concurrent MERGE clash (DataFrame DeltaTable.merge): two writers, one snapshot — "
                    "the stale one is refused") as say:
-        from duckrun import DeltaTable
         from deltalake.exceptions import CommitFailedError
         t0 = time.perf_counter()
         busiest = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")

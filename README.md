@@ -297,9 +297,10 @@ travel — `delta_scan('…', version => N)`) and applies **raw SQL DML** (`crea
 `CREATE TABLE` is Delta-backed, only `CREATE TEMP TABLE`/`CREATE VIEW` stay native DuckDB, and forms
 delta_rs can't express (`MERGE`, `UPDATE … FROM`, multi-statement) are rejected with a pointer to the
 write API. Writes also go through the DataFrame API: a `DataFrame` with `.write…saveAsTable()` (modes
-`overwrite` / `append` / `safeappend` / `ignore`) and a `DeltaTable` handle (`conn.delta_table(name)`
-/ `DeltaTable.forName`) with `.merge(...)`, `.delete()`, `.update()`, `.replaceWhere()`, `.version()`,
-plus `conn.read` and `conn.catalog`. See [the DML matrix](docs/connection-api.md#raw-sql-dml-through-connsql).
+`overwrite` / `append` / `safeappend` / `ignore`, plus `option("replaceWhere", …)` for an atomic
+slice overwrite) and a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) with `.merge(...)`,
+`.delete()`, `.update()`, `.version()`, plus `conn.read` and `conn.catalog`.
+See [the DML matrix](docs/connection-api.md#raw-sql-dml-through-connsql).
 
 `merge` is **snapshot-pinned by default** — single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit is validated against it, so a concurrent writer fails
@@ -313,11 +314,16 @@ conn = duckrun.connect("abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/
 conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
 conn.table("orders_copy").show()
 
-conn.delta_table("orders").delete("region = 'eu'")   # delete / update / replaceWhere
+from duckrun import DeltaTable
+DeltaTable.forName(conn, "orders").delete("region = 'eu'")   # delete / update / version
+
+# overwrite just one slice, atomically
+conn.sql("select * from corrections").write.option("replaceWhere", "region = 'eu'") \
+    .mode("overwrite").saveAsTable("orders")
 
 # upsert — pinned automatically, nothing to pass
 src = conn.sql("select * from updates")
-conn.delta_table("orders").merge(src, "target.id = source.id") \
+DeltaTable.forName(conn, "orders").merge(src, "target.id = source.id") \
     .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
 ```
 
