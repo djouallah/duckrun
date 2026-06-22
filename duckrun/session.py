@@ -282,7 +282,8 @@ class DuckSession:
     """A session handle bound to one or more Delta lakehouse roots, each surfaced as a catalog."""
 
     def __init__(self, path: str, storage_options: Optional[Dict[str, str]],
-                 schema: Optional[str], compaction_threshold: int, read_only: bool = True):
+                 schema: Optional[str], compaction_threshold: int, read_only: bool = True,
+                 name: Optional[str] = None):
         self.compaction_threshold = compaction_threshold
         self.read_only = read_only
 
@@ -298,10 +299,12 @@ class DuckSession:
         self.catalog = Catalog(self)
 
         root, schema_filter = _split_root_schema(path, schema)
-        # The primary catalog is never named by the caller (single-lakehouse users never type a
-        # catalog name), so a GUID-only OneLake root is fine here — fall back to a neutral name.
-        name = _derive_catalog_name(root) or "lakehouse"
-        self._attach_catalog(name, root, storage_options, schema_filter, primary=True, quiet=False)
+        # Catalog is first-class, so single- and multi-catalog sessions share one code path
+        # (catalog.schema.table works either way). The primary's name: an explicit name= wins, else
+        # derive it from the URL (OneLake lakehouse name / local folder), else fall back to "data"
+        # (a non-reserved word — usable bare in SQL, unlike "default"/"main").
+        catalog_name = name or _derive_catalog_name(root) or "data"
+        self._attach_catalog(catalog_name, root, storage_options, schema_filter, primary=True, quiet=False)
 
     # ---- catalog registry ------------------------------------------------------------------
 
@@ -966,11 +969,13 @@ class Catalog:
 
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
             schema: Optional[str] = None, compaction_threshold: int = 100,
-            read_only: bool = True) -> DuckSession:
+            read_only: bool = True, name: Optional[str] = None) -> DuckSession:
     """Open a storage-neutral, DataFrame-style session over a Delta lakehouse.
 
-    The session binds to this one lakehouse root (the primary catalog). Attach more lakehouses with
-    :meth:`DuckSession.attach` to query across them as ``catalog.schema.table``.
+    The session binds to this one lakehouse root as the primary catalog. Catalog is first-class:
+    tables are addressed ``catalog.schema.table`` (``schema.table`` / ``table`` resolve in the current
+    catalog), so single- and multi-catalog sessions share one code path. Attach more lakehouses with
+    :meth:`DuckSession.attach` to query across them.
 
     Args:
         path: the lakehouse root, or (OneLake) ``…/Tables`` or ``…/Tables/<schema>``. Works with a
@@ -983,12 +988,17 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
             / save / merge / insert / update / delete / replaceWhere) with a ``PermissionError``, so
             an accidental write can't mutate a shared lakehouse. Pass ``read_only=False`` to enable
             writes. Reads and native DuckDB scratch (``CREATE TEMP``/``CREATE VIEW``) are unaffected.
+        name: the primary catalog's name. When omitted it's derived from the URL (the OneLake
+            lakehouse name, or the local folder name); when nothing can be derived (a GUID-only
+            OneLake path) it falls back to ``"data"`` — a non-reserved word, so ``data.schema.table``
+            works bare. Pass one to address the catalog explicitly as ``<name>.schema.table``.
 
     Example:
-        >>> conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")
-        >>> conn.sql("SHOW TABLES").show()
+        >>> conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/sales.Lakehouse/Tables")
+        >>> conn.sql("SHOW TABLES").show()                          # primary catalog 'sales'
         >>> w = duckrun.connect("…/Tables/dbo", read_only=False)   # opt in to write
         >>> w.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
+        >>> lh = duckrun.connect("…/<guid>/Tables", name="lakehouse")   # name a GUID-path catalog
     """
     check_runtime_versions()  # fail loud if Fabric's stale duckdb/deltalake are still loaded
-    return DuckSession(path, storage_options, schema, compaction_threshold, read_only)
+    return DuckSession(path, storage_options, schema, compaction_threshold, read_only, name)

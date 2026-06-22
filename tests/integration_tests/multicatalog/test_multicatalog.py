@@ -41,7 +41,7 @@ def test_multicatalog_local_derisk(tmp_path):
           "SELECT * FROM (VALUES (DATE '2024-01-01','D1',500.0,80.0),"
           "(DATE '2024-01-01','D2',200.0,75.0),(DATE '2024-01-01','D3',300.0,90.0)) t(date, DUID, mw, price)")
 
-    conn = duckrun.connect(lakehouse, schema=demo.REMOTE_SCHEMA, read_only=False)
+    conn = duckrun.connect(lakehouse, schema=demo.REMOTE_SCHEMA, read_only=False, name="lakehouse")
     demo.run_multicatalog_demo(conn, warehouse, local, SCHEMA)
 
     # the joined mart was written BACK under the lakehouse root (not the warehouse / local).
@@ -65,7 +65,7 @@ def test_multicatalog_demo_writes_html(tmp_path, monkeypatch):
     lakehouse, warehouse, local = (str(tmp_path / n) for n in ("lakehouse", "warehouse", "local"))
     _seed(lakehouse + "/mart/dim_duid", "SELECT 'D1' AS DUID, 'Victoria' AS State, 'Wind' AS FuelSourceDescriptor")
     _seed(warehouse + "/mart/fct_summary", "SELECT DATE '2024-01-01' AS date, 'D1' AS DUID, 10.0 AS mw, 50.0 AS price")
-    conn = duckrun.connect(lakehouse, schema=demo.REMOTE_SCHEMA, read_only=False)
+    conn = duckrun.connect(lakehouse, schema=demo.REMOTE_SCHEMA, read_only=False, name="lakehouse")
     demo.run_multicatalog_demo(conn, warehouse, local, SCHEMA)
     conn.stop()
     body = page.read_text(encoding="utf-8")

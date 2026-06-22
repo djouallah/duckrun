@@ -12,8 +12,10 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   `conn.read` and `conn.catalog`.
 - a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
   `.merge(...)`, `.delete()`, `.update()`, `.version()`, `.history()`.
-- **multiple catalogs**: `connect()` binds one lakehouse root (the primary catalog); attach more with
-  `conn.attach(path, name=…)` and address them as `catalog.schema.table`. `conn.catalog.listCatalogs()`
+- **multiple catalogs**: `connect()` binds one lakehouse root (the primary catalog — named from the
+  URL, e.g. the OneLake lakehouse / local folder name, or `data` when a GUID-only path gives nothing
+  to derive; pass `name=` to override); attach more with `conn.attach(path, name=…)` and address them
+  as `catalog.schema.table`. `conn.catalog.listCatalogs()`
   / `currentCatalog()` / `setCurrentCatalog(name)` switch which catalog unqualified / 2-part names
   resolve in. `name` is derived from a friendly path (mandatory for a GUID-only OneLake path); one URL
   maps to one name. `attach(..., read_only=True)` fences writes to *that* catalog independently of the

@@ -355,7 +355,8 @@ def main():
         )
         return
     # No storage_options: on OneLake the token is acquired automatically (the whole point).
-    conn = duckrun.connect(WAREHOUSE_PATH, schema=REMOTE_SCHEMA, read_only=False)
+    # Name the primary catalog "lakehouse" (else it defaults to "default") so it reads next to "warehouse".
+    conn = duckrun.connect(WAREHOUSE_PATH, schema=REMOTE_SCHEMA, read_only=False, name="lakehouse")
     local = tempfile.mkdtemp(prefix="duckrun_local_")
     run_multicatalog_demo(conn, WAREHOUSE_RO_PATH, local, SCHEMA)
 

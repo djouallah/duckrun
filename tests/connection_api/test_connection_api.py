@@ -144,7 +144,7 @@ class TestCatalog:
         assert conn.catalog.listColumns("src") == ["id", "name"]
 
     def test_listCatalogs(self, conn):
-        # single-catalog session: just the primary (named from the lakehouse path's last segment).
+        # single-catalog session: the primary, named from the lakehouse folder ("wh") — no name= given.
         assert conn.catalog.listCatalogs() == ["wh"]
 
     def test_currentCatalog(self, conn):
@@ -1005,7 +1005,7 @@ def _two_lakehouses(tmp_path):
 
 def test_multi_catalog_cross_query(tmp_path):
     conn = _two_lakehouses(tmp_path)
-    assert conn.catalog.listCatalogs() == ["lhA", "other"]
+    assert conn.catalog.listCatalogs() == ["lhA", "other"]   # primary derives its folder name "lhA"
     assert conn.catalog.currentCatalog() == "lhA"
     # cross-catalog read resolves catalog.schema.table across the two lakehouse roots.
     assert conn.sql("select n from other.dbo.t2").fetchone()[0] == 7
@@ -1050,6 +1050,37 @@ def test_multi_catalog_bijective_guards(tmp_path):
         conn.attach(guid)
 
 
+def test_primary_name_derive_explicit_and_fallback(tmp_path):
+    # No name= → derive from the path's last segment (the folder name).
+    a = str(tmp_path / "wh")
+    _write_table(a + "/dbo/t", "select 1 as id")
+    assert duckrun.connect(a).catalog.currentCatalog() == "wh"
+    # Explicit name= wins.
+    assert duckrun.connect(a, name="picked").catalog.currentCatalog() == "picked"
+    # Nothing derivable (a GUID-shaped segment → _derive_catalog_name returns None) → "data" fallback,
+    # which is non-reserved so it's usable bare in 3-part SQL.
+    g = str(tmp_path / "11111111-1111-1111-1111-111111111111")
+    _write_table(g + "/dbo/t", "select 1 as id")
+    conn = duckrun.connect(g)
+    assert conn.catalog.currentCatalog() == "data"
+    assert conn.sql("select count(*) from data.dbo.t").fetchone()[0] == 1   # bare, no quoting needed
+
+
+def test_name_url_bijection_with_derived_names(tmp_path, tmp_path_factory):
+    # one name <-> one url, even when names are AUTO-DERIVED: two different roots whose folders derive
+    # the SAME name must not silently collide.
+    a = str(tmp_path / "wh")
+    b = str(tmp_path_factory.mktemp("other") / "wh")   # different URL, same derived name "wh"
+    _write_table(a + "/dbo/t", "select 1 as id")
+    _write_table(b + "/dbo/t", "select 2 as id")
+    conn = duckrun.connect(a, read_only=False)         # primary derives "wh"
+    with pytest.raises(ValueError, match="already attached|another name"):
+        conn.attach(b)                                 # derived name "wh" clashes with the primary
+    conn.attach(b, name="wh2")                         # an explicit name resolves it
+    assert set(conn.catalog.listCatalogs()) == {"wh", "wh2"}
+    assert conn.sql("select id from wh2.dbo.t").fetchone()[0] == 2
+
+
 def test_attach_schema_filter_skips_discovery(tmp_path):
     # schema= on attach restricts discovery to that one schema (no full glob) — other schemas absent.
     a, b = str(tmp_path / "lhA"), str(tmp_path / "lhB")
@@ -1069,7 +1100,7 @@ def test_cross_catalog_raw_dml_rejected(tmp_path):
     conn = _two_lakehouses(tmp_path)
     with pytest.raises(ValueError, match="can't target another catalog"):
         conn.sql("insert into other.dbo.t2 values (1)")
-    # but a 3-part target naming the CURRENT catalog is fine (routes to the current root).
+    # but a 3-part target naming the CURRENT catalog ("lhA") is fine (routes to the current root).
     conn.sql("insert into lhA.dbo.t1 values (3, 'c')")
     assert conn.sql("select count(*) from t1").fetchone()[0] == 3
 
