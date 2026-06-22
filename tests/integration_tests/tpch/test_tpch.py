@@ -26,8 +26,6 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from psutil import cpu_count
-
 import duckrun
 from duckrun import DeltaTable
 
@@ -815,7 +813,7 @@ def run_tpch_benchmark(sf=1, base_path=None, make_chart=False):
 
     # Save results with the duckrun DataFrame API (no pandas).
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cores = cpu_count()
+    cores = os.cpu_count()
     rows = [(r["query"], r["dur"], "duckrun", now, sf, cores, "tpch") for r in results]
     conn.createDataFrame(
         rows, "query int, dur double, engine string, time string, sf int, cpu int, test string"
