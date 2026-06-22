@@ -137,12 +137,16 @@ _MERGE = re.compile(
 _M_USING = re.compile(r"\busing\b", re.I)
 _M_ON = re.compile(r"\bon\b", re.I)
 _M_WHEN = re.compile(r"\bwhen\b", re.I)
-# One WHEN clause: kind (most specific first), optional `AND <pred>`, then the action after THEN.
-_M_CLAUSE = re.compile(
+# One WHEN clause, split on its top-level THEN (see _split_when_clause). _M_KIND parses the part
+# BEFORE that THEN: kind (most specific first) + optional `AND <pred>`. The THEN boundary is found
+# quote/paren-aware (_M_THEN via _find_top_level) so a string literal containing the word `then`
+# (e.g. `s.note <> 'x then y'`) doesn't cut the clause in the wrong place.
+_M_KIND = re.compile(
     r"\s*when\s+(?P<kind>not\s+matched\s+by\s+source|not\s+matched|matched)\b"
-    r"(?:\s+and\s+(?P<pred>.+?))?\s+then\s+(?P<action>.+?)\s*;?\s*",
+    r"(?:\s+and\s+(?P<pred>.+))?\s*;?\s*",
     re.I | re.S,
 )
+_M_THEN = re.compile(r"\bthen\b", re.I)
 _M_UPDATE_ALL = re.compile(r"\s*update\s+set\s+\*\s*", re.I)
 _M_UPDATE_SET = re.compile(r"\s*update\s+set\s+(?P<assign>.+)", re.I | re.S)
 _M_INSERT_ALL = re.compile(r"\s*insert\s+\*\s*", re.I)
@@ -176,6 +180,38 @@ def _strip_leading(query: str) -> str:
             s = "" if end == -1 else t[end + 2:]
         else:
             return t
+
+
+def _strip_comments(sql: str) -> str:
+    """Remove ``--`` line and ``/* */`` block comments that are OUTSIDE string/identifier quotes,
+    replacing each with a single space so adjacent tokens don't fuse. Quote-aware so a ``--``/``/*``
+    inside a literal (``'a -- b'``) is left intact. Applied to the whole statement before structural
+    parsing so an inline comment can't inject a false USING/ON/WHEN/THEN boundary (``_strip_leading``
+    only peels comments off the *front*)."""
+    out, i, n, quote = [], 0, len(sql), None
+    while i < n:
+        ch = sql[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+        elif ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+        elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
+            nl = sql.find("\n", i)
+            i = n if nl == -1 else nl  # stop before the newline so it's preserved
+            out.append(" ")
+        elif ch == "/" and i + 1 < n and sql[i + 1] == "*":
+            end = sql.find("*/", i + 2)
+            i = n if end == -1 else end + 2
+            out.append(" ")
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def _find_top_level(s: str, pattern) -> int:
@@ -418,6 +454,28 @@ def _parse_update_set(assign: str) -> List[str]:
     if not cols:
         raise ValueError("WHEN MATCHED THEN UPDATE SET has no assignments")
     return cols
+
+
+def _split_when_clause(clause: str) -> Tuple[str, Optional[str], str]:
+    """``(kind, pred, action)`` for one ``WHEN <kind> [AND <pred>] THEN <action>``.
+
+    The clause is split on its first *top-level* ``THEN`` (outside quotes/parens, via
+    :func:`_find_top_level`) so a string literal that contains the word ``then`` — e.g.
+    ``WHEN MATCHED AND s.note <> 'x then y' THEN …`` — is not mistaken for the clause's THEN.
+    """
+    s = clause.strip()
+    ti = _find_top_level(s, _M_THEN)
+    if ti < 0:
+        raise ValueError(f"unsupported MERGE clause (no THEN): {s!r}")
+    # rstrip a trailing statement terminator so the LAST clause's action (`… INSERT *;`) still
+    # matches the action patterns, which the old single-clause regex absorbed via `\s*;?\s*`.
+    head, action = s[:ti], s[ti + len("then"):].strip().rstrip(";").strip()
+    km = _M_KIND.fullmatch(head)
+    if not km:
+        raise ValueError(f"unsupported MERGE clause: {s!r}")
+    kind = re.sub(r"\s+", " ", km.group("kind").strip().lower())
+    pred = km.group("pred")
+    return kind, (pred.strip() if pred else None), action
 
 
 class _DeltaDML:
@@ -729,13 +787,7 @@ class _DeltaDML:
         not_matched = None    # None | ("all", pred)  — INSERT * only
         by_source_delete = None  # None | True | predicate string
         for clause in clause_strs:
-            cm = _M_CLAUSE.fullmatch(clause.strip())
-            if not cm:
-                raise ValueError(f"unsupported MERGE clause: {clause.strip()!r}")
-            kind = re.sub(r"\s+", " ", cm.group("kind").strip().lower())
-            pred = cm.group("pred")
-            pred = pred.strip() if pred else None
-            action = cm.group("action").strip()
+            kind, pred, action = _split_when_clause(clause)
             if kind == "matched":
                 if matched is not None:
                     raise ValueError("duplicate WHEN MATCHED clause is not supported")
@@ -839,6 +891,7 @@ def handle(cursor, root_path, storage_options, sql: str, default_schema=None) ->
     if not root_path:
         return False
     sql = _strip_leading(sql)  # so leading comments/whitespace don't hide the verb
+    sql = _strip_comments(sql)  # drop interior --/* */ comments so they can't fake a clause boundary
     with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
     # Cheap pre-filter: only the candidate DML verbs.
     head = body[:7].lower()

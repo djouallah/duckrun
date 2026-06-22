@@ -516,6 +516,33 @@ class TestSqlDml:
                  "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
         assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
 
+    def test_sql_merge_literal_with_then_in_predicate(self, conn):
+        # a string literal containing the word "then" (with spaces) must NOT be mistaken for the
+        # clause's THEN — the clause is split on its top-level THEN only.
+        conn.sql("MERGE INTO src USING (values (1,'X'),(9,'z')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED AND source.name <> 'do then redo' THEN UPDATE SET * "
+                 "WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"  # pred true → updated
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"  # inserted
+
+    def test_sql_merge_inline_line_comment(self, conn):
+        # an interior `--` comment (here carrying the word "when") must not inject a false clause
+        # boundary — comments are stripped before structural parsing.
+        conn.sql("MERGE INTO src USING (values (1,'X')) t(id, name) ON target.id = source.id\n"
+                 "WHEN MATCHED THEN UPDATE SET *\n"
+                 "-- recompute when stale\n"
+                 "WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+
+    def test_sql_merge_inline_block_comment(self, conn):
+        # a `/* */` comment (with using/on/when inside) between the target and USING is ignored, not
+        # mistaken for the structural USING/ON/WHEN keywords.
+        conn.sql("MERGE INTO src /* using on when */ USING (values (1,'X'),(9,'z')) t(id, name) "
+                 "ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
+
     def test_sql_merge_bad_alias_rejected(self, conn):
         # an alias matching neither side (not the table/source names or their aliases) is rejected.
         with pytest.raises(ValueError, match="target.*source"):
