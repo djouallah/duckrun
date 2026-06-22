@@ -137,7 +137,7 @@ express are rejected up front with a pointer to the write API, rather than faili
 | `DELETE FROM x [WHERE …]` | delta_rs delete |
 | `ALTER TABLE x ADD COLUMN …` | Delta overwrite, widening the schema |
 | `DROP TABLE x` | **tombstone** — marks the table dropped (a one-column marker) without deleting data; files persist for a human to purge, a later `create … as` revives it |
-| `MERGE INTO x USING s ON target.k = source.k WHEN …` | delta_rs upsert (same engine + snapshot pin as the `DeltaTable.merge` builder). The `ON`/`WHEN` clauses **must use the literal `target`/`source` aliases**. Supports `UPDATE SET *` / `UPDATE SET col = source.col`, `INSERT *`, `WHEN NOT MATCHED BY SOURCE THEN DELETE`, and per-clause `AND` predicates |
+| `MERGE INTO x [a] USING s [b] ON a.k = b.k WHEN …` | delta_rs upsert (same engine + snapshot pin as the `DeltaTable.merge` builder). Write it like standard SQL — the `ON`/`WHEN` clauses may use **your own aliases or the table/relation names** (the literal `target`/`source` also work); fully-unqualified columns (`ON k = k`) are ambiguous and unsupported. Supports `UPDATE SET *` / `UPDATE SET col = <src>.col`, `INSERT *`, `WHEN NOT MATCHED BY SOURCE THEN DELETE`, and per-clause `AND` predicates |
 | `CREATE TEMP/TEMPORARY TABLE …`, `CREATE VIEW …` | **native DuckDB** — ephemeral, session-local; not a Delta artifact |
 | `UPDATE … FROM`, `DELETE … USING` | rejected → rewrite as a correlated subquery, or use `DeltaTable.forName(conn, name)` |
 | multiple statements in one call | rejected → one statement per `conn.sql()` |

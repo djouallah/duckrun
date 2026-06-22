@@ -408,7 +408,7 @@ class TestSqlDml:
     """conn.sql(): reads (incl. version-pinned delta_scan) pass through, and Delta DML is applied
     via delta_rs — create-as / insert-select / insert-values / update / delete / alter-add, drop
     (a tombstone: no data deleted), and merge (upsert; same boundary as the DeltaTable.merge
-    builder, ON/WHEN must use the target/source aliases)."""
+    builder, ON/WHEN may use your own aliases or the table/relation names)."""
 
     def test_select_passthrough(self, conn):
         assert conn.sql("SELECT 1").fetchall() == [(1,)]
@@ -489,10 +489,37 @@ class TestSqlDml:
                  "ON target.id = source.id WHEN NOT MATCHED THEN INSERT *")
         assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
+    def test_sql_merge_user_aliases(self, conn):
+        # user-chosen aliases (s/t) on both sides resolve to the engine's target/source.
+        conn.sql("MERGE INTO src s USING (values (1,'X'),(9,'z')) t(id, name) ON s.id = t.id "
+                 "WHEN MATCHED THEN UPDATE SET name = t.name WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
+
+    def test_sql_merge_qualify_target_by_table_name(self, conn):
+        # no target alias: qualify the target by its table name, the source by its alias.
+        conn.sql("MERGE INTO src USING (values (1,'X')) u(id, name) ON src.id = u.id "
+                 "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+
+    def test_sql_merge_qualify_source_by_relation_name(self, conn):
+        # a bare-relation source can be qualified by its own name (no alias needed).
+        conn.sql("create table donor as select * from (values (1,'X'),(9,'z')) t(id, name)")
+        conn.sql("MERGE INTO src USING donor ON src.id = donor.id "
+                 "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
+
+    def test_sql_merge_literal_aliases_still_work(self, conn):
+        # backward compatible: the literal target/source aliases keep working.
+        conn.sql("MERGE INTO src USING (values (1,'X')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+
     def test_sql_merge_bad_alias_rejected(self, conn):
-        # the ON clause must use the target/source aliases — the error must say so.
+        # an alias matching neither side (not the table/source names or their aliases) is rejected.
         with pytest.raises(ValueError, match="target.*source"):
-            conn.sql("MERGE INTO src s USING (values (1,'x')) t(id, name) ON s.id = t.id "
+            conn.sql("MERGE INTO src s USING (values (1,'x')) t(id, name) ON foo.id = bar.id "
                      "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
 
     def test_sql_merge_matched_delete_rejected(self, conn):
@@ -1178,9 +1205,10 @@ def test_native_passthrough_not_delta(tmp_path, stmt, name):
 
 
 # Tier 4 — rejection contract: conn.sql() refuses what it can't route to delta_rs.
-# (A raw MERGE *is* routed — see TestSqlDml — but it must use the target/source aliases.)
+# (A raw MERGE *is* routed — see TestSqlDml — but its ON aliases must resolve to a side.)
 @pytest.mark.parametrize("stmt,msg", [
-    ("merge into items t using items s on t.id = s.id when matched then update set name = 'x'",
+    ("merge into items t using items s on foo.id = bar.id when matched then update set * "
+     "when not matched then insert *",
      "target.*source"),
     ("update items set name = o.name from wide o where items.id = o.id", "UPDATE . FROM"),
     ("delete from items using wide o where items.id = o.id", "DELETE . USING"),

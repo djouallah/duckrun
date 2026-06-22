@@ -386,14 +386,15 @@ def run_taxi_demo(conn, schema):
         tgt_zone = q(f"SELECT zone FROM zone_stats WHERE zone_id = {target}").replace("'", "''")
         new_avg = round(old_avg + 5.0, 2)
         # A real SQL MERGE: conn.sql routes it to delta-rs (same engine + snapshot pin as the
-        # DeltaTable.merge builder). The ON clause and WHEN clauses must use the literal target/source
-        # aliases. One statement does the upsert — the busiest zone is updated, zone 999 is inserted.
+        # DeltaTable.merge builder). Write it like standard SQL — pick your own aliases (here z/s);
+        # duckrun normalizes them internally. One statement does the upsert — the busiest zone is
+        # updated, zone 999 is inserted.
         _sql(conn, f"""
-            MERGE INTO zone_stats USING (VALUES
+            MERGE INTO zone_stats z USING (VALUES
                 ({target}, '{tgt_zone}', {tgt_trips}, {new_avg}),
                 (999, 'NEW Demo Zone', 1, 7.77)
-            ) AS source(zone_id, zone, trips, avg_fare)
-            ON target.zone_id = source.zone_id
+            ) AS s(zone_id, zone, trips, avg_fare)
+            ON z.zone_id = s.zone_id
             WHEN MATCHED THEN UPDATE SET *
             WHEN NOT MATCHED THEN INSERT *
         """)
@@ -414,7 +415,7 @@ def run_taxi_demo(conn, schema):
         # refreshed (this also heals the busy zone step 7 deliberately skewed by +5), any zone not yet
         # present is inserted. This is how MERGE is actually used — sync a target from a derived query.
         _sql(conn, """
-            MERGE INTO zone_stats AS target
+            MERGE INTO zone_stats zs
             USING (
                 SELECT zone_id,
                        any_value(zone)      AS zone,
@@ -423,8 +424,8 @@ def run_taxi_demo(conn, schema):
                 FROM trips
                 WHERE borough = 'Manhattan'
                 GROUP BY zone_id
-            ) AS source
-            ON target.zone_id = source.zone_id
+            ) fresh
+            ON zs.zone_id = fresh.zone_id
             WHEN MATCHED THEN UPDATE SET *
             WHEN NOT MATCHED THEN INSERT *
         """)

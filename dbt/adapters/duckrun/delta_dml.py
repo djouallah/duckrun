@@ -48,10 +48,11 @@ Supported / unsupported (what reaches delta_rs):
     update x set … [where …]                                 delta_rs update
     alter table x add column …                               Delta overwrite (widen schema)
     drop table x                                             tombstone (no data deleted)
-    merge into x using s on target.k = source.k when …       delta_rs upsert (engine.merge_delta) —
-                                                             same boundary as DeltaTable.merge; the ON
-                                                             clause and WHEN clauses must use the
-                                                             literal target/source aliases
+    merge into x [a] using s [b] on a.k = b.k when …         delta_rs upsert (engine.merge_delta) —
+                                                             same boundary as DeltaTable.merge; ON/WHEN
+                                                             may use your own aliases or the table/
+                                                             relation names (normalized to the
+                                                             target/source aliases delta_rs uses)
     update … from / delete … using / multi-stmt              NOT handled here — the connection API
                                                              (session.sql) rejects them with a clear
                                                              error; the dbt path never emits them.
@@ -247,6 +248,90 @@ def _split_relation(rel: str) -> Tuple[Optional[str], Optional[str]]:
     identifier = parts[-1]
     schema = parts[-2] if len(parts) >= 2 else None
     return schema, identifier
+
+
+def _lead_alias(text: str) -> Optional[str]:
+    """The optional ``[AS] <alias>`` on a MERGE target (the text between the table and USING)."""
+    s = re.sub(r"(?i)^as\s+", "", text.strip())
+    am = re.match(r'"([^"]+)"|(\w+)', s)
+    if not am:
+        return None
+    return am.group(1) if am.group(1) is not None else am.group(2)
+
+
+def _source_primary_and_alias(operand: str) -> Tuple[Optional[str], Optional[str]]:
+    """``(primary_identifier, alias)`` for a MERGE USING operand ``<primary> [AS] <alias> [(cols)]``.
+
+    ``primary_identifier`` is the unquoted last part of a bare/dotted/quoted relation name (so
+    ``USING other ON … = other.id`` resolves), or None when the primary is a ``(subquery)``. The
+    trailing alias (after an optional ``AS``, before any column-rename list) is returned when present.
+    """
+    s = operand.strip()
+    if not s:
+        return None, None
+    primary_ident = None
+    if s[0] in "([":  # subquery primary — skip to its matching close, tracking quotes/nesting
+        depth, i, n, quote = 0, 0, len(s), None
+        while i < n:
+            ch = s[i]
+            if quote:
+                if ch == quote:
+                    quote = None
+            elif ch in ("'", '"'):
+                quote = ch
+            elif ch in "([":
+                depth += 1
+            elif ch in ")]":
+                depth -= 1
+                if depth == 0:
+                    i += 1
+                    break
+            i += 1
+        rest = s[i:].strip()
+    else:  # relation-name primary — read the (dotted/quoted) name, the remainder is the alias part
+        m = re.match(r'(?:"[^"]+"|\w+)(?:\.(?:"[^"]+"|\w+))*', s)
+        primary_ident = _split_relation(m.group(0))[1] if m else None
+        rest = s[m.end():].strip() if m else ""
+    rest = re.sub(r"(?i)^as\s+", "", rest)
+    am = re.match(r'"([^"]+)"|(\w+)', rest)
+    alias = None
+    if am:
+        alias = am.group(1) if am.group(1) is not None else am.group(2)
+    return primary_ident, alias
+
+
+_QUALIFIER = re.compile(r"(\w+)\s*\.")
+
+
+def _rewrite_qualifiers(s: str, mapping) -> str:
+    """Replace each ``<alias>.`` qualifier whose (lower-cased) identifier is in ``mapping`` with
+    ``<canonical>.``, leaving string literals, quoted identifiers, and unrelated tokens untouched.
+    Used to normalize user-chosen MERGE aliases to the canonical ``target``/``source`` names."""
+    out, i, n, quote = [], 0, len(s), None
+    while i < n:
+        ch = s[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if not (i and (s[i - 1].isalnum() or s[i - 1] == "_")):  # only at an identifier boundary
+            m = _QUALIFIER.match(s, i)
+            if m:
+                canon = mapping.get(m.group(1).lower())
+                if canon:
+                    out.append(canon + ".")
+                    i = m.end()
+                    continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 def _split_top_level_commas(s: str) -> List[str]:
@@ -602,8 +687,9 @@ class _DeltaDML:
     def _merge(self, m, rel, schema, loc) -> None:
         """Dispatch a raw SQL MERGE to ``engine.merge_delta`` — the same engine call, snapshot pin,
         and supported boundary as the DataFrame ``DeltaTable.merge`` builder. The ON condition and
-        WHEN clauses must use the literal ``target``/``source`` aliases (delta_rs renames the merge
-        relations to those names); any other alias raises a clear error."""
+        WHEN clauses may use the user's own aliases (``MERGE INTO t a USING s b ON a.k = b.k``) or
+        the table/relation names; these are normalized to the literal ``target``/``source`` aliases
+        delta_rs uses. Fully-unqualified columns (``ON k = k``) are ambiguous and unsupported."""
         rest = m.group("rest")
         ui = _find_top_level(rest, _M_USING)
         if ui < 0:
@@ -614,6 +700,19 @@ class _DeltaDML:
             raise ValueError("MERGE requires an ON <condition> clause")
         source_part = after_using[:oi]
         cond_clauses = after_using[oi + len("on"):]
+        # Normalize whatever aliases the user wrote to the canonical target/source the engine uses.
+        # The target may be referenced by its alias (`MERGE INTO t a …`) or its table name; the
+        # source by its alias or, for a bare relation, its name. Literal target/source always work
+        # (backward compatible). delta_rs renames the relations to target/source itself, so this only
+        # has to fix the ON/WHEN qualifiers — source_part is evaluated verbatim and left alone.
+        talias = _lead_alias(rest[:ui])
+        src_primary, salias = _source_primary_and_alias(source_part)
+        mapping = {"target": "target", "source": "source"}
+        mapping[(talias or _split_relation(rel)[1] or "target").lower()] = "target"
+        sq = salias or src_primary
+        if sq:
+            mapping[sq.lower()] = "source"
+        cond_clauses = _rewrite_qualifiers(cond_clauses, mapping)
         whens = _find_all_top_level(cond_clauses, _M_WHEN)
         if not whens:
             raise ValueError("MERGE requires at least one WHEN clause")
