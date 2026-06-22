@@ -8,12 +8,15 @@ DuckDB's fancy SQL (QUALIFY, PIVOT, ROLLUP, LIST/STRUCT, ASOF JOIN) and closes w
 scorecard. ``test_coffee.py`` already covers the DataFrame-style builder API on generated data; this is
 the SQL-first, real-data counterpart.
 
-The demo is split in two parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql``.
+The demo is split in three parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql``.
 **Part 2** switches to the DataFrame API on the same connection — the ``DataFrameWriter`` writing Delta by
 **path** (``.mode("overwrite"/"append").save(path)``, read back with ``conn.read.format("delta").load(path)``), closing
 with a **concurrent MERGE clash** staged through the DataFrame ``DeltaTable.merge`` builder (``conn.sql``
 rejects ``MERGE`` on purpose) — two writers pinned to one snapshot, the stale one refused with
-``CommitFailedError``, proving snapshot isolation.
+``CommitFailedError``, proving snapshot isolation. **Part 3** is **multi-catalog**: ``conn.attach`` brings a
+*second* lakehouse in as a named catalog (here a local scratch dir alongside the warehouse — they can be on
+different storage), then a single ``conn.sql`` JOINs a table in the primary catalog with one in the attached
+catalog, addressing them as ``catalog.schema.table``.
 
 Heavy read+compute runs in-engine over the *full* month (millions of rows, local CPU); only a
 bounded **sample** plus compact marts are written over the network to OneLake, so the network is not
@@ -36,6 +39,7 @@ Knobs (all env-overridable):
 import html
 import os
 import sys
+import tempfile
 import textwrap
 import time
 from contextlib import contextmanager
@@ -241,8 +245,9 @@ def _page_html(scorecard, body, caption, ok):
   <a class="back" href="index.html">← duckrun docs</a>
   <h1>the connection API — SQL &amp; DataFrame<span class="tag">not a dbt project</span></h1>
   <p class="lede">{html.escape(caption)}. Part 1 runs raw SQL through <code>conn.sql(...)</code>; Part 2 uses
-  the <code>DataFrameWriter</code>/<code>DeltaTable</code> API to write by path — both against live
-  NYC&nbsp;TLC data, landing real Delta, top to bottom.</p>
+  the <code>DataFrameWriter</code>/<code>DeltaTable</code> API to write by path; Part 3 attaches a second
+  lakehouse with <code>conn.attach</code> and JOINs across catalogs — all against live NYC&nbsp;TLC data,
+  landing real Delta, top to bottom.</p>
   <h2 style="margin-bottom:0.2rem">Run scorecard — <span style="font-weight:400">{verdict}</span></h2>
   {scorecard}
   {body}
@@ -551,6 +556,87 @@ def run_taxi_demo(conn, schema):
                             clashed and final_avg == 100.0, time.perf_counter() - t0))
         say(f"snapshot isolation held: zone {busiest} avg = {final_avg} (writer A won); "
             f"writer B refused — {errline.split(':')[-1].strip() or 'CommitFailedError'}")
+
+    _part("Part 3 · multi-catalog — attach a second lakehouse and query across both",
+          "conn.attach(path, name=…) brings a second lakehouse in as a named catalog, addressed as "
+          "catalog.schema.table. Catalogs can sit on DIFFERENT storage — here the primary warehouse "
+          "plus a local scratch lakehouse — and one SQL statement can JOIN across them.")
+
+    # 15 ── attach a second lakehouse as a named catalog ────────────────────────────────────────────
+    with _step(15, "conn.attach(path, name='scratch'): bring a second lakehouse in as a catalog") as say:
+        scratch_path = tempfile.mkdtemp(prefix="duckrun_scratch_")
+        primary = conn.catalog.currentCatalog()
+        _emit('  <pre class="py"># a second lakehouse root becomes a named catalog (could be another\n'
+              '# OneLake lakehouse, an S3 bucket, … — here a local scratch dir):\n'
+              'conn.attach(scratch_path, name="scratch")\n'
+              'conn.catalog.listCatalogs()      # [primary, "scratch"]\n'
+              'conn.catalog.currentCatalog()    # still the primary — attach does NOT switch</pre>')
+        conn.attach(scratch_path, name="scratch")
+        _table([(c, "primary (current)" if c == primary else "attached") for c in conn.catalog.listCatalogs()],
+               ["catalog", "role"], "  attached catalogs (each is its own lakehouse root)")
+        say(f"attached '{_trim_loc(scratch_path)}' as catalog 'scratch'; current catalog is still '{primary}'")
+
+    # 16 ── cross-catalog write: saveAsTable into the SCRATCH catalog by 3-part name ─────────────────
+    with _step(16, "cross-catalog write: df.write.saveAsTable('scratch.dbo.borough_targets') — lands "
+                   "under the SCRATCH root, not the primary") as say:
+        t0 = time.perf_counter()
+        _emit('  <pre class="py"># a 3-part name routes the write to THAT catalog\'s storage root:\n'
+              'targets = conn.sql("SELECT borough, round(sum(revenue) * 1.1, 0) AS target_rev "\n'
+              '                   "FROM mart_zone_revenue GROUP BY borough")\n'
+              'targets.write.mode("overwrite").saveAsTable("scratch.dbo.borough_targets")\n'
+              'DeltaTable.forName(conn, "scratch.dbo.borough_targets").path   # under the scratch root</pre>')
+        targets = conn.sql("SELECT borough, round(sum(revenue) * 1.1, 0) AS target_rev "
+                           "FROM mart_zone_revenue GROUP BY borough")
+        targets.write.mode("overwrite").saveAsTable("scratch.dbo.borough_targets")
+        n_tgt = q("SELECT count(*) FROM scratch.dbo.borough_targets")
+        landed = DeltaTable.forName(conn, "scratch.dbo.borough_targets").path.replace("\\", "/")
+        in_scratch = scratch_path.replace("\\", "/") in landed
+        results.append(_row("Cross-catalog write (scratch)", 0, n_tgt, n_tgt, n_tgt > 0, in_scratch,
+                            time.perf_counter() - t0))
+        say(f"{n_tgt} rows written under the scratch root ({_trim_loc(landed)}) — "
+            f"physically separate from the primary catalog")
+
+    # 17 ── the payoff: ONE query joining a PRIMARY table with a SCRATCH table ───────────────────────
+    with _step(17, "cross-catalog JOIN: actuals (primary catalog) ⋈ targets (scratch catalog) in one conn.sql") as say:
+        rows = _sql(conn, """
+            SELECT m.borough,
+                   round(sum(m.revenue), 0)                              AS actual_rev,
+                   any_value(t.target_rev)                               AS target_rev,
+                   round(100.0 * sum(m.revenue) / any_value(t.target_rev), 1) AS pct_of_target
+            FROM mart_zone_revenue m
+            JOIN scratch.dbo.borough_targets t ON t.borough = m.borough
+            GROUP BY m.borough ORDER BY actual_rev DESC
+        """).collect()
+        _table([(b, f"{a:,.0f}", f"{tg:,.0f}", f"{pct}%") for b, a, tg, pct in rows],
+               ["borough", "actual $", "target $", "% of target"],
+               "  actuals (primary catalog) joined to targets (scratch catalog) in a single query")
+        say(f"one SQL statement joined {len(rows)} boroughs across two lakehouses on different storage")
+
+    # 18 ── switch the current catalog, and the fail-loud safety rails ───────────────────────────────
+    with _step(18, "catalog.setCurrentCatalog('scratch'): unqualified names resolve there; then the guards") as say:
+        _emit('  <pre class="py">conn.catalog.setCurrentCatalog("scratch")\n'
+              'conn.sql("SELECT count(*) FROM borough_targets")   # unqualified → scratch.dbo\n'
+              'conn.catalog.setCurrentCatalog(primary)            # back to the warehouse\n'
+              '# fail-loud rails (both raise — no state change):\n'
+              'conn.attach(scratch_path, name="dup")              # one URL ↔ one name\n'
+              'conn.sql("INSERT INTO scratch.dbo.borough_targets VALUES (\'Z\', 0)")  # cross-catalog raw DML</pre>')
+        conn.catalog.setCurrentCatalog("scratch")
+        unq = q("SELECT count(*) FROM borough_targets")           # resolves in scratch.dbo now
+        switched = conn.catalog.currentCatalog()
+        conn.catalog.setCurrentCatalog(primary)
+        guards = []
+        try:
+            conn.attach(scratch_path, name="dup")                # same URL → refused
+        except ValueError:
+            guards.append("re-attaching the same URL → refused")
+        try:
+            conn.sql("INSERT INTO scratch.dbo.borough_targets VALUES ('Z', 0)")  # other catalog → refused
+        except ValueError:
+            guards.append("raw DML against another catalog → refused")
+        _table([(g,) for g in guards], ["fail-loud guard (raised as designed)"],
+               "  one URL ↔ one name; raw DML stays in the current catalog")
+        say(f"unqualified name resolved in '{switched}' ({unq} rows); switched back to '{primary}'; "
+            f"{len(guards)} safety rails held")
 
     _scorecard(results)
 

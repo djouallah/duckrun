@@ -142,18 +142,23 @@ class DeltaTable:
     """A handle to a Delta table for merging. Build with :meth:`forName` or :meth:`forPath`."""
 
     def __init__(self, session, path: str, schema: Optional[str] = None,
-                 table: Optional[str] = None):
+                 table: Optional[str] = None, catalog: Optional[str] = None,
+                 storage_options=None):
         self._session = session
         self.path = path
-        self.storage_options = session.storage_options
+        # forName resolves the target catalog's storage_options; forPath / forName-in-current-catalog
+        # fall back to the current catalog's (the session.storage_options property).
+        self.storage_options = storage_options if storage_options is not None else session.storage_options
         self.compaction_threshold = session.compaction_threshold
         self._schema = schema
         self._table = table
+        self._catalog = catalog
 
     @classmethod
     def forName(cls, session, name: str) -> "DeltaTable":
-        schema, table = session._resolve(name)
-        return cls(session, session._table_path(schema, table), schema, table)
+        catalog, schema, table = session._resolve(name)
+        return cls(session, session._table_path(schema, table, catalog), schema, table,
+                   catalog, session._catalog_storage_options(catalog))
 
     @classmethod
     def forPath(cls, session, path: str) -> "DeltaTable":
@@ -200,4 +205,5 @@ class DeltaTable:
     def _refresh_view(self):
         # Only a forName() table maps to a registered view; forPath() has no name to refresh.
         if self._schema is not None and self._table is not None:
-            self._session._register_view(self._schema, self._table)
+            catalog = self._catalog or self._session._current_catalog
+            self._session._register_view(catalog, self._schema, self._table)

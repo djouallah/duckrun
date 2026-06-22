@@ -9,7 +9,9 @@ It is storage-neutral — local path, ``s3://``, ``gs://``, ``az://``, OneLake `
 every storage concern (token → secret, table discovery, the Delta write path) is delegated to the
 ``dbt.adapters.duckrun`` modules that already handle all of them. This module is glue.
 """
+import os
 import re
+from collections import namedtuple
 from typing import Dict, List, Optional
 
 import duckdb
@@ -203,48 +205,181 @@ def _split_root_schema(path: str, schema: Optional[str]):
     return p, None
 
 
+# One attached lakehouse root = one DuckDB catalog. The primary (from connect) is the first entry;
+# attach() adds more. `schema_filter` mirrors connect's `schema=` (restrict discovery to one schema).
+_CatEntry = namedtuple("_CatEntry", ["name", "root_path", "storage_options", "schema_filter"])
+
+
+def _derive_catalog_name(root_path: str) -> Optional[str]:
+    """A catalog identifier from a lakehouse root's last readable segment — strips a trailing
+    ``…/Tables`` and a ``.Lakehouse`` suffix, sanitizes to SQL-identifier chars. Returns ``None`` for
+    a GUID-only or empty segment (the caller must require an explicit ``name=``)."""
+    p = root_path.replace("\\", "/").rstrip("/")
+    idx = p.lower().rfind("/tables")
+    if idx != -1:
+        p = p[:idx]
+    seg = p.rstrip("/").rsplit("/", 1)[-1]
+    if "@" in seg:  # abfss container@host with no further path — take the container
+        seg = seg.split("@", 1)[0]
+    if seg.lower().endswith(".lakehouse"):
+        seg = seg[: -len(".lakehouse")]
+    seg = seg.strip()
+    if not seg or _GUID.match(seg):
+        return None
+    sanitized = re.sub(r"[^0-9A-Za-z_]", "_", seg).strip("_")
+    return sanitized or None
+
+
+def _secret_name(catalog_name: str) -> str:
+    """A stable DuckDB secret name for an attached catalog's scoped Azure token."""
+    return "duckrun_cat_" + re.sub(r"[^0-9A-Za-z_]", "_", catalog_name)
+
+
+def _mint_scoped_secret(con, secret_name: str, root: str, storage_options) -> bool:
+    """Mint a path-**scoped** DuckDB Azure secret for an attached OneLake catalog, so two different
+    bearer tokens (one per workspace) coexist in one connection — DuckDB picks the longest-matching
+    scope, so each catalog's reads use its own token. No-op (False) when there's no token."""
+    token = secret.bearer_token(storage_options)
+    if not token:
+        return False
+    con.execute("INSTALL azure; LOAD azure;")
+    transport = os.environ.get("AZURE_TRANSPORT_OPTION_TYPE")
+    if transport:
+        con.execute(f"SET GLOBAL azure_transport_option_type = '{transport.replace(chr(39), chr(39) * 2)}'")
+    token_sql = token.replace("'", "''")
+    scope_sql = str(root).replace("'", "''")
+    con.execute(
+        f"CREATE OR REPLACE SECRET {secret_name} "
+        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}', SCOPE '{scope_sql}')"
+    )
+    return True
+
+
+# DML target-relation matcher (verb → relation), used only to detect a 3-part cross-catalog target.
+_DML_REL = re.compile(
+    r"^(?:insert\s+into|delete\s+from|update|alter\s+table|drop\s+table(?:\s+if\s+exists)?|"
+    r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?)\s+(?P<rel>[\w.\"]+)",
+    re.IGNORECASE,
+)
+
+
+def _dml_target_catalog(query: str) -> Optional[str]:
+    """The leading catalog token of a DML statement's target when it's 3-part
+    (``catalog.schema.table``), else ``None``. Lets ``sql()`` reject cross-catalog raw DML."""
+    s = _strip_leading(query)
+    _, body = delta_dml._split_leading_with(s)  # peel a leading WITH so the verb is visible
+    m = _DML_REL.match(_strip_leading(body))
+    if not m:
+        return None
+    parts = [p.strip().strip('"') for p in m.group("rel").split(".")]
+    return parts[0] if len(parts) >= 3 else None
+
+
 class DuckSession:
-    """A session handle bound to one Delta lakehouse root."""
+    """A session handle bound to one or more Delta lakehouse roots, each surfaced as a catalog."""
 
     def __init__(self, path: str, storage_options: Optional[Dict[str, str]],
                  schema: Optional[str], compaction_threshold: int, read_only: bool = True):
-        self.root_path, self._schema = _split_root_schema(path, schema)
-        self.storage_options = dict(storage_options) if storage_options else None
         self.compaction_threshold = compaction_threshold
         self.read_only = read_only
 
-        # OneLake with no caller-supplied token: acquire one (Fabric / env / azure-identity) so
-        # both the DuckDB read secret and delta-rs writes can authenticate.
-        if remote.is_abfss(self.root_path) and not secret.bearer_token(self.storage_options):
-            self.storage_options = dict(self.storage_options or {})
-            self.storage_options["bearer_token"] = auth.get_onelake_token()
-
         self.con = duckdb.connect()
         engine.configure_duckdb_session(self.con)
-        # abfss:// / az:// reads need the DuckDB Azure secret minted before any delta_scan/glob.
-        # No-op when there's no bearer token (e.g. local / s3 / gcs use env / DuckDB secrets).
-        try:
-            secret.ensure_azure_secret(self.con, self.storage_options)
-        except Exception as exc:  # surfaced, not swallowed as "no tables" later
-            print(f"⚠️  could not mint OneLake secret: {exc}")
 
+        # The catalog registry: name -> _CatEntry. The primary (from connect) is the first entry;
+        # attach() adds more. root_path / storage_options stay readable as properties that return the
+        # *current* catalog's values, so existing single-catalog callers keep working unchanged.
+        self._catalogs: Dict[str, _CatEntry] = {}
+        self._current_catalog: Optional[str] = None
+        self._current_database: Optional[str] = None
         self.catalog = Catalog(self)
-        self._current_database = None
-        self.refresh()
+
+        root, schema_filter = _split_root_schema(path, schema)
+        # The primary catalog is never named by the caller (single-lakehouse users never type a
+        # catalog name), so a GUID-only OneLake root is fine here — fall back to a neutral name.
+        name = _derive_catalog_name(root) or "lakehouse"
+        self._attach_catalog(name, root, storage_options, schema_filter, primary=True, quiet=False)
+
+    # ---- catalog registry ------------------------------------------------------------------
+
+    @property
+    def root_path(self) -> str:
+        """The current catalog's lakehouse root (back-compat for single-catalog callers)."""
+        return self._catalogs[self._current_catalog].root_path
+
+    @property
+    def storage_options(self) -> Optional[Dict[str, str]]:
+        """The current catalog's storage_options (back-compat for single-catalog callers)."""
+        return self._catalogs[self._current_catalog].storage_options
+
+    def _attach_catalog(self, name: str, root: str, storage_options, schema_filter,
+                        primary: bool = False, quiet: bool = True):
+        """Register a lakehouse root as a named DuckDB catalog, mint its read secret, discover its
+        tables. The primary keeps the original unscoped OneLake secret; attached catalogs get a
+        path-scoped secret so two different OneLake tokens can coexist in one connection."""
+        root = root.replace("\\", "/").rstrip("/")
+        so = dict(storage_options) if storage_options else None
+        # OneLake with no caller-supplied token: acquire one (Fabric / env / azure-identity) so both
+        # the DuckDB read secret and delta-rs writes can authenticate.
+        if remote.is_abfss(root) and not secret.bearer_token(so):
+            so = dict(so or {})
+            so["bearer_token"] = auth.get_onelake_token()
+        # The Azure secret must be minted before any delta_scan/glob. No-op without a bearer token.
+        try:
+            if primary:
+                secret.ensure_azure_secret(self.con, so)
+            else:
+                _mint_scoped_secret(self.con, _secret_name(name), root, so)
+        except Exception as exc:  # surfaced, not swallowed as "no tables" later
+            print(f"⚠️  could not mint OneLake secret for catalog '{name}': {exc}")
+
+        self.con.execute(f"ATTACH ':memory:' AS {_qid(name)}")
+        self._catalogs[name] = _CatEntry(name, root, so, schema_filter)
+        if primary:
+            self._current_catalog = name
+        self._refresh_catalog(name, quiet=quiet)
+
+    def attach(self, path: str, name: Optional[str] = None,
+               storage_options: Optional[Dict[str, str]] = None,
+               schema: Optional[str] = None) -> "DuckSession":
+        """Attach a second+ lakehouse as a named catalog, so ``catalog.schema.table`` resolves across
+        lakehouses.
+
+        ``name`` is derived from a friendly path when omitted, but is **mandatory** for a GUID-only
+        OneLake path (raises, since there is no readable name to derive). The mapping is bijective:
+        re-attaching a URL (under any name), or reusing a name, raises. ``schema`` restricts discovery
+        to a single schema, exactly as in :func:`connect`. Returns ``self`` so it chains.
+        """
+        root, schema_filter = _split_root_schema(path, schema)
+        root = root.replace("\\", "/").rstrip("/")
+        if name is None:
+            name = _derive_catalog_name(root)
+            if name is None:
+                raise ValueError(
+                    f"could not derive a catalog name from '{path}' (a GUID-only OneLake path has no "
+                    f"readable name); pass name= explicitly, e.g. conn.attach(path, name='sales')."
+                )
+        if name in self._catalogs:
+            raise ValueError(f"catalog name '{name}' is already attached; choose another name.")
+        for entry in self._catalogs.values():
+            if entry.root_path == root:
+                raise ValueError(f"that lakehouse is already attached as catalog '{entry.name}'.")
+        self._attach_catalog(name, root, storage_options, schema_filter, primary=False, quiet=False)
+        return self
 
     # ---- discovery -------------------------------------------------------------------------
 
-    def _list_tables(self, schema: str) -> List[str]:
-        if remote.is_abfss(self.root_path):
-            return remote.list_delta_tables(self.root_path, str(schema), self.storage_options)
-        return remote.list_delta_tables_via_glob(self.con, self.root_path, str(schema))
+    def _list_tables(self, root: str, schema: str, so) -> List[str]:
+        if remote.is_abfss(root):
+            return remote.list_delta_tables(root, str(schema), so)
+        return remote.list_delta_tables_via_glob(self.con, root, str(schema))
 
-    def _list_schemas(self) -> List[str]:
-        if remote.is_abfss(self.root_path):
+    def _list_schemas(self, root: str, so) -> List[str]:
+        if remote.is_abfss(root):
             # Immediate sub-directories under the root (…/Tables) are the schema folders.
-            return remote.list_delta_tables(self.root_path, "", self.storage_options)
+            return remote.list_delta_tables(root, "", so)
         # Local / s3 / gcs / az: glob two levels deep and collect the schema segment.
-        pattern = _qlit(self.root_path.rstrip("/") + "/*/*/_delta_log/*.json")
+        pattern = _qlit(root.rstrip("/") + "/*/*/_delta_log/*.json")
         try:
             rows = self.con.execute(f"SELECT DISTINCT file FROM glob('{pattern}')").fetchall()
         except Exception:
@@ -262,47 +397,58 @@ class DuckSession:
                 schemas.append(parts[-2])
         return schemas
 
-    def refresh(self, quiet: bool = False):
-        """Re-discover the Delta tables and (re)register them as ``delta_scan`` views.
+    def refresh(self, quiet: bool = False, catalog: Optional[str] = None):
+        """Re-discover Delta tables and (re)register their ``delta_scan`` views.
 
-        Call after writing tables out-of-band (or from another process) to surface them.
-        Pass ``quiet=True`` to skip the connection banner (used by the catalog existence checks,
-        which refresh on every call).
+        Refreshes every attached catalog by default; pass ``catalog=`` to refresh just one. Call
+        after writing tables out-of-band (or from another process) to surface them. ``quiet=True``
+        skips the per-catalog banner (used by the catalog existence checks, which refresh on every
+        call).
         """
-        if self._schema is not None:
-            mapping = {self._schema: self._list_tables(self._schema)}
+        names = [catalog] if catalog is not None else list(self._catalogs)
+        for name in names:
+            self._refresh_catalog(name, quiet=quiet)
+        return self
+
+    def _refresh_catalog(self, name: str, quiet: bool = True):
+        entry = self._catalogs[name]
+        root, so = entry.root_path, entry.storage_options
+        if entry.schema_filter is not None:
+            mapping = {entry.schema_filter: self._list_tables(root, entry.schema_filter, so)}
         else:
-            mapping = {s: self._list_tables(s) for s in self._list_schemas()}
+            mapping = {s: self._list_tables(root, s, so) for s in self._list_schemas(root, so)}
 
         registered = []
         for schema, tables in mapping.items():
             if not tables:
                 continue
-            self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(schema)}")
+            self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(name)}.{_qid(schema)}")
             for table in tables:
                 # Hide drop-tombstones (a `drop table` overwrites the table to a one-column marker;
                 # no data is deleted, the files persist, but the table must not surface).
-                if delta_dml.is_dropped(self.con, self._table_path(schema, table), self.storage_options):
+                if delta_dml.is_dropped(self.con, f"{root}/{schema}/{table}", so):
                     continue
-                self._register_view(schema, table)
+                self._register_view(name, schema, table)
                 registered.append(f"{schema}.{table}")
 
         schemas = list(mapping.keys())
-        if self._current_database is None:
+        if name == self._current_catalog and self._current_database is None:
             self._current_database = "dbo" if "dbo" in schemas else (schemas[0] if schemas else "dbo")
-        self._set_search_path(self._current_database)
+        if name == self._current_catalog:
+            self._use(self._current_catalog, self._current_database)
 
         if not quiet:
-            lh = self.root_path.rstrip("/").rsplit("/", 1)[-1]
-            print(f"🔌 Connected to {lh} — discovered {len(registered)} table(s)"
+            lh = root.rstrip("/").rsplit("/", 1)[-1]
+            print(f"🔌 Connected to {lh} (catalog '{name}') — discovered {len(registered)} table(s)"
                   + (": " + ", ".join(registered) if registered else ""))
-        return self
+        return registered
 
-    def _register_view(self, schema: str, table: str):
-        path = f"{self.root_path.rstrip('/')}/{schema}/{table}"
+    def _register_view(self, catalog: str, schema: str, table: str):
+        entry = self._catalogs[catalog]
+        path = f"{entry.root_path}/{schema}/{table}"
         try:
             self.con.execute(
-                f"CREATE OR REPLACE VIEW {_qid(schema)}.{_qid(table)} AS "
+                f"CREATE OR REPLACE VIEW {_qid(catalog)}.{_qid(schema)}.{_qid(table)} AS "
                 f"SELECT * FROM delta_scan('{_qlit(path)}')"
             )
         except Exception as exc:
@@ -310,28 +456,48 @@ class DuckSession:
             # e.g. the OneLake "No files in log segment" delta-kernel bug), but drop DuckDB's echo
             # of the CREATE VIEW statement *we* generated, and say which table/path it was. Suppress
             # the chained original (`from None`) so the noisy SQL echo doesn't reappear in tracebacks.
-            hint = _onelake_guid_hint(self.root_path)
+            hint = _onelake_guid_hint(entry.root_path)
             raise RuntimeError(
-                f"duckrun: could not read Delta table {schema}.{table} at '{path}':\n"
+                f"duckrun: could not read Delta table {catalog}.{schema}.{table} at '{path}':\n"
                 f"{_strip_query_context(str(exc))}"
                 + (f"\n\n{hint}" if hint else "")
             ) from None
 
-    def _set_search_path(self, schema: str):
+    def _use(self, catalog: str, schema: Optional[str]):
+        """Switch DuckDB's current catalog (and schema, when present) so unqualified and 2-part
+        names resolve in the current catalog. A missing/empty schema shouldn't abort connect."""
         try:
-            self.con.execute(f"SET search_path = {_qid(schema)}")
+            if schema:
+                self.con.execute(f"USE {_qid(catalog)}.{_qid(schema)}")
+            else:
+                self.con.execute(f"USE {_qid(catalog)}")
         except Exception:  # an empty/absent schema shouldn't abort connect
             pass
 
-    def _table_path(self, schema: str, table: str) -> str:
-        return f"{self.root_path.rstrip('/')}/{schema}/{table}"
+    def _table_path(self, schema: str, table: str, catalog: Optional[str] = None) -> str:
+        cat = catalog if catalog is not None else self._current_catalog
+        return f"{self._catalogs[cat].root_path}/{schema}/{table}"
+
+    def _catalog_storage_options(self, catalog: str):
+        return self._catalogs[catalog].storage_options
 
     def _resolve(self, name: str):
-        """Split a possibly-qualified ``db.table`` into ``(schema, table)`` using the current db."""
-        if "." in name:
-            schema, table = name.split(".", 1)
-            return schema, table
-        return self._current_database, name
+        """Split a possibly-qualified name into ``(catalog, schema, table)``.
+
+        3 parts → ``catalog.schema.table`` (the catalog must be attached); 2 parts → ``schema.table``
+        in the current catalog; 1 part → table in the current catalog + database."""
+        parts = [p.strip().strip('"') for p in name.split(".")]
+        if len(parts) >= 3:
+            catalog, schema, table = parts[-3], parts[-2], parts[-1]
+            if catalog not in self._catalogs:
+                raise ValueError(
+                    f"unknown catalog '{catalog}'; attached catalogs: {list(self._catalogs)}. "
+                    f"Attach it with conn.attach(path, name='{catalog}')."
+                )
+            return catalog, schema, table
+        if len(parts) == 2:
+            return self._current_catalog, parts[0], parts[1]
+        return self._current_catalog, self._current_database, parts[0]
 
     def _require_writable(self, op: str):
         """Raise unless this session was opened with ``read_only=False``. Guards every Delta-write
@@ -363,17 +529,30 @@ class DuckSession:
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)
+        # Raw DML routes through delta_rs against ONE root (the current catalog's); a 3-part target in
+        # another catalog can't be routed here, so reject it with a pointer rather than silently
+        # writing to the wrong root. Reads (SELECT) are unaffected — DuckDB resolves them natively.
+        target_cat = _dml_target_catalog(query)
+        if target_cat is not None and target_cat != self._current_catalog:
+            raise ValueError(
+                f"conn.sql() raw DML can't target another catalog ('{target_cat}') — it writes to the "
+                f"current catalog ('{self._current_catalog}'). Switch with "
+                f"conn.catalog.setCurrentCatalog('{target_cat}'), or use the DataFrame write API "
+                f"(df.write.saveAsTable('{target_cat}.<schema>.<table>') / "
+                f"DeltaTable.forName(conn, '{target_cat}.<schema>.<table>'))."
+            )
         if delta_dml.handle(self.con, self.root_path, self.storage_options, query,
                             default_schema=self._current_database):
-            self.refresh(quiet=True)
+            self.refresh(quiet=True, catalog=self._current_catalog)
             return DataFrame(self.con.sql("SELECT 'ok' AS status"), self)
         if _is_delta_write(query):
             raise ValueError(_delta_write_message(query))
         return DataFrame(self.con.sql(query), self)
 
     def table(self, name: str) -> "DataFrame":
-        schema, table = self._resolve(name)
-        return DataFrame(self.con.sql(f"SELECT * FROM {_qid(schema)}.{_qid(table)}"), self)
+        catalog, schema, table = self._resolve(name)
+        return DataFrame(
+            self.con.sql(f"SELECT * FROM {_qid(catalog)}.{_qid(schema)}.{_qid(table)}"), self)
 
     @property
     def read(self) -> "DataFrameReader":
@@ -563,12 +742,14 @@ class DataFrameWriter:
         self._partition_by = list(cols)
         return self
 
-    def _write(self, path: str, descr: str) -> None:
+    def _write(self, path: str, descr: str, so=None) -> None:
         """Apply the configured mode to the Delta table at ``path`` (storage-neutral). ``descr``
-        names the target in the mode='error' message. Shared by saveAsTable and save."""
+        names the target in the mode='error' message. ``so`` is the target catalog's storage_options
+        (defaults to the current catalog's). Shared by saveAsTable and save."""
         session = self._df.session
         session._require_writable("write a Delta table")
-        so = session.storage_options
+        if so is None:
+            so = session.storage_options
 
         if self._replace_where is not None:
             # df.write.option("replaceWhere", pred).mode("overwrite").save()/saveAsTable() — a single
@@ -647,16 +828,16 @@ class DataFrameWriter:
 
     def saveAsTable(self, name: str) -> str:
         session = self._df.session
-        schema, table = session._resolve(name)
-        path = session._table_path(schema, table)
-        self._write(path, f"table '{schema}.{table}'")
+        catalog, schema, table = session._resolve(name)
+        path = session._table_path(schema, table, catalog)
+        self._write(path, f"table '{catalog}.{schema}.{table}'",
+                    session._catalog_storage_options(catalog))
         # Surface the (new or grown) table immediately — no manual refresh() needed.
-        session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(schema)}")
-        session._register_view(schema, table)
-        # Re-apply the search_path: on a previously-empty warehouse the schema didn't exist at
-        # connect, so SET search_path silently no-op'd; now that it exists, unqualified names
-        # (e.g. `select * from <table>`) must resolve.
-        session._set_search_path(session._current_database)
+        session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(catalog)}.{_qid(schema)}")
+        session._register_view(catalog, schema, table)
+        # Re-apply USE: on a previously-empty warehouse the schema didn't exist at connect, so the
+        # USE silently no-op'd; now that it exists, unqualified names must resolve.
+        session._use(session._current_catalog, session._current_database)
         return table
 
     def insertInto(self, name: str, overwrite: bool = False) -> str:
@@ -666,11 +847,11 @@ class DataFrameWriter:
         Columns are matched as delta-rs appends them (by name); the configured ``mode()`` is ignored
         in favour of the insert/overwrite semantics."""
         session = self._df.session
-        schema, table = session._resolve(name)
-        path = session._table_path(schema, table)
-        if not engine.table_exists(path, session.storage_options):
+        catalog, schema, table = session._resolve(name)
+        path = session._table_path(schema, table, catalog)
+        if not engine.table_exists(path, session._catalog_storage_options(catalog)):
             raise ValueError(
-                f"insertInto target '{schema}.{table}' does not exist; create it first with "
+                f"insertInto target '{catalog}.{schema}.{table}' does not exist; create it first with "
                 f"df.write.saveAsTable('{name}')."
             )
         self._mode = "overwrite" if overwrite else "append"
@@ -683,20 +864,22 @@ class Catalog:
     def __init__(self, session: DuckSession):
         self.session = session
 
+    _SKIP_SCHEMAS = {"information_schema", "pg_catalog", "main"}
+
     def listDatabases(self) -> List[str]:
         rows = self.session.con.execute(
             "SELECT schema_name FROM information_schema.schemata "
-            "WHERE catalog_name = current_database() ORDER BY schema_name"
+            "WHERE catalog_name = ? ORDER BY schema_name",
+            [self.session._current_catalog],
         ).fetchall()
-        skip = {"information_schema", "pg_catalog", "main"}
-        return [r[0] for r in rows if r[0] not in skip]
+        return [r[0] for r in rows if r[0] not in self._SKIP_SCHEMAS]
 
     def listTables(self, dbName: Optional[str] = None) -> List[str]:
         schema = dbName or self.session._current_database
         rows = self.session.con.execute(
             "SELECT table_name FROM information_schema.tables "
-            "WHERE table_schema = ? ORDER BY table_name",
-            [schema],
+            "WHERE table_catalog = ? AND table_schema = ? ORDER BY table_name",
+            [self.session._current_catalog, schema],
         ).fetchall()
         return [r[0] for r in rows]
 
@@ -705,17 +888,17 @@ class Catalog:
 
     def setCurrentDatabase(self, dbName: str):
         self.session._current_database = dbName
-        self.session._set_search_path(dbName)
+        self.session._use(self.session._current_catalog, dbName)
 
     def tableExists(self, tableName: str, dbName: Optional[str] = None) -> bool:
         self.session.refresh(quiet=True)  # safe: reflect on-store truth, not stale views
-        schema, table = self.session._resolve(tableName)
+        catalog, schema, table = self.session._resolve(tableName)
         if dbName is not None:
             schema = dbName
         rows = self.session.con.execute(
             "SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema = ? AND table_name = ?",
-            [schema, table],
+            "WHERE table_catalog = ? AND table_schema = ? AND table_name = ?",
+            [catalog, schema, table],
         ).fetchall()
         return len(rows) > 0
 
@@ -725,21 +908,51 @@ class Catalog:
 
     def listColumns(self, tableName: str, dbName: Optional[str] = None) -> List[str]:
         self.session.refresh(quiet=True)
-        schema, table = self.session._resolve(tableName)
+        catalog, schema, table = self.session._resolve(tableName)
         if dbName is not None:
             schema = dbName
         rows = self.session.con.execute(
             "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = ? AND table_name = ? ORDER BY ordinal_position",
-            [schema, table],
+            "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? ORDER BY ordinal_position",
+            [catalog, schema, table],
         ).fetchall()
         return [r[0] for r in rows]
+
+    # ---- multi-catalog (each attached lakehouse root is a catalog) -------------------------
+
+    def listCatalogs(self) -> List[str]:
+        """The attached catalogs (the primary from ``connect`` plus any ``conn.attach``ed roots)."""
+        return list(self.session._catalogs.keys())
+
+    def currentCatalog(self) -> str:
+        return self.session._current_catalog
+
+    def setCurrentCatalog(self, catalogName: str):
+        """Make ``catalogName`` the current catalog, so unqualified / 2-part names resolve in it. The
+        current database becomes that catalog's ``dbo`` (or its first schema)."""
+        sess = self.session
+        if catalogName not in sess._catalogs:
+            raise ValueError(
+                f"unknown catalog '{catalogName}'; attached catalogs: {list(sess._catalogs)}."
+            )
+        sess._current_catalog = catalogName
+        rows = sess.con.execute(
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE catalog_name = ? ORDER BY schema_name",
+            [catalogName],
+        ).fetchall()
+        schemas = [r[0] for r in rows if r[0] not in self._SKIP_SCHEMAS]
+        sess._current_database = "dbo" if "dbo" in schemas else (schemas[0] if schemas else "dbo")
+        sess._use(catalogName, sess._current_database)
 
 
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
             schema: Optional[str] = None, compaction_threshold: int = 100,
             read_only: bool = True) -> DuckSession:
     """Open a storage-neutral, DataFrame-style session over a Delta lakehouse.
+
+    The session binds to this one lakehouse root (the primary catalog). Attach more lakehouses with
+    :meth:`DuckSession.attach` to query across them as ``catalog.schema.table``.
 
     Args:
         path: the lakehouse root, or (OneLake) ``…/Tables`` or ``…/Tables/<schema>``. Works with a

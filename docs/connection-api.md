@@ -12,6 +12,12 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   `conn.read` and `conn.catalog`.
 - a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
   `.merge(...)`, `.delete()`, `.update()`, `.version()`, `.history()`.
+- **multiple catalogs**: `connect()` binds one lakehouse root (the primary catalog); attach more with
+  `conn.attach(path, name=…)` and address them as `catalog.schema.table`. `conn.catalog.listCatalogs()`
+  / `currentCatalog()` / `setCurrentCatalog(name)` switch which catalog unqualified / 2-part names
+  resolve in. `name` is derived from a friendly path (mandatory for a GUID-only OneLake path); one URL
+  maps to one name. Raw `conn.sql()` DML targets the current catalog — cross-catalog writes go through
+  the DataFrame API (`df.write.saveAsTable("cat.schema.t")`) or `DeltaTable.forName(conn, "cat.schema.t")`.
 
 `connect()` is **read-only by default**: every Delta write (`saveAsTable` / `insertInto` / `save` /
 `merge` / `insert` / `update` / `delete` / `replaceWhere`) raises `PermissionError`, so an accidental
@@ -97,19 +103,20 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | Surface | Methods | Pass |
 | --- | --- | :-: |
 | `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
-| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns` | 8/8 ✅ |
+| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns`, `listCatalogs`, `currentCatalog`, `setCurrentCatalog` | 11/11 ✅ |
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow` | 6/6 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `versionAsOf`, `timestampAsOf_rejected` | 6/6 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 10/10 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `merge`, `version`, `history`, `delete`, `update` | 7/7 ✅ |
 
-### duckrun-specific helpers — 16/16 ✅
+### duckrun-specific helpers — 17/17 ✅
 
 > Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).
 
 | Method | Surface | Pass |
 | --- | --- | :-: |
 | `connect` | `DuckSession` | ✅ |
+| `attach` | `DuckSession` | ✅ |
 | `refresh` | `DuckSession` | ✅ |
 | `connection` | `DuckSession` | ✅ |
 | `stop` | `DuckSession` | ✅ |

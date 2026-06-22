@@ -21,6 +21,8 @@
 
 All local, network-free, serial (duckrun's write path is single-writer). No DAT, no external engine.
 """
+import os
+
 import duckdb
 import deltalake
 import pytest
@@ -95,6 +97,15 @@ class TestSession:
     def test_table_path(self, conn):
         assert conn._table_path("dbo", "src").endswith("dbo/src")
 
+    def test_attach(self, conn, tmp_path):
+        # attach a second lakehouse as a named catalog; cross-catalog read resolves catalog.schema.table.
+        other = duckrun.connect(str(tmp_path / "wh2"), schema="dbo", read_only=False)
+        other.sql("select 99 as n").write.mode("overwrite").saveAsTable("only_there")
+        other.stop()
+        assert conn.attach(str(tmp_path / "wh2"), name="sales") is conn  # chains
+        assert "sales" in conn.catalog.listCatalogs()
+        assert conn.sql("select n from sales.dbo.only_there").fetchone()[0] == 99
+
     def test_show_tables(self, conn):
         assert "src" in {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
 
@@ -131,6 +142,19 @@ class TestCatalog:
 
     def test_listColumns(self, conn):
         assert conn.catalog.listColumns("src") == ["id", "name"]
+
+    def test_listCatalogs(self, conn):
+        # single-catalog session: just the primary (named from the lakehouse path's last segment).
+        assert conn.catalog.listCatalogs() == ["wh"]
+
+    def test_currentCatalog(self, conn):
+        assert conn.catalog.currentCatalog() == "wh"
+
+    def test_setCurrentCatalog(self, conn):
+        conn.catalog.setCurrentCatalog("wh")  # the only catalog; no-op switch must hold
+        assert conn.catalog.currentCatalog() == "wh"
+        with pytest.raises(ValueError):
+            conn.catalog.setCurrentCatalog("ghost")  # unknown catalog → fail loud
 
 
 class TestDataFrame:
@@ -960,3 +984,115 @@ def test_with_prefixed_update_parked(tmp_path):
     c = _seed(str(tmp_path / "wh"))
     c.sql("with bump as (select 1 id) update items set name = 'Z' where id in (select id from bump)")
     assert c.sql("select name from items where id = 1").fetchone()[0] == "Z"
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# Multi-catalog — attach a second+ lakehouse root as a named DuckDB catalog (catalog.schema.table).
+# Each catalog is its own lakehouse root; storage-neutral, so the local-fs run is representative of
+# OneLake (only the secret/discovery backend differs). The genuine mixed local+abfss case is the
+# WAREHOUSE_PATH-gated test at the bottom.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+def _two_lakehouses(tmp_path):
+    """connect(A) + attach(B, name='other'); A has dbo.t1, B has dbo.t2 + sales.s. Returns the conn."""
+    a, b = str(tmp_path / "lhA"), str(tmp_path / "lhB")
+    _write_table(a + "/dbo/t1", "select * from (values (1,'a'),(2,'b')) t(id, name)")
+    _write_table(b + "/dbo/t2", "select 7 as n")
+    _write_table(b + "/sales/s", "select 'x' as label")
+    conn = duckrun.connect(a, read_only=False)
+    conn.attach(b, name="other")
+    return conn
+
+
+def test_multi_catalog_cross_query(tmp_path):
+    conn = _two_lakehouses(tmp_path)
+    assert conn.catalog.listCatalogs() == ["lhA", "other"]
+    assert conn.catalog.currentCatalog() == "lhA"
+    # cross-catalog read resolves catalog.schema.table across the two lakehouse roots.
+    assert conn.sql("select n from other.dbo.t2").fetchone()[0] == 7
+    assert conn.sql("select label from other.sales.s").fetchone()[0] == "x"
+    # 2-part / unqualified still resolve in the CURRENT catalog (lhA), not the attached one.
+    assert conn.sql("select count(*) from dbo.t1").fetchone()[0] == 2
+    assert conn.sql("select count(*) from t1").fetchone()[0] == 2  # via USE lhA.dbo
+
+
+def test_multi_catalog_set_current(tmp_path):
+    conn = _two_lakehouses(tmp_path)
+    conn.catalog.setCurrentCatalog("other")
+    assert conn.catalog.currentCatalog() == "other"
+    assert conn.catalog.currentDatabase() == "dbo"          # picks dbo when present
+    assert conn.sql("select n from t2").fetchone()[0] == 7   # unqualified now resolves in 'other'
+    assert set(conn.catalog.listDatabases()) == {"dbo", "sales"}  # other's schemas, not lhA's
+    assert conn.catalog.listTables() == ["t2"]              # current catalog (other) + db (dbo)
+
+
+def test_multi_catalog_write_lands_in_right_root(tmp_path):
+    conn = _two_lakehouses(tmp_path)
+    # a cross-catalog DataFrame write must land under the ATTACHED root (lhB), not the primary (lhA).
+    conn.sql("select 1 as id, 'z' as v").write.mode("overwrite").saveAsTable("other.dbo.created")
+    assert deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhB" / "dbo" / "created"))
+    assert not deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhA" / "dbo" / "created"))
+    assert conn.sql("select v from other.dbo.created").fetchone()[0] == "z"
+    # and the DeltaTable handle resolves the attached catalog's path + storage_options.
+    dt = DeltaTable.forName(conn, "other.dbo.created")
+    assert dt.path.replace("\\", "/").endswith("lhB/dbo/created")
+
+
+def test_multi_catalog_bijective_guards(tmp_path):
+    conn = _two_lakehouses(tmp_path)
+    b = str(tmp_path / "lhB")
+    with pytest.raises(ValueError, match="already attached"):       # name taken
+        conn.attach(b, name="other")
+    with pytest.raises(ValueError, match="already attached as"):    # same URL, any name
+        conn.attach(b, name="different")
+    guid = ("abfss://ws@onelake.dfs.fabric.microsoft.com/"
+            "22222222-2222-2222-2222-222222222222.Lakehouse/Tables/dbo")
+    with pytest.raises(ValueError, match="could not derive a catalog name"):  # GUID, no name=
+        conn.attach(guid)
+
+
+def test_attach_schema_filter_skips_discovery(tmp_path):
+    # schema= on attach restricts discovery to that one schema (no full glob) — other schemas absent.
+    a, b = str(tmp_path / "lhA"), str(tmp_path / "lhB")
+    _write_table(a + "/dbo/t1", "select 1 as id")
+    _write_table(b + "/dbo/keep", "select 1 as id")
+    _write_table(b + "/skipme/hidden", "select 1 as id")
+    conn = duckrun.connect(a, read_only=False)
+    conn.attach(b, name="other", schema="dbo")
+    conn.catalog.setCurrentCatalog("other")
+    assert conn.catalog.listDatabases() == ["dbo"]          # skipme not discovered
+    assert conn.catalog.listTables() == ["keep"]
+
+
+def test_cross_catalog_raw_dml_rejected(tmp_path):
+    # raw DML through conn.sql() targets the current catalog only; a 3-part target naming ANOTHER
+    # catalog is rejected with a pointer (it can't be routed through delta_rs's single-root path).
+    conn = _two_lakehouses(tmp_path)
+    with pytest.raises(ValueError, match="can't target another catalog"):
+        conn.sql("insert into other.dbo.t2 values (1)")
+    # but a 3-part target naming the CURRENT catalog is fine (routes to the current root).
+    conn.sql("insert into lhA.dbo.t1 values (3, 'c')")
+    assert conn.sql("select count(*) from t1").fetchone()[0] == 3
+
+
+def test_stop_closes_connection(tmp_path):
+    conn = _two_lakehouses(tmp_path)
+    conn.stop()
+    with pytest.raises(Exception):
+        conn.sql("select 1").collect()  # underlying DuckDB connection is closed
+
+
+@pytest.mark.skipif(not os.environ.get("WAREHOUSE_PATH"),
+                    reason="needs a real OneLake lakehouse (WAREHOUSE_PATH) for the mixed local+abfss case")
+def test_multi_catalog_mixed_local_and_onelake(tmp_path):
+    # The genuine mixed case: a local-filesystem primary catalog with a real abfss OneLake catalog
+    # attached alongside, queried across. Each catalog carries its own root + (scoped) token.
+    local = str(tmp_path / "lhLocal")
+    _write_table(local + "/dbo/local_t", "select 1 as id, 'local' as src")
+    conn = duckrun.connect(local, read_only=False)
+    conn.attach(os.environ["WAREHOUSE_PATH"], name="onelake")
+    assert "onelake" in conn.catalog.listCatalogs()
+    # local catalog reads through the primary (unscoped) path; the onelake catalog through its own.
+    assert conn.sql("select src from dbo.local_t").fetchone()[0] == "local"
+    conn.catalog.setCurrentCatalog("onelake")
+    assert conn.catalog.listTables() is not None  # discovery succeeded against the abfss root
+    conn.stop()

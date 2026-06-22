@@ -27,13 +27,15 @@ that says *which mapped methods actually pass their tests*; this page says *what
 
 ## Bespoke — duckrun-only, no Spark/Delta equivalent
 
-The **entire** invented surface is the three entries below — a path-based entry point and two
-runtime primitives. Everything else on this page either maps to a real Spark/delta-rs method, is a
-deliberate 🚫 omission, or is a ➖ TODO. There is nothing else masquerading as Spark.
+The **entire** invented surface is the four entries below — a path-based entry point, a multi-catalog
+attach verb, and two runtime primitives. Everything else on this page either maps to a real
+Spark/delta-rs method, is a deliberate 🚫 omission, or is a ➖ TODO. There is nothing else
+masquerading as Spark.
 
 | duckrun | what it is | why there's no Spark name |
 | --- | --- | --- |
 | `duckrun.connect(path, storage_options=…, schema=…, read_only=True)` | open a session bound to one lakehouse root, addressed by a storage **path**; **read-only by default** (`read_only=False` to write) | Spark's entry point is `SparkSession.builder…getOrCreate()` against a cluster — there's no cluster and no builder; one connection binds to one storage root, and defaults to read-only to protect a shared lakehouse |
+| `conn.attach(path, name=…, storage_options=…, schema=…)` | attach a **second+** lakehouse root as a named catalog, so `catalog.schema.table` resolves across lakehouses (powers `catalog.listCatalogs` / `setCurrentCatalog`) | Spark *configures* catalogs (metastore/Unity) at session build; there's no runtime "attach another storage root as a catalog" verb. `name` is derived from a friendly path, mandatory for a GUID-only OneLake path; one URL ↔ one name (re-attaching either raises). |
 | `conn.refresh()` | re-discover the Delta tables under the store and re-register their views | duckrun finds tables by globbing storage for `_delta_log`; Spark's metastore is authoritative, so it never needs a "rescan the store" call |
 | `write.mode("safeappend")` | fail-loud compare-and-swap append (commits only if the table version hasn't moved) | no Spark `SaveMode` for it — it's the duckrun/dbt concurrency primitive |
 
@@ -129,7 +131,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.refreshTable` | — | ➖ | TODO — per-table; `conn.refresh()` (bespoke) rediscovers the whole store. |
 | `catalog.recoverPartitions` | — | ➖ | TODO (delta-rs gap). |
 | `catalog.refreshByPath` | — | 🚫 | Path reads aren't cached — nothing to refresh. |
-| `catalog.currentCatalog` / `setCurrentCatalog` / `listCatalogs` | — | ➖ | TODO — would map each attached lakehouse root to a catalog (multi-lakehouse); single-root today. |
+| `catalog.currentCatalog` / `setCurrentCatalog` / `listCatalogs` | `catalog.currentCatalog()` / `setCurrentCatalog(name)` / `listCatalogs()` | ✅ | Each attached lakehouse root is a catalog (`catalog.schema.table`). The primary comes from `connect`; add more with `conn.attach(path, name=…)` (bespoke — see top). |
 | `catalog.functionExists` / `listFunctions` / `registerFunction` | — | 🚫 | DuckDB owns the function namespace; not a duckrun catalog concept. |
 | `catalog.dropGlobalTempView` | — | 🚫 | No global-temp namespace in duckrun. |
 
