@@ -94,7 +94,7 @@ def assert_catalog_has_delta_stats(catalog_path):
 
 def test_sde_dbt_tutorial_scd2_stateful():
     env = _env()
-    con = duckrun.connect(ROOT, storage_options=_storage_options())
+    con = duckrun.connect(ROOT, storage_options=_storage_options(), read_only=False)
 
     snap = f"{ROOT}/sde_snapshots/dim_customer"
     obt = f"{ROOT}/sde_main/orders_obt"

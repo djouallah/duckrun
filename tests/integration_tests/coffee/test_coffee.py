@@ -231,7 +231,8 @@ def test_coffee_local(tmp_path):
 )
 def test_coffee_onelake():
     """Live OneLake, small fact table — the network dominates, so keep the row count tiny."""
-    conn = duckrun.connect(WAREHOUSE_PATH, storage_options={"bearer_token": ONELAKE_TOKEN}, schema=ONELAKE_SCHEMA)
+    conn = duckrun.connect(WAREHOUSE_PATH, storage_options={"bearer_token": ONELAKE_TOKEN},
+                           schema=ONELAKE_SCHEMA, read_only=False)
     run_coffee_scenario(conn, ONELAKE_SCHEMA, ONELAKE_ROWS)
 
 

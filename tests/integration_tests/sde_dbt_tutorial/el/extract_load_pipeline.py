@@ -32,7 +32,7 @@ def _storage_options():
 
 
 def main():
-    con = duckrun.connect(ROOT, storage_options=_storage_options())
+    con = duckrun.connect(ROOT, storage_options=_storage_options(), read_only=False)
     for table, csv_name in FILES.items():
         path = os.path.join(HERE, "raw_data", csv_name).replace("\\", "/")
         df = con.read.option("all_varchar", True).option("header", True).csv(path)
