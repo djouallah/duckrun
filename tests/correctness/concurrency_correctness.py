@@ -9,7 +9,7 @@ Prints a scorecard (also to the GitHub Actions job summary). Exit 0 if every inv
 1 if any is violated — so a regression that breaks concurrency correctness blocks the PR.
 
 Three guarantees are checked here. (MERGE single-snapshot pinning — read_version →
-`load_as_version`, OCC over `(vB, HEAD]` — is proved separately in `test_snapshot_pinning.py`;
+`load_as_version`, OCC over `(vB, HEAD]` — is proved separately in `test_correctness.py`;
 merge now ALWAYS pins, there is no unpinned path to demo.)
 
 B. safeappend (pin intended). The `safeappend` incremental strategy appends only if the table
@@ -245,7 +245,7 @@ def render_console(sa_disp, mut_disp, conn_disp, safe):
         [[x["mode"], x["concurrent"], x["read"], x["head"], x["res_txt"]] for x in conn_disp])
     verdict = ("CONCURRENCY-CORRECT: safeappend refuses a moved table, plain append has no guard;\n"
                "  DELETE/UPDATE fail on a conflicting commit; conn-API safeappend refuses a moved\n"
-               "  table even when reading the same table it writes. (MERGE pinning: test_snapshot_pinning.)"
+               "  table even when reading the same table it writes. (MERGE pinning: test_correctness.)"
                if safe else
                "INVARIANT VIOLATED — a case behaved unexpectedly (see tables). Investigate.")
     return ("\n  duckrun — concurrency correctness\n\n"
@@ -260,7 +260,7 @@ def render_console(sa_disp, mut_disp, conn_disp, safe):
 def render_markdown(sa_disp, mut_disp, conn_disp, safe):
     tick = "✅" if safe else "❌"
     L = [f"## duckrun — concurrency correctness {tick}", "",
-         "> MERGE single-snapshot pinning is proved separately in `test_snapshot_pinning.py` "
+         "> MERGE single-snapshot pinning is proved separately in `test_correctness.py` "
          "(read_version → `load_as_version`, OCC over `(vB, HEAD]`).", "",
          "### B) safeappend — *append only if the version didn't move*", "",
          "| mode | concurrent write | read | head | result |",

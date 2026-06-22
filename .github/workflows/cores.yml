@@ -63,7 +63,7 @@ jobs:
           python -m pytest \
             tests/adapter \
             tests/connection_api/test_connection_api.py \
-            tests/correctness/test_snapshot_pinning.py \
+            tests/correctness/test_correctness.py \
             -q -p no:cacheprovider
 
       - name: Snapshot-pin dbt integration test (single-snapshot MERGE through a real dbt run)

@@ -18,7 +18,7 @@ WHAT DUCKRUN DOES ON EVERY INCREMENTAL RUN (see _delta_core.sql + engine.merge_d
                    the model was running, the merge REFUSES to commit (a Delta commit conflict).
 
   Together: the read and the write agree on ONE version of the table — single-snapshot MERGE
-  semantics. (The delta-rs OCC internals are unit-tested in tests/correctness/test_snapshot_pinning.py;
+  semantics. (The delta-rs OCC internals are unit-tested in tests/correctness/test_correctness.py;
   this file is the end-to-end "why it matters to a `dbt run`" layer.)
 
 WHY THAT FLIPS A RUN BETWEEN SUCCESS AND FAILURE — three real dbt runs below:
