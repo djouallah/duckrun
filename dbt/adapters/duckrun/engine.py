@@ -668,6 +668,13 @@ def table_version(path: str, storage_options: Optional[Dict[str, str]] = None) -
     return _delta_table(path, storage_options).version()
 
 
+def table_history(path: str, storage_options: Optional[Dict[str, str]] = None,
+                  limit: Optional[int] = None) -> List[Dict]:
+    """Delta commit history (delta_rs ``DeltaTable.history``) — newest first; each entry is a dict
+    with ``version``, ``timestamp``, ``operation``, etc. ``limit`` caps how many commits are read."""
+    return _delta_table(path, storage_options).history(limit)
+
+
 def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:
     """Threshold-gated upkeep shared by the append / merge / delete+insert paths: once the table
     has more than ``compaction_threshold`` files, compact small files, vacuum tombstoned old

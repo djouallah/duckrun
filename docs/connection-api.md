@@ -11,7 +11,7 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   `safeappend` / `ignore`, plus `option("replaceWhere", …)` for an atomic slice overwrite — plus
   `conn.read` and `conn.catalog`.
 - a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
-  `.merge(...)`, `.delete()`, `.update()`, `.version()`.
+  `.merge(...)`, `.delete()`, `.update()`, `.version()`, `.history()`.
 
 `connect()` is **read-only by default**: every Delta write (`saveAsTable` / `insertInto` / `save` /
 `merge` / `insert` / `update` / `delete` / `replaceWhere`) raises `PermissionError`, so an accidental

@@ -44,7 +44,9 @@ conn.sql("SHOW TABLES").show()
 conn.sql("select status, count(*) from orders group by status").show()
 df = conn.table("orders").toPandas()          # or .toArrow() for a streaming RecordBatchReader
 
-# Time travel for free
+# Time travel: list the versions, then read one
+from duckrun import DeltaTable
+DeltaTable.forName(conn, "orders").history()   # newest-first commits: version, timestamp, operation, …
 conn.read.format("delta").option("versionAsOf", 0).load(".../Tables/dbo/orders").show()
 ```
 

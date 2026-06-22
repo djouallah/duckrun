@@ -154,7 +154,7 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.delete(predicate)` | `.delete(predicate)` | ✅ | delta-rs param name (`predicate`); takes literals, not `IN (SELECT …)`. |
 | `.update(condition, set)` | `.update(condition=…, set=…)` | ✅ | delta-spark signature. |
 | `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `df.write.option("replaceWhere", pred).mode("overwrite").save()` / `.saveAsTable()` | ✅ | Single atomic commit; snapshot-fenced. |
-| `.history()` | — | ➖ | TODO — delta-rs exposes table history just fine. |
+| `.history()` | `.history(limit=None)` | ✅ | delta-rs commit history (newest-first list of dicts: `version`, `timestamp`, `operation`, …). |
 | `.vacuum()` | — | ➖ | TODO |
 | `.optimize()` | — | ➖ | TODO |
 | `.generate()` | — | ➖ | TODO |

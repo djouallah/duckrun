@@ -172,6 +172,13 @@ class DeltaTable:
         """Current Delta version of the table (``DeltaTable`` history head)."""
         return engine.table_version(self.path, self.storage_options)
 
+    def history(self, limit: Optional[int] = None) -> List[Dict]:
+        """Delta commit history (delta_rs ``DeltaTable.history``) — newest first; each entry is a
+        dict with ``version``, ``timestamp``, ``operation``, … Use it to find a version to time-travel
+        to: ``conn.read.format("delta").option("versionAsOf", N).load(path)``. ``limit`` caps the
+        number of commits read."""
+        return engine.table_history(self.path, self.storage_options, limit)
+
     def delete(self, predicate: Optional[str] = None) -> None:
         """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
         when ``predicate`` is None. ``DeltaTable.delete``."""

@@ -332,6 +332,13 @@ class TestDeltaTable:
         self._seed(conn)  # one overwrite → version 0
         assert DeltaTable.forName(conn, "dbo.m").version() == 0
 
+    def test_history(self, conn):
+        self._seed(conn)  # v0
+        conn.sql("select 9 id, 9 val").write.mode("append").saveAsTable("m")  # v1
+        hist = DeltaTable.forName(conn, "dbo.m").history()
+        assert [h["version"] for h in hist] == [1, 0]          # newest-first
+        assert DeltaTable.forName(conn, "dbo.m").history(1)[0]["version"] == 1   # limit
+
     def test_delete(self, conn):
         self._seed(conn)
         DeltaTable.forName(conn, "dbo.m").delete("id = 2")
