@@ -1039,6 +1039,13 @@ class DataFrameWriter:
         return self.saveAsTable(name)
 
 
+# Spark's catalog.getTable / getDatabase return Table / Database objects; we mirror their fields with
+# a plain namedtuple rather than inventing classes. duckrun tables are always managed Delta tables
+# materialized under the catalog root, never temporary.
+Table = namedtuple("Table", ["name", "catalog", "database", "description", "tableType", "isTemporary"])
+Database = namedtuple("Database", ["name", "catalog", "description", "locationUri"])
+
+
 class Catalog:
     """A small ``Catalog`` over the discovered schemas/views."""
 
@@ -1082,6 +1089,28 @@ class Catalog:
             [catalog, schema, table],
         ).fetchall()
         return len(rows) > 0
+
+    def getTable(self, tableName: str, dbName: Optional[str] = None) -> Table:
+        """Return a :class:`Table` record for ``tableName`` (Spark's ``catalog.getTable``), or raise
+        ``ValueError`` if it doesn't exist — the peer of :meth:`tableExists` / :meth:`listTables`.
+        duckrun tables are always managed Delta tables, never temporary."""
+        catalog, schema, table = self.session._resolve(tableName)
+        if dbName is not None:
+            schema = dbName
+        if not self.tableExists(tableName, dbName):
+            raise ValueError(f"table '{tableName}' not found in '{catalog}.{schema}'.")
+        return Table(name=table, catalog=catalog, database=schema, description=None,
+                     tableType="MANAGED", isTemporary=False)
+
+    def getDatabase(self, dbName: str) -> Database:
+        """Return a :class:`Database` record for ``dbName`` (Spark's ``catalog.getDatabase``), or
+        raise ``ValueError`` if it doesn't exist — the peer of :meth:`databaseExists` /
+        :meth:`listDatabases`. ``locationUri`` is the schema folder under the catalog root."""
+        catalog = self.session._current_catalog
+        if not self.databaseExists(dbName):
+            raise ValueError(f"database '{dbName}' not found in catalog '{catalog}'.")
+        location = f"{self.session._catalogs[catalog].root_path}/{dbName}"
+        return Database(name=dbName, catalog=catalog, description=None, locationUri=location)
 
     def databaseExists(self, dbName: str) -> bool:
         self.session.refresh(quiet=True)  # safe: re-discover schema folders first

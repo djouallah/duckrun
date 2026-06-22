@@ -123,8 +123,8 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.setCurrentDatabase(db)` | `catalog.setCurrentDatabase(db)` | ✅ | |
 | `catalog.tableExists(t, db)` | `catalog.tableExists(t, db)` | ✅ | |
 | `catalog.databaseExists(db)` | `catalog.databaseExists(db)` | ✅ | |
-| `catalog.getTable(t, db)` | — | ➖ | TODO — peer of `tableExists` / `listTables`. |
-| `catalog.getDatabase(db)` | — | ➖ | TODO — peer of `databaseExists` / `listDatabases`. |
+| `catalog.getTable(t, db)` | `catalog.getTable(t, db=None)` | ✅ | Returns a `Table` namedtuple (`name`, `catalog`, `database`, `description`, `tableType`, `isTemporary`); raises if absent. duckrun tables are always `MANAGED`, never temporary. |
+| `catalog.getDatabase(db)` | `catalog.getDatabase(db)` | ✅ | Returns a `Database` namedtuple (`name`, `catalog`, `description`, `locationUri`); raises if absent. |
 | `catalog.dropTempView(name)` | `catalog.dropTempView(name)` | ✅ | Inverse of `df.createOrReplaceTempView`; returns `True` if the view existed. |
 | `catalog.createTable` / `createExternalTable` | — | ➖ | TODO — today use `df.write.saveAsTable`. |
 | `catalog.cacheTable` / `uncacheTable` / `isCached` / `clearCache` | — | ➖ | TODO — closest is materializing a TEMP table. |

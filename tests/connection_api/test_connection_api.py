@@ -151,6 +151,21 @@ class TestCatalog:
     def test_listColumns(self, conn):
         assert conn.catalog.listColumns("src") == ["id", "name"]
 
+    def test_getTable(self, conn):
+        t = conn.catalog.getTable("src")
+        assert (t.name, t.database, t.catalog) == ("src", "dbo", "wh")
+        assert t.tableType == "MANAGED" and t.isTemporary is False
+        assert conn.catalog.getTable("other.thing").database == "other"  # qualified name
+        with pytest.raises(ValueError):
+            conn.catalog.getTable("nope")
+
+    def test_getDatabase(self, conn):
+        d = conn.catalog.getDatabase("dbo")
+        assert (d.name, d.catalog) == ("dbo", "wh")
+        assert d.locationUri.endswith("/dbo")
+        with pytest.raises(ValueError):
+            conn.catalog.getDatabase("ghost")
+
     def test_dropTempView(self, conn):
         conn.sql("select * from src").createOrReplaceTempView("tv")
         assert conn.sql("select count(*) from tv").fetchone()[0] == 3
