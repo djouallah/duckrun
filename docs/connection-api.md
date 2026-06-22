@@ -153,6 +153,6 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `delete` | `sql()` | ✅ |
 | `alter add column` | `sql()` | ✅ |
 | `drop (tombstone)` | `sql()` | ✅ |
-| `merge guard (→ builder)` | `sql()` | ✅ |
+| `merge` | `sql()` | ✅ |
 
 <!-- CONNECTION_API:END -->
