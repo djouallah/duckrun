@@ -10,9 +10,17 @@
 Works the same against a local path, ``s3://``, ``gs://``, ``az://``, or OneLake ``abfss://``.
 This is the interactive/notebook API; the dbt adapter lives under ``dbt.adapters.duckrun``.
 """
+from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
 from .session import connect, DuckSession, DataFrame
 from .delta_table import DeltaTable
 
-__version__ = "0.3.20"
+try:
+    # Single source of truth: the installed distribution's version (built from pyproject.toml).
+    # Avoids a hand-maintained string drifting from the real package version — it had: this said
+    # "0.3.20" while the published wheel was 0.3.21.
+    __version__ = _pkg_version("duckrun")
+except PackageNotFoundError:  # running from a source tree that was never installed
+    __version__ = "0+unknown"
 
 __all__ = ["connect", "DuckSession", "DataFrame", "DeltaTable", "__version__"]
