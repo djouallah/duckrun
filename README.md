@@ -3,7 +3,7 @@
 [![PyPI](https://img.shields.io/pypi/v/duckrun?color=blue&label=PyPI&logo=pypi&logoColor=white)](https://pypi.org/project/duckrun/)
 [![Downloads](https://static.pepy.tech/badge/duckrun)](https://pepy.tech/project/duckrun)
 [![Downloads/month](https://img.shields.io/pypi/dm/duckrun?color=brightgreen&label=downloads%2Fmonth)](https://pypi.org/project/duckrun/)
-[![Python](https://img.shields.io/pypi/pyversions/duckrun?logo=python&logoColor=white)](https://pypi.org/project/duckrun/)
+[![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://pypi.org/project/duckrun/)
 [![License](https://img.shields.io/pypi/l/duckrun?color=lightgrey)](https://github.com/djouallah/duckrun/blob/main/LICENSE)
 
 > **Disclaimer:** This is a personal project, built and maintained in my own time. It is

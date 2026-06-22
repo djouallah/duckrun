@@ -12,6 +12,17 @@ authors = [
     {name = "mim"}
 ]
 requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+]
 dependencies = [
     "dbt-duckdb>=1.8",
     # Cap dbt-core below 2.0: it's a breaking change (restructured packaging — `dbt.cli` moves,
