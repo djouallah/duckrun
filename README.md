@@ -1,6 +1,10 @@
 <img src="https://raw.githubusercontent.com/djouallah/duckrun/main/duckrun.png" width="400" alt="duckrun">
 
-[![PyPI version](https://badge.fury.io/py/duckrun.svg)](https://badge.fury.io/py/duckrun)
+[![PyPI](https://img.shields.io/pypi/v/duckrun?color=blue&label=PyPI&logo=pypi&logoColor=white)](https://pypi.org/project/duckrun/)
+[![Downloads](https://static.pepy.tech/badge/duckrun)](https://pepy.tech/project/duckrun)
+[![Downloads/month](https://img.shields.io/pypi/dm/duckrun?color=brightgreen&label=downloads%2Fmonth)](https://pypi.org/project/duckrun/)
+[![Python](https://img.shields.io/pypi/pyversions/duckrun?logo=python&logoColor=white)](https://pypi.org/project/duckrun/)
+[![License](https://img.shields.io/pypi/l/duckrun?color=lightgrey)](https://github.com/djouallah/duckrun/blob/main/LICENSE)
 
 > **Disclaimer:** This is a personal project, built and maintained in my own time. It is
 > not affiliated with, endorsed by, or supported by any employer or vendor. No warranty —
