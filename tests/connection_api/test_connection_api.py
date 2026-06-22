@@ -151,6 +151,14 @@ class TestCatalog:
     def test_listColumns(self, conn):
         assert conn.catalog.listColumns("src") == ["id", "name"]
 
+    def test_refreshTable(self, conn):
+        # a table materialized out-of-band isn't visible until refreshed; refreshTable surfaces
+        # just that one (the per-table peer of conn.refresh()).
+        path = _stage_parquet(conn, "dbo/rt")
+        DeltaTable.convertToDelta(conn, f"parquet.`{path}`")  # writes _delta_log, registers no view
+        conn.catalog.refreshTable("rt")
+        assert conn.sql("select * from rt").fetchall() == [(1, "a")]
+
     def test_getTable(self, conn):
         t = conn.catalog.getTable("src")
         assert (t.name, t.database, t.catalog) == ("src", "dbo", "wh")

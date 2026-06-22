@@ -1112,6 +1112,13 @@ class Catalog:
         location = f"{self.session._catalogs[catalog].root_path}/{dbName}"
         return Database(name=dbName, catalog=catalog, description=None, locationUri=location)
 
+    def refreshTable(self, tableName: str) -> None:
+        """Rebuild the cached view for a single table from the current on-store Delta snapshot
+        (Spark's ``catalog.refreshTable``). The per-table peer of ``conn.refresh()``, which
+        rediscovers the whole store; use this after an out-of-band write to one table."""
+        catalog, schema, table = self.session._resolve(tableName)
+        self.session._register_view(catalog, schema, table)
+
     def databaseExists(self, dbName: str) -> bool:
         self.session.refresh(quiet=True)  # safe: re-discover schema folders first
         return dbName in self.listDatabases()
