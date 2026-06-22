@@ -234,6 +234,18 @@ class TestDataFrame:
         assert conn.sql("select * from src").isEmpty() is False
         assert conn.sql("select * from src where id > 99").isEmpty() is True
 
+    def test_schema(self, conn):
+        s = conn.sql("select id, name from src").schema
+        assert s.names == ["id", "name"]
+        assert (s.fields[0].name, s.fields[0].nullable) == ("id", True)
+        assert s.simpleString().startswith("struct<id:")
+
+    def test_printSchema(self, conn, capsys):
+        conn.sql("select id from src").printSchema()
+        out = capsys.readouterr().out
+        assert out.startswith("root\n")
+        assert "|-- id:" in out and "(nullable = true)" in out
+
     def test_relation_passthrough(self, conn):
         # unknown attrs fall through to the DuckDB relation (e.g. .fetchall())
         assert conn.sql("select 1").fetchall() == [(1,)]

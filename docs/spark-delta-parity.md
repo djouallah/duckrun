@@ -76,8 +76,8 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `df.createOrReplaceTempView(name)` | `df.createOrReplaceTempView(name)` | ✅ | Native, ephemeral DuckDB view — not Delta, not in `conn.catalog`. |
 | `df.columns` | (passthrough) | 🟡 | Not reimplemented — `__getattr__` forwards to the DuckDB relation; a list of names, like Spark. |
 | `df.dtypes` | (passthrough) | 🟡 | Passthrough to the DuckDB relation — returns DuckDB types, not Spark `(name, type)` tuples. |
-| `df.schema` | — | ➖ | TODO |
-| `df.printSchema()` | — | ➖ | TODO |
+| `df.schema` | `df.schema` | 🟡 | Returns a `StructType` of `StructField(name, dataType, nullable)` — same surface as Spark, but `dataType` is the **DuckDB** type string (like `df.dtypes`), not a Spark type object, and `nullable` is always `True` (the relation doesn't track it). |
+| `df.printSchema()` | `df.printSchema()` | ✅ | Spark's `root / |-- col: type (nullable = …)` tree, with DuckDB type names. |
 
 
 ## `DataFrameReader` (`conn.read`)

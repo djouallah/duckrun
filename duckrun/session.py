@@ -726,6 +726,54 @@ class DuckSession:
         return self.con
 
 
+class StructField:
+    """One column of a :class:`StructType`. Mirrors Spark's ``StructField`` surface (``name``,
+    ``dataType``, ``nullable``); ``dataType`` is the **DuckDB** type as a string — duckrun is
+    DuckDB-native and doesn't remap to Spark type objects (same stance as ``df.dtypes``)."""
+
+    def __init__(self, name: str, dataType: str, nullable: bool = True):
+        self.name = name
+        self.dataType = dataType
+        self.nullable = nullable
+
+    def simpleString(self) -> str:
+        return f"{self.name}:{self.dataType}"
+
+    def __repr__(self) -> str:
+        return f"StructField('{self.name}', '{self.dataType}', {self.nullable})"
+
+
+class StructType:
+    """A :class:`DataFrame`'s schema — a list of :class:`StructField`, built from the DuckDB
+    relation's columns and types. Mirrors Spark's ``StructType`` surface (``fields``, ``names``,
+    iteration, ``simpleString()``)."""
+
+    def __init__(self, fields: List[StructField]):
+        self.fields = list(fields)
+
+    @property
+    def names(self) -> List[str]:
+        return [f.name for f in self.fields]
+
+    def __iter__(self):
+        return iter(self.fields)
+
+    def __len__(self) -> int:
+        return len(self.fields)
+
+    def simpleString(self) -> str:
+        return f"struct<{','.join(f.simpleString() for f in self.fields)}>"
+
+    def treeString(self) -> str:
+        lines = ["root"]
+        for f in self.fields:
+            lines.append(f" |-- {f.name}: {f.dataType} (nullable = {str(f.nullable).lower()})")
+        return "\n".join(lines) + "\n"
+
+    def __repr__(self) -> str:
+        return f"StructType([{', '.join(repr(f) for f in self.fields)}])"
+
+
 class DataFrame:
     """Wraps a DuckDB relation; exposes a DataFrame-style ``.write`` plus a few DataFrame aliases.
 
@@ -779,6 +827,18 @@ class DataFrame:
     def isEmpty(self) -> bool:
         """``True`` if the DataFrame has no rows (Spark's ``DataFrame.isEmpty()``)."""
         return self.relation.limit(1).fetchone() is None
+
+    @property
+    def schema(self) -> StructType:
+        """The schema as a :class:`StructType` of :class:`StructField` (Spark's ``DataFrame.schema``).
+        Types are the DuckDB types (as in ``df.dtypes``); the relation doesn't carry nullability, so
+        every field reports ``nullable=True`` — Spark's own default for an inferred schema."""
+        rel = self.relation
+        return StructType([StructField(n, str(t)) for n, t in zip(rel.columns, rel.types)])
+
+    def printSchema(self) -> None:
+        """Print the schema as a tree (Spark's ``DataFrame.printSchema``)."""
+        print(self.schema.treeString(), end="")
 
     def createOrReplaceTempView(self, name: str) -> "DataFrame":
         """Register this DataFrame as a session-scoped view named ``name``, so it can be queried by
