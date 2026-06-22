@@ -273,15 +273,15 @@ class Bench:
 
     def full_sync(self, model):
         """Full-dimension sync: matched UPDATE + WHEN NOT MATCHED BY SOURCE DELETE. The source is
-        ~95% of the table (every key but a deterministic 5% slice), so the heavy part is the
-        whole-target anti-join. Departed slice (l_orderkey % 20 = 0) is deleted; survivors updated."""
+        ~50% of the table (every odd orderkey), streamed (merge_streamed_exec) so the big source
+        isn't materialized whole. Even orderkeys are 'departed' → by-source DELETE; odd → UPDATE."""
         p = self.path(model)
         before = self.count(model)
-        departed = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_orderkey % 20 = 0")
+        departed = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_orderkey % 2 = 0")
         dt = self.dbt(model)
         after = self.count(model)
         updated = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_quantity = {MARK_SYNC}")
-        departed_left = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_orderkey % 20 = 0")
+        departed_left = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_orderkey % 2 = 0")
         expected = before - departed
         return {"name": "Full sync (update + by-source delete)", "src": before - departed,
                 "upd": updated, "ins": 0, "before": before, "after": after,
@@ -418,8 +418,9 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
     L.append("5. **CDC merge (full clause set):** one MERGE that DELETEs a tombstoned slice, UPDATEs a "
              "sample, and INSERTs key-shifted rows — matched-delete + matched-update + not-matched-insert "
              "via `merge_clauses`.")
-    L.append("6. **Full sync (by-source delete):** matched rows UPDATEd, keys the ~95% source no longer "
-             "carries DELETEd via `WHEN NOT MATCHED BY SOURCE` — the heaviest shape (whole-target anti-join).")
+    L.append("6. **Full sync (by-source delete):** matched rows UPDATEd, keys a ~50% (streamed) source "
+             "no longer carries DELETEd via `WHEN NOT MATCHED BY SOURCE` — the heaviest shape "
+             "(whole-target anti-join); `merge_streamed_exec` keeps the big source from materializing.")
     L.append("7. **Expression update:** a 100%-match UPDATE whose SET is an arbitrary expression + `CASE` "
              "(`merge_update_set_expressions`), not a plain column copy.")
     L.append("8. **Append (no merge):** the batch appended — no target scan/join (far cheaper).")
