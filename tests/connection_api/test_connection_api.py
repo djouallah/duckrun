@@ -1129,6 +1129,14 @@ def test_createDataFrame_bad_schema_type_errors(conn):
         conn.createDataFrame([(1,)], schema=123)
 
 
+def test_createDataFrame_column_name_with_embedded_quote(conn):
+    # Regression: _project_rename must escape identifiers via _qid. A column name containing a
+    # double-quote previously built broken SQL (`"_1" AS "id"x"`); now it round-trips.
+    df = conn.createDataFrame([(1, "a"), (2, "b")], ['id"x', "name"])
+    assert df.columns == ['id"x', "name"]
+    assert df.count() == 2
+
+
 def test_createDataFrame_round_trip_to_delta(conn):
     conn.createDataFrame([(1, "a"), (2, "b")], "id int, name string") \
         .write.mode("overwrite").saveAsTable("seeded")
@@ -1636,6 +1644,42 @@ def test_stop_closes_connection(tmp_path):
     conn.stop()
     with pytest.raises(Exception):
         conn.sql("select 1").collect()  # underlying DuckDB connection is closed
+
+
+def test_context_manager_closes_connection(tmp_path):
+    # `with duckrun.connect(...) as conn:` closes the connection on exit.
+    with duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False) as conn:
+        conn.sql("select 1 as x").write.mode("overwrite").saveAsTable("t")
+        assert conn.sql("select count(*) from t").collect()[0][0] == 1
+    with pytest.raises(Exception):
+        conn.sql("select 1").collect()  # closed on `with` exit
+
+
+def test_primary_secret_mint_failure_raises_and_closes_connection(tmp_path, monkeypatch):
+    # A primary catalog whose secret can't be minted must fail loud at connect() — not warn and
+    # resurface as a cryptic 403 later — AND must not leak the DuckDB connection it opened.
+    from duckrun import session as S
+
+    created = []
+    real_connect = S.duckdb.connect
+
+    def tracking_connect(*a, **k):
+        c = real_connect(*a, **k)
+        created.append(c)
+        return c
+
+    def boom(*a, **k):
+        raise RuntimeError("mint exploded")
+
+    monkeypatch.setattr(S.duckdb, "connect", tracking_connect)
+    monkeypatch.setattr(S.secret, "ensure_azure_secret", boom)
+
+    with pytest.raises(RuntimeError, match="could not mint OneLake secret"):
+        duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False)
+
+    assert created, "expected connect() to have opened a DuckDB connection"
+    with pytest.raises(Exception):
+        created[-1].execute("select 1")  # closed by the failed __init__, not leaked
 
 
 # Weird-but-valid catalog names: duckrun quotes every identifier (_qid), so a name that's a SQL

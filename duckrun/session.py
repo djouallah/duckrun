@@ -187,14 +187,14 @@ def _project_rename(rel, names: List[str]):
     cur = rel.columns
     if len(names) != len(cur):
         raise ValueError(f"schema lists {len(names)} columns but data has {len(cur)}")
-    return rel.project(", ".join(f'"{c}" AS "{n}"' for c, n in zip(cur, names)))
+    return rel.project(", ".join(f'{_qid(c)} AS {_qid(n)}' for c, n in zip(cur, names)))
 
 
 def _project_cast(rel, types: List[str]):
     cur = rel.columns
     if len(types) != len(cur):
         raise ValueError(f"schema lists {len(types)} types but data has {len(cur)} columns")
-    return rel.project(", ".join(f'CAST("{c}" AS {t}) AS "{c}"' for c, t in zip(cur, types)))
+    return rel.project(", ".join(f'CAST({_qid(c)} AS {t}) AS {_qid(c)}' for c, t in zip(cur, types)))
 
 
 def _delta_write_message(query: str) -> str:
@@ -396,7 +396,13 @@ class DuckSession:
         # derive it from the URL (OneLake lakehouse name / local folder), else fall back to "data"
         # (a non-reserved word — usable bare in SQL, unlike "default"/"main").
         catalog_name = name or _derive_catalog_name(root) or "data"
-        self._attach_catalog(catalog_name, root, storage_options, schema_filter, primary=True, quiet=False)
+        try:
+            self._attach_catalog(catalog_name, root, storage_options, schema_filter, primary=True, quiet=False)
+        except Exception:
+            # Don't leak the DuckDB connection opened above if discovery/secret-mint fails
+            # (e.g. fail-loud primary token error) — the half-built session is discarded.
+            self.con.close()
+            raise
 
     # ---- catalog registry ------------------------------------------------------------------
 
@@ -430,7 +436,15 @@ class DuckSession:
                 secret.ensure_azure_secret(self.con, so)
             else:
                 _mint_scoped_secret(self.con, _secret_name(name), root, so)
-        except Exception as exc:  # surfaced, not swallowed as "no tables" later
+        except Exception as exc:
+            # The primary catalog's secret is load-bearing: without it every delta_scan fails
+            # later with a cryptic 403 / "no tables". Fail loud at connect() instead. Attached
+            # (secondary) catalogs stay best-effort — a warning, so one bad attach doesn't sink
+            # an otherwise-usable session.
+            if primary:
+                raise RuntimeError(
+                    f"could not mint OneLake secret for catalog '{name}': {exc}"
+                ) from exc
             print(f"⚠️  could not mint OneLake secret for catalog '{name}': {exc}")
 
         self.con.execute(f"ATTACH ':memory:' AS {_qid(name)}")
@@ -719,6 +733,14 @@ class DuckSession:
         """Close the underlying DuckDB connection (Spark's ``SparkSession.stop()``). The session is
         unusable afterwards — registered views and the minted secret go with the connection."""
         self.con.close()
+
+    def __enter__(self) -> "DuckSession":
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        """Close the connection on ``with`` exit — ``with duckrun.connect(...) as conn:``."""
+        self.stop()
+        return False
 
     @property
     def _connection(self):

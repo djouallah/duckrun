@@ -41,17 +41,26 @@ permissions:
 jobs:
   adapter:
     # duckrun's core public surfaces (dbt adapter internals + the duckrun.connect() API),
-    # tested on a local-filesystem Delta warehouse.
+    # tested on a local-filesystem Delta warehouse. Run on every supported Python the package
+    # advertises a regression for (pyproject says 3.9–3.12) — 3.12 is the one we actively care
+    # about beyond the 3.11 baseline. (Conformance stays single-version: its gate is a
+    # 3.11-derived baseline that a second Python would spuriously trip.)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12']
     concurrency:
-      group: cores-adapter-${{ github.ref }}
+      # Include the Python version: matrix cells share a job's concurrency group, so without it
+      # the second cell would cancel the first (cancel-in-progress: true).
+      group: cores-adapter-${{ github.ref }}-${{ matrix.python-version }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python-version }}
 
       - name: Install duckrun + test deps (dbt-duckdb + duckdb + deltalake + pytest + pyarrow)
         run: pip install -e ".[test]"
