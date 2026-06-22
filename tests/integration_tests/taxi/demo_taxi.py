@@ -8,12 +8,13 @@ DuckDB's fancy SQL (QUALIFY, PIVOT, ROLLUP, LIST/STRUCT, ASOF JOIN) and closes w
 scorecard. ``test_coffee.py`` already covers the DataFrame-style builder API on generated data; this is
 the SQL-first, real-data counterpart.
 
-The demo is split in three parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql``.
+The demo is split in three parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql`` — including a real ``MERGE`` upsert.
 **Part 2** switches to the DataFrame API on the same connection — the ``DataFrameWriter`` writing Delta by
 **path** (``.mode("overwrite"/"append").save(path)``, read back with ``conn.read.format("delta").load(path)``), closing
-with a **concurrent MERGE clash** staged through the DataFrame ``DeltaTable.merge`` builder (``conn.sql``
-rejects ``MERGE`` on purpose) — two writers pinned to one snapshot, the stale one refused with
-``CommitFailedError``, proving snapshot isolation. **Part 3** is **multi-catalog**: ``conn.attach`` brings a
+with a **concurrent MERGE clash** staged through the DataFrame ``DeltaTable.merge`` builder (the builder
+snapshot-pins at BUILD time, so two writers can be pinned to one snapshot before either commits — a raw
+``conn.sql`` MERGE pins-and-commits in one call) — the stale writer refused with ``CommitFailedError``,
+proving snapshot isolation. **Part 3** is **multi-catalog**: ``conn.attach`` brings a
 *second* lakehouse in as a named catalog (here a local scratch dir alongside the warehouse — they can be on
 different storage), then a single ``conn.sql`` JOINs a table in the primary catalog with one in the attached
 catalog, addressing them as ``catalog.schema.table``.
@@ -370,8 +371,8 @@ def run_taxi_demo(conn, schema):
                             after - before == 100, time.perf_counter() - t0))
         say(f"{before:,} → {after:,} rows")
 
-    # 7 ── SQL-only upsert: DELETE affected keys + INSERT (1 update, 1 insert) ─────────────────────
-    with _step(7, "SQL-only upsert on 'zone_stats': DELETE literal keys + INSERT (1 update, 1 insert)") as say:
+    # 7 ── SQL upsert via a real MERGE (1 update, 1 insert), one statement ─────────────────────────
+    with _step(7, "SQL upsert on 'zone_stats': a real MERGE through conn.sql (1 update, 1 insert)") as say:
         _sql(conn, """
             CREATE OR REPLACE TABLE zone_stats AS
             SELECT zone_id, any_value(zone) AS zone, count(*) AS trips, round(avg(fare), 2) AS avg_fare
@@ -384,15 +385,22 @@ def run_taxi_demo(conn, schema):
         tgt_trips = q(f"SELECT trips FROM zone_stats WHERE zone_id = {target}")
         tgt_zone = q(f"SELECT zone FROM zone_stats WHERE zone_id = {target}").replace("'", "''")
         new_avg = round(old_avg + 5.0, 2)
-        # delta-rs DELETE predicates take literals, not IN (SELECT …) — so we key the DELETE on literal
-        # ids captured above, then INSERT the recomputed/new rows. That is the SQL-only upsert.
-        _sql(conn, f"DELETE FROM zone_stats WHERE zone_id = {target} OR zone_id = 999")
-        _sql(conn, f"INSERT INTO zone_stats VALUES "
-                   f"({target}, '{tgt_zone}', {tgt_trips}, {new_avg}), (999, 'NEW Demo Zone', 1, 7.77)")
+        # A real SQL MERGE: conn.sql routes it to delta-rs (same engine + snapshot pin as the
+        # DeltaTable.merge builder). The ON clause and WHEN clauses must use the literal target/source
+        # aliases. One statement does the upsert — the busiest zone is updated, zone 999 is inserted.
+        _sql(conn, f"""
+            MERGE INTO zone_stats USING (VALUES
+                ({target}, '{tgt_zone}', {tgt_trips}, {new_avg}),
+                (999, 'NEW Demo Zone', 1, 7.77)
+            ) AS source(zone_id, zone, trips, avg_fare)
+            ON target.zone_id = source.zone_id
+            WHEN MATCHED THEN UPDATE SET *
+            WHEN NOT MATCHED THEN INSERT *
+        """)
         after = q("SELECT count(*) FROM zone_stats")
         upd_ok = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {target}") == new_avg
         ins_ok = q("SELECT count(*) FROM zone_stats WHERE zone_id = 999") == 1
-        results.append(_row("SQL upsert (1 upd, 1 ins)", before, after, before + 1, after == before + 1,
+        results.append(_row("SQL MERGE (1 upd, 1 ins)", before, after, before + 1, after == before + 1,
                             upd_ok and ins_ok, time.perf_counter() - t0))
         say(f"zone {target} avg {old_avg}→{new_avg} (updated), zone 999 inserted; {before:,} → {after:,} rows")
 
@@ -527,9 +535,10 @@ def run_taxi_demo(conn, schema):
         old_avg = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {busiest}")
         before = q("SELECT count(*) FROM zone_stats")
         cond = "target.zone_id = source.zone_id"
-        # DataFrame API on purpose — conn.sql rejects MERGE. .merge() snapshot-pins at BUILD time, so both
-        # writers capture the SAME version before either commits: exactly two concurrent writers.
-        _emit('  <pre class="py"># DataFrame builder API (conn.sql rejects MERGE) — both writers pin the SAME version:\n'
+        # DataFrame builder on purpose (step 7 already showed a SQL MERGE): .merge() snapshot-pins at
+        # BUILD time, so we can stage TWO writers against the SAME version before either commits — a raw
+        # conn.sql MERGE pins-and-commits in one call, so it can't stage the clash. Exactly two concurrent writers.
+        _emit('  <pre class="py"># DataFrame builder API — staged so both writers pin the SAME version before committing:\n'
               f'writer_A = DeltaTable.forName(conn, "zone_stats").merge(srcA, "{cond}") \\\n'
               '    .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcA sets avg → 100.0\n'
               f'writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, "{cond}") \\\n'
