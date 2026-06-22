@@ -156,19 +156,19 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 74 passed   ❌ 0 failed  │
-│ 74 methods · 100% passing │
+│ ✅ 75 passed   ❌ 0 failed  │
+│ 75 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### DataFrame API — 56/56 ✅
+### DataFrame API — 57/57 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
 | Surface | Methods | Pass |
 | --- | --- | :-: |
 | `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
-| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns`, `getTable`, `getDatabase`, `dropTempView`, `listCatalogs`, `currentCatalog`, `setCurrentCatalog` | 14/14 ✅ |
+| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns`, `refreshTable`, `getTable`, `getDatabase`, `dropTempView`, `listCatalogs`, `currentCatalog`, `setCurrentCatalog` | 15/15 ✅ |
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow`, `first`, `head`, `take`, `isEmpty` | 10/10 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `json`, `versionAsOf`, `timestampAsOf_rejected` | 7/7 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 10/10 ✅ |
