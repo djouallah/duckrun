@@ -126,10 +126,8 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.getTable(t, db)` | `catalog.getTable(t, db=None)` | ✅ | Returns a `Table` namedtuple (`name`, `catalog`, `database`, `description`, `tableType`, `isTemporary`); raises if absent. duckrun tables are always `MANAGED`, never temporary. |
 | `catalog.getDatabase(db)` | `catalog.getDatabase(db)` | ✅ | Returns a `Database` namedtuple (`name`, `catalog`, `description`, `locationUri`); raises if absent. |
 | `catalog.dropTempView(name)` | `catalog.dropTempView(name)` | ✅ | Inverse of `df.createOrReplaceTempView`; returns `True` if the view existed. |
-| `catalog.createTable` / `createExternalTable` | — | ➖ | TODO — today use `df.write.saveAsTable`. |
-| `catalog.cacheTable` / `uncacheTable` / `isCached` / `clearCache` | — | ➖ | TODO — closest is materializing a TEMP table. |
+| `catalog.createTable` | — | ➖ | TODO — today use `df.write.saveAsTable`. |
 | `catalog.refreshTable(t)` | `catalog.refreshTable(t)` | ✅ | Rebuilds one table's cached view from the current on-store snapshot — the per-table peer of `conn.refresh()` (bespoke), which rediscovers the whole store. |
-| `catalog.recoverPartitions` | — | ➖ | TODO (delta-rs gap). |
 | `catalog.refreshByPath` | — | 🚫 | Path reads aren't cached — nothing to refresh. |
 | `catalog.currentCatalog` / `setCurrentCatalog` / `listCatalogs` | `catalog.currentCatalog()` / `setCurrentCatalog(name)` / `listCatalogs()` | ✅ | Each attached lakehouse root is a catalog (`catalog.schema.table`). The primary comes from `connect`; add more with `conn.attach(path, name=…)` (bespoke — see top). |
 | `catalog.functionExists` / `listFunctions` / `registerFunction` | — | 🚫 | DuckDB owns the function namespace; not a duckrun catalog concept. |
