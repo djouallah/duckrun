@@ -40,11 +40,6 @@ _TOP_FROM = re.compile(r"\bfrom\b", re.IGNORECASE)
 _TOP_USING = re.compile(r"\busing\b", re.IGNORECASE)
 _strip_leading = delta_dml._strip_leading  # shared comment/whitespace stripper
 
-_MERGE_MSG = (
-    "conn.sql() can't run a SQL MERGE via delta_rs. Use the DataFrame write API: "
-    "df.write.saveAsTable(...) to create/append, df.write.option('replaceWhere', …) to overwrite "
-    "a slice, or DeltaTable.forName(conn, name).merge(...)/.delete()/.update()."
-)
 _UPDATE_FROM_MSG = (
     "conn.sql() can't run UPDATE … FROM via delta_rs. Rewrite the SET values as correlated "
     "subqueries, or use DeltaTable.forName(conn, name).update(...)/.merge(...)."
@@ -69,8 +64,6 @@ def _unsupported_dml(query: str) -> Optional[str]:
     """An error message if ``query`` is a DML form duckrun can't route to delta_rs, else None."""
     s = _strip_leading(query)
     low = s.lower()
-    if low.startswith("merge"):
-        return _MERGE_MSG
     if low.startswith("update") and delta_dml._find_top_level(s, _TOP_FROM) != -1:
         return _UPDATE_FROM_MSG
     if low.startswith("delete") and delta_dml._find_top_level(s, _TOP_USING) != -1:
@@ -357,7 +350,8 @@ def _mint_scoped_secret(con, secret_name: str, root: str, storage_options) -> bo
 
 # DML target-relation matcher (verb → relation), used only to detect a 3-part cross-catalog target.
 _DML_REL = re.compile(
-    r"^(?:insert\s+into|delete\s+from|update|alter\s+table|drop\s+table(?:\s+if\s+exists)?|"
+    r"^(?:insert\s+into|delete\s+from|update|merge\s+into|alter\s+table|"
+    r"drop\s+table(?:\s+if\s+exists)?|"
     r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?)\s+(?P<rel>[\w.\"]+)",
     re.IGNORECASE,
 )
@@ -628,13 +622,15 @@ class DuckSession:
 
         Delta **DML** is applied to the Delta table via delta_rs (works local AND on OneLake):
         ``create table … as select`` (overwrite), ``insert into … select``/``insert into … values``
-        (append), ``delete``/``update`` (delta_rs delete/update), ``alter table … add column``, and
+        (append), ``delete``/``update`` (delta_rs delete/update), ``alter table … add column``,
         ``drop table`` (tombstone — marks the table dropped without deleting data; a human purges
-        the files). After a DML statement the catalog is refreshed.
+        the files), and ``merge into … using … on … when …`` (delta_rs upsert). After a DML
+        statement the catalog is refreshed.
 
-        ``merge`` isn't expressible via delta_rs DML here — use the DataFrame write API instead:
-        ``df.write.saveAsTable(...)`` or
-        ``DeltaTable.forName(conn, name).merge(...)/.delete()/.update()``.
+        A SQL ``merge`` must reference the literal ``target`` and ``source`` aliases in the ``ON``
+        condition and ``WHEN`` clauses (``merge into t using s on target.id = source.id when matched
+        then update set * when not matched then insert *``) — duckrun renames the merge relations to
+        those names. It mirrors the DataFrame ``DeltaTable.forName(conn, name).merge(...)`` builder.
         ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
         """
         # Raw DML routes through delta_rs against ONE root. A 3-part target names which catalog that

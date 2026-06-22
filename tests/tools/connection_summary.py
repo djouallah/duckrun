@@ -78,6 +78,8 @@ def _label(test: str) -> str:
         return "version-pinned read"
     if test.startswith("sql_insert_values"):  # _insert_values / _insert_values_named_subset → one method
         return "insert…values"
+    if test.startswith("sql_merge"):  # _upsert / _update_columns / _insert_only / _by_source_delete / … → one method
+        return "merge"
     if test.startswith("sql_"):
         return {
             "sql_create_table_as": "create table as",
@@ -86,7 +88,6 @@ def _label(test: str) -> str:
             "sql_delete": "delete",
             "sql_alter_add_column": "alter add column",
             "sql_drop_tombstone": "drop (tombstone)",
-            "sql_merge_rejected": "merge guard (→ builder)",
         }.get(test, test)
     if test == "update_only_rejected":
         return "merge"

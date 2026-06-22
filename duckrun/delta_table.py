@@ -9,47 +9,13 @@ Supported clauses map onto delta-rs's ``when_matched_update_all`` / ``when_match
 other than ``target``/``source``, update-only merges) raise a clear error rather than being
 silently dropped — the same posture the adapter takes for unsupported merge features.
 """
-import re
 from typing import Dict, List, Optional
 
-from dbt.adapters.duckrun import engine
+from dbt.adapters.duckrun import delta_dml, engine
 
-_EQ = re.compile(r"^\s*(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)\s*$", re.IGNORECASE)
-
-
-def _parse_condition(condition: str):
-    """Split a merge condition into (unique_key, extra_predicates).
-
-    Each ``AND``-separated term of the form ``target.X = source.X`` (same column, either order)
-    contributes ``X`` as a merge key; any other term is passed through as an extra predicate
-    (delta-rs ANDs it into the merge condition). Raises if no key equality is found or an alias
-    other than ``target``/``source`` is used.
-    """
-    keys: List[str] = []
-    predicates: List[str] = []
-    for term in re.split(r"\s+AND\s+", condition, flags=re.IGNORECASE):
-        term = term.strip()
-        if not term:
-            continue
-        m = _EQ.match(term)
-        if m:
-            a_alias, a_col, b_alias, b_col = (g.lower() for g in m.groups())
-            aliases = {a_alias, b_alias}
-            if aliases == {"target", "source"} and a_col == b_col:
-                keys.append(m.group(2))  # original-case column
-                continue
-            if not aliases <= {"target", "source"}:
-                raise ValueError(
-                    f"merge condition must use 'target'/'source' aliases, got: {term!r}"
-                )
-        # A non-key term (range predicate, target.a = source.b, etc.) → pass through.
-        predicates.append(term)
-    if not keys:
-        raise ValueError(
-            "merge condition has no 'target.<col> = source.<col>' key equality; "
-            f"got: {condition!r}"
-        )
-    return keys, predicates
+# Condition parsing (the supported key-equality boundary) is shared with the raw-SQL MERGE handler
+# in delta_dml.parse_merge_condition, so the DataFrame builder and conn.sql("MERGE …") accept exactly
+# the same conditions.
 
 
 class DeltaMergeBuilder:
@@ -57,7 +23,7 @@ class DeltaMergeBuilder:
                  read_version: Optional[int] = None):
         self._table = table
         self._source = source  # DataFrame
-        self._keys, self._predicates = _parse_condition(condition)
+        self._keys, self._predicates = delta_dml.parse_merge_condition(condition)
         self._matched = None       # None | ("all", cond) | ("cols", [cols], cond)
         self._not_matched = None   # None | ("all", cond)
         self._by_source_delete = None  # None | True | predicate string

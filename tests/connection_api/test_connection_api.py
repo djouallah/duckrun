@@ -395,9 +395,9 @@ class TestDeltaTable:
 
 class TestSqlDml:
     """conn.sql(): reads (incl. version-pinned delta_scan) pass through, and Delta DML is applied
-    via delta_rs — create-as / insert-select / insert-values / update / delete / alter-add, and drop
-    (a tombstone: no data deleted). Only a SQL merge isn't expressible as delta_rs DML and is
-    directed to the DataFrame write API."""
+    via delta_rs — create-as / insert-select / insert-values / update / delete / alter-add, drop
+    (a tombstone: no data deleted), and merge (upsert; same boundary as the DeltaTable.merge
+    builder, ON/WHEN must use the target/source aliases)."""
 
     def test_select_passthrough(self, conn):
         assert conn.sql("SELECT 1").fetchall() == [(1,)]
@@ -446,10 +446,55 @@ class TestSqlDml:
         conn.sql("drop table src")
         assert "src" not in conn.catalog.listTables()
 
-    def test_sql_merge_rejected(self, conn):
-        # a SQL merge can't be expressed as delta_rs DML → directed to the .merge() builder.
-        with pytest.raises(ValueError):
-            conn.sql("MERGE INTO src USING src s ON src.id = s.id WHEN MATCHED THEN DELETE")
+    def test_sql_merge_upsert(self, conn):
+        conn.sql("MERGE INTO src USING (values (2,'B'),(9,'z')) t(id, name) "
+                 "ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
+        assert conn.table("src").count() == 4
+        assert conn.sql("select name from src where id = 2").fetchone()[0] == "B"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
+
+    def test_sql_merge_update_columns(self, conn):
+        conn.sql("MERGE INTO src USING (values (1,'X')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET name = source.name WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+
+    def test_sql_merge_insert_only(self, conn):
+        conn.sql("MERGE INTO src USING (values (2,'B'),(5,'e')) t(id, name) "
+                 "ON target.id = source.id WHEN NOT MATCHED THEN INSERT *")
+        assert conn.table("src").count() == 4                                   # only id=5 added
+        assert conn.sql("select name from src where id = 2").fetchone()[0] == "b"  # untouched
+
+    def test_sql_merge_by_source_delete(self, conn):
+        # full sync: source carries ids {2,3}; matched updates, unmatched-by-source (1) deleted.
+        conn.sql("MERGE INTO src USING (values (2,'B'),(3,'C')) t(id, name) "
+                 "ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT * "
+                 "WHEN NOT MATCHED BY SOURCE THEN DELETE")
+        assert dict(conn.sql("select id, name from src").collect()) == {2: "B", 3: "C"}
+
+    def test_sql_merge_subquery_source(self, conn):
+        conn.sql("MERGE INTO src USING (select 9 as id, 'z' as name) AS source "
+                 "ON target.id = source.id WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
+
+    def test_sql_merge_bad_alias_rejected(self, conn):
+        # the ON clause must use the target/source aliases — the error must say so.
+        with pytest.raises(ValueError, match="target.*source"):
+            conn.sql("MERGE INTO src s USING (values (1,'x')) t(id, name) ON s.id = t.id "
+                     "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
+
+    def test_sql_merge_matched_delete_rejected(self, conn):
+        # engine/builder have no matched-delete — rejected clearly.
+        with pytest.raises(ValueError, match="DELETE is not supported"):
+            conn.sql("MERGE INTO src USING (values (1,'x')) t(id, name) ON target.id = source.id "
+                     "WHEN MATCHED THEN DELETE")
+
+    def test_sql_merge_insert_values_rejected(self, conn):
+        # only INSERT * is supported (no arbitrary column/value maps).
+        with pytest.raises(ValueError, match=r"INSERT \* is supported"):
+            conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
+                     "WHEN NOT MATCHED THEN INSERT (id, name) VALUES (source.id, source.name)")
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -966,14 +1011,16 @@ def test_native_passthrough_not_delta(tmp_path, stmt, name):
 
 
 # Tier 4 — rejection contract: conn.sql() refuses what it can't route to delta_rs.
+# (A raw MERGE *is* routed — see TestSqlDml — but it must use the target/source aliases.)
 @pytest.mark.parametrize("stmt,msg", [
-    ("merge into items t using items s on t.id = s.id when matched then update set name = 'x'", "MERGE"),
+    ("merge into items t using items s on t.id = s.id when matched then update set name = 'x'",
+     "target.*source"),
     ("update items set name = o.name from wide o where items.id = o.id", "UPDATE . FROM"),
     ("delete from items using wide o where items.id = o.id", "DELETE . USING"),
     ("insert into items values (4,'d'); insert into items values (5,'e')", "one statement"),
     ("create table items as select 1 id, 'a' name", "already exists"),
     ("create table items (id integer)", "already exists"),
-], ids=["merge", "update_from", "delete_using", "multi_statement",
+], ids=["merge_bad_alias", "update_from", "delete_using", "multi_statement",
         "create_as_exists", "create_coldefs_exists"])
 def test_rejected(tmp_path, stmt, msg):
     with pytest.raises(ValueError, match=msg):
