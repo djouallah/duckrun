@@ -2,6 +2,75 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- **Multiple catalogs in one session.** `conn.attach(path, name=…)` binds a second+ lakehouse root as
+  a named catalog, so a single session reads and joins across several lakehouses by three-part
+  `catalog.schema.table` name. `read_only` is **per-catalog** — a read-only reference store (e.g. a
+  Fabric Warehouse, which is a write-locked Lakehouse) sits next to a writable lakehouse. New catalog
+  surface: `catalog.listCatalogs()` / `currentCatalog()` / `setCurrentCatalog(name)`. The primary
+  catalog's `name` is derived from the URL (else `data`); `name=` overrides it and is mandatory for a
+  GUID-only OneLake path. See [`docs/connection-api.md`](docs/connection-api.md) and the
+  [live demo](https://djouallah.github.io/duckrun/multicatalog.html).
+- **`conn.createDataFrame(data, schema=None)`** turns in-memory data (list of tuples/scalars, pandas
+  `DataFrame`, or pyarrow `Table`/`RecordBatchReader`) into a DataFrame on duckrun's own connection —
+  for seeding, demos, or persisting a small result to Delta. No Spark/PySpark dependency.
+- **`DeltaTable.convertToDelta(conn, ident, partitionSchema=None)`** — zero-copy conversion of existing
+  parquet into Delta (writes a `_delta_log`, no data rewrite).
+- **Raw SQL `MERGE` through `conn.sql`** routes to delta-rs (same engine + snapshot pin as the
+  `DeltaTable.merge` builder), via the literal `target`/`source` aliases (issue #4).
+- **`DeltaTable.history(limit=None)`** — delta-rs commit history (newest-first), to discover versions
+  for time travel.
+
+## [0.3.20] - 2026-06-22
+
+### Changed
+- **`connect()` is read-only by default.** Every Delta write raises `PermissionError` unless
+  `read_only=False` is passed, so an accidental write can't mutate a shared lakehouse. Reads and native
+  `CREATE TEMP`/`CREATE VIEW` scratch are always allowed.
+
+### Added
+- **`conn.stop()`** closes the underlying DuckDB connection.
+- **`df.toArrow()`** returns a streaming `pyarrow.RecordBatchReader` (not a fully-materialized table),
+  so large results don't have to fit in memory.
+
+## [0.3.19] - 2026-06-21
+
+### Added
+- **`DataFrame.createOrReplaceTempView(name)`** — a native, ephemeral DuckDB view (not Delta, not in
+  `conn.catalog`).
+
+### Fixed
+- **INSERT fails loud on lossy numeric narrowing** instead of silently truncating values that don't fit
+  the target Delta column type (issue #5).
+
+## [0.3.18] - 2026-06-21
+
+### Fixed
+- **Cleaner OneLake `delta_scan` errors**, plus a live hint that friendly workspace/lakehouse names hit
+  an upstream OneLake read bug — use the GUID form.
+
+## [0.3.17] - 2026-06-21
+
+### Added
+- **Storage-neutral `duckrun.connect()` notebook API.** A DataFrame-style surface over DuckDB +
+  delta-rs (local / S3 / GCS / ADLS / OneLake) — `conn.sql`, `conn.table`, `conn.read`, `conn.catalog`,
+  a `DataFrame` with `.write…saveAsTable()`, and a `DeltaTable` handle (`merge`, `delete`, `update`,
+  `version`). See [`docs/connection-api.md`](docs/connection-api.md) and
+  [`docs/spark-delta-parity.md`](docs/spark-delta-parity.md).
+- **Raw SQL DML through `conn.sql` routes to delta-rs** (`create table as` / `insert` / `update` /
+  `delete` / `alter add column` / `drop`), so it works identically on a local path and on OneLake. The
+  invariant: every `CREATE TABLE` is Delta-backed; only `CREATE TEMP TABLE` / `CREATE VIEW` stay native.
+- **Snapshot pinning by default.** Incremental writes (`merge`, and `mode("safeappend")`) capture the
+  target version and validate the commit against it, so a concurrent writer fails loud
+  (`CommitFailedError`) rather than silently interleaving (issue #1).
+- **Delta-backed dbt snapshots** (`snapshot` materialization via MERGE on `dbt_scd_id`).
+
+### Changed
+- **Requires `duckdb` ≥ 1.5.4** (newer than Fabric's bundled stable build) and `deltalake` ≥ 1.5.0;
+  `connect()` fails loud with a version guardrail otherwise.
+
 ## [0.3.16] - 2026-06-12
 
 ### Added

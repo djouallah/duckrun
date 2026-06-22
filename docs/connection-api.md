@@ -12,16 +12,9 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   `conn.read` and `conn.catalog`.
 - a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
   `.merge(...)`, `.delete()`, `.update()`, `.version()`, `.history()`.
-- **multiple catalogs**: `connect()` binds one lakehouse root (the primary catalog — named from the
-  URL, e.g. the OneLake lakehouse / local folder name, or `data` when a GUID-only path gives nothing
-  to derive; pass `name=` to override); attach more with `conn.attach(path, name=…)` and address them
-  as `catalog.schema.table`. `conn.catalog.listCatalogs()`
-  / `currentCatalog()` / `setCurrentCatalog(name)` switch which catalog unqualified / 2-part names
-  resolve in. `name` is derived from a friendly path (mandatory for a GUID-only OneLake path); one URL
-  maps to one name. `attach(..., read_only=True)` fences writes to *that* catalog independently of the
-  session, so a read-only reference store (e.g. a Fabric Warehouse) can sit next to a writable lakehouse.
-  Raw `conn.sql()` DML targets the current catalog — cross-catalog writes go through the DataFrame API
-  (`df.write.saveAsTable("cat.schema.t")`) or `DeltaTable.forName(conn, "cat.schema.t")`.
+- **multiple catalogs**: `connect()` binds one lakehouse root (the primary catalog); attach more with
+  `conn.attach(path, name=…)` and read/join across them by three-part `catalog.schema.table` name —
+  see [Multiple catalogs with `conn.attach`](#multiple-catalogs-with-connattach) below.
 
 `connect()` is **read-only by default**: every Delta write (`saveAsTable` / `insertInto` / `save` /
 `merge` / `insert` / `update` / `delete` / `replaceWhere`) raises `PermissionError`, so an accidental
@@ -74,6 +67,57 @@ conn.createDataFrame([(1, "a"), (2, "b")], "id int, name string") \
 conn.createDataFrame(pandas_df).show()
 conn.createDataFrame([], "id int, name string")   # typed empty frame
 ```
+
+## Multiple catalogs with `conn.attach`
+
+`connect()` binds one lakehouse root as the **primary catalog**; `conn.attach(path, name=…)` binds
+more, so a single session can read and join across several lakehouses by **three-part name**
+(`catalog.schema.table`). In Microsoft Fabric a **Warehouse** and a **Lakehouse** are the same thing
+to duckrun — both are Delta in OneLake — *except a Warehouse is locked to writes*, so attach it
+`read_only=True` and keep the lakehouse writable. On OneLake tokens are automatic (nothing to pass in
+a Fabric notebook).
+
+```python
+import duckrun
+
+# primary catalog: a writable lakehouse. name= reads next to the others (else derived from the URL).
+conn = duckrun.connect(
+    "abfss://ws@onelake.dfs.fabric.microsoft.com/lakehouse.Lakehouse/Tables",
+    read_only=False, name="lakehouse")
+
+# attach a read-only Fabric Warehouse and a plain local folder as more catalogs
+conn.attach("abfss://ws@onelake.dfs.fabric.microsoft.com/warehouse.Warehouse/Tables",
+            name="warehouse", schema="mart", read_only=True)
+conn.attach("/data/reference", name="local")
+
+conn.catalog.listCatalogs()          # ['lakehouse', 'warehouse', 'local']
+
+# join across all three in one query — facts from the warehouse, dim from the lakehouse,
+# a lookup from local — and write the mart back to the (writable) lakehouse
+conn.sql("""
+    SELECT d.state, sum(f.mw) AS total_mw
+    FROM warehouse.mart.fct_summary f
+    JOIN mart.dim_duid d                ON d.duid = f.duid
+    LEFT JOIN local.dbo.fuel_factors lf ON lower(lf.fuel) = lower(d.fuel)
+    GROUP BY d.state
+""").write.mode("overwrite").saveAsTable("mart_generation_by_state")
+
+# the warehouse is read-only — a write into it is refused, not silently dropped
+conn.sql("SELECT 1 AS x").write.saveAsTable("warehouse.mart.nope")   # -> PermissionError
+```
+
+Naming: a table can be addressed 3-part (`warehouse.mart.fct_summary`, from anywhere), 2-part
+(`mart.fct_summary`, in the current catalog) or bare (`fct_summary`, in the current catalog + schema).
+`conn.catalog.setCurrentCatalog(name)` / `setCurrentDatabase(db)` move where unqualified names
+resolve. `name` is derived from a friendly path and is **mandatory for a GUID-only OneLake path**; one
+URL maps to one name (re-attaching either raises). `read_only` is **per-catalog**, independent of the
+session — a read-only reference store sits safely next to a writable lakehouse. Raw `conn.sql()` DML
+targets the current catalog; cross-catalog writes go through the DataFrame API
+(`df.write.saveAsTable("cat.schema.t")`) or `DeltaTable.forName(conn, "cat.schema.t")`.
+
+See the full runnable walkthrough in
+[`tests/integration_tests/multicatalog/demo_multicatalog.py`](../tests/integration_tests/multicatalog/demo_multicatalog.py)
+(published as a [live report](https://djouallah.github.io/duckrun/multicatalog.html)).
 
 ## Raw SQL DML through `conn.sql`
 

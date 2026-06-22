@@ -75,8 +75,19 @@ DeltaTable.forName(conn, "clean_orders").merge(src, "target.id = source.id") \
 conn.stop()
 ```
 
+**Multiple catalogs** — attach more lakehouses and read/join across them by three-part name. In
+Fabric a Warehouse is just a write-locked Lakehouse, so attach it `read_only=True` next to a writable
+one:
+
+```python
+conn.attach("abfss://…/warehouse.Warehouse/Tables", name="warehouse", read_only=True)
+conn.attach("/data/reference", name="local")
+conn.sql("select * from warehouse.mart.facts f join local.dbo.lookup l on l.id = f.id").show()
+```
+
 Works the same against a local path, `s3://`, `gs://`, or `az://`. Full method map:
-**[Connection API](docs/connection-api.md)** · **[Spark/Delta coverage](docs/spark-delta-parity.md)**.
+**[Connection API](docs/connection-api.md)** · **[Spark/Delta coverage](docs/spark-delta-parity.md)** ·
+[live multi-catalog demo](https://djouallah.github.io/duckrun/multicatalog.html).
 
 ## dbt adapter
 
