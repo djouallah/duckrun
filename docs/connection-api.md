@@ -156,12 +156,12 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 75 passed   ❌ 0 failed  │
-│ 75 methods · 100% passing │
+│ ✅ 77 passed   ❌ 0 failed  │
+│ 77 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### DataFrame API — 57/57 ✅
+### DataFrame API — 59/59 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
@@ -169,7 +169,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | --- | --- | :-: |
 | `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
 | `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns`, `refreshTable`, `getTable`, `getDatabase`, `dropTempView`, `listCatalogs`, `currentCatalog`, `setCurrentCatalog` | 15/15 ✅ |
-| `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow`, `first`, `head`, `take`, `isEmpty` | 10/10 ✅ |
+| `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow`, `first`, `head`, `take`, `isEmpty`, `schema`, `printSchema` | 12/12 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `json`, `versionAsOf`, `timestampAsOf_rejected` | 7/7 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 10/10 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `vacuum`, `restoreToVersion` | 11/11 ✅ |
