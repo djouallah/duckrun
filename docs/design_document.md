@@ -2,11 +2,22 @@
 
 ## Context
 
-**Purpose:** add dbt support for Delta Lake using **delta_rs** for writes as a pragmatic
-workaround until DuckDB's native Delta write support matures (today it is read-first, with
-only blind `INSERT` and no `UPDATE`/`DELETE`/`MERGE`). Until then, delta_rs does the writing
-and DuckDB does the reading; this design can be revisited once DuckDB Delta writes are
-reliable enough to take over.
+**Purpose** — duckrun is **glue over DuckDB + dbt-duckdb + delta_rs**, and exists to:
+
+- give **dbt** Delta Lake support, writing through **delta_rs** — a pragmatic workaround,
+  since DuckDB's native Delta writer appears tied to a Unity Catalog;
+- offer a **deliberately small DataFrame API** (shaped like the Spark / Delta `DeltaTable`
+  surface) to read and write Delta;
+- offer **SQL DML** (`conn.sql(...)`) to read and write Delta.
+
+**Anti-goal** — duckrun is *not* reimplementing Spark:
+
+- no extensive Spark DataFrame API (no fluent `select` / `filter` / `withColumn` transform
+  builder) and no Spark SQL engine;
+- transforms are written in **SQL**; the surface above is only the parity layer that makes
+  notebook code read familiarly. duckrun stays glue — it does not grow into an engine.
+
+
 
 The duckrun dbt adapter keeps **all state in Delta Lake**. Writes always go through
 **delta_rs** (overwrite / merge / append in `engine.py` + `delta_plugin.py`). DuckDB is

@@ -393,6 +393,13 @@ class DataFrame:
     def toPandas(self):
         return self.relation.df()
 
+    def toArrow(self):
+        """Spark's ``DataFrame.toArrow()`` by name — but **streaming, not materialized**. Spark
+        returns a fully-collected ``pyarrow.Table``; duckrun returns a lazy
+        ``pyarrow.RecordBatchReader`` (DuckDB's ``to_arrow_reader()``), so large results are pulled
+        one batch at a time instead of loaded whole into memory."""
+        return self.relation.to_arrow_reader()
+
     def collect(self):
         return self.relation.fetchall()
 

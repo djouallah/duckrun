@@ -146,6 +146,13 @@ class TestDataFrame:
         # DataFrame, so pandas+numpy are required — provided by the [test] extra.
         assert list(conn.sql("select name from src order by id").toPandas()["name"]) == ["a", "b", "c"]
 
+    def test_toArrow(self, conn):
+        # toArrow() returns a streaming pyarrow.RecordBatchReader (not a materialized Table).
+        import pyarrow as pa
+        reader = conn.sql("select name from src order by id").toArrow()
+        assert isinstance(reader, pa.RecordBatchReader)
+        assert reader.read_all().column("name").to_pylist() == ["a", "b", "c"]
+
     def test_relation_passthrough(self, conn):
         # unknown attrs fall through to the DuckDB relation (e.g. .fetchall())
         assert conn.sql("select 1").fetchall() == [(1,)]

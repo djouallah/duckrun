@@ -1,4 +1,4 @@
-# Coverage vs the Spark / Delta `DeltaTable` API
+# Coverage vs the Spark / Delta API
 
 duckrun's connection API (`duckrun.connect()`) deliberately targets **parity with the surface most
 data engineers already know** — PySpark's `SparkSession` / `DataFrame` family and Delta Lake's
@@ -25,18 +25,32 @@ that says *which mapped methods actually pass their tests*; this page says *what
 - 🚫 **by design** — deliberately not offered (SQL-first, or no Spark runtime). **Not a gap.**
 - ➖ not wired yet — could be added if asked for
 
+## Bespoke — duckrun-only, no Spark/Delta equivalent
+
+The **entire** invented surface is the three entries below — a path-based entry point and two
+runtime primitives. Everything else on this page either maps to a real Spark/delta-rs method, is a
+deliberate 🚫 omission, or is a ➖ TODO. There is nothing else masquerading as Spark.
+
+| duckrun | what it is | why there's no Spark name |
+| --- | --- | --- |
+| `duckrun.connect(path, storage_options=…, schema=…)` | open a session bound to one lakehouse root, addressed by a storage **path** | Spark's entry point is `SparkSession.builder…getOrCreate()` against a cluster — there's no cluster and no builder; one connection binds to one storage root |
+| `conn.refresh()` | re-discover the Delta tables under the store and re-register their views | duckrun finds tables by globbing storage for `_delta_log`; Spark's metastore is authoritative, so it never needs a "rescan the store" call |
+| `write.mode("safeappend")` | fail-loud compare-and-swap append (commits only if the table version hasn't moved) | no Spark `SaveMode` for it — it's the duckrun/dbt concurrency primitive |
+
+Private plumbing (`_resolve`, `_table_path`, `_connection`) is bespoke too but intentionally not
+part of the public surface, so it isn't tracked below. One naming note: `DeltaTable.delete(predicate)`
+uses delta-rs's parameter name (`predicate`) rather than delta-spark's (`condition`) — real API,
+not invented.
+
 ## `SparkSession` ↔ `duckrun.connect()` / `DuckSession`
 
 | Spark | duckrun | | Notes |
 | --- | --- | :-: | --- |
-| `SparkSession.builder…getOrCreate()` | `duckrun.connect(path, storage_options=…, schema=…)` | 🟡 | Entry point is a storage **path**, not a builder — one connection bound to one lakehouse root. |
 | `spark.sql(str)` | `conn.sql(str)` | ✅ | Plus raw **DML** routing to delta-rs (`create table as` / `insert` / `update` / `delete` / `alter add column` / `drop`). |
 | `spark.table(name)` | `conn.table(name)` | ✅ | |
 | `spark.read` | `conn.read` | ✅ | → `DataFrameReader`. |
 | `spark.catalog` | `conn.catalog` | ✅ | → `Catalog` (see below). |
-| `spark.createDataFrame(rows)` | `conn.sql("SELECT * FROM (VALUES …) t(…)")` | ➖ | TODO |
-| `spark.range(n)` | `conn.sql("SELECT … FROM range(n)")` | ➖ | TODO |
-| — | `conn.refresh()` | 🟡 | duckrun plumbing: re-discover the catalog. |
+| `spark.createDataFrame(rows)` | — | ➖ | TODO |
 
 ## `DataFrame`
 
@@ -50,12 +64,18 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `df.write` | `df.write` | ✅ | → `DataFrameWriter`. |
 | `df.collect()` | `df.collect()` | ✅ | |
 | `df.toPandas()` | `df.toPandas()` | ✅ | |
+| `df.toArrow()` | `df.toArrow()` | 🟡 | Spark collects a whole `pyarrow.Table`; duckrun returns a **streaming** `pyarrow.RecordBatchReader` (`to_arrow_reader()`) so big results don't materialize. |
 | `df.count()` | `df.count()` | ✅ | |
 | `df.show()` | `df.show()` | ✅ | |
+| `df.first()` | — | ➖ | TODO |
+| `df.head(n=1)` / `df.take(n)` | — | ➖ | TODO |
+| `df.isEmpty()` | — | ➖ | TODO |
 | `df.createOrReplaceTempView(name)` | `df.createOrReplaceTempView(name)` | ✅ | Native, ephemeral DuckDB view — not Delta, not in `conn.catalog`. |
 | `df.columns` | (passthrough) | 🟡 | Not reimplemented — `__getattr__` forwards to the DuckDB relation; a list of names, like Spark. |
 | `df.dtypes` | (passthrough) | 🟡 | Passthrough to the DuckDB relation — returns DuckDB types, not Spark `(name, type)` tuples. |
 | `df.schema` | — | ➖ | TODO |
+| `df.printSchema()` | — | ➖ | TODO |
+
 
 ## `DataFrameReader` (`conn.read`)
 
@@ -85,7 +105,6 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `write.partitionBy(*cols)` | `write.partitionBy(*cols)` | ✅ | |
 | `write.save(path)` | `write.save(path)` | ✅ | Write Delta by **path**. |
 | `write.saveAsTable(name)` | `write.saveAsTable(name)` | ✅ | Write Delta by **catalog name**. |
-| — | `write.mode("safeappend")` | 🟡 | duckrun extra: a fail-loud compare-and-swap append (no Spark equivalent). |
 | `write.insertInto(name)` | `write.insertInto(name)` | ✅ | Appends to an **existing** table (errors if missing); `overwrite=True` replaces all rows. |
 | `write.bucketBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 | `write.sortBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
@@ -101,11 +120,17 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.setCurrentDatabase(db)` | `catalog.setCurrentDatabase(db)` | ✅ | |
 | `catalog.tableExists(t, db)` | `catalog.tableExists(t, db)` | ✅ | |
 | `catalog.databaseExists(db)` | `catalog.databaseExists(db)` | ✅ | |
-| `catalog.cacheTable` | — | ➖ | TODO |
-| `catalog.clearCache` | — | ➖ | TODO |
-| `catalog.dropTempView` | `conn.sql("DROP VIEW name")` | ➖ | TODO |
-| `catalog.refreshTable` | `conn.refresh()` | ➖ | TODO |
-| `catalog.recoverPartitions` | — | ➖ | TODO (delta-rs gap) |
+| `catalog.getTable(t, db)` | — | ➖ | TODO — peer of `tableExists` / `listTables`. |
+| `catalog.getDatabase(db)` | — | ➖ | TODO — peer of `databaseExists` / `listDatabases`. |
+| `catalog.dropTempView(name)` | — | ➖ | TODO — inverse of `df.createOrReplaceTempView`. |
+| `catalog.createTable` / `createExternalTable` | — | ➖ | TODO — today use `df.write.saveAsTable`. |
+| `catalog.cacheTable` / `uncacheTable` / `isCached` / `clearCache` | — | ➖ | TODO — closest is materializing a TEMP table. |
+| `catalog.refreshTable` | — | ➖ | TODO — per-table; `conn.refresh()` (bespoke) rediscovers the whole store. |
+| `catalog.recoverPartitions` | — | ➖ | TODO (delta-rs gap). |
+| `catalog.refreshByPath` | — | 🚫 | Path reads aren't cached — nothing to refresh. |
+| `catalog.currentCatalog` / `setCurrentCatalog` / `listCatalogs` | — | ➖ | TODO — would map each attached lakehouse root to a catalog (multi-lakehouse); single-root today. |
+| `catalog.functionExists` / `listFunctions` / `registerFunction` | — | 🚫 | DuckDB owns the function namespace; not a duckrun catalog concept. |
+| `catalog.dropGlobalTempView` | — | 🚫 | No global-temp namespace in duckrun. |
 
 ## `DeltaTable` (Delta-on-Spark) ↔ `DeltaTable.forName(conn, name)`
 
@@ -128,8 +153,7 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.delete(predicate)` | `.delete(predicate)` | ✅ | delta-rs param name (`predicate`); takes literals, not `IN (SELECT …)`. |
 | `.update(condition, set)` | `.update(condition=…, set=…)` | ✅ | delta-spark signature. |
 | `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `df.write.option("replaceWhere", pred).mode("overwrite").save()` / `.saveAsTable()` | ✅ | Single atomic commit; snapshot-fenced. |
-| `.history()` | `.version()` | 🟡 | duckrun exposes delta-rs `DeltaTable.version()` (an int); full `.history()` is ➖ TODO. |
-| `spark.read.option("versionAsOf", N)` | `conn.read.option("versionAsOf", N).load(path)` (or `conn.sql("… delta_scan(path, version => N)")`) | ✅ | See the DataFrameReader table. |
+| `.history()` | — | ➖ | TODO — delta-rs exposes table history just fine. |
 | `.vacuum()` | — | ➖ | TODO |
 | `.optimize()` | — | ➖ | TODO |
 | `.generate()` | — | ➖ | TODO |
