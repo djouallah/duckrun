@@ -152,6 +152,40 @@ def test_validate_merge_allows_clause_configs():
     TableMerger clause list — see _custom_merge_clauses), so they pass validation."""
     Plugin._validate_merge_config({"merge_clauses": {"when_matched": [{"action": "update"}]}})
     Plugin._validate_merge_config({"merge_update_set_expressions": {"v": "v + 1"}})
+    # when_not_matched_by_source (full-sync delete/update) is a valid clause group too.
+    Plugin._validate_merge_config(
+        {"merge_clauses": {"when_not_matched_by_source": [{"action": "delete"}]}})
+
+
+def test_merge_clauses_translation_full_surface():
+    """_specs_from_merge_clauses maps a full CDC/sync merge_clauses dict onto ordered delta_rs clause
+    specs — matched update+delete, not-matched insert, and not-matched-by-source delete/update."""
+    cols = ["id", "name", "amount"]
+    specs = Plugin._specs_from_merge_clauses({
+        "when_matched": [
+            {"action": "delete", "condition": "DBT_INTERNAL_SOURCE.amount < 0"},
+            {"action": "update", "mode": "by_name"},
+        ],
+        "when_not_matched": [{"action": "insert", "mode": "by_name"}],
+        "when_not_matched_by_source": [{"action": "delete"}],
+    }, cols, "id")
+    kinds = [(s["clause"], s["action"]) for s in specs]
+    assert kinds == [
+        ("matched", "delete"), ("matched", "update_all"),
+        ("not_matched", "insert_all"), ("not_matched_by_source", "delete"),
+    ]
+    # DBT_INTERNAL_SOURCE alias rewritten to delta_rs's 'source' for the matched-delete predicate.
+    assert specs[0]["predicate"] == "source.amount < 0"
+
+    # by-source UPDATE needs an explicit set map (no source row to copy from).
+    upd = Plugin._specs_from_merge_clauses(
+        {"when_not_matched_by_source": [{"action": "update", "set": {"name": "'departed'"}}]},
+        cols, "id")
+    assert upd == [{"clause": "not_matched_by_source", "action": "update",
+                    "updates": {"name": "'departed'"}, "predicate": None}]
+    with pytest.raises(CompilationError, match="requires a 'set' map"):
+        Plugin._specs_from_merge_clauses(
+            {"when_not_matched_by_source": [{"action": "update"}]}, cols, "id")
 
 
 def test_validate_merge_allows_supported_conditions():

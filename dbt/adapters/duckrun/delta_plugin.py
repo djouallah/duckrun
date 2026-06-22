@@ -421,12 +421,13 @@ class Plugin(BasePlugin):
             if not is_mapping(merge_clauses):
                 errors.append(f"merge_clauses must be a dictionary, found: {merge_clauses}")
             else:
-                if "when_matched" not in merge_clauses and "when_not_matched" not in merge_clauses:
+                clause_keys = ("when_matched", "when_not_matched", "when_not_matched_by_source")
+                if not any(k in merge_clauses for k in clause_keys):
                     errors.append(
                         "merge_clauses must contain at least one of "
-                        "'when_matched' or 'when_not_matched' keys"
+                        "'when_matched', 'when_not_matched', or 'when_not_matched_by_source' keys"
                     )
-                for ct in ("when_matched", "when_not_matched"):
+                for ct in clause_keys:
                     if ct not in merge_clauses:
                         continue
                     clause = merge_clauses.get(ct)
@@ -604,7 +605,9 @@ class Plugin(BasePlugin):
     def _specs_from_merge_clauses(cls, merge_clauses: dict, columns, unique_key) -> list:
         """Translate a dbt-duckdb ``merge_clauses`` dict into delta_rs clause specs (applied in
         order). ``mode: by_name`` → UPDATE/INSERT all columns; ``mode: explicit`` → the columns named
-        by ``update``/``insert`` include/exclude; ``action: delete`` → matched delete."""
+        by ``update``/``insert`` include/exclude; ``action: delete`` → delete. ``when_matched`` →
+        update/delete, ``when_not_matched`` → insert, ``when_not_matched_by_source`` → update/delete
+        (rows the source doesn't carry — full-sync semantics)."""
         keys = cls._key_set(unique_key)
         allcols = [str(c) for c in columns]
         specs = []
@@ -640,6 +643,29 @@ class Plugin(BasePlugin):
                 raise CompilationError(
                     f"unsupported merge_clauses.when_not_matched action: {action!r} "
                     f"(expected 'insert')")
+        for c in merge_clauses.get("when_not_matched_by_source", []) or []:
+            action = (c.get("action") or "").lower()
+            cond = cls._rewrite_merge_aliases(c.get("condition"))
+            if action == "update":
+                cols = cls._explicit_cols(c.get("update"), allcols, keys)
+                # by-source rows have no source row, so columns can't be copied from source — only an
+                # explicit expression map makes sense. Support the common case (set literals/exprs)
+                # via merge_clauses' update.set, else require it.
+                set_map = c.get("set") or (c.get("update") or {}).get("set")
+                if set_map:
+                    specs.append({"clause": "not_matched_by_source", "action": "update",
+                                  "updates": {k: cls._rewrite_merge_aliases(v) for k, v in set_map.items()},
+                                  "predicate": cond})
+                else:
+                    raise CompilationError(
+                        "merge_clauses.when_not_matched_by_source update requires a 'set' map "
+                        "(by-source rows have no source columns to copy)")
+            elif action == "delete":
+                specs.append({"clause": "not_matched_by_source", "action": "delete", "predicate": cond})
+            else:
+                raise CompilationError(
+                    f"unsupported merge_clauses.when_not_matched_by_source action: {action!r} "
+                    f"(expected 'update' or 'delete')")
         return specs
 
     @staticmethod

@@ -656,7 +656,7 @@ class TestIncrementalMergeValidation:
         """Test validation fails for empty merge_clauses"""
         run_dbt(["run", "--select", "merge_empty_clauses"], expect_pass=True)
         result = run_dbt(["run", "--select", "merge_empty_clauses"], expect_pass=False)
-        assert "must contain at least one of 'when_matched' or 'when_not_matched'" in str(result.results[0].message)
+        assert "must contain at least one of 'when_matched', 'when_not_matched'" in str(result.results[0].message)
 
     def test_invalid_clause_list(self, project):
         """Test validation fails for non-list clause values"""
