@@ -112,12 +112,12 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 62 passed   ❌ 0 failed  │
-│ 62 methods · 100% passing │
+│ ✅ 63 passed   ❌ 0 failed  │
+│ 63 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### DataFrame API — 44/44 ✅
+### DataFrame API — 45/45 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
@@ -128,7 +128,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow` | 6/6 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `versionAsOf`, `timestampAsOf_rejected` | 6/6 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 10/10 ✅ |
-| `DeltaTable` | `forName`, `forPath`, `merge`, `version`, `history`, `delete`, `update` | 7/7 ✅ |
+| `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update` | 8/8 ✅ |
 
 ### duckrun-specific helpers — 18/18 ✅
 
