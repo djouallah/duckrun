@@ -162,4 +162,4 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.generate()` | — | ➖ | TODO |
 | `.restoreToVersion()` | — | ➖ | TODO |
 | `.clone()` | — | ➖ | TODO |
-| `convertToDelta` | — | ➖ | TODO |
+| `DeltaTable.convertToDelta(spark, ident, partitionSchema)` | `DeltaTable.convertToDelta(conn, ident, partitionSchema=None)` | ✅ | Zero-copy — writes a `_delta_log` over existing parquet, no data rewrite. `ident` is `"parquet.`<path>`"` (a bare path is also accepted); `partitionSchema` is a pyarrow `Schema` for a Hive-partitioned dir. |

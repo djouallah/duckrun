@@ -12,7 +12,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 from dbt.adapters.events.logging import AdapterLogger
-from deltalake import CommitProperties, DeltaTable, write_deltalake
+from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_deltalake
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 logger = AdapterLogger("Duckrun")
@@ -676,6 +676,21 @@ def table_history(path: str, storage_options: Optional[Dict[str, str]] = None,
     """Delta commit history (delta_rs ``DeltaTable.history``) — newest first; each entry is a dict
     with ``version``, ``timestamp``, ``operation``, etc. ``limit`` caps how many commits are read."""
     return _delta_table(path, storage_options).history(limit)
+
+
+def convert_to_delta(path: str, storage_options: Optional[Dict[str, str]] = None,
+                     *, partition_by=None, mode: str = "error") -> None:
+    """Write a Delta ``_delta_log`` over an existing parquet directory IN PLACE (delta-rs
+    ``convert_to_deltalake``) — zero-copy, the parquet files are not rewritten. ``partition_by`` is a
+    pyarrow ``Schema`` of the Hive-partition columns (None for an unpartitioned dir). ``mode='error'``
+    (delta-rs default) raises if ``path`` is already a Delta table; ``'ignore'`` makes it a no-op."""
+    kwargs: Dict = {"mode": mode}
+    if storage_options:
+        kwargs["storage_options"] = storage_options
+    if partition_by is not None:
+        kwargs["partition_by"] = partition_by
+        kwargs["partition_strategy"] = "hive"
+    convert_to_deltalake(path, **kwargs)
 
 
 def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:

@@ -9,9 +9,22 @@ Supported clauses map onto delta-rs's ``when_matched_update_all`` / ``when_match
 other than ``target``/``source``, update-only merges) raise a clear error rather than being
 silently dropped — the same posture the adapter takes for unsupported merge features.
 """
+import re
 from typing import Dict, List, Optional
 
 from dbt.adapters.duckrun import delta_dml, engine
+
+# delta-spark addresses the source parquet as ``"parquet.`<path>`"``; we accept that and a bare path.
+_PARQUET_IDENT = re.compile(r"^\s*parquet\s*\.\s*`(?P<path>.+)`\s*$", re.IGNORECASE | re.DOTALL)
+
+
+def _parse_parquet_identifier(identifier: str) -> str:
+    """Pull the directory out of a delta-spark ``"parquet.`<path>`"`` identifier; a bare path
+    (no ``parquet.`…``` wrapper) is returned as-is."""
+    if not isinstance(identifier, str) or not identifier.strip():
+        raise ValueError("convertToDelta identifier must be a non-empty path string.")
+    m = _PARQUET_IDENT.match(identifier)
+    return m.group("path").strip() if m else identifier.strip()
 
 # Condition parsing (the supported key-equality boundary) is shared with the raw-SQL MERGE handler
 # in delta_dml.parse_merge_condition, so the DataFrame builder and conn.sql("MERGE …") accept exactly
@@ -129,6 +142,25 @@ class DeltaTable:
     @classmethod
     def forPath(cls, session, path: str) -> "DeltaTable":
         return cls(session, path)
+
+    @classmethod
+    def convertToDelta(cls, session, identifier: str, partitionSchema=None) -> "DeltaTable":
+        """Convert an existing parquet directory to Delta IN PLACE and return a handle to it
+        (delta-spark ``DeltaTable.convertToDelta``). The conversion is **zero-copy** — a
+        ``_delta_log`` is written over the parquet, the data files are not rewritten.
+
+        ``identifier`` is the delta-spark form ``"parquet.`<path>`"`` (a bare ``<path>`` is also
+        accepted). ``partitionSchema`` is a pyarrow ``Schema`` of the Hive-partition columns for a
+        partitioned dir, or ``None`` when unpartitioned. The path is storage-neutral (local / s3 /
+        gs / az / OneLake) — reads use the session's already-minted credentials.
+
+        The result is a by-path table: read it back with ``conn.read.format('delta').load(path)``, or
+        if it sits under a catalog root, ``conn.refresh()`` to surface it as a discoverable view.
+        """
+        path = _parse_parquet_identifier(identifier).replace("\\", "/").rstrip("/")
+        session._require_writable("convert parquet to Delta")
+        engine.convert_to_delta(path, session.storage_options, partition_by=partitionSchema)
+        return cls.forPath(session, path)
 
     def merge(self, source, condition: str) -> DeltaMergeBuilder:
         """Begin a DataFrame-style merge of ``source`` into this table on ``condition``.
