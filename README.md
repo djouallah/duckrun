@@ -130,7 +130,7 @@ None of this is required to use duckrun.
 | [dbt adapter](docs/dbt-adapter.md) | Profiles, materializations, incremental strategies, sources, maintenance, limitations. |
 | [Design document](docs/design_document.md) | Why delta-rs (not DuckDB's native Delta writer), why Delta (not Iceberg), why a separate adapter. |
 | [dbt adapter conformance](docs/conformance.md) | Official `dbt-tests-adapter` results, regenerated on every push to `main`. |
-| [Incremental MERGE benchmark](docs/merge-benchmark.md) | ~120M-row TPCH merge / append / overwrite scorecard — the release gate. |
+| [Incremental MERGE benchmark](docs/merge-benchmark.md) | ~60M-row TPCH merge / append / overwrite scorecard — the release gate. |
 
 ## License
 

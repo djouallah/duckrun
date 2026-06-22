@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.21] - 2026-06-22
+
 ### Added
+- **Full delta-rs `MERGE` parity on the connection API** (`conn.sql` raw `MERGE` + the
+  `DeltaTable.merge` builder). Beyond the upsert subset, both surfaces now accept everything delta-rs
+  `TableMerger` exposes: `WHEN MATCHED … THEN DELETE`, `WHEN MATCHED … THEN UPDATE SET col = <expr>`
+  (arbitrary expressions, incl. `CASE`), `WHEN NOT MATCHED … THEN INSERT (cols) VALUES (<exprs>)`,
+  `WHEN NOT MATCHED BY SOURCE … THEN UPDATE/DELETE`, **multiple clauses of the same kind in order**,
+  and an arbitrary boolean `ON` predicate (multi-key / range / non-equi). The dbt incremental path and
+  its single-snapshot read-pin / OCC concurrency guarantees are unchanged.
+- **dbt `merge_clauses` and `merge_update_set_expressions` configs** are now honored — an ordered,
+  user-specified clause list and arbitrary `SET col = expr` updates route through the same clause core.
+  (`merge_returning_columns` stays rejected — delta-rs `execute()` returns metrics, not rows.)
 - **Multiple catalogs in one session.** `conn.attach(path, name=…)` binds a second+ lakehouse root as
   a named catalog, so a single session reads and joins across several lakehouses by three-part
   `catalog.schema.table` name. `read_only` is **per-catalog** — a read-only reference store (e.g. a
