@@ -221,7 +221,7 @@ def test_set_write_memory_limit_respects_lower_baseline(monkeypatch):
 
 def test_set_write_memory_limit_loosens_from_prior_merge_tighten(monkeypatch):
     """Set absolutely from the baseline (not tighten-only): a prior merge left memory_limit at its
-    0.3 share, and the next write must loosen it back up to its larger 0.8 write share."""
+    0.3 share, and the next write must loosen it back up to its larger 0.85 write share."""
     monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
     merge_share = f"{int(16 * 2 ** 30 * engine._DUCKDB_MEM_FRACTION)}B"
     con = _FakeCon({"memory_limit": merge_share, "temp_directory": ".tmp"})
