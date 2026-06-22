@@ -78,12 +78,12 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 52 passed   ❌ 0 failed  │
-│ 52 methods · 100% passing │
+│ ✅ 54 passed   ❌ 0 failed  │
+│ 54 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### DataFrame API — 36/36 ✅
+### DataFrame API — 39/39 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
@@ -92,11 +92,11 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
 | `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns` | 8/8 ✅ |
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas` | 5/5 ✅ |
-| `DataFrameReader` | `format/load`, `table`, `parquet`, `csv` | 4/4 ✅ |
-| `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 8/8 ✅ |
-| `DeltaTable` | `forName`, `forPath`, `merge`, `version`, `delete`, `update`, `replaceWhere` | 7/7 ✅ |
+| `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `versionAsOf`, `timestampAsOf_rejected` | 6/6 ✅ |
+| `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 10/10 ✅ |
+| `DeltaTable` | `forName`, `forPath`, `merge`, `version`, `delete`, `update` | 6/6 ✅ |
 
-### duckrun-specific helpers — 16/16 ✅
+### duckrun-specific helpers — 15/15 ✅
 
 > Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).
 
@@ -107,7 +107,6 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `connection` | `DuckSession` | ✅ |
 | `table_path` | `DuckSession` | ✅ |
 | `__getattr__` | `DataFrame` | ✅ |
-| `delta` | `DataFrameReader` | ✅ |
 | `SELECT (passthrough)` | `sql()` | ✅ |
 | `version-pinned read` | `sql()` | ✅ |
 | `create table as` | `sql()` | ✅ |
