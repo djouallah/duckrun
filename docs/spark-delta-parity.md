@@ -125,7 +125,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.databaseExists(db)` | `catalog.databaseExists(db)` | ✅ | |
 | `catalog.getTable(t, db)` | — | ➖ | TODO — peer of `tableExists` / `listTables`. |
 | `catalog.getDatabase(db)` | — | ➖ | TODO — peer of `databaseExists` / `listDatabases`. |
-| `catalog.dropTempView(name)` | — | ➖ | TODO — inverse of `df.createOrReplaceTempView`. |
+| `catalog.dropTempView(name)` | `catalog.dropTempView(name)` | ✅ | Inverse of `df.createOrReplaceTempView`; returns `True` if the view existed. |
 | `catalog.createTable` / `createExternalTable` | — | ➖ | TODO — today use `df.write.saveAsTable`. |
 | `catalog.cacheTable` / `uncacheTable` / `isCached` / `clearCache` | — | ➖ | TODO — closest is materializing a TEMP table. |
 | `catalog.refreshTable` | — | ➖ | TODO — per-table; `conn.refresh()` (bespoke) rediscovers the whole store. |
