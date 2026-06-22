@@ -228,48 +228,67 @@ def _strip_comments(sql: str) -> str:
     return "".join(out)
 
 
-def _find_top_level(s: str, pattern) -> int:
-    """Index of the first ``pattern`` match at paren-depth 0 and outside quotes, else -1.
+# A ``CASE … END`` expression nests its own ``WHEN``/``THEN`` keywords; treat it as a depth level (like
+# parens) so a ``CASE WHEN … THEN …`` inside a MERGE clause action/predicate isn't mistaken for the
+# structural MERGE ``WHEN``/``THEN``. Detected at an identifier boundary so ``staircase``/``append`` etc.
+# don't trip it (the surrounding scan already skips quoted identifiers and string literals).
+_CASE_KW = re.compile(r"case\b", re.I)
+_END_KW = re.compile(r"end\b", re.I)
 
-    Lets us tell a top-level clause (the ``FROM`` of ``UPDATE … FROM``, the verb after a leading
-    ``WITH``) from the same keyword nested in a subquery, without a full SQL parser."""
-    depth, quote, i, n = 0, None, 0, len(s)
+
+def _top_level(s: str, pattern, find_all: bool):
+    """Find ``pattern`` matches at paren-depth 0, outside quotes, and outside any ``CASE … END``
+    expression. Returns a list of indices when ``find_all`` else the first index (or -1). Lets us
+    tell a structural keyword (the ``FROM`` of ``UPDATE … FROM``, the verb after a leading ``WITH``,
+    each MERGE ``WHEN``) from the same word nested in a subquery or a ``CASE`` — without a full parser."""
+    out: List[int] = []
+    depth = case_depth = 0
+    quote, i, n = None, 0, len(s)
     while i < n:
         ch = s[i]
         if quote:
             if ch == quote:
                 quote = None
-        elif ch in ("'", '"'):
+            i += 1
+            continue
+        if ch in ("'", '"'):
             quote = ch
-        elif ch in "([":
+            i += 1
+            continue
+        if ch in "([":
             depth += 1
-        elif ch in ")]":
+            i += 1
+            continue
+        if ch in ")]":
             depth -= 1
-        elif depth == 0 and pattern.match(s, i):
-            return i
+            i += 1
+            continue
+        at_boundary = not (i and (s[i - 1].isalnum() or s[i - 1] == "_"))
+        if at_boundary and _CASE_KW.match(s, i):
+            case_depth += 1
+            i += 4
+            continue
+        if at_boundary and _END_KW.match(s, i):
+            case_depth = max(0, case_depth - 1)
+            i += 3
+            continue
+        if depth == 0 and case_depth == 0 and pattern.match(s, i):
+            if not find_all:
+                return i
+            out.append(i)
         i += 1
-    return -1
+    return out if find_all else -1
+
+
+def _find_top_level(s: str, pattern) -> int:
+    """First index where ``pattern`` matches at the top level (see :func:`_top_level`), else -1."""
+    return _top_level(s, pattern, find_all=False)
 
 
 def _find_all_top_level(s: str, pattern) -> List[int]:
-    """Every index where ``pattern`` matches at paren-depth 0 and outside quotes (see
-    :func:`_find_top_level`). Used to split a MERGE body on each top-level ``WHEN``."""
-    out, depth, quote, i, n = [], 0, None, 0, len(s)
-    while i < n:
-        ch = s[i]
-        if quote:
-            if ch == quote:
-                quote = None
-        elif ch in ("'", '"'):
-            quote = ch
-        elif ch in "([":
-            depth += 1
-        elif ch in ")]":
-            depth -= 1
-        elif depth == 0 and pattern.match(s, i):
-            out.append(i)
-        i += 1
-    return out
+    """Every index where ``pattern`` matches at the top level (see :func:`_top_level`). Used to split
+    a MERGE body on each structural ``WHEN``."""
+    return _top_level(s, pattern, find_all=True)
 
 
 def _split_leading_with(sql: str) -> Tuple[str, str]:

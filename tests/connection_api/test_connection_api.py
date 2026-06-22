@@ -620,6 +620,16 @@ class TestSqlDml:
                  "WHEN NOT MATCHED THEN INSERT *")
         assert conn.sql("select name from src where id = 1").fetchone()[0] == "X!"
 
+    def test_sql_merge_case_expression(self, conn):
+        # a CASE WHEN … THEN … END inside a clause action carries its OWN when/then keywords; the
+        # clause splitter is CASE-aware so they aren't mistaken for the structural MERGE WHEN/THEN.
+        conn.sql("MERGE INTO src USING (values (1,'x'),(9,'z')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET "
+                 "  name = case when source.id = 1 then 'one' else source.name end "
+                 "WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "one"   # CASE true branch
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"     # inserted
+
     def test_sql_merge_by_source_update(self, conn):
         # WHEN NOT MATCHED BY SOURCE THEN UPDATE — touch rows the source doesn't carry.
         conn.sql("MERGE INTO src USING (values (1,'A')) t(id, name) ON target.id = source.id "
