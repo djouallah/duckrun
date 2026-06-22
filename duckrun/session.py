@@ -58,9 +58,10 @@ _MULTI_MSG = (
     "conn.sql() runs one statement at a time — split the batch into separate conn.sql() calls."
 )
 _READ_ONLY_MSG = (
-    "connection is read-only — cannot {op}. duckrun.connect() opens read-only by default; "
-    "pass read_only=False to enable Delta writes "
-    "(saveAsTable / insertInto / save / merge / insert / update / delete / replaceWhere)."
+    "catalog '{catalog}' is read-only — cannot {op}. duckrun opens read-only by default; enable "
+    "Delta writes (saveAsTable / insertInto / save / merge / insert / update / delete / replaceWhere) "
+    "with connect(read_only=False) for the primary, or conn.attach(path, name='{catalog}', "
+    "read_only=False) for an attached catalog."
 )
 
 
@@ -206,8 +207,10 @@ def _split_root_schema(path: str, schema: Optional[str]):
 
 
 # One attached lakehouse root = one DuckDB catalog. The primary (from connect) is the first entry;
-# attach() adds more. `schema_filter` mirrors connect's `schema=` (restrict discovery to one schema).
-_CatEntry = namedtuple("_CatEntry", ["name", "root_path", "storage_options", "schema_filter"])
+# attach() adds more. `schema_filter` mirrors connect's `schema=` (restrict discovery to one schema);
+# `read_only` is per-catalog so a read-only reference store (e.g. a Fabric Warehouse) can sit next to
+# a writable lakehouse in one session.
+_CatEntry = namedtuple("_CatEntry", ["name", "root_path", "storage_options", "schema_filter", "read_only"])
 
 
 def _derive_catalog_name(root_path: str) -> Optional[str]:
@@ -313,11 +316,13 @@ class DuckSession:
         return self._catalogs[self._current_catalog].storage_options
 
     def _attach_catalog(self, name: str, root: str, storage_options, schema_filter,
-                        primary: bool = False, quiet: bool = True):
+                        primary: bool = False, quiet: bool = True, read_only=None):
         """Register a lakehouse root as a named DuckDB catalog, mint its read secret, discover its
         tables. The primary keeps the original unscoped OneLake secret; attached catalogs get a
-        path-scoped secret so two different OneLake tokens can coexist in one connection."""
+        path-scoped secret so two different OneLake tokens can coexist in one connection. ``read_only``
+        defaults to the session default (the primary's mode) when None."""
         root = root.replace("\\", "/").rstrip("/")
+        ro = self.read_only if read_only is None else bool(read_only)
         so = dict(storage_options) if storage_options else None
         # OneLake with no caller-supplied token: acquire one (Fabric / env / azure-identity) so both
         # the DuckDB read secret and delta-rs writes can authenticate.
@@ -334,21 +339,24 @@ class DuckSession:
             print(f"⚠️  could not mint OneLake secret for catalog '{name}': {exc}")
 
         self.con.execute(f"ATTACH ':memory:' AS {_qid(name)}")
-        self._catalogs[name] = _CatEntry(name, root, so, schema_filter)
+        self._catalogs[name] = _CatEntry(name, root, so, schema_filter, ro)
         if primary:
             self._current_catalog = name
         self._refresh_catalog(name, quiet=quiet)
 
     def attach(self, path: str, name: Optional[str] = None,
                storage_options: Optional[Dict[str, str]] = None,
-               schema: Optional[str] = None) -> "DuckSession":
+               schema: Optional[str] = None, read_only: Optional[bool] = None) -> "DuckSession":
         """Attach a second+ lakehouse as a named catalog, so ``catalog.schema.table`` resolves across
         lakehouses.
 
         ``name`` is derived from a friendly path when omitted, but is **mandatory** for a GUID-only
         OneLake path (raises, since there is no readable name to derive). The mapping is bijective:
         re-attaching a URL (under any name), or reusing a name, raises. ``schema`` restricts discovery
-        to a single schema, exactly as in :func:`connect`. Returns ``self`` so it chains.
+        to a single schema, exactly as in :func:`connect`. ``read_only`` fences writes to *this* catalog
+        independently of the session (default: inherit the session's mode) — so a read-only reference
+        store (e.g. a Fabric Warehouse) can sit next to a writable lakehouse. Returns ``self`` so it
+        chains.
         """
         root, schema_filter = _split_root_schema(path, schema)
         root = root.replace("\\", "/").rstrip("/")
@@ -364,7 +372,8 @@ class DuckSession:
         for entry in self._catalogs.values():
             if entry.root_path == root:
                 raise ValueError(f"that lakehouse is already attached as catalog '{entry.name}'.")
-        self._attach_catalog(name, root, storage_options, schema_filter, primary=False, quiet=False)
+        self._attach_catalog(name, root, storage_options, schema_filter, primary=False, quiet=False,
+                             read_only=read_only)
         return self
 
     # ---- discovery -------------------------------------------------------------------------
@@ -499,11 +508,14 @@ class DuckSession:
             return self._current_catalog, parts[0], parts[1]
         return self._current_catalog, self._current_database, parts[0]
 
-    def _require_writable(self, op: str):
-        """Raise unless this session was opened with ``read_only=False``. Guards every Delta-write
-        entry point (the DataFrame write API, the DeltaTable mutators, and raw write-DML in sql())."""
-        if self.read_only:
-            raise PermissionError(_READ_ONLY_MSG.format(op=op))
+    def _require_writable(self, op: str, catalog: Optional[str] = None):
+        """Raise unless the target catalog (default: the current one) is writable. Guards every
+        Delta-write entry point (the DataFrame write API, the DeltaTable mutators, and raw write-DML
+        in sql()). ``read_only`` is per-catalog, so a read-only attached store fails loud here even
+        when the session/primary is writable."""
+        cat = catalog if catalog is not None else self._current_catalog
+        if self._catalogs[cat].read_only:
+            raise PermissionError(_READ_ONLY_MSG.format(op=op, catalog=cat))
 
     # ---- DataFrame-style surface --------------------------------------------------------------
 
@@ -524,8 +536,10 @@ class DuckSession:
         ``DeltaTable.forName(conn, name).merge(...)/.delete()/.update()``.
         ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
         """
-        if self.read_only and _is_delta_write(query):  # _WRITE_KEYWORD_RE covers insert/update/delete/merge
-            raise PermissionError(_READ_ONLY_MSG.format(op="run write DML"))
+        # Raw write-DML targets the current catalog (cross-catalog raw DML is rejected below), so the
+        # read-only gate is the current catalog's. _WRITE_KEYWORD_RE covers insert/update/delete/merge.
+        if self._catalogs[self._current_catalog].read_only and _is_delta_write(query):
+            raise PermissionError(_READ_ONLY_MSG.format(op="run write DML", catalog=self._current_catalog))
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)
@@ -742,12 +756,12 @@ class DataFrameWriter:
         self._partition_by = list(cols)
         return self
 
-    def _write(self, path: str, descr: str, so=None) -> None:
+    def _write(self, path: str, descr: str, so=None, catalog=None) -> None:
         """Apply the configured mode to the Delta table at ``path`` (storage-neutral). ``descr``
-        names the target in the mode='error' message. ``so`` is the target catalog's storage_options
-        (defaults to the current catalog's). Shared by saveAsTable and save."""
+        names the target in the mode='error' message. ``so`` / ``catalog`` are the target catalog's
+        storage_options / name (default to the current catalog's). Shared by saveAsTable and save."""
         session = self._df.session
-        session._require_writable("write a Delta table")
+        session._require_writable("write a Delta table", catalog)
         if so is None:
             so = session.storage_options
 
@@ -831,7 +845,7 @@ class DataFrameWriter:
         catalog, schema, table = session._resolve(name)
         path = session._table_path(schema, table, catalog)
         self._write(path, f"table '{catalog}.{schema}.{table}'",
-                    session._catalog_storage_options(catalog))
+                    session._catalog_storage_options(catalog), catalog)
         # Surface the (new or grown) table immediately — no manual refresh() needed.
         session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(catalog)}.{_qid(schema)}")
         session._register_view(catalog, schema, table)
@@ -936,13 +950,17 @@ class Catalog:
                 f"unknown catalog '{catalogName}'; attached catalogs: {list(sess._catalogs)}."
             )
         sess._current_catalog = catalogName
-        rows = sess.con.execute(
-            "SELECT schema_name FROM information_schema.schemata "
-            "WHERE catalog_name = ? ORDER BY schema_name",
-            [catalogName],
-        ).fetchall()
-        schemas = [r[0] for r in rows if r[0] not in self._SKIP_SCHEMAS]
-        sess._current_database = "dbo" if "dbo" in schemas else (schemas[0] if schemas else "dbo")
+        schema_filter = sess._catalogs[catalogName].schema_filter
+        if schema_filter is not None:
+            sess._current_database = schema_filter  # the catalog was attached pinned to one schema
+        else:
+            rows = sess.con.execute(
+                "SELECT schema_name FROM information_schema.schemata "
+                "WHERE catalog_name = ? ORDER BY schema_name",
+                [catalogName],
+            ).fetchall()
+            schemas = [r[0] for r in rows if r[0] not in self._SKIP_SCHEMAS]
+            sess._current_database = "dbo" if "dbo" in schemas else (schemas[0] if schemas else "dbo")
         sess._use(catalogName, sess._current_database)
 
 

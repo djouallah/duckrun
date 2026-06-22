@@ -1074,6 +1074,27 @@ def test_cross_catalog_raw_dml_rejected(tmp_path):
     assert conn.sql("select count(*) from t1").fetchone()[0] == 3
 
 
+def test_attach_read_only_catalog_fences_writes(tmp_path):
+    # A read-only attached catalog fences writes independently of the (writable) session/primary —
+    # so a reference store (e.g. a Fabric Warehouse) can sit next to a writable lakehouse.
+    a, b = str(tmp_path / "lhA"), str(tmp_path / "ref")
+    _write_table(a + "/dbo/t1", "select 1 as id")
+    _write_table(b + "/dbo/lookup", "select 1 as id, 'one' as label")
+    conn = duckrun.connect(a, read_only=False)              # primary writable
+    conn.attach(b, name="ref", read_only=True)              # attached read-only
+
+    # the read-only catalog still reads (cross-catalog) ...
+    assert conn.sql("select label from ref.dbo.lookup").fetchone()[0] == "one"
+    # ... but every write entry point into it fails loud, even though the session is writable.
+    with pytest.raises(PermissionError):
+        conn.sql("select 2 as id, 'two' as label").write.mode("append").saveAsTable("ref.dbo.lookup")
+    with pytest.raises(PermissionError):
+        DeltaTable.forName(conn, "ref.dbo.lookup").delete("id = 1")
+    # writes to the writable primary still work.
+    conn.sql("select 2 as id").write.mode("append").saveAsTable("t1")
+    assert conn.sql("select count(*) from t1").fetchone()[0] == 2
+
+
 def test_stop_closes_connection(tmp_path):
     conn = _two_lakehouses(tmp_path)
     conn.stop()

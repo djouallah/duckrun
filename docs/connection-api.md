@@ -16,8 +16,10 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   `conn.attach(path, name=…)` and address them as `catalog.schema.table`. `conn.catalog.listCatalogs()`
   / `currentCatalog()` / `setCurrentCatalog(name)` switch which catalog unqualified / 2-part names
   resolve in. `name` is derived from a friendly path (mandatory for a GUID-only OneLake path); one URL
-  maps to one name. Raw `conn.sql()` DML targets the current catalog — cross-catalog writes go through
-  the DataFrame API (`df.write.saveAsTable("cat.schema.t")`) or `DeltaTable.forName(conn, "cat.schema.t")`.
+  maps to one name. `attach(..., read_only=True)` fences writes to *that* catalog independently of the
+  session, so a read-only reference store (e.g. a Fabric Warehouse) can sit next to a writable lakehouse.
+  Raw `conn.sql()` DML targets the current catalog — cross-catalog writes go through the DataFrame API
+  (`df.write.saveAsTable("cat.schema.t")`) or `DeltaTable.forName(conn, "cat.schema.t")`.
 
 `connect()` is **read-only by default**: every Delta write (`saveAsTable` / `insertInto` / `save` /
 `merge` / `insert` / `update` / `delete` / `replaceWhere`) raises `PermissionError`, so an accidental

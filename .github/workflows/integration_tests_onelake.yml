@@ -30,6 +30,7 @@ on:
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/sde_dbt_tutorial/**'
       - 'tests/integration_tests/taxi/**'
+      - 'tests/integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
       - 'tests/tools/merge_tpch_bench.py'
       - 'docs/site/**'
@@ -41,6 +42,7 @@ on:
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/sde_dbt_tutorial/**'
       - 'tests/integration_tests/taxi/**'
+      - 'tests/integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
       - 'tests/tools/merge_tpch_bench.py'
       - 'docs/site/**'
@@ -289,6 +291,52 @@ jobs:
           path: taxi_run.html
           if-no-files-found: warn
 
+  multicatalog:
+    # The multi-catalog connection-API showcase (a runnable demo, not a gate): one session binds the
+    # writable OneLake lakehouse, a READ-ONLY Fabric Warehouse, and a local scratch dir as three
+    # catalogs, JOINs across them, and writes a mart back to the lakehouse. Non-fatal like taxi.
+    runs-on: ubuntu-latest
+    concurrency:
+      group: multicatalog-onelake
+      cancel-in-progress: false
+    env:
+      AZURE_TRANSPORT_OPTION_TYPE: curl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun (pulls duckdb + deltalake)
+        run: pip install -e .
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Multi-catalog live demo (lakehouse + read-only warehouse + local scratch)
+        continue-on-error: true
+        env:
+          # writable aemo lakehouse (the shared sample lakehouse) + the read-only Fabric Warehouse.
+          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          WAREHOUSE_RO_PATH: abfss://d5f25039-7f33-4668-b909-2c397b2626fb@onelake.dfs.fabric.microsoft.com/61bf56ea-a4d5-4895-a90e-a6daa6e02d04/Tables
+          DUCKRUN_MULTICAT_SCHEMA: multicatalog_demo
+          DUCKRUN_MULTICAT_PAGE: multicatalog_run.html   # the demo writes its full HTML report here
+        run: python tests/integration_tests/multicatalog/demo_multicatalog.py
+
+      - name: Upload this run's HTML report for deploy-docs to publish as multicatalog.html
+        if: always() && hashFiles('multicatalog_run.html') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-multicatalog-page
+          path: multicatalog_run.html
+          if-no-files-found: warn
+
   sde:
     # The josephmachado/simple_dbt_project port: a tiny LOCAL full build for the docs catalog
     # (order_status_pivot needs the gold table to exist at parse time, so it can't be DAG-only),
@@ -347,10 +395,10 @@ jobs:
     # combined dbt-docs site to GitHub Pages (main only). `needs` all four, so any project job failing
     # (or a non-main branch) skips publishing automatically; PR/feature runs still get the four
     # per-project artifacts from their own jobs.
-    needs: [aemo, merge_spill, coffee, sde, taxi]
-    # Wait for taxi (so its scorecard artifact is ready) but DON'T let a flaky OneLake taxi run block
-    # publishing: require only the four dbt jobs to have succeeded; taxi's result is tolerated (a
-    # missing card just falls back to the placeholder).
+    needs: [aemo, merge_spill, coffee, sde, taxi, multicatalog]
+    # Wait for taxi + multicatalog (so their report artifacts are ready) but DON'T let a flaky OneLake
+    # run block publishing: require only the four dbt jobs to have succeeded; the two demo jobs'
+    # results are tolerated (a missing report just falls back to the committed placeholder).
     if: >-
       always() && github.ref == 'refs/heads/main'
       && needs.aemo.result == 'success' && needs.merge_spill.result == 'success'
@@ -384,6 +432,14 @@ jobs:
             echo "published THIS run's taxi report."
           else
             echo "no taxi report artifact — publishing the committed taxi.html."
+          fi
+          # Same pattern for the multi-catalog report: committed fallback, overwritten by this run's.
+          cp docs/site/multicatalog.html                       dbt-docs-site/multicatalog.html
+          if [ -f docs-artifacts/docs-multicatalog-page/multicatalog_run.html ]; then
+            cp docs-artifacts/docs-multicatalog-page/multicatalog_run.html dbt-docs-site/multicatalog.html
+            echo "published THIS run's multicatalog report."
+          else
+            echo "no multicatalog report artifact — publishing the committed multicatalog.html."
           fi
       - name: Package docs for Pages
         uses: actions/upload-pages-artifact@v3

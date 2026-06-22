@@ -80,6 +80,15 @@
       concurrent-MERGE clash. <strong>Click through</strong> for every statement and its actual output from a live run.</span>
       <span class="src">source: <a href="https://github.com/djouallah/duckrun/blob/main/tests/integration_tests/taxi/demo_taxi.py">demo_taxi.py</a></span>
     </li>
+    <li>
+      <a href="multicatalog.html">multi-catalog — lakehouse + warehouse + local</a><span class="tag">not a dbt project</span>
+      <span class="desc">One <code>duckrun.connect()</code> session binding three catalogs: a <strong>writable</strong> OneLake
+      lakehouse, a <strong>read-only</strong> Fabric Warehouse (<code>attach(..., read_only=True)</code>), and a local
+      scratch dir. A single <code>conn.sql</code> JOINs across them as <code>catalog.schema.table</code>, the
+      read-only fence refuses a warehouse write, and the mart is written back to the lakehouse. <strong>Click through</strong>
+      for every step and its actual output.</span>
+      <span class="src">source: <a href="https://github.com/djouallah/duckrun/blob/main/tests/integration_tests/multicatalog/demo_multicatalog.py">demo_multicatalog.py</a></span>
+    </li>
   </ul>
 
   <footer>

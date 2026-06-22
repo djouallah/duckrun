@@ -99,7 +99,7 @@ class DeltaMergeBuilder:
         return self
 
     def execute(self) -> None:
-        self._table._session._require_writable("merge")
+        self._table._session._require_writable("merge", self._table._catalog)
         if self._matched is None and self._not_matched is None and not self._by_source_delete:
             raise ValueError("merge has no clauses; add whenMatchedUpdate*/whenNotMatchedInsertAll/"
                              "whenNotMatchedBySourceDelete.")
@@ -187,7 +187,7 @@ class DeltaTable:
     def delete(self, predicate: Optional[str] = None) -> None:
         """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
         when ``predicate`` is None. ``DeltaTable.delete``."""
-        self._session._require_writable("delete")
+        self._session._require_writable("delete", self._catalog)
         engine.delete_rows(self.path, predicate, storage_options=self.storage_options,
                            compaction_threshold=self.compaction_threshold)
         self._refresh_view()
@@ -197,7 +197,7 @@ class DeltaTable:
         every row when ``condition`` is None. Mirrors delta-spark ``DeltaTable.update``."""
         if not set:
             raise ValueError("update() requires a non-empty 'set' mapping of {column: expression}.")
-        self._session._require_writable("update")
+        self._session._require_writable("update", self._catalog)
         engine.update_rows(self.path, set, condition, storage_options=self.storage_options,
                            compaction_threshold=self.compaction_threshold)
         self._refresh_view()
