@@ -38,6 +38,13 @@ SCHEMA = "mart"
 MARK_UPSERT = "-1.0"
 MARK_UPDATE = "-2.0"
 FUTURE_SHIPDATE = "2035-06-15"
+# Full-surface scenarios (local-only): CDC tombstone/update markers + insert shipdate, full-sync
+# update marker, and the expression-update marker.
+MARK_CDC_DELETE = "-7.0"
+MARK_CDC_UPDATE = "-8.0"
+CDC_INSERT_SHIPDATE = "2036-01-01"
+MARK_SYNC = "-5.0"
+MARK_EXPR = "-9.0"
 
 
 def _peak_rss_mb():
@@ -234,6 +241,74 @@ class Bench:
                 "peak_mb": self.peak_mb,
                 "verify": f"table replaced with the {after:,}-row batch (no target scan)"}
 
+    # -- full-surface MERGE scenarios (delta_rs's complete clause set via dbt merge_clauses /
+    #    merge_update_set_expressions) — LOCAL stress only; the OneLake job skips them to stay fast --
+
+    def cdc(self, model):
+        """CDC change-set in ONE merge: matched DELETE (tombstones) + matched UPDATE + NOT MATCHED
+        INSERT. Deletes are a deterministic 1% slice counted BEFORE the merge; inserts/updates carry
+        markers counted after, so the net count closes (after == before + inserts - deletes)."""
+        p = self.path(model)
+        before = self.count(model)
+        deletes = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_orderkey % 100 = 7")
+        dt = self.dbt(model)
+        after = self.count(model)
+        inserts = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_shipdate = DATE '{CDC_INSERT_SHIPDATE}'")
+        updates = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_quantity = {MARK_CDC_UPDATE}")
+        # the delete clause must have removed the tombstoned slice (none left, and none survived as
+        # a stale -7 marker — that would mean the UPDATE clause caught them instead of DELETE).
+        tombstones_left = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_quantity = {MARK_CDC_DELETE}")
+        slice_left = self.q(
+            f"SELECT count(*) FROM delta_scan('{p}') WHERE l_orderkey % 100 = 7 "
+            f"AND l_shipdate <> DATE '{CDC_INSERT_SHIPDATE}'")
+        expected = before + inserts - deletes
+        return {"name": "CDC merge (delete+update+insert)", "src": deletes + updates + inserts,
+                "upd": updates, "ins": inserts, "before": before, "after": after,
+                "expected": expected, "dt": dt, "count_ok": after == expected,
+                "verify_ok": deletes > 0 and inserts > 0 and updates > 0
+                             and tombstones_left == 0 and slice_left == 0,
+                "peak_mb": self.peak_mb,
+                "verify": f"deleted {deletes:,} tombstoned (slice gone, none updated), "
+                          f"updated {updates:,} (-8), inserted {inserts:,} (2036 shipdate)"}
+
+    def full_sync(self, model):
+        """Full-dimension sync: matched UPDATE + WHEN NOT MATCHED BY SOURCE DELETE. The source is
+        ~95% of the table (every key but a deterministic 5% slice), so the heavy part is the
+        whole-target anti-join. Departed slice (l_orderkey % 20 = 0) is deleted; survivors updated."""
+        p = self.path(model)
+        before = self.count(model)
+        departed = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_orderkey % 20 = 0")
+        dt = self.dbt(model)
+        after = self.count(model)
+        updated = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_quantity = {MARK_SYNC}")
+        departed_left = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_orderkey % 20 = 0")
+        expected = before - departed
+        return {"name": "Full sync (update + by-source delete)", "src": before - departed,
+                "upd": updated, "ins": 0, "before": before, "after": after,
+                "expected": expected, "dt": dt, "count_ok": after == expected,
+                "verify_ok": departed > 0 and departed_left == 0 and updated == after,
+                "peak_mb": self.peak_mb,
+                "verify": f"by-source-deleted {departed:,} departed keys; updated all {updated:,} survivors (-5)"}
+
+    def expr_update(self, model):
+        """100%-match update via merge_update_set_expressions: sets l_quantity = -9 and re-derives
+        l_returnflag with a CASE over the source (arbitrary-expression path). Count unchanged."""
+        p = self.path(model)
+        before = self.count(model)
+        dt = self.dbt(model)
+        after = self.count(model)
+        marked = self.q(f"SELECT count(*) FROM delta_scan('{p}') WHERE l_quantity = {MARK_EXPR}")
+        # every expression-updated row must also carry the CASE-derived flag ('H' or 'L') — proving
+        # the expression ran, not a plain copy (lineitem's real flags are A/N/R).
+        bad_case = self.q(
+            f"SELECT count(*) FROM delta_scan('{p}') WHERE l_quantity = {MARK_EXPR} "
+            f"AND l_returnflag NOT IN ('H', 'L')")
+        return {"name": "Expression update (set_expressions + CASE)", "src": marked, "upd": marked,
+                "ins": 0, "before": before, "after": after, "expected": before, "dt": dt,
+                "count_ok": after == before, "verify_ok": marked > 0 and bad_case == 0,
+                "peak_mb": self.peak_mb,
+                "verify": f"updated {marked:,} rows via expressions (l_quantity=-9, l_returnflag=CASE H/L)"}
+
 
 def run(args):
     # Local runs start from a clean warehouse; the OneLake job can't rmtree a remote store, so it
@@ -274,6 +349,14 @@ def run(args):
     b.seed("idempotent_remerge")
     b.dbt("idempotent_remerge")    # first increment (set-up); the reported run is the re-merge
     results.append(b.idempotent("idempotent_remerge"))
+    # Full-surface MERGE scenarios — the complete delta_rs clause set (matched delete + multi-clause,
+    # by-source delete, arbitrary/CASE update expressions) at scale, each seeded from a big (sampled)
+    # base. LOCAL stress only: skipped on the OneLake integration run (remote), which keeps the small
+    # path-smoke job fast and is the wrong place for these heavy, whole-target merges.
+    if not b.remote:
+        b.seed("cdc_merge");       results.append(b.cdc("cdc_merge"))
+        b.seed("full_sync");       results.append(b.full_sync("full_sync"))
+        b.seed("expr_update");     results.append(b.expr_update("expr_update"))
     b.seed("append_only");         results.append(b.appendish("append_only", "Append"))
     b.seed("safeappend_only");     results.append(b.appendish("safeappend_only", "Safeappend"))
     results.append(b.overwrite("overwrite_all", "safeappend_only"))
@@ -332,9 +415,19 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
     L.append("2. **Insert-only (~5% sample):** key-shifted past max key, future `l_shipdate` (2035) → all INSERT.")
     L.append("3. **Update-only (~5% sample):** existing keys, no shift → 100% match; row count unchanged.")
     L.append("4. **Idempotent re-merge:** re-merge unchanged rows → nothing changes.")
-    L.append("5. **Append (no merge):** the batch appended — no target scan/join (far cheaper).")
-    L.append("6. **Safeappend (no merge):** same cheap append, version-guarded against concurrent writers.")
-    L.append("7. **Overwrite (no merge):** the table replaced by the batch — also no target scan/join.")
+    L.append("5. **CDC merge (full clause set):** one MERGE that DELETEs a tombstoned slice, UPDATEs a "
+             "sample, and INSERTs key-shifted rows — matched-delete + matched-update + not-matched-insert "
+             "via `merge_clauses`.")
+    L.append("6. **Full sync (by-source delete):** matched rows UPDATEd, keys the ~95% source no longer "
+             "carries DELETEd via `WHEN NOT MATCHED BY SOURCE` — the heaviest shape (whole-target anti-join).")
+    L.append("7. **Expression update:** a 100%-match UPDATE whose SET is an arbitrary expression + `CASE` "
+             "(`merge_update_set_expressions`), not a plain column copy.")
+    L.append("8. **Append (no merge):** the batch appended — no target scan/join (far cheaper).")
+    L.append("9. **Safeappend (no merge):** same cheap append, version-guarded against concurrent writers.")
+    L.append("10. **Overwrite (no merge):** the table replaced by the batch — also no target scan/join.")
+    L.append("")
+    L.append("_Operations 5–7 exercise delta-rs's full MERGE clause set and run on the LOCAL stress gate "
+             "only; the OneLake path-smoke job skips them._")
     L += [""]
 
     def _m(n):
