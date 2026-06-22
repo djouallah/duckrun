@@ -8,7 +8,7 @@ DuckDB's fancy SQL (QUALIFY, PIVOT, ROLLUP, LIST/STRUCT, ASOF JOIN) and closes w
 scorecard. ``test_coffee.py`` already covers the DataFrame-style builder API on generated data; this is
 the SQL-first, real-data counterpart.
 
-The demo is split in three parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql`` — including a real ``MERGE`` upsert.
+The demo is split in four parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql`` — including a real ``MERGE`` upsert.
 **Part 2** switches to the DataFrame API on the same connection — the ``DataFrameWriter`` writing Delta by
 **path** (``.mode("overwrite"/"append").save(path)``, read back with ``conn.read.format("delta").load(path)``), closing
 with a **concurrent MERGE clash** staged through the DataFrame ``DeltaTable.merge`` builder (the builder
@@ -17,7 +17,11 @@ snapshot-pins at BUILD time, so two writers can be pinned to one snapshot before
 proving snapshot isolation. **Part 3** is **multi-catalog**: ``conn.attach`` brings a
 *second* lakehouse in as a named catalog (here a local scratch dir alongside the warehouse — they can be on
 different storage), then a single ``conn.sql`` JOINs a table in the primary catalog with one in the attached
-catalog, addressing them as ``catalog.schema.table``.
+catalog, addressing them as ``catalog.schema.table``. **Part 4** shows the **full MERGE surface** — the complete
+delta-rs clause set (matched update/delete, not-matched insert, not-matched-by-source delete, CASE/arbitrary
+expressions, many clauses in order) applied in a single MERGE driven by a **fresh recompute over the fact**
+(a subquery — the real ETL shape, no hand-typed VALUES), BOTH through ``conn.sql`` and through the
+``DeltaTable.merge`` builder.
 
 Heavy read+compute runs in-engine over the *full* month (millions of rows, local CPU); only a
 bounded **sample** plus compact marts are written over the network to OneLake, so the network is not
@@ -247,7 +251,8 @@ def _page_html(scorecard, body, caption, ok):
   <h1>the connection API — SQL &amp; DataFrame<span class="tag">not a dbt project</span></h1>
   <p class="lede">{html.escape(caption)}. Part 1 runs raw SQL through <code>conn.sql(...)</code>; Part 2 uses
   the <code>DataFrameWriter</code>/<code>DeltaTable</code> API to write by path; Part 3 attaches a second
-  lakehouse with <code>conn.attach</code> and JOINs across catalogs — all against live NYC&nbsp;TLC data,
+  lakehouse with <code>conn.attach</code> and JOINs across catalogs; Part 4 exercises the full delta-rs
+  <code>MERGE</code> clause set in both SQL and DataFrame form — all against live NYC&nbsp;TLC data,
   landing real Delta, top to bottom.</p>
   <h2 style="margin-bottom:0.2rem">Run scorecard — <span style="font-weight:400">{verdict}</span></h2>
   {scorecard}
@@ -684,6 +689,138 @@ def run_taxi_demo(conn, schema):
                "  one URL ↔ one name; raw DML stays in the current catalog")
         say(f"unqualified name resolved in '{switched}' ({unq} rows); switched back to '{primary}'; "
             f"{len(guards)} safety rails held")
+
+    _part("Part 4 · the full MERGE surface — a real recompute, applied in one MERGE (SQL & DataFrame)",
+          "duckrun's MERGE is the COMPLETE delta-rs TableMerger — matched UPDATE (arbitrary expressions, "
+          "CASE) / matched DELETE / NOT MATCHED INSERT / NOT MATCHED BY SOURCE delete, any number of "
+          "clauses applied in order. Both steps drive ONE MERGE off a fresh recompute over the 'trips' "
+          "fact (a subquery — the real ETL shape, no hand-typed VALUES): one through conn.sql, one "
+          "through the DeltaTable.merge builder.")
+
+    # 20 ── SQL: refresh a dimension from the fact in ONE merge — recompute source, all clause kinds ──
+    with _step(20, "SQL full-surface MERGE (real ETL): a fresh recompute over 'trips', applied to a "
+                  "step-behind dimension in one statement — retire (DELETE), refresh (UPDATE + CASE tier), "
+                  "onboard (INSERT)") as say:
+        # the dimension AS OF the last load: a recompute that's a step behind — the two busiest zones
+        # were added to the network since then and aren't onboarded yet, and every tier still reads
+        # 'standard'. (The MERGE source below recomputes the CURRENT truth straight off the fact.)
+        _sql(conn, """
+            CREATE OR REPLACE TABLE zone_scorecard AS
+            SELECT zone_id, any_value(zone) AS zone, any_value(borough) AS borough,
+                   count(*) AS trips, round(avg(fare), 2)::DOUBLE AS avg_fare, 'standard' AS tier
+            FROM trips
+            WHERE zone_id NOT IN (SELECT zone_id FROM trips GROUP BY zone_id ORDER BY count(*) DESC LIMIT 2)
+            GROUP BY zone_id
+        """)
+        t0 = time.perf_counter()
+        before = q("SELECT count(*) FROM zone_scorecard")
+        # data-driven thresholds, no magic numbers: retire the smallest zone(s), gold = top quartile.
+        floor = q("SELECT min(c) + 1 FROM (SELECT count(*) c FROM trips GROUP BY zone_id)")
+        gold = q("SELECT approx_quantile(c, 0.75) FROM (SELECT count(*) c FROM trips GROUP BY zone_id)")
+        # the MERGE source is a SUBQUERY recomputing fresh per-zone stats off the fact — the real ETL
+        # shape, not hand-typed VALUES. One statement does retire + refresh + onboard, top-to-bottom.
+        _sql(conn, f"""
+            MERGE INTO zone_scorecard t
+            USING (
+                SELECT zone_id, any_value(zone) AS zone, any_value(borough) AS borough,
+                       count(*) AS trips, round(avg(fare), 2)::DOUBLE AS avg_fare
+                FROM trips
+                GROUP BY zone_id
+            ) s
+            ON t.zone_id = s.zone_id
+            WHEN MATCHED AND s.trips < {floor} THEN DELETE
+            WHEN MATCHED THEN UPDATE SET trips    = s.trips,
+                                         avg_fare = s.avg_fare,
+                                         tier     = CASE WHEN s.trips >= {gold} THEN 'gold' ELSE 'standard' END
+            WHEN NOT MATCHED THEN INSERT (zone_id, zone, borough, trips, avg_fare, tier)
+                 VALUES (s.zone_id, s.zone, s.borough, s.trips, s.avg_fare,
+                         CASE WHEN s.trips >= {gold} THEN 'gold' ELSE 'standard' END)
+        """)
+        after = q("SELECT count(*) FROM zone_scorecard")
+        n_zones = q("SELECT count(DISTINCT zone_id) FROM trips")
+        retired = q(f"SELECT count(*) FROM (SELECT count(*) c FROM trips GROUP BY zone_id) WHERE c < {floor}")
+        onboarded = q("SELECT count(*) FROM (SELECT zone_id FROM trips GROUP BY zone_id ORDER BY count(*) DESC LIMIT 2)")
+        # every surviving zone must equal the fresh recompute (no stale metric left behind), the
+        # retired ones must be gone, and DELETE + INSERT must have actually fired (not no-ops).
+        drift = q("""
+            SELECT count(*) FROM zone_scorecard t
+            JOIN (SELECT zone_id, count(*) AS trips, round(avg(fare), 2)::DOUBLE AS avg_fare
+                  FROM trips GROUP BY zone_id) s USING (zone_id)
+            WHERE t.trips <> s.trips OR t.avg_fare <> s.avg_fare
+        """)
+        ok = (
+            after == n_zones - retired                                              # final = all zones minus retired
+            and q(f"SELECT count(*) FROM zone_scorecard WHERE trips < {floor}") == 0  # retired ones gone
+            and retired >= 1 and onboarded == 2                                     # DELETE and INSERT really fired
+            and drift == 0                                                          # every survivor matches fresh
+            and q("SELECT count(*) FROM zone_scorecard WHERE tier = 'gold'") > 0    # CASE tier applied
+        )
+        results.append(_row("SQL MERGE (retire+refresh+onboard)", before, after, n_zones - retired,
+                            after == n_zones - retired, ok, time.perf_counter() - t0))
+        _table([(t, f"{z:,}", f"{mn:,}", f"{mx:,}") for t, z, mn, mx in conn.sql(
+                    """SELECT tier, count(*) AS zones, min(trips) AS mn, max(trips) AS mx
+                       FROM zone_scorecard GROUP BY tier ORDER BY tier""").collect()],
+               ["tier", "zones", "min trips", "max trips"],
+               "  zone_scorecard after the merge — tiers (re)assigned by CASE, low-volume zones retired, new zones onboarded")
+        say(f"one MERGE off a recompute subquery: retired {retired}, refreshed {before - retired}, "
+            f"onboarded {onboarded}; {before:,} → {after:,} rows, 0 drift")
+
+    # 21 ── DataFrame: full-sync a dimension from a recompute — refresh matched, purge departed keys ──
+    with _step(21, "DataFrame full-surface merge (real ETL): full-sync 'fare_watch' from a fresh "
+                   "recompute over 'trips' via the builder — whenMatchedUpdate(CASE) + whenNotMatchedBySourceDelete") as say:
+        # the dimension carries two decommissioned zones (901, 902) that no longer appear in the fact —
+        # a full sync must refresh the live zones AND purge the departed ones.
+        _sql(conn, """
+            CREATE OR REPLACE TABLE fare_watch AS
+            SELECT zone_id, zone, round(avg_fare, 2)::DOUBLE AS avg_fare, 'active' AS status FROM (
+                SELECT zone_id, any_value(zone) AS zone, avg(fare) AS avg_fare FROM trips GROUP BY zone_id)
+            UNION ALL SELECT 901, 'Retired North', 0.0::DOUBLE, 'active'
+            UNION ALL SELECT 902, 'Retired South', 0.0::DOUBLE, 'active'
+        """)
+        t0 = time.perf_counter()
+        before = q("SELECT count(*) FROM fare_watch")
+        n_zones = q("SELECT count(DISTINCT zone_id) FROM trips")
+        hi = q("SELECT approx_quantile(avg_fare, 0.75) FROM (SELECT avg(fare) AS avg_fare FROM trips GROUP BY zone_id)")
+        # the merge SOURCE is a recompute over the fact (real ETL). The builder refreshes every matched
+        # zone — re-banding 'status' with a CASE expression — and DELETEs every target zone the source
+        # no longer carries, so the two decommissioned zones are purged. No VALUES in the merge.
+        _emit('  <pre class="py"># builder full-sync: source is a recompute over the fact, not VALUES\n'
+              'src = conn.sql("SELECT zone_id, any_value(zone) AS zone, "\n'
+              '               "round(avg(fare),2)::DOUBLE AS avg_fare FROM trips GROUP BY zone_id")\n'
+              'DeltaTable.forName(conn, "fare_watch").merge(src, "target.zone_id = source.zone_id") \\\n'
+              '    .whenMatchedUpdate(set={"avg_fare": "source.avg_fare",\n'
+              '        "status": "case when source.avg_fare >= <p75> then \'premium\' else \'active\' end"}) \\\n'
+              '    .whenNotMatchedBySourceDelete() \\\n'
+              '    .execute()</pre>')
+        src = conn.sql("SELECT zone_id, any_value(zone) AS zone, round(avg(fare), 2)::DOUBLE AS avg_fare "
+                       "FROM trips GROUP BY zone_id")
+        DeltaTable.forName(conn, "fare_watch").merge(src, "target.zone_id = source.zone_id") \
+            .whenMatchedUpdate(set={"avg_fare": "source.avg_fare",
+                                    "status": f"case when source.avg_fare >= {hi} then 'premium' else 'active' end"}) \
+            .whenNotMatchedBySourceDelete() \
+            .execute()
+        after = q("SELECT count(*) FROM fare_watch")
+        purged = q("SELECT count(*) FROM fare_watch WHERE zone_id IN (901, 902)")
+        drift = q("""
+            SELECT count(*) FROM fare_watch t
+            JOIN (SELECT zone_id, round(avg(fare), 2)::DOUBLE AS avg_fare FROM trips GROUP BY zone_id) s
+            USING (zone_id) WHERE t.avg_fare <> s.avg_fare
+        """)
+        ok = (
+            after == n_zones                       # every live zone kept, both decommissioned zones gone
+            and purged == 0                        # by-source DELETE fired
+            and drift == 0                         # matched UPDATE refreshed every zone from source
+            and q("SELECT count(*) FROM fare_watch WHERE status = 'premium'") > 0   # CASE re-band applied
+        )
+        results.append(_row("DataFrame merge (refresh+purge)", before, after, n_zones, after == n_zones, ok,
+                            time.perf_counter() - t0))
+        _table([(s, f"{z:,}", f"{mn:,.2f}", f"{mx:,.2f}") for s, z, mn, mx in conn.sql(
+                    """SELECT status, count(*) AS zones, min(avg_fare) AS mn, max(avg_fare) AS mx
+                       FROM fare_watch GROUP BY status ORDER BY status""").collect()],
+               ["status", "zones", "min fare", "max fare"],
+               "  fare_watch after the full-sync — every live zone refreshed & re-banded by CASE, decommissioned zones purged")
+        say(f"builder full-sync off a recompute: refreshed {n_zones} live zones (re-banded via CASE), "
+            f"purged {before - after} departed; {before:,} → {after:,} rows, 0 drift")
 
     _scorecard(results)
 
