@@ -13,10 +13,10 @@ Ported from the Fabric/OneLake multi-engine notebook. Differences:
     not pandas write_deltalake.
 
 The end-to-end flow is :func:`run_tpch_benchmark`, parameterized by scale factor. ``test_tpch_local``
-drives it as an offline CI smoke (generation needs ``tpchgen-cli``); run the file directly to drive it
-by hand:
+drives it as an offline CI smoke (generation needs ``tpchgen-cli``; the cores job runs SF=10); run the
+file directly to drive it by hand:
 
-    TPCH_SF=1 python tests/integration_tests/tpch/test_tpch.py
+    TPCH_SF=10 python tests/integration_tests/tpch/test_tpch.py
 """
 import os
 import subprocess
@@ -756,14 +756,21 @@ def _generate_tables(conn, sf):
         return
     print(f"Generating TPC-H SF={sf}")
     with tempfile.TemporaryDirectory() as staging:
+        t0 = time.time()
         subprocess.run(
             ["tpchgen-cli", "-s", str(sf), "--output-dir", staging, "--format", "parquet"],
             check=True,
         )
+        print(f"Generated parquet in {time.time() - t0:.2f}s")
+
         print("Loading parquet → Delta via duckrun...")
+        t1 = time.time()
         for tbl in TPCH_TABLES:
             parquet = os.path.join(staging, f"{tbl}.parquet").replace(os.sep, "/")
+            ts = time.time()
             conn.read.parquet(parquet).write.mode("overwrite").saveAsTable(tbl)
+            print(f"  {tbl}: parquet → Delta in {time.time() - ts:.2f}s")
+        print(f"Wrote all Delta tables in {time.time() - t1:.2f}s")
     print("Done!")
 
 
