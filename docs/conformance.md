@@ -30,8 +30,8 @@ Every still-failing test in the card below falls into one of three categories:
 
 ```
 ┌───────────────────────────────────────────────────────┐
-│ ✅ 123 passed   ❌ 7 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 135 total · 91% passing                               │
+│ ✅ 126 passed   ❌ 4 failed   💥 0 errors   ⏭️ 5 skipped │
+│ 135 total · 93% passing                               │
 └───────────────────────────────────────────────────────┘
 ```
 
@@ -51,11 +51,11 @@ Every still-failing test in the card below falls into one of three categories:
 | `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `unit_testing` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `basic` | `█████████░` 94% | 15 | 1 | 0 | 0 | 16 |
+| `incremental` | `█████████░` 92% | 24 | 2 | 0 | 0 | 26 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
-| `incremental` | `████████░░` 81% | 21 | 5 | 0 | 0 | 26 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `█████████░` **91%** | **123** | **7** | **0** | **5** | **135** |
+| **Total** | `█████████░` **93%** | **126** | **4** | **0** | **5** | **135** |
 
 ### Incremental / write support
 
@@ -91,15 +91,12 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestChangeRelationTypesDuckDB::test_changing_materialization_changes_relation_type` | AssertionError: dbt exit state did not match expected |
 
 </details>
-<details><summary><b>incremental</b> — 5 not passing (21/26 pass)</summary>
+<details><summary><b>incremental</b> — 2 not passing (24/26 pass)</summary>
 
 | Outcome | Test | Message |
 | --- | --- | --- |
 | ❌ | `TestIncrementalOnSchemaChange::test_run_incremental_sync_all_columns` | dbt_common.exceptions.base.DbtRuntimeError: Runtime Error Binder Error: Referenced column "field2" not found in FROM clause! Candidate bindings: "field1", "fiel |
 | ❌ | `TestIncrementalOnSchemaChangeQuotingFalse::test__handle_identifier_quoting_config_false` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMerge::test_merge_with_set_expressions` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMerge::test_merge_custom_clauses` | AssertionError: dbt exit state did not match expected |
-| ❌ | `TestIncrementalMergeValidation::test_ducklake_valid_single_update` | AssertionError: dbt exit state did not match expected |
 
 </details>
 <details><summary><b>basic</b> — 1 not passing (15/16 pass)</summary>
