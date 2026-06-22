@@ -159,6 +159,23 @@ class TestCatalog:
         conn.catalog.refreshTable("rt")
         assert conn.sql("select * from rt").fetchall() == [(1, "a")]
 
+    def test_createTable_ddl(self, conn):
+        df = conn.catalog.createTable("ct", "id int, name string")
+        assert df.count() == 0 and df.columns == ["id", "name"]
+        assert conn.catalog.tableExists("ct")          # managed Delta, queryable immediately
+        conn.sql("insert into ct values (1, 'x')")
+        assert conn.table("ct").collect() == [(1, "x")]
+
+    def test_createTable_from_struct(self, conn):
+        # schema can be a StructType lifted from another frame
+        conn.catalog.createTable("ct2", conn.sql("select 1::bigint k, 2.0::double v").schema)
+        assert conn.catalog.getTable("ct2").tableType == "MANAGED"
+        assert conn.sql("select * from ct2").schema.simpleString() == "struct<k:BIGINT,v:DOUBLE>"
+
+    def test_createTable_bad_schema(self, conn):
+        with pytest.raises(ValueError):
+            conn.catalog.createTable("ct3", 123)
+
     def test_getTable(self, conn):
         t = conn.catalog.getTable("src")
         assert (t.name, t.database, t.catalog) == ("src", "dbo", "wh")

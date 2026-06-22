@@ -1162,6 +1162,23 @@ class Catalog:
         return Table(name=table, catalog=catalog, database=schema, description=None,
                      tableType="MANAGED", isTemporary=False)
 
+    def createTable(self, tableName: str, schema) -> "DataFrame":
+        """Create an empty managed Delta table and return it as a :class:`DataFrame` (Spark's
+        ``catalog.createTable``). ``schema`` is a DDL string (``"id int, name string"``) or a
+        :class:`StructType` (e.g. from another frame's ``df.schema``). Routes through the same
+        Delta-backed ``CREATE TABLE`` the SQL path uses, so the table is queryable immediately.
+
+        Note: unlike Spark there's no ``path`` / ``source`` argument — duckrun tables are always
+        managed Delta under the catalog root; read foreign data by path with ``conn.read…load()``."""
+        if isinstance(schema, StructType):
+            ddl = ", ".join(f'"{f.name}" {f.dataType}' for f in schema.fields)
+        elif isinstance(schema, str):
+            ddl = schema
+        else:
+            raise ValueError("createTable: schema must be a DDL string or a StructType.")
+        self.session.sql(f"CREATE TABLE {tableName} ({ddl})")
+        return self.session.table(tableName)
+
     def getDatabase(self, dbName: str) -> Database:
         """Return a :class:`Database` record for ``dbName`` (Spark's ``catalog.getDatabase``), or
         raise ``ValueError`` if it doesn't exist — the peer of :meth:`databaseExists` /

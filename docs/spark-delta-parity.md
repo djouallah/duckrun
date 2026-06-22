@@ -126,7 +126,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `catalog.getTable(t, db)` | `catalog.getTable(t, db=None)` | ✅ | Returns a `Table` namedtuple (`name`, `catalog`, `database`, `description`, `tableType`, `isTemporary`); raises if absent. duckrun tables are always `MANAGED`, never temporary. |
 | `catalog.getDatabase(db)` | `catalog.getDatabase(db)` | ✅ | Returns a `Database` namedtuple (`name`, `catalog`, `description`, `locationUri`); raises if absent. |
 | `catalog.dropTempView(name)` | `catalog.dropTempView(name)` | ✅ | Inverse of `df.createOrReplaceTempView`; returns `True` if the view existed. |
-| `catalog.createTable` | — | ➖ | TODO — today use `df.write.saveAsTable`. |
+| `catalog.createTable(t, schema)` | `catalog.createTable(t, schema)` | 🟡 | Creates an empty managed Delta table from a DDL string or a `StructType`, returns it as a DataFrame. No `path`/`source` arg — duckrun tables are always managed (read foreign data by path with `conn.read…load()`). |
 | `catalog.refreshTable(t)` | `catalog.refreshTable(t)` | ✅ | Rebuilds one table's cached view from the current on-store snapshot — the per-table peer of `conn.refresh()` (bespoke), which rediscovers the whole store. |
 | `catalog.refreshByPath` | — | 🚫 | Path reads aren't cached — nothing to refresh. |
 | `catalog.currentCatalog` / `setCurrentCatalog` / `listCatalogs` | `catalog.currentCatalog()` / `setCurrentCatalog(name)` / `listCatalogs()` | ✅ | Each attached lakehouse root is a catalog (`catalog.schema.table`). The primary comes from `connect`; add more with `conn.attach(path, name=…)` (bespoke — see top). |
