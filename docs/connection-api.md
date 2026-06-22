@@ -58,6 +58,23 @@ DeltaTable.forName(conn, "orders").merge(src, "target.id = source.id") \
     .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()   # pinned automatically
 ```
 
+## In-memory data with `conn.createDataFrame`
+
+`conn.createDataFrame(data, schema=None)` turns in-memory data into a DataFrame on duckrun's own
+connection — handy for seeding, demos, or persisting a small Python/pandas result to Delta. `data`
+is a list of tuples/lists (a list of scalars becomes one column), a pandas `DataFrame`, or a
+pyarrow `Table`/`RecordBatchReader`. `schema` is `None` (names inferred — `_1, _2, …` for tuples),
+a list of column names, or a DDL string (`"id int, name string"`; `name: type` is also accepted).
+Empty data needs a DDL schema. It's a plain DuckDB build — no Spark/PySpark dependency.
+
+```python
+conn.createDataFrame([(1, "a"), (2, "b")], "id int, name string") \
+    .write.mode("overwrite").saveAsTable("seeded")
+
+conn.createDataFrame(pandas_df).show()
+conn.createDataFrame([], "id int, name string")   # typed empty frame
+```
+
 ## Raw SQL DML through `conn.sql`
 
 `conn.sql` doesn't only read — raw SQL DML against a discovered (Delta-backed) table is intercepted

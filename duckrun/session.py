@@ -107,6 +107,103 @@ def _is_delta_write(query: str) -> bool:
     return bool(_CREATE_TABLE_RE.match(s)) and not _CREATE_TEMP_RE.match(s)
 
 
+# ---- createDataFrame helpers --------------------------------------------------------------
+# PySpark DDL type spellings → DuckDB types. Anything not listed (INTEGER, DECIMAL(10,2), …) is
+# already a DuckDB type and passes through untouched.
+_SPARK_TO_DUCKDB_TYPE = {
+    "int": "INTEGER", "integer": "INTEGER",
+    "long": "BIGINT", "bigint": "BIGINT",
+    "short": "SMALLINT", "smallint": "SMALLINT",
+    "byte": "TINYINT", "tinyint": "TINYINT",
+    "string": "VARCHAR", "str": "VARCHAR",
+    "double": "DOUBLE", "float": "FLOAT", "real": "FLOAT",
+    "boolean": "BOOLEAN", "bool": "BOOLEAN",
+    "date": "DATE", "timestamp": "TIMESTAMP",
+    "binary": "BLOB",
+}
+
+
+def _split_top_level_commas(s: str) -> List[str]:
+    """Split ``s`` on commas that are not inside parentheses, so ``DECIMAL(10,2)`` stays intact."""
+    parts, depth, start = [], 0, 0
+    for i, ch in enumerate(s):
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+        elif ch == "," and depth == 0:
+            parts.append(s[start:i])
+            start = i + 1
+    parts.append(s[start:])
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _map_type(spark_type: str) -> str:
+    """Map a (possibly parameterised) Spark/DuckDB type spelling to a DuckDB type."""
+    base = spark_type.split("(", 1)[0].strip().lower()
+    mapped = _SPARK_TO_DUCKDB_TYPE.get(base)
+    if mapped is None:
+        return spark_type.strip()  # already a DuckDB type (INTEGER, DECIMAL(10,2), …)
+    paren = spark_type[spark_type.find("("):] if "(" in spark_type else ""
+    return mapped + paren
+
+
+def _parse_ddl_schema(ddl: str):
+    """``"id int, name: string"`` → ``(["id", "name"], ["INTEGER", "VARCHAR"])``."""
+    names, types = [], []
+    for field in _split_top_level_commas(ddl):
+        name, _, typ = field.replace(":", " ", 1).strip().partition(" ")
+        if not name or not typ.strip():
+            raise ValueError(f"bad schema field {field!r}; expected 'name type'")
+        names.append(name.strip().strip('"'))
+        types.append(_map_type(typ.strip()))
+    return names, types
+
+
+def _parse_schema(schema):
+    """Normalise the ``schema`` arg to ``(names | None, duckdb_types | None)``."""
+    if schema is None:
+        return None, None
+    if isinstance(schema, str):
+        return _parse_ddl_schema(schema)
+    if isinstance(schema, (list, tuple)) and all(isinstance(c, str) for c in schema):
+        return list(schema), None
+    raise TypeError(
+        "schema must be None, a list of column names, or a DDL string like 'id int, name string'")
+
+
+def _as_pandas(data):
+    """Return ``data`` if it is a pandas DataFrame (pandas optional), else None."""
+    try:
+        import pandas
+    except ImportError:
+        return None
+    return data if isinstance(data, pandas.DataFrame) else None
+
+
+def _is_arrow(data) -> bool:
+    """True if ``data`` is a pyarrow Table / RecordBatchReader (pyarrow optional)."""
+    try:
+        import pyarrow
+    except ImportError:
+        return False
+    return isinstance(data, (pyarrow.Table, pyarrow.RecordBatchReader))
+
+
+def _project_rename(rel, names: List[str]):
+    cur = rel.columns
+    if len(names) != len(cur):
+        raise ValueError(f"schema lists {len(names)} columns but data has {len(cur)}")
+    return rel.project(", ".join(f'"{c}" AS "{n}"' for c, n in zip(cur, names)))
+
+
+def _project_cast(rel, types: List[str]):
+    cur = rel.columns
+    if len(types) != len(cur):
+        raise ValueError(f"schema lists {len(types)} types but data has {len(cur)} columns")
+    return rel.project(", ".join(f'CAST("{c}" AS {t}) AS "{c}"' for c, t in zip(cur, types)))
+
+
 def _delta_write_message(query: str) -> str:
     """The error for a raw-SQL write conn.sql() can't route to delta_rs. For an INSERT/UPDATE/DELETE
     whose target isn't a discovered Delta table — the common cause being a typo or a table written
@@ -570,6 +667,53 @@ class DuckSession:
         catalog, schema, table = self._resolve(name)
         return DataFrame(
             self.con.sql(f"SELECT * FROM {_qid(catalog)}.{_qid(schema)}.{_qid(table)}"), self)
+
+    def createDataFrame(self, data, schema=None, samplingRatio=None,
+                        verifySchema: bool = True) -> "DataFrame":
+        """Create a :class:`DataFrame` from in-memory data — the ``createDataFrame`` API.
+
+        ``data`` is a list of tuples/lists (a list of scalars is treated as a single column), a
+        pandas ``DataFrame``, or a pyarrow ``Table`` / ``RecordBatchReader``. ``schema`` is
+        ``None`` (names inferred — ``_1, _2, …`` for tuples, the frame's own names otherwise), a
+        list of column names, or a DDL string (``"id int, name string"``; ``:`` between name and
+        type is also accepted). The data is materialised as a relation on duckrun's own DuckDB
+        connection — write it to Delta with ``df.write.saveAsTable(...)``.
+
+        ``samplingRatio`` is accepted for signature parity and ignored; ``verifySchema`` is
+        best-effort — DuckDB casts/validates when the relation is built.
+        """
+        names, types = _parse_schema(schema)
+
+        pdf = _as_pandas(data)
+        if pdf is not None:
+            rel = self.con.from_df(pdf)
+        elif _is_arrow(data):
+            rel = self.con.from_arrow(data)
+        else:
+            rows = list(data)
+            if rows and not isinstance(rows[0], (tuple, list)):
+                rows = [(v,) for v in rows]  # list of scalars → a single column
+            if not rows:
+                if not types:
+                    raise ValueError(
+                        "cannot infer schema from an empty dataset — pass a DDL schema, e.g. "
+                        "createDataFrame([], 'id int, name string')")
+                cols = ", ".join(f'CAST(NULL AS {t}) AS "{n}"' for n, t in zip(names, types))
+                return DataFrame(self.con.sql(f"SELECT {cols} WHERE 1=0"), self)
+            ncols = len(rows[0])
+            if any(len(r) != ncols for r in rows):
+                raise ValueError("all rows must have the same number of columns")
+            placeholders = ", ".join("(" + ", ".join(["?"] * ncols) + ")" for _ in rows)
+            collist = ", ".join(f'"_{i + 1}"' for i in range(ncols))
+            flat = [v for r in rows for v in r]
+            rel = self.con.sql(
+                f"SELECT * FROM (VALUES {placeholders}) AS t({collist})", params=flat)
+
+        if names is not None:
+            rel = _project_rename(rel, names)
+        if types is not None:
+            rel = _project_cast(rel, types)
+        return DataFrame(rel, self)
 
     @property
     def read(self) -> "DataFrameReader":

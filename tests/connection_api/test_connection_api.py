@@ -75,6 +75,11 @@ class TestSession:
     def test_table(self, conn):
         assert conn.table("src").count() == 3
 
+    def test_createDataFrame(self, conn):
+        df = conn.createDataFrame([(1, "a"), (2, "b")], "id int, name string")
+        assert df.columns == ["id", "name"]
+        assert df.count() == 2
+
     def test_read_property(self, conn):
         assert conn.read is not None
 
