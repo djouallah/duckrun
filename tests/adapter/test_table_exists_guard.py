@@ -141,15 +141,17 @@ def test_assert_not_null_passes_when_no_nulls():
 
 
 def test_validate_merge_rejects_unsupported_semantics():
-    """Valid-but-unsupported merge configs are REJECTED (not silently ignored) so a green run
-    can't quietly diverge from what the user asked for."""
-    for key, value in (
-        ("merge_clauses", {"when_matched": [{"action": "update"}]}),
-        ("merge_update_set_expressions", {"v": "v + 1"}),
-        ("merge_on_using_columns", ["id"]),
-    ):
-        with pytest.raises(CompilationError, match="duckrun cannot honor"):
-            Plugin._validate_merge_config({key: value})
+    """merge_on_using_columns has no delta_rs equivalent and is REJECTED (not silently ignored) so
+    a green run can't quietly diverge from what the user asked for."""
+    with pytest.raises(CompilationError, match="duckrun cannot honor"):
+        Plugin._validate_merge_config({"merge_on_using_columns": ["id"]})
+
+
+def test_validate_merge_allows_clause_configs():
+    """merge_clauses and merge_update_set_expressions ARE honored now (translated to delta_rs's full
+    TableMerger clause list — see _custom_merge_clauses), so they pass validation."""
+    Plugin._validate_merge_config({"merge_clauses": {"when_matched": [{"action": "update"}]}})
+    Plugin._validate_merge_config({"merge_update_set_expressions": {"v": "v + 1"}})
 
 
 def test_validate_merge_allows_supported_conditions():

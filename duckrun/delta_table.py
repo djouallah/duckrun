@@ -1,13 +1,15 @@
 """A Delta-Lake-shaped ``DeltaTable.merge(...)`` upsert builder.
 
 Mirrors the Delta ``DeltaTable`` merge API and runs on the adapter's
-:func:`engine.merge_delta`, so it inherits the cgroup-aware spill caps and post-merge
+:func:`engine.merge_delta_clauses`, so it inherits the cgroup-aware spill caps and post-merge
 compaction/vacuum. This is the upsert path — ``saveAsTable`` deliberately does not merge.
 
-Supported clauses map onto delta-rs's ``when_matched_update_all`` / ``when_matched_update`` /
-``when_not_matched_insert_all``. Shapes delta-rs can't express (arbitrary value maps, aliases
-other than ``target``/``source``, update-only merges) raise a clear error rather than being
-silently dropped — the same posture the adapter takes for unsupported merge features.
+Exposes the FULL delta-rs ``TableMerger`` surface: ``whenMatchedUpdateAll`` / ``whenMatchedUpdate``
+(arbitrary expressions) / ``whenMatchedDelete`` / ``whenNotMatchedInsertAll`` /
+``whenNotMatchedInsert`` / ``whenNotMatchedBySourceUpdate`` / ``whenNotMatchedBySourceDelete``,
+any number of clauses applied in order. The merge ``condition`` must reference the literal
+``target``/``source`` aliases (validated up front); the only shape delta-rs can't express —
+``MERGE … RETURNING`` — is simply not part of this API.
 """
 import re
 from typing import Dict, List, Optional
@@ -26,9 +28,10 @@ def _parse_parquet_identifier(identifier: str) -> str:
     m = _PARQUET_IDENT.match(identifier)
     return m.group("path").strip() if m else identifier.strip()
 
-# Condition parsing (the supported key-equality boundary) is shared with the raw-SQL MERGE handler
-# in delta_dml.parse_merge_condition, so the DataFrame builder and conn.sql("MERGE …") accept exactly
-# the same conditions.
+# The merge condition must reference the literal ``target``/``source`` aliases; that alias check is
+# shared with the raw-SQL MERGE handler (delta_dml.validate_merge_condition), so the DataFrame
+# builder and conn.sql("MERGE …") accept exactly the same conditions. Both feed one ordered list of
+# clauses to engine.merge_delta_clauses — the full delta-rs TableMerger surface.
 
 
 class DeltaMergeBuilder:
@@ -36,17 +39,16 @@ class DeltaMergeBuilder:
                  read_version: Optional[int] = None):
         self._table = table
         self._source = source  # DataFrame
-        self._keys, self._predicates = delta_dml.parse_merge_condition(condition)
-        self._matched = None       # None | ("all", cond) | ("cols", [cols], cond)
-        self._not_matched = None   # None | ("all", cond)
-        self._by_source_delete = None  # None | True | predicate string
+        delta_dml.validate_merge_condition(condition)
+        self._condition = condition  # handed to delta_rs verbatim as the merge predicate
+        self._clauses: List[dict] = []  # ordered engine.merge_delta_clauses specs
         # Pin the target to this version so OCC validates (vB, HEAD]: pass the same vB you pinned
         # the source read to (forName(...).version() → delta_scan('…', version => vB)) and source +
         # target are ONE snapshot — exactly a single-snapshot MERGE. None merges against HEAD.
         self._read_version = read_version
 
     def whenMatchedUpdateAll(self, condition: Optional[str] = None) -> "DeltaMergeBuilder":
-        self._matched = ("all", None, condition)
+        self._clauses.append({"clause": "matched", "action": "update_all", "predicate": condition})
         return self
 
     def whenMatchedUpdate(self, condition: Optional[str] = None,
@@ -54,62 +56,64 @@ class DeltaMergeBuilder:
         if not set:
             raise ValueError("whenMatchedUpdate requires a non-empty 'set' mapping; "
                              "use whenMatchedUpdateAll() to copy every column.")
-        cols = []
-        for col, expr in set.items():
-            norm = str(expr).strip().lower()
-            if norm not in (f"source.{col.lower()}", f'"source"."{col.lower()}"'):
-                raise ValueError(
-                    f"whenMatchedUpdate only supports plain column copies (set={{'{col}': "
-                    f"'source.{col}'}}); arbitrary expression {expr!r} is not supported."
-                )
-            cols.append(col)
-        self._matched = ("cols", cols, condition)
+        self._clauses.append({"clause": "matched", "action": "update",
+                              "updates": {c: str(e) for c, e in set.items()},
+                              "predicate": condition})
+        return self
+
+    def whenMatchedDelete(self, condition: Optional[str] = None) -> "DeltaMergeBuilder":
+        """``WHEN MATCHED [AND <condition>] THEN DELETE`` — delete matched target rows (e.g. a
+        CDC tombstone flag on the source)."""
+        self._clauses.append({"clause": "matched", "action": "delete", "predicate": condition})
         return self
 
     def whenNotMatchedInsertAll(self, condition: Optional[str] = None) -> "DeltaMergeBuilder":
-        self._not_matched = ("all", condition)
+        self._clauses.append({"clause": "not_matched", "action": "insert_all", "predicate": condition})
+        return self
+
+    def whenNotMatchedInsert(self, condition: Optional[str] = None,
+                             values: Optional[Dict[str, str]] = None) -> "DeltaMergeBuilder":
+        """``WHEN NOT MATCHED [AND <condition>] THEN INSERT (cols) VALUES (<exprs>)`` — ``values`` maps
+        each target column to an expression (e.g. ``{"id": "source.id", "name": "upper(source.name)"}``)."""
+        if not values:
+            raise ValueError("whenNotMatchedInsert requires a non-empty 'values' mapping; "
+                             "use whenNotMatchedInsertAll() to insert every column.")
+        self._clauses.append({"clause": "not_matched", "action": "insert",
+                              "updates": {c: str(e) for c, e in values.items()},
+                              "predicate": condition})
+        return self
+
+    def whenNotMatchedBySourceUpdate(self, condition: Optional[str] = None,
+                                     set: Optional[Dict[str, str]] = None) -> "DeltaMergeBuilder":
+        """``WHEN NOT MATCHED BY SOURCE [AND <condition>] THEN UPDATE SET …`` — update target rows the
+        source doesn't carry (e.g. mark them inactive)."""
+        if not set:
+            raise ValueError("whenNotMatchedBySourceUpdate requires a non-empty 'set' mapping.")
+        self._clauses.append({"clause": "not_matched_by_source", "action": "update",
+                              "updates": {c: str(e) for c, e in set.items()},
+                              "predicate": condition})
         return self
 
     def whenNotMatchedBySourceDelete(self, condition: Optional[str] = None) -> "DeltaMergeBuilder":
         """The "WHEN NOT MATCHED BY SOURCE THEN DELETE" form: delete target rows the source doesn't
         carry. No ``condition`` = delete every unmatched target row (full sync); a predicate string
         scopes the deletion."""
-        self._by_source_delete = condition if condition is not None else True
+        self._clauses.append({"clause": "not_matched_by_source", "action": "delete",
+                              "predicate": condition})
         return self
 
     def execute(self) -> None:
         self._table._session._require_writable("merge", self._table._catalog)
-        if self._matched is None and self._not_matched is None and not self._by_source_delete:
-            raise ValueError("merge has no clauses; add whenMatchedUpdate*/whenNotMatchedInsertAll/"
-                             "whenNotMatchedBySourceDelete.")
-        # delta-rs can express insert-only, upsert, and (with) by-source-delete in any combination;
-        # only a bare update-with-no-insert-and-no-delete is the unsupported degenerate case.
-        if self._not_matched is None and self._matched is not None and not self._by_source_delete:
-            raise ValueError(
-                "update-only merge (no whenNotMatchedInsertAll) is not supported; "
-                "add .whenNotMatchedInsertAll() for an upsert, .whenNotMatchedBySourceDelete() for "
-                "a sync, or omit the matched clause for insert-only."
-            )
-
-        insert_only = self._matched is None and self._not_matched is not None
-        update_columns = None
-        update_condition = None
-        if self._matched is not None:
-            kind, cols, update_condition = self._matched
-            if kind == "cols":
-                update_columns = cols
-        insert_condition = self._not_matched[1] if self._not_matched is not None else None
-
-        engine.merge_delta(
+        if not self._clauses:
+            raise ValueError("merge has no clauses; add whenMatched*/whenNotMatched*/"
+                             "whenNotMatchedBySource* before execute().")
+        # The ordered clause list is the full delta-rs TableMerger surface; delta_rs enforces its own
+        # legality rules on combinations, so we don't pre-reject shapes here.
+        engine.merge_delta_clauses(
             self._table.path,
             self._source.relation,
-            self._keys if len(self._keys) > 1 else self._keys[0],
-            insert_only=insert_only,
-            update_columns=update_columns,
-            predicates=self._predicates or None,
-            update_condition=update_condition,
-            insert_condition=insert_condition,
-            delete_unmatched_by_source=self._by_source_delete,
+            self._condition,
+            self._clauses,
             read_version=self._read_version,
             storage_options=self._table.storage_options,
             compaction_threshold=self._table.compaction_threshold,

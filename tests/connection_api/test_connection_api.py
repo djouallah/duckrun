@@ -359,12 +359,53 @@ class TestDeltaTable:
         assert conn.table("m").count() == 4  # only id=5 added
         assert conn.sql("select val from m where id = 2").fetchone()[0] == 10  # untouched
 
-    def test_update_only_rejected(self, conn):
+    def test_merge_update_only(self, conn):
+        # update-only merge (matched update, no insert) is supported — matched rows change, none added.
         self._seed(conn)
-        src = conn.sql("select 1 id, 1 val")
-        with pytest.raises(ValueError):
-            DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-                .whenMatchedUpdateAll().execute()
+        src = conn.sql("select * from (values (1,99),(5,99)) t(id, val)")
+        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
+            .whenMatchedUpdateAll().execute()
+        assert conn.sql("select val from m where id = 1").fetchone()[0] == 99  # updated
+        assert conn.table("m").count() == 3                                    # id=5 NOT inserted
+
+    def test_merge_matched_delete(self, conn):
+        # WHEN MATCHED THEN DELETE — matched rows removed (CDC-style).
+        self._seed(conn)
+        src = conn.sql("select * from (values (2,0),(3,0)) t(id, val)")
+        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
+            .whenMatchedDelete().execute()
+        assert sorted(r[0] for r in conn.table("m").collect()) == [1]
+
+    def test_merge_update_and_delete(self, conn):
+        # two WHEN MATCHED clauses in one merge: delete flagged rows, update the rest.
+        self._seed(conn)
+        src = conn.sql("select * from (values (1,99,false),(2,99,true)) t(id, val, gone)")
+        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
+            .whenMatchedDelete("source.gone").whenMatchedUpdate(set={"val": "source.val"}).execute()
+        rows = dict(conn.sql("select id, val from m").collect())
+        assert 2 not in rows           # deleted (gone = true)
+        assert rows[1] == 99           # updated
+        assert rows[3] == 10           # untouched
+
+    def test_merge_insert_values(self, conn):
+        # whenNotMatchedInsert with explicit value expressions.
+        self._seed(conn)
+        src = conn.sql("select * from (values (9,'5')) t(id, val)")
+        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
+            .whenNotMatchedInsert(values={"id": "source.id", "val": "cast(source.val as int) * 10"}) \
+            .execute()
+        assert conn.sql("select val from m where id = 9").fetchone()[0] == 50
+
+    def test_merge_by_source_update(self, conn):
+        # whenNotMatchedBySourceUpdate — touch rows the source doesn't carry.
+        self._seed(conn)
+        src = conn.sql("select * from (values (1,99)) t(id, val)")
+        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
+            .whenMatchedUpdateAll().whenNotMatchedBySourceUpdate(set={"val": "-1"}).execute()
+        rows = dict(conn.sql("select id, val from m").collect())
+        assert rows[1] == 99    # matched → updated from source
+        assert rows[2] == -1    # not in source → set to -1
+        assert rows[3] == -1
 
     def test_version(self, conn):
         self._seed(conn)  # one overwrite → version 0
@@ -549,17 +590,52 @@ class TestSqlDml:
             conn.sql("MERGE INTO src s USING (values (1,'x')) t(id, name) ON foo.id = bar.id "
                      "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
 
-    def test_sql_merge_matched_delete_rejected(self, conn):
-        # engine/builder have no matched-delete — rejected clearly.
-        with pytest.raises(ValueError, match="DELETE is not supported"):
-            conn.sql("MERGE INTO src USING (values (1,'x')) t(id, name) ON target.id = source.id "
-                     "WHEN MATCHED THEN DELETE")
+    def test_sql_merge_matched_delete(self, conn):
+        # WHEN MATCHED THEN DELETE — matched rows removed (full delta-rs surface).
+        conn.sql("MERGE INTO src USING (values (2,'x'),(3,'x')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED THEN DELETE")
+        assert sorted(r[0] for r in conn.table("src").collect()) == [1]
 
-    def test_sql_merge_insert_values_rejected(self, conn):
-        # only INSERT * is supported (no arbitrary column/value maps).
-        with pytest.raises(ValueError, match=r"INSERT \* is supported"):
-            conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
-                     "WHEN NOT MATCHED THEN INSERT (id, name) VALUES (source.id, source.name)")
+    def test_sql_merge_matched_delete_and_update(self, conn):
+        # two WHEN MATCHED clauses, applied in order: delete flagged rows, update the rest.
+        conn.sql("MERGE INTO src USING (values (1,'A',false),(2,'B',true)) t(id, name, gone) "
+                 "ON target.id = source.id "
+                 "WHEN MATCHED AND source.gone THEN DELETE "
+                 "WHEN MATCHED THEN UPDATE SET name = source.name")
+        rows = dict(conn.sql("select id, name from src").collect())
+        assert 2 not in rows          # deleted (gone = true)
+        assert rows[1] == "A"         # updated
+        assert rows[3] == "c"         # untouched (not in source)
+
+    def test_sql_merge_insert_values(self, conn):
+        # WHEN NOT MATCHED THEN INSERT (cols) VALUES (<exprs>) — arbitrary value expressions.
+        conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
+                 "WHEN NOT MATCHED THEN INSERT (id, name) VALUES (source.id, upper(source.name))")
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "Z"
+
+    def test_sql_merge_update_expression(self, conn):
+        # UPDATE SET col = <arbitrary expr> (not just plain source.col copies).
+        conn.sql("MERGE INTO src USING (values (1,'x')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET name = upper(source.name) || '!' "
+                 "WHEN NOT MATCHED THEN INSERT *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X!"
+
+    def test_sql_merge_by_source_update(self, conn):
+        # WHEN NOT MATCHED BY SOURCE THEN UPDATE — touch rows the source doesn't carry.
+        conn.sql("MERGE INTO src USING (values (1,'A')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET * "
+                 "WHEN NOT MATCHED BY SOURCE THEN UPDATE SET name = 'gone'")
+        rows = dict(conn.sql("select id, name from src").collect())
+        assert rows[1] == "A"          # matched → updated from source
+        assert rows[2] == "gone"       # not in source → updated
+        assert rows[3] == "gone"
+
+    def test_sql_merge_update_only(self, conn):
+        # update-only merge (matched update, no insert clause) is now supported.
+        conn.sql("MERGE INTO src USING (values (1,'A'),(9,'z')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET *")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "A"  # updated
+        assert conn.table("src").count() == 3                                      # id=9 NOT inserted
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -732,13 +808,14 @@ def test_merge_insert_only(wh):
     assert conn.sql("select val from io where id = 2").fetchone()[0] == 10  # existing untouched
 
 
-def test_update_only_merge_rejected(wh):
+def test_update_only_merge(wh):
+    # update-only merge (matched update, no insert) is supported — only existing rows change.
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    src = conn.sql("select 1 id, 1 val")
-    builder = DeltaTable.forName(conn, "dbo.t1").merge(src, "target.id = source.id") \
-        .whenMatchedUpdateAll()
-    with pytest.raises(ValueError):
-        builder.execute()
+    src = conn.sql("select * from (values (1,'A'),(9,'z')) t(id, name)")
+    DeltaTable.forName(conn, "dbo.t1").merge(src, "target.id = source.id") \
+        .whenMatchedUpdateAll().execute()
+    assert conn.sql("select name from t1 where id = 1").fetchone()[0] == "A"  # updated
+    assert conn.sql("select count(*) from t1").fetchone()[0] == 2             # id=9 NOT inserted
 
 
 def test_toPandas(wh):

@@ -48,11 +48,20 @@ Supported / unsupported (what reaches delta_rs):
     update x set … [where …]                                 delta_rs update
     alter table x add column …                               Delta overwrite (widen schema)
     drop table x                                             tombstone (no data deleted)
-    merge into x [a] using s [b] on a.k = b.k when …         delta_rs upsert (engine.merge_delta) —
-                                                             same boundary as DeltaTable.merge; ON/WHEN
-                                                             may use your own aliases or the table/
-                                                             relation names (normalized to the
-                                                             target/source aliases delta_rs uses)
+    merge into x [a] using s [b] on a.k = b.k when …         delta_rs MERGE (engine.merge_delta_clauses)
+                                                             — the FULL delta-rs TableMerger surface:
+                                                             WHEN MATCHED [AND p] THEN UPDATE SET * /
+                                                             SET col=<expr> / DELETE; WHEN NOT MATCHED
+                                                             [AND p] THEN INSERT * / INSERT (cols)
+                                                             VALUES (<exprs>); WHEN NOT MATCHED BY
+                                                             SOURCE [AND p] THEN UPDATE SET … / DELETE.
+                                                             Any number of clauses, applied in order;
+                                                             the ON predicate may be any boolean
+                                                             (multi-key/range/non-equi). ON/WHEN may
+                                                             use your own aliases or the table/relation
+                                                             names (normalized to the target/source
+                                                             aliases delta_rs uses). Same boundary as
+                                                             DeltaTable.merge.
     update … from / delete … using / multi-stmt              NOT handled here — the connection API
                                                              (session.sql) rejects them with a clear
                                                              error; the dbt path never emits them.
@@ -150,6 +159,11 @@ _M_THEN = re.compile(r"\bthen\b", re.I)
 _M_UPDATE_ALL = re.compile(r"\s*update\s+set\s+\*\s*", re.I)
 _M_UPDATE_SET = re.compile(r"\s*update\s+set\s+(?P<assign>.+)", re.I | re.S)
 _M_INSERT_ALL = re.compile(r"\s*insert\s+\*\s*", re.I)
+# `insert (col, …) values (<expr>, …)` — the column list (no parens inside) and the value list,
+# which may contain function calls (commas split at top level by _split_top_level_commas).
+_M_INSERT_COLS = re.compile(
+    r"\s*insert\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>.+)\)\s*", re.I | re.S
+)
 _M_DELETE = re.compile(r"\s*delete\s*", re.I)
 # `create temp/temporary table …` is DuckDB-local scratch by design and must NEVER be captured —
 # checked first in try_handle so it always passes through to native DuckDB (the invariant: only
@@ -390,70 +404,75 @@ def _split_top_level_commas(s: str) -> List[str]:
     return [p.strip() for p in out if p.strip()]
 
 
-# A single ``target.col = source.col`` key equality (same column, either alias order). Shared by the
-# SQL MERGE handler here and the DataFrame ``DeltaTable.merge`` builder (duckrun/delta_table.py) so
-# both enforce ONE supported boundary.
-_EQ = re.compile(r"^\s*(\w+)\.(\w+)\s*=\s*(\w+)\.(\w+)\s*$", re.IGNORECASE)
-
-
-def parse_merge_condition(condition: str) -> Tuple[List[str], List[str]]:
-    """Split a merge ``ON`` condition into ``(unique_key, extra_predicates)``.
-
-    Each ``AND``-separated term of the form ``target.X = source.X`` (same column, either order)
-    contributes ``X`` as a merge key; any other term is passed through as an extra predicate
-    (delta-rs ANDs it into the merge condition). Raises if no key equality is found or an alias other
-    than ``target``/``source`` is used — duckrun's MERGE always renames the relations to the literal
-    ``target``/``source`` aliases delta-rs uses, so the condition must reference those names.
-    """
-    keys: List[str] = []
-    predicates: List[str] = []
-    for term in re.split(r"\s+AND\s+", condition, flags=re.IGNORECASE):
-        term = term.strip()
-        if not term:
+def _qualifiers(s: str) -> List[str]:
+    """Every ``<word>.`` qualifier in ``s`` that sits outside string/identifier quotes and at an
+    identifier boundary (same quote/boundary rules as :func:`_rewrite_qualifiers`). Used to validate
+    that a merge condition references only the canonical ``target``/``source`` relations."""
+    out, i, n, quote = [], 0, len(s), None
+    while i < n:
+        ch = s[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            i += 1
             continue
-        m = _EQ.match(term)
-        if m:
-            a_alias, a_col, b_alias, b_col = (g.lower() for g in m.groups())
-            aliases = {a_alias, b_alias}
-            if aliases == {"target", "source"} and a_col == b_col:
-                keys.append(m.group(2))  # original-case column
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if not (i and (s[i - 1].isalnum() or s[i - 1] == "_")):
+            mm = _QUALIFIER.match(s, i)
+            if mm:
+                out.append(mm.group(1))
+                i = mm.end()
                 continue
-            if not aliases <= {"target", "source"}:
-                raise ValueError(
-                    f"merge condition must use the 'target' and 'source' aliases, got: {term!r}. "
-                    f"Write the ON clause as 'target.<col> = source.<col>' (duckrun renames the "
-                    f"merge relations to target/source)."
-                )
-        # A non-key term (range predicate, target.a = source.b, etc.) → pass through.
-        predicates.append(term)
-    if not keys:
-        raise ValueError(
-            "merge condition has no 'target.<col> = source.<col>' key equality; "
-            f"got: {condition!r}"
-        )
-    return keys, predicates
+        i += 1
+    return out
 
 
-def _parse_update_set(assign: str) -> List[str]:
-    """Columns named in a ``WHEN MATCHED THEN UPDATE SET col = source.col, …`` clause. Only plain
-    ``source.col`` copies are accepted (same boundary as the builder's ``whenMatchedUpdate``); an
-    arbitrary expression raises, directing the user to ``UPDATE SET *`` to copy every column."""
-    cols: List[str] = []
+def validate_merge_condition(condition: str) -> None:
+    """Raise if the merge ``ON`` condition references a qualifier other than the canonical
+    ``target``/``source`` (user aliases are already rewritten to those by the caller). Does NOT
+    require a ``target.k = source.k`` key equality — any boolean predicate delta-rs accepts
+    (multi-key, range, non-equi) is allowed, matching the full delta-rs MERGE surface. Shared by the
+    SQL MERGE handler here and the DataFrame ``DeltaTable.merge`` builder so both enforce ONE
+    boundary."""
+    for qual in _qualifiers(condition):
+        if qual.lower() not in ("target", "source"):
+            raise ValueError(
+                f"merge condition must use the 'target' and 'source' aliases, got qualifier "
+                f"{qual!r}. Write the ON clause with target.<col> / source.<col> (duckrun renames "
+                f"the merge relations to target/source)."
+            )
+
+
+def _parse_set_exprs(assign: str) -> dict:
+    """``{col: expr}`` for a ``UPDATE SET col = <expr>, …`` clause. The expression is ANY SQL delta-rs
+    accepts (a plain ``source.col`` copy or an arbitrary expression like ``source.qty + 1``); it is
+    passed to delta-rs verbatim (already alias-rewritten to target/source)."""
+    updates: dict = {}
     for a in _split_top_level_commas(assign):
         col, sep, expr = a.partition("=")
-        if not sep:
+        if not sep or not col.strip() or not expr.strip():
             raise ValueError(f"malformed UPDATE SET assignment: {a.strip()!r}")
-        col = col.strip().strip('"')
-        norm = expr.strip().lower()
-        if norm not in (f"source.{col.lower()}", f'"source"."{col.lower()}"'):
-            raise ValueError(
-                f"WHEN MATCHED THEN UPDATE SET only supports plain column copies (col = "
-                f"source.col); got {a.strip()!r}. Use UPDATE SET * to copy every column."
-            )
-        cols.append(col)
+        updates[col.strip().strip('"')] = expr.strip()
+    if not updates:
+        raise ValueError("UPDATE SET has no assignments")
+    return updates
+
+
+def _parse_insert_cols(cols_text: str, vals_text: str) -> dict:
+    """``{col: value_expr}`` for ``INSERT (col, …) VALUES (<expr>, …)`` — columns and values zipped
+    positionally (values split at top level so a function call's commas don't break the pairing)."""
+    cols = [c.strip().strip('"') for c in cols_text.split(",") if c.strip()]
+    vals = _split_top_level_commas(vals_text)
+    if len(cols) != len(vals):
+        raise ValueError(
+            f"INSERT column/value count mismatch: {len(cols)} column(s), {len(vals)} value(s)"
+        )
     if not cols:
-        raise ValueError("WHEN MATCHED THEN UPDATE SET has no assignments")
-    return cols
+        raise ValueError("INSERT has no columns")
+    return dict(zip(cols, vals))
 
 
 def _split_when_clause(clause: str) -> Tuple[str, Optional[str], str]:
@@ -476,6 +495,45 @@ def _split_when_clause(clause: str) -> Tuple[str, Optional[str], str]:
     kind = re.sub(r"\s+", " ", km.group("kind").strip().lower())
     pred = km.group("pred")
     return kind, (pred.strip() if pred else None), action
+
+
+def _build_merge_clause(kind: str, pred: Optional[str], action: str) -> dict:
+    """Turn one parsed ``(kind, pred, action)`` WHEN clause into an ``engine.merge_delta_clauses``
+    spec dict. Covers the full delta-rs TableMerger surface; only a malformed/typo action raises —
+    legality of clause *combinations* is left to delta_rs."""
+    if kind == "matched":
+        if _M_UPDATE_ALL.fullmatch(action):
+            return {"clause": "matched", "action": "update_all", "predicate": pred}
+        if _M_DELETE.fullmatch(action):
+            return {"clause": "matched", "action": "delete", "predicate": pred}
+        sm = _M_UPDATE_SET.fullmatch(action)
+        if sm:
+            return {"clause": "matched", "action": "update",
+                    "updates": _parse_set_exprs(sm.group("assign")), "predicate": pred}
+        raise ValueError(
+            f"unsupported WHEN MATCHED action (expected UPDATE SET * / UPDATE SET col=… / DELETE): "
+            f"{action!r}")
+    if kind == "not matched":
+        if _M_INSERT_ALL.fullmatch(action):
+            return {"clause": "not_matched", "action": "insert_all", "predicate": pred}
+        im = _M_INSERT_COLS.fullmatch(action)
+        if im:
+            return {"clause": "not_matched", "action": "insert",
+                    "updates": _parse_insert_cols(im.group("cols"), im.group("vals")),
+                    "predicate": pred}
+        raise ValueError(
+            f"unsupported WHEN NOT MATCHED action (expected INSERT * or INSERT (cols) VALUES (…)): "
+            f"{action!r}")
+    # "not matched by source": UPDATE SET … or DELETE
+    if _M_DELETE.fullmatch(action):
+        return {"clause": "not_matched_by_source", "action": "delete", "predicate": pred}
+    sm = _M_UPDATE_SET.fullmatch(action)
+    if sm:
+        return {"clause": "not_matched_by_source", "action": "update",
+                "updates": _parse_set_exprs(sm.group("assign")), "predicate": pred}
+    raise ValueError(
+        f"unsupported WHEN NOT MATCHED BY SOURCE action (expected UPDATE SET … or DELETE): "
+        f"{action!r}")
 
 
 class _DeltaDML:
@@ -741,13 +799,15 @@ class _DeltaDML:
         )
         engine.write_delta(loc, data, "overwrite", overwrite_schema=True, storage_options=self.so)
 
-    # -- merge into <target> using <source> on <cond> when … : delta_rs upsert ------------------
+    # -- merge into <target> using <source> on <cond> when … : full delta_rs MERGE ---------------
     def _merge(self, m, rel, schema, loc) -> None:
-        """Dispatch a raw SQL MERGE to ``engine.merge_delta`` — the same engine call, snapshot pin,
-        and supported boundary as the DataFrame ``DeltaTable.merge`` builder. The ON condition and
-        WHEN clauses may use the user's own aliases (``MERGE INTO t a USING s b ON a.k = b.k``) or
-        the table/relation names; these are normalized to the literal ``target``/``source`` aliases
-        delta_rs uses. Fully-unqualified columns (``ON k = k``) are ambiguous and unsupported."""
+        """Dispatch a raw SQL MERGE to ``engine.merge_delta_clauses`` — the full delta-rs TableMerger
+        surface, same engine core, snapshot pin, and boundary as the DataFrame ``DeltaTable.merge``
+        builder. Any number of ``WHEN MATCHED`` / ``WHEN NOT MATCHED`` / ``WHEN NOT MATCHED BY
+        SOURCE`` clauses are parsed in order; the ON condition may be any boolean predicate. The ON
+        and WHEN clauses may use the user's own aliases (``MERGE INTO t a USING s b ON a.k = b.k``)
+        or the table/relation names; these are normalized to the literal ``target``/``source``
+        aliases delta_rs uses, and the ON predicate is then handed to delta_rs verbatim."""
         rest = m.group("rest")
         ui = _find_top_level(rest, _M_USING)
         if ui < 0:
@@ -774,86 +834,25 @@ class _DeltaDML:
         whens = _find_all_top_level(cond_clauses, _M_WHEN)
         if not whens:
             raise ValueError("MERGE requires at least one WHEN clause")
-        cond = cond_clauses[:whens[0]]
+        cond = cond_clauses[:whens[0]].strip()
+        if not cond:
+            raise ValueError("MERGE requires an ON <condition> clause")
+        validate_merge_condition(cond)
         clause_strs = [cond_clauses[a:b] for a, b in zip(whens, whens[1:] + [len(cond_clauses)])]
+        # One clause spec per WHEN, in source order — delta_rs evaluates them top-to-bottom and
+        # enforces its own legality rules (e.g. multiple unconditional matched clauses), so we don't
+        # second-guess combinations here: whatever delta_rs accepts, we accept.
+        clauses = [_build_merge_clause(*_split_when_clause(c)) for c in clause_strs]
 
-        keys, predicates = parse_merge_condition(cond)
         # Evaluate the whole USING operand (including any alias) so a bare name, an aliased name, and
         # a subquery with a column-renaming alias (`(values …) t(id, name)`) all work — delta_rs
         # renames the relation to `source` regardless of the SQL alias.
         source = self.cursor.sql(f"select * from {source_part.strip()}")
-
-        matched = None        # None | ("all", pred) | ("cols", [cols], pred)
-        not_matched = None    # None | ("all", pred)  — INSERT * only
-        by_source_delete = None  # None | True | predicate string
-        for clause in clause_strs:
-            kind, pred, action = _split_when_clause(clause)
-            if kind == "matched":
-                if matched is not None:
-                    raise ValueError("duplicate WHEN MATCHED clause is not supported")
-                if _M_UPDATE_ALL.fullmatch(action):
-                    matched = ("all", pred)
-                elif _M_DELETE.fullmatch(action):
-                    raise ValueError(
-                        "WHEN MATCHED THEN DELETE is not supported — duckrun's merge has no "
-                        "matched-delete. Use WHEN NOT MATCHED BY SOURCE THEN DELETE for a sync, or "
-                        "DeltaTable.forName(conn, name).delete(...)."
-                    )
-                else:
-                    sm = _M_UPDATE_SET.fullmatch(action)
-                    if not sm:
-                        raise ValueError(f"unsupported WHEN MATCHED action: {action!r}")
-                    matched = ("cols", _parse_update_set(sm.group("assign")), pred)
-            elif kind == "not matched":
-                if not_matched is not None:
-                    raise ValueError("duplicate WHEN NOT MATCHED clause is not supported")
-                if not _M_INSERT_ALL.fullmatch(action):
-                    raise ValueError(
-                        "only WHEN NOT MATCHED THEN INSERT * is supported (no column/value lists) — "
-                        f"got: {action!r}"
-                    )
-                not_matched = ("all", pred)
-            else:  # "not matched by source"
-                if by_source_delete is not None:
-                    raise ValueError("duplicate WHEN NOT MATCHED BY SOURCE clause is not supported")
-                if not _M_DELETE.fullmatch(action):
-                    raise ValueError(
-                        "WHEN NOT MATCHED BY SOURCE supports only THEN DELETE — "
-                        f"got: {action!r}"
-                    )
-                by_source_delete = pred if pred is not None else True
-
-        if matched is None and not_matched is None and not by_source_delete:
-            raise ValueError("MERGE has no supported WHEN clauses")
-        # An update-only merge (matched update, no insert and no by-source-delete) can't be expressed
-        # — mirror the DataFrame builder.
-        if not_matched is None and matched is not None and not by_source_delete:
-            raise ValueError(
-                "update-only merge is not supported; add WHEN NOT MATCHED THEN INSERT * for an "
-                "upsert, WHEN NOT MATCHED BY SOURCE THEN DELETE for a sync, or omit the matched "
-                "clause for insert-only."
-            )
-
-        insert_only = matched is None and not_matched is not None
-        update_columns = None
-        update_condition = None
-        if matched is not None:
-            if matched[0] == "all":
-                update_condition = matched[1]
-            else:
-                update_columns, update_condition = matched[1], matched[2]
-        insert_condition = not_matched[1] if not_matched is not None else None
-
-        engine.merge_delta(
+        engine.merge_delta_clauses(
             loc,
             source,
-            keys if len(keys) > 1 else keys[0],
-            insert_only=insert_only,
-            update_columns=update_columns,
-            predicates=predicates or None,
-            update_condition=update_condition,
-            insert_condition=insert_condition,
-            delete_unmatched_by_source=by_source_delete,
+            cond,
+            clauses,
             # Pin the target to the version we read now (single statement) — same as the builder's
             # .merge(), which captures the version at call time.
             read_version=engine.table_version(loc, self.so),

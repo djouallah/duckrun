@@ -207,24 +207,41 @@ class Plugin(BasePlugin):
             # prune the target (right for small incremental deltas into a large table). A model
             # whose source is itself huge can set merge_streamed_exec=true to stream it instead.
             sx = cfg.get("merge_streamed_exec")
+            # merge_clauses / merge_update_set_expressions need delta_rs's full ordered clause list
+            # (matched-delete, multiple matched clauses, custom SET expressions) — divert to the
+            # clause-core. Everything else stays on the byte-identical flat-kwarg merge_delta path.
+            clause_specs = self._custom_merge_clauses(cfg, data.columns, unique_key)
             with engine.mem_profile("merge", con=cur):
-                engine.merge_delta(
-                    path, data, unique_key,
-                    insert_only=(strategy == "insert"),
-                    update_columns=cfg.get("merge_update_columns"),
-                    exclude_columns=cfg.get("merge_exclude_columns"),
-                    predicates=self._merge_predicates(cfg, data.columns),
-                    update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
-                    insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
-                    merge_schema=evolve_schema,
-                    max_spill_size=cfg.get("merge_max_spill_size"),
-                    streamed_exec=(False if sx is None else bool(sx)),
-                    # Pin the merge target to the version the model read (vB, captured before it read
-                    # {{ this }}), so OCC validates (vB, HEAD] — read and commit are one snapshot.
-                    read_version=cfg.get("read_version"),
-                    storage_options=storage_options,
-                    compaction_threshold=self._compaction_threshold,
-                )
+                if clause_specs is not None:
+                    engine.merge_delta_clauses(
+                        path, data,
+                        self._merge_on_predicate(unique_key, cfg, data.columns),
+                        clause_specs,
+                        merge_schema=evolve_schema,
+                        max_spill_size=cfg.get("merge_max_spill_size"),
+                        streamed_exec=(False if sx is None else bool(sx)),
+                        read_version=cfg.get("read_version"),
+                        storage_options=storage_options,
+                        compaction_threshold=self._compaction_threshold,
+                    )
+                else:
+                    engine.merge_delta(
+                        path, data, unique_key,
+                        insert_only=(strategy == "insert"),
+                        update_columns=cfg.get("merge_update_columns"),
+                        exclude_columns=cfg.get("merge_exclude_columns"),
+                        predicates=self._merge_predicates(cfg, data.columns),
+                        update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
+                        insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
+                        merge_schema=evolve_schema,
+                        max_spill_size=cfg.get("merge_max_spill_size"),
+                        streamed_exec=(False if sx is None else bool(sx)),
+                        # Pin the merge target to the version the model read (vB, captured before it
+                        # read {{ this }}), so OCC validates (vB, HEAD] — read and commit are one snapshot.
+                        read_version=cfg.get("read_version"),
+                        storage_options=storage_options,
+                        compaction_threshold=self._compaction_threshold,
+                    )
         elif strategy == "append":
             with engine.mem_profile("append", con=cur):
                 engine.write_delta(
@@ -458,20 +475,20 @@ class Plugin(BasePlugin):
         # the result ignores what the user asked for. merge_update_condition / merge_insert_condition
         # ARE honored (delta_rs per-clause predicates — see merge_delta), so they are NOT rejected;
         # merge_update_columns / merge_exclude_columns / incremental_predicates are honored too.
+        # merge_clauses and merge_update_set_expressions ARE honored now (translated to delta_rs's
+        # full TableMerger clause list — see _custom_merge_clauses), so they are not rejected.
         # (merge_returning_columns is a caller-side return value duckrun never surfaces, so ignoring
         # it changes no table state — left unflagged.)
-        unsupported = [
-            k for k in ("merge_clauses", "merge_update_set_expressions", "merge_on_using_columns")
-            if cfg.get(k)
-        ]
+        unsupported = [k for k in ("merge_on_using_columns",) if cfg.get(k)]
         if unsupported:
             raise CompilationError(
                 "duckrun cannot honor these merge configs (delta_rs has no equivalent), and "
                 "refuses to run them as a plain upsert because that would silently ignore what you "
                 "asked for: " + ", ".join(unsupported) + ". Supported merge controls: unique_key, "
                 "merge_update_columns, merge_exclude_columns, merge_update_condition, "
-                "merge_insert_condition, incremental_predicates. Remove the unsupported keys or "
-                "express the logic with the supported ones."
+                "merge_insert_condition, merge_update_set_expressions, merge_clauses, "
+                "incremental_predicates. Remove the unsupported keys or express the logic with the "
+                "supported ones."
             )
 
     @staticmethod
@@ -513,6 +530,117 @@ class Plugin(BasePlugin):
         if isinstance(preds, str):
             preds = [preds]
         return [cls._qualify_predicate(cls._rewrite_merge_aliases(p), columns) for p in preds]
+
+    @classmethod
+    def _merge_on_predicate(cls, unique_key, cfg: dict, columns=None) -> str:
+        """The full MERGE ``ON`` predicate ``target.k = source.k [AND …]`` — the same string
+        ``merge_delta`` builds internally from ``unique_key`` + ``incremental_predicates``. Used by
+        the clause-core path (merge_clauses / merge_update_set_expressions), which takes the predicate
+        directly rather than a unique_key."""
+        keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
+        conditions = [f"target.{k} = source.{k}" for k in keys]
+        preds = cls._merge_predicates(cfg, columns)
+        if preds:
+            conditions.extend(p for p in preds if p)
+        return " AND ".join(conditions)
+
+    @classmethod
+    def _custom_merge_clauses(cls, cfg: dict, columns, unique_key):
+        """Return an ordered ``engine.merge_delta_clauses`` spec list when the config uses
+        ``merge_clauses`` or ``merge_update_set_expressions`` (delta_rs's full TableMerger surface),
+        else None so the caller stays on the standard flat-kwarg ``merge_delta`` path. The two knobs
+        are mutually exclusive (``_validate_merge_config`` rejects ``merge_clauses`` mixed with the
+        basic configs)."""
+        if cfg.get("merge_clauses"):
+            return cls._specs_from_merge_clauses(cfg.get("merge_clauses"), columns, unique_key)
+        if cfg.get("merge_update_set_expressions"):
+            return cls._specs_from_set_expressions(cfg, columns, unique_key)
+        return None
+
+    @staticmethod
+    def _key_set(unique_key):
+        keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
+        return {str(k).lower() for k in keys}
+
+    @classmethod
+    def _explicit_cols(cls, spec, allcols, keys) -> list:
+        """Columns named by an explicit-mode ``merge_clauses`` update/insert: ``{'include': [...]}``,
+        ``{'exclude': [...]}``, or (absent) every non-key column."""
+        if isinstance(spec, dict):
+            if spec.get("include"):
+                return [str(c) for c in spec["include"]]
+            if spec.get("exclude"):
+                ex = {str(e).lower() for e in spec["exclude"]}
+                return [c for c in allcols if c.lower() not in ex]
+        return [c for c in allcols if c.lower() not in keys]
+
+    @classmethod
+    def _specs_from_set_expressions(cls, cfg: dict, columns, unique_key) -> list:
+        """``merge_update_set_expressions``: a matched UPDATE that copies every (non-key) column from
+        source, with the named columns overridden by custom SQL expressions, plus the standard
+        not-matched INSERT *. Mirrors dbt-duckdb semantics."""
+        keys = cls._key_set(unique_key)
+        allcols = [str(c) for c in columns]
+        update_cols = cfg.get("merge_update_columns")
+        exclude_cols = cfg.get("merge_exclude_columns")
+        if update_cols:
+            base = [str(c) for c in update_cols]
+        elif exclude_cols:
+            ex = {str(e).lower() for e in exclude_cols}
+            base = [c for c in allcols if c.lower() not in ex and c.lower() not in keys]
+        else:
+            base = [c for c in allcols if c.lower() not in keys]
+        updates = {c: f"source.{c}" for c in base}
+        for col, expr in cfg["merge_update_set_expressions"].items():
+            updates[col] = cls._rewrite_merge_aliases(expr)
+        return [
+            {"clause": "matched", "action": "update", "updates": updates,
+             "predicate": cls._rewrite_merge_aliases(cfg.get("merge_update_condition"))},
+            {"clause": "not_matched", "action": "insert_all",
+             "predicate": cls._rewrite_merge_aliases(cfg.get("merge_insert_condition"))},
+        ]
+
+    @classmethod
+    def _specs_from_merge_clauses(cls, merge_clauses: dict, columns, unique_key) -> list:
+        """Translate a dbt-duckdb ``merge_clauses`` dict into delta_rs clause specs (applied in
+        order). ``mode: by_name`` → UPDATE/INSERT all columns; ``mode: explicit`` → the columns named
+        by ``update``/``insert`` include/exclude; ``action: delete`` → matched delete."""
+        keys = cls._key_set(unique_key)
+        allcols = [str(c) for c in columns]
+        specs = []
+        for c in merge_clauses.get("when_matched", []) or []:
+            action = (c.get("action") or "").lower()
+            cond = cls._rewrite_merge_aliases(c.get("condition"))
+            if action == "update":
+                if (c.get("mode") or "by_name").lower() == "by_name":
+                    specs.append({"clause": "matched", "action": "update_all", "predicate": cond})
+                else:
+                    cols = cls._explicit_cols(c.get("update"), allcols, keys)
+                    specs.append({"clause": "matched", "action": "update",
+                                  "updates": {col: f"source.{col}" for col in cols},
+                                  "predicate": cond})
+            elif action == "delete":
+                specs.append({"clause": "matched", "action": "delete", "predicate": cond})
+            else:
+                raise CompilationError(
+                    f"unsupported merge_clauses.when_matched action: {action!r} "
+                    f"(expected 'update' or 'delete')")
+        for c in merge_clauses.get("when_not_matched", []) or []:
+            action = (c.get("action") or "").lower()
+            cond = cls._rewrite_merge_aliases(c.get("condition"))
+            if action == "insert":
+                if (c.get("mode") or "by_name").lower() == "by_name":
+                    specs.append({"clause": "not_matched", "action": "insert_all", "predicate": cond})
+                else:
+                    cols = cls._explicit_cols(c.get("insert") or c.get("update"), allcols, keys)
+                    specs.append({"clause": "not_matched", "action": "insert",
+                                  "updates": {col: f"source.{col}" for col in cols},
+                                  "predicate": cond})
+            else:
+                raise CompilationError(
+                    f"unsupported merge_clauses.when_not_matched action: {action!r} "
+                    f"(expected 'insert')")
+        return specs
 
     @staticmethod
     def _resolve_schema_change(on_schema_change, path, data, storage_options) -> bool:

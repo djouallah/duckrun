@@ -1007,6 +1007,98 @@ def merge_delta(
         conditions.extend(p for p in extra if p)
     predicate = " AND ".join(conditions)
 
+    # Build the fixed clause shape this convenience wrapper has always produced, then hand it to the
+    # ordered clause-core. dbt merge_update_condition / merge_insert_condition gate which matched rows
+    # update and which unmatched rows insert; delta_rs expresses these as per-clause predicates
+    # (referencing target/source — the caller has already rewritten DBT_INTERNAL_DEST/SOURCE).
+    clauses: List[dict] = []
+    if insert_only:
+        clauses.append({"clause": "not_matched", "action": "insert_all",
+                        "predicate": insert_condition})
+    else:
+        if update_columns:
+            clauses.append({"clause": "matched", "action": "update",
+                            "updates": {c: f"source.{c}" for c in update_columns},
+                            "predicate": update_condition})
+        elif exclude_columns:
+            clauses.append({"clause": "matched", "action": "update_all",
+                            "except_cols": list(exclude_columns), "predicate": update_condition})
+        else:
+            clauses.append({"clause": "matched", "action": "update_all",
+                            "predicate": update_condition})
+        clauses.append({"clause": "not_matched", "action": "insert_all",
+                        "predicate": insert_condition})
+    # "WHEN NOT MATCHED BY SOURCE THEN DELETE": optionally remove target rows the source doesn't carry
+    # (full sync). True = all unmatched; a string = only those matching the predicate. Default None
+    # adds nothing (dbt incremental paths unaffected).
+    if delete_unmatched_by_source:
+        by_source_pred = (delete_unmatched_by_source
+                          if isinstance(delete_unmatched_by_source, str) else None)
+        clauses.append({"clause": "not_matched_by_source", "action": "delete",
+                        "predicate": by_source_pred})
+
+    merge_delta_clauses(
+        path, data, predicate, clauses,
+        read_version=read_version,
+        merge_schema=merge_schema,
+        streamed_exec=streamed_exec,
+        max_spill_size=max_spill_size,
+        storage_options=storage_options,
+        compaction_threshold=compaction_threshold,
+    )
+
+
+# delta-rs TableMerger method per (clause, action) — the full surface duckrun's connection-API MERGE
+# exposes. `*_all` take except_cols; `update`/`insert` take an `updates` map; `delete` takes neither.
+def _apply_merge_clause(merger, c: dict):
+    clause, action = c["clause"], c["action"]
+    pred = c.get("predicate")
+    if clause == "matched":
+        if action == "update_all":
+            return merger.when_matched_update_all(predicate=pred, except_cols=c.get("except_cols"))
+        if action == "update":
+            return merger.when_matched_update(updates=c["updates"], predicate=pred)
+        if action == "delete":
+            return merger.when_matched_delete(predicate=pred)
+    elif clause == "not_matched":
+        if action == "insert_all":
+            return merger.when_not_matched_insert_all(predicate=pred, except_cols=c.get("except_cols"))
+        if action == "insert":
+            return merger.when_not_matched_insert(updates=c["updates"], predicate=pred)
+    elif clause == "not_matched_by_source":
+        if action == "update":
+            return merger.when_not_matched_by_source_update(updates=c["updates"], predicate=pred)
+        if action == "delete":
+            return merger.when_not_matched_by_source_delete(predicate=pred)
+    raise ValueError(f"unsupported merge clause/action: {clause}/{action}")
+
+
+def merge_delta_clauses(
+    path: str,
+    data,
+    predicate: str,
+    clauses: List[dict],
+    *,
+    read_version: Optional[int] = None,
+    merge_schema: bool = False,
+    streamed_exec: bool = False,
+    max_spill_size: Optional[int] = None,
+    storage_options: Optional[Dict[str, str]] = None,
+    compaction_threshold: int = 100,
+) -> None:
+    """Run a MERGE described by an ORDERED list of clause dicts — the full delta-rs ``TableMerger``
+    surface. Each clause is ``{"clause": "matched"|"not_matched"|"not_matched_by_source",
+    "action": "update"|"update_all"|"delete"|"insert"|"insert_all", "predicate": str|None,
+    "updates": {col: expr}|None, "except_cols": [..]|None}`` and is applied in order (delta-rs
+    evaluates them top-to-bottom). ``predicate`` is the full ON condition, referencing the literal
+    ``target``/``source`` aliases.
+
+    This is the shared core for every merge path: ``merge_delta`` (dbt incremental — builds a fixed
+    clause list), the raw-SQL MERGE handler, and the DataFrame ``DeltaTable.merge`` builder. The
+    spill cap, target pruning, the REQUIRED ``read_version`` snapshot pin (OCC over (vB, HEAD]), and
+    the post-merge maintenance are identical for every clause shape, so the single-snapshot and
+    concurrency-safety guarantees hold for all of them. See ``merge_delta`` for the parameter
+    semantics (spill / streamed_exec / read_version / maintenance)."""
     # Sample the effective limit ONCE so the cap we apply and the cap we log can't disagree:
     # free RAM is read live on every call, so two separate reads would drift on a busy box.
     eff_limit = _effective_mem_limit_bytes()
@@ -1038,9 +1130,11 @@ def merge_delta(
     # read_version=None would silently merge against HEAD and reopen the read->write gap — refuse it.
     if read_version is None:
         raise ValueError(
-            "merge_delta requires read_version (the version the caller read). A merge always has "
-            "an existing target to pin to; None would merge against HEAD and break single-snapshot."
+            "merge_delta_clauses requires read_version (the version the caller read). A merge always "
+            "has an existing target to pin to; None would merge against HEAD and break single-snapshot."
         )
+    if not clauses:
+        raise ValueError("merge has no clauses")
     dt = _delta_table(path, storage_options)
     # Pin the target to the snapshot the model read (vB) so OCC validates (vB, HEAD] — one snapshot
     # for both the read and the commit.
@@ -1054,29 +1148,8 @@ def merge_delta(
         streamed_exec=streamed_exec,
         **spill_kwargs,
     )
-    # dbt merge_update_condition / merge_insert_condition gate which matched rows update and which
-    # unmatched rows insert. delta_rs expresses these as per-clause predicates (referencing the
-    # target/source aliases), so they are honored for real here — not silently dropped. The caller
-    # has already rewritten dbt's DBT_INTERNAL_DEST/SOURCE aliases to target/source.
-    if insert_only:
-        merger = merger.when_not_matched_insert_all(predicate=insert_condition)
-    else:
-        if update_columns:
-            updates = {c: f"source.{c}" for c in update_columns}
-            merger = merger.when_matched_update(updates=updates, predicate=update_condition)
-        elif exclude_columns:
-            merger = merger.when_matched_update_all(
-                except_cols=list(exclude_columns), predicate=update_condition
-            )
-        else:
-            merger = merger.when_matched_update_all(predicate=update_condition)
-        merger = merger.when_not_matched_insert_all(predicate=insert_condition)
-    # "WHEN NOT MATCHED BY SOURCE THEN DELETE": optionally remove target rows the source
-    # doesn't carry (full sync). True = all unmatched; a string = only those matching the predicate.
-    # Composes with both branches above; default None adds nothing (dbt incremental paths unaffected).
-    if delete_unmatched_by_source:
-        by_source_pred = delete_unmatched_by_source if isinstance(delete_unmatched_by_source, str) else None
-        merger = merger.when_not_matched_by_source_delete(predicate=by_source_pred)
+    for c in clauses:
+        merger = _apply_merge_clause(merger, c)
     merger.execute()
 
     # Same threshold-gated maintenance as the append / delete+insert paths: a merged-on-every-run
