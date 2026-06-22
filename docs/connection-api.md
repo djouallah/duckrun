@@ -91,12 +91,12 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 57 passed   ❌ 0 failed  │
-│ 57 methods · 100% passing │
+│ ✅ 61 passed   ❌ 0 failed  │
+│ 61 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### DataFrame API — 41/41 ✅
+### DataFrame API — 44/44 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
@@ -116,11 +116,11 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | Method | Surface | Pass |
 | --- | --- | :-: |
 | `connect` | `DuckSession` | ✅ |
-| `attach` | `DuckSession` | ✅ |
 | `refresh` | `DuckSession` | ✅ |
 | `connection` | `DuckSession` | ✅ |
 | `stop` | `DuckSession` | ✅ |
 | `table_path` | `DuckSession` | ✅ |
+| `attach` | `DuckSession` | ✅ |
 | `__getattr__` | `DataFrame` | ✅ |
 | `SELECT (passthrough)` | `sql()` | ✅ |
 | `version-pinned read` | `sql()` | ✅ |
