@@ -85,8 +85,8 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 55 passed   ❌ 0 failed  │
-│ 55 methods · 100% passing │
+│ ✅ 56 passed   ❌ 0 failed  │
+│ 56 methods · 100% passing │
 └───────────────────────────┘
 ```
 
@@ -103,7 +103,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 10/10 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `merge`, `version`, `delete`, `update` | 6/6 ✅ |
 
-### duckrun-specific helpers — 15/15 ✅
+### duckrun-specific helpers — 16/16 ✅
 
 > Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).
 
@@ -112,6 +112,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `connect` | `DuckSession` | ✅ |
 | `refresh` | `DuckSession` | ✅ |
 | `connection` | `DuckSession` | ✅ |
+| `stop` | `DuckSession` | ✅ |
 | `table_path` | `DuckSession` | ✅ |
 | `__getattr__` | `DataFrame` | ✅ |
 | `SELECT (passthrough)` | `sql()` | ✅ |
