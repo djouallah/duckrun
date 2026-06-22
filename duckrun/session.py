@@ -268,7 +268,8 @@ _DML_REL = re.compile(
 
 def _dml_target_catalog(query: str) -> Optional[str]:
     """The leading catalog token of a DML statement's target when it's 3-part
-    (``catalog.schema.table``), else ``None``. Lets ``sql()`` reject cross-catalog raw DML."""
+    (``catalog.schema.table``), else ``None``. Lets ``sql()`` route raw DML to the named catalog's
+    root (rather than the current one)."""
     s = _strip_leading(query)
     _, body = delta_dml._split_leading_with(s)  # peel a leading WITH so the verb is visible
     m = _DML_REL.match(_strip_leading(body))
@@ -539,28 +540,27 @@ class DuckSession:
         ``DeltaTable.forName(conn, name).merge(...)/.delete()/.update()``.
         ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
         """
-        # Raw write-DML targets the current catalog (cross-catalog raw DML is rejected below), so the
-        # read-only gate is the current catalog's. _WRITE_KEYWORD_RE covers insert/update/delete/merge.
-        if self._catalogs[self._current_catalog].read_only and _is_delta_write(query):
-            raise PermissionError(_READ_ONLY_MSG.format(op="run write DML", catalog=self._current_catalog))
+        # Raw DML routes through delta_rs against ONE root. A 3-part target names which catalog that
+        # is (``_dml_target_catalog`` → its name); an unqualified/2-part target is the current catalog.
+        # Reads (SELECT) are unaffected — DuckDB resolves every attached catalog natively.
+        target_cat = _dml_target_catalog(query)
+        if target_cat is not None and target_cat not in self._catalogs:
+            raise ValueError(
+                f"unknown catalog '{target_cat}'; attached catalogs: {list(self._catalogs)}. "
+                f"Attach it with conn.attach(path, name='{target_cat}')."
+            )
+        write_cat = target_cat if target_cat is not None else self._current_catalog
+        # The read-only gate is the *target* catalog's — a read-only attached store fails loud even
+        # when the current catalog is writable. _WRITE_KEYWORD_RE covers insert/update/delete/merge.
+        if self._catalogs[write_cat].read_only and _is_delta_write(query):
+            raise PermissionError(_READ_ONLY_MSG.format(op="run write DML", catalog=write_cat))
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)
-        # Raw DML routes through delta_rs against ONE root (the current catalog's); a 3-part target in
-        # another catalog can't be routed here, so reject it with a pointer rather than silently
-        # writing to the wrong root. Reads (SELECT) are unaffected — DuckDB resolves them natively.
-        target_cat = _dml_target_catalog(query)
-        if target_cat is not None and target_cat != self._current_catalog:
-            raise ValueError(
-                f"conn.sql() raw DML can't target another catalog ('{target_cat}') — it writes to the "
-                f"current catalog ('{self._current_catalog}'). Switch with "
-                f"conn.catalog.setCurrentCatalog('{target_cat}'), or use the DataFrame write API "
-                f"(df.write.saveAsTable('{target_cat}.<schema>.<table>') / "
-                f"DeltaTable.forName(conn, '{target_cat}.<schema>.<table>'))."
-            )
-        if delta_dml.handle(self.con, self.root_path, self.storage_options, query,
+        entry = self._catalogs[write_cat]
+        if delta_dml.handle(self.con, entry.root_path, entry.storage_options, query,
                             default_schema=self._current_database):
-            self.refresh(quiet=True, catalog=self._current_catalog)
+            self.refresh(quiet=True, catalog=write_cat)
             return DataFrame(self.con.sql("SELECT 'ok' AS status"), self)
         if _is_delta_write(query):
             raise ValueError(_delta_write_message(query))

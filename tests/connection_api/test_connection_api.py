@@ -1092,15 +1092,34 @@ def test_attach_schema_filter_skips_discovery(tmp_path):
     assert conn.catalog.listTables() == ["keep"]
 
 
-def test_cross_catalog_raw_dml_rejected(tmp_path):
-    # raw DML through conn.sql() targets the current catalog only; a 3-part target naming ANOTHER
-    # catalog is rejected with a pointer (it can't be routed through delta_rs's single-root path).
-    conn = _two_lakehouses(tmp_path)
-    with pytest.raises(ValueError, match="can't target another catalog"):
-        conn.sql("insert into other.dbo.t2 values (1)")
-    # but a 3-part target naming the CURRENT catalog ("lhA") is fine (routes to the current root).
+def test_cross_catalog_raw_dml_routes_to_target_root(tmp_path):
+    # raw DML through conn.sql() routes by the 3-part target's catalog: a target naming ANOTHER
+    # catalog writes to THAT catalog's root (delta_rs gets the target's root + storage_options),
+    # not the current one. The current catalog stays untouched.
+    conn = _two_lakehouses(tmp_path)              # current = lhA; 'other' = lhB (dbo.t2 has 1 row)
+
+    # INSERT ... VALUES into the attached catalog lands under lhB, leaving lhA's dbo.t2 absent.
+    conn.sql("insert into other.dbo.t2 values (8)")
+    assert conn.sql("select count(*) from other.dbo.t2").fetchone()[0] == 2
+    assert deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhB" / "dbo" / "t2"))
+    assert not deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhA" / "dbo" / "t2"))
+
+    # INSERT ... SELECT reading from the CURRENT catalog (lhA.dbo.t1) into the attached one (the
+    # user's literal shape, cross-root): both rows of t1 append to other.dbo.t2.
+    conn.sql("insert into other.dbo.t2 select id from lhA.dbo.t1")
+    assert conn.sql("select count(*) from other.dbo.t2").fetchone()[0] == 4
+
+    # a non-INSERT verb routes the same way: UPDATE/DELETE hit the target catalog's root.
+    conn.sql("delete from other.dbo.t2 where n = 8")
+    assert conn.sql("select count(*) from other.dbo.t2").fetchone()[0] == 3
+
+    # a 3-part target naming the CURRENT catalog ("lhA") still works (routes to the current root).
     conn.sql("insert into lhA.dbo.t1 values (3, 'c')")
     assert conn.sql("select count(*) from t1").fetchone()[0] == 3
+
+    # an unknown catalog name is rejected with the attach pointer (not silently written anywhere).
+    with pytest.raises(ValueError, match="unknown catalog 'nope'"):
+        conn.sql("insert into nope.dbo.t2 values (1)")
 
 
 def test_attach_read_only_catalog_fences_writes(tmp_path):
@@ -1119,6 +1138,9 @@ def test_attach_read_only_catalog_fences_writes(tmp_path):
         conn.sql("select 2 as id, 'two' as label").write.mode("append").saveAsTable("ref.dbo.lookup")
     with pytest.raises(PermissionError):
         DeltaTable.forName(conn, "ref.dbo.lookup").delete("id = 1")
+    # cross-catalog raw DML fences off the TARGET catalog's read-only flag, not the current one.
+    with pytest.raises(PermissionError):
+        conn.sql("insert into ref.dbo.lookup values (2, 'two')")
     # writes to the writable primary still work.
     conn.sql("select 2 as id").write.mode("append").saveAsTable("t1")
     assert conn.sql("select count(*) from t1").fetchone()[0] == 2
