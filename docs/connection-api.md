@@ -156,19 +156,19 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 77 passed   ❌ 0 failed  │
-│ 77 methods · 100% passing │
+│ ✅ 80 passed   ❌ 0 failed  │
+│ 80 methods · 100% passing │
 └───────────────────────────┘
 ```
 
-### DataFrame API — 59/59 ✅
+### DataFrame API — 62/62 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
 | Surface | Methods | Pass |
 | --- | --- | :-: |
 | `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
-| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns`, `refreshTable`, `getTable`, `getDatabase`, `dropTempView`, `listCatalogs`, `currentCatalog`, `setCurrentCatalog` | 15/15 ✅ |
+| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns`, `refreshTable`, `createTable_ddl`, `createTable_from_struct`, `createTable_bad_schema`, `getTable`, `getDatabase`, `dropTempView`, `listCatalogs`, `currentCatalog`, `setCurrentCatalog` | 18/18 ✅ |
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow`, `first`, `head`, `take`, `isEmpty`, `schema`, `printSchema` | 12/12 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `json`, `versionAsOf`, `timestampAsOf_rejected` | 7/7 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 10/10 ✅ |
