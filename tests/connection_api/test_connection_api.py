@@ -454,6 +454,26 @@ class TestDeltaTable:
         DeltaTable.forName(conn, "dbo.m").update(condition="id = 1", set={"val": "val + 1"})
         assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
 
+    def test_optimize(self, conn):
+        # write two commits → two files, then compact; data unchanged, metrics returned.
+        self._seed(conn)
+        conn.sql("select 4 id, 10 val").write.mode("append").saveAsTable("m")
+        metrics = DeltaTable.forName(conn, "dbo.m").optimize()
+        assert metrics["numFilesAdded"] >= 1
+        assert conn.table("m").count() == 4
+
+    def test_vacuum(self, conn):
+        # dry_run lists removable files without deleting; never errors on a healthy table.
+        self._seed(conn)
+        assert isinstance(DeltaTable.forName(conn, "dbo.m").vacuum(dry_run=True), list)
+
+    def test_restoreToVersion(self, conn):
+        self._seed(conn)                                                    # v0: ids 1,2,3
+        conn.sql("select 9 id, 9 val").write.mode("append").saveAsTable("m")  # v1: + id 9
+        assert conn.table("m").count() == 4
+        DeltaTable.forName(conn, "dbo.m").restoreToVersion(0)
+        assert sorted(r[0] for r in conn.table("m").collect()) == [1, 2, 3]
+
     def test_merge_by_source_delete(self, conn):
         # full sync: source carries ids {2,4}; matched updates, unmatched-by-source (1,3) deleted.
         self._seed(conn)

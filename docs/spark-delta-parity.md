@@ -157,9 +157,9 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.update(condition, set)` | `.update(condition=…, set=…)` | ✅ | delta-spark signature. |
 | `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `df.write.option("replaceWhere", pred).mode("overwrite").save()` / `.saveAsTable()` | ✅ | Single atomic commit; snapshot-fenced. |
 | `.history()` | `.history(limit=None)` | ✅ | delta-rs commit history (newest-first list of dicts: `version`, `timestamp`, `operation`, …). |
-| `.vacuum()` | — | ➖ | TODO |
-| `.optimize()` | — | ➖ | TODO |
-| `.generate()` | — | ➖ | TODO |
-| `.restoreToVersion()` | — | ➖ | TODO |
-| `.clone()` | — | ➖ | TODO |
+| `.vacuum()` | `.vacuum(retention_hours=None, dry_run=False, …)` | ✅ | delta-rs `vacuum`; **deletes by default** (Spark-like), `dry_run=True` only lists. Returns the removed paths. |
+| `.optimize()` | `.optimize(zorder_by=None, target_size=None)` | ✅ | delta-rs `optimize.compact` (or `optimize.z_order` with `zorder_by`); returns the metrics dict. |
+| `.restoreToVersion()` | `.restoreToVersion(version)` | ✅ | delta-rs `restore`; commits a new version, so the restore is itself revertible. |
+| `.generate()` | — | ➖ | TODO (delta-rs gap — no symlink-format-manifest generation). |
+| `.clone()` | — | ➖ | TODO (delta-rs gap). |
 | `DeltaTable.convertToDelta(spark, ident, partitionSchema)` | `DeltaTable.convertToDelta(conn, ident, partitionSchema=None)` | ✅ | Zero-copy — writes a `_delta_log` over existing parquet, no data rewrite. `ident` is `"parquet.`<path>`"` (a bare path is also accepted); `partitionSchema` is a pyarrow `Schema` for a Hive-partitioned dir. |

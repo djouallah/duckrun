@@ -934,6 +934,54 @@ def update_rows(
     _maintain(_delta_table(path, storage_options), compaction_threshold)
 
 
+def vacuum(
+    path: str,
+    *,
+    retention_hours: Optional[int] = None,
+    dry_run: bool = False,
+    enforce_retention_duration: bool = True,
+    storage_options: Optional[Dict[str, str]] = None,
+) -> List[str]:
+    """Remove data files no longer referenced and older than the retention window (delta_rs
+    ``DeltaTable.vacuum``). Returns the list of file paths deleted (or that *would* be deleted when
+    ``dry_run=True``). ``retention_hours=None`` uses the table's configured retention (delta_rs
+    default 7 days); a value below that needs ``enforce_retention_duration=False``."""
+    dt = _delta_table(path, storage_options)
+    return dt.vacuum(
+        retention_hours=retention_hours,
+        dry_run=dry_run,
+        enforce_retention_duration=enforce_retention_duration,
+    )
+
+
+def optimize(
+    path: str,
+    *,
+    zorder_by: Optional[List[str]] = None,
+    target_size: Optional[int] = None,
+    storage_options: Optional[Dict[str, str]] = None,
+) -> Dict:
+    """Compact small files into larger ones (delta_rs ``DeltaTable.optimize``) and return the
+    operation metrics. With ``zorder_by`` the files are Z-ordered on those columns
+    (``optimize.z_order``); otherwise a plain bin-packing compaction (``optimize.compact``)."""
+    dt = _delta_table(path, storage_options)
+    if zorder_by:
+        return dt.optimize.z_order(zorder_by, target_size=target_size)
+    return dt.optimize.compact(target_size=target_size)
+
+
+def restore_to_version(
+    path: str,
+    version: int,
+    *,
+    storage_options: Optional[Dict[str, str]] = None,
+) -> None:
+    """Restore the table to an earlier Delta ``version`` (delta_rs ``DeltaTable.restore``). This is a
+    new commit on top of history — it does not rewrite the log — so it is itself revertible."""
+    dt = _delta_table(path, storage_options)
+    dt.restore(version)
+
+
 def merge_delta(
     path: str,
     data,

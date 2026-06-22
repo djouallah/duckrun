@@ -204,6 +204,34 @@ class DeltaTable:
                            compaction_threshold=self.compaction_threshold)
         self._refresh_view()
 
+    def vacuum(self, retention_hours: Optional[int] = None, dry_run: bool = False,
+               enforce_retention_duration: bool = True) -> List[str]:
+        """Delete data files no longer referenced and older than the retention window, returning the
+        paths removed (delta-spark ``DeltaTable.vacuum``). Unlike delta_rs's API the default here
+        actually deletes (``dry_run=False``), matching Spark; pass ``dry_run=True`` to only list.
+        ``retention_hours`` below the configured window needs ``enforce_retention_duration=False``."""
+        self._session._require_writable("vacuum", self._catalog)
+        return engine.vacuum(self.path, retention_hours=retention_hours, dry_run=dry_run,
+                             enforce_retention_duration=enforce_retention_duration,
+                             storage_options=self.storage_options)
+
+    def optimize(self, zorder_by: Optional[List[str]] = None,
+                 target_size: Optional[int] = None) -> Dict:
+        """Compact small files (delta-spark ``DeltaTable.optimize``), returning the operation
+        metrics. Pass ``zorder_by`` to Z-order on those columns instead of a plain compaction."""
+        self._session._require_writable("optimize", self._catalog)
+        metrics = engine.optimize(self.path, zorder_by=zorder_by, target_size=target_size,
+                                  storage_options=self.storage_options)
+        self._refresh_view()
+        return metrics
+
+    def restoreToVersion(self, version: int) -> None:
+        """Restore the table to an earlier Delta ``version`` (delta-spark ``DeltaTable.restoreToVersion``).
+        It commits a new version on top of history, so the restore is itself revertible."""
+        self._session._require_writable("restoreToVersion", self._catalog)
+        engine.restore_to_version(self.path, version, storage_options=self.storage_options)
+        self._refresh_view()
+
     def _refresh_view(self):
         # Only a forName() table maps to a registered view; forPath() has no name to refresh.
         if self._schema is not None and self._table is not None:
