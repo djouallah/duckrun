@@ -151,6 +151,12 @@ class TestCatalog:
     def test_listColumns(self, conn):
         assert conn.catalog.listColumns("src") == ["id", "name"]
 
+    def test_dropTempView(self, conn):
+        conn.sql("select * from src").createOrReplaceTempView("tv")
+        assert conn.sql("select count(*) from tv").fetchone()[0] == 3
+        assert conn.catalog.dropTempView("tv") is True   # existed → dropped
+        assert conn.catalog.dropTempView("tv") is False  # already gone → no-op
+
     def test_listCatalogs(self, conn):
         # single-catalog session: the primary, named from the lakehouse folder ("wh") — no name= given.
         assert conn.catalog.listCatalogs() == ["wh"]
@@ -190,6 +196,21 @@ class TestDataFrame:
         assert isinstance(reader, pa.RecordBatchReader)
         assert reader.read_all().column("name").to_pylist() == ["a", "b", "c"]
 
+    def test_first(self, conn):
+        assert conn.sql("select id from src order by id").first() == (1,)
+        assert conn.sql("select id from src where id > 99").first() is None
+
+    def test_head(self, conn):
+        assert conn.sql("select id from src order by id").head() == (1,)
+        assert conn.sql("select id from src order by id").head(2) == [(1,), (2,)]
+
+    def test_take(self, conn):
+        assert conn.sql("select id from src order by id").take(2) == [(1,), (2,)]
+
+    def test_isEmpty(self, conn):
+        assert conn.sql("select * from src").isEmpty() is False
+        assert conn.sql("select * from src where id > 99").isEmpty() is True
+
     def test_relation_passthrough(self, conn):
         # unknown attrs fall through to the DuckDB relation (e.g. .fetchall())
         assert conn.sql("select 1").fetchall() == [(1,)]
@@ -211,6 +232,11 @@ class TestDataFrameReader:
         p = tmp_path / "s.csv"
         p.write_text("x,y\n1,2\n3,4\n")
         assert conn.read.option("header", True).csv(p.as_posix()).count() == 2
+
+    def test_json(self, conn, tmp_path):
+        p = tmp_path / "s.json"
+        p.write_text('{"a": 1, "b": 2}\n{"a": 3, "b": 4}\n')
+        assert conn.read.json(p.as_posix()).count() == 2
 
     @needs_version_param
     def test_versionAsOf(self, conn):

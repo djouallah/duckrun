@@ -70,9 +70,9 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `df.toArrow()` | `df.toArrow()` | 🟡 | Spark collects a whole `pyarrow.Table`; duckrun returns a **streaming** `pyarrow.RecordBatchReader` (`to_arrow_reader()`) so big results don't materialize. |
 | `df.count()` | `df.count()` | ✅ | |
 | `df.show()` | `df.show()` | ✅ | |
-| `df.first()` | — | ➖ | TODO |
-| `df.head(n=1)` / `df.take(n)` | — | ➖ | TODO |
-| `df.isEmpty()` | — | ➖ | TODO |
+| `df.first()` | `df.first()` | ✅ | First row as a tuple, or `None` if empty. |
+| `df.head(n=1)` / `df.take(n)` | `df.head([n])` / `df.take(n)` | ✅ | `head()` → first row (or `None`); `head(n)` / `take(n)` → list of the first `n` rows. |
+| `df.isEmpty()` | `df.isEmpty()` | ✅ | |
 | `df.createOrReplaceTempView(name)` | `df.createOrReplaceTempView(name)` | ✅ | Native, ephemeral DuckDB view — not Delta, not in `conn.catalog`. |
 | `df.columns` | (passthrough) | 🟡 | Not reimplemented — `__getattr__` forwards to the DuckDB relation; a list of names, like Spark. |
 | `df.dtypes` | (passthrough) | 🟡 | Passthrough to the DuckDB relation — returns DuckDB types, not Spark `(name, type)` tuples. |
@@ -94,9 +94,9 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `read.option("versionAsOf", N).load(path)` | `read.option("versionAsOf", N).load(path)` | ✅ | Time travel via duckdb-delta `version =>`. |
 | `read.option("timestampAsOf", ts)` | — | 🚫 | duckdb-delta time-travels by version only; rejected (use `versionAsOf`). |
 | `read.schema(…)` | — | ➖ | TODO |
-| `read.json` | — | ➖ | TODO |
-| `read.orc` | — | ➖ | TODO |
-| `read.text` | — | ➖ | TODO |
+| `read.json` | `read.json(path)` / `read.format("json").load(path)` | ✅ | DuckDB `read_json_auto`. |
+| `read.orc` | — | 🚫 | DuckDB has no native ORC reader; no engine to back it. |
+| `read.text` | — | 🚫 | Spark yields one row per line (`value` column); DuckDB's `read_text` returns the whole file as one value — different shape, so rejected rather than faked. |
 
 ## `DataFrameWriter` (`df.write`)
 
@@ -150,9 +150,9 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `.whenMatchedUpdateAll()` | `.whenMatchedUpdateAll()` | ✅ | |
 | `.whenNotMatchedInsertAll()` | `.whenNotMatchedInsertAll()` | ✅ | |
 | `.whenNotMatchedBySourceDelete()` | `.whenNotMatchedBySourceDelete()` | ✅ | |
-| `.whenMatchedDelete()` | — | ➖ | TODO |
-| `.whenNotMatchedInsert(values=…)` | — | ➖ | TODO |
-| `.whenNotMatchedBySourceUpdate(set=…)` | — | ➖ | TODO |
+| `.whenMatchedDelete()` | `.whenMatchedDelete(condition=None)` | ✅ | `WHEN MATCHED [AND …] THEN DELETE`. |
+| `.whenNotMatchedInsert(values=…)` | `.whenNotMatchedInsert(values=…)` | ✅ | `values` maps each target column to a source expression. |
+| `.whenNotMatchedBySourceUpdate(set=…)` | `.whenNotMatchedBySourceUpdate(set=…)` | ✅ | Update target rows the source doesn't carry. |
 | `.delete(predicate)` | `.delete(predicate)` | ✅ | delta-rs param name (`predicate`); takes literals, not `IN (SELECT …)`. |
 | `.update(condition, set)` | `.update(condition=…, set=…)` | ✅ | delta-spark signature. |
 | `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `df.write.option("replaceWhere", pred).mode("overwrite").save()` / `.saveAsTable()` | ✅ | Single atomic commit; snapshot-fenced. |

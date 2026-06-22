@@ -761,6 +761,25 @@ class DataFrame:
     def count(self) -> int:
         return self.relation.aggregate("count(*)").fetchone()[0]
 
+    def first(self):
+        """First row as a tuple, or ``None`` if empty (Spark's ``DataFrame.first()``)."""
+        return self.relation.limit(1).fetchone()
+
+    def head(self, n=None):
+        """``head()`` → the first row (or ``None``); ``head(n)`` → a list of the first ``n`` rows
+        (Spark's ``DataFrame.head([n])``)."""
+        if n is None:
+            return self.relation.limit(1).fetchone()
+        return self.relation.limit(n).fetchall()
+
+    def take(self, n: int):
+        """The first ``n`` rows as a list (Spark's ``DataFrame.take(n)``)."""
+        return self.relation.limit(n).fetchall()
+
+    def isEmpty(self) -> bool:
+        """``True`` if the DataFrame has no rows (Spark's ``DataFrame.isEmpty()``)."""
+        return self.relation.limit(1).fetchone() is None
+
     def createOrReplaceTempView(self, name: str) -> "DataFrame":
         """Register this DataFrame as a session-scoped view named ``name``, so it can be queried by
         name via ``conn.sql("select * from name")`` (the ``createOrReplaceTempView`` API).
@@ -817,15 +836,20 @@ class DataFrameReader:
                 scan = f"delta_scan('{_qlit(path)}')"
         elif fmt == "parquet":
             scan = f"read_parquet('{_qlit(path)}')"
+        elif fmt == "json":
+            scan = f"read_json_auto('{_qlit(path)}')"
         elif fmt == "csv":
             opts = "".join(f", {k}={_csv_opt(v)}" for k, v in self._options.items())
             scan = f"read_csv_auto('{_qlit(path)}'{opts})"
         else:
-            raise ValueError(f"Unsupported read format '{fmt}'. Use 'delta', 'parquet', or 'csv'.")
+            raise ValueError(f"Unsupported read format '{fmt}'. Use 'delta', 'parquet', 'json', or 'csv'.")
         return DataFrame(self.session.con.sql(f"SELECT * FROM {scan}"), self.session)
 
     def parquet(self, path: str) -> DataFrame:
         return self.format("parquet").load(path)
+
+    def json(self, path: str) -> DataFrame:
+        return self.format("json").load(path)
 
     def csv(self, path: str) -> DataFrame:
         return self.format("csv").load(path)
@@ -1074,6 +1098,19 @@ class Catalog:
             [catalog, schema, table],
         ).fetchall()
         return [r[0] for r in rows]
+
+    def dropTempView(self, viewName: str) -> bool:
+        """Drop a view registered by :meth:`DataFrame.createOrReplaceTempView` (the inverse). Returns
+        ``True`` if the view existed and was dropped, ``False`` if there was nothing to drop — like
+        Spark's ``catalog.dropTempView``. These views are native, ephemeral DuckDB views, not Delta
+        tables, so this never touches storage."""
+        con = self.session.con
+        existed = con.execute(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = ? AND table_type = 'VIEW'",
+            [viewName],
+        ).fetchone() is not None
+        con.execute(f'DROP VIEW IF EXISTS "{viewName}"')
+        return existed
 
     # ---- multi-catalog (each attached lakehouse root is a catalog) -------------------------
 
