@@ -7,18 +7,18 @@ Ported from the Fabric/OneLake multi-engine notebook. Differences:
   * One engine only — duckrun (DuckDB over delta-rs). The chdb/polars/lakesail
     branches are gone; there is nothing to compare against locally.
   * Local storage — data and results live under a local folder, no abfss/OneLake.
+  * Ingestion goes through duckrun: read each generated parquet file with
+    ``conn.read.parquet(path)`` and write it as Delta with ``.write.saveAsTable(name)``.
   * Results are saved with the duckrun DataFrame API (createDataFrame + saveAsTable),
     not pandas write_deltalake.
-  * One chart — per-query duration for this scale factor (interactive runs only).
 
 The end-to-end flow is :func:`run_tpch_benchmark`, parameterized by scale factor. ``test_tpch_local``
-drives it at SF=1 as a fast, offline CI smoke (generation needs ``tpchgen-cli``); running the file
-directly renders the chart for interactive use:
+drives it as an offline CI smoke (generation needs ``tpchgen-cli``); run the file directly to drive it
+by hand:
 
     TPCH_SF=1 python tests/integration_tests/tpch/test_tpch.py
 """
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -27,7 +27,6 @@ from datetime import datetime
 from pathlib import Path
 
 import duckrun
-from duckrun import DeltaTable
 
 # The scenario (and session.refresh) print Unicode; force utf-8 so a Windows cp1252 console doesn't
 # crash on it when watching the run with `pytest -s`.
@@ -747,65 +746,39 @@ def _execute_queries(conn, sql_script):
     return results
 
 
-def _generate_tables(conn, sf, schema_dir):
-    """Generate TPCH parquet with tpchgen-cli and convert each table to Delta in place (zero-copy:
-    convertToDelta writes a _delta_log over the parquet, no data rewrite). One-time — skipped when the
-    tables already exist."""
+def _generate_tables(conn, sf):
+    """Generate TPCH parquet with tpchgen-cli, then read each file back through duckrun and write it
+    out as Delta — ``conn.read.parquet(path).write.saveAsTable(name)``. This exercises the read →
+    write surface (parquet reader + DataFrameWriter). One-time — skipped when the tables already
+    exist."""
     if conn.catalog.tableExists("supplier"):
         print("Data already exists")
         return
-    os.makedirs(schema_dir, exist_ok=True)
-    print(f"Generating TPC-H SF={sf} into {schema_dir}")
+    print(f"Generating TPC-H SF={sf}")
     with tempfile.TemporaryDirectory() as staging:
         subprocess.run(
             ["tpchgen-cli", "-s", str(sf), "--output-dir", staging, "--format", "parquet"],
             check=True,
         )
-        print("Converting parquet to Delta...")
+        print("Loading parquet → Delta via duckrun...")
         for tbl in TPCH_TABLES:
-            table_dir = os.path.join(schema_dir, tbl)
-            os.makedirs(table_dir, exist_ok=True)
-            shutil.move(os.path.join(staging, f"{tbl}.parquet"),
-                        os.path.join(table_dir, f"{tbl}.parquet"))
-            DeltaTable.convertToDelta(conn, f"parquet.`{table_dir}`")
-    conn.refresh()
+            parquet = os.path.join(staging, f"{tbl}.parquet").replace(os.sep, "/")
+            conn.read.parquet(parquet).write.mode("overwrite").saveAsTable(tbl)
     print("Done!")
 
 
-def _render_chart(conn, sf, base_path, cores):
-    """One chart: per-query average duration for this scale factor. Best-effort — never fatal."""
-    s = conn.sql(f"""
-        SELECT query, AVG(dur) AS dur
-        FROM result
-        WHERE test = 'tpch' AND sf = {sf}
-        GROUP BY query
-        ORDER BY query
-    """).toPandas()
-    ax = s.plot.bar(
-        x="query", y="dur", legend=False,
-        title=f"duckrun (local Delta) — TPCH-like SF={sf}, {cores} cores, 22 SQL queries",
-        ylabel="Duration seconds (lower is better)", figsize=(18, 8),
-    )
-    ax.set_ylim(bottom=0)
-    ax.grid(axis="y", linestyle="--", alpha=0.5)
-    out = os.path.join(base_path, f"tpch_sf{sf}_durations.png")
-    ax.get_figure().savefig(out, bbox_inches="tight")
-    print(f"Chart written to {out}")
-
-
-def run_tpch_benchmark(sf=1, base_path=None, make_chart=False):
-    """Generate (once) TPCH SF=``sf`` locally as Delta, run the 22 queries through ``conn.sql``,
-    save the timings with the duckrun DataFrame API (createDataFrame + saveAsTable — no pandas), and
-    optionally render the per-query chart. Returns the list of ``{'query', 'dur'}`` timings."""
+def run_tpch_benchmark(sf=1, base_path=None):
+    """Generate (once) TPCH SF=``sf`` locally as Delta, run the 22 queries through ``conn.sql``, and
+    save the timings with the duckrun DataFrame API (createDataFrame + saveAsTable — no pandas).
+    Returns the list of ``{'query', 'dur'}`` timings."""
     base_path = base_path or os.environ.get("TPCH_BASE", str(Path.home() / "tpch_duckrun"))
     schema = f"CH{sf:04d}"
-    schema_dir = os.path.join(base_path, schema)
 
     start = time.time()
     conn = duckrun.connect(base_path, schema=schema, read_only=False)
     setup_time = time.time() - start
 
-    _generate_tables(conn, sf, schema_dir)
+    _generate_tables(conn, sf)
     conn.catalog.setCurrentDatabase(schema)  # resolve the queries' unqualified table names
 
     results = _execute_queries(conn, _tpch_sql(sf))
@@ -818,12 +791,6 @@ def run_tpch_benchmark(sf=1, base_path=None, make_chart=False):
     conn.createDataFrame(
         rows, "query int, dur double, engine string, time string, sf int, cpu int, test string"
     ).write.mode("append").saveAsTable("result")
-
-    if make_chart:
-        try:
-            _render_chart(conn, sf, base_path, cores)
-        except Exception as exc:
-            print(f"(chart not rendered: {exc})")
 
     print(f"Total: {sum(r['dur'] for r in results):.2f}s across {len(results)} queries")
     return results
@@ -843,5 +810,4 @@ if __name__ == "__main__":
     run_tpch_benchmark(
         sf=int(os.environ.get("TPCH_SF", "1")),
         base_path=os.environ.get("TPCH_BASE"),
-        make_chart=True,
     )

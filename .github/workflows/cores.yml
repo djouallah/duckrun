@@ -355,8 +355,8 @@ jobs:
 
   tpch-smoke:
     # A smoke of the connection-API TPCH benchmark (duckrun.connect) on a LOCAL filesystem warehouse
-    # at SF=10 — the per-change guard that generate → convertToDelta → 22-query run → createDataFrame
-    # save still works end to end. Fully offline bar tpchgen-cli (which only generates the data).
+    # at SF=10 — the per-change guard that generate → read.parquet → saveAsTable → 22-query run →
+    # createDataFrame save still works end to end. Fully offline bar tpchgen-cli (which generates the data).
     runs-on: ubuntu-latest
     env:
       TPCH_SF: "10"
