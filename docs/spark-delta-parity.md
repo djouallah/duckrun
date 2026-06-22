@@ -52,7 +52,7 @@ not invented.
 | `spark.table(name)` | `conn.table(name)` | ✅ | |
 | `spark.read` | `conn.read` | ✅ | → `DataFrameReader`. |
 | `spark.catalog` | `conn.catalog` | ✅ | → `Catalog` (see below). |
-| `spark.createDataFrame(rows)` | — | ➖ | TODO |
+| `spark.createDataFrame(rows)` | `conn.createDataFrame(data, schema=None)` | ✅ | Accepts a list of tuples/scalars, a pandas `DataFrame`, or a pyarrow `Table`/`RecordBatchReader`; `schema` is a list of names or a DDL string. Materialized on duckrun's own DuckDB connection — persist with `df.write.saveAsTable(...)`. |
 | `spark.stop()` | `conn.stop()` | ✅ | Closes the underlying DuckDB connection. |
 
 ## `DataFrame`

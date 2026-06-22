@@ -352,3 +352,26 @@ jobs:
       - name: Run the local coffee-shop scenario (small N)
         # -s streams the scenario's stage-by-stage narration into the job log.
         run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider
+
+  tpch-smoke:
+    # A fast, automatic smoke of the connection-API TPCH benchmark (duckrun.connect) on a LOCAL
+    # filesystem warehouse at SF=1 — the per-change guard that generate → convertToDelta → 22-query
+    # run → createDataFrame save still works end to end. Fully offline bar tpchgen-cli (which only
+    # generates the data). The heavy SF=10 run is a manual/notebook concern, not this gate.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
+        run: pip install -e ".[test]"
+
+      - name: Install tpchgen-cli (the scenario shells out to it to generate the data)
+        run: pip install tpchgen-cli
+
+      - name: Run the local TPCH benchmark (SF=1)
+        # -s streams the per-query timings into the job log.
+        run: python -m pytest tests/integration_tests/tpch/test_tpch.py::test_tpch_local -q -s -p no:cacheprovider
