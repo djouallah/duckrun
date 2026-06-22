@@ -373,6 +373,6 @@ jobs:
       - name: Install tpchgen-cli (the scenario shells out to it to generate the data)
         run: pip install tpchgen-cli
 
-      - name: Run the local TPCH benchmark (SF=1)
+      - name: Run the local TPCH benchmark (SF=10)
         # -s streams the per-query timings into the job log.
         run: python -m pytest tests/integration_tests/tpch/test_tpch.py::test_tpch_local -q -s -p no:cacheprovider
