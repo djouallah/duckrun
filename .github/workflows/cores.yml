@@ -354,11 +354,12 @@ jobs:
         run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider
 
   tpch-smoke:
-    # A fast, automatic smoke of the connection-API TPCH benchmark (duckrun.connect) on a LOCAL
-    # filesystem warehouse at SF=1 — the per-change guard that generate → convertToDelta → 22-query
-    # run → createDataFrame save still works end to end. Fully offline bar tpchgen-cli (which only
-    # generates the data). The heavy SF=10 run is a manual/notebook concern, not this gate.
+    # A smoke of the connection-API TPCH benchmark (duckrun.connect) on a LOCAL filesystem warehouse
+    # at SF=10 — the per-change guard that generate → convertToDelta → 22-query run → createDataFrame
+    # save still works end to end. Fully offline bar tpchgen-cli (which only generates the data).
     runs-on: ubuntu-latest
+    env:
+      TPCH_SF: "10"
     steps:
       - uses: actions/checkout@v4
 

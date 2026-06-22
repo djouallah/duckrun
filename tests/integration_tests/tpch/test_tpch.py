@@ -830,9 +830,11 @@ def run_tpch_benchmark(sf=1, base_path=None, make_chart=False):
 
 
 def test_tpch_local(tmp_path):
-    """Fast, offline CI smoke: the whole benchmark at SF=1 lands 22 timed queries and a `result`
-    Delta table. Generation shells out to tpchgen-cli (installed by the workflow)."""
-    results = run_tpch_benchmark(sf=1, base_path=str(tmp_path / "wh"))
+    """Offline CI smoke: the whole benchmark lands 22 timed queries and a `result` Delta table.
+    SF defaults to 1 for a fast local `pytest`; CI sets TPCH_SF (the cores job runs SF=10).
+    Generation shells out to tpchgen-cli (installed by the workflow)."""
+    sf = int(os.environ.get("TPCH_SF", "1"))
+    results = run_tpch_benchmark(sf=sf, base_path=str(tmp_path / "wh"))
     assert [r["query"] for r in results] == list(range(1, 23))
     assert all(r["dur"] >= 0 for r in results)
 
