@@ -21,13 +21,18 @@
 
 All local, network-free, serial (duckrun's write path is single-writer). No DAT, no external engine.
 """
+import os
+from pathlib import Path
+
 import duckdb
 import deltalake
 import pytest
 from deltalake.exceptions import CommitFailedError
 
 import duckrun
+import duckrun.session as session_mod
 from duckrun import DeltaTable
+from duckrun.delta_table import _parse_parquet_identifier
 from dbt.adapters.duckrun import engine
 from dbt.adapters.duckrun.delta_dml import TOMBSTONE_COLUMN
 
@@ -324,6 +329,12 @@ class TestDeltaTable:
 
     def test_forPath(self, conn):
         assert DeltaTable.forPath(conn, conn._table_path("dbo", "src")).path.endswith("dbo/src")
+
+    def test_convertToDelta(self, conn):
+        path = _stage_parquet(conn, "dbo/conv")            # out-of-band parquet under the catalog root
+        DeltaTable.convertToDelta(conn, f"parquet.`{path}`")  # zero-copy: writes a _delta_log over it
+        conn.refresh()
+        assert conn.table("conv").fetchall() == [(1, "a")]
 
     def test_merge_upsert(self, conn):
         self._seed(conn)
@@ -761,6 +772,162 @@ def test_delta_table_for_path_and_version(wh):
 
     conn.sql("select 2 id, 'b' v").write.mode("append").saveAsTable("ver")
     assert DeltaTable.forPath(conn, path).version() == 1   # a new commit bumps the version
+
+
+# ── createDataFrame: every input/schema form ──────────────────────────────────────────────────────
+# The scorecard (TestSession.test_createDataFrame) has the one-liner; these are the edge cases, merged
+# in from the former test_create_dataframe.py so CI (which runs THIS file by path) actually runs them.
+def _cdf_types(df):
+    return [str(t) for t in df.relation.types]
+
+
+def test_createDataFrame_tuples_no_schema_autonames(conn):
+    df = conn.createDataFrame([(1, "a"), (2, "b")])
+    assert df.columns == ["_1", "_2"]
+    assert df.collect() == [(1, "a"), (2, "b")]
+
+
+def test_createDataFrame_tuples_with_names(conn):
+    df = conn.createDataFrame([(1, "a"), (2, "b")], ["id", "name"])
+    assert df.columns == ["id", "name"]
+    assert df.count() == 2
+
+
+def test_createDataFrame_ddl_casts_types(conn):
+    df = conn.createDataFrame([(1, "a")], "id int, name string")
+    assert df.columns == ["id", "name"]
+    assert _cdf_types(df) == ["INTEGER", "VARCHAR"]
+
+
+def test_createDataFrame_ddl_colon_spelling(conn):
+    df = conn.createDataFrame([(1, "a")], "id: int, name: string")
+    assert df.columns == ["id", "name"]
+    assert _cdf_types(df) == ["INTEGER", "VARCHAR"]
+
+
+def test_createDataFrame_ddl_decimal_with_comma_survives(conn):
+    df = conn.createDataFrame([(1, "1.50")], "id long, amount decimal(10,2)")
+    assert _cdf_types(df) == ["BIGINT", "DECIMAL(10,2)"]
+    assert df.collect() == [(1, pytest.approx(1.50))]
+
+
+def test_createDataFrame_list_of_scalars_single_column(conn):
+    df = conn.createDataFrame([1, 2, 3], "value int")
+    assert df.columns == ["value"]
+    assert [r[0] for r in df.collect()] == [1, 2, 3]
+
+
+def test_createDataFrame_ragged_rows_error(conn):
+    with pytest.raises(ValueError, match="same number of columns"):
+        conn.createDataFrame([(1, "a"), (2,)])
+
+
+def test_createDataFrame_pandas(conn):
+    pd = pytest.importorskip("pandas")
+    df = conn.createDataFrame(pd.DataFrame({"id": [1, 2], "name": ["a", "b"]}))
+    assert df.columns == ["id", "name"]
+    assert df.count() == 2
+
+
+def test_createDataFrame_pandas_with_schema_rename(conn):
+    pd = pytest.importorskip("pandas")
+    df = conn.createDataFrame(pd.DataFrame({"x": [1], "y": ["a"]}), ["id", "name"])
+    assert df.columns == ["id", "name"]
+
+
+def test_createDataFrame_pyarrow_table(conn):
+    pa = pytest.importorskip("pyarrow")
+    df = conn.createDataFrame(pa.table({"id": [1, 2], "name": ["a", "b"]}))
+    assert df.columns == ["id", "name"]
+    assert df.count() == 2
+
+
+def test_createDataFrame_empty_with_ddl(conn):
+    df = conn.createDataFrame([], "id int, name string")
+    assert df.columns == ["id", "name"]
+    assert _cdf_types(df) == ["INTEGER", "VARCHAR"]
+    assert df.count() == 0
+
+
+def test_createDataFrame_empty_without_schema_errors(conn):
+    with pytest.raises(ValueError, match="empty dataset"):
+        conn.createDataFrame([])
+
+
+def test_createDataFrame_name_count_mismatch_errors(conn):
+    with pytest.raises(ValueError, match="columns"):
+        conn.createDataFrame([(1, "a")], ["only_one"])
+
+
+def test_createDataFrame_bad_schema_type_errors(conn):
+    with pytest.raises(TypeError, match="schema must be"):
+        conn.createDataFrame([(1,)], schema=123)
+
+
+def test_createDataFrame_round_trip_to_delta(conn):
+    conn.createDataFrame([(1, "a"), (2, "b")], "id int, name string") \
+        .write.mode("overwrite").saveAsTable("seeded")
+    fresh = duckrun.connect(conn.root_path, schema="dbo", read_only=True)
+    assert fresh.table("seeded").relation.order("id").fetchall() == [(1, "a"), (2, "b")]
+
+
+def test_createDataFrame_no_experimental_spark_import():
+    src = Path(session_mod.__file__).read_text(encoding="utf-8")
+    assert "experimental.spark" not in src
+
+
+# ── convertToDelta: zero-copy parquet→Delta in place (delta-spark DeltaTable.convertToDelta) ─────────
+# The scorecard (TestDeltaTable.test_convertToDelta) has the one-liner; these are the identifier /
+# zero-copy / guard cases, merged in from the former test_convert_to_delta.py.
+def _stage_parquet(conn, rel_dir, sql="select 1 AS id, 'a' AS nm"):
+    """Stage a parquet file at <root>/<rel_dir>/data.parquet via the raw DuckDB connection
+    (out-of-band — a native parquet write, not a Delta write, so the read-only gate lets it through)."""
+    path = conn.root_path + "/" + rel_dir
+    os.makedirs(path, exist_ok=True)
+    conn._connection.execute(f"COPY ({sql}) TO '{path}/data.parquet' (FORMAT parquet)")
+    return path
+
+
+def test_convertToDelta_parse_identifier_spark_form():
+    assert _parse_parquet_identifier("parquet.`/a/b`") == "/a/b"
+    assert _parse_parquet_identifier("PARQUET . `/a/b` ") == "/a/b"
+
+
+def test_convertToDelta_parse_identifier_bare_path():
+    assert _parse_parquet_identifier("/a/b") == "/a/b"
+
+
+def test_convertToDelta_parse_identifier_rejects_empty():
+    with pytest.raises(ValueError, match="non-empty path"):
+        _parse_parquet_identifier("   ")
+
+
+def test_convertToDelta_bare_path_round_trip(conn):
+    path = _stage_parquet(conn, "dbo/bare")
+    DeltaTable.convertToDelta(conn, path)            # a bare path works, not just parquet.`…`
+    conn.refresh()
+    assert conn.table("bare").count() == 1
+
+
+def test_convertToDelta_is_zero_copy(conn):
+    path = _stage_parquet(conn, "dbo/zc")
+    DeltaTable.convertToDelta(conn, path)
+    assert os.path.exists(path + "/data.parquet")    # original parquet survives
+    assert os.path.isdir(path + "/_delta_log")       # only a _delta_log was added
+
+
+def test_convertToDelta_read_only_raises(tmp_path):
+    ro = duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=True)
+    path = _stage_parquet(ro, "dbo/blocked")
+    with pytest.raises(PermissionError):
+        DeltaTable.convertToDelta(ro, path)
+
+
+def test_convertToDelta_already_delta_raises(conn):
+    path = _stage_parquet(conn, "dbo/twice")
+    DeltaTable.convertToDelta(conn, path)
+    with pytest.raises(Exception):                   # delta-rs mode='error' on an already-converted dir
+        DeltaTable.convertToDelta(conn, path)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
