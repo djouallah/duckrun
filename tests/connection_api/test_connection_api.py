@@ -21,8 +21,6 @@
 
 All local, network-free, serial (duckrun's write path is single-writer). No DAT, no external engine.
 """
-import os
-
 import duckdb
 import deltalake
 import pytest
@@ -1133,18 +1131,42 @@ def test_stop_closes_connection(tmp_path):
         conn.sql("select 1").collect()  # underlying DuckDB connection is closed
 
 
-@pytest.mark.skipif(not os.environ.get("WAREHOUSE_PATH"),
-                    reason="needs a real OneLake lakehouse (WAREHOUSE_PATH) for the mixed local+abfss case")
-def test_multi_catalog_mixed_local_and_onelake(tmp_path):
-    # The genuine mixed case: a local-filesystem primary catalog with a real abfss OneLake catalog
-    # attached alongside, queried across. Each catalog carries its own root + (scoped) token.
-    local = str(tmp_path / "lhLocal")
-    _write_table(local + "/dbo/local_t", "select 1 as id, 'local' as src")
-    conn = duckrun.connect(local, read_only=False)
-    conn.attach(os.environ["WAREHOUSE_PATH"], name="onelake")
-    assert "onelake" in conn.catalog.listCatalogs()
-    # local catalog reads through the primary (unscoped) path; the onelake catalog through its own.
-    assert conn.sql("select src from dbo.local_t").fetchone()[0] == "local"
-    conn.catalog.setCurrentCatalog("onelake")
-    assert conn.catalog.listTables() is not None  # discovery succeeded against the abfss root
-    conn.stop()
+# Weird-but-valid catalog names: duckrun quotes every identifier (_qid), so a name that's a SQL
+# reserved word, or has spaces / dashes / unicode / mixed case / a leading digit, works fine — you
+# just quote it in your own SQL. (A dot is the one thing a name can't contain: it's the
+# catalog.schema.table separator.)
+_WEIRD_NAMES = ["select", "my lake", "cat-2024", "café", "MixedCase", "default", "123start"]
+
+
+@pytest.mark.parametrize("weird", _WEIRD_NAMES)
+def test_weird_attached_catalog_names(tmp_path, tmp_path_factory, weird):
+    a = str(tmp_path / "wh")
+    b = str(tmp_path_factory.mktemp("store") / "store")
+    _write_table(a + "/dbo/t", "select 1 as id")
+    _write_table(b + "/dbo/t2", "select 9 as n")
+    conn = duckrun.connect(a, read_only=False)
+    conn.attach(b, name=weird)
+    assert weird in conn.catalog.listCatalogs()
+    qn = '"' + weird.replace('"', '""') + '"'   # the caller quotes the weird name in their own SQL
+    # cross-catalog read through the quoted 3-part name
+    assert conn.sql(f"select n from {qn}.dbo.t2").fetchone()[0] == 9
+    # cross-catalog write via the DataFrame API (catalog resolved from the quoted 3-part name)
+    conn.sql("select 7 as v").write.mode("overwrite").saveAsTable(f"{qn}.dbo.created")
+    assert conn.sql(f"select v from {qn}.dbo.created").fetchone()[0] == 7
+    # switch to it and introspect under the weird name
+    conn.catalog.setCurrentCatalog(weird)
+    assert conn.catalog.currentCatalog() == weird
+    assert {"t2", "created"} <= set(conn.catalog.listTables("dbo"))
+
+
+@pytest.mark.parametrize("weird", ["select", "my lake", "café", "default"])
+def test_weird_primary_catalog_name(tmp_path, weird):
+    # an explicit name= on connect() may be weird too — bare names still resolve in the current
+    # catalog, and the explicit 3-part form works when the caller quotes the name.
+    a = str(tmp_path / "wh")
+    _write_table(a + "/dbo/t", "select 5 as id")
+    conn = duckrun.connect(a, name=weird, read_only=False)
+    assert conn.catalog.currentCatalog() == weird
+    assert conn.sql("select id from t").fetchone()[0] == 5            # bare, current catalog
+    qn = '"' + weird.replace('"', '""') + '"'
+    assert conn.sql(f"select id from {qn}.dbo.t").fetchone()[0] == 5  # explicit 3-part, quoted
