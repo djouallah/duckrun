@@ -543,7 +543,7 @@ class DuckSession:
 
         if not quiet:
             lh = root.rstrip("/").rsplit("/", 1)[-1]
-            print(f"🔌 Connected to {lh} (catalog '{name}') — discovered {len(registered)} table(s)"
+            print(f"Connected to {lh} (catalog '{name}') — discovered {len(registered)} table(s)"
                   + (": " + ", ".join(registered) if registered else ""))
         return registered
 
