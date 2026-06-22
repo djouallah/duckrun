@@ -339,10 +339,10 @@ _MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size
 # merge pool — so it gets the bulk of the cap, not a 0.3 share. But it must still be BOUNDED to the
 # effective limit, because DuckDB's own default memory_limit is 80% of *physical* RAM, and on a
 # container (Fabric/k8s) physical RAM is the whole node, not our slice — so the default
-# overcommits and the kernel OOM-kills us. 0.7 of the effective limit (which folds in available RAM,
+# overcommits and the kernel OOM-kills us. 0.8 of the effective limit (which folds in available RAM,
 # the only signal that reflects the container on Fabric where the cgroup is the unlimited root)
-# leaves ~30% for the Arrow source stream, the Parquet writer, and page cache outside DuckDB's pool.
-_WRITE_MEM_FRACTION = 0.7
+# leaves ~20% for the Arrow source stream, the Parquet writer, and page cache outside DuckDB's pool.
+_WRITE_MEM_FRACTION = 0.8
 
 
 def _default_merge_spill_size() -> Optional[int]:

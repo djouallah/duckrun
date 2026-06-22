@@ -13,6 +13,11 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
 - a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
   `.merge(...)`, `.delete()`, `.update()`, `.version()`.
 
+`connect()` is **read-only by default**: every Delta write (`saveAsTable` / `insertInto` / `save` /
+`merge` / `insert` / `update` / `delete` / `replaceWhere`) raises `PermissionError`, so an accidental
+write can't mutate a shared lakehouse. Pass `read_only=False` to enable writes; reads and native
+`CREATE TEMP`/`CREATE VIEW` scratch are always allowed.
+
 For a method-by-method map of this surface against PySpark / Delta-on-Spark — what maps 1:1, what's
 duckrun-flavored, and what's deliberately out of scope (SQL-first, no Spark runtime — by design) —
 see [Coverage vs the Spark / Delta API](spark-delta-parity.md).
@@ -25,7 +30,9 @@ the table is unchanged since the call, else raises `CommitFailedError`.
 
 ```python
 import duckrun
-conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")
+# writable session — read_only=False opts in (the default is read-only)
+conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo",
+                       read_only=False)
 conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
 conn.table("orders_copy").show()
 

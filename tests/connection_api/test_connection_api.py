@@ -58,7 +58,7 @@ needs_version_param = pytest.mark.skipif(
 @pytest.fixture
 def conn(tmp_path):
     """A connected local-fs session with a seed table `src` (dbo) and a second schema `other`."""
-    c = duckrun.connect(str(tmp_path / "wh"), schema="dbo")
+    c = duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False)
     c.sql("select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)") \
         .write.mode("overwrite").saveAsTable("src")
     c.sql("select 7 as n").write.mode("overwrite").saveAsTable("other.thing")
@@ -86,6 +86,11 @@ class TestSession:
 
     def test_connection(self, conn):
         assert conn._connection.execute("select 1").fetchone()[0] == 1
+
+    def test_stop(self, conn):
+        conn.stop()  # closes the DuckDB connection (Spark's SparkSession.stop())
+        with pytest.raises(Exception):
+            conn.sql("select 1").collect()  # connection is closed -> unusable
 
     def test_table_path(self, conn):
         assert conn._table_path("dbo", "src").endswith("dbo/src")
@@ -484,7 +489,7 @@ def test_discover_all_schemas(wh):
 
 
 def test_write_modes_round_trip(wh):
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
 
     conn.sql("select 1 as id, 'x' as v").write.mode("overwrite").saveAsTable("t3")
     assert conn.sql("select count(*) from t3").fetchone()[0] == 1
@@ -502,7 +507,7 @@ def test_write_modes_round_trip(wh):
 
 
 def test_safeappend_creates_then_appends(wh):
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
     # First run on a missing table: nothing to fence against → create via append.
     conn.sql("select 1 id, 'a' v").write.mode("safeappend").saveAsTable("sa")
     assert conn.table("sa").count() == 1
@@ -514,7 +519,7 @@ def test_safeappend_creates_then_appends(wh):
 def test_safeappend_refuses_on_concurrent_commit(wh, monkeypatch):
     # safeappend pins to the version it read; if a writer lands before the commit, it must fail
     # loud (CommitFailedError) instead of duplicating — identical to the dbt safeappend strategy.
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
     conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("sc")
     path = conn._table_path("dbo", "sc")
     stale = engine.table_version(path, conn.storage_options)  # the version "as read"
@@ -531,7 +536,7 @@ def test_dataframe_writes_persist_to_delta(wh):
     # create/append via saveAsTable and mutate via the DeltaTable handle must land as real Delta,
     # visible to a brand-new connection (not DuckDB-native tables in this session). conn.sql() is
     # read-only for Delta writes — these go through the DataFrame API.
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
     conn.sql("select 1 id, 'A' grp").write.mode("overwrite").saveAsTable("evt")
     conn.sql("select 2 id, 'B' grp").write.mode("append").saveAsTable("evt")
     conn.sql("select 3 id, 'C' grp").write.mode("append").saveAsTable("evt")
@@ -545,6 +550,24 @@ def test_dataframe_writes_persist_to_delta(wh):
     assert sorted(fresh.table("evt").collect()) == [(1, "Z"), (3, "C")]
 
 
+def test_read_only_is_default_and_blocks_writes(wh):
+    # connect() is read-only by default: every Delta-write entry point raises PermissionError,
+    # reads and native scratch still work. read_only=False opts back in.
+    ro = duckrun.connect(wh, schema="dbo")
+    assert ro.sql("select count(*) from t1").fetchone()[0] == 2          # reads fine
+    ro.sql("create temp table scratch as select 1 x")                    # native scratch fine
+    with pytest.raises(PermissionError):
+        ro.sql("select 1 id").write.mode("overwrite").saveAsTable("nope")  # writer blocked
+    with pytest.raises(PermissionError):
+        ro.sql("insert into t1 values (3, 'c')")                          # write-DML blocked
+    with pytest.raises(PermissionError):
+        DeltaTable.forName(ro, "t1").delete("id = 1")                      # DeltaTable mutator blocked
+
+    rw = duckrun.connect(wh, schema="dbo", read_only=False)
+    rw.sql("select 9 id, 'z' v").write.mode("overwrite").saveAsTable("ok")  # opt-in writes
+    assert rw.table("ok").count() == 1
+
+
 def test_read_api(wh):
     conn = duckrun.connect(wh, schema="dbo")
     t1_path = conn._table_path("dbo", "t1")
@@ -553,7 +576,7 @@ def test_read_api(wh):
 
 
 def test_merge_insert_only(wh):
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
     conn.sql("select * from (values (1,10),(2,10)) t(id, val)") \
         .write.mode("overwrite").saveAsTable("io")
 
@@ -566,7 +589,7 @@ def test_merge_insert_only(wh):
 
 
 def test_update_only_merge_rejected(wh):
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
     src = conn.sql("select 1 id, 1 val")
     builder = DeltaTable.forName(conn, "dbo.t1").merge(src, "target.id = source.id") \
         .whenMatchedUpdateAll()
@@ -622,7 +645,7 @@ def test_reader_parquet_csv_and_table(wh, tmp_path):
 
 
 def test_writer_format(wh):
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
     # .format('delta') is accepted (the only supported writer format)…
     conn.sql("select 1 id").write.format("delta").mode("overwrite").saveAsTable("wf")
     assert conn.table("wf").count() == 1
@@ -649,7 +672,7 @@ def test_catalog_database_and_column_introspection(wh):
 
 
 def test_delta_table_for_path_and_version(wh):
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
     conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("ver")
     path = conn._table_path("dbo", "ver")
 
@@ -672,7 +695,7 @@ def _k(row):
 def _seed(wh):
     """Seed a fresh warehouse at ``wh`` with the canonical tables and return the connection:
     ``items(id, name)`` = (1,a),(2,b),(3,c) and ``wide(id, name, qty)`` = (1,a,10)."""
-    conn = duckrun.connect(wh, schema="dbo")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
     conn.sql("select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)") \
         .write.mode("overwrite").saveAsTable("items")
     conn.sql("select * from (values (1,'a',10)) t(id, name, qty)") \
@@ -805,7 +828,7 @@ def test_insert_allows_whole_number_decimal(tmp_path):
 def test_insert_allows_widening_numeric(tmp_path):
     # An int literal into a BIGINT column is a lossless widening — not flagged.
     wh = str(tmp_path / "wh")
-    c = duckrun.connect(wh, schema="dbo")
+    c = duckrun.connect(wh, schema="dbo", read_only=False)
     c.sql("select cast(1 as bigint) as id").write.mode("overwrite").saveAsTable("big")
     c.sql("insert into big values (2)")
     assert _dump(wh, "big")[1] == sorted([(1,), (2,)], key=_k)

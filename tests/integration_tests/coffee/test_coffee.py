@@ -221,7 +221,7 @@ def run_coffee_scenario(conn, schema, n_rows):
 
 def test_coffee_local(tmp_path):
     """Local filesystem, big fact table — stress the engine without the network in the way."""
-    conn = duckrun.connect(str(tmp_path / "wh"), schema="dbo")
+    conn = duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False)
     run_coffee_scenario(conn, "dbo", LOCAL_ROWS)
 
 

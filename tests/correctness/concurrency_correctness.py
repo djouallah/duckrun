@@ -171,7 +171,7 @@ def conn_safeappend_run(mode: str, concurrent: bool) -> dict:
     version it read (vB), a foreign writer then commits, and safeappend's CAS must refuse the commit
     (HEAD moved past vB) while a plain append silently lands on the new HEAD."""
     root = tempfile.mkdtemp()
-    conn = duckrun.connect(root, schema="dbo")
+    conn = duckrun.connect(root, schema="dbo", read_only=False)
     conn.sql("select 0 as id").write.mode("overwrite").saveAsTable("t")    # v0
     path = conn._table_path("dbo", "t")
     so = conn.storage_options

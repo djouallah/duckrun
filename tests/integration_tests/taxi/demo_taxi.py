@@ -578,7 +578,8 @@ def main():
             flush=True,
         )
         return
-    conn = duckrun.connect(WAREHOUSE_PATH, storage_options={"bearer_token": ONELAKE_TOKEN}, schema=TAXI_SCHEMA)
+    conn = duckrun.connect(WAREHOUSE_PATH, storage_options={"bearer_token": ONELAKE_TOKEN},
+                           schema=TAXI_SCHEMA, read_only=False)
     run_taxi_demo(conn, TAXI_SCHEMA)
 
 

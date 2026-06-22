@@ -296,11 +296,14 @@ travel — `delta_scan('…', version => N)`) and applies **raw SQL DML** (`crea
 `update`, `delete`, `alter add column`, `drop`) straight to the Delta table via delta_rs — every
 `CREATE TABLE` is Delta-backed, only `CREATE TEMP TABLE`/`CREATE VIEW` stay native DuckDB, and forms
 delta_rs can't express (`MERGE`, `UPDATE … FROM`, multi-statement) are rejected with a pointer to the
-write API. Writes also go through the DataFrame API: a `DataFrame` with `.write…saveAsTable()` (modes
-`overwrite` / `append` / `safeappend` / `ignore`, plus `option("replaceWhere", …)` for an atomic
-slice overwrite) and a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) with `.merge(...)`,
-`.delete()`, `.update()`, `.version()`, plus `conn.read` and `conn.catalog`.
-See [the DML matrix](docs/connection-api.md#raw-sql-dml-through-connsql).
+write API. Writes also go through the DataFrame API: a `DataFrame` with `.write…saveAsTable()` /
+`.insertInto()` (modes `overwrite` / `append` / `safeappend` / `ignore`, plus
+`option("replaceWhere", …)` for an atomic slice overwrite) and a `DeltaTable` handle
+(`DeltaTable.forName(conn, name)`) with `.merge(...)`, `.delete()`, `.update()`, `.version()`.
+Reads stream out via `conn.read` (incl. `option("versionAsOf", N)` time travel) and `df.toArrow()`
+(a streaming `RecordBatchReader`); introspection via `conn.catalog`; close with `conn.stop()`.
+See [the DML matrix](docs/connection-api.md#raw-sql-dml-through-connsql) and the
+[Spark/Delta coverage map](docs/spark-delta-parity.md).
 
 `merge` is **snapshot-pinned by default** — single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit is validated against it, so a concurrent writer fails
@@ -308,9 +311,16 @@ the commit loudly instead of silently interleaving. `mode("safeappend")` is the 
 fail-loud append as the dbt [`safeappend`](#safeappend) strategy: it commits only if the table is
 unchanged since the call, else raises `CommitFailedError`.
 
+`connect()` is **read-only by default** — it refuses every Delta write so an accidental `saveAsTable`
+can't mutate a shared lakehouse. Pass `read_only=False` to opt in to writes.
+
 ```python
 import duckrun
+# read-only session (the default): reads, time travel, catalog introspection
 conn = duckrun.connect("abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables/dbo")
+
+# writable session — opt in explicitly
+conn = duckrun.connect("abfss://<workspace_id>@onelake…/Tables/dbo", read_only=False)
 conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
 conn.table("orders_copy").show()
 

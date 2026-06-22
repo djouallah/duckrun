@@ -55,6 +55,11 @@ _DELETE_USING_MSG = (
 _MULTI_MSG = (
     "conn.sql() runs one statement at a time — split the batch into separate conn.sql() calls."
 )
+_READ_ONLY_MSG = (
+    "connection is read-only — cannot {op}. duckrun.connect() opens read-only by default; "
+    "pass read_only=False to enable Delta writes "
+    "(saveAsTable / insertInto / save / merge / insert / update / delete / replaceWhere)."
+)
 
 
 def _unsupported_dml(query: str) -> Optional[str]:
@@ -202,10 +207,11 @@ class DuckSession:
     """A session handle bound to one Delta lakehouse root."""
 
     def __init__(self, path: str, storage_options: Optional[Dict[str, str]],
-                 schema: Optional[str], compaction_threshold: int):
+                 schema: Optional[str], compaction_threshold: int, read_only: bool = True):
         self.root_path, self._schema = _split_root_schema(path, schema)
         self.storage_options = dict(storage_options) if storage_options else None
         self.compaction_threshold = compaction_threshold
+        self.read_only = read_only
 
         # OneLake with no caller-supplied token: acquire one (Fabric / env / azure-identity) so
         # both the DuckDB read secret and delta-rs writes can authenticate.
@@ -327,6 +333,12 @@ class DuckSession:
             return schema, table
         return self._current_database, name
 
+    def _require_writable(self, op: str):
+        """Raise unless this session was opened with ``read_only=False``. Guards every Delta-write
+        entry point (the DataFrame write API, the DeltaTable mutators, and raw write-DML in sql())."""
+        if self.read_only:
+            raise PermissionError(_READ_ONLY_MSG.format(op=op))
+
     # ---- DataFrame-style surface --------------------------------------------------------------
 
     def sql(self, query: str) -> "DataFrame":
@@ -346,6 +358,8 @@ class DuckSession:
         ``DeltaTable.forName(conn, name).merge(...)/.delete()/.update()``.
         ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
         """
+        if self.read_only and _is_delta_write(query):  # _WRITE_KEYWORD_RE covers insert/update/delete/merge
+            raise PermissionError(_READ_ONLY_MSG.format(op="run write DML"))
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)
@@ -364,6 +378,11 @@ class DuckSession:
     @property
     def read(self) -> "DataFrameReader":
         return DataFrameReader(self)
+
+    def stop(self):
+        """Close the underlying DuckDB connection (Spark's ``SparkSession.stop()``). The session is
+        unusable afterwards — registered views and the minted secret go with the connection."""
+        self.con.close()
 
     @property
     def _connection(self):
@@ -548,6 +567,7 @@ class DataFrameWriter:
         """Apply the configured mode to the Delta table at ``path`` (storage-neutral). ``descr``
         names the target in the mode='error' message. Shared by saveAsTable and save."""
         session = self._df.session
+        session._require_writable("write a Delta table")
         so = session.storage_options
 
         if self._replace_where is not None:
@@ -717,7 +737,8 @@ class Catalog:
 
 
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
-            schema: Optional[str] = None, compaction_threshold: int = 100) -> DuckSession:
+            schema: Optional[str] = None, compaction_threshold: int = 100,
+            read_only: bool = True) -> DuckSession:
     """Open a storage-neutral, DataFrame-style session over a Delta lakehouse.
 
     Args:
@@ -727,11 +748,16 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
             can omit it inside a Fabric notebook — a token is acquired automatically.
         schema: restrict to a single schema. Omit to discover every schema folder.
         compaction_threshold: file-count threshold for post-append/merge compaction.
+        read_only: **default True** — the session refuses every Delta write (saveAsTable / insertInto
+            / save / merge / insert / update / delete / replaceWhere) with a ``PermissionError``, so
+            an accidental write can't mutate a shared lakehouse. Pass ``read_only=False`` to enable
+            writes. Reads and native DuckDB scratch (``CREATE TEMP``/``CREATE VIEW``) are unaffected.
 
     Example:
         >>> conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")
         >>> conn.sql("SHOW TABLES").show()
-        >>> conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
+        >>> w = duckrun.connect("…/Tables/dbo", read_only=False)   # opt in to write
+        >>> w.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
     """
     check_runtime_versions()  # fail loud if Fabric's stale duckdb/deltalake are still loaded
-    return DuckSession(path, storage_options, schema, compaction_threshold)
+    return DuckSession(path, storage_options, schema, compaction_threshold, read_only)

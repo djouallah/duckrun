@@ -33,7 +33,7 @@ deliberate 🚫 omission, or is a ➖ TODO. There is nothing else masquerading a
 
 | duckrun | what it is | why there's no Spark name |
 | --- | --- | --- |
-| `duckrun.connect(path, storage_options=…, schema=…)` | open a session bound to one lakehouse root, addressed by a storage **path** | Spark's entry point is `SparkSession.builder…getOrCreate()` against a cluster — there's no cluster and no builder; one connection binds to one storage root |
+| `duckrun.connect(path, storage_options=…, schema=…, read_only=True)` | open a session bound to one lakehouse root, addressed by a storage **path**; **read-only by default** (`read_only=False` to write) | Spark's entry point is `SparkSession.builder…getOrCreate()` against a cluster — there's no cluster and no builder; one connection binds to one storage root, and defaults to read-only to protect a shared lakehouse |
 | `conn.refresh()` | re-discover the Delta tables under the store and re-register their views | duckrun finds tables by globbing storage for `_delta_log`; Spark's metastore is authoritative, so it never needs a "rescan the store" call |
 | `write.mode("safeappend")` | fail-loud compare-and-swap append (commits only if the table version hasn't moved) | no Spark `SaveMode` for it — it's the duckrun/dbt concurrency primitive |
 
@@ -51,6 +51,7 @@ not invented.
 | `spark.read` | `conn.read` | ✅ | → `DataFrameReader`. |
 | `spark.catalog` | `conn.catalog` | ✅ | → `Catalog` (see below). |
 | `spark.createDataFrame(rows)` | — | ➖ | TODO |
+| `spark.stop()` | `conn.stop()` | ✅ | Closes the underlying DuckDB connection. |
 
 ## `DataFrame`
 
