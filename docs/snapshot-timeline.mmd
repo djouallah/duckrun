@@ -1,0 +1,11 @@
+%% Render at https://mermaid.live → export PNG as snapshot-timeline.png
+%% Image #3 — read→compute→write race turned into a loud CommitFailedError
+sequenceDiagram
+  participant A as Writer A
+  participant T as Delta table
+  participant B as Writer B
+  A->>T: read v5
+  Note over A: compute
+  B->>T: commit v6 ✅
+  A->>T: commit (based on v5)
+  T-->>A: CommitFailedError ❌ (not a silent overwrite)

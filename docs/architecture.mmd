@@ -1,0 +1,12 @@
+%% Render at https://mermaid.live → export PNG as architecture.png
+%% Image #1 — the one-glance mental model for the blog
+flowchart LR
+  subgraph dbt[dbt — orchestrates the DAG]
+    direction LR
+    A[SQL / dbt model] --> B["DuckDB<br/>executes · reads Delta via delta_scan"]
+    B -->|"Arrow C-stream<br/>decode/re-encode, not zero-copy"| C["delta-rs<br/>every write: overwrite · append<br/>merge · delete · update"]
+    C -->|"commit against version N<br/>OCC → CommitFailedError on a conflicting commit"| D[("Delta table<br/>OneLake · S3 · GCS · ADLS")]
+    D -. "delta_scan(…, version ⇒ N)<br/>pins the read at version N" .-> B
+  end
+  linkStyle 2 stroke:#6c3fc5,stroke-width:2.5px
+  linkStyle 3 stroke:#6c3fc5,stroke-width:2.5px
