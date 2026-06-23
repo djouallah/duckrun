@@ -19,15 +19,6 @@ def _human(n: int) -> str:
     return f"{n / 1e6:.1f}M" if n >= 1_000_000 else f"{n:,}"
 
 
-def _box(lines):
-    """An at-a-glance monospaced box (fenced so it renders fixed-width)."""
-    width = max(len(s) for s in lines) + 1
-    out = ["```", "┌" + "─" * (width + 1) + "┐"]
-    out += ["│ " + s.ljust(width) + "│" for s in lines]
-    out += ["└" + "─" * (width + 1) + "┘", "```"]
-    return out
-
-
 def render_card(t: dict) -> str:
     ingestion = t["ingestion"]
     queries = t["queries"]
@@ -45,11 +36,11 @@ def render_card(t: dict) -> str:
         "this scale\", not a *duckrun is fast* claim."
     )
     L.append("")
-    L += _box([
-        f"ingest {len(ingestion)} tables {ing_total:9.1f}s",
-        f"run 22 queries {qry_total:9.1f}s",
-        f"SF {t['sf']}  -  {_human(rows_total)} rows  -  {t['cpu']} cores",
-    ])
+    L.append(
+        f"> **Ingest {len(ingestion)} tables in {ing_total:.1f}s** &middot; "
+        f"**run 22 queries in {qry_total:.1f}s** &middot; "
+        f"SF {t['sf']} &middot; {_human(rows_total)} rows &middot; {t['cpu']} cores"
+    )
     L.append("")
 
     L += ["### Setup", "| | |", "|---|---|"]
