@@ -97,3 +97,6 @@ logs/
 simple_test.ipynb
 # import profiling artifact
 importtime.log
+
+# Draft blog post (not part of the package)
+intro-blog.md

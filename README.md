@@ -6,7 +6,7 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://pypi.org/project/duckrun/)
 [![License](https://img.shields.io/pypi/l/duckrun?color=lightgrey)](https://github.com/djouallah/duckrun/blob/main/LICENSE)
 
-> **Disclaimer:** This is a personal project, built and maintained in my own time. It is
+> **Disclaimer:** This is a personal project. It is
 > not affiliated with, endorsed by, or supported by any employer or vendor. No warranty —
 > use it at your own risk.
 
