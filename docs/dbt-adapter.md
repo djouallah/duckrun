@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # duckrun dbt adapter
 
 duckrun is a thin wrapper around [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb): you keep

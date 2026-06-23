@@ -103,16 +103,12 @@ validation:
 
 nav:
   - Home: index.md
-  - Overview: overview.md
   - Guides:
+      - Getting started: getting-started.md
       - Connection API: connection-api.md
-      - dbt adapter: dbt-adapter.md
       - Spark / Delta coverage: spark-delta-parity.md
-  - Internals:
-      - Design document: design_document.md
-      - Snapshot isolation: snapshot-isolation.md
-      - Snapshot pin walkthrough: snapshot-pin.md
-  - Conformance: conformance.md
+  - dbt adapter: dbt-adapter.md
+  - Overview: overview.md
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
@@ -124,3 +120,8 @@ nav:
       - sde_dbt_tutorial: https://djouallah.github.io/duckrun/sde_dbt_tutorial.html
       - taxi: https://djouallah.github.io/duckrun/taxi.html
       - multicatalog: https://djouallah.github.io/duckrun/multicatalog.html
+  - Internals:
+      - Design document: design_document.md
+      - Snapshot isolation: snapshot-isolation.md
+      - Snapshot pin walkthrough: snapshot-pin.md
+  - Conformance: conformance.md
