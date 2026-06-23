@@ -118,6 +118,7 @@ class DeltaMergeBuilder:
             storage_options=self._table.storage_options,
             compaction_threshold=self._table.compaction_threshold,
         )
+        self._table._resnapshot()
         self._table._refresh_view()
 
 
@@ -136,6 +137,16 @@ class DeltaTable:
         self._schema = schema
         self._table = table
         self._catalog = catalog
+        # Snapshot isolation: capture the table version ONCE when the handle is taken. Every
+        # read-modify-write through this handle (merge/delete/update) is pinned to THIS version
+        # (load_as_version) and validated under delta-rs native OCC over (V, HEAD], so a CONFLICTING
+        # write that landed after the handle was taken fails the mutation loudly — "the version I
+        # read == the version I commit against". A handle to a not-yet-existing table has no version
+        # (None); a mutation on it then raises the engine's clear "requires read_version" error.
+        self._read_version = (
+            engine.table_version(self.path, self.storage_options)
+            if engine.table_exists(self.path, self.storage_options) else None
+        )
 
     @classmethod
     def forName(cls, session, name: str) -> "DeltaTable":
@@ -169,15 +180,21 @@ class DeltaTable:
     def merge(self, source, condition: str) -> DeltaMergeBuilder:
         """Begin a DataFrame-style merge of ``source`` into this table on ``condition``.
 
-        The merge is snapshot-pinned automatically: the table version is captured now and the
-        commit validates OCC against it, so a concurrent writer fails the commit loudly instead of
-        silently interleaving (single-snapshot MERGE). Nothing for the caller to pass."""
-        return DeltaMergeBuilder(self, source, condition,
-                                 read_version=engine.table_version(self.path, self.storage_options))
+        The merge is snapshot-pinned to the version captured when this handle was taken
+        (``forName``/``forPath``): the commit validates OCC against it, so a concurrent writer that
+        landed since then fails the commit loudly instead of silently interleaving (single-snapshot
+        MERGE). Nothing for the caller to pass."""
+        return DeltaMergeBuilder(self, source, condition, read_version=self._read_version)
 
     def version(self) -> int:
         """Current Delta version of the table (``DeltaTable`` history head)."""
         return engine.table_version(self.path, self.storage_options)
+
+    def _resnapshot(self) -> None:
+        """Advance the handle's pinned version to current HEAD after a successful mutation through
+        it, so a SECOND mutation on the same handle fences to the post-mutation version instead of
+        the stale construction-time one — only a FOREIGN write between operations makes it fail."""
+        self._read_version = engine.table_version(self.path, self.storage_options)
 
     def history(self, limit: Optional[int] = None) -> List[Dict]:
         """Delta commit history (delta_rs ``DeltaTable.history``) — newest first; each entry is a
@@ -190,8 +207,10 @@ class DeltaTable:
         """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
         when ``predicate`` is None. ``DeltaTable.delete``."""
         self._session._require_writable("delete", self._catalog)
-        engine.delete_rows(self.path, predicate, storage_options=self.storage_options,
+        engine.delete_rows(self.path, predicate, read_version=self._read_version,
+                           storage_options=self.storage_options,
                            compaction_threshold=self.compaction_threshold)
+        self._resnapshot()
         self._refresh_view()
 
     def update(self, condition: Optional[str] = None, set: Optional[Dict[str, str]] = None) -> None:
@@ -200,8 +219,10 @@ class DeltaTable:
         if not set:
             raise ValueError("update() requires a non-empty 'set' mapping of {column: expression}.")
         self._session._require_writable("update", self._catalog)
-        engine.update_rows(self.path, set, condition, storage_options=self.storage_options,
+        engine.update_rows(self.path, set, condition, read_version=self._read_version,
+                           storage_options=self.storage_options,
                            compaction_threshold=self.compaction_threshold)
+        self._resnapshot()
         self._refresh_view()
 
     def vacuum(self, retention_hours: Optional[int] = None, dry_run: bool = False,

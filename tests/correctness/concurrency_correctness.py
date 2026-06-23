@@ -70,8 +70,7 @@ def safeappend_run(mode: str, concurrent: bool) -> dict:
             engine.write_delta(path, _batch([1]), "append")
         else:
             # safeappend pinned to the version we read (v0); refuses if HEAD moved past it.
-            engine.append_if_unchanged(path, _batch([1]),
-                                       read_version=(0 if concurrent else None))
+            engine.append_if_unchanged(path, _batch([1]), read_version=0)
         cap["outcome"], cap["final"] = "committed", _ids(path)
     except CommitFailedError:
         cap["outcome"], cap["final"] = "refused", _ids(path)
@@ -102,10 +101,11 @@ def safeappend_display(rows):
 
 def mutate_run(op: str, concurrent: bool) -> dict:
     """A connection-API ``DeltaTable.forName(conn, t).delete(…)/.update(…)`` (engine.delete_rows /
-    update_rows) is a genuinely conflicting Delta operation, so — exactly like MERGE — delta-rs OCC fails it
-    with CommitFailedError when a foreign commit changed the same rows after its snapshot was
-    opened. No max_commit_retries hack (that was only needed for non-conflicting appends): the
-    conflict detection is native. With no concurrent writer it simply commits."""
+    update_rows) is pinned to the version the handle read (``load_as_version``) and committed under
+    delta-rs native OCC over ``(read_version, HEAD]`` — exactly like MERGE — so a CONFLICTING
+    foreign commit landing after that snapshot makes it fail with CommitFailedError. (Here the
+    foreign writer updates the same row, a genuine conflict.) With no concurrent writer it
+    commits."""
     path = str(Path(tempfile.mkdtemp()) / "t")
     engine.write_delta(
         path,
@@ -113,6 +113,7 @@ def mutate_run(op: str, concurrent: bool) -> dict:
                   "value": pa.array([10, 10, 10], pa.int64())}),
         "overwrite",
     )                                                            # v0
+    read_ver = engine.table_version(path)                        # the handle's pinned version (0)
     cap = {"op": op, "concurrent": concurrent}
 
     # Inject the foreign commit AFTER the operation opens its snapshot but BEFORE it commits, by
@@ -133,9 +134,9 @@ def mutate_run(op: str, concurrent: bool) -> dict:
     engine._delta_table = patched
     try:
         if op == "delete":
-            engine.delete_rows(path, "id = 1")
+            engine.delete_rows(path, "id = 1", read_version=read_ver)
         else:
-            engine.update_rows(path, {"value": "5"}, "id = 1")
+            engine.update_rows(path, {"value": "5"}, "id = 1", read_version=read_ver)
         cap["outcome"] = "COMMITTED"
     except CommitFailedError:
         cap["outcome"] = "REFUSED"

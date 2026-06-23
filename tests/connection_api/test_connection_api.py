@@ -886,6 +886,42 @@ def test_safeappend_refuses_on_concurrent_commit(wh, monkeypatch):
         conn.sql("select 2 id, 'b' v").write.mode("safeappend").saveAsTable("sc")
 
 
+def test_handle_pinned_mutations_refuse_after_foreign_write(wh):
+    # The DeltaTable handle pins the version captured when it was taken (forName). A CONFLICTING
+    # write that lands on the table AFTER the handle was taken makes delete/update/merge through
+    # that handle fail loud (CommitFailedError) — poor-man's SNAPSHOT isolation, same as merge
+    # (delta-rs native OCC over (V, HEAD]: a conflict aborts).
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
+
+    def handle_then_foreign_write():
+        conn.sql("select * from (values (1,'a'),(2,'b')) t(id,name)") \
+            .write.mode("overwrite").saveAsTable("h")
+        dt = DeltaTable.forName(conn, "h")                                   # pinned at V
+        # a conflicting write (full overwrite) lands after the handle was taken -> V+1
+        conn.sql("select 9 as id, 'z' as name").write.mode("overwrite").saveAsTable("h")
+        return dt
+
+    with pytest.raises(CommitFailedError):
+        handle_then_foreign_write().delete("id = 1")
+    with pytest.raises(CommitFailedError):
+        handle_then_foreign_write().update(condition="id = 1", set={"name": "'X'"})
+    with pytest.raises(CommitFailedError):
+        handle_then_foreign_write().merge(conn.sql("select 1 as id, 'M' as name"),
+                                          "target.id = source.id").whenMatchedUpdateAll().execute()
+
+
+def test_overwrite_append_stay_unsafe(wh):
+    # overwrite/append are NOT fenced (Spark SaveMode parity): a write landing on the table does
+    # not make a later overwrite/append fail — last-writer-wins / additive, by design.
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
+    conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("us")
+    pending = conn.sql("select 2 id, 'b' v")
+    conn.sql("select 9 id, 'z' v").write.mode("append").saveAsTable("us")   # a write lands
+    pending.write.mode("append").saveAsTable("us")                          # unfenced -> commits
+    conn.sql("select 5 id, 'q' v").write.mode("overwrite").saveAsTable("us")  # unfenced -> commits
+    assert conn.table("us").collect() == [(5, "q")]                         # overwrite replaced all
+
+
 def test_dataframe_writes_persist_to_delta(wh):
     # create/append via saveAsTable and mutate via the DeltaTable handle must land as real Delta,
     # visible to a brand-new connection (not DuckDB-native tables in this session). conn.sql() is

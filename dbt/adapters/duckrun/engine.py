@@ -778,7 +778,7 @@ def append_if_unchanged(
     path: str,
     data,
     *,
-    read_version: Optional[int] = None,
+    read_version: Optional[int],
     partition_by: Optional[List[str]] = None,
     merge_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
@@ -791,18 +791,25 @@ def append_if_unchanged(
     delta_rs has no native conditional / compare-and-swap commit. A plain append normally
     auto-rebases onto the latest version (appends are non-conflicting), so it can never fail on
     a concurrent write. We instead pin the write to the snapshot we read — a ``DeltaTable``
-    loaded at ``read_version`` (or current HEAD) — and pass ``max_commit_retries=0`` so delta_rs
-    does NOT rebase: if any commit landed since that snapshot, the append's target version is
-    already taken and the commit fails. That is compare-and-swap on the table version.
+    loaded at ``read_version`` — and pass ``max_commit_retries=0`` so delta_rs does NOT rebase:
+    if any commit landed since that snapshot, the append's target version is already taken and
+    the commit fails. That is compare-and-swap on the table version. ``read_version`` is REQUIRED
+    (no blind-HEAD path); the lazy read may see a newer version than ``read_version`` and that is
+    fine — the commit simply fails, so nothing stale lands (delta_rs cannot pin an append's read).
 
     Dedup is NOT performed — that is the model SQL's job. This only guarantees the append is
     atomic with respect to the version it was computed against; on a conflict the caller should
     re-run the model against the new HEAD. After a successful append, run the same threshold-
     gated maintenance as the plain append path.
     """
+    if read_version is None:
+        raise ValueError(
+            "append_if_unchanged requires read_version (the version the caller read). A safe "
+            "append must be pinned to its snapshot — a brand-new table's first write goes through "
+            "write_delta, not here."
+        )
     dt = _delta_table(path, storage_options)
-    if read_version is not None:
-        dt.load_as_version(read_version)
+    dt.load_as_version(read_version)
     pinned = dt.version()
 
     schema_mode = "merge" if merge_schema else None
@@ -833,7 +840,7 @@ def replace_where(
     data,
     predicate: str,
     *,
-    read_version: Optional[int] = None,
+    read_version: Optional[int],
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
@@ -846,23 +853,28 @@ def replace_where(
     ``predicate`` is a delta_rs/datafusion SQL expression. Keep it CAST-free: delta_rs can't
     serialize a CAST expression back to a string ("Unable to convert expression to string").
 
-    When ``read_version`` is given, the overwrite is pinned to that snapshot and committed with
-    ``max_commit_retries=0`` (compare-and-swap): a concurrent writer that lands since ``vB`` fails
-    the commit loudly instead of silently interleaving. ``None`` keeps blind-HEAD behavior.
-    Maintenance always runs at a fresh HEAD afterward (never pinned)."""
+    A replaceWhere is a read-modify-write, so ``read_version`` is REQUIRED (no blind-HEAD path):
+    the overwrite is pinned to that snapshot and committed with ``max_commit_retries=0``
+    (compare-and-swap), so a concurrent writer that lands since ``vB`` fails the commit loudly
+    instead of silently interleaving. Maintenance always runs at a fresh HEAD afterward (never
+    pinned)."""
+    if read_version is None:
+        raise ValueError(
+            "replace_where requires read_version (the version the caller read). A replaceWhere is "
+            "a read-modify-write and must be pinned to its snapshot."
+        )
     args = build_write_deltalake_args(
         path, data, "overwrite", partition_by=partition_by, storage_options=storage_options
     )
     args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
-    if read_version is not None:
-        # Pin to the read snapshot and disable rebasing, so a concurrent commit since vB fails this
-        # overwrite (CAS) instead of landing on top of it. storage_options live on the DeltaTable
-        # already, so drop the kwarg form (mirrors append_if_unchanged).
-        dt = _delta_table(path, storage_options)
-        dt.load_as_version(read_version)
-        args["table_or_uri"] = dt
-        args.pop("storage_options", None)
-        args["commit_properties"] = CommitProperties(max_commit_retries=0)
+    # Pin to the read snapshot and disable rebasing, so a concurrent commit since vB fails this
+    # overwrite (CAS) instead of landing on top of it. storage_options live on the DeltaTable
+    # already, so drop the kwarg form (mirrors append_if_unchanged).
+    dt = _delta_table(path, storage_options)
+    dt.load_as_version(read_version)
+    args["table_or_uri"] = dt
+    args.pop("storage_options", None)
+    args["commit_properties"] = CommitProperties(max_commit_retries=0)
     try:
         write_deltalake(**args)
     except CommitFailedError as e:
@@ -883,7 +895,7 @@ def replace_window(
     column: str,
     start: str,
     end: str,
-    read_version: Optional[int] = None,
+    read_version: Optional[int],
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
@@ -907,14 +919,33 @@ def delete_rows(
     path: str,
     predicate: Optional[str] = None,
     *,
+    read_version: Optional[int],
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
 ) -> None:
     """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
-    when ``predicate`` is None. The Delta-native ``DELETE FROM`` for the connection API; same
-    delta_rs ``dt.delete`` the microbatch window path uses. Then threshold-gated maintenance."""
+    when ``predicate`` is None. The Delta-native ``DELETE FROM`` for the connection API.
+
+    A delete is a read-modify-write, so it is pinned to ``read_version`` (the version the caller
+    read) with ``load_as_version`` and committed under delta-rs native OCC — exactly like merge:
+    delta-rs validates the operation over ``(read_version, HEAD]`` and fails loudly if a
+    *conflicting* commit landed since that version (a non-conflicting one rebases). ``read_version``
+    is REQUIRED (no blind-HEAD path). Then maintenance at a fresh HEAD."""
+    if read_version is None:
+        raise ValueError(
+            "delete_rows requires read_version (the version the caller read). A delete is a "
+            "read-modify-write and must be pinned to its snapshot — pass the version you read "
+            "(e.g. DeltaTable.forName(conn, name) captures it)."
+        )
     dt = _delta_table(path, storage_options)
-    dt.delete(predicate) if predicate else dt.delete()
+    dt.load_as_version(read_version)
+    try:
+        dt.delete(predicate)
+    except CommitFailedError as e:
+        raise CommitFailedError(
+            f"delete: table '{path}' changed since version {read_version} "
+            f"(a conflicting concurrent write committed); delete refused. Re-read and retry."
+        ) from e
     _maintain(_delta_table(path, storage_options), compaction_threshold)
 
 
@@ -923,14 +954,31 @@ def update_rows(
     updates: Dict[str, str],
     predicate: Optional[str] = None,
     *,
+    read_version: Optional[int],
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
 ) -> None:
     """Update ``{column: expression}`` for rows matching ``predicate`` (delta_rs/datafusion SQL),
     or every row when ``predicate`` is None. The Delta-native ``UPDATE`` for the connection API.
-    Then threshold-gated maintenance."""
+
+    Like :func:`delete_rows`, an update is a read-modify-write: pinned to ``read_version`` with
+    ``load_as_version`` and committed under delta-rs native OCC over ``(read_version, HEAD]``
+    (conflict → fail, like merge). ``read_version`` is REQUIRED. Then maintenance at a fresh HEAD."""
+    if read_version is None:
+        raise ValueError(
+            "update_rows requires read_version (the version the caller read). An update is a "
+            "read-modify-write and must be pinned to its snapshot — pass the version you read "
+            "(e.g. DeltaTable.forName(conn, name) captures it)."
+        )
     dt = _delta_table(path, storage_options)
-    dt.update(updates=updates, predicate=predicate)
+    dt.load_as_version(read_version)
+    try:
+        dt.update(updates=updates, predicate=predicate)
+    except CommitFailedError as e:
+        raise CommitFailedError(
+            f"update: table '{path}' changed since version {read_version} "
+            f"(a conflicting concurrent write committed); update refused. Re-read and retry."
+        ) from e
     _maintain(_delta_table(path, storage_options), compaction_threshold)
 
 

@@ -81,7 +81,8 @@ def test_replace_where_is_single_atomic_commit():
     matching window."""
     path = str(Path(tempfile.mkdtemp()) / "t")
     _seed(path)  # v0
-    engine.replace_where(path, _tbl([(1, 77), (2, 77)]), "id < 3")
+    engine.replace_where(path, _tbl([(1, 77), (2, 77)]), "id < 3",
+                         read_version=engine.table_version(path))
     assert DeltaTable(path).version() == 1  # exactly one new version — atomic, not two commits
     rows = {r["id"]: r["value"] for r in DeltaTable(path).to_pyarrow_table().to_pylist()}
     assert rows == {1: 77, 2: 77, 3: 10}
