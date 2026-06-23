@@ -24,20 +24,18 @@
   display: none;
 }
 
-/* Minimal homepage hero — deliberately compact so the logo, pitch, buttons AND the
-   start of "Install" all fit on the first screen without scrolling. */
+/* A slightly larger header logo — the brand now lives only here (no hero logo). */
+.md-header__button.md-logo img,
+.md-header__button.md-logo svg {
+  height: 1.7rem;
+  width: auto;
+}
+
+/* Minimal homepage hero — pitch + buttons only, compact so "Install" and the read
+   snippet are visible on the first screen without scrolling. */
 .md-typeset .duck-hero {
   text-align: center;
-  /* negative top pulls the hero up under the header, reclaiming Material's content gap */
-  margin: -1.2rem auto 0.5rem;
-}
-.md-typeset .duck-hero p {
-  margin: 0;   /* kill the paragraph margin around the logo image */
-}
-.duck-hero img.logo {
-  width: 120px;
-  max-width: 40%;
-  margin-bottom: 0;
+  margin: 0 auto 0.5rem;
 }
 .md-typeset .duck-hero .tagline {
   font-size: 1rem;

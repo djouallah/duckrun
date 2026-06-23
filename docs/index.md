@@ -8,8 +8,6 @@ hide:
 
 <div class="duck-hero" markdown>
 
-![duckrun](duckrun.png){ .logo }
-
 <p class="tagline">Run SQL in <strong>DuckDB</strong>, read &amp; write <strong>Delta Lake</strong> via delta-rs — locally or object store.</p>
 
 
