@@ -18,13 +18,8 @@ orchestrates**. Two ways to use it:
 - **`connect()`** — a notebook helper to query and write Delta straight from SQL (this page);
 - a **[dbt adapter](docs/dbt-adapter.md)** that materializes models as Delta tables.
 
-![duckrun architecture: DuckDB executes SQL and reads Delta via delta_scan; an Arrow C-stream bridges to delta-rs, which handles every write and commits against the read version (OCC); dbt orchestrates on top](https://raw.githubusercontent.com/djouallah/duckrun/main/docs/architecture.png)
-
 Concurrent writers are first-class: every write is snapshot-pinned and fails loud rather than
-silently interleaving. The read is fixed at `delta_scan(…, version => N)` and the write commits
-against `N`, so a racing commit is rejected with `CommitFailedError` instead of silently overwriting:
-
-![Two writers race on one table: Writer A reads v5 and computes; Writer B commits v6 in between; A's commit against v5 is rejected with CommitFailedError instead of silently overwriting B](https://raw.githubusercontent.com/djouallah/duckrun/main/docs/snapshot-timeline.png)
+silently interleaving.
 
 ## Install
 
@@ -125,6 +120,22 @@ other dbt adapters). For **Claude Code**:
 
 Other assistants read the [`AGENTS.md`](AGENTS.md) at the repo root, which points to the full guide.
 None of this is required to use duckrun.
+
+## How it works
+
+Two engines, split cleanly: DuckDB runs every query and reads Delta through `delta_scan` views,
+delta-rs handles every write, an Arrow C-stream bridges them, and dbt orchestrates on top.
+
+![duckrun architecture: DuckDB executes SQL and reads Delta via delta_scan; an Arrow C-stream bridges to delta-rs, which handles every write and commits against the read version (OCC); dbt orchestrates on top](https://raw.githubusercontent.com/djouallah/duckrun/main/docs/architecture.png)
+
+Writes are snapshot-pinned: the read is fixed at `delta_scan(…, version => N)` and the write commits
+against `N`, so a concurrent commit is rejected with `CommitFailedError` instead of silently
+overwriting a lost update.
+
+![Two writers race on one table: Writer A reads v5 and computes; Writer B commits v6 in between; A's commit against v5 is rejected with CommitFailedError instead of silently overwriting B](https://raw.githubusercontent.com/djouallah/duckrun/main/docs/snapshot-timeline.png)
+
+More on the design: [Design document](docs/design_document.md) ·
+[Snapshot isolation](docs/snapshot-isolation.md).
 
 ## Docs
 
