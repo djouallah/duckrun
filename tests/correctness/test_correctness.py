@@ -276,6 +276,31 @@ def test_dml_delete_predicate(root):
     assert _read(root, "items") == [(1, "a"), (3, "c")]
 
 
+@pytest.mark.parametrize("stmt", [
+    "delete from items where id = 2",
+    "update items set name = 'Y' where id = 2",
+], ids=["delete", "update"])
+def test_dml_delete_update_are_snapshot_fenced_like_handle(root, monkeypatch, stmt):
+    """conn.sql("delete"/"update") MUST route through the same snapshot-fenced engine path as
+    DeltaTable.forName(...).delete()/.update(): pinned to the version read (read_version →
+    load_as_version), committed under delta-rs OCC over (vB, HEAD], so a CONFLICTING foreign commit
+    makes it fail loud — SQL and the DataFrame handle behave identically.
+
+    Regression guard: the SQL handler used to call delta-rs delete()/update() directly at HEAD,
+    skipping the read_version pin, so a raw conn.sql delete/update silently applied over a foreign
+    commit while the DataFrame handle refused it. Inject the read→foreign-commit→write race by
+    forcing the statement's internal version capture to the now-stale vB."""
+    conn = _seed_items(root)
+    path = _path(root, "items")
+    vB = engine.table_version(path)
+    DeltaTable(path).update(predicate="id = 2", updates={"name": "'X'"})  # foreign commit -> vB+1
+    # The statement reads vB but HEAD has already moved to vB+1 (a concurrent writer). Pinned to vB,
+    # OCC over (vB, HEAD] sees the foreign id=2 commit and must refuse.
+    monkeypatch.setattr(engine, "table_version", lambda *a, **k: vB)
+    with pytest.raises(CommitFailedError):
+        conn.sql(stmt)
+
+
 def test_dml_insert_reordered_column_list(root):
     """INSERT (name, id) must map by NAME, not position — _append_projected reads the target schema via
     delta_scan and canonicalizes the supplied list. A regression to positional mapping swaps id/name and

@@ -706,7 +706,15 @@ class _DeltaDML:
 
     def _delete(self, m, rel, schema, loc) -> None:
         where = m.group("where")
-        engine._delta_table(loc, self.so).delete(predicate=where.strip() if where else None)
+        # Route through engine.delete_rows pinned to the version read at statement start — the SAME
+        # snapshot-fenced path (read_version → load_as_version, OCC over (vB, HEAD], post-op
+        # maintenance) as DeltaTable.forName(...).delete(). conn.sql and the DataFrame handle MUST
+        # behave identically; a raw delta-rs delete() at HEAD skipped the pin and the maintenance.
+        engine.delete_rows(
+            loc, where.strip() if where else None,
+            read_version=engine.table_version(loc, self.so),
+            storage_options=self.so,
+        )
 
     def _update(self, m, rel, schema, loc) -> None:
         updates = {}
@@ -714,8 +722,11 @@ class _DeltaDML:
             col, _, expr = assign.partition("=")
             updates[col.strip().strip('"')] = expr.strip()
         where = m.group("where")
-        engine._delta_table(loc, self.so).update(
-            updates=updates, predicate=where.strip() if where else None
+        # Same snapshot-fenced path as DeltaTable.forName(...).update() — SQL == DataFrame.
+        engine.update_rows(
+            loc, updates, where.strip() if where else None,
+            read_version=engine.table_version(loc, self.so),
+            storage_options=self.so,
         )
 
     def _insert_select(self, m, rel, schema, loc) -> None:
