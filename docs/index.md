@@ -40,3 +40,5 @@ duckrun is just glue — the real work is done by [DuckDB](https://duckdb.org/),
 and [Apache Arrow](https://arrow.apache.org/).
 
 </div>
+
+<p class="duck-pins">needs <code>duckdb&nbsp;&gt;=&nbsp;1.5.4</code> &middot; <code>deltalake&nbsp;==&nbsp;1.5.0</code></p>
