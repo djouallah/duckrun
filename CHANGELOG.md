@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.23] - 2026-06-23
+
+### Changed
+- **`deltalake` hard-pinned to `==1.5.0`.** Every newer release breaks duckrun — `DELETE` is broken
+  and OneLake support regresses — and 1.5.0 is the first with the MERGE `max_spill_size` config the
+  merge path needs. Do not float until upstream fixes land.
+- **`duckdb` upper cap dropped** (`>=1.5.4`, was `>=1.5.4,<1.6.0`). duckdb is only used to read; the
+  floor is solely for duckdb-delta's `version =>` pin support, and newer builds read fine.
+- **merge-spill recurring gate back to SF=10** (~60M rows). SF=20 (~120M) was verified once in 0.3.22
+  (peak 10.5 GB on a 16 GB runner); SF=10 is enough as the per-release gate and keeps release time down.
+
 ## [0.3.22] - 2026-06-23
 
 ### Added

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.3.22"
+version = "0.3.23"
 description = "A dbt adapter that runs SQL in DuckDB and materializes to Delta Lake (delta_rs)."
 readme = "README.md"
 license = {text = "MIT"}
@@ -38,9 +38,10 @@ dependencies = [
     # read and the write commit resolve at ONE Delta snapshot (single-snapshot MERGE parity; see the
     # staging-read pin in _delta_core.sql and merge_delta's read_version). duckdb is only ever used to
     # READ here, so any newer version is fine — the floor exists solely to get the version-pin support.
-    # deltalake is pinned EXACTLY to 1.5.0: it is the first release with the MERGE disk-spill config
-    # (max_spill_size) that engine.merge_delta relies on to cap merge RAM and avoid OOM on large
-    # upserts, AND the next release regresses OneLake support — so pin it, don't float.
+    # deltalake is pinned EXACTLY to 1.5.0 — a HARD requirement, not a preference: 1.5.0 is the first
+    # release with the MERGE disk-spill config (max_spill_size) that engine.merge_delta relies on to
+    # cap merge RAM and avoid OOM on large upserts, and every newer release so far breaks us — DELETE
+    # is broken and OneLake support regresses. So pin exactly; do NOT float until upstream fixes land.
     "duckdb>=1.5.4",
     "deltalake==1.5.0",
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
