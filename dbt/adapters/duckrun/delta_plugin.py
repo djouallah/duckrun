@@ -251,14 +251,14 @@ class Plugin(BasePlugin):
                     storage_options=storage_options,
                     compaction_threshold=self._compaction_threshold,
                 )
-        elif strategy == "safeappend":
-            # Optimistic append: commit only if the table version has not moved since the model
-            # *started* (read_version, captured before it read {{ this }}), else fail so dbt errors
-            # and the orchestrator re-runs. Pinning to the start version — not HEAD at write time —
-            # is what closes the read→write gap: a writer that commits any time during the build
-            # makes this fail instead of appending a duplicate. No dedup — that's the SQL's job.
-            # Compare-and-swap via delta_rs max_commit_retries=0 (see engine).
-            with engine.mem_profile("safeappend", con=cur):
+        elif strategy in ("append_if_unchanged", "safeappend"):
+            # Optimistic append (``safeappend`` is the deprecated alias): commit only if the table
+            # version has not moved since the model *started* (read_version, captured before it read
+            # {{ this }}), else fail so dbt errors and the orchestrator re-runs. Pinning to the start
+            # version — not HEAD at write time — is what closes the read→write gap: a writer that
+            # commits any time during the build makes this fail instead of appending a duplicate. No
+            # dedup — that's the SQL's job. Compare-and-swap via delta_rs max_commit_retries=0 (engine).
+            with engine.mem_profile("append_if_unchanged", con=cur):
                 engine.append_if_unchanged(
                     path, data,
                     read_version=cfg.get("read_version"),
@@ -270,7 +270,7 @@ class Plugin(BasePlugin):
         else:
             raise ValueError(
                 f"Unknown incremental_strategy '{strategy}'. "
-                "Use 'merge', 'insert', 'append', or 'safeappend'."
+                "Use 'merge', 'insert', 'append', or 'append_if_unchanged'."
             )
 
     def _store_microbatch(

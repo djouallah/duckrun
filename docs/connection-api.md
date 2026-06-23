@@ -8,8 +8,9 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   `insert`, `update`, `delete`, `alter add column`, `drop`, `merge`) is applied to the Delta table via
   delta_rs (works local AND on OneLake) — see the [DML matrix](#raw-sql-dml-through-connsql) below.
 - a `DataFrame` with a DataFrame-style `.write…saveAsTable()` — modes `overwrite` / `append` /
-  `safeappend` / `ignore`, plus `option("replaceWhere", …)` for an atomic slice overwrite — plus
-  `conn.read` and `conn.catalog`.
+  `append_if_unchanged` / `overwrite_if_unchanged` / `ignore` (the `_if_unchanged` modes are the
+  fenced, fail-loud siblings; `safeappend` is the deprecated alias for `append_if_unchanged`), plus
+  `option("replaceWhere", …)` for an atomic slice overwrite — plus `conn.read` and `conn.catalog`.
 - a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
   `.merge(...)`, `.delete()`, `.update()`, `.version()`, `.history()`.
 - **multiple catalogs**: `connect()` binds one lakehouse root (the primary catalog); attach more with
@@ -27,9 +28,11 @@ see [Coverage vs the Spark / Delta API](spark-delta-parity.md).
 
 `merge` is **snapshot-pinned by default** — single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit validates against it, so a concurrent writer fails the
-commit loudly instead of silently interleaving. `mode("safeappend")` applies the same fail-loud
-compare-and-swap to a plain append (identical to the dbt `safeappend` strategy): it commits only if
-the table is unchanged since the call, else raises `CommitFailedError`.
+commit loudly instead of silently interleaving. `mode("append_if_unchanged")` (alias: `safeappend`)
+and `mode("overwrite_if_unchanged")` apply the same fail-loud compare-and-swap to a plain append /
+full overwrite: they commit only if the table is unchanged since the version read, else raise
+`CommitFailedError`. The full model and a cross-engine comparison are in
+[Snapshot isolation](snapshot-isolation.md).
 
 ```python
 import duckrun

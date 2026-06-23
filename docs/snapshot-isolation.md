@@ -134,16 +134,25 @@ The takeaways:
   path) to get the read-version fence; an ad-hoc `conn.sql` read followed by a separate write is not
   auto-isolated.
 
+## Fenced writer modes
+
+The `DataFrameWriter` exposes the fenced (compare-and-swap) siblings of the unfenced Spark modes:
+
+| Unsafe (Spark SaveMode) | Fenced sibling | Fails if the table moved since the read version |
+|---|---|---|
+| `mode("append")` | `mode("append_if_unchanged")` | yes (any movement — appends are non-conflicting) |
+| `mode("overwrite")` | `mode("overwrite_if_unchanged")` | yes (any movement) |
+
+`safeappend` is kept as a **deprecated alias** for `append_if_unchanged` (the dbt incremental
+strategy accepts both names too). `append_if_unchanged` is the clearer name and matches the engine
+function.
+
 ## Roadmap
 
-Two refinements are planned on top of the model above (the mechanism is unchanged; these are
-naming + plumbing):
+One plumbing refinement remains (the mechanism is unchanged):
 
-1. **Unified fenced-mode names** — expose the fenced writer modes as `append_if_unchanged` (the
-   engine's own, clearer name; `safeappend` kept as a deprecated alias) and add a symmetric
-   `overwrite_if_unchanged` (fenced full overwrite).
-2. **Carry the read version on the DataFrame** — `conn.table(name)` / `conn.read.load(path)` will
-   remember the version they read so a fenced writer mode fences to *that* version (the read
-   version) instead of the version at write time, closing the read→write gap for the DataFrame
-   writer the same way the handle already does for delete/update/merge. `conn.table` stays live for
-   reads; it only *also remembers* the version.
+- **Carry the read version on the DataFrame** — `conn.table(name)` / `conn.read.load(path)` will
+  remember the version they read so a fenced writer mode fences to *that* version (the read version)
+  instead of the version at write time, closing the read→write gap for the DataFrame writer the same
+  way the handle already does for delete/update/merge. `conn.table` stays live for reads; it only
+  *also remembers* the version.

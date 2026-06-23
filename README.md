@@ -105,8 +105,8 @@ my_project:
       root_path: "abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables"
 ```
 
-Profiles, materializations, incremental strategies (incl. `safeappend`), sources, and automatic
-compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
+Profiles, materializations, incremental strategies (incl. `append_if_unchanged`), sources, and
+automatic compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
 
 ## Building with an AI assistant
 

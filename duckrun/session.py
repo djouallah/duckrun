@@ -998,7 +998,11 @@ class DataFrameWriter:
     the call (compare-and-swap), else raises ``CommitFailedError``. Non-standard, but identical
     behaviour to ``safeappend`` in dbt."""
 
-    _MODES = {"overwrite", "append", "safeappend", "ignore", "error", "errorifexists"}
+    # append_if_unchanged / overwrite_if_unchanged are the fenced (compare-and-swap) siblings of the
+    # unfenced Spark modes append / overwrite. "safeappend" is the deprecated alias for
+    # append_if_unchanged (normalized in mode()).
+    _MODES = {"overwrite", "append", "append_if_unchanged", "overwrite_if_unchanged",
+              "ignore", "error", "errorifexists"}
 
     def __init__(self, df: DataFrame):
         self._df = df
@@ -1017,6 +1021,8 @@ class DataFrameWriter:
 
     def mode(self, mode: str) -> "DataFrameWriter":
         m = mode.lower()
+        if m == "safeappend":
+            m = "append_if_unchanged"  # deprecated alias — kept so existing notebooks don't break
         if m not in self._MODES:
             raise ValueError(f"mode must be one of {sorted(self._MODES)}, got '{mode}'.")
         self._mode = m
@@ -1084,10 +1090,10 @@ class DataFrameWriter:
                 )
             mode = "overwrite"
 
-        if mode == "safeappend":
-            # Optimistic append, identical to the dbt safeappend strategy: pin to the version now
-            # and CAS the commit, so a writer that lands between this read and the commit fails the
-            # append (fail loud) instead of duplicating. On a missing table there is nothing to
+        if mode == "append_if_unchanged":
+            # Optimistic append (the dbt append_if_unchanged/safeappend strategy): pin to the version
+            # now and CAS the commit, so a writer that lands between this read and the commit fails
+            # the append (fail loud) instead of duplicating. On a missing table there is nothing to
             # fence against, so create it via a plain append (matches dbt's first-run create).
             if engine.table_exists(path, so):
                 engine.append_if_unchanged(
@@ -1106,6 +1112,30 @@ class DataFrameWriter:
                     mode="append",
                     partition_by=self._partition_by,
                     merge_schema=self._merge_schema,
+                    storage_options=so,
+                    compaction_threshold=session.compaction_threshold,
+                )
+        elif mode == "overwrite_if_unchanged":
+            # Optimistic FULL overwrite (the overwrite sibling of append_if_unchanged): pin + CAS so
+            # a concurrent write fails the overwrite instead of being clobbered. A missing table has
+            # nothing to fence — create it via a plain overwrite.
+            if engine.table_exists(path, so):
+                engine.overwrite_if_unchanged(
+                    path,
+                    self._df.relation,
+                    read_version=engine.table_version(path, so),
+                    partition_by=self._partition_by,
+                    overwrite_schema=self._overwrite_schema,
+                    storage_options=so,
+                    compaction_threshold=session.compaction_threshold,
+                )
+            else:
+                engine.write_delta(
+                    path,
+                    self._df.relation,
+                    mode="overwrite",
+                    partition_by=self._partition_by,
+                    overwrite_schema=self._overwrite_schema,
                     storage_options=so,
                     compaction_threshold=session.compaction_threshold,
                 )

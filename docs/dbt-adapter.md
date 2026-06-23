@@ -117,15 +117,17 @@ The first run (or `--full-refresh`, or a missing table) overwrites. Later runs a
 | `merge` (default with `unique_key`) | upsert — update matched, insert new       | `unique_key` |
 | `insert`                           | insert only new keys (idempotent append)  | `unique_key` |
 | `append` (default without `unique_key`) | blind append                          | —            |
-| `safeappend`                       | append, but only if the table is unchanged since the model read it (else fail) — cheap, no dedup scan | — |
+| `append_if_unchanged` (alias `safeappend`) | append, but only if the table is unchanged since the model read it (else fail) — cheap, no dedup scan | — |
 
-### `safeappend`
+### `append_if_unchanged`
+
+(Formerly `safeappend`, which is kept as a deprecated alias — both strategy names work.)
 
 A cheap append for the common "load only what's new" pattern — when your model SQL **already
 guarantees no duplicates** and you don't want to pay for a merge.
 
 ```sql
-{{ config(materialized='incremental', incremental_strategy='safeappend') }}
+{{ config(materialized='incremental', incremental_strategy='append_if_unchanged') }}
 
 select * from read_csv(getvariable('new_files'))
 {% if is_incremental() %}
@@ -165,7 +167,7 @@ table, which loads only not-yet-seen files and so uses `safeappend` instead of a
 | option                  | description                                                                 |
 |-------------------------|-----------------------------------------------------------------------------|
 | `location`              | Delta path. Defaults to `<root_path>/<schema>/<id>`.                        |
-| `incremental_strategy`  | `merge` \| `insert` \| `append` \| `safeappend` (incremental only).          |
+| `incremental_strategy`  | `merge` \| `insert` \| `append` \| `append_if_unchanged` (alias `safeappend`) (incremental only). |
 | `unique_key`            | column(s) to merge on.                                                       |
 | `merge_update_columns`  | merge: update only these columns on match (others untouched).               |
 | `merge_exclude_columns` | merge: update all columns **except** these on match.                        |

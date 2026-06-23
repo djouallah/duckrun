@@ -201,12 +201,12 @@ select * from {{ ref('stg_orders') }}
 | `merge` (default with `unique_key`) | upsert: update matched, insert new | `unique_key` | Rows change after first load |
 | `insert` | insert only keys not present | `unique_key` | Append-only data but you want key-level idempotency |
 | `append` (default without `unique_key`) | blind append | — | Event streams where duplicates are impossible or acceptable |
-| `safeappend` | append, but only if the table version hasn't moved since the model started; else fail | — | Your SQL already dedups against `{{ this }}` and the table is big |
+| `append_if_unchanged` (alias `safeappend`) | append, but only if the table version hasn't moved since the model started; else fail | — | Your SQL already dedups against `{{ this }}` and the table is big |
 | `microbatch` | delete+insert per `event_time` window | `event_time` config; rejects `unique_key` | dbt-driven backfills by time window |
 
 First run, `--full-refresh`, or a missing table always overwrites.
 
-**Steer big tables toward `safeappend`.** A `merge` scans the target and joins on the
+**Steer big tables toward `append_if_unchanged`** (alias `safeappend`). A `merge` scans the target and joins on the
 key — expensive on a large fact table, and the merge path splits the memory budget
 between DuckDB and delta-rs. If the model SQL already excludes rows present in
 `{{ this }}` (the classic "load only files not yet seen" pattern), that join is pure
@@ -218,7 +218,7 @@ safe and idempotent: the SQL dedup excludes whatever the previous attempt loaded
 canonical shape:
 
 ```sql
-{{ config(materialized='incremental', incremental_strategy='safeappend') }}
+{{ config(materialized='incremental', incremental_strategy='append_if_unchanged') }}
 select * from read_csv(getvariable('new_files'))
 {% if is_incremental() %}
   where file not in (select distinct file from {{ this }})  -- dedup is YOUR job here

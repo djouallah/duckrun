@@ -828,11 +828,66 @@ def append_if_unchanged(
         write_deltalake(**args)
     except CommitFailedError as e:
         raise CommitFailedError(
-            f"safeappend: table '{path}' changed since version {pinned} "
-            f"(a concurrent write committed); append refused. Re-run the model."
+            f"append_if_unchanged: table '{path}' changed since version {pinned} "
+            f"(a concurrent write committed); append refused. Re-read and retry."
         ) from e
 
     _maintain(_delta_table(path, storage_options), compaction_threshold)
+
+
+def overwrite_if_unchanged(
+    path: str,
+    data,
+    *,
+    read_version: Optional[int],
+    partition_by: Optional[List[str]] = None,
+    overwrite_schema: bool = False,
+    storage_options: Optional[Dict[str, str]] = None,
+    compaction_threshold: int = 100,
+) -> None:
+    """Optimistic FULL-TABLE overwrite: replace every row with ``data`` only if the table version
+    has not moved since we read it — otherwise refuse with ``CommitFailedError``. The overwrite
+    sibling of :func:`append_if_unchanged`, for the read-whole-table -> recompute -> write-it-back
+    pattern.
+
+    Same compare-and-swap trick: pin to ``read_version`` and ``max_commit_retries=0`` so a concurrent
+    commit fails the overwrite instead of clobbering it. (An overwrite, like an append, is
+    non-conflicting to delta_rs's checker — it would otherwise just replace whatever HEAD is — so
+    strict version CAS is the only way to make it fail-loud.) ``read_version`` is REQUIRED; a
+    brand-new table's first write goes through ``write_delta``, not here. Then the same vacuum +
+    metadata cleanup as the plain overwrite path."""
+    if read_version is None:
+        raise ValueError(
+            "overwrite_if_unchanged requires read_version (the version the caller read). A fenced "
+            "overwrite must be pinned to its snapshot — a brand-new table goes through write_delta."
+        )
+    dt = _delta_table(path, storage_options)
+    dt.load_as_version(read_version)
+    pinned = dt.version()
+
+    schema_mode = "overwrite" if overwrite_schema else None
+    args = build_write_deltalake_args(
+        path, data, "overwrite",
+        schema_mode=schema_mode,
+        partition_by=partition_by,
+        storage_options=storage_options,
+    )
+    args["table_or_uri"] = dt
+    args.pop("storage_options", None)
+    args["commit_properties"] = CommitProperties(max_commit_retries=0)
+    try:
+        write_deltalake(**args)
+    except CommitFailedError as e:
+        raise CommitFailedError(
+            f"overwrite_if_unchanged: table '{path}' changed since version {pinned} "
+            f"(a concurrent write committed); overwrite refused. Re-read and retry."
+        ) from e
+
+    # Full overwrite → vacuum + cleanup like the plain overwrite path (not threshold-gated append
+    # maintenance): the replaced version's files become tombstones to retire.
+    dt = _delta_table(path, storage_options)
+    dt.vacuum(dry_run=False)
+    dt.cleanup_metadata()
 
 
 def replace_where(

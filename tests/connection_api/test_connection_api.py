@@ -860,30 +860,59 @@ def test_write_modes_round_trip(wh):
     assert conn.table("t3").count() == 2
 
 
-def test_safeappend_creates_then_appends(wh):
+def test_append_if_unchanged_creates_then_appends(wh):
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
     # First run on a missing table: nothing to fence against → create via append.
-    conn.sql("select 1 id, 'a' v").write.mode("safeappend").saveAsTable("sa")
+    conn.sql("select 1 id, 'a' v").write.mode("append_if_unchanged").saveAsTable("sa")
     assert conn.table("sa").count() == 1
     # Unchanged table → optimistic append commits and grows the table.
-    conn.sql("select 2 id, 'b' v").write.mode("safeappend").saveAsTable("sa")
+    conn.sql("select 2 id, 'b' v").write.mode("append_if_unchanged").saveAsTable("sa")
     assert sorted(conn.table("sa").collect()) == [(1, "a"), (2, "b")]
+    # "safeappend" stays as a deprecated alias for append_if_unchanged.
+    conn.sql("select 3 id, 'c' v").write.mode("safeappend").saveAsTable("sa")
+    assert conn.table("sa").count() == 3
 
 
-def test_safeappend_refuses_on_concurrent_commit(wh, monkeypatch):
-    # safeappend pins to the version it read; if a writer lands before the commit, it must fail
-    # loud (CommitFailedError) instead of duplicating — identical to the dbt safeappend strategy.
+def test_append_if_unchanged_refuses_on_concurrent_commit(wh, monkeypatch):
+    # append_if_unchanged pins to the version it read; if a writer lands before the commit, it must
+    # fail loud (CommitFailedError) instead of duplicating — identical to the dbt strategy.
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
     conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("sc")
     path = conn._table_path("dbo", "sc")
     stale = engine.table_version(path, conn.storage_options)  # the version "as read"
 
-    # A concurrent writer commits, moving HEAD past the version safeappend will pin to.
+    # A concurrent writer commits, moving HEAD past the version append_if_unchanged will pin to.
     engine.write_delta(path, duckdb.connect().sql("select 99 id, 'x' v"), mode="append")
     monkeypatch.setattr(engine, "table_version", lambda *a, **k: stale)
 
     with pytest.raises(CommitFailedError):
-        conn.sql("select 2 id, 'b' v").write.mode("safeappend").saveAsTable("sc")
+        conn.sql("select 2 id, 'b' v").write.mode("append_if_unchanged").saveAsTable("sc")
+
+
+def test_overwrite_if_unchanged_commits_when_unchanged_and_creates(wh):
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
+    conn.sql("select * from (values (1,'a'),(2,'b')) t(id,v)").write.mode("overwrite").saveAsTable("ou")
+    # unchanged → fenced full overwrite replaces all rows
+    conn.sql("select 5 id, 'z' v").write.mode("overwrite_if_unchanged").saveAsTable("ou")
+    assert conn.table("ou").collect() == [(5, "z")]
+    # missing table → nothing to fence → create via plain overwrite
+    conn.sql("select 7 id, 'q' v").write.mode("overwrite_if_unchanged").saveAsTable("ou_new")
+    assert conn.table("ou_new").collect() == [(7, "q")]
+
+
+def test_overwrite_if_unchanged_refuses_on_concurrent_commit(wh, monkeypatch):
+    # overwrite_if_unchanged pins to the version it read; a foreign commit makes it fail loud
+    # instead of clobbering the concurrent change — the overwrite sibling of append_if_unchanged.
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
+    conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("oc")
+    path = conn._table_path("dbo", "oc")
+    stale = engine.table_version(path, conn.storage_options)
+
+    engine.write_delta(path, duckdb.connect().sql("select 99 id, 'x' v"), mode="append")
+    monkeypatch.setattr(engine, "table_version", lambda *a, **k: stale)
+
+    with pytest.raises(CommitFailedError):
+        conn.sql("select 2 id, 'b' v").write.mode("overwrite_if_unchanged").saveAsTable("oc")
 
 
 def test_handle_pinned_mutations_refuse_after_foreign_write(wh):
