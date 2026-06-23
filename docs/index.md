@@ -16,14 +16,10 @@ pip install duckrun
 import duckrun
 
 # read-only by default — explore safely, no accidental writes
-conn = duckrun.connect("abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables/dbo")
+conn = duckrun.connect("./my_lakehouse/Tables")   # or abfss://…onelake… for OneLake
 conn.sql("select status, count(*) from orders group by status").show()
 reader = conn.table("orders").toArrow()   # streaming pyarrow.RecordBatchReader
 ```
-
-Writing Delta, snapshot-pinned upserts, the dbt adapter, the design and live examples
-are in the menu above — start with the **[Connection API](connection-api.md)** or the
-**[dbt adapter](dbt-adapter.md)**.
 
 </div>
 
