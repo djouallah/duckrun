@@ -1,8 +1,3 @@
----
-hide:
-  - navigation
----
-
 # Overview
 
 duckrun is **glue over DuckDB + delta-rs + dbt-duckdb**. It gives you two surfaces over

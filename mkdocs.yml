@@ -103,15 +103,8 @@ validation:
 
 nav:
   - Home: index.md
-  - Guides:
-      - Getting started: getting-started.md
-      - Connection API: connection-api.md
-      - Spark / Delta coverage: spark-delta-parity.md
-  - dbt adapter: dbt-adapter.md
-  - Overview: overview.md
-  - Benchmarks:
-      - MERGE benchmark: merge-benchmark.md
-      - TPC-H benchmark: tpch.md
+  - Getting started: getting-started.md
+  - dbt: dbt-adapter.md
   - Examples:
       - examples.md
       - aemo: https://djouallah.github.io/dbt_fabric_python_delta/
@@ -120,7 +113,13 @@ nav:
       - sde_dbt_tutorial: https://djouallah.github.io/duckrun/sde_dbt_tutorial.html
       - taxi: https://djouallah.github.io/duckrun/taxi.html
       - multicatalog: https://djouallah.github.io/duckrun/multicatalog.html
-  - Internals:
+  - Benchmarks:
+      - MERGE benchmark: merge-benchmark.md
+      - TPC-H benchmark: tpch.md
+  - Connection API: connection-api.md
+  - Spark / Delta coverage: spark-delta-parity.md
+  - How it works:
+      - Overview: overview.md
       - Design document: design_document.md
       - Snapshot isolation: snapshot-isolation.md
       - Snapshot pin walkthrough: snapshot-pin.md

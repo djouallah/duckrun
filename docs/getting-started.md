@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # Getting started
 
 duckrun gives you a DuckDB SQL engine that **reads and writes Delta Lake** — locally or on
@@ -76,21 +81,7 @@ conn.sql("""
 The read-only fence refuses any write to `wh`. Works the same against a local path, `s3://`,
 `gs://`, or `az://`.
 
-## Building pipelines with dbt
-
-For multi-model pipelines, point a dbt profile at a lakehouse and `dbt run` — duckrun
-materializes each model as a Delta table:
-
-```yaml
-# ~/.dbt/profiles.yml
-my_project:
-  outputs:
-    dev:
-      type: duckrun
-      root_path: "abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables"
-```
-
 ---
 
-**Next:** the full [Connection API](connection-api.md) reference · the [dbt adapter](dbt-adapter.md)
-guide · runnable [Examples](examples.md).
+**Next:** building multi-model pipelines with [dbt](dbt-adapter.md) · runnable
+[Examples](examples.md) · the full [Connection API](connection-api.md) reference.

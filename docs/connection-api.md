@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # Connection API (notebook)
 
 Besides the dbt adapter, duckrun ships a storage-neutral, DataFrame-style `duckrun.connect()` for
