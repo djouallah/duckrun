@@ -50,13 +50,6 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   the table and writes a tombstone marker but **does not reclaim the data files** (a deliberate
   precaution — you purge them when you're sure). Address dropped tables by name, not by path.
 
-## Not a Spark engine
-
-- **SQL-first, by design.** There's no fluent DataFrame transform builder (`select` / `filter` /
-  `withColumn`) and no Spark SQL runtime — write transforms in SQL. The `connect()` surface only
-  targets *syntax* parity with a small slice of the PySpark / Delta API; what's 1:1 vs deliberately
-  out of scope is mapped in [Spark / Delta coverage](spark-delta-parity.md).
-
 ## Memory
 
 - **Two engines share one machine's memory.** DuckDB and delta-rs each keep their own pool in the same
