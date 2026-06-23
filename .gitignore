@@ -100,3 +100,15 @@ importtime.log
 
 # Draft blog post (not part of the package)
 intro-blog.md
+
+# Generated docs site — rebuilt from docs/*.md by docs/build_site.py on every deploy.
+# (taxi.html / multicatalog.html are committed live-report fallbacks, so NOT ignored.)
+docs/site/index.html
+docs/site/connection-api.html
+docs/site/dbt-adapter.html
+docs/site/spark-delta-parity.html
+docs/site/design_document.html
+docs/site/snapshot-isolation.html
+docs/site/snapshot-pin.html
+docs/site/conformance.html
+docs/site/merge-benchmark.html

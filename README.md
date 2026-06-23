@@ -139,6 +139,9 @@ More on the design: [Design document](docs/design_document.md) ·
 
 ## Docs
 
+Browse the rendered docs site at **[djouallah.github.io/duckrun](https://djouallah.github.io/duckrun/)**
+— or read the markdown here:
+
 | Doc | What's in it |
 |---|---|
 | [Connection API](docs/connection-api.md) | The `duckrun.connect()` notebook API + the live per-method scorecard. |

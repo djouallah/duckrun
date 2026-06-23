@@ -33,7 +33,7 @@ on:
       - 'tests/integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
       - 'tests/tools/merge_tpch_bench.py'
-      - 'docs/site/**'
+      - 'docs/**'
       - '.github/workflows/integration_tests_onelake.yml'
   pull_request:
     paths:
@@ -45,7 +45,7 @@ on:
       - 'tests/integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
       - 'tests/tools/merge_tpch_bench.py'
-      - 'docs/site/**'
+      - 'docs/**'
       - '.github/workflows/integration_tests_onelake.yml'
   workflow_dispatch:
 
@@ -410,16 +410,26 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Render the docs site from markdown (homepage + docs/*.md -> docs/site/*.html)
+        # build_site.py is the single source of truth for the homepage and the rendered doc pages;
+        # the generated *.html are git-ignored and rebuilt here on every deploy.
+        run: |
+          pip install markdown
+          python docs/build_site.py
       - name: Download all per-project docs artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: docs-*
           path: docs-artifacts
-      - name: Assemble the combined docs site (landing page + per-project DAGs)
+      - name: Assemble the combined docs site (homepage + rendered docs + per-project DAGs)
         run: |
           mkdir -p dbt-docs-site
-          cp docs/site/index.html                              dbt-docs-site/index.html
-          cp docs/site/duckrun_dbt_output.png                  dbt-docs-site/duckrun_dbt_output.png
+          # homepage + rendered doc pages (generated) + committed demo fallbacks (taxi/multicatalog)
+          cp docs/site/*.html                                  dbt-docs-site/
+          cp docs/site/*.png                                   dbt-docs-site/
           cp docs-artifacts/docs-aemo/static_index.html        dbt-docs-site/aemo.html
           cp docs-artifacts/docs-merge_spill/static_index.html dbt-docs-site/merge_spill.html
           cp docs-artifacts/docs-coffee/static_index.html      dbt-docs-site/coffee.html
