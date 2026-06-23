@@ -413,41 +413,38 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Render the docs site from markdown (homepage + docs/*.md -> docs/site/*.html)
-        # build_site.py is the single source of truth for the homepage and the rendered doc pages;
-        # the generated *.html are git-ignored and rebuilt here on every deploy.
+      - name: Render the docs site from markdown (MkDocs Material -> site/)
+        # mkdocs.yml + docs/*.md are the single source of truth; `mkdocs build` renders the
+        # whole site (homepage, nav, search) into site/. The committed docs/taxi.html &
+        # docs/multicatalog.html are copied through verbatim as the live-report fallbacks.
         run: |
-          pip install markdown
-          python docs/build_site.py
+          pip install mkdocs-material
+          # not --strict: the per-project example pages (merge_spill.html, …) are dropped in
+          # by the next step, so they're legitimately absent at build time.
+          mkdocs build
       - name: Download all per-project docs artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: docs-*
           path: docs-artifacts
-      - name: Assemble the combined docs site (homepage + rendered docs + per-project DAGs)
+      - name: Drop the per-project DAGs + live demo reports into the built site
         run: |
-          mkdir -p dbt-docs-site
-          # homepage + rendered doc pages (generated) + committed demo fallbacks (taxi/multicatalog)
-          cp docs/site/*.html                                  dbt-docs-site/
-          cp docs/site/*.png                                   dbt-docs-site/
-          cp docs-artifacts/docs-aemo/static_index.html        dbt-docs-site/aemo.html
-          cp docs-artifacts/docs-merge_spill/static_index.html dbt-docs-site/merge_spill.html
-          cp docs-artifacts/docs-coffee/static_index.html      dbt-docs-site/coffee.html
-          cp docs-artifacts/docs-sde/static_index.html         dbt-docs-site/sde_dbt_tutorial.html
-          # The connection-API report: ship the committed page, then overwrite it with THIS run's
-          # report if the taxi job produced one — so the live taxi.html shows the run it was deployed
-          # from (no commit-back, no lag). The committed copy is the fallback if the demo didn't run.
-          cp docs/site/taxi.html                               dbt-docs-site/taxi.html
+          # The standalone per-project dbt catalogs link from docs/examples.md at the site root.
+          cp docs-artifacts/docs-aemo/static_index.html        site/aemo.html
+          cp docs-artifacts/docs-merge_spill/static_index.html site/merge_spill.html
+          cp docs-artifacts/docs-coffee/static_index.html      site/coffee.html
+          cp docs-artifacts/docs-sde/static_index.html         site/sde_dbt_tutorial.html
+          # The connection-API reports: mkdocs already copied the committed docs/taxi.html &
+          # docs/multicatalog.html into site/ (the fallback). Overwrite with THIS run's report if
+          # the demo job produced one — so the live page shows the run it was deployed from.
           if [ -f docs-artifacts/docs-taxi-page/taxi_run.html ]; then
-            cp docs-artifacts/docs-taxi-page/taxi_run.html     dbt-docs-site/taxi.html
+            cp docs-artifacts/docs-taxi-page/taxi_run.html     site/taxi.html
             echo "published THIS run's taxi report."
           else
             echo "no taxi report artifact — publishing the committed taxi.html."
           fi
-          # Same pattern for the multi-catalog report: committed fallback, overwritten by this run's.
-          cp docs/site/multicatalog.html                       dbt-docs-site/multicatalog.html
           if [ -f docs-artifacts/docs-multicatalog-page/multicatalog_run.html ]; then
-            cp docs-artifacts/docs-multicatalog-page/multicatalog_run.html dbt-docs-site/multicatalog.html
+            cp docs-artifacts/docs-multicatalog-page/multicatalog_run.html site/multicatalog.html
             echo "published THIS run's multicatalog report."
           else
             echo "no multicatalog report artifact — publishing the committed multicatalog.html."
@@ -455,7 +452,7 @@ jobs:
       - name: Package docs for Pages
         uses: actions/upload-pages-artifact@v3
         with:
-          path: dbt-docs-site
+          path: site
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v4

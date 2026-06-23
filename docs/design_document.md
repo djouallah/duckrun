@@ -166,7 +166,7 @@ So the plugin overrides `configure_cursor(cursor)` to stash the live per-model c
 `store()`/`load()` read on **that** cursor (falling back to the shared connection). The
 pre-hook variable, the staged view, and the delta_rs read all share one session.
 
-### 3. Memory: one cap split across two engines  (`engine.py`)
+### 3. Memory: one cap split across two engines  (`engine.py`) { #3-memory-one-cap-split-across-two-engines }
 
 DuckDB and delta_rs each manage their own memory and neither knows the other exists. On a
 **merge** — the one path where both peak in the same process at the same time (DuckDB

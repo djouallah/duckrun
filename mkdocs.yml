@@ -1,0 +1,117 @@
+site_name: duckrun
+site_description: >-
+  duckrun runs SQL in DuckDB and reads/writes Delta Lake via delta-rs — a notebook
+  connect() helper and a dbt adapter, locally or on OneLake / S3 / GCS / ADLS.
+site_url: https://djouallah.github.io/duckrun/
+repo_url: https://github.com/djouallah/duckrun
+repo_name: djouallah/duckrun
+docs_dir: docs
+site_dir: site
+# Keep flat .html URLs (connection-api.html, not connection-api/) so links to the
+# previous site — and the example pages dropped in at the root — resolve unchanged.
+use_directory_urls: false
+copyright: >-
+  duckrun — DuckDB executes · delta-rs materializes · Arrow bridges · dbt orchestrates.
+
+theme:
+  name: material
+  logo: duckrun.png
+  favicon: duckrun.png
+  icon:
+    repo: fontawesome/brands/github
+  font:
+    text: Inter
+    code: JetBrains Mono
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.instant
+    - navigation.instant.progress
+    - navigation.tracking
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - toc.follow
+  palette:
+    # Light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to dark mode
+    # Dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to light mode
+
+extra_css:
+  - stylesheets/extra.css
+
+# Rewrite repo-relative doc links (../tests/…, ../.github/…) to GitHub blob URLs,
+# the way the previous generator did.
+hooks:
+  - hooks/github_links.py
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.superfences
+  - pymdownx.details
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/djouallah/duckrun
+      name: duckrun on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/duckrun/
+      name: duckrun on PyPI
+    - icon: fontawesome/brands/linkedin
+      link: https://www.linkedin.com/in/mimounedjouallah/
+      name: Mimoune Djouallah on LinkedIn
+
+# The example pages (aemo.html, taxi.html, …) are standalone HTML the integration
+# workflow drops into the built site; they aren't mkdocs pages, so don't fail the
+# build over links/files mkdocs can't resolve at build time.
+validation:
+  nav:
+    omitted_files: ignore
+  links:
+    absolute_links: ignore
+    unrecognized_links: ignore
+
+nav:
+  - Home: index.md
+  - Overview: overview.md
+  - Guides:
+      - Connection API: connection-api.md
+      - dbt adapter: dbt-adapter.md
+      - Spark / Delta coverage: spark-delta-parity.md
+  - Internals:
+      - Design document: design_document.md
+      - Snapshot isolation: snapshot-isolation.md
+      - Snapshot pin walkthrough: snapshot-pin.md
+  - Benchmarks:
+      - dbt conformance: conformance.md
+      - MERGE benchmark: merge-benchmark.md
+  - Examples: examples.md

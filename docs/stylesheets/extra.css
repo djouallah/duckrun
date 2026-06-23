@@ -1,0 +1,66 @@
+/* duck-yellow accent — Material's "custom" primary/accent reads these vars. */
+:root {
+  --md-primary-fg-color:        #f2c200;
+  --md-primary-fg-color--light: #f7d652;
+  --md-primary-fg-color--dark:  #c79e00;
+  --md-primary-bg-color:        #1b1f24;
+  --md-primary-bg-color--light: #1b1f24;
+  --md-accent-fg-color:         #b58900;
+  --md-accent-fg-color--transparent: rgba(242, 194, 0, 0.1);
+}
+
+/* In dark mode the yellow header text/icons need a dark ink to stay legible. */
+[data-md-color-scheme="slate"] {
+  --md-accent-fg-color: #f2c200;
+}
+
+/* Links pick up the brand yellow without washing out on white. */
+.md-typeset a {
+  color: var(--md-accent-fg-color);
+}
+
+/* Minimal homepage hero. */
+.duck-hero {
+  text-align: center;
+  margin: 2.5rem auto 1.5rem;
+}
+.duck-hero img.logo {
+  width: 360px;
+  max-width: 70%;
+}
+.duck-hero .tagline {
+  font-size: 1.15rem;
+  color: var(--md-default-fg-color--light);
+  max-width: 620px;
+  margin: 1rem auto 0;
+}
+.duck-hero .mantra {
+  font-size: 0.85rem;
+  color: var(--md-default-fg-color--lighter);
+  margin: 0.6rem auto 0;
+}
+.duck-hero .md-button {
+  margin: 0.3rem 0.25rem;
+}
+
+/* Center the install / quickstart code on the minimal homepage. */
+.duck-home-code {
+  max-width: 640px;
+  margin: 1.5rem auto 0;
+}
+
+/* Acknowledgements — compact, centered credits row. */
+.duck-thanks {
+  text-align: center;
+  color: var(--md-default-fg-color--light);
+  margin-top: 3rem;
+  font-size: 0.9rem;
+}
+.duck-thanks ul {
+  list-style: none;
+  padding: 0;
+  display: flex;
+  gap: 0.4rem 1.2rem;
+  justify-content: center;
+  flex-wrap: wrap;
+}
