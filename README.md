@@ -6,20 +6,13 @@
 [![Python](https://img.shields.io/badge/python-3.9%2B-blue?logo=python&logoColor=white)](https://pypi.org/project/duckrun/)
 [![License](https://img.shields.io/pypi/l/duckrun?color=lightgrey)](https://github.com/djouallah/duckrun/blob/main/LICENSE)
 
-> **Disclaimer:** This is a personal project. It is
-> not affiliated with, endorsed by, or supported by any employer or vendor. No warranty —
-> use it at your own risk.
+> **Disclaimer:** This is a personal project. Not affiliated with, endorsed by, or supported by any
+> employer or vendor. No warranty — use it at your own risk.
 
 **duckrun** runs SQL in [DuckDB](https://duckdb.org/) and reads/writes
 [**Delta Lake**](https://delta-io.github.io/delta-rs/) via delta-rs — locally or on OneLake / S3 /
-GCS / ADLS. It's just glue: **DuckDB executes · delta-rs materializes · Arrow bridges · dbt
-orchestrates**. Two ways to use it:
-
-- **`connect()`** — a notebook helper to query and write Delta straight from SQL (this page);
-- a **[dbt adapter](docs/dbt-adapter.md)** that materializes models as Delta tables.
-
-Concurrent writers are first-class: every write is snapshot-pinned and fails loud rather than
-silently interleaving.
+GCS / ADLS. Query a lakehouse, attach more catalogs, and **write Delta tables with plain SQL**;
+concurrent writes are snapshot-pinned and fail loud. It's also a [dbt adapter](docs/dbt-adapter.md).
 
 ## Install
 
@@ -28,64 +21,53 @@ pip install duckrun
 ```
 
 In a **Microsoft Fabric** notebook, upgrade and restart the kernel (duckrun needs `duckdb` ≥ 1.5.4,
-which is newer than the bundled stable build; it fails loud at `connect()` otherwise):
+newer than the bundled stable build; it fails loud at `connect()` otherwise):
 
 ```python
 !pip install duckrun --upgrade
 notebookutils.session.restartPython()
 ```
 
-## Quickstart — OneLake in a notebook
+## Pure SQL over Delta
+
+Connect to a lakehouse, attach a Fabric **Warehouse read-only** as a second catalog, and write a
+Delta table with a plain `CREATE TABLE AS SELECT` — no DataFrame API, just `conn.sql(...)`:
 
 ```python
 import duckrun
 
-# Read-only by default — explore a lakehouse safely, no chance of an accidental write.
-# Use the workspace + lakehouse GUIDs (friendly names hit an upstream OneLake read bug for now).
-conn = duckrun.connect("abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables/dbo")
+# Connect to a lakehouse. Read-only by default — pass read_only=False to opt into writes.
+conn = duckrun.connect(
+    "abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables/dbo",
+    read_only=False,
+)
 
-conn.sql("SHOW TABLES").show()
-conn.sql("select status, count(*) from orders group by status").show()
-df = conn.table("orders").toPandas()          # or .toArrow() for a streaming RecordBatchReader
+# Attach a Fabric Warehouse read-only (a write-locked lakehouse) as the catalog `wh`.
+conn.attach(
+    "abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<warehouse>.Warehouse/Tables",
+    name="wh", read_only=True,
+)
 
-# Time travel: list the versions, then read one
-from duckrun import DeltaTable
-DeltaTable.forName(conn, "orders").history()   # newest-first commits: version, timestamp, operation, …
-conn.read.format("delta").option("versionAsOf", 0).load(".../Tables/dbo/orders").show()
+# Write a Delta table with plain SQL: join the read-only warehouse to the lakehouse and
+# land the result as Delta in the lakehouse (CREATE TABLE AS SELECT routes to delta-rs).
+conn.sql("""
+    CREATE OR REPLACE TABLE daily_revenue AS
+    SELECT d.order_date, SUM(f.amount) AS revenue
+    FROM wh.dbo.fact_sales f
+    JOIN dim_date d ON d.date_id = f.date_id
+    GROUP BY d.order_date
+""")
+
+conn.sql("SELECT * FROM daily_revenue ORDER BY order_date").show()
 ```
 
-Need to **write**? Opt in with `read_only=False`:
+Everything is plain `conn.sql(...)`: reads pass straight through DuckDB; `CREATE TABLE AS SELECT`,
+`INSERT`, `UPDATE`, `DELETE`, and `MERGE` route to delta-rs and commit **snapshot-pinned** — a
+concurrent commit is rejected with `CommitFailedError` instead of silently overwriting a lost
+update. The read-only fence refuses any write to `wh`. Works the same against a local path,
+`s3://`, `gs://`, or `az://`.
 
-```python
-conn = duckrun.connect("abfss://…/Tables/dbo", read_only=False)
-
-# write Delta straight from SQL
-conn.sql("select * from orders where amount > 0") \
-    .write.mode("overwrite").saveAsTable("clean_orders")
-
-# raw DML routes to delta-rs (insert / update / delete / create table as / alter / drop)
-conn.sql("delete from clean_orders where amount = 0")
-
-# upsert — snapshot-pinned automatically, nothing extra to pass
-from duckrun import DeltaTable
-src = conn.sql("select * from updates")
-DeltaTable.forName(conn, "clean_orders").merge(src, "target.id = source.id") \
-    .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-
-conn.stop()
-```
-
-**Multiple catalogs** — attach more lakehouses and read/join across them by three-part name. In
-Fabric a Warehouse is just a write-locked Lakehouse, so attach it `read_only=True` next to a writable
-one:
-
-```python
-conn.attach("abfss://…/warehouse.Warehouse/Tables", name="warehouse", read_only=True)
-conn.attach("/data/reference", name="local")
-conn.sql("select * from warehouse.mart.facts f join local.dbo.lookup l on l.id = f.id").show()
-```
-
-Works the same against a local path, `s3://`, `gs://`, or `az://`. Full method map:
+Full surface (DataFrame writes, `DeltaTable` merge/time-travel, the per-method scorecard):
 **[Connection API](docs/connection-api.md)** · **[Spark/Delta coverage](docs/spark-delta-parity.md)** ·
 [live multi-catalog demo](https://djouallah.github.io/duckrun/multicatalog.html).
 
@@ -102,55 +84,36 @@ my_project:
   outputs:
     dev:
       type: duckrun
-      root_path: "abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables"
+      root_path: "abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables"
 ```
 
-Profiles, materializations, incremental strategies (incl. `append_if_unchanged`), sources, and
-automatic compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
-
-## Building with an AI assistant
-
-duckrun ships a guide so AI coding assistants get the adapter's defaults right (several differ from
-other dbt adapters). For **Claude Code**:
-
-```
-/plugin marketplace add djouallah/duckrun
-/plugin install duckrun-projects@duckrun
-```
-
-Other assistants read the [`AGENTS.md`](AGENTS.md) at the repo root, which points to the full guide.
-None of this is required to use duckrun.
+Materializations, incremental strategies (incl. `append_if_unchanged`), sources, and automatic
+compaction/vacuum are in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**. AI coding assistants:
+`/plugin marketplace add djouallah/duckrun` then `/plugin install duckrun-projects@duckrun`
+(Claude Code), or read [`AGENTS.md`](AGENTS.md).
 
 ## How it works
 
 Two engines, split cleanly: DuckDB runs every query and reads Delta through `delta_scan` views,
-delta-rs handles every write, an Arrow C-stream bridges them, and dbt orchestrates on top.
+delta-rs handles every write, and an Arrow C-stream bridges them. Writes are snapshot-pinned — the
+read is fixed at `delta_scan(…, version => N)` and the write commits against `N`. More:
+[Design document](docs/design_document.md) · [Snapshot isolation](docs/snapshot-isolation.md).
 
 ![duckrun architecture: DuckDB executes SQL and reads Delta via delta_scan; an Arrow C-stream bridges to delta-rs, which handles every write and commits against the read version (OCC); dbt orchestrates on top](https://raw.githubusercontent.com/djouallah/duckrun/main/docs/architecture.png)
 
-Writes are snapshot-pinned: the read is fixed at `delta_scan(…, version => N)` and the write commits
-against `N`, so a concurrent commit is rejected with `CommitFailedError` instead of silently
-overwriting a lost update.
-
-![Two writers race on one table: Writer A reads v5 and computes; Writer B commits v6 in between; A's commit against v5 is rejected with CommitFailedError instead of silently overwriting B](https://raw.githubusercontent.com/djouallah/duckrun/main/docs/snapshot-timeline.png)
-
-More on the design: [Design document](docs/design_document.md) ·
-[Snapshot isolation](docs/snapshot-isolation.md).
-
 ## Docs
 
-Browse the rendered docs site at **[djouallah.github.io/duckrun](https://djouallah.github.io/duckrun/)**
-— or read the markdown here:
+Rendered site: **[djouallah.github.io/duckrun](https://djouallah.github.io/duckrun/)**.
 
 | Doc | What's in it |
 |---|---|
-| [Connection API](docs/connection-api.md) | The `duckrun.connect()` notebook API + the live per-method scorecard. |
+| [Connection API](docs/connection-api.md) | The `duckrun.connect()` API + the live per-method scorecard. |
 | [Spark / Delta coverage](docs/spark-delta-parity.md) | What the `connect()` surface maps to in PySpark / Delta. |
-| [dbt adapter](docs/dbt-adapter.md) | Profiles, materializations, incremental strategies, sources, maintenance, limitations. |
-| [Design document](docs/design_document.md) | Why delta-rs (not DuckDB's native Delta writer), why Delta (not Iceberg), why a separate adapter. |
-| [Snapshot isolation](docs/snapshot-isolation.md) | How a read-modify-write is fenced to the version you read, and how it compares to delta-rs/Spark/SQL Server. |
-| [dbt adapter conformance](docs/conformance.md) | Official `dbt-tests-adapter` results, regenerated on every push to `main`. |
-| [Incremental MERGE benchmark](docs/merge-benchmark.md) | ~60M-row TPCH merge / append / overwrite scorecard — the release gate. |
+| [dbt adapter](docs/dbt-adapter.md) | Profiles, materializations, incremental strategies, sources, maintenance. |
+| [Design document](docs/design_document.md) | Why delta-rs (not DuckDB's native writer), why Delta (not Iceberg), why a separate adapter. |
+| [Snapshot isolation](docs/snapshot-isolation.md) | How a read-modify-write is fenced to the version you read. |
+| [dbt conformance](docs/conformance.md) | Official `dbt-tests-adapter` results, regenerated on every push to `main`. |
+| [MERGE](docs/merge-benchmark.md) · [TPC-H](docs/tpch.md) | The live benchmark scorecards. |
 
 ## License
 
