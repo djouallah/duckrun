@@ -15,8 +15,9 @@ name: integration_tests_onelake
 #   • sde         — tiny local build for the docs catalog, then the SCD2 port driven through real
 #                   dbt subprocesses against a persistent OneLake snapshot.
 #
-# `deploy-docs` is the final publisher: it collects the four projects' docs artifacts + the landing
-# page (docs/site/index.html) and pushes the combined dbt-docs site to GitHub Pages (main only).
+# This workflow only PRODUCES the per-project docs artifacts (each project's static_index.html and
+# the taxi/multicatalog demo reports); publishing to GitHub Pages is a separate workflow
+# (deploy-docs.yml), which reuses these artifacts so a docs-only change never re-runs this suite.
 #
 # None of these is the per-change gate (that's cores.yml); they hit live OneLake and so are not
 # release gates. The OneLake projects share one lakehouse, so each writes an isolated schema and
@@ -33,7 +34,6 @@ on:
       - 'tests/integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
       - 'tests/tools/merge_tpch_bench.py'
-      - 'docs/**'
       - '.github/workflows/integration_tests_onelake.yml'
   pull_request:
     paths:
@@ -45,14 +45,12 @@ on:
       - 'tests/integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
       - 'tests/tools/merge_tpch_bench.py'
-      - 'docs/**'
       - '.github/workflows/integration_tests_onelake.yml'
   workflow_dispatch:
 
-# The docs deploy needs Pages + OIDC; the project jobs use OIDC (id-token) for the Azure login.
+# The project jobs use OIDC (id-token) for the Azure login. (Pages publishing lives in deploy-docs.yml.)
 permissions:
   contents: read
-  pages: write
   id-token: write
 
 jobs:
@@ -390,69 +388,3 @@ jobs:
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
         run: python -m pytest tests/integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py -q -s -p no:cacheprovider
-
-  deploy-docs:
-    # The final publisher: collect the four projects' docs artifacts + the landing page and push the
-    # combined dbt-docs site to GitHub Pages (main only). `needs` all four, so any project job failing
-    # (or a non-main branch) skips publishing automatically; PR/feature runs still get the four
-    # per-project artifacts from their own jobs.
-    needs: [aemo, merge_spill, coffee, sde, taxi, multicatalog]
-    # Wait for taxi + multicatalog (so their report artifacts are ready) but DON'T let a flaky OneLake
-    # run block publishing: require only the four dbt jobs to have succeeded; the two demo jobs'
-    # results are tolerated (a missing report just falls back to the committed placeholder).
-    if: >-
-      always() && github.ref == 'refs/heads/main'
-      && needs.aemo.result == 'success' && needs.merge_spill.result == 'success'
-      && needs.coffee.result == 'success' && needs.sde.result == 'success'
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Render the docs site from markdown (MkDocs Material -> site/)
-        # mkdocs.yml + docs/*.md are the single source of truth; `mkdocs build` renders the
-        # whole site (homepage, nav, search) into site/. The committed docs/taxi.html &
-        # docs/multicatalog.html are copied through verbatim as the live-report fallbacks.
-        run: |
-          pip install mkdocs-material
-          # not --strict: the per-project example pages (merge_spill.html, …) are dropped in
-          # by the next step, so they're legitimately absent at build time.
-          mkdocs build
-      - name: Download all per-project docs artifacts
-        uses: actions/download-artifact@v4
-        with:
-          pattern: docs-*
-          path: docs-artifacts
-      - name: Drop the per-project DAGs + live demo reports into the built site
-        run: |
-          # The standalone per-project dbt catalogs link from docs/examples.md at the site root.
-          cp docs-artifacts/docs-aemo/static_index.html        site/aemo.html
-          cp docs-artifacts/docs-merge_spill/static_index.html site/merge_spill.html
-          cp docs-artifacts/docs-coffee/static_index.html      site/coffee.html
-          cp docs-artifacts/docs-sde/static_index.html         site/sde_dbt_tutorial.html
-          # The connection-API reports: mkdocs already copied the committed docs/taxi.html &
-          # docs/multicatalog.html into site/ (the fallback). Overwrite with THIS run's report if
-          # the demo job produced one — so the live page shows the run it was deployed from.
-          if [ -f docs-artifacts/docs-taxi-page/taxi_run.html ]; then
-            cp docs-artifacts/docs-taxi-page/taxi_run.html     site/taxi.html
-            echo "published THIS run's taxi report."
-          else
-            echo "no taxi report artifact — publishing the committed taxi.html."
-          fi
-          if [ -f docs-artifacts/docs-multicatalog-page/multicatalog_run.html ]; then
-            cp docs-artifacts/docs-multicatalog-page/multicatalog_run.html site/multicatalog.html
-            echo "published THIS run's multicatalog report."
-          else
-            echo "no multicatalog report artifact — publishing the committed multicatalog.html."
-          fi
-      - name: Package docs for Pages
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-      - name: Deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@v4

@@ -1,0 +1,102 @@
+name: deploy-docs
+
+# Publish the MkDocs Material site to GitHub Pages — decoupled from the heavy
+# live-OneLake integration suite. A docs-only change builds + deploys in seconds and
+# REUSES the example pages (per-project dbt catalogs + demo reports) that the
+# integration workflow already produced, instead of re-running it.
+#
+# It runs:
+#   • on a docs/site change pushed to main (fast path — reuse the last good examples);
+#   • after integration_tests_onelake finishes on main (so freshly-rebuilt example
+#     pages get republished);
+#   • on demand (workflow_dispatch).
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - 'mkdocs.yml'
+      - 'hooks/**'
+      - '.github/workflows/deploy-docs.yml'
+  workflow_run:
+    workflows: ["integration_tests_onelake"]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+  actions: read   # gh run download: read artifacts from the integration workflow's runs
+
+# Serialize Pages deploys; never cancel an in-flight publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # When chained off the integration run, only publish if that run succeeded.
+    if: >-
+      github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Build the docs site (MkDocs Material -> site/)
+        run: |
+          pip install mkdocs-material
+          # The committed docs/taxi.html & docs/multicatalog.html are copied into site/ here as
+          # fallbacks; the example DAG pages are dropped in by the next step.
+          mkdocs build
+      - name: Reuse the example pages from integration tests
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Which integration run to pull the example HTML from: the run that just finished
+          # (workflow_run), else the most recent successful run on main.
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            RUN_ID="${{ github.event.workflow_run.id }}"
+          else
+            RUN_ID="$(gh run list --workflow=integration_tests_onelake.yml --branch=main \
+              --status=success --limit=1 --json databaseId --jq '.[0].databaseId' || true)"
+          fi
+          if [ -n "${RUN_ID:-}" ]; then
+            echo "Reusing example artifacts from integration run $RUN_ID"
+            gh run download "$RUN_ID" --pattern 'docs-*' --dir docs-artifacts || true
+          else
+            echo "No successful integration run found — will fall back to the live site."
+          fi
+          # Overlay the per-project DAG catalogs and the live demo reports onto the built site.
+          cp_art() { [ -f "$1" ] && cp "$1" "site/$2" && echo "  from artifact: $2"; }
+          cp_art docs-artifacts/docs-aemo/static_index.html        aemo.html            || true
+          cp_art docs-artifacts/docs-merge_spill/static_index.html merge_spill.html     || true
+          cp_art docs-artifacts/docs-coffee/static_index.html      coffee.html          || true
+          cp_art docs-artifacts/docs-sde/static_index.html         sde_dbt_tutorial.html || true
+          cp_art docs-artifacts/docs-taxi-page/taxi_run.html       taxi.html            || true
+          cp_art docs-artifacts/docs-multicatalog-page/multicatalog_run.html multicatalog.html || true
+          # Safety net: for any example page still absent (artifact download failed and no committed
+          # fallback), preserve whatever is currently published so a deploy never wipes a live page.
+          for p in aemo merge_spill coffee sde_dbt_tutorial taxi multicatalog; do
+            if [ ! -f "site/$p.html" ]; then
+              if curl -fsS "https://djouallah.github.io/duckrun/$p.html" -o "site/$p.html"; then
+                echo "  preserved live: $p.html"
+              else
+                echo "  WARNING: no source for $p.html (link will 404 until integration runs)"
+              fi
+            fi
+          done
+      - name: Package docs for Pages
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
