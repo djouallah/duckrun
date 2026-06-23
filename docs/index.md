@@ -8,8 +8,9 @@ hide:
 
 <div class="duck-home-code" markdown>
 
-```bash
-pip install duckrun
+```python
+!pip install duckrun --upgrade
+notebookutils.session.restartPython()
 ```
 
 ```python
