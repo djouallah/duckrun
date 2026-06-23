@@ -10,12 +10,6 @@ hide:
 
 <p class="tagline">Run SQL in <strong>DuckDB</strong>, read &amp; write <strong>Delta Lake</strong> via delta-rs — locally or object store.</p>
 
-
-[Get started](#install){ .md-button .md-button--primary }
-[Connection API](connection-api.md){ .md-button }
-[dbt adapter](dbt-adapter.md){ .md-button }
-[Examples](examples.md){ .md-button }
-
 </div>
 
 <div class="duck-home-code" markdown>
