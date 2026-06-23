@@ -750,11 +750,16 @@ def _generate_tables(conn, sf):
     """Generate TPCH parquet with tpchgen-cli, then read each file back through duckrun and write it
     out as Delta — ``conn.read.parquet(path).write.saveAsTable(name)``. This exercises the read →
     write surface (parquet reader + DataFrameWriter). One-time — skipped when the tables already
-    exist."""
+    exist.
+
+    Returns the per-table ingestion timings ``[{'table', 'rows', 'dur'}, …]`` (the parquet→Delta
+    *write* cost only; the row count is a cheap parquet-metadata read), or ``[]`` when the tables
+    already exist and nothing was written."""
     if conn.catalog.tableExists("supplier"):
         print("Data already exists")
-        return
+        return []
     print(f"Generating TPC-H SF={sf}")
+    ingestion = []
     with tempfile.TemporaryDirectory() as staging:
         t0 = time.time()
         subprocess.run(
@@ -767,17 +772,25 @@ def _generate_tables(conn, sf):
         t1 = time.time()
         for tbl in TPCH_TABLES:
             parquet = os.path.join(staging, f"{tbl}.parquet").replace(os.sep, "/")
+            rows = conn.read.parquet(parquet).count()   # cheap: parquet footer metadata
             ts = time.time()
             conn.read.parquet(parquet).write.mode("overwrite").saveAsTable(tbl)
-            print(f"  {tbl}: parquet → Delta in {time.time() - ts:.2f}s")
+            dur = time.time() - ts
+            ingestion.append({"table": tbl, "rows": rows, "dur": dur})
+            print(f"  {tbl}: {rows:,} rows parquet → Delta in {dur:.2f}s")
         print(f"Wrote all Delta tables in {time.time() - t1:.2f}s")
     print("Done!")
+    return ingestion
 
 
-def run_tpch_benchmark(sf=1, base_path=None):
+def run_tpch_benchmark(sf=1, base_path=None, timings_out=None):
     """Generate (once) TPCH SF=``sf`` locally as Delta, run the 22 queries through ``conn.sql``, and
     save the timings with the duckrun DataFrame API (createDataFrame + saveAsTable — no pandas).
-    Returns the list of ``{'query', 'dur'}`` timings."""
+    Returns the list of ``{'query', 'dur'}`` query timings.
+
+    If ``timings_out`` (a dict) is passed, it is filled with the full run — ``ingestion`` (the
+    per-table parquet→Delta write timings), ``queries`` (the same list returned), ``sf`` and
+    ``cpu`` — so a caller (the scorecard driver) can render a card without changing the return."""
     base_path = base_path or os.environ.get("TPCH_BASE", str(Path.home() / "tpch_duckrun"))
     schema = f"CH{sf:04d}"
 
@@ -785,7 +798,7 @@ def run_tpch_benchmark(sf=1, base_path=None):
     conn = duckrun.connect(base_path, schema=schema, read_only=False)
     setup_time = time.time() - start
 
-    _generate_tables(conn, sf)
+    ingestion = _generate_tables(conn, sf)
     conn.catalog.setCurrentDatabase(schema)  # resolve the queries' unqualified table names
 
     results = _execute_queries(conn, _tpch_sql(sf))
@@ -798,6 +811,12 @@ def run_tpch_benchmark(sf=1, base_path=None):
     conn.createDataFrame(
         rows, "query int, dur double, engine string, time string, sf int, cpu int, test string"
     ).write.mode("append").saveAsTable("result")
+
+    if timings_out is not None:
+        timings_out["ingestion"] = ingestion
+        timings_out["queries"] = results
+        timings_out["sf"] = sf
+        timings_out["cpu"] = cores
 
     print(f"Total: {sum(r['dur'] for r in results):.2f}s across {len(results)} queries")
     return results

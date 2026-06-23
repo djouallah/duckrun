@@ -115,6 +115,7 @@ nav:
   - Conformance: conformance.md
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md
+      - TPC-H benchmark: tpch.md
   - Examples:
       - examples.md
       - aemo: https://djouallah.github.io/dbt_fabric_python_delta/

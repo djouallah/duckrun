@@ -363,10 +363,16 @@ jobs:
         run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider
 
   tpch-smoke:
-    # A smoke of the connection-API TPCH benchmark (duckrun.connect) on a LOCAL filesystem warehouse
-    # at SF=10 — the per-change guard that generate → read.parquet → saveAsTable → 22-query run →
-    # createDataFrame save still works end to end. Fully offline bar tpchgen-cli (which generates the data).
+    # The connection-API TPCH benchmark (duckrun.connect) on a LOCAL filesystem warehouse at SF=10:
+    # generate → read.parquet → saveAsTable → 22-query run, rendering the ingestion + query-timing
+    # scorecard. It is BOTH the per-change guard (the card script exits non-zero if the read/write
+    # surface breaks) and the source of the docs/tpch.md card. Fully offline bar tpchgen-cli.
     runs-on: ubuntu-latest
+    # Serialize (static group, no cancel): the main run commits the rendered card, which two
+    # concurrent runs can't do without a non-fast-forward.
+    concurrency:
+      group: tpch-card
+      cancel-in-progress: false
     env:
       TPCH_SF: "10"
     steps:
@@ -382,6 +388,27 @@ jobs:
       - name: Install tpchgen-cli (the scenario shells out to it to generate the data)
         run: pip install tpchgen-cli
 
-      - name: Run the local TPCH benchmark (SF=10)
-        # -s streams the per-query timings into the job log.
-        run: python -m pytest tests/integration_tests/tpch/test_tpch.py::test_tpch_local -q -s -p no:cacheprovider
+      - name: Run the TPCH benchmark and render the scorecard (SF=10)
+        # Runs the full benchmark and writes docs/tpch_card.md + the job summary. Exit non-zero =
+        # the read/write surface or the 22-query run regressed, so this is the guard too.
+        run: python tests/integration_tests/tpch/tpch_card.py
+
+      - name: Inject the card into docs and commit to main
+        # Only a push to main updates the canonical card in the docs; PRs/branches just show it in
+        # their own run summary. Never fail the run on a commit hiccup. [skip ci] avoids re-trigger.
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push' && hashFiles('docs/tpch_card.md') != ''
+        continue-on-error: true
+        run: |
+          python tests/tools/inject_readme.py docs/tpch.md docs/tpch_card.md TPCH
+          if git diff --quiet -- docs/tpch.md; then
+            echo "docs TPCH card unchanged."
+            exit 0
+          fi
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/tpch.md
+          git commit -m "docs: update TPCH scorecard [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done

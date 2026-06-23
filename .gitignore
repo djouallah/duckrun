@@ -81,6 +81,8 @@ tests/integration_tests/*/logs/
 docs/merge_card.md
 # The snapshot-pin scorecard the runner writes (injected into docs/snapshot-pin.md in CI)
 docs/snapshot_pin_card.md
+# The TPC-H scorecard the runner writes (injected into docs/tpch.md in CI)
+docs/tpch_card.md
 # The NYC-taxi demo HTML report the runner writes (published as taxi.html in CI)
 taxi_run.html
 # CI-only scorecards: rendered from test XML and injected into the docs/*.md beside them
