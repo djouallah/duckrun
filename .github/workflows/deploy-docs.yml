@@ -21,10 +21,11 @@ on:
       - 'hooks/**'
       - '.github/workflows/deploy-docs.yml'
   workflow_run:
-    # After integration finishes (fresh example pages) OR after cores finishes (the conformance /
-    # connection / snapshot-pin / TPC-H scorecards it commits to docs with [skip ci], which would
-    # otherwise not reach the site until the next docs push).
-    workflows: ["integration_tests_onelake", "cores"]
+    # After integration finishes (fresh example pages), or after cores / local_stress_tests finish
+    # (the scorecards they commit to docs with [skip ci] — conformance / connection / snapshot-pin
+    # from cores, the SF=100 TPC-H card from local_stress_tests — which would otherwise not reach the
+    # site, since [skip ci] suppresses the docs-push trigger).
+    workflows: ["integration_tests_onelake", "cores", "local_stress_tests"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
