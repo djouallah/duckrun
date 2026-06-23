@@ -117,7 +117,6 @@ nav:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
   - Advanced:
-      - Limitations: limitations.md
       - Connection API: connection-api.md
       - Spark / Delta coverage: spark-delta-parity.md
       - How it works:
@@ -126,3 +125,4 @@ nav:
           - Snapshot isolation: snapshot-isolation.md
           - Snapshot pin walkthrough: snapshot-pin.md
       - Conformance: conformance.md
+      - Limitations: limitations.md
