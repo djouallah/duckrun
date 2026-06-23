@@ -68,18 +68,10 @@
   overflow-wrap: anywhere;
 }
 
-/* Acknowledgements — compact, centered credits row. */
+/* Acknowledgements — compact, centered single-line credit. */
 .duck-thanks {
   text-align: center;
   color: var(--md-default-fg-color--light);
-  margin-top: 3rem;
-  font-size: 0.9rem;
-}
-.duck-thanks ul {
-  list-style: none;
-  padding: 0;
-  display: flex;
-  gap: 0.4rem 1.2rem;
-  justify-content: center;
-  flex-wrap: wrap;
+  margin-top: 1.5rem;
+  font-size: 0.85rem;
 }
