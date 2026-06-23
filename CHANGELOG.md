@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.22] - 2026-06-23
+
+### Added
+- **Snapshot-isolated read-modify-write through the `DeltaTable` handle.** `DeltaTable.forName` /
+  `forPath` capture the table version once; `merge` / `delete` / `update` through that handle are
+  pinned to it and validated under delta-rs OCC, so a conflicting concurrent commit fails loud
+  (`CommitFailedError`) instead of silently interleaving. See [docs/snapshot-isolation.md](docs/snapshot-isolation.md).
+- **Fenced writer modes** — `mode("append_if_unchanged")` (alias `safeappend`) and
+  `mode("overwrite_if_unchanged")`: fail-loud compare-and-swap append / overwrite that commit only
+  if the table version hasn't moved since the read.
+- **`DeltaTable` maintenance ops** on the connection API — `vacuum`, `optimize`, `restoreToVersion`.
+- **Catalog surface fill-in** — `catalog.createTable` (empty managed Delta table from DDL/StructType),
+  `refreshTable`, `getTable` / `getDatabase`, `dropTempView`.
+- **DataFrame / reader parity** — `df.schema` / `df.printSchema` (Spark shape, DuckDB types), more
+  DataFrame actions, `read.schema` (explicit read schema for csv/json), `read.json`.
+
+### Fixed
+- Quote-safe identifiers, fail-loud primary authentication, and connection lifecycle on the
+  connection API.
+
+### Changed
+- **merge-spill release gate restored to SF=20 (~120M rows)** (was SF=10 in 0.3.21).
+- CI now also runs on Python 3.12.
+
 ## [0.3.21] - 2026-06-22
 
 ### Added

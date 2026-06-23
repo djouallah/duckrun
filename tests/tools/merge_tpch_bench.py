@@ -1,6 +1,6 @@
 """Rigorous MERGE smoke/stress test on a big fact table — run entirely through the dbt path.
 
-Generate one big TPCH ``lineitem`` (default SF=10, ~60M rows) with ``tpchgen-cli`` as parquet. A dbt
+Generate one big TPCH ``lineitem`` (default SF=20, ~120M rows) with ``tpchgen-cli`` as parquet. A dbt
 DAG then builds a CHAIN of Delta tables: the first model STREAMS the parquet ``source`` into its Delta
 table, and everything downstream is ``ref`` to Delta tables duckrun writes — no manual convert, and
 nothing ever materializes the whole fact in RAM:
@@ -20,7 +20,7 @@ chain), and a second ``dbt run`` applies the op (the merge runs through the mate
 read-pin + the plugin's spill cap). Batches are sampled in-model with deterministic markers
 (l_quantity = -1 / -2, l_shipdate = 2035) so the runner can verify the effect by querying the table.
 
-    python tests/tools/merge_tpch_bench.py --dir /tmp/m --sf 10
+    python tests/tools/merge_tpch_bench.py --dir /tmp/m --sf 20
 """
 import argparse
 import os
@@ -101,7 +101,7 @@ class Bench:
     def __init__(self, args):
         self.args = args
         # --warehouse abfss://… points the whole chain at OneLake (the small-N integration job);
-        # the default is the local <dir>/warehouse the heavy SF=10 gate uses. Schema comes from
+        # the default is the local <dir>/warehouse the heavy SF=20 gate uses. Schema comes from
         # DBT_SCHEMA so the OneLake job can write into an isolated schema (no aemo collision).
         self.remote = bool(args.warehouse and args.warehouse.startswith("abfss://"))
         self.root = args.warehouse if args.warehouse else os.path.join(args.dir, "warehouse")
@@ -455,11 +455,11 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--dir", required=True)
-    ap.add_argument("--sf", type=float, default=10.0, help="target fact table scale factor")
+    ap.add_argument("--sf", type=float, default=20.0, help="target fact table scale factor")
     ap.add_argument("--warehouse", default=None,
                     help="Delta warehouse root. An abfss://… path runs the whole chain against "
                          "OneLake (the small-N integration job); default is the local <dir>/warehouse "
-                         "the heavy SF=10 gate uses.")
+                         "the heavy SF=20 gate uses.")
     ap.add_argument("--target", default="dev",
                     help="dbt target/profile output (use 'onelake' with --warehouse abfss://…)")
     ap.add_argument("--spill-size", type=int, default=None, dest="spill_size",
