@@ -3,13 +3,14 @@ hide:
   - toc
 ---
 
+# duckrun { .duck-hide }
+
 <div class="duck-hero" markdown>
 
 ![duckrun](duckrun.png){ .logo }
 
-<p class="tagline">Run SQL in <strong>DuckDB</strong>, read &amp; write <strong>Delta Lake</strong> via delta-rs — locally or on OneLake / S3 / GCS / ADLS.</p>
+<p class="tagline">Run SQL in <strong>DuckDB</strong>, read &amp; write <strong>Delta Lake</strong> via delta-rs — locally or object store.</p>
 
-<p class="mantra">DuckDB executes · delta-rs materializes · Arrow bridges · dbt orchestrates.</p>
 
 [Get started](#install){ .md-button .md-button--primary }
 [Connection API](connection-api.md){ .md-button }
@@ -44,7 +45,7 @@ conn = duckrun.connect("abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/
 
 conn.sql("show tables").show()
 conn.sql("select status, count(*) from orders group by status").show()
-df = conn.table("orders").toPandas()
+reader = conn.table("orders").toArrow()   # streaming pyarrow.RecordBatchReader
 ```
 
 That's the whole on-ramp. Writing Delta from SQL, snapshot-pinned upserts, the dbt
