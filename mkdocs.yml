@@ -25,6 +25,7 @@ theme:
   features:
     - navigation.tabs
     - navigation.sections
+    - navigation.indexes
     - navigation.top
     - navigation.instant
     - navigation.instant.progress
@@ -111,7 +112,14 @@ nav:
       - Design document: design_document.md
       - Snapshot isolation: snapshot-isolation.md
       - Snapshot pin walkthrough: snapshot-pin.md
+  - Conformance: conformance.md
   - Benchmarks:
-      - dbt conformance: conformance.md
       - MERGE benchmark: merge-benchmark.md
-  - Examples: examples.md
+  - Examples:
+      - examples.md
+      - aemo: https://djouallah.github.io/dbt_fabric_python_delta/
+      - merge_spill: https://djouallah.github.io/duckrun/merge_spill.html
+      - coffee: https://djouallah.github.io/duckrun/coffee.html
+      - sde_dbt_tutorial: https://djouallah.github.io/duckrun/sde_dbt_tutorial.html
+      - taxi: https://djouallah.github.io/duckrun/taxi.html
+      - multicatalog: https://djouallah.github.io/duckrun/multicatalog.html
