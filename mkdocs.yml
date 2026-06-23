@@ -116,11 +116,13 @@ nav:
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
-  - Connection API: connection-api.md
-  - Spark / Delta coverage: spark-delta-parity.md
-  - How it works:
-      - Overview: overview.md
-      - Design document: design_document.md
-      - Snapshot isolation: snapshot-isolation.md
-      - Snapshot pin walkthrough: snapshot-pin.md
-  - Conformance: conformance.md
+  - Advanced:
+      - Limitations: limitations.md
+      - Connection API: connection-api.md
+      - Spark / Delta coverage: spark-delta-parity.md
+      - How it works:
+          - Overview: overview.md
+          - Design document: design_document.md
+          - Snapshot isolation: snapshot-isolation.md
+          - Snapshot pin walkthrough: snapshot-pin.md
+      - Conformance: conformance.md

@@ -1,8 +1,3 @@
----
-hide:
-  - navigation
----
-
 # Coverage vs the Spark / Delta API
 
 duckrun's connection API (`duckrun.connect()`) deliberately targets **parity with the surface most
