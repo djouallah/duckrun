@@ -16,6 +16,10 @@ name: local_stress_tests
 #                     generate the fact, partitioned Delta write, mart, append, merge, insert-only.
 #                     Writes a data-engineer-readable report (rows / wall clock / peak memory) to
 #                     the run summary.
+#   • tpch-stress   — the full TPC-H benchmark (ingest 8 tables → 22 queries) at a LARGE scale
+#                     factor (default SF=100). MANUAL ONLY (workflow_dispatch) — it is a
+#                     ceiling-finding run that may not fit the runner, so it never gates a release.
+#                     It renders + commits the canonical docs/tpch.md scorecard (cores runs SF=1).
 
 on:
   workflow_call:
@@ -29,6 +33,10 @@ on:
         description: "coffee-stress: fact rows to generate (gate uses 5,000,000)"
         required: false
         default: "20000000"
+      tpch_sf:
+        description: "tpch-stress: TPCH scale factor (manual only; SF=100 ≈ 600M-row lineitem — ceiling-finding)"
+        required: false
+        default: "100"
 
 # Needed so the release run can commit the rendered MERGE scorecard back to README on main.
 permissions:
@@ -170,3 +178,70 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           exit $rc
+
+  tpch-stress:
+    # The full TPC-H benchmark at a LARGE scale factor (default SF=100 ≈ 600M-row lineitem): ingest
+    # the 8 tables Parquet → Delta, then run the 22 queries, and render the docs/tpch.md scorecard.
+    # MANUAL ONLY (workflow_dispatch): SF=100 needs the big /mnt disk and may not fit, so it must
+    # never gate a release (local_stress is a release gate via workflow_call). Generates onto /mnt
+    # (≈66 GB; / has only ~14 GB) via TMPDIR. This is the canonical card source; cores runs SF=1.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: tpch-stress
+      cancel-in-progress: false
+    env:
+      TPCH_SF: "${{ inputs.tpch_sf || '100' }}"
+      DIR: /mnt/tpch
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + tpchgen-cli
+        run: |
+          pip install -e ".[test]"
+          pip install tpchgen-cli
+
+      - name: Prepare big disk dir + show specs
+        run: |
+          sudo mkdir -p "$DIR" && sudo chown "$(id -u):$(id -g)" "$DIR"
+          echo "## TPC-H stress — SF=$TPCH_SF" >> "$GITHUB_STEP_SUMMARY"
+          echo "- CPUs: $(nproc) · memory: $(free -h | awk '/Mem:/{print $2}')" >> "$GITHUB_STEP_SUMMARY"
+          free -h; df -h /mnt /
+
+      - name: Run the TPC-H benchmark and render the scorecard
+        # Generation, the Delta warehouse, and DuckDB spill all land on the big /mnt disk via TMPDIR
+        # (/ has only ~14 GB). Runs from the repo root so the card writes to docs/tpch_card.md.
+        # OOM / disk-full is the experiment (rc 137/139) — note it and don't crash the summary.
+        env:
+          TMPDIR: /mnt/tpch
+        run: |
+          python tests/integration_tests/tpch/tpch_card.py ; rc=$?
+          if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
+            echo "**TPC-H SF=$TPCH_SF: 💀 OOM / disk-killed (rc=$rc)** — did not fit the runner." >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
+
+      - name: Render the scorecard into docs and commit to main
+        # This manual run IS the canonical card source. Never fail the run on a commit hiccup;
+        # [skip ci] avoids re-triggering. No-op if the bench died before writing the card.
+        if: always() && hashFiles('docs/tpch_card.md') != ''
+        continue-on-error: true
+        run: |
+          git fetch origin main
+          git checkout -B main origin/main
+          python tests/tools/inject_readme.py docs/tpch.md docs/tpch_card.md TPCH
+          if git diff --quiet -- docs/tpch.md; then
+            echo "docs TPCH card unchanged."
+            exit 0
+          fi
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/tpch.md
+          git commit -m "docs: update TPCH scorecard [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
