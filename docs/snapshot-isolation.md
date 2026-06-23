@@ -140,8 +140,14 @@ single-table. What a lakehouse can't honestly provide, and duckrun therefore doe
 
 - **Multi-table transactions** — Delta commits one table at a time.
 - **Pessimistic locking / blocking** — lakehouses are optimistic-only; writers fail-and-retry, never block.
-- **Implicit cross-statement isolation** — you must take a `DeltaTable` handle (or use the dbt path);
-  an ad-hoc `conn.sql` read followed by a separate write is not auto-isolated.
+- **Isolation across a _materialized_ read** — DuckDB relations are lazy (exactly like Spark
+  DataFrames), so a `conn.sql` read that feeds a fenced `.write` is pinned at **write** time even when
+  the read and the write are separate calls — read and commit land on one snapshot, and the CAS fences
+  the window. The gap opens only if you **materialize** (`.toPandas()` / `collect()`) and write the
+  result back later, so the read and the write genuinely sit at different versions. That is what the
+  `DeltaTable` handle is for — it carries the read version explicitly. Spark + Delta behaves
+  identically: a lazy DataFrame read→write is fenced at the commit; a collected-then-written result is
+  not, and you reach for a `MERGE` or an explicit version check.
 
 ## Further reading
 
