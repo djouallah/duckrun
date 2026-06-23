@@ -41,12 +41,14 @@ forced by the operation, not chosen:
 | Operation | Mechanism | Fails when… | Why |
 |---|---|---|---|
 | `merge`, `delete`, `update` | native OCC (`load_as_version` + plain op) | a **conflicting** commit landed since `V` (touches the same rows/files) | delete/update/merge have a real read/write set, so delta-rs detects genuine conflicts and lets non-conflicting commits rebase |
-| `append_if_unchanged` (a.k.a. `safeappend`), `replaceWhere` | strict version CAS (`load_as_version` + `max_commit_retries=0`) | **any** commit landed since `V` | a plain append is *non-conflicting* in delta-rs (it would auto-rebase and never fail), so the only way to make it fail-loud is to forbid all rebasing |
+| `append_if_unchanged` (a.k.a. `safeappend`), `overwrite_if_unchanged`, `replaceWhere` | strict version CAS (`load_as_version` + `max_commit_retries=0`) | **any** commit landed since `V` | an append/overwrite reads *nothing* from the target, so `load_as_version` alone is inert — there is no read-set for OCC to validate, and delta-rs would just rebase the write onto HEAD. `max_commit_retries=0` is the only thing that makes it fail-loud; `load_as_version` only sets *which* version the CAS measures from |
 
 So a `delete` tolerates an unrelated concurrent append (correct — not a lost update), while a
-`safeappend` fails on *any* movement (it has no finer notion of conflict). This asymmetry is
-inherent to the operations; it is exactly how SQL Server SNAPSHOT isolation behaves too (abort on a
-write-write **conflict**, not on every concurrent commit).
+fenced append/overwrite fails on *any* movement (it has no finer notion of conflict — it read
+nothing). This asymmetry is inherent to the operations: pinning the version *has meaning* for
+delete/merge (their read-set is checked against `(V, HEAD]`) but is inert for append/overwrite,
+where only `max_commit_retries=0` can fence. It is also exactly how SQL Server SNAPSHOT isolation
+behaves (abort on a write-write **conflict**, not on every concurrent commit).
 
 `read_version` is **required** on every fenced path — there is no blind-HEAD escape hatch. A
 brand-new table's first write is a plain create (`write_delta`), never a fenced op.
@@ -147,12 +149,26 @@ The `DataFrameWriter` exposes the fenced (compare-and-swap) siblings of the unfe
 strategy accepts both names too). `append_if_unchanged` is the clearer name and matches the engine
 function.
 
-## Roadmap
+## Why the writer pins at write time (and that's enough)
 
-One plumbing refinement remains (the mechanism is unchanged):
+The fenced writer modes capture the version at **write time** — `read_version =
+engine.table_version(path)` — not at some earlier read. That is correct, not a gap, because DuckDB
+relations are **lazy**: `conn.table("x")` / `conn.sql(...)` read nothing; the relation is executed
+only when `.write` runs it. So the read, the dedup, and the commit all happen inside the one write
+call, and the CAS fences that whole window — a concurrent writer landing during it fails the commit
+loudly (where a plain `append` would silently land a duplicate). There is no separate, earlier
+"read version" to carry — the write-time pin already *is* the read version.
 
-- **Carry the read version on the DataFrame** — `conn.table(name)` / `conn.read.load(path)` will
-  remember the version they read so a fenced writer mode fences to *that* version (the read version)
-  instead of the version at write time, closing the read→write gap for the DataFrame writer the same
-  way the handle already does for delete/update/merge. `conn.table` stays live for reads; it only
-  *also remembers* the version.
+The only time a read and a write are at genuinely different versions is when you **materialize** a
+read and act later (collect to Python, hold a version across statements). That is what the
+`DeltaTable` handle is for — it captures `V` explicitly and you carry the *handle*. There is nothing
+to carry on a DataFrame.
+
+## Further reading
+
+- **[Snapshot pin — version by version](snapshot-pin.md)** — the dbt MERGE pin proved through a real
+  `dbt run` (silent data loss vs a loud, safe failure).
+- **[How far Python alone can take you on Delta](https://datamonkeysite.com/2026/05/24/how-far-python-alone-can-take-you-on-delta/)**
+  — the manual, do-it-yourself version of this pattern in pure Python (`vB = DeltaTable(path).version()`,
+  pin the read to `vB`, pin the merge to `vB`, catch `CommitFailedError`, retry). duckrun automates
+  exactly this: the dbt path does it every run, and `DeltaTable.forName` does it for the connection API.
