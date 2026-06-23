@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # dbt adapter conformance
 
 `tests/conformance/` runs the official dbt adapter test suite
