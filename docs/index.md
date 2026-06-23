@@ -16,10 +16,19 @@ notebookutils.session.restartPython()
 ```python
 import duckrun
 
-# read-only by default — explore safely, no accidental writes
-conn = duckrun.connect("./my_lakehouse/Tables")   # or abfss://…onelake… for OneLake
-conn.sql("select status, count(*) from orders group by status").show()
-reader = conn.table("orders").toArrow()   # streaming pyarrow.RecordBatchReader
+# connect to a lakehouse (read-only by default — pass read_only=False to write)
+conn = duckrun.connect("abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables/dbo", read_only=False)
+
+# attach a Fabric Warehouse read-only as another catalog
+conn.attach("abfss://<ws>@onelake.dfs.fabric.microsoft.com/<warehouse>.Warehouse/Tables", name="wh", read_only=True)
+
+# write a Delta table with plain SQL — CREATE TABLE AS SELECT routes to delta-rs
+conn.sql("""
+  CREATE OR REPLACE TABLE daily_revenue AS
+  SELECT d.order_date, sum(f.amount) AS revenue
+  FROM wh.dbo.fact_sales f JOIN dim_date d ON d.date_id = f.date_id
+  GROUP BY d.order_date
+""")
 ```
 
 </div>
