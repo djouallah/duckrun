@@ -1,144 +1,56 @@
-# Bienvenue sur Make Open Data
+# makeopendata — French open data on duckrun
 
-### Des données publiques exploitables déployées sur une BDD Postgres/PostGIS accessibles depuis l'outil de votre choix.
+A faithful port of [make-open-data/make-open-data](https://github.com/make-open-data/make-open-data)
+— a production-grade dbt project over real French public data (INSEE, Etalab, IGN, DVF/Etalab,
+La Poste, Opendatasoft) — running on **duckrun**: every model executes in DuckDB and is
+materialized as a **Delta Lake** table via delta-rs.
 
-- Présentation du projet ou contactez-nous pour une démo : https://make-open-data.fr/
-- Catalogue des données : https://data.make-open-data.fr/
+Upstream targets **Postgres + PostGIS**. This port keeps the upstream layout, macros, seeds and
+**tests verbatim**, and rewrites only the model/macro SQL where Postgres/PostGIS differs from
+DuckDB + the `spatial` extension.
 
-## Qu'est-ce que Make Open Data ?
+## What changed from upstream (and why)
 
-Make Open Data est un ELT Open Source pour les données publiques :
+**Sources — re-pointed to public origins.** Upstream reads a private S3 mirror; its geography
+backbone (the `cog_*` reference tables and the IGN shapefiles) is access-gated (HTTP 403). Each
+source is re-pointed to its canonical public origin and read straight over `https` as a duckrun
+plugin source (`meta.plugin: duckrun`, see [1_data/sources/schema.yml](1_data/sources/schema.yml)):
 
-- **Extrait** les fichiers sources (data.gouv, INSEE, Etalab, etc.) les plus adaptés et récents.
-- **Transforme** ces données selon des règles transparentes et le moins irréversibles possible.
-- **Stocke** ces données dans une base de données PostgreSQL (avec PostGIS).
-- **Teste** des hypothèses sur ces données (ex. : prix par transaction immobilière sur DVF).
+| Source(s) | Public origin | Format |
+|---|---|---|
+| `cog_communes/arrondissements/departements/regions` | Etalab `decoupage-administratif` (unpkg) | json |
+| `cog_poste` | La Poste *base officielle des codes postaux* | csv |
+| `shape_commune_2024` | IGN ADMIN-EXPRESS COG 2025 communes (data.gouv) | GeoParquet (EPSG:4326) |
+| `shape_iris_2024` | Opendatasoft `georef-france-iris` (national; dev scopes to Occitanie) | GeoJSON via json export |
+| dvf / logement / filosofi / seveso / bpe / bmo / … | the project's own public bucket objects | csv |
 
-<img src="assets/make-open-data-flow.png" width="600">
+`shape_arrondissement_municipal_2024` has no public source, so the 45 Paris/Lyon/Marseille
+arrondissements municipaux carry a NULL contour. The commune **count is unaffected** (it derives
+from `cog_communes`); `assert_geo_communes_number` (35074) still passes.
 
-Les données spatiales sont intégrables dans QGIS et autres SIG.
+**SQL — PostGIS → DuckDB spatial, Postgres-isms → DuckDB.** Geometry has no Arrow/Delta type, so
+duckrun stores it as **WKB BLOB**; any spatial op on a geometry read back from a Delta table wraps it
+in `ST_GeomFromWKB`. The mechanical mappings:
 
-<img src="assets/demo-qgis.png" width="600">
+- `ST_SetSRID(ST_MakePoint(x,y), 4326)` → `ST_Point(x,y)`
+- `ST_Union(geom)` (aggregate) → `ST_Union_Agg(ST_GeomFromWKB(geom))`
+- PostGIS KNN `a <-> b` → `ST_Distance(ST_GeomFromWKB(a), ST_GeomFromWKB(b))`
+- `ST_Transform(geom, 4674)` dropped — the IGN/Opendatasoft geometry is already EPSG:4326
+- `TO_DATE(x,'YYYY')` → `strptime(x,'%Y')::DATE`; `SUBSTRING(x for n)` → `SUBSTRING(x,1,n)`
+- `materialized='view'` → `table` (duckrun has no persistent view)
+- the PostGIS `GIST` index `post_hook` is dropped (no DuckDB index on a Delta-backed model)
 
----
+**Adapter — JSON source support.** The duckrun source plugin learned a `json` format
+(`read_json_auto`) so the Etalab/Opendatasoft JSON sources read as catalog views like CSV/Parquet.
 
-## Déploiement managé par Make Open Data
+## Run it
 
-Nous fournissons les accès à une base PostgreSQL dans le cloud avec des données à jour.
-
-Contactez-nous : https://make-open-data.fr/
-
----
-
-## Déploiement manuel
-
-### 1. Installation des outils nécessaires
-
-Mettre à jour les paquets et installer les dépendances :
-
-```sh
-sudo apt update
-sudo apt install git python3-venv postgresql postgis
+```bash
+export WAREHOUSE_PATH=/tmp/makeopendata_wh   # local Delta warehouse (or an abfss:// Tables path)
+dbt deps  --project-dir tests/integration_tests/makeopendata --profiles-dir tests/integration_tests/makeopendata
+dbt build --project-dir tests/integration_tests/makeopendata --profiles-dir tests/integration_tests/makeopendata
 ```
 
-### 2. Cloner le projet et configurer l'environnement virtuel
-
-```sh
-git clone git@github.com:<utilisateur_orga_destination>/<nom_repo_destination>.git
-cd make-open-data-EPF
-python3 -m venv dbt-env
-source dbt-env/bin/activate
-```
-
-### 3. Configuration de PostgreSQL
-
-Définir les variables d'environnement :
-
-```sh
-nano dbt-env/env.sh
-```
-
-Ajouter :
-
-```sh
-export POSTGRES_USER=<YOUR_POSTGRES_USER> # ex: postgres
-export POSTGRES_PASSWORD=<YOUR_POSTGRES_PASSWORD>
-export POSTGRES_HOST=<YOUR_POSTGRES_HOST> # ex: localhost
-export POSTGRES_PORT=<YOUR_POSTGRES_PORT> # ex: 5432
-export POSTGRES_DB=<YOUR_POSTGRES_DB> # ex: postgres
-```
-
-Appliquer les changements :
-
-```sh
-source dbt-env/env.sh
-```
-
-Modifier la configuration PostgreSQL :
-
-```sh
-sudo nano /etc/postgresql/XX/main/postgresql.conf
-```
-
-Changer :
-
-```sh
-#listen_addresses = 'localhost'
-```
-
-Par :
-
-```sh
-listen_addresses = '*'
-```
-
-Redémarrer PostgreSQL :
-
-```sh
-sudo systemctl restart postgresql.service
-```
-
-### 4. Activer PostGIS
-
-Se connecter à PostgreSQL et activer l'extension :
-
-```sh
-psql postgresql://$POSTGRES_USER:$POSTGRES_PASSWORD@$POSTGRES_HOST:$POSTGRES_PORT/$POSTGRES_DB
-CREATE EXTENSION postgis;
-\q
-```
-
-### 5. Chargement des données
-
-```sh
-python3 -m load  # Chargement des données d'exemple
-python3 -m load --production  # Chargement complet des données
-```
-
-### 6. Configuration et exécution de DBT
-
-```sh
-export DBT_PROFILES_DIR=.
-dbt debug
-dbt deps
-dbt seed
-dbt run --target dev  # Tables logement sur Occitanie et DVF Hérault
-```
-
-Pour une exécution complète en production :
-
-```sh
-dbt run --target production  # Environ 1 heure
-```
-
-Tester les transformations :
-
-```sh
-dbt test
-```
-
-### 7. Installation de pgAdmin4 (facultatif)
-
-```sh
-sudo apt install pgadmin4
-```
+`dev` (default) reads the small Hérault/Occitanie samples (dvf, logement) and scopes IRIS to
+Occitanie; `--target production` reads all millésimes and all of France. Point `WAREHOUSE_PATH` at an
+`abfss://…/Tables` path and set `ONELAKE_TOKEN` to build against Microsoft Fabric OneLake.
