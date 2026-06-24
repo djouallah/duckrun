@@ -1,11 +1,14 @@
 name: makeopendata
 
 # The make-open-data dbt project (ported off Postgres + PostGIS) built end-to-end on a LOCAL
-# filesystem Delta warehouse — a real `dbt build` of ~30 models over live French open data plus the
-# project's own (untouched) conformance tests (35074 communes, the KNN macro, the source asserts).
-# Path-filtered: the build downloads ~2.5 GB and takes ~15 min, so it only runs when the project or
-# the adapter source it exercises (JSON sources, the run_query-on-source fix, geometry -> Delta)
-# changes. The heavier national/OneLake build is the manual `--target production` path.
+# filesystem Delta warehouse on the runner — NO OneLake. A real `dbt build` of ~30 models over live
+# French open data plus the project's own (untouched) conformance tests (35074 communes, the KNN
+# macro, the source asserts), then `dbt docs generate --static` so the published DAG page carries the
+# REAL catalog stats (row counts / sizes) off the local Delta tables. The HTML is uploaded as the
+# docs-makeopendata artifact and deploy-docs publishes it as makeopendata.html.
+#
+# Standalone + path-filtered: it is NOT a release/integration gate (publish.yml gates only on cores +
+# local_stress_tests), so a failure here never blocks anything.
 on:
   push:
     paths:
@@ -30,7 +33,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/makeopendata
-      WAREHOUSE_PATH: ${{ github.workspace }}/makeopendata_wh   # local Delta warehouse (no OneLake)
+      WAREHOUSE_PATH: ${{ github.workspace }}/makeopendata_wh   # local Delta warehouse on the runner
       DBT_SCHEMA: prepare
     defaults:
       run:
@@ -54,3 +57,17 @@ jobs:
         # count drifted from 35074, the KNN averages diverged). The tests are vendored verbatim from
         # make-open-data; green here means the DuckDB/Delta port reproduces the Postgres/PostGIS results.
         run: dbt build
+
+      - name: dbt docs generate (static, REAL catalog over the local Delta tables)
+        # --static emits a single self-contained static_index.html; the catalog is read off the Delta
+        # tables just built, so the page carries row counts / sizes (not an --empty-catalog stub).
+        run: dbt docs generate --static --target dev
+
+      - name: Verify the catalog carries Delta table stats
+        run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json makeopendata
+
+      - name: Upload makeopendata docs (the DAG page deploy-docs publishes as makeopendata.html)
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-makeopendata
+          path: tests/integration_tests/makeopendata/target/static_index.html
