@@ -86,11 +86,13 @@ Verified end-to-end against real remote object storage: `table` overwrite, `incr
 | **`table`**       | Delta (overwrite)        | DuckDB runs the SQL; delta_rs writes the table fresh each run.         |
 | **`incremental`** | Delta (merge / append)   | First run overwrites; later runs apply `incremental_strategy`.         |
 | `view`            | in-memory DuckDB         | Ephemeral staging within a run (inherited from dbt-duckdb).            |
-| `seed`            | in-memory DuckDB         | CSV fixtures (inherited from dbt-duckdb).                              |
+| `seed`            | Delta (overwrite)        | CSV loaded via DuckDB, then persisted as a Delta table — survives across processes like a model. |
 | `delta`           | Delta                    | Alias for `table`; honors `incremental=true`. Kept for convenience.   |
 
-The persisted materializations (`table`, `incremental`, `delta`) register a `delta_scan` view over
-the new Delta table, so downstream `ref()` works.
+The persisted materializations (`table`, `incremental`, `delta`, `seed`) register a `delta_scan` view
+over the new Delta table, so downstream `ref()` works — and because a seed is now a real Delta table,
+it's rediscovered from storage in a fresh process (e.g. `dbt docs generate`, or a partial
+`--select`), not just within the run that loaded it.
 
 ### `table`
 

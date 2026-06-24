@@ -182,6 +182,9 @@ class TestDocsGenerateDuckDB(BaseDocsGenerate):
             view_type="VIEW",
             table_type="BASE TABLE",
             model_stats=no_stats(),
+            # The seed (and the source that reads it) is now a Delta-backed table, so duckrun
+            # publishes Delta-log stats for it — the models here are views, which stay statless.
+            seed_stats=duckrun_table_stats(),
         )
 
 
@@ -197,9 +200,10 @@ class TestDocsGenReferencesDuckDB(BaseDocsGenReferences):
             view_type="VIEW",
             table_type="BASE TABLE",
             # ephemeral_summary is materialized='table' -> a Delta table -> duckrun publishes stats.
-            # view_summary (a view) and the seed/source (native, not Delta-backed) stay statless.
+            # The seed (and the source that reads it) is now Delta-backed too, so it has stats.
+            # view_summary (a view) has no Delta table, so it stays statless.
             model_stats=duckrun_table_stats(),
-            seed_stats=no_stats(),
+            seed_stats=duckrun_table_stats(),
             view_summary_stats=no_stats(),
             bigint_type="BIGINT",
         )

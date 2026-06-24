@@ -43,9 +43,11 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
 
 ## Materializations
 
-- **No persistent views.** Delta has no view primitive, so a `materialized='view'` model is just a
-  transient DuckDB catalog view, not a durable artifact — and swapping a model's materialization
-  between `table` and `view` isn't supported.
+- **No persistent views.** The Delta spec doesn't define a view, so there's nothing durable to write.
+  A `materialized='view'` model *runs* fine — it's a real DuckDB catalog view you can query for the
+  rest of the session — but it lives only in that connection and vanishes when it closes; nothing is
+  saved to storage, so the next session won't see it. (And swapping a model between `table` and
+  `view` isn't supported.)
 - **`DROP TABLE` is a soft tombstone, not a physical delete.** `conn.sql("drop table x")` unregisters
   the table and writes a tombstone marker but **does not reclaim the data files** (a deliberate
   precaution — you purge them when you're sure). Address dropped tables by name, not by path.
