@@ -13,7 +13,7 @@
 - [commune_centroid_poste](/#!/model/model.makeopendata.commune_centroid_poste): table de correspondance une commune pour chaque code postal : si N communes pour un code postal, on prend la commune la plus centrale (centroîd)
 - [infos_communes](/#!/model/model.makeopendata.infos_communes) : informations sur les communes : codes, nom, population, localisation et contour géographique.
 - [infos_iris](/#!/model/model.makeopendata.infos_iris) : informations sur les iris : codes, nom, localisation et contour géographique.
-- [infos_poste](/#!/model/model.makeopendata.infos_poste) : informations sur les codes postaux
+- [infos_postes](/#!/model/model.makeopendata.infos_postes) : informations sur les codes postaux
 
 
 - [demographie_departements](/#!/model/model.makeopendata.demographie_departements) : Nombre de ménages par structure démographique (âge, enfants, status matrimonial, etc) par département
@@ -39,12 +39,12 @@
 - [revenu_commune](/#!/model/model.makeopendata.revenu_commune) : Indicateur de revenus (médiane niveau de vie, déciles, pauvreté par tranche d'âge) et nature de revenu (part revenu activité, indemnités chômage, patrimoine, etc) par commune
 
 
-- [professionnels_sante_departement](/#!/model/model.makeopendata.professionnels_sante_departement) : Nombre de professionnels de santés médecins (chirurgiens, dermatologues, dentistes, etc) et para-médical (infirmiers, kiné, etc) par département en 2022.
+- [professionels_sante_departement](/#!/model/model.makeopendata.professionels_sante_departement) : Nombre de professionnels de santés médecins (chirurgiens, dermatologues, dentistes, etc) et para-médical (infirmiers, kiné, etc) par département en 2022.
 
 
 - [ventes_immobilieres_enrichies](/#!/model/model.makeopendata.ventes_immobilieres_enrichies) : Liste des transactions immobilières à l'échelle de la transaction (une ligne par transaction) avec leurs prix, surfaces, type de bien, le prix moyen des plus proches voisins, etc. Pour l'années 2023.
 
-- [datatourisme_place]() : Liste des sites touristiques https://www.data.gouv.fr/fr/datasets/r/cf247ad9-5bcd-4c8a-8f4d-f49f0803bca1
+- [datatourisme_place](/#!/model/model.makeopendata.place) : Liste des sites touristiques https://www.data.gouv.fr/fr/datasets/r/cf247ad9-5bcd-4c8a-8f4d-f49f0803bca1
   https://www.data.gouv.fr/fr/datasets/datatourisme-la-base-nationale-des-donnees-publiques-dinformation-touristique-en-open-data/#/resources
 
 ## Notes 
