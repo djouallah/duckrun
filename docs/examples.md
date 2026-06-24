@@ -1,3 +1,8 @@
+---
+hide:
+  - navigation
+---
+
 # Examples
 
 Real dbt projects materialized as Delta tables, plus runnable connection-API showcases —
