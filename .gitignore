@@ -77,6 +77,7 @@ tests/integration_tests/*/warehouse/
 tests/integration_tests/*/target/
 tests/integration_tests/*/dbt_packages/
 tests/integration_tests/*/logs/
+tests/integration_tests/*/package-lock.yml
 # The MERGE benchmark scorecard the runner writes (injected into docs/merge-benchmark.md in CI)
 docs/merge_card.md
 # The snapshot-pin scorecard the runner writes (injected into docs/snapshot-pin.md in CI)

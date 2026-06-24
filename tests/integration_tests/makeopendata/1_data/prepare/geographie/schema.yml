@@ -1,0 +1,144 @@
+version: 2
+
+models:
+- name: infos_communes
+  description: 'Fournit une tables des communes avec les informations basiques'
+  columns:
+  - name: code_commune
+    description: "code commune. Primary key of the table"
+    tests:
+              - unique
+              - not_null
+    data_type: string
+  - name: nom_commune
+    description: "nom de la commune"
+    data_type: string
+  - name: code_arrondissement
+    description: "code arrondissement"
+    data_type: string
+  - name: code_departement
+    description: "code departement"
+    data_type: string
+  - name: code_region
+    description: "code region"
+    data_type: string
+  - name: codes_postaux
+    description: "codes postaux"
+    data_type: string
+  - name: population
+    description: "population"
+    data_type: string
+  - name: code_zone
+    description: "Départements ou Régions français d'Outre-Mer (DROM), Collectivités d'Outre-Mer (COM) ou Métropole"
+    data_type: string
+  - name: nom_arrondissement
+    description: "nom arrondissement"
+    data_type: string
+  - name: nom_departement
+    description: "nom departement"
+    data_type: string
+  - name: nom_region
+    description: "nom region"
+    data_type: string
+  - name: commune_latitude
+    description: "latitude de la commune"
+    data_type: float
+  - name: commune_longitude
+    description: "longitude de la commune"
+    data_type: float
+  - name : commune_centre_geopoint
+    description: "geo point de la latitude longitude du commune"
+    data_type: geometry
+  - name: commune_contour
+    description: "contour géographique"
+    data_tupe: geometry
+
+- name: infos_postes
+  description: 'Tables avec codes postaux uniques et leurs informations basiques.'
+  columns:
+    - name: code_postal
+      description: "code postal. Primary key of the table"
+      data_type: string
+      tests:
+          - unique
+          - not_null
+    - name: code_departement
+      description: "code departement"
+      data_type: string
+    - name: nom_departement
+      description: "nom departement"
+      data_type: string
+    - name: code_region
+      description: "code region"
+      data_type: string
+    - name: nom_region
+      description: "nom region"
+      data_type: string
+
+- name: commune_centroid_poste
+  description: 'Table de passage pour avoir une relation unique entre les codes postaux et les codes communes insee. Un code postal peut appartenir à plusieurs communes et une code commune insee peut appartenir plusieurs codes postaux.'
+
+- name: infos_departements
+  description: 'Tables avec les informations géographiques et administratifs des départements.'
+  columns:
+    - name: code_departement
+      description: "code département. Primary key of the table"
+      data_type: string
+      tests:
+          - unique
+          - not_null
+    - name: nom_departement
+      description: "nom departement"
+      data_type: string
+    - name: code_region
+      description: "code region"
+      data_type: string
+    - name: nom_region
+      description: "nom region"
+      data_type: string
+    - name: population_departement
+      description: "population dans le département"
+      data_type: string
+    - name: contour_departement
+      description: "contour géographique du département"
+      data_type: geometry
+      
+- name: infos_scot
+  description: 'Table synthétique rapportant les informations principales sur chaque SCoT (Schéma de Cohérence Territoriale) : code, siren, nom, région, département (si unique), multi_dpt, population totale, contour géographique agrégé, nombre de communes.'
+  columns:
+    - name: scot_code
+      description: 'Identifiant unique du SCoT'
+      data_type: string
+      tests:
+          - unique
+          - not_null
+    - name: siren
+      description: 'SIREN du SCoT'
+      data_type: string
+    - name: scot_name
+      description: 'Nom du SCoT'
+      data_type: string
+    - name: code_region
+      description: 'Code de la region du SCoT'
+      data_type: string
+    - name: nom_region
+      description: 'Nom de la region du SCoT'
+      data_type: string
+    - name: code_departement
+      description: 'Code du departement si unique, NULL sinon'
+      data_type: string
+    - name: nom_departement
+      description: 'Nom du departement si unique, NULL sinon'
+      data_type: string
+    - name: multi_dpt
+      description: 'Booleen : true si le SCoT couvre plusieurs départements, false sinon'
+      data_type: boolean
+    - name: population
+      description: 'Population totale du SCoT'
+      data_type: numeric
+    - name: contour
+      description: 'Contour géographique du SCoT (union des contours des communes)'
+      data_type: geometry
+    - name: number_of_communes
+      description: 'Nombre de communes dans le SCoT'
+      data_type: integer

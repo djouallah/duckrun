@@ -66,17 +66,24 @@ class DuckrunEnvironment(LocalEnvironment):
         if scan_sql is None:
             return super().load_source(plugin_name, source_config)
 
-        handle = self.handle()
-        cursor = handle.cursor()
+        # Create the catalog view on a RAW child cursor of the shared DuckDB database. We must NOT
+        # go through self.handle() here: handle() runs initialize_cursor -> plugin.configure_cursor,
+        # which overwrites the delta plugin's live per-model cursor with this throwaway one — and we
+        # then close it. So a source resolved inside a model's own run() (e.g.
+        # `run_query(... {{ source(...) }} ...)` in the model body) would leave the plugin's store()
+        # writing on a closed cursor: "Connection already closed". A raw cursor has no such side
+        # effect, and CREATE OR REPLACE VIEW is lazy (the scan — and its httpfs/json/spatial
+        # extensions — runs later on whichever initialized per-node cursor reads the view).
+        with self.lock:
+            if self.conn is None:
+                self.conn = self.initialize_db(self.creds, self._plugins)
+        cursor = self.conn.cursor()
         try:
             if source_config.schema:
                 cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {source_config.schema}")
-            # A catalog view is shared across all cursors of this DuckDB database, so it resolves
-            # for whichever per-node cursor reads the source (and is rebuilt in a fresh process).
             cursor.execute(
                 f"CREATE OR REPLACE VIEW {source_config.table_name()} AS "
                 f"{scan_sql(source_config)}"
             )
         finally:
             cursor.close()
-            handle.close()

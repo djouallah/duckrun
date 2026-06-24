@@ -1,0 +1,56 @@
+name: makeopendata
+
+# The make-open-data dbt project (ported off Postgres + PostGIS) built end-to-end on a LOCAL
+# filesystem Delta warehouse — a real `dbt build` of ~30 models over live French open data plus the
+# project's own (untouched) conformance tests (35074 communes, the KNN macro, the source asserts).
+# Path-filtered: the build downloads ~2.5 GB and takes ~15 min, so it only runs when the project or
+# the adapter source it exercises (JSON sources, the run_query-on-source fix, geometry -> Delta)
+# changes. The heavier national/OneLake build is the manual `--target production` path.
+on:
+  push:
+    paths:
+      - 'tests/integration_tests/makeopendata/**'
+      - 'dbt/adapters/duckrun/**'
+      - 'dbt/include/duckrun/**'
+      - '.github/workflows/makeopendata.yml'
+  pull_request:
+    paths:
+      - 'tests/integration_tests/makeopendata/**'
+      - 'dbt/adapters/duckrun/**'
+      - 'dbt/include/duckrun/**'
+      - '.github/workflows/makeopendata.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: makeopendata-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/makeopendata
+      WAREHOUSE_PATH: ${{ github.workspace }}/makeopendata_wh   # local Delta warehouse (no OneLake)
+      DBT_SCHEMA: prepare
+    defaults:
+      run:
+        working-directory: tests/integration_tests/makeopendata
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (dbt-duckdb + duckdb + deltalake come with it)
+        run: pip install -e ".[test]"
+        working-directory: ${{ github.workspace }}
+
+      - name: dbt deps (dbt_utils)
+        run: dbt deps
+
+      - name: dbt build (dev) — models + the upstream conformance tests, on a local Delta warehouse
+        # A non-zero exit means a model failed to build OR an upstream test failed (e.g. the commune
+        # count drifted from 35074, the KNN averages diverged). The tests are vendored verbatim from
+        # make-open-data; green here means the DuckDB/Delta port reproduces the Postgres/PostGIS results.
+        run: dbt build

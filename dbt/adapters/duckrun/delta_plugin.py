@@ -698,8 +698,8 @@ class Plugin(BasePlugin):
     def source_scan_sql(source_config: SourceConfig) -> str:
         """SQL that scans a ``meta.plugin: duckrun`` source.
 
-        The source can be a Delta table, a CSV, or a Parquet file. ``delta_table_path`` forces
-        Delta (back-compat); otherwise the path is ``location``/``path`` and the format is
+        The source can be a Delta table, a CSV, a Parquet, or a JSON file. ``delta_table_path``
+        forces Delta (back-compat); otherwise the path is ``location``/``path`` and the format is
         ``meta.format`` or inferred from the extension (a bare directory is a Delta table).
         A source declares *where/what* (location + format) only; CSV parsing is left to
         ``read_csv_auto``'s detection — anything that needs hand-tuned parse options belongs in
@@ -723,6 +723,8 @@ class Plugin(BasePlugin):
                 fmt = "csv"
             elif lower.endswith(".parquet") or lower.endswith(".pq"):
                 fmt = "parquet"
+            elif lower.endswith(".json") or lower.endswith(".ndjson") or lower.endswith(".json.gz"):
+                fmt = "json"
             else:
                 fmt = "delta"
 
@@ -735,8 +737,13 @@ class Plugin(BasePlugin):
         if fmt == "csv":
             # read_csv_auto detects header/types; a source carries no parse options by design.
             return f"SELECT * FROM read_csv_auto('{path_sql}')"
+        if fmt == "json":
+            # read_json_auto detects records/columns; like CSV, a source carries no parse options.
+            # Raise maximum_object_size from the 16 MB default — web JSON exports (e.g. a GeoJSON
+            # FeatureCollection) routinely exceed it, and a source has no other place to set it.
+            return f"SELECT * FROM read_json_auto('{path_sql}', maximum_object_size=2147483647)"
         raise ValueError(
-            f"Unsupported duckrun source format {fmt!r}; expected 'csv', 'parquet', or 'delta'."
+            f"Unsupported duckrun source format {fmt!r}; expected 'csv', 'parquet', 'json', or 'delta'."
         )
 
     def load(self, source_config: SourceConfig):

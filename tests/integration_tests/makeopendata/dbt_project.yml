@@ -1,0 +1,35 @@
+name: 'makeopendata'
+version: '1.0.0'
+config-version: 2
+
+profile: 'makeopendata'
+
+model-paths: ["1_data"]
+analysis-paths: ["2_analyses"]
+test-paths: ["3_tests"]
+seed-paths: ["4_seeds"]
+macro-paths: ["5_macros"]
+snapshot-paths: ["6_snapshots"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# duckrun executes every model in DuckDB and materializes it as a Delta Lake table via delta-rs.
+# The French open-data sources are mirrored as CSV/JSON on a public bucket (see 1_data/sources/
+# schema.yml meta + load/storage_to_pg.yml), so we read them straight over https. spatial is loaded
+# for the geo models that parse the shapefile sources (ST_Read / geometry). Only run/build touch the
+# network — docs generation just compiles.
+on-run-start:
+  - "INSTALL httpfs"
+  - "LOAD httpfs"
+  - "INSTALL spatial"
+  - "LOAD spatial"
+  - "INSTALL json"
+  - "LOAD json"
+
+models:
+  makeopendata:
+    # Persist every model as a Delta table (the upstream Postgres build keeps everything in the
+    # `prepare` schema). Individual models can still override with {{ config(materialized=...) }}.
+    +materialized: table

@@ -1,0 +1,95 @@
+version: 2
+
+models:
+
+- name: revenu_commune
+  description: ""
+  columns:
+  - name: "code_commune_2024"
+    quote: true
+    description: "Code géographique"
+    data_type: text
+    tests:
+      - unique
+      - not_null
+  - name: nombre_menages_fiscaux
+    description: "Nombre de ménages fiscaux"
+    data_type: numeric
+  - name: nombre_personnes
+    description: "Nombre de personnes dans les ménages fiscaux"
+    data_type: numeric
+  - name: mediane_niveau_vie_euro
+    description: "Médiane du niveau de vie (€)"
+    data_type: numeric
+  - name: part_menages_fiscaux_imposes_pourcentage
+    description: "Part des ménages fiscaux imposés (%)"
+    data_type: numeric
+  - name: taux_pauvrete_ensemble_pourcentage
+    description: "Taux de pauvreté-Ensemble (%)"
+    data_type: numeric
+  - name: taux_pauvrete_moins_30_ans_pourcentage
+    description: "Taux de pauvreté des personnes dans les ménages dont le référent fiscal a moins de 30 ans (%)"
+    data_type: numeric
+  - name: taux_pauvrete_30_39_ans_pourcentage
+    description: "Taux de pauvreté des personnes dans les ménages dont le référent fiscal a de 30 à 39 ans (%)"
+    data_type: numeric
+  - name: taux_pauvrete_40_49_ans_pourcentage
+    description: "Taux de pauvreté des personnes dans les ménages dont le référent fiscal a de 40 à 49 ans (%)"
+    data_type: numeric
+  - name: taux_pauvrete_50_59_ans_pourcentage
+    description: "Taux de pauvreté des personnes dans les ménages dont le référent fiscal a de 50 à 59 ans (%)"
+    data_type: numeric
+  - name: taux_pauvrete_60_74_ans_pourcentage
+    description: "Taux de pauvreté des personnes dans les ménages dont le référent fiscal a de 60 à 74 ans (%)"
+    data_type: numeric
+  - name: taux_pauvrete_75_ans_ou_plus_pourcentage
+    description: "Taux de pauvreté des personnes dans les ménages dont le référent fiscal a 75 ans ou plus (%)"
+    data_type: numeric
+  - name: taux_pauvrete_proprietaires_pourcentage
+    description: "Taux de pauvreté des personnes dans les ménages propriétaires de leur logement (%)"
+    data_type: numeric
+  - name: taux_pauvrete_locataires_pourcentage
+    description: "Taux de pauvreté des personnes dans les ménages locataires de leur logement (%)"
+    data_type: numeric
+  - name: part_revenus_activite_pourcentage
+    description: "Part des revenus d'activité (%)"
+    data_type: numeric
+  - name: part_salaires_traitements_pourcentage
+    description: "dont part des salaires et traitements (%)"
+    data_type: numeric
+  - name: part_indemnites_chomage_pourcentage
+    description: "dont part des indemnités de chômage (%)"
+    data_type: numeric
+  - name: part_revenus_activites_non_salariees_pourcentage
+    description: "dont part des revenus des activités non salariées (%)"
+    data_type: numeric
+  - name: part_pensions
+    description: "retraites et rentes (%)"
+    data_type: numeric
+  - name: part_revenus_patrimoine_autres_revenus_pourcentage
+    description: "Part des revenus du patrimoine et des autres revenus (%)"
+    data_type: numeric
+  - name: part_ensemble_prestations_sociales_pourcentage
+    description: "Part de l'ensemble des prestations sociales (%)"
+    data_type: numeric
+  - name: part_prestations_familiales_pourcentage
+    description: "dont part des prestations familiales (%)"
+    data_type: numeric
+  - name: part_minima_sociaux_pourcentage
+    description: "dont part des minima sociaux (%)"
+    data_type: numeric
+  - name: part_prestations_logement_pourcentage
+    description: "dont part des prestations logement (%)"
+    data_type: numeric
+  - name: part_des_impots_pourcentage
+    description: "Part des impôts (%)"
+    data_type: numeric
+  - name: decile_1_niveau_vie_euro
+    description: "1er décile du niveau de vie (€)"
+    data_type: numeric
+  - name: decile_9_niveau_vie_euro
+    description: "9e décile du niveau de vie (€)"
+    data_type: numeric
+  - name: rapport_interdecile_9_1
+    description: "Rapport interdécile 9e décile/1er décile"
+    data_type: numeric
