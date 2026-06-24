@@ -36,11 +36,16 @@ def _parse_parquet_identifier(identifier: str) -> str:
 
 class DeltaMergeBuilder:
     def __init__(self, table: "DeltaTable", source, condition: str,
-                 read_version: Optional[int] = None):
+                 read_version: Optional[int] = None, streamed_exec: bool = False):
         self._table = table
         self._source = source  # DataFrame
         delta_dml.validate_merge_condition(condition)
         self._condition = condition  # handed to delta_rs verbatim as the merge predicate
+        # streamed_exec=True streams the source instead of collecting it for pruning stats — the config
+        # for a merge whose SOURCE is huge (e.g. a full-sync by-source delete over ~half the table),
+        # where collecting it whole would build a non-spillable hash and OOM. Default False (collect +
+        # prune) suits the common small-delta-into-large-table merge.
+        self._streamed_exec = streamed_exec
         self._clauses: List[dict] = []  # ordered engine.merge_delta_clauses specs
         # Pin the target to this version so OCC validates (vB, HEAD]: pass the same vB you pinned
         # the source read to (forName(...).version() → delta_scan('…', version => vB)) and source +
@@ -115,6 +120,7 @@ class DeltaMergeBuilder:
             self._condition,
             self._clauses,
             read_version=self._read_version,
+            streamed_exec=self._streamed_exec,
             storage_options=self._table.storage_options,
             compaction_threshold=self._table.compaction_threshold,
         )
@@ -177,14 +183,19 @@ class DeltaTable:
         engine.convert_to_delta(path, session.storage_options, partition_by=partitionSchema)
         return cls.forPath(session, path)
 
-    def merge(self, source, condition: str) -> DeltaMergeBuilder:
+    def merge(self, source, condition: str, streamed_exec: bool = False) -> DeltaMergeBuilder:
         """Begin a DataFrame-style merge of ``source`` into this table on ``condition``.
 
         The merge is snapshot-pinned to the version captured when this handle was taken
         (``forName``/``forPath``): the commit validates OCC against it, so a concurrent writer that
         landed since then fails the commit loudly instead of silently interleaving (single-snapshot
-        MERGE). Nothing for the caller to pass."""
-        return DeltaMergeBuilder(self, source, condition, read_version=self._read_version)
+        MERGE). Nothing for the caller to pass.
+
+        ``streamed_exec=True`` streams the source rather than collecting it for target-pruning stats —
+        pass it when the SOURCE is huge (e.g. a full-sync ``whenNotMatchedBySourceDelete`` over ~half
+        the table), where collecting the source whole would build a non-spillable hash and OOM."""
+        return DeltaMergeBuilder(self, source, condition, read_version=self._read_version,
+                                 streamed_exec=streamed_exec)
 
     def version(self) -> int:
         """Current Delta version of the table (``DeltaTable`` history head)."""

@@ -239,6 +239,16 @@ class Bench:
                 # engine path, with the version-guard fence).
                 self.conn.sql("SELECT * FROM _batch").write.mode("append_if_unchanged") \
                     .saveAsTable(self.t("safeappend_only"))
+            if model == "full_sync":
+                # No raw-SQL way to set streamed_exec, and a by-source MERGE must STREAM its big ~50%
+                # source (collecting it whole builds a non-spillable hash → OOM), so apply it via the
+                # DataFrame builder with streamed_exec=True. _src is built by sql/full_sync.sql above.
+                src = self.conn.sql("SELECT * FROM _src")
+                duckrun.DeltaTable.forName(self.conn, self.t("full_sync")).merge(
+                    src,
+                    "target.l_orderkey = source.l_orderkey AND target.l_linenumber = source.l_linenumber",
+                    streamed_exec=True,
+                ).whenMatchedUpdateAll().whenNotMatchedBySourceDelete().execute()
         self.peak_mb = sampler.peak
         return time.time() - t
 
