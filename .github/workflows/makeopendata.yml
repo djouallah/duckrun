@@ -15,6 +15,7 @@ name: makeopendata
 # local_stress_tests), so a failure here never blocks anything.
 on:
   push:
+    branches: ["**"]   # any branch, but NOT a tag push — never run on a release tag (v*); that is publish.yml's job
     paths:
       - 'tests/integration_tests/makeopendata/**'
       - 'dbt/adapters/duckrun/**'
