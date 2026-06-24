@@ -31,8 +31,7 @@ conn.sql("""
 """)
 ```
 
-Works anywhere Delta lives — **local filesystem, ADLS, S3, GCS, OneLake**. All you give it is a
-path; **no catalog or metastore required**.
+Works anywhere Delta lives — **local filesystem, ADLS, S3, GCS, OneLake**
 
 </div>
 
