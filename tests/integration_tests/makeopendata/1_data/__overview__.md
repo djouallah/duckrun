@@ -10,41 +10,41 @@
 ### Liste non exhaustive et non définitive des tables préparées par Make Open Data : 
 
 
-- [commune_centroid_poste](/#!/model/model.makeopendata.commune_centroid_poste): table de correspondance une commune pour chaque code postal : si N communes pour un code postal, on prend la commune la plus centrale (centroîd)
-- [infos_communes](/#!/model/model.makeopendata.infos_communes) : informations sur les communes : codes, nom, population, localisation et contour géographique.
-- [infos_iris](/#!/model/model.makeopendata.infos_iris) : informations sur les iris : codes, nom, localisation et contour géographique.
-- [infos_postes](/#!/model/model.makeopendata.infos_postes) : informations sur les codes postaux
+- [commune_centroid_poste](#!/model/model.makeopendata.commune_centroid_poste): table de correspondance une commune pour chaque code postal : si N communes pour un code postal, on prend la commune la plus centrale (centroîd)
+- [infos_communes](#!/model/model.makeopendata.infos_communes) : informations sur les communes : codes, nom, population, localisation et contour géographique.
+- [infos_iris](#!/model/model.makeopendata.infos_iris) : informations sur les iris : codes, nom, localisation et contour géographique.
+- [infos_postes](#!/model/model.makeopendata.infos_postes) : informations sur les codes postaux
 
 
-- [demographie_departements](/#!/model/model.makeopendata.demographie_departements) : Nombre de ménages par structure démographique (âge, enfants, status matrimonial, etc) par département
-- [demographie_communes](/#!/model/model.makeopendata.demographie_communes) : Nombre de ménages par structure démographique (âge, enfants, status matrimonial, etc) par commune
-- [demographie_iris](/#!/model/model.makeopendata.demographie_iris) : Nombre de ménages par structure démographie (âge, enfants, status matrimonial, etc) par iris
+- [demographie_departements](#!/model/model.makeopendata.demographie_departements) : Nombre de ménages par structure démographique (âge, enfants, status matrimonial, etc) par département
+- [demographie_communes](#!/model/model.makeopendata.demographie_communes) : Nombre de ménages par structure démographique (âge, enfants, status matrimonial, etc) par commune
+- [demographie_iris](#!/model/model.makeopendata.demographie_iris) : Nombre de ménages par structure démographie (âge, enfants, status matrimonial, etc) par iris
 
 
-- [activite_departements](/#!/model/model.makeopendata.activite_departements) : Nombre de ménages par nature d'activité (scolarisation, travail, type de contrat, etc) par département
-- [activite_communes](/#!/model/model.makeopendata.activite_communes) : Nombre de ménages par nature d'activité (scolarisation, travail, type de contrat, etc) par commune
-- [activite_iris](/#!/model/model.makeopendata.activite_iris) : Nombre de ménages par nature d'activité (scolarisation, travail, type de contrat, etc) par iris
+- [activite_departements](#!/model/model.makeopendata.activite_departements) : Nombre de ménages par nature d'activité (scolarisation, travail, type de contrat, etc) par département
+- [activite_communes](#!/model/model.makeopendata.activite_communes) : Nombre de ménages par nature d'activité (scolarisation, travail, type de contrat, etc) par commune
+- [activite_iris](#!/model/model.makeopendata.activite_iris) : Nombre de ménages par nature d'activité (scolarisation, travail, type de contrat, etc) par iris
 
 
-- [habitat_departements](/#!/model/model.makeopendata.habitat_departements) : Nombre de ménages par caractéristique de l'habitat (emménagement, statut d'occupation, combustible, etc) par département
-- [habitat_communes](/#!/model/model.makeopendata.habitat_communes) : Nombre de ménages par caractéristique de l'habitat (emménagement, statut d'occupation, combustible, etc) par commune
-- [habitat_iris](/#!/model/model.makeopendata.habitat_iris) : Nombre de ménages par caractéristique de l'habitat (emménagement, statut d'occupation, combustible, etc) par iris
+- [habitat_departements](#!/model/model.makeopendata.habitat_departements) : Nombre de ménages par caractéristique de l'habitat (emménagement, statut d'occupation, combustible, etc) par département
+- [habitat_communes](#!/model/model.makeopendata.habitat_communes) : Nombre de ménages par caractéristique de l'habitat (emménagement, statut d'occupation, combustible, etc) par commune
+- [habitat_iris](#!/model/model.makeopendata.habitat_iris) : Nombre de ménages par caractéristique de l'habitat (emménagement, statut d'occupation, combustible, etc) par iris
 
 
-- [mobilite_departements](/#!/model/model.makeopendata.mobilite_departements) : Nombre de ménages par nature de mobilité (lieu de travail vs domicile, nombre de véhicules, mode transport, etc) par département
-- [mobilite_communes](/#!/model/model.makeopendata.mobilite_communes) : Nombre de ménages par nature de mobilité (lieu de travail vs domicile, nombre de véhicules, mode transport, etc) par commune
-- [mobilite_iris](/#!/model/model.makeopendata.mobilite_iris) : Nombre de ménages par nature de mobilité (lieu domicile année précédente, lieu de travail vs domicile, nombre de véhicules, mode transport, etc) par iris
+- [mobilite_departements](#!/model/model.makeopendata.mobilite_departements) : Nombre de ménages par nature de mobilité (lieu de travail vs domicile, nombre de véhicules, mode transport, etc) par département
+- [mobilite_communes](#!/model/model.makeopendata.mobilite_communes) : Nombre de ménages par nature de mobilité (lieu de travail vs domicile, nombre de véhicules, mode transport, etc) par commune
+- [mobilite_iris](#!/model/model.makeopendata.mobilite_iris) : Nombre de ménages par nature de mobilité (lieu domicile année précédente, lieu de travail vs domicile, nombre de véhicules, mode transport, etc) par iris
 
 
-- [revenu_commune](/#!/model/model.makeopendata.revenu_commune) : Indicateur de revenus (médiane niveau de vie, déciles, pauvreté par tranche d'âge) et nature de revenu (part revenu activité, indemnités chômage, patrimoine, etc) par commune
+- [revenu_commune](#!/model/model.makeopendata.revenu_commune) : Indicateur de revenus (médiane niveau de vie, déciles, pauvreté par tranche d'âge) et nature de revenu (part revenu activité, indemnités chômage, patrimoine, etc) par commune
 
 
-- [professionels_sante_departement](/#!/model/model.makeopendata.professionels_sante_departement) : Nombre de professionnels de santés médecins (chirurgiens, dermatologues, dentistes, etc) et para-médical (infirmiers, kiné, etc) par département en 2022.
+- [professionels_sante_departement](#!/model/model.makeopendata.professionels_sante_departement) : Nombre de professionnels de santés médecins (chirurgiens, dermatologues, dentistes, etc) et para-médical (infirmiers, kiné, etc) par département en 2022.
 
 
-- [ventes_immobilieres_enrichies](/#!/model/model.makeopendata.ventes_immobilieres_enrichies) : Liste des transactions immobilières à l'échelle de la transaction (une ligne par transaction) avec leurs prix, surfaces, type de bien, le prix moyen des plus proches voisins, etc. Pour l'années 2023.
+- [ventes_immobilieres_enrichies](#!/model/model.makeopendata.ventes_immobilieres_enrichies) : Liste des transactions immobilières à l'échelle de la transaction (une ligne par transaction) avec leurs prix, surfaces, type de bien, le prix moyen des plus proches voisins, etc. Pour l'années 2023.
 
-- [datatourisme_place](/#!/model/model.makeopendata.place) : Liste des sites touristiques https://www.data.gouv.fr/fr/datasets/r/cf247ad9-5bcd-4c8a-8f4d-f49f0803bca1
+- [datatourisme_place](#!/model/model.makeopendata.place) : Liste des sites touristiques https://www.data.gouv.fr/fr/datasets/r/cf247ad9-5bcd-4c8a-8f4d-f49f0803bca1
   https://www.data.gouv.fr/fr/datasets/datatourisme-la-base-nationale-des-donnees-publiques-dinformation-touristique-en-open-data/#/resources
 
 ## Notes 
