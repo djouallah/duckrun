@@ -51,7 +51,7 @@ jobs:
       group: merge-spill
       cancel-in-progress: false
     env:
-      SF: "${{ inputs.sf || '10' }}"   # release gate uses 10 (~60M rows; SF=20 verified once in 0.3.22); a manual dispatch can pick another. Each op runs in its own worker process, so the merge spill cap is sampled against clean per-op RAM.
+      SF: "${{ inputs.sf || '10' }}"   # release gate uses 10 (SF=20 verified once in 0.3.22); a manual dispatch can pick another
       DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4

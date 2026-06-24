@@ -16,17 +16,15 @@ so it's now plain SQL driven by a small Python harness.
 - `sql/<op>.sql` — one file per operation, plain DuckDB SQL (no Jinja). Each builds its batch into a
   `_batch` TEMP table (so a random sample is evaluated exactly once) and then applies the op:
   a `MERGE` (`USING _batch`), an `INSERT … SELECT` (append), or a `CREATE OR REPLACE TABLE … AS`
-  (overwrite). `{schema}` is substituted by the runner. `full_sync.sql` streams its big ~50% source
-  as an inline subquery instead of a TEMP table; `safeappend_only.sql` only builds the batch (there
-  is no raw-SQL safeappend — the runner appends it via `.write.mode("append_if_unchanged")`).
+  (overwrite). `{schema}` is substituted by the runner. `full_sync.sql` only builds its big ~50% source
+  (`_src`) — the runner applies the by-source MERGE via the DataFrame builder with `streamed_exec=True`
+  (no raw-SQL way to set it, and a by-source source must be streamed, not collected whole into a
+  non-spillable hash); `safeappend_only.sql` likewise only builds the batch (no raw-SQL safeappend —
+  the runner appends it via `.write.mode("append_if_unchanged")`).
 - The runner — [`tests/tools/merge_tpch_bench.py`](../../tools/merge_tpch_bench.py) — generates the
   TPCH `lineitem` parquet with `tpchgen-cli`, seeds each op's table from the previous one
   (`CREATE OR REPLACE TABLE … AS SELECT * FROM <prev>`), runs each `sql/<op>.sql`, and verifies the
-  effect by querying the table. It writes the scorecard to `docs/merge_card.md`. On the heavy local
-  gate each op runs in its OWN `duckrun.connect()` worker subprocess (the chain state is all on disk,
-  so this is faithful): a finished op's RSS returns to the OS on process exit, so the next op's merge
-  spill cap is sampled against the RAM actually free rather than degrading as one long-lived process
-  accumulates the chain. The small OneLake smoke keeps the whole chain in one in-process session.
+  effect by querying the table. It writes the scorecard to `docs/merge_card.md`.
 
 ## Run it
 

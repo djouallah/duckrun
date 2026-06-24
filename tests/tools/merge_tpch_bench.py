@@ -1,7 +1,7 @@
 """Rigorous MERGE smoke/stress test on a big fact table — run entirely through the connection API.
 
-Generate one big TPCH ``lineitem`` (default SF=10, ~60M rows) with ``tpchgen-cli`` as parquet. The
-bench then builds a CHAIN of Delta tables with ``conn.sql(...)``: the
+Generate one big TPCH ``lineitem`` (default SF=10, ~60M rows) with ``tpchgen-cli`` as parquet. A
+single ``duckrun.connect()`` session then builds a CHAIN of Delta tables with ``conn.sql(...)``: the
 first table STREAMS the parquet into Delta, and everything downstream is seeded from the Delta table
 the previous step wrote — no dbt, no manual convert, and nothing ever materializes the whole fact in
 RAM:
@@ -25,17 +25,9 @@ runs through delta_rs's spill cap + the per-merge DuckDB memory pin — the same
 adapter uses). Batches are sampled with deterministic markers (l_quantity = -1 / -2, l_shipdate =
 2035) so the runner can verify the effect by querying the table.
 
-On the heavy local SF=N gate each op runs in its OWN ``duckrun.connect()`` worker subprocess (the chain
-state is all on disk, so this is faithful): a finished op's RSS — delta_rs holds ~99% of it — returns
-to the OS on process exit, so the next op's merge spill cap (``0.6 ×`` the RAM free *now*) is sampled
-clean, instead of degrading as one long-lived process accumulates the chain and starves the
-non-spillable hash-join build side. The small-N OneLake smoke keeps the whole chain in one in-process
-session.
-
     python tests/tools/merge_tpch_bench.py --dir /tmp/m --sf 10
 """
 import argparse
-import json
 import os
 import re
 import shutil
@@ -394,76 +386,7 @@ class Bench:
                 "verify": f"updated {marked:,} rows via expressions (l_quantity=-9, l_returnflag=CASE H/L)"}
 
 
-# Each op's reported run, given a Bench whose table this op writes is already seeded — mirrors the call
-# sites the original single-session run() used. The orchestrator runs each in its OWN worker process.
-DISPATCH = {
-    "mixed_upsert":       lambda b: b.mixed("mixed_upsert"),
-    "insert_only":        lambda b: b.insert_only("insert_only"),
-    "update_only":        lambda b: b.update_only("update_only"),
-    "idempotent_remerge": lambda b: b.idempotent("idempotent_remerge"),
-    "cdc_merge":          lambda b: b.cdc("cdc_merge"),
-    "full_sync":          lambda b: b.full_sync("full_sync"),
-    "expr_update":        lambda b: b.expr_update("expr_update"),
-    "append_only":        lambda b: b.appendish("append_only", "Append"),
-    "safeappend_only":    lambda b: b.appendish("safeappend_only", "Safeappend"),
-    "overwrite_all":      lambda b: b.overwrite("overwrite_all", "safeappend_only"),
-}
-# Chain order. cdc/full_sync/expr_update are the heavy whole-target MERGEs — they run on the local gate
-# (run_orchestrated runs the full chain); the remote OneLake smoke (run_inprocess) skips them.
-ORDER = ["mixed_upsert", "insert_only", "update_only", "idempotent_remerge",
-         "cdc_merge", "full_sync", "expr_update",
-         "append_only", "safeappend_only", "overwrite_all"]
-
-RESULT_PREFIX = "RESULT_JSON "
-
-
-def _run_one_op(b, op):
-    """Seed this op from the on-disk chain, apply it, and return its verified result dict — the same
-    seed+run sequence the single-session chain used. mixed_upsert streams the parquet; overwrite_all is
-    never seeded (its SQL replaces the table from safeappend_only); idempotent_remerge merges once as
-    set-up, then the reported run re-merges."""
-    if op != "overwrite_all":
-        b.seed(op)
-    if op == "idempotent_remerge":
-        b.run_op(op)  # first increment (set-up); the reported run is the re-merge
-    return DISPATCH[op](b)
-
-
-def _report(r):
-    """Print one op's result line (FAIL detail to stderr); return True iff it passed."""
-    passed = r["count_ok"] and r["verify_ok"]
-    print(f"== [{'OK' if passed else 'FAIL'}] {r['name']}: {r['src']:,} rows "
-          f"({r['upd']:,} upd + {r['ins']:,} ins) in {r['dt']:.1f}s; "
-          f"rows {r['before']:,} -> {r['after']:,} (expected {r['expected']:,}); {r['verify']} ==",
-          flush=True)
-    if not r["count_ok"]:
-        print(f"   FAIL: row count {r['after']:,} != expected {r['expected']:,}", file=sys.stderr)
-    if not r["verify_ok"]:
-        print(f"   FAIL: value check failed ({r['verify']})", file=sys.stderr)
-    return passed
-
-
-def _parse_result(stdout):
-    """Pull the worker's single RESULT_JSON line out of its captured stdout (last match wins)."""
-    for line in reversed(stdout.splitlines()):
-        if line.startswith(RESULT_PREFIX):
-            return json.loads(line[len(RESULT_PREFIX):])
-    return None
-
-
 def run(args):
-    """Dispatch. ``--op`` runs a single op as an isolated worker; an abfss:// warehouse runs the whole
-    chain in-process (the small-N OneLake smoke, which never OOMs); the heavy local gate fans each op
-    out to its own process so its merge spill cap is sampled against clean available RAM, not RAM still
-    held by a prior op's delta_rs heap."""
-    if args.op:
-        return run_worker(args)
-    if args.warehouse and args.warehouse.startswith("abfss://"):
-        return run_inprocess(args)
-    return run_orchestrated(args)
-
-
-def run_inprocess(args):
     # Local runs start from a clean warehouse; the OneLake job can't rmtree a remote store, so it
     # relies on each seed's CREATE OR REPLACE TABLE to recreate the table fresh instead.
     if not (args.warehouse and args.warehouse.startswith("abfss://")):
@@ -507,7 +430,15 @@ def run_inprocess(args):
 
     ok = True
     for r in results:
-        ok = _report(r) and ok
+        status = "OK" if (r["count_ok"] and r["verify_ok"]) else "FAIL"
+        ok = ok and r["count_ok"] and r["verify_ok"]
+        print(f"== [{status}] {r['name']}: {r['src']:,} rows ({r['upd']:,} upd + {r['ins']:,} ins) "
+              f"in {r['dt']:.1f}s; rows {r['before']:,} -> {r['after']:,} (expected {r['expected']:,}); "
+              f"{r['verify']} ==", flush=True)
+        if not r["count_ok"]:
+            print(f"   FAIL: row count {r['after']:,} != expected {r['expected']:,}", file=sys.stderr)
+        if not r["verify_ok"]:
+            print(f"   FAIL: value check failed ({r['verify']})", file=sys.stderr)
 
     final_rows = b.count("safeappend_only")
     op_peaks = [r["peak_mb"] for r in results if r.get("peak_mb")]
@@ -518,86 +449,6 @@ def run_inprocess(args):
     if not ok:
         sys.exit(2)
     print("OK: duckrun ran the chain through the connection API and survived.")
-
-
-def run_orchestrated(args):
-    """The heavy local SF=N gate: generate the base parquet once, then drive each op in its OWN worker
-    subprocess so a finished op's RSS is returned to the OS (on process exit) before the next op samples
-    its merge spill cap. The chain state is all on disk, so each worker reconstructs its slice from the
-    Delta warehouse — process memory carries nothing between ops."""
-    warehouse = os.path.join(args.dir, "warehouse")
-    if os.path.exists(warehouse):
-        shutil.rmtree(warehouse)
-
-    # Throwaway session: generate the base parquet + capture the card's setup inputs, then drop it so it
-    # doesn't sit on the workers' available RAM.
-    b = Bench(args)
-    print(f"== generate base: tpchgen SF={args.sf} -> lineitem parquet ==", flush=True)
-    b.generate()
-    target_rows = b.q(f"SELECT count(*) FROM read_parquet('{b.gen_glob()}')")
-    eff = b.engine._effective_mem_limit_bytes()
-    cap = b.engine._default_merge_spill_size()
-    print(f"== base lineitem: {target_rows:,} rows | effective_mem="
-          f"{None if eff is None else round(eff/1048576)}MB merge_cap="
-          f"{None if cap is None else round(cap/1048576)}MB ==", flush=True)
-    setup = {"duckdb_ver": duckdb.__version__, "deltalake_ver": deltalake.__version__,
-             "sf": args.sf, "target_rows": target_rows,
-             "eff_mb": None if eff is None else round(eff/1048576),
-             "cap_mb": None if cap is None else round(cap/1048576)}
-    del b  # free the generate session before the workers run
-
-    results, ok = [], True
-    for op in ORDER:
-        cmd = [sys.executable, str(Path(__file__).resolve()),
-               "--op", op, "--dir", args.dir, "--sf", str(args.sf)]
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        for line in proc.stdout.splitlines():           # forward the worker's log (sans the JSON line)
-            if not line.startswith(RESULT_PREFIX):
-                print(line, flush=True)
-        if proc.stderr:
-            sys.stderr.write(proc.stderr)
-        r = _parse_result(proc.stdout)
-        if r is not None:
-            ok = _report(r) and ok
-            results.append(r)
-        if proc.returncode != 0:
-            # subprocess returns a NEGATIVE code for a signal death (SIGKILL -9 -> OOM); normalize to
-            # the shell's 128+signal convention so the workflow's `rc == 137` OOM branch still fires.
-            sig = -proc.returncode if proc.returncode < 0 else 0
-            code = (128 + sig) if sig else proc.returncode
-            oom = code in (137, 139)
-            if r is None:
-                print(f"== [FAIL] {op}: worker exited {code}"
-                      f"{' (OOM-killed)' if oom else ''} — stopping the chain ==", flush=True)
-            print(f"   FAIL: op '{op}' worker rc={code}{' (OOM-killed)' if oom else ''}",
-                  file=sys.stderr)
-            sys.exit(code)
-
-    # Chain tail before the terminal overwrite; read it from a fresh session (the workers' writes are
-    # all on disk).
-    tail = Bench(args)
-    final_rows = tail.count("safeappend_only")
-    del tail
-    op_peaks = [r["peak_mb"] for r in results if r.get("peak_mb")]
-    peak = max(op_peaks) if op_peaks else _peak_rss_mb()
-    peak_s = f"{peak}MB" if peak is not None else "n/a (/proc RSS sampling is Linux-only)"
-    print(f"== done: peak RSS={peak_s} (chain tail grew to {final_rows:,} rows) ==", flush=True)
-    _write_summary(setup, results, final_rows, peak, ok)
-    if not ok:
-        sys.exit(2)
-    print("OK: duckrun ran the chain through the connection API and survived.")
-
-
-def run_worker(args):
-    """Run ONE op (``--op``) in this process and emit its result as a single RESULT_JSON line on stdout
-    (narration + the engine mem-profile log go to stderr). The process then exits, returning the op's
-    RSS — delta_rs holds ~99% of it — to the OS so the next op's cap is sampled against clean RAM."""
-    b = Bench(args)
-    r = _run_one_op(b, args.op)
-    sys.stdout.write(RESULT_PREFIX + json.dumps(r) + "\n")
-    sys.stdout.flush()
-    if not (r["count_ok"] and r["verify_ok"]):
-        sys.exit(2)
 
 
 def _write_summary(setup, results, final_rows, peak, all_ok):
@@ -674,9 +525,6 @@ def main():
                     help="Delta warehouse root. An abfss://… path runs the whole chain against "
                          "OneLake (the small-N integration job); default is the local <dir>/warehouse "
                          "the heavy SF=10 gate uses.")
-    ap.add_argument("--op", default=None,
-                    help="internal: run a single chain op in an isolated worker process (the "
-                         "orchestrator spawns one per op; not for direct use)")
     ap.set_defaults(func=run)
     args = ap.parse_args()
     args.func(args)
