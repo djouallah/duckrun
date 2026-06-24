@@ -6,12 +6,7 @@
 }}
 
 WITH logement AS (
-    select * 
-    {% if target.name == 'production' %}
-        from {{ source('sources', 'logement_2020') }}
-    {% else %}
-        from {{ source('sources', 'logement_2020_dev') }}
-    {% endif %}
+    select * from {{ ref('logement_raw') }}
 ),
 logement_renomee AS (
     ( {{ renommer_colonnes_values_logement(logement, 'activite') }} )
