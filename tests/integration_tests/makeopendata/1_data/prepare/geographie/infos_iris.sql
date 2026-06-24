@@ -1,4 +1,4 @@
-{{ config(materialized='table') }}
+{{ config(materialized='table', partition_by='code_departement') }}
 
 -- IRIS contours come from the Opendatasoft "georef-france-iris" GeoParquet export (read over https):
 -- com_code / iris_code / iris_name are scalars; geo_shape is native GEOMETRY (EPSG:4326). The 4-digit

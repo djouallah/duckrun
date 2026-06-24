@@ -1,4 +1,4 @@
-{{ config(materialized='table') }}
+{{ config(materialized='table', partition_by='code_departement') }}
 
 with filtre_cog_communes as (
     -- Filter out non-commune rows here to avoid confusion of filtering in the main query
