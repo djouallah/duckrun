@@ -1,9 +1,4 @@
----
-hide:
-  - navigation
----
-
-# Examples
+# Examples { .duck-hide }
 
 Real dbt projects materialized as Delta tables, plus runnable connection-API showcases —
 every one rebuilt against live Microsoft Fabric OneLake on each push to `main`.
