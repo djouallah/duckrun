@@ -109,7 +109,6 @@ nav:
       - examples.md
       - dbt projects:
           - aemo: https://djouallah.github.io/dbt_fabric_python_delta/
-          - merge_spill: https://djouallah.github.io/duckrun/merge_spill.html
           - coffee: https://djouallah.github.io/duckrun/coffee.html
           - sde_dbt_tutorial: https://djouallah.github.io/duckrun/sde_dbt_tutorial.html
       - Pure SQL:

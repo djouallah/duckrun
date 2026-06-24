@@ -19,14 +19,6 @@ Microsoft Fabric OneLake lakehouse.*
 
     *source: [djouallah/dbt_fabric_python_delta](https://github.com/djouallah/dbt_fabric_python_delta)*
 
--   __[merge_spill](merge_spill.html)__
-
-    The incremental-MERGE spill benchmark (`merge_spill_bench`): a chain of merge / append
-    / overwrite ops on a TPCH `lineitem`. Built for real on a tiny scale factor, so the
-    catalog carries Delta stats. The heavy 60M-row spill run is a separate release gate.
-
-    *source: [djouallah/duckrun](https://github.com/djouallah/duckrun/tree/main/tests/integration_tests/merge_spill)*
-
 -   __[coffee](coffee.html)__
 
     The coffee-shop scenario (`coffee_shop`): ingest two dimension CSVs over https, dedup

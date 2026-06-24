@@ -83,14 +83,13 @@ jobs:
           # Overlay the per-project DAG catalogs and the live demo reports onto the built site.
           cp_art() { [ -f "$1" ] && cp "$1" "site/$2" && echo "  from artifact: $2"; }
           cp_art docs-artifacts/docs-aemo/static_index.html        aemo.html            || true
-          cp_art docs-artifacts/docs-merge_spill/static_index.html merge_spill.html     || true
           cp_art docs-artifacts/docs-coffee/static_index.html      coffee.html          || true
           cp_art docs-artifacts/docs-sde/static_index.html         sde_dbt_tutorial.html || true
           cp_art docs-artifacts/docs-taxi-page/taxi_run.html       taxi.html            || true
           cp_art docs-artifacts/docs-multicatalog-page/multicatalog_run.html multicatalog.html || true
           # Safety net: for any example page still absent (artifact download failed and no committed
           # fallback), preserve whatever is currently published so a deploy never wipes a live page.
-          for p in aemo merge_spill coffee sde_dbt_tutorial taxi multicatalog; do
+          for p in aemo coffee sde_dbt_tutorial taxi multicatalog; do
             if [ ! -f "site/$p.html" ]; then
               if curl -fsS "https://djouallah.github.io/duckrun/$p.html" -o "site/$p.html"; then
                 echo "  preserved live: $p.html"
