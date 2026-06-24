@@ -1,17 +1,14 @@
 name: makeopendata
 
-# The make-open-data dbt project (ported off Postgres + PostGIS) built end-to-end against live
-# Microsoft Fabric OneLake (abfss://) — the same shared lakehouse the other integration projects use,
-# so the build is PERSISTENT (not a throwaway local warehouse) and matches real duckrun usage. A real
-# `dbt build` of ~30 models over live French open data plus the project's own (untouched) conformance
-# tests (35074 communes, the KNN macro, the source asserts), then `dbt docs generate --static` so the
-# published DAG page carries the REAL catalog stats (row counts / sizes) off the OneLake Delta tables.
-# The HTML is uploaded as the docs-makeopendata artifact and deploy-docs publishes it as makeopendata.html.
+# The make-open-data dbt project (ported off Postgres + PostGIS) built end-to-end on a LOCAL
+# filesystem Delta warehouse on the runner — NO OneLake. A real `dbt build` of ~30 models over live
+# French open data plus the project's own (untouched) conformance tests (35074 communes, the KNN
+# macro, the source asserts), then `dbt docs generate --static` so the published DAG page carries the
+# REAL catalog stats (row counts / sizes) off the local Delta tables. The HTML is uploaded as the
+# docs-makeopendata artifact and deploy-docs publishes it as makeopendata.html.
 #
 # Standalone + path-filtered: it is NOT a release/integration gate (publish.yml gates only on cores +
-# local_stress_tests), so a failure here never blocks anything. The OneLake projects share one
-# lakehouse, so this writes its own schemas (prepare/intermediaires/...) and takes a per-project
-# concurrency lock.
+# local_stress_tests), so a failure here never blocks anything.
 on:
   push:
     paths:
@@ -27,28 +24,17 @@ on:
       - '.github/workflows/makeopendata.yml'
   workflow_dispatch:
 
-# OIDC (id-token) for the Azure login that mints the OneLake bearer token.
-permissions:
-  contents: read
-  id-token: write
-
-# Serialize across branches: it writes the single shared OneLake lakehouse.
 concurrency:
-  group: makeopendata-onelake
-  cancel-in-progress: false
+  group: makeopendata-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/makeopendata
-      # Live OneLake Tables path (the same Fabric lakehouse aemo/coffee/merge_spill build into);
-      # delta_rs writes land at <root>/<schema>/<model> and persist. ONELAKE_TOKEN is minted below.
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+      WAREHOUSE_PATH: ${{ github.workspace }}/makeopendata_wh   # local Delta warehouse on the runner
       DBT_SCHEMA: prepare
-      # The azure extension's default transport fails the OneLake TLS handshake on the runner
-      # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
-      AZURE_TRANSPORT_OPTION_TYPE: curl
     defaults:
       run:
         working-directory: tests/integration_tests/makeopendata
@@ -63,34 +49,18 @@ jobs:
         run: pip install -e ".[test]"
         working-directory: ${{ github.workspace }}
 
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: Acquire a fresh OneLake bearer token
-        # Bearer tokens last ~1h, so mint one per run. OneLake takes Azure Storage AAD tokens.
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-
       - name: dbt deps (dbt_utils)
         run: dbt deps
 
-      - name: dbt build (dev) — models + the upstream conformance tests, on OneLake (abfss://)
+      - name: dbt build (dev) — models + the upstream conformance tests, on a local Delta warehouse
         # A non-zero exit means a model failed to build OR an upstream test failed (e.g. the commune
         # count drifted from 35074, the KNN averages diverged). The tests are vendored verbatim from
         # make-open-data; green here means the DuckDB/Delta port reproduces the Postgres/PostGIS results.
         run: dbt build
 
-      - name: dbt docs generate (static, REAL catalog over the OneLake Delta tables)
+      - name: dbt docs generate (static, REAL catalog over the local Delta tables)
         # --static emits a single self-contained static_index.html; the catalog is read off the Delta
         # tables just built, so the page carries row counts / sizes (not an --empty-catalog stub).
-        # A fresh process: it materializes nothing, so it only passes if the adapter re-registers every
-        # Delta table (incl. the seed) as a delta_scan view at run start — the cross-process gate.
         run: dbt docs generate --static --target dev
 
       - name: Verify the catalog carries Delta table stats

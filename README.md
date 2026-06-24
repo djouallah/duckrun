@@ -112,8 +112,8 @@ See it on a real, complex project:
 **[makeopendata](tests/integration_tests/makeopendata)** ports
 [make-open-data](https://github.com/make-open-data/make-open-data) (Postgres + PostGIS) to duckrun —
 ~30 models over live French open data (INSEE census, IGN/Etalab/La Poste geography, DVF real-estate,
-IGN communes + IRIS contours), every model (and seed) materialized as a Delta table — built live on
-Microsoft Fabric OneLake in CI — with the upstream dbt tests passing unchanged. Smaller starters: [aemo](tests/integration_tests/aemo),
+IGN communes + IRIS contours), every model (and seed) materialized as a Delta table, with the
+upstream dbt tests passing unchanged. Smaller starters: [aemo](tests/integration_tests/aemo),
 [coffee](tests/integration_tests/coffee), [sde_dbt_tutorial](tests/integration_tests/sde_dbt_tutorial).
 
 ## Building with an AI assistant
