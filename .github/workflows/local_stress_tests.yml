@@ -6,7 +6,7 @@ name: local_stress_tests
 # the ceiling. Each is its own job (own runner + install), and each serializes via a static group.
 #
 # Jobs:
-#   • merge-spill   — generate a large TPCH lineitem (gate SF=9 ≈ 54M rows) and merge several
+#   • merge-spill   — generate a large TPCH lineitem (gate SF=10 ≈ 60M rows) and merge several
 #                     incremental batches back into it (mixed / insert-only / update-only /
 #                     idempotent), plus append / safeappend / overwrite for comparison, on the
 #                     runner's real RAM with duckrun's shipping defaults. Pinned deltalake 1.5.0
@@ -26,9 +26,9 @@ on:
   workflow_dispatch:
     inputs:
       sf:
-        description: "merge-spill: TPCH scale factor for lineitem (gate uses 9 ≈ 54M rows; SF=20 verified in 0.3.22)"
+        description: "merge-spill: TPCH scale factor for lineitem (gate uses 10 ≈ 60M rows; SF=20 verified in 0.3.22)"
         required: false
-        default: "9"
+        default: "10"
       rows:
         description: "coffee-stress: fact rows to generate (gate uses 5,000,000)"
         required: false
@@ -51,7 +51,7 @@ jobs:
       group: merge-spill
       cancel-in-progress: false
     env:
-      SF: "${{ inputs.sf || '9' }}"   # release gate uses 9 (~54M rows; lowered from 10 for memory headroom under runner-RAM variance); a manual dispatch can pick another
+      SF: "${{ inputs.sf || '10' }}"   # release gate uses 10 (~60M rows; SF=20 verified once in 0.3.22); a manual dispatch can pick another. Each op runs in its own worker process, so the merge spill cap is sampled against clean per-op RAM.
       DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4

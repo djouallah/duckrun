@@ -22,7 +22,11 @@ so it's now plain SQL driven by a small Python harness.
 - The runner — [`tests/tools/merge_tpch_bench.py`](../../tools/merge_tpch_bench.py) — generates the
   TPCH `lineitem` parquet with `tpchgen-cli`, seeds each op's table from the previous one
   (`CREATE OR REPLACE TABLE … AS SELECT * FROM <prev>`), runs each `sql/<op>.sql`, and verifies the
-  effect by querying the table. It writes the scorecard to `docs/merge_card.md`.
+  effect by querying the table. It writes the scorecard to `docs/merge_card.md`. On the heavy local
+  gate each op runs in its OWN `duckrun.connect()` worker subprocess (the chain state is all on disk,
+  so this is faithful): a finished op's RSS returns to the OS on process exit, so the next op's merge
+  spill cap is sampled against the RAM actually free rather than degrading as one long-lived process
+  accumulates the chain. The small OneLake smoke keeps the whole chain in one in-process session.
 
 ## Run it
 
