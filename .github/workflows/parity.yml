@@ -49,7 +49,10 @@ jobs:
       cancel-in-progress: false
     env:
       # duckrun materializes here (abfss:// OneLake); run_parity.py reads it back over abfss for the diff.
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_jaffle
+      # Bare Tables root + a per-project SCHEMA (like the integration suite) → Tables/parity_jaffle/<table>,
+      # a real Fabric table. (A subfolder in the path instead would nest a level too deep → "Unidentified".)
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
+      DBT_SCHEMA: parity_jaffle
       # The azure extension's default transport fails the OneLake TLS handshake on the runner; curl
       # respects the system CA bundle (same as the integration suite).
       AZURE_TRANSPORT_OPTION_TYPE: curl
@@ -76,7 +79,6 @@ jobs:
       - name: Generate jaffle_shop dbt docs (static — catalog with row/byte stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/jaffle_shop
-          DBT_SCHEMA: main
         working-directory: /tmp/js
         run: dbt docs generate --static --target dev --target-path target_docs
       - name: Upload jaffle_shop dbt docs (deploy-docs publishes it as jaffle_shop.html)
@@ -95,7 +97,8 @@ jobs:
       group: parity-sde-onelake
       cancel-in-progress: false
     env:
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_sde
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
+      DBT_SCHEMA: parity_sde
       AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
@@ -120,7 +123,6 @@ jobs:
       - name: Generate sde dbt docs (static — catalog stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/sde
-          DBT_SCHEMA: main
         working-directory: /tmp/sde_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
       - name: Upload sde dbt docs (deploy-docs publishes it as sde.html)
@@ -140,7 +142,8 @@ jobs:
       group: parity-mrr-onelake
       cancel-in-progress: false
     env:
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_mrr
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
+      DBT_SCHEMA: parity_mrr
       AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
@@ -165,7 +168,6 @@ jobs:
       - name: Generate mrr dbt docs (static — catalog stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/mrr
-          DBT_SCHEMA: main
         working-directory: /tmp/mrr_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
       - name: Upload mrr dbt docs (deploy-docs publishes it as mrr.html)
@@ -187,7 +189,8 @@ jobs:
       group: parity-techflow-onelake
       cancel-in-progress: false
     env:
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_techflow
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
+      DBT_SCHEMA: parity_techflow
       AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
@@ -212,7 +215,6 @@ jobs:
       - name: Generate techflow dbt docs (static — catalog stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/techflow
-          DBT_SCHEMA: main
         working-directory: /tmp/techflow_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
       - name: Upload techflow dbt docs (deploy-docs publishes it as techflow.html)
@@ -237,7 +239,7 @@ jobs:
       # is run verbatim. httpfs + s3_region (in this profile) let the seed bootstrap read the public
       # tuva-public-resources S3 bucket anonymously; models materialize to OneLake.
       DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/tuva
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_tuva
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       AZURE_TRANSPORT_OPTION_TYPE: curl
       DBT_SCHEMA: tuva
     steps:

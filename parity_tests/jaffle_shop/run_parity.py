@@ -25,7 +25,10 @@ ORACLE_SCHEMA = "main"
 # duckrun warehouse root: an abfss:// OneLake Tables path when WAREHOUSE_PATH is set (the parity CI
 # points it at Microsoft Fabric); otherwise a local-filesystem warehouse for a plain local run.
 DUCKRUN_WH = os.environ.get("WAREHOUSE_PATH") or ("C:/tmp/js_wh" if os.name == "nt" else "/tmp/js_wh")
-DUCKRUN_SCHEMA = "main"
+# duckrun writes <root>/<schema>/<table>. On OneLake the CI sets a per-project schema (e.g.
+# parity_jaffle) so each project is an isolated Fabric schema under the SAME Tables root — exactly
+# how the integration suite isolates projects. Local default 'main'.
+DUCKRUN_SCHEMA = os.environ.get("DBT_SCHEMA", "main")
 _REMOTE = "://" in DUCKRUN_WH
 
 

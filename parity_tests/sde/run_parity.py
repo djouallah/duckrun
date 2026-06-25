@@ -25,6 +25,9 @@ DUCKRUN_DIR = TMP / "sde_duckrun"    # sources from ./dbt.duckdb; models → Del
 # duckrun warehouse root: an abfss:// OneLake Tables path when WAREHOUSE_PATH is set (the parity CI
 # points it at Microsoft Fabric); otherwise a local-filesystem warehouse for a plain local run.
 DUCKRUN_WH = os.environ.get("WAREHOUSE_PATH") or str(TMP / "sde_duckrun_wh")
+# duckrun writes <root>/<schema>/<table>. On OneLake the CI sets a per-project schema (parity_sde) so
+# each project is an isolated Fabric schema under the SAME Tables root (like the integration suite).
+DUCKRUN_SCHEMA = os.environ.get("DBT_SCHEMA", "main")
 _REMOTE = "://" in DUCKRUN_WH
 
 # SCD2 snapshot bookkeeping columns are stamped from run wall-clock / row hashes, so they differ
@@ -86,10 +89,13 @@ def diff() -> bool:
     ).fetchall()
     all_ok = True
     for schema, t in tabs:
-        if not _present(c, schema, t):
+        # The oracle's default schema ('main') maps to the duckrun side's DUCKRUN_SCHEMA (per-project
+        # on OneLake); custom schemas (e.g. snapshots) are written as-is by both, so map to themselves.
+        dr_schema = DUCKRUN_SCHEMA if schema == "main" else schema
+        if not _present(c, dr_schema, t):
             print(f"{schema}.{t:24} SKIP (not persisted by duckrun)")
             continue
-        uri = _duckrun_uri(schema, t)
+        uri = _duckrun_uri(dr_schema, t)
         ocols = [r[0] for r in c.execute(
             "select column_name from duckdb_columns() where database_name='o' "
             f"and schema_name='{schema}' and table_name='{t}' order by column_index").fetchall()]
@@ -115,7 +121,7 @@ def main():
     # Oracle: the repo's OWN profile (type: duckdb, path: ./dbt.duckdb) — zero external config.
     build(ORACLE_DIR, str(ORACLE_DIR), {})
     # duckrun: external profile here (type: duckrun, path → ./dbt.duckdb, root_path → Delta warehouse).
-    build(DUCKRUN_DIR, str(HERE), {"WAREHOUSE_PATH": DUCKRUN_WH, "DBT_SCHEMA": "main"})
+    build(DUCKRUN_DIR, str(HERE), {"WAREHOUSE_PATH": DUCKRUN_WH, "DBT_SCHEMA": DUCKRUN_SCHEMA})
     print("\n=== parity diff (duckrun Delta vs duckdb oracle) ===")
     ok = diff()
     print("\nPARITY:", "PASS — duckrun == dbt-duckdb on every persisted table" if ok else "FAIL")
