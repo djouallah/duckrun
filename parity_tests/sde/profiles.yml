@@ -1,0 +1,14 @@
+---
+# External duckrun connection for the sde_dbt_tutorial parity test — NOT part of the repo.
+# Upstream's EL (extract_load_pipeline.py) loads the raw CSVs into a DuckDB file (./dbt.duckdb) and
+# the project reads them via `sources`. So duckrun opens that SAME file via `path` (sources resolve
+# from it, unchanged), while models/snapshots materialize to Delta via `root_path`. The repo runs
+# verbatim — only this external profile differs from the upstream `type: duckdb` one.
+sde_dbt_tutorial:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      path: "{{ env_var('SDE_DUCKDB', './dbt.duckdb') }}"
+      root_path: "{{ env_var('WAREHOUSE_PATH', './warehouse') }}"
+      schema: "{{ env_var('DBT_SCHEMA', 'main') }}"
