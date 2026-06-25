@@ -74,6 +74,19 @@ class Plugin(BasePlugin):
         # cursor-local, so store()/load() MUST read on this same cursor — not a new child
         # of the shared connection — or the variables/relations won't be visible.
         self._cursor_handle = cursor
+        # OneLake token refresh. A run longer than the bearer token's ~1h life would 401 mid-build
+        # (the token is captured once at connection-open). dbt calls this once per model, so it's the
+        # natural place to re-mint just before this model's reads (delta_scan of {{ this }}) and its
+        # store() write. No-op unless the token is a JWT near expiry AND a live source can refresh it
+        # (Fabric / azure-identity), so short jobs and the local path are untouched.
+        if secret.bearer_token(self._storage_options):
+            fresh = secret.refreshed(self._storage_options)
+            if fresh is not self._storage_options:  # token was actually re-acquired
+                self._storage_options = fresh
+                try:
+                    secret.ensure_azure_secret(cursor, fresh)  # re-mint the read secret with it
+                except Exception:  # best-effort: a transient refresh failure keeps the old secret
+                    pass
 
     def _cursor(self):
         # Prefer the live per-model cursor (shares the session where pre-hook variables and

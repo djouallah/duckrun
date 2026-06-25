@@ -62,7 +62,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun (dbt-duckdb + duckdb + deltalake come with it)
-        run: pip install -e ".[test]"
+        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
@@ -106,7 +106,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun
-        run: pip install -e ".[test]"
+        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
@@ -151,7 +151,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun
-        run: pip install -e ".[test]"
+        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
@@ -198,7 +198,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun
-        run: pip install -e ".[test]"
+        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
@@ -248,7 +248,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun
-        run: pip install -e ".[test]"
+        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:

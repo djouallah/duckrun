@@ -31,6 +31,39 @@ def bearer_token(storage_options: Optional[Dict[str, str]]) -> Optional[str]:
     return so.get("bearer_token") or so.get("token") or so.get("access_token")
 
 
+def refreshed(storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """``storage_options`` with a still-valid OneLake bearer token.
+
+    A run longer than the token's ~1h lifetime would otherwise 401 mid-build, because the token is
+    captured once at connection-open. When the current token is a JWT near expiry, re-acquire a fresh
+    one from a LIVE source (Fabric notebook / azure-identity — see ``auth.refresh_storage_token``) and
+    swap it in. Returns the SAME object when nothing changed (no token, not a JWT, not expiring, or no
+    live source available), so callers can identity-check whether a re-mint is needed and short jobs
+    pay nothing.
+    """
+    tok = bearer_token(storage_options)
+    if not tok:
+        return storage_options
+    try:
+        from duckrun import auth  # lazy: keep the adapter importable without the connect package
+    except Exception:
+        return storage_options
+    if not auth.token_is_expiring(tok):
+        return storage_options
+    try:
+        fresh = auth.refresh_storage_token()
+    except Exception:
+        fresh = None
+    if not fresh or fresh == tok:
+        return storage_options  # best effort — keep the (stale) token; nothing better available
+    out = dict(storage_options)
+    for k in ("bearer_token", "token", "access_token"):
+        if k in out:
+            out[k] = fresh
+    out.setdefault("bearer_token", fresh)
+    return out
+
+
 def ensure_azure_secret(conn, storage_options: Optional[Dict[str, str]]) -> bool:
     """Mint the DuckDB Azure secret from a bearer token in ``storage_options`` on ``conn``.
 
