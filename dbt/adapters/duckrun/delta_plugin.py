@@ -188,8 +188,9 @@ class Plugin(BasePlugin):
             if not unique_key:
                 raise ValueError("incremental_strategy='delete+insert' requires a unique_key.")
             self._store_delete_insert(
-                path, cur, name, data, unique_key, storage_options,
+                path, cur, name, unique_key, storage_options,
                 read_version=cfg.get("read_version"), partition_by=partition_by,
+                incremental_predicates=cfg.get("incremental_predicates"),
             )
             return
 
@@ -352,29 +353,66 @@ class Plugin(BasePlugin):
             )
 
     def _store_delete_insert(
-        self, path, cur, name, data, unique_key, storage_options,
-        read_version=None, partition_by=None,
+        self, path, cur, name, unique_key, storage_options,
+        read_version=None, partition_by=None, incremental_predicates=None,
     ) -> None:
         """dbt ``incremental_strategy='delete+insert'``: delete the target rows whose ``unique_key``
-        is present in the incoming batch, then insert EVERY incoming row (duplicates preserved) — as
-        a single atomic ``replaceWhere`` commit fenced to ``read_version`` (the model's vB). Same
-        result as dbt-duckdb's delete+insert, INCLUDING tolerating duplicate keys in the batch (which
-        the merge strategy rejects). ``replaceWhere`` requires every written row to satisfy the
-        predicate — and it does by construction: the predicate is ``unique_key IN (the batch's own
-        distinct keys)``, so each staged row matches it."""
+        is present in the incoming batch (optionally further restricted by ``incremental_predicates``),
+        then insert EVERY incoming row (duplicates preserved). Same result as dbt-duckdb's
+        delete+insert — including tolerating duplicate keys in the batch (which merge rejects), and
+        ``incremental_predicates`` that spare a matched key so its old row STAYS while its new row is
+        also inserted (a deliberate duplicate, per dbt's contract).
+
+        The delete condition is evaluated in DuckDB, not delta_rs: keep the target rows the delete
+        would NOT remove (``(delete_cond) IS NOT TRUE`` — DELETE removes only TRUE matches, so FALSE
+        and NULL rows stay, matching SQL DELETE incl. NULL keys), UNION the whole batch, and overwrite.
+        delta_rs's own ``delete(predicate)`` is avoided on purpose: it runs the predicate through the
+        Delta kernel for file-skipping, which rejects an Int32-column vs Int64-literal comparison (the
+        type bare integer literals get) — DuckDB just coerces. Staging through a TEMP table detaches
+        the read from the table before the overwrite replaces it."""
         keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
         keys = [str(k).strip().strip('"') for k in keys]
         keycols = ", ".join('"' + k + '"' for k in keys)
         rows = cur.sql(f"SELECT DISTINCT {keycols} FROM {name}").fetchall()
         if not rows:
             return  # empty batch → nothing to delete or insert (an incremental no-op)
-        engine.replace_where(
-            path, data, self._key_set_predicate(keys, rows),
-            read_version=read_version,
-            partition_by=partition_by,
-            storage_options=storage_options,
-            compaction_threshold=self._compaction_threshold,
+        delete_cond = self._key_set_predicate(keys, rows)
+        preds = self._delete_insert_predicates(incremental_predicates)
+        if preds:
+            delete_cond = "(" + delete_cond + ") AND " + " AND ".join(f"({p})" for p in preds)
+        loc_sql = path.replace("'", "''")
+        ver = f", version => {read_version}" if read_version is not None else ""
+        tmp = f"__duckrun_di_{abs(hash(path)) & 0xFFFFFFFF}"
+        cur.execute(
+            f'CREATE OR REPLACE TEMP TABLE "{tmp}" AS '
+            f"SELECT * FROM delta_scan('{loc_sql}'{ver}) WHERE ({delete_cond}) IS NOT TRUE "
+            f"UNION ALL SELECT * FROM {name}"
         )
+        try:
+            engine.write_delta(
+                path, cur.sql(f'SELECT * FROM "{tmp}"'), "overwrite",
+                partition_by=partition_by,
+                storage_options=storage_options,
+                compaction_threshold=self._compaction_threshold,
+            )
+        finally:
+            cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
+
+    @staticmethod
+    def _delete_insert_predicates(incremental_predicates) -> list:
+        """Normalize ``incremental_predicates`` (a list of SQL strings, or one string) to target-side
+        predicates for the delta_rs DELETE — dropping dbt's ``DBT_INTERNAL_DEST`` alias, since the
+        delete runs against the target table directly."""
+        if not incremental_predicates:
+            return []
+        preds = (incremental_predicates if isinstance(incremental_predicates, (list, tuple))
+                 else [incremental_predicates])
+        out = []
+        for p in preds:
+            p = re.sub(r"(?i)\bDBT_INTERNAL_DEST\.", "", str(p).strip())
+            if p:
+                out.append(p)
+        return out
 
     @staticmethod
     def _sql_literal(v) -> str:

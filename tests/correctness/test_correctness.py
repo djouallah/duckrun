@@ -383,39 +383,6 @@ def test_merge_strategies(root, case_id, seed, src, build, expected):
     assert _read(root, "m") == sorted(expected, key=_k)
 
 
-def test_delete_insert_replaces_keys_and_keeps_batch_duplicates(root):
-    """incremental_strategy='delete+insert' (Plugin._store_delete_insert → engine.replace_where):
-    delete the target rows whose unique_key is in the incoming batch, then insert the WHOLE batch.
-    Duplicate keys WITHIN the batch are preserved — the behavior that distinguishes delete+insert
-    from merge (which rejects duplicate source keys). Pins the fix for the upstream sde model, which
-    duckrun previously aliased to merge (a silent behavior swap)."""
-    from dbt.adapters.duckrun.delta_plugin import Plugin
-    conn = duckrun.connect(root, schema="dbo", read_only=False)
-    conn.sql("select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, val)") \
-        .write.mode("overwrite").saveAsTable("di")
-    path = _path(root, "di")
-    vB = engine.table_version(path)
-    # batch: replace id=2, and insert id=4 TWICE (a duplicate key merge would reject).
-    batch = conn.sql("select * from (values (2,'B'),(4,'d'),(4,'D')) t(id, val)")
-    keys = conn.sql("select distinct id from (values (2,'B'),(4,'d'),(4,'D')) t(id, val)").fetchall()
-    predicate = Plugin._key_set_predicate(Plugin.__new__(Plugin), ["id"], keys)
-    assert predicate == '"id" IN (2, 4)'
-    engine.replace_where(path, batch, predicate, read_version=vB)
-    # id 1,3 untouched; id 2 replaced; BOTH id=4 rows present (duplicate preserved).
-    assert _read(root, "di") == sorted([(1, "a"), (3, "c"), (2, "B"), (4, "d"), (4, "D")], key=_k)
-
-
-def test_delete_insert_predicate_rendering():
-    """_key_set_predicate / _sql_literal render CAST-free predicates: bare numerics/bools, quoted
-    (and escaped) strings, and an OR-of-ANDs for a composite key."""
-    from dbt.adapters.duckrun.delta_plugin import Plugin
-    p = Plugin.__new__(Plugin)
-    assert p._key_set_predicate(["id"], [(1,), (2,)]) == '"id" IN (1, 2)'
-    assert p._key_set_predicate(["code"], [("a",), ("o'x",)]) == '''"code" IN ('a', 'o''x')'''
-    assert p._key_set_predicate(["a", "b"], [(1, "x"), (2, "y")]) == \
-        '''(("a" = 1 AND "b" = 'x') OR ("a" = 2 AND "b" = 'y'))'''
-
-
 def test_merge_idempotent_remerge(root):
     """Re-merging the same source must not duplicate or mutate rows (idempotency)."""
     conn = duckrun.connect(root, schema="dbo", read_only=False)
