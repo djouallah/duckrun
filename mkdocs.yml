@@ -115,6 +115,9 @@ nav:
       - Pure SQL:
           - taxi: https://djouallah.github.io/duckrun/taxi.html
           - multicatalog: https://djouallah.github.io/duckrun/multicatalog.html
+      - parity tests:
+          - jaffle_shop: parity.md#jaffle_shop
+          - tuva: parity.md#tuva
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
