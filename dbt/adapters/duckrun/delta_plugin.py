@@ -177,12 +177,21 @@ class Plugin(BasePlugin):
                 )
             return
 
-        # Resolve the incremental strategy: default to merge when a unique_key is
-        # given, else a plain append. delta_rs has no separate delete+insert; with a
-        # unique_key it is equivalent to an upsert, so treat it as merge.
+        # Resolve the incremental strategy: default to merge when a unique_key is given, else append.
         strategy = strategy or ("merge" if unique_key else "append")
+
+        # delete+insert: delete the target rows whose unique_key appears in the incoming batch, then
+        # insert EVERY incoming row (duplicates preserved) — one atomic replaceWhere fenced to vB. NOT
+        # an alias for merge: merge UPDATEs matched rows and rejects duplicate source keys, whereas
+        # delete+insert replaces whole rows and tolerates duplicate keys — matching dbt-duckdb exactly.
         if strategy in ("delete+insert", "delete_insert"):
-            strategy = "merge"
+            if not unique_key:
+                raise ValueError("incremental_strategy='delete+insert' requires a unique_key.")
+            self._store_delete_insert(
+                path, cur, name, data, unique_key, storage_options,
+                read_version=cfg.get("read_version"), partition_by=partition_by,
+            )
+            return
 
         if strategy in ("merge", "insert"):
             # Validate the merge config shape FIRST — before any Delta access, memory tuning, or
@@ -270,7 +279,7 @@ class Plugin(BasePlugin):
         else:
             raise ValueError(
                 f"Unknown incremental_strategy '{strategy}'. "
-                "Use 'merge', 'insert', 'append', or 'append_if_unchanged'."
+                "Use 'merge', 'insert', 'delete+insert', 'append', or 'append_if_unchanged'."
             )
 
     def _store_microbatch(
@@ -341,6 +350,57 @@ class Plugin(BasePlugin):
                 storage_options=storage_options,
                 compaction_threshold=self._compaction_threshold,
             )
+
+    def _store_delete_insert(
+        self, path, cur, name, data, unique_key, storage_options,
+        read_version=None, partition_by=None,
+    ) -> None:
+        """dbt ``incremental_strategy='delete+insert'``: delete the target rows whose ``unique_key``
+        is present in the incoming batch, then insert EVERY incoming row (duplicates preserved) — as
+        a single atomic ``replaceWhere`` commit fenced to ``read_version`` (the model's vB). Same
+        result as dbt-duckdb's delete+insert, INCLUDING tolerating duplicate keys in the batch (which
+        the merge strategy rejects). ``replaceWhere`` requires every written row to satisfy the
+        predicate — and it does by construction: the predicate is ``unique_key IN (the batch's own
+        distinct keys)``, so each staged row matches it."""
+        keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
+        keys = [str(k).strip().strip('"') for k in keys]
+        keycols = ", ".join('"' + k + '"' for k in keys)
+        rows = cur.sql(f"SELECT DISTINCT {keycols} FROM {name}").fetchall()
+        if not rows:
+            return  # empty batch → nothing to delete or insert (an incremental no-op)
+        engine.replace_where(
+            path, data, self._key_set_predicate(keys, rows),
+            read_version=read_version,
+            partition_by=partition_by,
+            storage_options=storage_options,
+            compaction_threshold=self._compaction_threshold,
+        )
+
+    @staticmethod
+    def _sql_literal(v) -> str:
+        """Render a Python key value as a CAST-free SQL literal for a delta_rs/datafusion predicate.
+        Non-numeric values are single-quoted; delta_rs coerces the string literal to the column's
+        type (the same trick the microbatch window predicate relies on)."""
+        import numbers
+        if v is None:
+            return "NULL"
+        if isinstance(v, bool):
+            return "true" if v else "false"
+        if isinstance(v, numbers.Number):
+            return str(v)
+        return "'" + str(v).replace("'", "''") + "'"
+
+    def _key_set_predicate(self, keys, rows) -> str:
+        """A CAST-free predicate matching exactly the key tuples in ``rows``: ``"k" IN (…)`` for a
+        single key, else an OR of per-tuple AND-equalities for a composite key."""
+        if len(keys) == 1:
+            lits = ", ".join(self._sql_literal(r[0]) for r in rows)
+            return f'"{keys[0]}" IN ({lits})'
+        terms = [
+            "(" + " AND ".join(f'"{k}" = {self._sql_literal(v)}' for k, v in zip(keys, r)) + ")"
+            for r in rows
+        ]
+        return "(" + " OR ".join(terms) + ")"
 
     @staticmethod
     def _relation_name(relation: Any) -> str:
