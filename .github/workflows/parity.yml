@@ -1,0 +1,75 @@
+name: parity
+
+# dbt-duckdb validation. Take a real, UNMODIFIED `type: duckdb` dbt project and run it on duckrun;
+# confirm it builds green and — where cheap — that duckrun's Delta output matches dbt-duckdb row for
+# row. dbt-duckdb is the oracle; a mismatch is a duckrun bug (fixed in duckrun, never in the project).
+#
+# Linux on purpose: these projects use `local: ../` packages and deep paths that dbt symlinks cleanly
+# on Linux but copies (recursively, hitting MAX_PATH) on Windows. The adapter behaves the same on both
+# — only the dbt-deps file plumbing differs — so CI is the right home for the heavier projects.
+#
+# Standalone + path-filtered: NOT a release gate (publish.yml gates on cores + local_stress_tests), so
+# a failure here never blocks a release.
+on:
+  push:
+    branches: ["**"]   # any branch, but NOT a tag push (v*) — that is publish.yml's job
+    paths:
+      - 'parity_tests/**'
+      - 'dbt/adapters/duckrun/**'
+      - 'dbt/include/duckrun/**'
+      - '.github/workflows/parity.yml'
+  pull_request:
+    paths:
+      - 'parity_tests/**'
+      - 'dbt/adapters/duckrun/**'
+      - 'dbt/include/duckrun/**'
+      - '.github/workflows/parity.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  jaffle_shop:
+    # Fast (~30s): clone jaffle_shop, build it on dbt-duckdb (oracle) AND duckrun, diff every
+    # persisted table (EXCEPT ALL both ways). The full differential — the strongest parity check.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun (dbt-duckdb + duckdb + deltalake come with it)
+        run: pip install -e ".[test]"
+      - name: Parity — jaffle_shop, duckrun vs dbt-duckdb (build both, diff every table)
+        run: python parity_tests/jaffle_shop/run_parity.py
+
+  tuva:
+    # Heavy (~40 min): the full Tuva data model (every vertical, synthetic_data_size=small) built
+    # UNMODIFIED on duckrun. `dbt build` runs Tuva's own models, snapshots, data-quality and tests,
+    # so green here means the DuckDB/Delta port reproduces Tuva's expected results. Manual-only
+    # (workflow_dispatch) so it doesn't run on every push.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    env:
+      # The duckrun connection lives OUTSIDE the cloned repo (dbt profiles always do); the Tuva repo
+      # is run verbatim. httpfs + s3_region (in this profile) let the seed bootstrap read the public
+      # tuva-public-resources S3 bucket anonymously.
+      DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/tuva
+      WAREHOUSE_PATH: /tmp/tuva_wh
+      DBT_SCHEMA: tuva
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun
+        run: pip install -e ".[test]"
+      - name: Clone Tuva (the repo under test) — run VERBATIM
+        run: git clone --depth 1 --branch v0.18.0 https://github.com/tuva-health/tuva /tmp/tv
+      - name: dbt deps (local ../ package symlinks on Linux; hub + git deps resolve)
+        run: dbt deps
+        working-directory: /tmp/tv/integration_tests
+      - name: dbt build — full Tuva on duckrun (models + snapshots + tests, everything enabled)
+        run: dbt build
+        working-directory: /tmp/tv/integration_tests

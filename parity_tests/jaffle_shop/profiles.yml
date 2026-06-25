@@ -1,0 +1,11 @@
+---
+# External duckrun connection for the jaffle_shop parity test — NOT part of the jaffle_shop repo.
+# Same profile name (`jaffle_shop`) as the project expects; supplied via --profiles-dir so the repo
+# under test is never modified. Local-filesystem Delta warehouse (seeds are in-repo CSVs, no S3).
+jaffle_shop:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      schema: "{{ env_var('DBT_SCHEMA', 'main') }}"
+      root_path: "{{ env_var('WAREHOUSE_PATH', './warehouse') }}"

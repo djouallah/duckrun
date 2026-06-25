@@ -1,0 +1,23 @@
+---
+# External duckrun connection for the parity test — NOT part of the Tuva repo.
+# The profile name (`default`) and the fact that it lives outside the project mirror exactly how
+# Tuva ships its own per-warehouse profiles (integration_tests/profiles/<warehouse>/profiles.yml),
+# selected with --profiles-dir. The Tuva repo under test is never modified.
+#
+# Local-filesystem Delta warehouse by default (no OneLake needed). httpfs is loaded and the S3
+# region set so Tuva's synthetic-seed bootstrap can read the public tuva-public-resources bucket
+# anonymously (read_csv('s3://...')). Point WAREHOUSE_PATH at an abfss:// Tables path + set
+# ONELAKE_TOKEN to run the same unmodified project against a Microsoft Fabric Lakehouse later.
+default:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      schema: "{{ env_var('DBT_SCHEMA', 'tuva') }}"
+      root_path: "{{ env_var('WAREHOUSE_PATH', './warehouse') }}"
+      extensions:
+        - httpfs
+      settings:
+        s3_region: us-east-1
+      storage_options:
+        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"
