@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.26] - 2026-06-26
+
+### Fixed
+- **`incremental_strategy='delete+insert'` is now real.** It was silently aliased to `merge`; duckrun
+  now performs an actual delete (by `unique_key`) + insert and honors `incremental_predicates`,
+  matching dbt-duckdb. Surfaced by the Start Data Engineering parity project.
+- **Raw-DML routing hardened.** `INSERT … VALUES` vs `INSERT … SELECT` is detected correctly even when
+  a `select` appears inside a string literal, and the statement scanner is dollar-quote-aware, so a
+  `;` inside `COMMENT ON … IS $tag$…$tag$` (e.g. Elementary's `persist_docs`) no longer truncates the
+  statement.
+
+### Added
+- **Multi-statement DML on the dbt-cursor path.** A `delete …; insert …` script (e.g. Elementary's
+  delete+insert upsert) is split into its top-level statements (parenthesis- and dollar-quote-aware)
+  and each is routed individually — Delta-DML to delta_rs, the rest to the DuckDB cursor. (`conn.sql`
+  still runs one statement per call by design.)
+
 ## [0.3.23] - 2026-06-23
 
 ### Changed
