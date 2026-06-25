@@ -50,9 +50,3 @@ duckrun), then diffs every persisted table. Exit 0 = parity.
 The `stg_*` and `int_invoice_monthly_amortized` models are `view`s — duckrun has no durable view, so
 they're intermediate-only and not part of the persisted diff. The full `dbt build` (5 seeds, 2 table
 models, 6 views, 43 data tests, 3 unit tests, 1 exposure) runs **green on duckrun**, unmodified.
-
-## Caveat
-
-This is a personal "assignment" repo (not an official dbt-labs project) and fills no specific
-*incremental* feature gap — its value is a new analytical idiom (MRR) plus native unit-test coverage,
-under a clean full row-diff.
