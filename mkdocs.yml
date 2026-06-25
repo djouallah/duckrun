@@ -118,6 +118,7 @@ nav:
           - jaffle_shop: https://djouallah.github.io/duckrun/jaffle_shop.html
           - sde: https://djouallah.github.io/duckrun/sde.html
           - mrr: https://djouallah.github.io/duckrun/mrr.html
+          - techflow: https://djouallah.github.io/duckrun/techflow.html
           - tuva: https://djouallah.github.io/duckrun/tuva.html
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md

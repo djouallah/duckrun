@@ -110,7 +110,7 @@ automatic compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.
 
 See it on real projects: [aemo](integration_tests/aemo) and [coffee](integration_tests/coffee) are
 runnable starters, and [parity_tests/](parity_tests) runs real `type: duckdb` projects (jaffle_shop,
-sde, MRR, Tuva) unchanged on duckrun and diffs the output against dbt-duckdb.
+sde, MRR, TechFlow, Tuva) unchanged on duckrun and diffs the output against dbt-duckdb.
 
 ## Building with an AI assistant
 

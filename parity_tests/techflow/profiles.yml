@@ -1,0 +1,13 @@
+---
+# External duckrun connection for the techflow (ameijin/dbt-example) parity test — NOT part of the
+# repo under test. Same profile name (`techflow_analytics`) the project expects; supplied via
+# --profiles-dir so the repo is never modified. The project reads its raw data from committed parquet
+# (external_location: data/*.parquet, relative to the project dir) — no external sources — so the
+# duckrun side just points root_path at a local-filesystem Delta warehouse.
+techflow_analytics:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      schema: "{{ env_var('DBT_SCHEMA', 'main') }}"
+      root_path: "{{ env_var('WAREHOUSE_PATH', './warehouse') }}"

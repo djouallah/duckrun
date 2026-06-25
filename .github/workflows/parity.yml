@@ -117,6 +117,37 @@ jobs:
           path: /tmp/mrr_duckrun/target_docs/static_index.html
           if-no-files-found: error
 
+  techflow:
+    # Fast: the TechFlow Analytics SaaS project on dbt-duckdb (oracle) AND duckrun, then diff every
+    # persisted table. First parity project with native dbt `unit_tests:`; also exercises sources read
+    # from committed parquet (external_location), an incremental model, two snapshots, dbt_expectations
+    # and exposures. dbt_project_evaluator's own models are skipped from the diff (a linting package
+    # hardcoded to `target.type in ['duckdb']`, so it describes the adapter, not the data) — it still
+    # builds green on duckrun; everything the project actually produces is diffed in full.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun
+        run: pip install -e ".[test]"
+      - name: Parity — techflow, duckrun vs dbt-duckdb (build both, diff every table)
+        run: python parity_tests/techflow/run_parity.py
+      - name: Generate techflow dbt docs (static — catalog stats off the Delta tables)
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/techflow
+          WAREHOUSE_PATH: /tmp/techflow_duckrun_wh
+          DBT_SCHEMA: main
+        working-directory: /tmp/techflow_duckrun
+        run: dbt docs generate --static --target dev --target-path target_docs
+      - name: Upload techflow dbt docs (deploy-docs publishes it as techflow.html)
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-techflow
+          path: /tmp/techflow_duckrun/target_docs/static_index.html
+          if-no-files-found: error
+
   tuva:
     # Heavy (~40 min): the full Tuva data model (every vertical, synthetic_data_size=small) built
     # UNMODIFIED on duckrun. `dbt build` runs Tuva's own models, snapshots, data-quality and tests,

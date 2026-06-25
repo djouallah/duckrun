@@ -89,6 +89,41 @@ green on duckrun, unmodified.
 
 → **[Browse the MRR dbt docs](mrr.html)** — generated on duckrun by `dbt docs generate --static`.
 
+## TechFlow — unit tests + parquet sources + snapshots { #techflow }
+
+[ameijin/dbt-example](https://github.com/ameijin/dbt-example) ("TechFlow Analytics") is a SaaS model
+and the first parity project with **native dbt `unit_tests:`**. It also reads its raw data from
+committed **parquet** via dbt-duckdb `external_location` sources, and exercises an **incremental**
+model, two **timestamp snapshots**, `dbt_expectations` and exposures — all deterministic.
+[`run_parity.py`](../parity_tests/techflow/run_parity.py) builds it on dbt-duckdb and duckrun and
+diffs every persisted table; the full `dbt build` (seeds, snapshots, ~30 models, 2 unit tests, 137
+data tests, exposures) runs green on duckrun, unmodified.
+
+| table | rows | duckrun == dbt-duckdb |
+|-------|------|:---------------------:|
+| fct_events | 52232 | ✓ |
+| fct_user_engagement_daily | 36092 | ✓ |
+| fct_revenue | 3772 | ✓ |
+| fct_mrr_daily (incremental) | 2718 | ✓ * |
+| dim_users / dim_customers | 500 / 500 | ✓ |
+| dim_subscriptions | 475 | ✓ |
+| user_plan_snapshot / subscription_pricing_snapshot | 500 / 475 | ✓ ** |
+| seeds (plan_catalog / product_features / utm_channel_mapping) | 18 / 18 / 20 | ✓ |
+
+\* compared excluding `loaded_at` (stamped `current_timestamp`). \*\* snapshots compared on business
+columns (SCD2 bookkeeping is per-run).
+
+This project also bundles **dbt_project_evaluator**, a dbt Labs *linting* package. Its models don't
+model the SaaS data — they introspect the dbt graph, and the package hardcodes
+`+materialized: "{{ 'table' if target.type in ['duckdb'] else 'view' }}"`. duckrun is its **own**
+adapter type (`target.type == 'duckrun'`), so the package's own models materialize differently and
+its `database` column reports a different catalog — connection metadata that can't match across two
+adapters and can't be "fixed" in duckrun (reporting `type: duckdb` is what makes dbt load dbt-duckdb).
+So those models are **skipped from the row diff** (by `package_name`, logged explicitly); the package
+still builds green on duckrun.
+
+→ **[Browse the TechFlow dbt docs](techflow.html)** — generated on duckrun by `dbt docs generate --static`.
+
 ## Tuva — a 100+-model real-world project { #tuva }
 
 [Tuva Health](https://github.com/tuva-health/tuva) is a large healthcare claims/clinical data
