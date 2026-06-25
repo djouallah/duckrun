@@ -52,6 +52,29 @@ def _rows(con, select_sql):
     return sorted(con.execute(select_sql).fetchall(), key=lambda r: tuple(str(c) for c in r))
 
 
+# fct_mrr_movements splits each (month, use_case, country) group into movement buckets (new /
+# expansion / contraction / reactivation / retained) via a STRICT >/< comparison of *unrounded*
+# float sums (this month's mrr_usd vs last month's). Months that are equal to the cent still differ
+# by ~5e-14 from float summation order, so 'retained' tips to 'expansion'/'contraction' differently
+# depending on scan order (a duckdb native table vs duckrun's delta_scan over parquet). That's a
+# non-determinism in the PROJECT's SQL, not a duckrun bug — fct_mrr (the rounded mart) matches
+# exactly, so duckrun's values are right to the cent. Roll the fragile bucket split away to the
+# (month, use_case, country) grain and compare what is provably invariant to which bucket a customer
+# lands in (same roll-up applied to both engines):
+#   - sum(customer_count): each customer is in exactly one bucket per group, so the total is fixed;
+#   - round(sum(mrr_change_usd), 2): the only customers that flip buckets are the cent-equal ones,
+#     whose change is ~0, so no bucket's rounded sum moves.
+# mrr_usd is intentionally NOT rolled up here: a flipping customer carries their full ~$X between
+# buckets, so re-summing the per-bucket-rounded mrr_usd could tip a cent — and it is already
+# verified exactly by fct_mrr (same sum, one grain up).
+ROLLUP = {
+    "fct_mrr_movements":
+        "select month, use_case, country, sum(customer_count) as customer_count, "
+        "round(sum(mrr_change_usd), 2) as mrr_change_usd "
+        "from {rel} group by month, use_case, country",
+}
+
+
 def diff() -> bool:
     c = duckdb.connect()
     c.execute("install delta; load delta")
@@ -67,16 +90,22 @@ def diff() -> bool:
         if not dpath.is_dir():
             print(f"{schema}.{t:24} SKIP (not persisted by duckrun)")
             continue
-        cols = [r[0] for r in c.execute(
-            "select column_name from duckdb_columns() where database_name='o' "
-            f"and schema_name='{schema}' and table_name='{t}' order by column_index").fetchall()]
-        sel = ", ".join('"' + col + '"' for col in cols)
-        o_rows = _rows(c, f'select {sel} from o."{schema}"."{t}"')
-        d_rows = _rows(c, f"select {sel} from delta_scan('{dpath.as_posix()}')")
+        rollup = ROLLUP.get(t)
+        if rollup:
+            o_rows = _rows(c, rollup.format(rel=f'o."{schema}"."{t}"'))
+            d_rows = _rows(c, rollup.format(rel=f"delta_scan('{dpath.as_posix()}')"))
+        else:
+            cols = [r[0] for r in c.execute(
+                "select column_name from duckdb_columns() where database_name='o' "
+                f"and schema_name='{schema}' and table_name='{t}' order by column_index").fetchall()]
+            sel = ", ".join('"' + col + '"' for col in cols)
+            o_rows = _rows(c, f'select {sel} from o."{schema}"."{t}"')
+            d_rows = _rows(c, f"select {sel} from delta_scan('{dpath.as_posix()}')")
         ok = o_rows == d_rows
         all_ok = all_ok and ok
+        note = " (rolled up past non-deterministic movement split)" if rollup else ""
         print(f"{schema}.{t:24} oracle={len(o_rows):<5} duckrun={len(d_rows):<5} "
-              f"-> {'MATCH' if ok else 'MISMATCH'}")
+              f"-> {'MATCH' if ok else 'MISMATCH'}{note}")
     return all_ok
 
 

@@ -70,12 +70,19 @@ every persisted table:
 | table | rows | duckrun == dbt-duckdb |
 |-------|------|:---------------------:|
 | fct_mrr | 1484 | ✓ |
-| fct_mrr_movements | 2078 | ✓ |
+| fct_mrr_movements | 2078 | ✓ * |
 | invoices (seed) | 2441 | ✓ |
 | subscriptions (seed) | 666 | ✓ |
 | customers (seed) | 292 | ✓ |
 | schools (seed) | 292 | ✓ |
 | products (seed) | 9 | ✓ |
+
+\* `fct_mrr_movements` buckets customer-months (new / expansion / contraction / reactivation /
+retained) via a strict `>`/`<` on **unrounded** float sums, so cent-equal months (~5e-14 apart from
+summation order) tip buckets differently for a native table vs a `delta_scan` — a non-determinism in
+the project's SQL, not a duckrun bug (`fct_mrr`, the rounded mart, matches exactly). It's compared
+rolled up past that split, on the bucket-invariant quantities (`sum(customer_count)` and
+`round(sum(mrr_change_usd), 2)` per `(month, use_case, country)`).
 
 The full build — 5 seeds, 2 table models, 6 views, 43 data tests, 3 unit tests, 1 exposure — runs
 green on duckrun, unmodified.
