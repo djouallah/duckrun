@@ -112,6 +112,7 @@ _CREATE_COLDEFS = re.compile(
     r"(?P<rel>.+?)\s*\((?P<defs>.+)\)\s*;?\s*",
     re.I | re.S,
 )
+_INSERT_INTO_RE = re.compile(r"\s*insert\s+into\b", re.I)
 _INSERT_SELECT = re.compile(
     r"\s*insert\s+into\s+(?P<rel>.+?)\s*(?:\((?P<cols>[^)]*)\))?\s+(?P<body>select\b.*)",
     re.I | re.S,
@@ -120,9 +121,24 @@ _INSERT_VALUES = re.compile(
     r"\s*insert\s+into\s+(?P<rel>.+?)\s*(?:\((?P<cols>[^)]*)\))?\s*values\s+(?P<body>\(.+)",
     re.I | re.S,
 )
+# INSERT is VALUES-or-SELECT, decided by the first TOP-LEVEL keyword (outside quotes/parens/CASE,
+# via _find_top_level) — NOT by racing the two regexes above. _INSERT_SELECT's body (`select\b.*`,
+# DOTALL) otherwise matches a `select` buried in a string literal in the VALUES payload (e.g.
+# Elementary's run-results upload, whose `compiled_code` column value literally contains
+# `\n    select * from (…)`), mis-parsing an INSERT…VALUES as INSERT…SELECT — `rel` captures the
+# whole statement, _resolve fails, and the write wrongly falls through to the read-only delta_scan
+# view ("… is not a table"). The column list is at paren-depth 1 so it's skipped; the real
+# VALUES/SELECT keyword is the first one at depth 0.
+_VALUES_KW = re.compile(r"\bvalues\b", re.I)
+_SELECT_KW = re.compile(r"\bselect\b", re.I)
 _DELETE = re.compile(
     r"\s*delete\s+from\s+(?P<rel>.+?)(?:\s+where\s+(?P<where>.+))?\s*;?\s*", re.I | re.S
 )
+# A predicate that references ANOTHER table via subquery (`… in (select … from other)`). delta_rs's
+# delete()/update() predicate engine (datafusion) raises a Rust `not implemented` panic on these
+# (delta_datafusion/expr.rs), so duckrun can't hand them to dt.delete(); see _delete for the DuckDB-
+# evaluated filtered-overwrite fallback. Plain column-vs-constant/expr predicates don't match.
+_PREDICATE_SUBQUERY = re.compile(r"\(\s*select\b", re.I)
 _UPDATE = re.compile(
     r"\s*update\s+(?P<rel>.+?)\s+set\s+(?P<set>.+?)(?:\s+where\s+(?P<where>.+?))?\s*;?\s*",
     re.I | re.S,
@@ -179,6 +195,30 @@ _DRIVING_DML = re.compile(r"\b(?:insert\s+into|update|delete\s+from)\b", re.I)
 _NUMERIC_TYPE_RE = re.compile(
     r"^(?:TINYINT|SMALLINT|INTEGER|BIGINT|HUGEINT|UTINYINT|USMALLINT|UINTEGER|UBIGINT|UHUGEINT|"
     r"FLOAT|REAL|DOUBLE|DECIMAL)\b", re.I)
+# Approximate floating-point target types. Narrowing a numeric into one of these is INTENDED
+# approximation (the column was declared float) — duckdb/dbt-duckdb cast decimal/double -> float
+# silently too — not silent corruption, so the lossy-narrowing guard skips them. It still fires for
+# EXACT targets (e.g. 3.9 -> INTEGER lands 4). See _reject_lossy_numeric_narrowing.
+_APPROX_FLOAT_RE = re.compile(r"^(?:FLOAT|REAL|DOUBLE|FLOAT4|FLOAT8)\b", re.I)
+
+# PostgreSQL/DuckDB dollar-quoting: ``$tag$ … $tag$`` (the tag is optional, so ``$$ … $$`` too). The
+# body is OPAQUE — no escaping — so a ``;``, a ``'``/``"`` quote, or a ``--``/``/* */`` marker inside
+# it is literal text, NOT a structural token. Every quote/paren-aware scanner here must skip a
+# dollar-quoted run wholesale; otherwise dbt's persist_docs `COMMENT ON … IS
+# $dbt_comment_literal_block$ …text with "quotes"; and ';'… $dbt_comment_literal_block$` (a comment
+# body carrying embedded quotes/semicolons) is mis-split into fragments with an unterminated $-quote.
+_DOLLAR_OPEN = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
+
+
+def _dollar_quote_end(s: str, i: int) -> Optional[int]:
+    """If a dollar-quote opens at ``s[i]`` (``$$`` or ``$tag$``), return the index just past its
+    matching close; else None (not a dollar-quote, or no close found — leave it to normal scanning)."""
+    m = _DOLLAR_OPEN.match(s, i)
+    if not m:
+        return None
+    delim = m.group(0)
+    close = s.find(delim, m.end())
+    return close + len(delim) if close != -1 else None
 
 
 def _strip_leading(query: str) -> str:
@@ -214,6 +254,10 @@ def _strip_comments(sql: str) -> str:
             quote = ch
             out.append(ch)
             i += 1
+        elif ch == "$" and _dollar_quote_end(sql, i) is not None:
+            de = _dollar_quote_end(sql, i)
+            out.append(sql[i:de])  # opaque dollar-quoted body — keep verbatim, scan nothing inside
+            i = de
         elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
             nl = sql.find("\n", i)
             i = n if nl == -1 else nl  # stop before the newline so it's preserved
@@ -255,6 +299,11 @@ def _top_level(s: str, pattern, find_all: bool):
             quote = ch
             i += 1
             continue
+        if ch == "$":
+            de = _dollar_quote_end(s, i)
+            if de is not None:
+                i = de  # skip an opaque dollar-quoted run (its keywords aren't structural)
+                continue
         if ch in "([":
             depth += 1
             i += 1
@@ -307,6 +356,20 @@ def _split_leading_with(sql: str) -> Tuple[str, str]:
 
 def _fullmatch(pattern, sql):
     return pattern.fullmatch(sql.strip())
+
+
+def _insert_kind(sql: str) -> Optional[str]:
+    """``'values'`` or ``'select'`` for an INSERT, by whichever keyword appears first at the TOP
+    level (outside quotes/parens/CASE — see :func:`_find_top_level`). A keyword inside a string
+    literal in the VALUES payload, inside the column list (paren-depth 1), or inside a nested
+    subquery/CTE can't flip the classification. ``None`` when neither is found at the top level."""
+    vi = _find_top_level(sql, _VALUES_KW)
+    si = _find_top_level(sql, _SELECT_KW)
+    if vi == -1 and si == -1:
+        return None
+    if vi != -1 and (si == -1 or vi < si):
+        return "values"
+    return "select"
 
 
 def _split_relation(rel: str) -> Tuple[Optional[str], Optional[str]]:
@@ -598,12 +661,18 @@ class _DeltaDML:
         m = _fullmatch(_CREATE_COLDEFS, sql)
         if m and "__duckrun" not in m.group("rel"):
             return self._create_coldefs(m)
-        m = _fullmatch(_INSERT_SELECT, sql)
-        if m:
-            return self._mutate(m, self._insert_select)
-        m = _fullmatch(_INSERT_VALUES, sql)
-        if m:
-            return self._mutate(m, self._insert_values)
+        if _INSERT_INTO_RE.match(sql):
+            # Classify VALUES vs SELECT structurally, THEN apply the matching regex — see _insert_kind.
+            kind = _insert_kind(sql)
+            if kind == "select":
+                m = _fullmatch(_INSERT_SELECT, sql)
+                if m:
+                    return self._mutate(m, self._insert_select)
+            elif kind == "values":
+                m = _fullmatch(_INSERT_VALUES, sql)
+                if m:
+                    return self._mutate(m, self._insert_values)
+            return False
         m = _fullmatch(_DELETE, sql)
         if m:
             return self._mutate(m, self._delete)
@@ -627,17 +696,24 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
-        # dbt/cursor path (no default_schema): keep the ORIGINAL narrow interception — only a plain
-        # `create table … as select …` routes to Delta. The wider forms (`or replace`, a CTE or a
-        # parenthesised body) are a connection-API affordance; on the dbt path they must stay native
-        # so dbt keeps owning the relation. dbt-internal CTAS like store_failures' `create table … as
-        # (select …)` is a real TABLE dbt later drops/recreates — turning it into a delta_scan VIEW
-        # breaks that ("Existing object … is of type View, trying to drop type Table").
-        if self.default_schema is None and (
-            m.group("orrep") or not re.match(r"select\b", m.group("body").lstrip(), re.I)
-        ):
-            return False
         live = self._exists(loc) and not is_dropped(self.cursor, loc, self.so)
+        # dbt/cursor path (no default_schema): keep the ORIGINAL narrow interception — only a plain
+        # `create table … as select …` routes to Delta. A CTE or parenthesised body stays native so
+        # dbt keeps owning the relation (dbt-internal CTAS like store_failures' `create table … as
+        # (select …)` is a real TABLE dbt later drops/recreates — turning it into a delta_scan VIEW
+        # breaks that: "Existing object … is of type View, trying to drop type Table").
+        #
+        # `create or replace table … as select …` ALSO routes to Delta, but ONLY when the target is
+        # already a live duckrun-managed Delta table — i.e. a seed/model duckrun surfaced as a
+        # delta_scan view and a post-hook now refills via `… as select … from read_csv('s3://…')`
+        # (Tuva's duckdb__load_seed). Without this the `or replace` lands natively and DuckDB rejects
+        # replacing the view with a table. Over a NON-duckrun relation (no live Delta at the target),
+        # `or replace` stays native so dbt's own `create or replace table` keeps working.
+        if self.default_schema is None:
+            if not re.match(r"select\b", m.group("body").lstrip(), re.I):
+                return False
+            if m.group("orrep") and not live:
+                return False
         # `if not exists` over a live (non-tombstone) table is a no-op — just (re)surface the view.
         if m.group("ine") and live:
             self._refresh_view(rel, schema, loc)
@@ -706,12 +782,34 @@ class _DeltaDML:
 
     def _delete(self, m, rel, schema, loc) -> None:
         where = m.group("where")
+        where = where.strip() if where else None
+        if where and _PREDICATE_SUBQUERY.search(where):
+            # delta_rs's delete(predicate) can't evaluate a predicate that references ANOTHER table
+            # via subquery (`… in (select … from other)`): its datafusion expr engine raises a Rust
+            # `not implemented` panic. DuckDB CAN evaluate it (the subquery's table is a live relation
+            # on this cursor), so keep the complement and overwrite. `(P) IS NOT TRUE` is the exact
+            # set DELETE keeps — rows where the predicate is false OR null (3-valued logic), not just
+            # `NOT (P)`. Materialize survivors into a native temp first so the read is fully detached
+            # from the Delta table being replaced. Simple predicates still take the fenced path below.
+            loc_sql = loc.replace("'", "''")
+            tmp = f"__duckrun_del_{abs(hash(loc)) & 0xFFFFFFFF}"
+            self.cursor.execute(
+                f'create or replace temp table "{tmp}" as '
+                f"select * from delta_scan('{loc_sql}') where ({where}) is not true"
+            )
+            try:
+                keep = self.cursor.sql(f'select * from "{tmp}"')
+                engine.write_delta(loc, keep, "overwrite", overwrite_schema=True,
+                                   storage_options=self.so)
+            finally:
+                self.cursor.execute(f'drop table if exists "{tmp}"')
+            return
         # Route through engine.delete_rows pinned to the version read at statement start — the SAME
         # snapshot-fenced path (read_version → load_as_version, OCC over (vB, HEAD], post-op
         # maintenance) as DeltaTable.forName(...).delete(). conn.sql and the DataFrame handle MUST
         # behave identically; a raw delta-rs delete() at HEAD skipped the pin and the maintenance.
         engine.delete_rows(
-            loc, where.strip() if where else None,
+            loc, where,
             read_version=engine.table_version(loc, self.so),
             storage_options=self.so,
         )
@@ -799,6 +897,8 @@ class _DeltaDML:
             s, t = stype[col], ttype[col]
             if s == t or not (_NUMERIC_TYPE_RE.match(s) and _NUMERIC_TYPE_RE.match(t)):
                 continue
+            if _APPROX_FLOAT_RE.match(t):
+                continue  # approximate float target: narrowing is intended, not silent corruption
             # round-trip through the target type; try_cast so the probe itself never throws — an
             # out-of-range value becomes NULL → distinct → flagged, same as a fractional loss.
             checks.append(
@@ -906,6 +1006,56 @@ class _DeltaDML:
         return True
 
 
+def _split_top_level(sql: str) -> List[str]:
+    """Split a (comment-stripped) SQL script into its top-level statements — a ``;`` that is outside
+    quotes and parens. Returns the non-empty trimmed statements; a single statement yields ``[sql]``."""
+    stmts: List[str] = []
+    depth, quote, start = 0, None, 0
+    i, n = 0, len(sql)
+    while i < n:
+        ch = sql[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "$":
+            de = _dollar_quote_end(sql, i)
+            if de is not None:
+                i = de  # a ';' inside a dollar-quoted body is literal, not a statement boundary
+                continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth = max(0, depth - 1)
+        elif ch == ";" and depth == 0:
+            part = sql[start:i].strip()
+            if part:
+                stmts.append(part)
+            start = i + 1
+        i += 1
+    tail = sql[start:].strip()
+    if tail:
+        stmts.append(tail)
+    return stmts
+
+
+def _handle_one(cursor, root_path, storage_options, sql: str, default_schema) -> bool:
+    """Route ONE statement (already comment-stripped, leading junk removed) to Delta if it's a DML
+    form against a duckrun-managed relation. True if applied to Delta; False to pass through."""
+    with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
+    head = body[:7].lower()                        # cheap pre-filter: only the candidate DML verbs
+    if not head.startswith(("delete", "update", "insert", "create", "alter", "drop", "merge")):
+        return False
+    dml = _DeltaDML(cursor, root_path, storage_options, default_schema)
+    dml._with_clause = with_clause
+    return dml.try_handle(body)
+
+
 def handle(cursor, root_path, storage_options, sql: str, default_schema=None) -> bool:
     """Apply ``sql`` to Delta if it's a DML form targeting a duckrun-managed relation, using
     ``cursor`` to evaluate any SELECT body and to (re)create the ``delta_scan`` view.
@@ -916,16 +1066,27 @@ def handle(cursor, root_path, storage_options, sql: str, default_schema=None) ->
     database; the dbt path always renders fully-qualified names so passes None).
     Returns True if handled (the caller must NOT also run it on DuckDB), False to pass through —
     anything unrecognized, or (for the mutate forms) a target that isn't a Delta table.
+
+    A MULTI-statement script (``delete …; insert …`` — e.g. Elementary's delete+insert upsert) is
+    split into its top-level statements and each is routed individually: Delta-DML to delta_rs,
+    anything else run natively on ``cursor``. dbt-duckdb would hand the whole script to DuckDB, but
+    duckrun intercepts per-cursor, so a leading DELETE/INSERT against a Delta relation must not
+    swallow the rest of the script as its own predicate/body. (The connection API rejects multi-
+    statement upstream in session._unsupported_dml, so the split only fires on the dbt cursor path.)
     """
     if not root_path:
         return False
     sql = _strip_leading(sql)  # so leading comments/whitespace don't hide the verb
     sql = _strip_comments(sql)  # drop interior --/* */ comments so they can't fake a clause boundary
-    with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
-    # Cheap pre-filter: only the candidate DML verbs.
-    head = body[:7].lower()
-    if not head.startswith(("delete", "update", "insert", "create", "alter", "drop", "merge")):
-        return False
-    dml = _DeltaDML(cursor, root_path, storage_options, default_schema)
-    dml._with_clause = with_clause
-    return dml.try_handle(body)
+    sql = re.sub(r";\s*$", "", sql)  # drop a trailing ';' terminator. A matcher's body capture is
+    # DOTALL (`select\b.*`), so `insert … select … from t;` would carry the ';' into the rewritten
+    # `select … from (select … from t;) v(…)` — a syntax error mid-statement. dbt-duckdb runs the raw
+    # statement so never hits this; duckrun re-embeds the body, so it must drop the terminator first.
+    stmts = _split_top_level(sql)
+    if len(stmts) <= 1:
+        return _handle_one(cursor, root_path, storage_options, sql, default_schema)
+    # Multi-statement script: route each statement; non-Delta ones run on the cursor as DuckDB would.
+    for stmt in stmts:
+        if not _handle_one(cursor, root_path, storage_options, stmt, default_schema):
+            cursor.execute(stmt)
+    return True

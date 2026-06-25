@@ -1370,14 +1370,33 @@ def test_sql_equals_dataframe(tmp_path, case):
      "c", ["id"], [(1,), (2,), (3,)]),
     ("create table if not exists items as select 99 id, 'x' name", "items", ["id", "name"],
      [(1, "a"), (2, "b"), (3, "c")]),   # table exists → no-op, seed untouched
+    # Regression: a `select` keyword inside a string LITERAL in the VALUES payload (e.g. Elementary's
+    # run-results upload, whose `compiled_code` column value contains `\n    select * from (…)`) must
+    # NOT make duckrun mis-read INSERT…VALUES as INSERT…SELECT and fall through to the read-only
+    # delta_scan view ("… is not a table"). The classification is by the first top-level keyword.
+    ("insert into items values (4, '\n    select * from (foo)')", "items", ["id", "name"],
+     [(1, "a"), (2, "b"), (3, "c"), (4, "\n    select * from (foo)")]),
 ], ids=["leading_line_comment", "leading_block_comment", "create_parenthesised",
-        "create_as_cte", "create_if_not_exists_noop"])
+        "create_as_cte", "create_if_not_exists_noop", "insert_values_select_in_literal"])
 def test_sql_routing_lands_correct_delta(tmp_path, stmt, table, cols, rows):
     wh = str(tmp_path / "wh")
     _seed(wh).sql(stmt)
     got_cols, got_rows = _dump(wh, table)
     assert got_cols == cols
     assert got_rows == sorted(rows, key=_k)
+
+
+def test_split_top_level_skips_dollar_quoted_bodies():
+    # Regression: dbt persist_docs emits `COMMENT ON ... IS $tag$...$tag$`, and the body can carry
+    # embedded quotes and ';'. The multi-statement splitter must treat a dollar-quoted run as opaque,
+    # or it fragments the COMMENT into pieces with an unterminated $-quote (broke conformance
+    # test_persist_docs::test_has_comments_pglike — DuckDB "unterminated dollar-quoted string").
+    from dbt.adapters.duckrun.delta_dml import _split_top_level
+    batch = ('comment on view "d"."s"."v" is $tag$desc "q" and \'q\'; x$tag$;'
+             ' comment on column "d"."s"."v"."id" is $tag$the; id$tag$')
+    assert len(_split_top_level(batch)) == 2          # NOT 4 — ';' inside $tag$...$tag$ is literal
+    # a genuine multi-statement batch still splits
+    assert len(_split_top_level("delete from t where id=1; insert into t values (1)")) == 2
 
 
 def test_partial_insert_null_fills_and_keeps_type(tmp_path):
