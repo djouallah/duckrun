@@ -117,6 +117,7 @@ nav:
           - overview: parity.md
           - jaffle_shop: https://djouallah.github.io/duckrun/jaffle_shop.html
           - sde: https://djouallah.github.io/duckrun/sde.html
+          - mrr: https://djouallah.github.io/duckrun/mrr.html
           - tuva: https://djouallah.github.io/duckrun/tuva.html
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md

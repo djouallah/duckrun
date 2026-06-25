@@ -88,6 +88,35 @@ jobs:
           path: /tmp/sde_duckrun/target_docs/static_index.html
           if-no-files-found: error
 
+  mrr:
+    # Fast (~30s): the MRR (subscription-revenue) project on dbt-duckdb (oracle) AND duckrun, then
+    # diff every persisted table. Seeds-only (no EL), staging/intermediate views, mart TABLES that
+    # amortize invoices into monthly recurring revenue + MRR movements. First project here with
+    # native dbt `unit_tests:` (3 cases) + an exposure — `dbt build` runs them on both adapters.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun
+        run: pip install -e ".[test]"
+      - name: Parity — mrr, duckrun vs dbt-duckdb (build both, diff every table)
+        run: python parity_tests/mrr/run_parity.py
+      - name: Generate mrr dbt docs (static — catalog stats off the Delta tables)
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/mrr
+          WAREHOUSE_PATH: /tmp/mrr_duckrun_wh
+          DBT_SCHEMA: main
+        working-directory: /tmp/mrr_duckrun
+        run: dbt docs generate --static --target dev --target-path target_docs
+      - name: Upload mrr dbt docs (deploy-docs publishes it as mrr.html)
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-mrr
+          path: /tmp/mrr_duckrun/target_docs/static_index.html
+          if-no-files-found: error
+
   tuva:
     # Heavy (~40 min): the full Tuva data model (every vertical, synthetic_data_size=small) built
     # UNMODIFIED on duckrun. `dbt build` runs Tuva's own models, snapshots, data-quality and tests,

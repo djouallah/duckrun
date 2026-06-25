@@ -55,6 +55,33 @@ delete+insert it runs **verbatim** and matches:
 
 → **[Browse the sde dbt docs](sde.html)** — generated on duckrun by `dbt docs generate --static`.
 
+## MRR — subscription revenue + unit tests { #mrr }
+
+[dbt-mrr-assignment](https://github.com/Elkadev/dbt-mrr-assignment) is a **monthly recurring
+revenue** model: CSV seeds → staging/intermediate **views** → mart **tables** that amortize invoices
+into per-month revenue (`fct_mrr`) and derive MRR **movements** — new / expansion / contraction /
+reactivation / retained (`fct_mrr_movements`). It's the first project here with **native dbt
+`unit_tests:`** (3 cases on the amortization model) plus singular tests and an exposure, so a green
+`dbt build` proves duckrun's unit-test / test path too. No external sources, so the duckrun profile
+just points `root_path` at a Delta warehouse.
+[`run_parity.py`](../parity_tests/mrr/run_parity.py) builds it on dbt-duckdb and duckrun and diffs
+every persisted table:
+
+| table | rows | duckrun == dbt-duckdb |
+|-------|------|:---------------------:|
+| fct_mrr | 1484 | ✓ |
+| fct_mrr_movements | 2078 | ✓ |
+| invoices (seed) | 2441 | ✓ |
+| subscriptions (seed) | 666 | ✓ |
+| customers (seed) | 292 | ✓ |
+| schools (seed) | 292 | ✓ |
+| products (seed) | 9 | ✓ |
+
+The full build — 5 seeds, 2 table models, 6 views, 43 data tests, 3 unit tests, 1 exposure — runs
+green on duckrun, unmodified.
+
+→ **[Browse the MRR dbt docs](mrr.html)** — generated on duckrun by `dbt docs generate --static`.
+
 ## Tuva — a 100+-model real-world project { #tuva }
 
 [Tuva Health](https://github.com/tuva-health/tuva) is a large healthcare claims/clinical data
