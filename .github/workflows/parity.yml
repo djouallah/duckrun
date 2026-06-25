@@ -43,6 +43,21 @@ jobs:
         run: pip install -e ".[test]"
       - name: Parity — jaffle_shop, duckrun vs dbt-duckdb (build both, diff every table)
         run: python parity_tests/jaffle_shop/run_parity.py
+      - name: Generate jaffle_shop dbt docs (static — catalog with row/byte stats off the Delta tables)
+        # run_parity.py left the duckrun-built Delta warehouse at /tmp/js_wh; a fresh `docs generate`
+        # process re-registers every Delta table as a delta_scan view and reads the real catalog.
+        env:
+          DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/jaffle_shop
+          WAREHOUSE_PATH: /tmp/js_wh
+          DBT_SCHEMA: main
+        working-directory: /tmp/js
+        run: dbt docs generate --static --target dev --target-path target_docs
+      - name: Upload jaffle_shop dbt docs (deploy-docs publishes it as jaffle_shop.html)
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-jaffle_shop
+          path: /tmp/js/target_docs/static_index.html
+          if-no-files-found: error
 
   tuva:
     # Heavy (~40 min): the full Tuva data model (every vertical, synthetic_data_size=small) built
@@ -73,3 +88,12 @@ jobs:
       - name: dbt build — full Tuva on duckrun (models + snapshots + tests, everything enabled)
         run: dbt build
         working-directory: /tmp/tv/integration_tests
+      - name: Generate Tuva dbt docs (static — catalog stats off the Delta tables)
+        run: dbt docs generate --static --target dev --target-path target_docs
+        working-directory: /tmp/tv/integration_tests
+      - name: Upload Tuva dbt docs (deploy-docs publishes it as tuva.html)
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-tuva
+          path: /tmp/tv/integration_tests/target_docs/static_index.html
+          if-no-files-found: error

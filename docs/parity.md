@@ -29,6 +29,9 @@ Result — identical, row for row, both sides 28/28 green:
 | raw_orders     | 99   | ✓ |
 | raw_payments   | 113  | ✓ |
 
+→ **[Browse the jaffle_shop dbt docs](jaffle_shop.html)** — the full dbt documentation site (DAG +
+catalog with per-table row/byte stats), generated on duckrun by `dbt docs generate --static`.
+
 ## Tuva — a 100+-model real-world project { #tuva }
 
 [Tuva Health](https://github.com/tuva-health/tuva) is a large healthcare claims/clinical data
@@ -43,6 +46,9 @@ DuckDB/Delta port reproduces Tuva's expected results.
 | run | `dbt deps` + full `dbt build` (models + snapshots + Elementary + tests) |
 | result | ✓ green |
 | wall time | 21m 5s on a Linux CI runner |
+
+→ **[Browse the Tuva dbt docs](tuva.html)** — the full dbt documentation site (100+ models +
+catalog stats), generated on duckrun in CI by `dbt docs generate --static`.
 
 It runs in CI on Linux ([`.github/workflows/parity.yml`](../.github/workflows/parity.yml), the
 `tuva` job, `workflow_dispatch`). It is Linux-only because Tuva consumes itself as a `local: ../`
