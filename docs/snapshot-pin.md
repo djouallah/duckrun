@@ -19,7 +19,7 @@ The `snapshot-pin` job in [`cores.yml`](../.github/workflows/cores.yml) proves i
 once *without* the pin (the old behaviour: read/commit against HEAD) and once *with* it — and walks
 the table's Delta versions so you can see, version by version, where the unpinned path silently
 loses data and the pinned path catches it. The full scenario is in
-[`tests/integration_tests/snapshot_pin/`](../tests/integration_tests/snapshot_pin/); the assertions
+[`integration_tests/snapshot_pin/`](../integration_tests/snapshot_pin/); the assertions
 that gate every change live in `test_snapshot_pin.py`. The latest scorecard is rendered live below.
 
 <!-- SNAPSHOT-PIN:START -->

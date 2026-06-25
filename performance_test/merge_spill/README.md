@@ -21,7 +21,7 @@ so it's now plain SQL driven by a small Python harness.
   (no raw-SQL way to set it, and a by-source source must be streamed, not collected whole into a
   non-spillable hash); `safeappend_only.sql` likewise only builds the batch (no raw-SQL safeappend —
   the runner appends it via `.write.mode("append_if_unchanged")`).
-- The runner — [`tests/tools/merge_tpch_bench.py`](../../tools/merge_tpch_bench.py) — generates the
+- The runner — [`tests/performance/merge_tpch_bench.py`](../../tests/performance/merge_tpch_bench.py) — generates the
   TPCH `lineitem` parquet with `tpchgen-cli`, seeds each op's table from the previous one
   (`CREATE OR REPLACE TABLE … AS SELECT * FROM <prev>`), runs each `sql/<op>.sql`, and verifies the
   effect by querying the table. It writes the scorecard to `docs/merge_card.md`.
@@ -30,10 +30,10 @@ so it's now plain SQL driven by a small Python harness.
 
 ```bash
 # local stress / release gate (heavy — SF=10 ≈ 60M rows; the SF is configurable)
-python tests/tools/merge_tpch_bench.py --dir /mnt/mbench --sf 10
+python tests/performance/merge_tpch_bench.py --dir /mnt/mbench --sf 10
 
 # small OneLake path smoke (abfss merge write/read path)
-python tests/tools/merge_tpch_bench.py --dir /tmp/merge_onelake \
+python tests/performance/merge_tpch_bench.py --dir /tmp/merge_onelake \
   --warehouse "abfss://…@onelake.dfs.fabric.microsoft.com/…/Tables" --sf 1
 ```
 

@@ -17,13 +17,13 @@ on:
   push:
     branches: ["**"]   # any branch, but NOT a tag push — never run on a release tag (v*); that is publish.yml's job
     paths:
-      - 'tests/integration_tests/makeopendata/**'
+      - 'integration_tests/makeopendata/**'
       - 'dbt/adapters/duckrun/**'
       - 'dbt/include/duckrun/**'
       - '.github/workflows/makeopendata.yml'
   pull_request:
     paths:
-      - 'tests/integration_tests/makeopendata/**'
+      - 'integration_tests/makeopendata/**'
       - 'dbt/adapters/duckrun/**'
       - 'dbt/include/duckrun/**'
       - '.github/workflows/makeopendata.yml'
@@ -43,7 +43,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/makeopendata
+      DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests/makeopendata
       # makeopendata's own dedicated Fabric lakehouse (separate from the shared aemo/coffee one);
       # delta_rs writes land at <root>/<schema>/<model> and persist. ONELAKE_TOKEN is minted below.
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
@@ -53,7 +53,7 @@ jobs:
       AZURE_TRANSPORT_OPTION_TYPE: curl
     defaults:
       run:
-        working-directory: tests/integration_tests/makeopendata
+        working-directory: integration_tests/makeopendata
     steps:
       - uses: actions/checkout@v4
 
@@ -102,4 +102,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: docs-makeopendata
-          path: tests/integration_tests/makeopendata/target/static_index.html
+          path: integration_tests/makeopendata/target/static_index.html

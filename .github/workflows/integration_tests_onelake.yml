@@ -26,25 +26,25 @@ on:
   push:
     branches: ["**"]
     paths:
-      - 'tests/integration_tests/aemo/**'
-      - 'tests/integration_tests/merge_spill/**'
-      - 'tests/integration_tests/coffee/**'
-      - 'tests/integration_tests/sde_dbt_tutorial/**'
-      - 'tests/integration_tests/taxi/**'
-      - 'tests/integration_tests/multicatalog/**'
+      - 'integration_tests/aemo/**'
+      - 'performance_test/merge_spill/**'
+      - 'integration_tests/coffee/**'
+      - 'integration_tests/sde_dbt_tutorial/**'
+      - 'integration_tests/taxi/**'
+      - 'integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
-      - 'tests/tools/merge_tpch_bench.py'
+      - 'tests/performance/merge_tpch_bench.py'
       - '.github/workflows/integration_tests_onelake.yml'
   pull_request:
     paths:
-      - 'tests/integration_tests/aemo/**'
-      - 'tests/integration_tests/merge_spill/**'
-      - 'tests/integration_tests/coffee/**'
-      - 'tests/integration_tests/sde_dbt_tutorial/**'
-      - 'tests/integration_tests/taxi/**'
-      - 'tests/integration_tests/multicatalog/**'
+      - 'integration_tests/aemo/**'
+      - 'performance_test/merge_spill/**'
+      - 'integration_tests/coffee/**'
+      - 'integration_tests/sde_dbt_tutorial/**'
+      - 'integration_tests/taxi/**'
+      - 'integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
-      - 'tests/tools/merge_tpch_bench.py'
+      - 'tests/performance/merge_tpch_bench.py'
       - '.github/workflows/integration_tests_onelake.yml'
   workflow_dispatch:
 
@@ -64,9 +64,9 @@ jobs:
       cancel-in-progress: false
     defaults:
       run:
-        working-directory: tests/integration_tests/aemo
+        working-directory: integration_tests/aemo
     env:
-      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/aemo
+      DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests/aemo
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
       FILES_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Files
       DBT_SCHEMA: mart
@@ -113,7 +113,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: docs-aemo
-          path: tests/integration_tests/aemo/target/static_index.html
+          path: integration_tests/aemo/target/static_index.html
 
   merge_spill:
     # The incremental-MERGE project (SQL-only): the MERGE chain over OneLake at a SMALL scale factor
@@ -152,7 +152,7 @@ jobs:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DBT_SCHEMA: merge_spill_it
         run: >-
-          python tests/tools/merge_tpch_bench.py
+          python tests/performance/merge_tpch_bench.py
           --dir /tmp/merge_onelake
           --warehouse "$WAREHOUSE_PATH"
           --sf 1
@@ -167,7 +167,7 @@ jobs:
       group: coffee-onelake
       cancel-in-progress: false
     env:
-      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
+      DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests/coffee
       AZURE_TRANSPORT_OPTION_TYPE: curl
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
     steps:
@@ -193,7 +193,7 @@ jobs:
         # (row counts/size) off the abfss:// Delta tables. COFFEE_ROWS sizes the fact (kept small — the
         # 100M scale is already proven); DBT_SCHEMA isolates it from the connection-API scenario's
         # schema in the shared lakehouse.
-        working-directory: tests/integration_tests/coffee
+        working-directory: integration_tests/coffee
         env:
           DBT_SCHEMA: duckrun_dbt_it
           COFFEE_ROWS: "10000"
@@ -201,18 +201,18 @@ jobs:
           dbt build --target dev
           dbt docs generate --static --target dev
       - name: Verify the coffee catalog carries Delta table stats (issue #3)
-        working-directory: tests/integration_tests/coffee
+        working-directory: integration_tests/coffee
         run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json coffee
       - name: Upload coffee docs
         uses: actions/upload-artifact@v4
         with:
           name: docs-coffee
-          path: tests/integration_tests/coffee/target/static_index.html
+          path: integration_tests/coffee/target/static_index.html
       - name: Run the coffee-shop scenario against OneLake (connection-API smoke)
         env:
           DUCKRUN_IT_SCHEMA: duckrun_conn_it
           COFFEE_ONELAKE_ROWS: "2000"
-        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
+        run: python -m pytest integration_tests/coffee/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
 
       - name: Connect over a FRIENDLY-name OneLake path (delta-kernel #307 error-hygiene gate)
         # Same lakehouse as above, addressed by friendly workspace/lakehouse names instead of GUIDs.
@@ -221,7 +221,7 @@ jobs:
         # CREATE VIEW SQL) and carries the GUID workaround. The GUID jobs above can't cover this.
         env:
           WAREHOUSE_PATH_FRIENDLY: abfss://tpch@onelake.dfs.fabric.microsoft.com/duckrun.Lakehouse/Tables
-        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
+        run: python -m pytest integration_tests/coffee/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
 
   taxi:
     # The SQL-first NYC-taxi showcase: a runnable demo (not a gate) that reads real live NYC TLC
@@ -258,7 +258,7 @@ jobs:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
           DUCKRUN_TAXI_PAGE: taxi_run.html   # the demo writes its full SQL+results HTML report here
-        run: python tests/integration_tests/taxi/demo_taxi.py
+        run: python integration_tests/taxi/demo_taxi.py
 
       - name: Upload this run's HTML report for deploy-docs to publish as taxi.html
         # Named docs-* so deploy-docs picks it up with its existing `pattern: docs-*` download. The
@@ -307,7 +307,7 @@ jobs:
           WAREHOUSE_RO_PATH: abfss://d5f25039-7f33-4668-b909-2c397b2626fb@onelake.dfs.fabric.microsoft.com/61bf56ea-a4d5-4895-a90e-a6daa6e02d04/Tables
           DUCKRUN_MULTICAT_SCHEMA: multicatalog_demo
           DUCKRUN_MULTICAT_PAGE: multicatalog_run.html   # the demo writes its full HTML report here
-        run: python tests/integration_tests/multicatalog/demo_multicatalog.py
+        run: python integration_tests/multicatalog/demo_multicatalog.py
 
       - name: Upload this run's HTML report for deploy-docs to publish as multicatalog.html
         if: always() && hashFiles('multicatalog_run.html') != ''
@@ -326,7 +326,7 @@ jobs:
       group: sde-onelake
       cancel-in-progress: false
     env:
-      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/sde_dbt_tutorial
+      DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests/sde_dbt_tutorial
       AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
@@ -336,7 +336,7 @@ jobs:
       - name: Install duckrun + pytest
         run: pip install -e ".[test]"
       - name: EL + dbt build + docs generate (local, tiny full build)
-        working-directory: tests/integration_tests/sde_dbt_tutorial
+        working-directory: integration_tests/sde_dbt_tutorial
         env:
           DUCKRUN_WAREHOUSE: /tmp/sde_docs_wh
         run: |
@@ -347,13 +347,13 @@ jobs:
           dbt build --target dev
           dbt docs generate --static --target dev
       - name: Verify the sde_dbt_tutorial catalog carries Delta table stats (issue #3)
-        working-directory: tests/integration_tests/sde_dbt_tutorial
+        working-directory: integration_tests/sde_dbt_tutorial
         run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json sde_dbt_tutorial
       - name: Upload sde_dbt_tutorial docs
         uses: actions/upload-artifact@v4
         with:
           name: docs-sde
-          path: tests/integration_tests/sde_dbt_tutorial/target/static_index.html
+          path: integration_tests/sde_dbt_tutorial/target/static_index.html
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
@@ -368,4 +368,4 @@ jobs:
       - name: Run the sde_dbt_tutorial SCD2 port against OneLake (stateful, real dbt subprocesses)
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
-        run: python -m pytest tests/integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py -q -s -p no:cacheprovider
+        run: python -m pytest integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py -q -s -p no:cacheprovider

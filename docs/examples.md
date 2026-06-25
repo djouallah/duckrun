@@ -60,7 +60,7 @@ through for every statement and its actual output from a live run.
     OneLake using nothing but `conn.sql(...)` — QUALIFY, PIVOT, ROLLUP, ASOF JOIN, a
     SQL-only upsert, time travel, and a concurrent-MERGE clash.
 
-    *source: [demo_taxi.py](https://github.com/djouallah/duckrun/blob/main/tests/integration_tests/taxi/demo_taxi.py)*
+    *source: [demo_taxi.py](https://github.com/djouallah/duckrun/blob/main/integration_tests/taxi/demo_taxi.py)*
 
 -   __[multi-catalog — lakehouse + warehouse + local](multicatalog.html)__
 
@@ -69,6 +69,6 @@ through for every statement and its actual output from a live run.
     scratch dir. A single `conn.sql` JOINs across them as `catalog.schema.table`, the
     read-only fence refuses a warehouse write, and the mart is written back to the lakehouse.
 
-    *source: [demo_multicatalog.py](https://github.com/djouallah/duckrun/blob/main/tests/integration_tests/multicatalog/demo_multicatalog.py)*
+    *source: [demo_multicatalog.py](https://github.com/djouallah/duckrun/blob/main/integration_tests/multicatalog/demo_multicatalog.py)*
 
 </div>

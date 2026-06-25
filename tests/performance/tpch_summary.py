@@ -2,9 +2,9 @@
 the docs and the GitHub job summary.
 
 Pure formatting: ``render_card(timings)`` takes the dict that
-``tests/integration_tests/tpch/test_tpch.py::run_tpch_benchmark`` fills via its ``timings_out``
+``performance_test/tpch/test_tpch.py::run_tpch_benchmark`` fills via its ``timings_out``
 argument and returns the card markdown. The driver that actually runs the benchmark and writes the
-card is ``tests/integration_tests/tpch/tpch_card.py``.
+card is ``performance_test/tpch/tpch_card.py``.
 """
 import sys
 

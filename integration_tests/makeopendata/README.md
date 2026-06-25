@@ -47,8 +47,8 @@ in `ST_GeomFromWKB`. The mechanical mappings:
 
 ```bash
 export WAREHOUSE_PATH=/tmp/makeopendata_wh   # local Delta warehouse (or an abfss:// Tables path)
-dbt deps  --project-dir tests/integration_tests/makeopendata --profiles-dir tests/integration_tests/makeopendata
-dbt build --project-dir tests/integration_tests/makeopendata --profiles-dir tests/integration_tests/makeopendata
+dbt deps  --project-dir integration_tests/makeopendata --profiles-dir integration_tests/makeopendata
+dbt build --project-dir integration_tests/makeopendata --profiles-dir integration_tests/makeopendata
 ```
 
 `dev` (default) reads the small Hérault/Occitanie samples (dvf, logement) and scopes IRIS to

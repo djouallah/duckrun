@@ -46,7 +46,7 @@ the timestamp snapshot closes the old version and opens a new one.
 ```bash
 # requires a OneLake warehouse; skips otherwise
 export WAREHOUSE_PATH=abfss://…/Tables ONELAKE_TOKEN=<storage bearer token>
-pytest tests/integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py
+pytest integration_tests/sde_dbt_tutorial/test_sde_dbt_tutorial.py
 ```
 
 The test runs against a **persistent** OneLake warehouse, drives a controlled update to one customer,

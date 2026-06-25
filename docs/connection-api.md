@@ -119,7 +119,7 @@ targets the current catalog; cross-catalog writes go through the DataFrame API
 (`df.write.saveAsTable("cat.schema.t")`) or `DeltaTable.forName(conn, "cat.schema.t")`.
 
 See the full runnable walkthrough in
-[`tests/integration_tests/multicatalog/demo_multicatalog.py`](../tests/integration_tests/multicatalog/demo_multicatalog.py)
+[`integration_tests/multicatalog/demo_multicatalog.py`](../integration_tests/multicatalog/demo_multicatalog.py)
 (published as a [live report](https://djouallah.github.io/duckrun/multicatalog.html)).
 
 ## Raw SQL DML through `conn.sql`

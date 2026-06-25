@@ -166,7 +166,7 @@ loaded.
 
 First run (or `--full-refresh`, or a missing table) overwrites to create the table; `safeappend`
 applies on later runs. A real example is the AEMO
-[`fct_scada`](../tests/integration_tests/aemo/models/marts/fct_scada.sql) model — the project's largest
+[`fct_scada`](../integration_tests/aemo/models/marts/fct_scada.sql) model — the project's largest
 table, which loads only not-yet-seen files and so uses `safeappend` instead of an expensive merge.
 
 ### Config options (`table` / `incremental` / `delta`)

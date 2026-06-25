@@ -16,7 +16,7 @@ The end-to-end flow is :func:`run_tpch_benchmark`, parameterized by scale factor
 drives it as an offline CI smoke (generation needs ``tpchgen-cli``; the cores job runs SF=10); run the
 file directly to drive it by hand:
 
-    TPCH_SF=10 python tests/integration_tests/tpch/test_tpch.py
+    TPCH_SF=10 python performance_test/tpch/test_tpch.py
 """
 import os
 import subprocess

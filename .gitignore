@@ -60,24 +60,32 @@ conformance.xml
 *.csv
 
 # But DO keep integration test fixtures and dbt project files
-!tests/integration_tests/**/*.csv
-!tests/integration_tests/**/*.yml
-!tests/integration_tests/**/*.json
+!integration_tests/**/*.csv
+!integration_tests/**/*.yml
+!integration_tests/**/*.json
 # ...and the vendored connection-API fixtures (coffee dimension CSVs)
 !tests/connection_api/**/*.csv
 
 # Keep the Claude Code plugin marketplace manifests (the *.json rule above ignores them)
 !.claude-plugin/marketplace.json
 !plugins/**/.claude-plugin/plugin.json
-# ...except dbt's auto-generated local user file (aemo, merge_spill, any integration project)
-tests/integration_tests/*/.user.yml
+# ...except dbt's auto-generated local user file (aemo, any integration project)
+integration_tests/*/.user.yml
+performance_test/*/.user.yml
 
 # Delta output and dbt artifacts produced by the integration projects (runtime)
-tests/integration_tests/*/warehouse/
-tests/integration_tests/*/target/
-tests/integration_tests/*/dbt_packages/
-tests/integration_tests/*/logs/
-tests/integration_tests/*/package-lock.yml
+integration_tests/*/warehouse/
+integration_tests/*/target/
+integration_tests/*/dbt_packages/
+integration_tests/*/logs/
+integration_tests/*/package-lock.yml
+# Runtime artifacts from the performance projects (merge_spill / tpch write to external dirs by
+# default, but a local run may drop these inside the project)
+performance_test/*/warehouse/
+performance_test/*/target/
+performance_test/*/dbt_packages/
+performance_test/*/logs/
+performance_test/*/package-lock.yml
 # The MERGE benchmark scorecard the runner writes (injected into docs/merge-benchmark.md in CI)
 docs/merge_card.md
 # The snapshot-pin scorecard the runner writes (injected into docs/snapshot-pin.md in CI)

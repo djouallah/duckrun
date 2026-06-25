@@ -16,7 +16,7 @@ Scenario (identical for both arms): a `dbt run` seeds the table (v0); a concurre
 Both arms drive `dbt run` in-process; the only difference is the `read_version` the merge is pinned
 to (HEAD = no effective pin, vs vB = the real pin).
 
-    python tests/integration_tests/snapshot_pin/snapshot_pin_card.py
+    python integration_tests/snapshot_pin/snapshot_pin_card.py
 
 Prints an ASCII timeline to the console and, in CI, writes the same as Markdown to the GitHub
 Actions step summary ($GITHUB_STEP_SUMMARY) and to docs/snapshot_pin_card.md (for injection into

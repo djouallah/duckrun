@@ -5,8 +5,8 @@ in two incarnations that share the same scenario:
 
 | Incarnation | Where | What it covers |
 |---|---|---|
-| **dbt project** (this dir) | `tests/integration_tests/coffee/` | the model DAG — ingest → dedup → fact → mart |
-| **connection API** (`duckrun.connect`) | `tests/integration_tests/coffee/test_coffee.py` | the DataFrame-style surface, plus a millions-of-rows stress run |
+| **dbt project** (this dir) | `integration_tests/coffee/` | the model DAG — ingest → dedup → fact → mart |
+| **connection API** (`duckrun.connect`) | `integration_tests/coffee/test_coffee.py` | the DataFrame-style surface, plus a millions-of-rows stress run |
 
 ## Credit — dimension data
 
@@ -17,7 +17,7 @@ generated locally (random order lines), not taken from upstream.
 
 Two consumers, two ways of reading the same data:
 
-- **Connection-API scenario** (`tests/integration_tests/coffee/test_coffee.py`) reads **vendored** copies
+- **Connection-API scenario** (`integration_tests/coffee/test_coffee.py`) reads **vendored** copies
   under [`data/`](data/) — so the scenario, and the `coffee-stress`
   release gate that runs it, never touch the network (legit, repeatable stress numbers).
 - **This dbt project** reads the CSVs straight from upstream over `https`
@@ -49,7 +49,7 @@ dim_products ──► products ─┘ (also feeds mart_revenue)
 ```bash
 export WAREHOUSE_PATH=/tmp/coffee_wh    # local Delta warehouse (or an abfss:// Tables path)
 export COFFEE_ROWS=100000               # fact rows to generate (default 1,000,000)
-dbt build --project-dir tests/integration_tests/coffee --profiles-dir tests/integration_tests/coffee
+dbt build --project-dir integration_tests/coffee --profiles-dir integration_tests/coffee
 ```
 
 To target OneLake instead, point `WAREHOUSE_PATH` at an `abfss://…/Tables` path and set
