@@ -25,7 +25,7 @@ on:
     # (the scorecards they commit to docs with [skip ci] — conformance / connection / snapshot-pin
     # from cores, the SF=100 TPC-H card from local_stress_tests — which would otherwise not reach the
     # site, since [skip ci] suppresses the docs-push trigger).
-    workflows: ["integration_tests_onelake", "makeopendata", "cores", "local_stress_tests", "parity"]
+    workflows: ["integration_tests_onelake", "cores", "local_stress_tests", "parity"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -80,14 +80,6 @@ jobs:
           else
             echo "No successful integration run found — will fall back to the live site."
           fi
-          # makeopendata is built LOCALLY in its own workflow (not OneLake), so its docs artifact
-          # lives in the latest successful makeopendata run, not the integration run above.
-          MOD_RUN_ID="$(gh run list --workflow=makeopendata.yml --branch=main \
-            --status=success --limit=1 --json databaseId --jq '.[0].databaseId' || true)"
-          if [ -n "${MOD_RUN_ID:-}" ]; then
-            echo "Reusing makeopendata docs from run $MOD_RUN_ID"
-            gh run download "$MOD_RUN_ID" --pattern 'docs-makeopendata' --dir docs-artifacts || true
-          fi
           # parity-test dbt docs (jaffle_shop + tuva), generated ON DUCKRUN in the parity workflow.
           # jaffle_shop runs on every parity push; tuva only on workflow_dispatch — so the docs-tuva
           # artifact is in the latest dispatch run, not every run. Whatever's absent is preserved live
@@ -102,7 +94,6 @@ jobs:
           fi
           # Overlay the per-project DAG catalogs and the live demo reports onto the built site.
           cp_art() { [ -f "$1" ] && cp "$1" "site/$2" && echo "  from artifact: $2"; }
-          cp_art docs-artifacts/docs-makeopendata/static_index.html makeopendata.html     || true
           cp_art docs-artifacts/docs-aemo/static_index.html        aemo.html            || true
           cp_art docs-artifacts/docs-coffee/static_index.html      coffee.html          || true
           cp_art docs-artifacts/docs-sde/static_index.html         sde.html             || true
@@ -112,7 +103,7 @@ jobs:
           cp_art docs-artifacts/docs-tuva/static_index.html        tuva.html            || true
           # Safety net: for any example page still absent (artifact download failed and no committed
           # fallback), preserve whatever is currently published so a deploy never wipes a live page.
-          for p in makeopendata aemo coffee sde taxi multicatalog jaffle_shop tuva; do
+          for p in aemo coffee sde taxi multicatalog jaffle_shop tuva; do
             if [ ! -f "site/$p.html" ]; then
               if curl -fsS "https://djouallah.github.io/duckrun/$p.html" -o "site/$p.html"; then
                 echo "  preserved live: $p.html"

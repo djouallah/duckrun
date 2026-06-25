@@ -12,16 +12,6 @@ Microsoft Fabric OneLake lakehouse.*
 
 <div class="grid cards" markdown>
 
--   __[makeopendata](makeopendata.html)__
-
-    The [make-open-data](https://github.com/make-open-data/make-open-data) project ported off
-    Postgres + PostGIS: ~30 models over real French open data (INSEE census, Etalab/La Poste
-    geography, DVF real-estate, IGN communes + IRIS contours), with the spatial SQL rewritten for
-    DuckDB's `spatial` extension and every geometry materialized as a Delta table (WKB). The DAG +
-    catalog above are from a **local** `dbt build` on the CI runner (no OneLake), so the stats are real.
-
-    *source: [make-open-data/make-open-data](https://github.com/make-open-data/make-open-data)*
-
 -   __[aemo](https://djouallah.github.io/dbt_fabric_python_delta/#!/model/model.aemo_electricity.fct_scada)__
 
     The AEMO dbt project built against live Microsoft Fabric OneLake (`abfss://`). Full

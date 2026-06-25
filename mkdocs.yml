@@ -108,7 +108,6 @@ nav:
   - Examples:
       - examples.md
       - dbt projects:
-          - makeopendata: https://djouallah.github.io/duckrun/makeopendata.html
           - aemo: https://djouallah.github.io/dbt_fabric_python_delta/
           - coffee: https://djouallah.github.io/duckrun/coffee.html
       - Pure SQL:

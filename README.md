@@ -108,14 +108,9 @@ my_project:
 Profiles, materializations, incremental strategies (incl. `append_if_unchanged`), sources, and
 automatic compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
 
-See it on a real, complex project:
-**[makeopendata](integration_tests/makeopendata)** ports
-[make-open-data](https://github.com/make-open-data/make-open-data) (Postgres + PostGIS) to duckrun —
-~30 models over live French open data (INSEE census, IGN/Etalab/La Poste geography, DVF real-estate,
-IGN communes + IRIS contours), every model (and seed) materialized as a Delta table, with the
-upstream dbt tests passing unchanged. Smaller starters: [aemo](integration_tests/aemo),
-[coffee](integration_tests/coffee). And [parity_tests/](parity_tests) runs real `type: duckdb`
-projects (jaffle_shop, sde, Tuva) unchanged on duckrun and diffs the output against dbt-duckdb.
+See it on real projects: [aemo](integration_tests/aemo) and [coffee](integration_tests/coffee) are
+runnable starters, and [parity_tests/](parity_tests) runs real `type: duckdb` projects (jaffle_shop,
+sde, Tuva) unchanged on duckrun and diffs the output against dbt-duckdb.
 
 ## Building with an AI assistant
 
