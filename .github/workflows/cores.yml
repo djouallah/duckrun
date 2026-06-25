@@ -21,15 +21,29 @@ name: cores
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • coffee-smoke            — fast connect/read/write/merge smoke at a small row count.
 #
-# Runs on EVERY push / PR, and as a release gate (workflow_call from publish.yml). Out of scope here
-# (deliberately): the live-OneLake projects (integration_tests_onelake.yml) and the heavy local
-# stress runs (local_stress_tests.yml) — those are integration/stress, not the per-change gate.
+# Path-filtered to the offline surface it actually exercises — the adapter, the duckrun package, and
+# the test suites. A change that touches only docs, parity_tests/, or integration_tests/ doesn't
+# affect these tests, so it doesn't run cores. As a release gate it still runs UNFILTERED via
+# workflow_call from publish.yml. Out of scope here (deliberately): the live-OneLake projects
+# (integration_tests_onelake.yml) and the heavy local stress runs (local_stress_tests.yml).
 
 on:
   push:
     branches: ["**"]
+    paths:
+      - 'dbt/**'              # the adapter internals + include macros
+      - 'duckrun/**'          # the duckrun.connect() package
+      - 'tests/**'            # adapter / conformance / connection_api / correctness suites
+      - 'pyproject.toml'      # dependency / version changes
+      - '.github/workflows/cores.yml'
   pull_request:
-  # Callable as a release gate from publish.yml.
+    paths:
+      - 'dbt/**'
+      - 'duckrun/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - '.github/workflows/cores.yml'
+  # Callable as a release gate from publish.yml (runs unfiltered there).
   workflow_call:
 
 # The card jobs (conformance, connection-card, snapshot-pin) commit their rendered scorecards
