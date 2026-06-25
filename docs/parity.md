@@ -32,6 +32,29 @@ Result — identical, row for row, both sides 28/28 green:
 → **[Browse the jaffle_shop dbt docs](jaffle_shop.html)** — the full dbt documentation site (DAG +
 catalog with per-table row/byte stats), generated on duckrun by `dbt docs generate --static`.
 
+## sde — delete+insert + SCD2 + medallion { #sde }
+
+[Start Data Engineering](https://github.com/josephmachado/simple_dbt_project) is a medallion
+bronze→silver→gold project with a **`delete+insert` incremental model**, an **SCD2 snapshot**,
+packages, and an exposure. It ingests raw CSVs into a DuckDB file via its own EL and reads them as
+`sources` — so the duckrun profile sets `path` to that file and `root_path` to a Delta warehouse.
+[`run_parity.py`](../parity_tests/sde/run_parity.py) builds it on dbt-duckdb and duckrun and diffs
+every persisted table.
+
+This is the project that exposed duckrun silently aliasing `delete+insert` to `merge`; with real
+delete+insert it runs **verbatim** and matches:
+
+| table | rows | duckrun == dbt-duckdb |
+|-------|------|:---------------------:|
+| fct_clickstream (delete+insert) | 100 | ✓ |
+| fct_orders | 999 | ✓ |
+| order_status_code (seed) | 6 | ✓ |
+| dim_customer (SCD2) | 100 | ✓ * |
+
+\* compared on business columns; the SCD2 bookkeeping columns are stamped from run wall-clock.
+
+→ **[Browse the sde dbt docs](sde.html)** — generated on duckrun by `dbt docs generate --static`.
+
 ## Tuva — a 100+-model real-world project { #tuva }
 
 [Tuva Health](https://github.com/tuva-health/tuva) is a large healthcare claims/clinical data

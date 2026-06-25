@@ -114,7 +114,8 @@ See it on a real, complex project:
 ~30 models over live French open data (INSEE census, IGN/Etalab/La Poste geography, DVF real-estate,
 IGN communes + IRIS contours), every model (and seed) materialized as a Delta table, with the
 upstream dbt tests passing unchanged. Smaller starters: [aemo](integration_tests/aemo),
-[coffee](integration_tests/coffee), [sde_dbt_tutorial](integration_tests/sde_dbt_tutorial).
+[coffee](integration_tests/coffee). And [parity_tests/](parity_tests) runs real `type: duckdb`
+projects (jaffle_shop, sde, Tuva) unchanged on duckrun and diffs the output against dbt-duckdb.
 
 ## Building with an AI assistant
 

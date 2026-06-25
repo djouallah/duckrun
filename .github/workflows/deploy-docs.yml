@@ -98,20 +98,21 @@ jobs:
             echo "Reusing parity docs from run $PARITY_RUN_ID"
             gh run download "$PARITY_RUN_ID" --pattern 'docs-jaffle_shop' --dir docs-artifacts || true
             gh run download "$PARITY_RUN_ID" --pattern 'docs-tuva'        --dir docs-artifacts || true
+            gh run download "$PARITY_RUN_ID" --pattern 'docs-sde'         --dir docs-artifacts || true
           fi
           # Overlay the per-project DAG catalogs and the live demo reports onto the built site.
           cp_art() { [ -f "$1" ] && cp "$1" "site/$2" && echo "  from artifact: $2"; }
           cp_art docs-artifacts/docs-makeopendata/static_index.html makeopendata.html     || true
           cp_art docs-artifacts/docs-aemo/static_index.html        aemo.html            || true
           cp_art docs-artifacts/docs-coffee/static_index.html      coffee.html          || true
-          cp_art docs-artifacts/docs-sde/static_index.html         sde_dbt_tutorial.html || true
+          cp_art docs-artifacts/docs-sde/static_index.html         sde.html             || true
           cp_art docs-artifacts/docs-taxi-page/taxi_run.html       taxi.html            || true
           cp_art docs-artifacts/docs-multicatalog-page/multicatalog_run.html multicatalog.html || true
           cp_art docs-artifacts/docs-jaffle_shop/static_index.html jaffle_shop.html     || true
           cp_art docs-artifacts/docs-tuva/static_index.html        tuva.html            || true
           # Safety net: for any example page still absent (artifact download failed and no committed
           # fallback), preserve whatever is currently published so a deploy never wipes a live page.
-          for p in makeopendata aemo coffee sde_dbt_tutorial taxi multicatalog jaffle_shop tuva; do
+          for p in makeopendata aemo coffee sde taxi multicatalog jaffle_shop tuva; do
             if [ ! -f "site/$p.html" ]; then
               if curl -fsS "https://djouallah.github.io/duckrun/$p.html" -o "site/$p.html"; then
                 echo "  preserved live: $p.html"

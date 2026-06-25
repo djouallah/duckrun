@@ -37,14 +37,6 @@ Microsoft Fabric OneLake lakehouse.*
 
     *source: [JosueBogran/coffeeshopdatageneratorv2](https://github.com/JosueBogran/coffeeshopdatageneratorv2)*
 
--   __[sde_dbt_tutorial](sde_dbt_tutorial.html)__
-
-    The `josephmachado/simple_dbt_project` port: raw tables → bronze typing → a
-    Delta-backed SCD2 snapshot of the customer dim → a merge-incremental clickstream fact →
-    the `orders_obt` gold mart joined through the SCD2 validity window.
-
-    *source: [josephmachado/simple_dbt_project](https://github.com/josephmachado/simple_dbt_project)*
-
 </div>
 
 ## Pure SQL — the connection API

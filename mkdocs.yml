@@ -111,13 +111,13 @@ nav:
           - makeopendata: https://djouallah.github.io/duckrun/makeopendata.html
           - aemo: https://djouallah.github.io/dbt_fabric_python_delta/
           - coffee: https://djouallah.github.io/duckrun/coffee.html
-          - sde_dbt_tutorial: https://djouallah.github.io/duckrun/sde_dbt_tutorial.html
       - Pure SQL:
           - taxi: https://djouallah.github.io/duckrun/taxi.html
           - multicatalog: https://djouallah.github.io/duckrun/multicatalog.html
       - parity tests:
           - overview: parity.md
           - jaffle_shop: https://djouallah.github.io/duckrun/jaffle_shop.html
+          - sde: https://djouallah.github.io/duckrun/sde.html
           - tuva: https://djouallah.github.io/duckrun/tuva.html
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md
