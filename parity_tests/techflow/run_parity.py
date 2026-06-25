@@ -26,7 +26,10 @@ REPO_URL = "https://github.com/ameijin/dbt-example"
 TMP = Path("C:/tmp") if os.name == "nt" else Path("/tmp")
 ORACLE_DIR = TMP / "techflow_oracle"      # builds into its own ./dev.duckdb via the duckdb profile
 DUCKRUN_DIR = TMP / "techflow_duckrun"    # seeds + models -> Delta warehouse
-DUCKRUN_WH = TMP / "techflow_duckrun_wh"
+# duckrun warehouse root: an abfss:// OneLake Tables path when WAREHOUSE_PATH is set (the parity CI
+# points it at Microsoft Fabric); otherwise a local-filesystem warehouse for a plain local run.
+DUCKRUN_WH = os.environ.get("WAREHOUSE_PATH") or str(TMP / "techflow_duckrun_wh")
+_REMOTE = "://" in DUCKRUN_WH
 
 # Columns stamped from run wall-clock differ between two independent builds — compare on the rest.
 # fct_mrr_daily stamps `loaded_at = current_timestamp`; the two snapshots carry the usual SCD2
@@ -80,9 +83,28 @@ def _evaluator_relations() -> set:
             if n.get("package_name") == "dbt_project_evaluator"}
 
 
+def _duckrun_uri(schema, t):
+    return f"{DUCKRUN_WH.rstrip('/')}/{schema}/{t}"
+
+
+def _present(c, schema, t) -> bool:
+    """Is there a duckrun Delta table here? Views aren't persisted, so they're absent. Local: a
+    directory check. OneLake (abfss://): try delta_scan and treat any failure as 'absent'."""
+    if _REMOTE:
+        try:
+            c.execute(f"select 1 from delta_scan('{_duckrun_uri(schema, t)}') limit 1")
+            return True
+        except Exception:
+            return False
+    return Path(DUCKRUN_WH, schema, t).is_dir()
+
+
 def diff() -> bool:
     c = duckdb.connect()
     c.execute("install delta; load delta")
+    if _REMOTE:  # OneLake: mint the Azure secret so delta_scan can read abfss:// (same path the adapter uses)
+        from dbt.adapters.duckrun import secret
+        secret.ensure_azure_secret(c, {"bearer_token": os.environ.get("ONELAKE_TOKEN", "")})
     c.execute(f"attach '{(ORACLE_DIR / 'dev.duckdb').as_posix()}' as o (read_only)")
     evaluator = _evaluator_relations()
     # Every base table the oracle persisted (skip views — duckrun has no durable view).
@@ -95,10 +117,10 @@ def diff() -> bool:
         if (schema, t) in evaluator:
             print(f"{schema}.{t:36} SKIP (dbt_project_evaluator — linting pkg, hardcodes target.type in ['duckdb'])")
             continue
-        dpath = DUCKRUN_WH / schema / t
-        if not dpath.is_dir():
+        if not _present(c, schema, t):
             print(f"{schema}.{t:36} SKIP (not persisted by duckrun)")
             continue
+        uri = _duckrun_uri(schema, t)
         ocols = [r[0] for r in c.execute(
             "select column_name from duckdb_columns() where database_name='o' "
             f"and schema_name='{schema}' and table_name='{t}' order by column_index").fetchall()]
@@ -106,7 +128,7 @@ def diff() -> bool:
         cols = [col for col in ocols if col not in drop]
         sel = ", ".join('"' + col + '"' for col in cols)
         o_rows = _rows(c, f'select {sel} from o."{schema}"."{t}"')
-        d_rows = _rows(c, f"select {sel} from delta_scan('{dpath.as_posix()}')")
+        d_rows = _rows(c, f"select {sel} from delta_scan('{uri}')")
         ok = o_rows == d_rows
         all_ok = all_ok and ok
         note = f" (excl {sorted(drop)})" if drop else ""
@@ -119,11 +141,12 @@ def main():
     fresh_clone(ORACLE_DIR)
     fresh_clone(DUCKRUN_DIR)
     import shutil
-    shutil.rmtree(DUCKRUN_WH, ignore_errors=True)
+    if not _REMOTE:
+        shutil.rmtree(DUCKRUN_WH, ignore_errors=True)
     # Oracle: the repo's OWN profile (type: duckdb, path: ./dev.duckdb) — zero external config.
     build(ORACLE_DIR, str(ORACLE_DIR), {})
     # duckrun: external profile here (type: duckrun, root_path -> Delta warehouse).
-    build(DUCKRUN_DIR, str(HERE), {"WAREHOUSE_PATH": str(DUCKRUN_WH), "DBT_SCHEMA": "main"})
+    build(DUCKRUN_DIR, str(HERE), {"WAREHOUSE_PATH": DUCKRUN_WH, "DBT_SCHEMA": "main"})
     print("\n=== parity diff (duckrun Delta vs duckdb oracle) ===")
     ok = diff()
     print("\nPARITY:", "PASS — duckrun == dbt-duckdb on every persisted table" if ok else "FAIL")

@@ -4,6 +4,14 @@ name: parity
 # confirm it builds green and — where cheap — that duckrun's Delta output matches dbt-duckdb row for
 # row. dbt-duckdb is the oracle; a mismatch is a duckrun bug (fixed in duckrun, never in the project).
 #
+# The duckrun side materializes to live Microsoft Fabric OneLake (abfss://), exactly like the
+# integration suite (integration_tests_onelake.yml): OIDC Azure login → a fresh OneLake bearer token →
+# WAREHOUSE_PATH points at the lakehouse's Tables. Each project writes its own Tables/parity_<proj>
+# subfolder so the shared lakehouse never collides, and takes a per-project concurrency lock. The diff
+# reads the duckrun tables back over abfss:// (delta_scan + the same Azure secret the adapter mints).
+# Run locally without OneLake by leaving WAREHOUSE_PATH unset — run_parity.py falls back to a local
+# Delta warehouse.
+#
 # Linux on purpose: these projects use `local: ../` packages and deep paths that dbt symlinks cleanly
 # on Linux but copies (recursively, hitting MAX_PATH) on Windows. The adapter behaves the same on both
 # — only the dbt-deps file plumbing differs — so CI is the right home for the heavier projects.
@@ -26,14 +34,25 @@ on:
       - '.github/workflows/parity.yml'
   workflow_dispatch:
 
+# id-token for the OIDC Azure login (mints the OneLake token); contents to checkout.
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   jaffle_shop:
-    # Fast (~30s): clone jaffle_shop, build it on dbt-duckdb (oracle) AND duckrun, diff every
-    # persisted table (EXCEPT ALL both ways). The full differential — the strongest parity check.
+    # Fast (~30s): clone jaffle_shop, build it on dbt-duckdb (oracle) AND duckrun (→ OneLake), diff
+    # every persisted table (EXCEPT ALL both ways). The full differential — the strongest parity check.
     runs-on: ubuntu-latest
+    concurrency:
+      group: parity-jaffle-onelake
+      cancel-in-progress: false
+    env:
+      # duckrun materializes here (abfss:// OneLake); run_parity.py reads it back over abfss for the diff.
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_jaffle
+      # The azure extension's default transport fails the OneLake TLS handshake on the runner; curl
+      # respects the system CA bundle (same as the integration suite).
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -41,14 +60,22 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun (dbt-duckdb + duckdb + deltalake come with it)
         run: pip install -e ".[test]"
-      - name: Parity — jaffle_shop, duckrun vs dbt-duckdb (build both, diff every table)
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Parity — jaffle_shop, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python parity_tests/jaffle_shop/run_parity.py
-      - name: Generate jaffle_shop dbt docs (static — catalog with row/byte stats off the Delta tables)
-        # run_parity.py left the duckrun-built Delta warehouse at /tmp/js_wh; a fresh `docs generate`
-        # process re-registers every Delta table as a delta_scan view and reads the real catalog.
+      - name: Generate jaffle_shop dbt docs (static — catalog with row/byte stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/jaffle_shop
-          WAREHOUSE_PATH: /tmp/js_wh
           DBT_SCHEMA: main
         working-directory: /tmp/js
         run: dbt docs generate --static --target dev --target-path target_docs
@@ -61,10 +88,15 @@ jobs:
 
   sde:
     # Fast (~2 min): the Start Data Engineering project (a delete+insert incremental model, an SCD2
-    # snapshot, a medallion flow, packages) on dbt-duckdb (oracle) AND duckrun, then diff every
-    # persisted table. The repo's own EL + dbt build run UNCHANGED; only the connection profile differs.
-    # This is the project that exposed duckrun's old delete+insert→merge alias.
+    # snapshot, a medallion flow, packages) on dbt-duckdb (oracle) AND duckrun (→ OneLake), then diff
+    # every persisted table. The repo's own EL + dbt build run UNCHANGED; only the connection differs.
     runs-on: ubuntu-latest
+    concurrency:
+      group: parity-sde-onelake
+      cancel-in-progress: false
+    env:
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_sde
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -72,12 +104,22 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun
         run: pip install -e ".[test]"
-      - name: Parity — sde, duckrun vs dbt-duckdb (build both, diff every table)
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Parity — sde, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python parity_tests/sde/run_parity.py
-      - name: Generate sde dbt docs (static — catalog stats off the Delta tables)
+      - name: Generate sde dbt docs (static — catalog stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/sde
-          WAREHOUSE_PATH: /tmp/sde_duckrun_wh
           DBT_SCHEMA: main
         working-directory: /tmp/sde_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
@@ -89,11 +131,17 @@ jobs:
           if-no-files-found: error
 
   mrr:
-    # Fast (~30s): the MRR (subscription-revenue) project on dbt-duckdb (oracle) AND duckrun, then
-    # diff every persisted table. Seeds-only (no EL), staging/intermediate views, mart TABLES that
-    # amortize invoices into monthly recurring revenue + MRR movements. First project here with
-    # native dbt `unit_tests:` (3 cases) + an exposure — `dbt build` runs them on both adapters.
+    # Fast (~30s): the MRR (subscription-revenue) project on dbt-duckdb (oracle) AND duckrun (→ OneLake),
+    # then diff every persisted table. Seeds-only (no EL), staging/intermediate views, mart TABLES that
+    # amortize invoices into monthly recurring revenue + MRR movements. First project here with native
+    # dbt `unit_tests:` (3 cases) + an exposure — `dbt build` runs them on both adapters.
     runs-on: ubuntu-latest
+    concurrency:
+      group: parity-mrr-onelake
+      cancel-in-progress: false
+    env:
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_mrr
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -101,12 +149,22 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun
         run: pip install -e ".[test]"
-      - name: Parity — mrr, duckrun vs dbt-duckdb (build both, diff every table)
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Parity — mrr, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python parity_tests/mrr/run_parity.py
-      - name: Generate mrr dbt docs (static — catalog stats off the Delta tables)
+      - name: Generate mrr dbt docs (static — catalog stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/mrr
-          WAREHOUSE_PATH: /tmp/mrr_duckrun_wh
           DBT_SCHEMA: main
         working-directory: /tmp/mrr_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
@@ -118,13 +176,19 @@ jobs:
           if-no-files-found: error
 
   techflow:
-    # Fast: the TechFlow Analytics SaaS project on dbt-duckdb (oracle) AND duckrun, then diff every
-    # persisted table. First parity project with native dbt `unit_tests:`; also exercises sources read
-    # from committed parquet (external_location), an incremental model, two snapshots, dbt_expectations
-    # and exposures. dbt_project_evaluator's own models are skipped from the diff (a linting package
-    # hardcoded to `target.type in ['duckdb']`, so it describes the adapter, not the data) — it still
-    # builds green on duckrun; everything the project actually produces is diffed in full.
+    # Fast: the TechFlow Analytics SaaS project on dbt-duckdb (oracle) AND duckrun (→ OneLake), then
+    # diff every persisted table. First parity project with native dbt `unit_tests:`; also exercises
+    # sources read from committed parquet (external_location), an incremental model, two snapshots,
+    # dbt_expectations and exposures. dbt_project_evaluator's own models are skipped from the diff (a
+    # linting package hardcoded to `target.type in ['duckdb']`, so it describes the adapter, not the
+    # data) — it still builds green on duckrun; everything the project actually produces is diffed.
     runs-on: ubuntu-latest
+    concurrency:
+      group: parity-techflow-onelake
+      cancel-in-progress: false
+    env:
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_techflow
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -132,12 +196,22 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun
         run: pip install -e ".[test]"
-      - name: Parity — techflow, duckrun vs dbt-duckdb (build both, diff every table)
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Parity — techflow, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python parity_tests/techflow/run_parity.py
-      - name: Generate techflow dbt docs (static — catalog stats off the Delta tables)
+      - name: Generate techflow dbt docs (static — catalog stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/techflow
-          WAREHOUSE_PATH: /tmp/techflow_duckrun_wh
           DBT_SCHEMA: main
         working-directory: /tmp/techflow_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
@@ -150,17 +224,21 @@ jobs:
 
   tuva:
     # Heavy (~40 min): the full Tuva data model (every vertical, synthetic_data_size=small) built
-    # UNMODIFIED on duckrun. `dbt build` runs Tuva's own models, snapshots, data-quality and tests,
-    # so green here means the DuckDB/Delta port reproduces Tuva's expected results. Manual-only
+    # UNMODIFIED on duckrun → OneLake. `dbt build` runs Tuva's own models, snapshots, data-quality and
+    # tests, so green here means the DuckDB/Delta port reproduces Tuva's expected results. Manual-only
     # (workflow_dispatch) so it doesn't run on every push.
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    concurrency:
+      group: parity-tuva-onelake
+      cancel-in-progress: false
     env:
       # The duckrun connection lives OUTSIDE the cloned repo (dbt profiles always do); the Tuva repo
       # is run verbatim. httpfs + s3_region (in this profile) let the seed bootstrap read the public
-      # tuva-public-resources S3 bucket anonymously.
+      # tuva-public-resources S3 bucket anonymously; models materialize to OneLake.
       DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/tuva
-      WAREHOUSE_PATH: /tmp/tuva_wh
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables/parity_tuva
+      AZURE_TRANSPORT_OPTION_TYPE: curl
       DBT_SCHEMA: tuva
     steps:
       - uses: actions/checkout@v4
@@ -169,15 +247,26 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun
         run: pip install -e ".[test]"
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Clone Tuva (the repo under test) — run VERBATIM
         run: git clone --depth 1 --branch v0.18.0 https://github.com/tuva-health/tuva /tmp/tv
       - name: dbt deps (local ../ package symlinks on Linux; hub + git deps resolve)
         run: dbt deps
         working-directory: /tmp/tv/integration_tests
-      - name: dbt build — full Tuva on duckrun (models + snapshots + tests, everything enabled)
+      - name: dbt build — full Tuva on duckrun → OneLake (models + snapshots + tests, everything enabled)
         run: dbt build
         working-directory: /tmp/tv/integration_tests
-      - name: Generate Tuva dbt docs (static — catalog stats off the Delta tables)
+      - name: Generate Tuva dbt docs (static — catalog stats off the OneLake Delta tables)
         run: dbt docs generate --static --target dev --target-path target_docs
         working-directory: /tmp/tv/integration_tests
       - name: Upload Tuva dbt docs (deploy-docs publishes it as tuva.html)
