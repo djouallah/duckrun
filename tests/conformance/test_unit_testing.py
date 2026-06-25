@@ -1,8 +1,14 @@
 import pytest
 
-from dbt.tests.adapter.unit_testing.test_types import BaseUnitTestingTypes
+from dbt.tests.adapter.unit_testing.test_types import (
+    BaseUnitTestingTypes,
+    BaseUnitTestingVarcharFixtureNoTruncation,
+)
 from dbt.tests.adapter.unit_testing.test_case_insensitivity import BaseUnitTestCaseInsensivity
 from dbt.tests.adapter.unit_testing.test_invalid_input import BaseUnitTestInvalidInput
+from dbt.tests.adapter.unit_testing.test_quoted_reserved_word_column_names import (
+    BaseUnitTestQuotedReservedWordColumnNames,
+)
 
 
 @pytest.mark.skip_profile("buenavista")
@@ -33,4 +39,12 @@ class TestUnitTestCaseInsensitivityDuckDB(BaseUnitTestCaseInsensivity):
 
 
 class TestUnitTestInvalidInputDuckDB(BaseUnitTestInvalidInput):
+    pass
+
+
+class TestUnitTestingVarcharNoTruncationDuckDB(BaseUnitTestingVarcharFixtureNoTruncation):
+    pass
+
+
+class TestUnitTestQuotedReservedWordColumnNamesDuckDB(BaseUnitTestQuotedReservedWordColumnNames):
     pass
