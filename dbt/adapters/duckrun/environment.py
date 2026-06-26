@@ -12,6 +12,8 @@ process. We do the same for plugin sources here: instead of registering a Python
 ``CREATE OR REPLACE VIEW <source> AS <scan sql>``. No pyarrow, no copying the source into a table,
 and no dependence on dbt-duckdb's per-cursor relation re-registration.
 """
+import os
+
 from dbt.adapters.duckdb.environments.local import (
     DuckDBConnectionWrapper,
     DuckDBCursorWrapper,
@@ -19,6 +21,7 @@ from dbt.adapters.duckdb.environments.local import (
 )
 
 from . import delta_dml
+from . import secret
 
 
 class DuckrunCursorWrapper(DuckDBCursorWrapper):
@@ -37,8 +40,16 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
         self._duckrun_creds = credentials
 
     def execute(self, sql, bindings=None):
+        creds = self._duckrun_creds
+        # OneLake token freshness — the universal guard. configure_cursor re-mints per model, but a
+        # long build's later phases (dbt's tests / on-run-end reads) run on a reused cursor that it
+        # never revisits, so the once-minted DuckDB secret + storage_options go stale and every
+        # delta_scan 401s past the token's ~1h life. EVERY statement funnels through here, so this is
+        # the one place that covers them all. Cheap: refreshed() only parses the JWT expiry and returns
+        # the same object unless the token is genuinely near expiry — it hits the network at most once
+        # per token lifetime, not per statement.
+        self._refresh_onelake_token(creds)
         if bindings is None:
-            creds = self._duckrun_creds
             if delta_dml.handle(
                 self._cursor,
                 getattr(creds, "root_path", None),
@@ -47,6 +58,22 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
             ):
                 return self._cursor  # applied to Delta; nothing to run on DuckDB
         return super().execute(sql, bindings)
+
+    def _refresh_onelake_token(self, creds) -> None:
+        so = getattr(creds, "storage_options", None)
+        if not secret.bearer_token(so):
+            return
+        fresh = secret.refreshed(so)
+        if fresh is so:
+            return  # token still valid (the common path) — nothing to do
+        creds.storage_options = fresh  # keep the live copy DML/discovery read from in sync
+        try:
+            secret.ensure_azure_secret(self._cursor, fresh)  # re-mint the read secret on this connection
+            if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+                print("[duckrun-auth] execute: re-minted DuckDB secret with refreshed token", flush=True)
+        except Exception as e:  # best-effort: a transient refresh failure keeps the old secret
+            if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+                print(f"[duckrun-auth] execute: re-mint failed: {e!r}", flush=True)
 
 
 class DuckrunEnvironment(LocalEnvironment):

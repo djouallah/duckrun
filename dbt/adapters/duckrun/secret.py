@@ -53,6 +53,8 @@ def refreshed(storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, s
     # the full refresh+re-mint path on every model (a 30s build) instead of waiting for real expiry.
     forced = bool(os.environ.get("DUCKRUN_AUTH_FORCE_REFRESH"))
     expiring = forced or auth.token_is_expiring(tok)
+    if not expiring:
+        return storage_options  # cheap path — runs on every statement, so stays silent here
     if debug:
         exp = auth._token_expiry_epoch(tok)
         import time as _t
@@ -62,8 +64,6 @@ def refreshed(storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, s
             f"expiring={expiring} forced={forced}",
             flush=True,
         )
-    if not expiring:
-        return storage_options
     try:
         fresh = auth.refresh_storage_token()
     except Exception as e:
