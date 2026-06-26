@@ -44,20 +44,6 @@ EXCLUDE_COLS = {
     "user_plan_snapshot": _SCD2,
 }
 
-# Tables whose DOUBLE columns are compared rounded to cents instead of bit-exactly.
-# fct_mrr_daily's MRR columns are built by a parallel `GROUP BY sum(<double>)` (int_daily_mrr_changes)
-# feeding a running-`sum()` window (cumulative_mrr). DuckDB combines partial float sums in a
-# thread-scheduling order that depends on the runner's core count, so two INDEPENDENT builds drift in
-# the last ULPs (e.g. 24813.09999999998 vs 24813.10000000025). dbt-duckdb has the exact same behavior
-# — it is NOT a duckrun divergence (it reproduces locally only when the two builds happen to combine
-# identically). Every value here is genuine currency: measured residue from an exact cent is <= 3e-12
-# and zero rows are >1e-4 off a cent. So comparing rounded to cents drops only the float noise — it
-# changes no real value, has no boundary risk (values sit at cents, 0.005 from any rounding boundary),
-# and any real divergence >= $0.01 still fails. Same approach as the MRR fct_mrr_movements parity.
-# Non-float columns (keys, date_day, product, event_count) are always compared exactly.
-ROUND_CENTS_TABLES = {"fct_mrr_daily"}
-_FLOAT_TYPES = {"DOUBLE", "REAL", "FLOAT"}
-
 
 def sh(cmd, cwd=None, env=None):
     print(f"$ {' '.join(cmd)}  (cwd={cwd})")
@@ -71,12 +57,25 @@ def fresh_clone(dest: Path):
     sh(["git", "clone", "--depth", "1", REPO_URL, str(dest)])
 
 
-def build(dest: Path, profiles_dir: str, env_extra: dict):
-    """Run `dbt deps` + `dbt build`, verbatim, with the given profile (seeds + snapshots + models +
-    tests + unit tests). The raw parquet is committed in the repo, so no extract/generate step."""
+def build(dest: Path, profiles_dir: str, env_extra: dict, full_refresh: bool = False):
+    """Run `dbt deps` + `dbt build` with the given profile (seeds + snapshots + models + tests + unit
+    tests). The raw parquet is committed in the repo, so no extract/generate step.
+
+    full_refresh: pass `--full-refresh` so incremental models rebuild from scratch. Used for the
+    duckrun side, whose OneLake store PERSISTS across CI runs — without it, an incremental model left
+    from a prior run rebuilds incrementally (only the new-date batch) while the oracle, which always
+    gets a brand-new dev.duckdb, full-builds. That is fresh-vs-stale, not a real divergence: e.g.
+    fct_mrr_daily's cumulative_mrr is a `sum() over(...)` INSIDE its `where date_day > max` incremental
+    filter, so an incremental run can't see history outside the batch and resets to 0 — and dbt-duckdb
+    does the exact same thing (verified), so it's a project-model quirk, not a duckrun bug. --full-refresh
+    rebuilds via the normal Delta overwrite (a new version, history retained) — it never deletes the
+    OneLake table. The oracle needs no flag (a fresh db full-builds anyway), keeping it verbatim."""
     env = {**os.environ, **env_extra}
     sh(["dbt", "deps", "--profiles-dir", profiles_dir], cwd=dest, env=env)
-    sh(["dbt", "build", "--profiles-dir", profiles_dir], cwd=dest, env=env)
+    cmd = ["dbt", "build", "--profiles-dir", profiles_dir]
+    if full_refresh:
+        cmd.append("--full-refresh")
+    sh(cmd, cwd=dest, env=env)
 
 
 def _rows(con, select_sql):
@@ -141,21 +140,12 @@ def diff() -> bool:
             print(f"{schema}.{t:36} SKIP (not persisted by duckrun)")
             continue
         uri = _duckrun_uri(dr_schema, t)
-        ocols = c.execute(
-            "select column_name, data_type from duckdb_columns() where database_name='o' "
-            f"and schema_name='{schema}' and table_name='{t}' order by column_index").fetchall()
+        ocols = [r[0] for r in c.execute(
+            "select column_name from duckdb_columns() where database_name='o' "
+            f"and schema_name='{schema}' and table_name='{t}' order by column_index").fetchall()]
         drop = EXCLUDE_COLS.get(t, set())
-        round_cents = t in ROUND_CENTS_TABLES
-
-        def _expr(col, dtype):
-            q = '"' + col + '"'
-            # Round only this table's float columns to cents (see ROUND_CENTS_TABLES); everything else
-            # is compared bit-exactly. Applied identically to oracle and duckrun.
-            if round_cents and (dtype or "").upper() in _FLOAT_TYPES:
-                return f"round({q}, 2)"
-            return q
-
-        sel = ", ".join(_expr(col, dt) for col, dt in ocols if col not in drop)
+        cols = [col for col in ocols if col not in drop]
+        sel = ", ".join('"' + col + '"' for col in cols)
         o_rows = _rows(c, f'select {sel} from o."{schema}"."{t}"')
         d_rows = _rows(c, f"select {sel} from delta_scan('{uri}')")
         ok = o_rows == d_rows
@@ -164,17 +154,11 @@ def diff() -> bool:
             from collections import Counter
             co, cd = Counter(o_rows), Counter(d_rows)
             only_o, only_d = list((co - cd).elements()), list((cd - co).elements())
-            hdr = [col for col, _dt in ocols if col not in drop]
-            print(f"   diff: {len(only_o)} oracle-only, {len(only_d)} duckrun-only rows; cols={hdr}")
+            print(f"   diff: {len(only_o)} oracle-only, {len(only_d)} duckrun-only rows; cols={cols}")
             for tag, rows in (("oracle-only", only_o), ("duckrun-only", only_d)):
                 for r in rows[:6]:
                     print(f"     [{tag}] {r}")
-        bits = []
-        if drop:
-            bits.append(f"excl {sorted(drop)}")
-        if round_cents:
-            bits.append("floats rounded to cents")
-        note = f" ({'; '.join(bits)})" if bits else ""
+        note = f" (excl {sorted(drop)})" if drop else ""
         print(f"{schema}.{t:36} oracle={len(o_rows):<5} duckrun={len(d_rows):<5} "
               f"-> {'MATCH' if ok else 'MISMATCH'}{note}")
     return all_ok
@@ -183,13 +167,17 @@ def diff() -> bool:
 def main():
     fresh_clone(ORACLE_DIR)
     fresh_clone(DUCKRUN_DIR)
-    import shutil
-    if not _REMOTE:
-        shutil.rmtree(DUCKRUN_WH, ignore_errors=True)
-    # Oracle: the repo's OWN profile (type: duckdb, path: ./dev.duckdb) — zero external config.
+    # NB: the duckrun warehouse is NOT wiped — neither the local dir nor (especially) OneLake. The
+    # whole point is to prove --full-refresh rebuilds correctly OVER a persistent store: run twice and
+    # the second run still matches the oracle, exercising the same persist-then-overwrite path CI hits.
+    # Oracle: the repo's OWN profile (type: duckdb, path: ./dev.duckdb) — fresh dev.duckdb each run.
     build(ORACLE_DIR, str(ORACLE_DIR), {})
-    # duckrun: external profile here (type: duckrun, root_path -> Delta warehouse).
-    build(DUCKRUN_DIR, str(HERE), {"WAREHOUSE_PATH": DUCKRUN_WH, "DBT_SCHEMA": DUCKRUN_SCHEMA})
+    # duckrun: external profile here (type: duckrun, root_path -> Delta warehouse). --full-refresh so a
+    # persisted store (local OR OneLake) is rebuilt fresh — matching the always-fresh oracle — instead
+    # of an incremental model extending a prior run's table. Overwrites via the normal Delta write
+    # path (new version, history retained); never deletes. See build()'s docstring.
+    build(DUCKRUN_DIR, str(HERE), {"WAREHOUSE_PATH": DUCKRUN_WH, "DBT_SCHEMA": DUCKRUN_SCHEMA},
+          full_refresh=True)
     print("\n=== parity diff (duckrun Delta vs duckdb oracle) ===")
     ok = diff()
     print("\nPARITY:", "PASS — duckrun == dbt-duckdb on every persisted table" if ok else "FAIL")

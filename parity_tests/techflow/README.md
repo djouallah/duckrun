@@ -54,13 +54,14 @@ runs **green on duckrun**, unmodified. `stg_*`/`int_*` models are `view`s — du
 view, so they're intermediate-only and not part of the persisted diff.
 
 \* `fct_mrr_daily` stamps `loaded_at = current_timestamp` at build time (differs between two runs),
-so it is compared excluding `loaded_at`. Its MRR columns are `DOUBLE`s built by a parallel
-`GROUP BY sum(...)` feeding a running-`sum()` window, and DuckDB combines partial float sums in a
-thread-order that depends on the runner's core count — so two independent builds drift in the last
-ULPs (e.g. `24813.09999999998` vs `…10000000025`). dbt-duckdb has the identical behavior, so it is
-**not** a duckrun divergence. The values are genuine currency (every one is within ≤3e-12 of an exact
-cent), so these columns are compared **rounded to cents** — which drops only the float noise and still
-fails on any real ≥ $0.01 difference; keys, dates and `event_count` are compared exactly.
+so it is compared excluding `loaded_at`. It is also the only **incremental** model, and the duckrun
+side writes to a **persistent** OneLake store (the oracle always gets a brand-new `dev.duckdb`). So the
+duckrun build runs with `--full-refresh`, rebuilding it fresh — matching the oracle — rather than
+extending a table left from a prior run. (Why it matters: `cumulative_mrr` is a `sum() over(...)`
+*inside* the model's `where date_day > max(date_day)` incremental filter, so an incremental run can't
+see history outside the new-date batch and resets it to 0. dbt-duckdb does the **exact same thing** —
+verified — so it's a quirk of the project's SQL, not a duckrun bug. `--full-refresh` overwrites via the
+normal Delta write path; it never deletes the OneLake table.)
 \*\* snapshots are compared on their business columns; the SCD2 bookkeeping columns (`dbt_scd_id`,
 `dbt_updated_at`, `dbt_valid_from`, `dbt_valid_to`) are stamped per run.
 
