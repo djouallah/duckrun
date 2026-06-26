@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.27] - 2026-06-26
+
+### Fixed
+- **OneLake bearer-token refresh on long-running builds.** A build that outlives the token's ~1h
+  lifetime no longer 401s mid-run. The token is captured once at connection-open, so the adapter now
+  re-mints it at the universal cursor `execute()` choke point — covering not just per-model writes but
+  dbt's test/end-of-run reads, which run on a reused cursor — whenever the JWT is near expiry. The
+  fresh token comes from whatever live source is available: a Fabric notebook (`notebookutils`),
+  `azure-identity` (Azure CLI / managed identity), or GitHub Actions workload-identity federation. A
+  bare static token (`AZURE_STORAGE_TOKEN` with no live credential behind it) still can't self-refresh.
+
+### Changed
+- **Adapter version is single-sourced** from the installed package metadata, so it can no longer drift
+  from `pyproject.toml`.
+
 ## [0.3.26] - 2026-06-26
 
 ### Fixed
