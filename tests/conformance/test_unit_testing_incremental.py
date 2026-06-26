@@ -12,53 +12,84 @@ test itself. So the `incremental_strategy` does not, on its own, change a unit
 test's pass/fail.
 
 To make the strategy genuinely matter — and to stress duckrun's actual delta_rs
-write path — every case here runs `dbt build` **twice**:
-  * 1st build: creates the upstream model, runs the unit tests, creates the
-    incremental model (first run = overwrite).
-  * 2nd build: re-runs the unit tests AND performs the *real* incremental write
-    for that strategy (merge/insert/delete+insert/append/safeappend/microbatch).
-`run_dbt(["build"])` raises if any node (unit test, model, or data test) fails, so
-a green call means the whole combination held end to end.
+write path — every case here runs the model for REAL and then reads the resulting
+Delta table back and asserts its rows. The shared upstream is *windowed* by a
+`load` var so a second run delivers a genuine change (an existing key re-emitted
+with a new value at a later timestamp, plus a brand-new key):
+
+  * ``dbt run``                 — first load (var load=1): creates the model.
+  * ``dbt build``               — unit tests + a first, idempotent incremental
+                                  write (no new upstream rows yet); we assert the
+                                  table is unchanged (catches double-writes).
+  * ``dbt build --vars load=2`` — unit tests + the REAL incremental write of the
+                                  change; we assert the final rows match what THIS
+                                  strategy must produce.
+
+That final assertion is what distinguishes the strategies — merge UPDATES the
+re-emitted key, insert KEEPS the old value, delete+insert REPLACES it, and
+append/safeappend leave a SECOND copy. Without reading the rows back these were
+mere "does it crash" smoke tests; now wrong output fails the suite.
 
 Matrix axes: incremental_strategy × is_incremental(true/false) × key shape
 (none / single / composite) × incremental_predicates × key data type
 (int / date / timestamp / timestamptz / decimal) × fixture format
-(dict / csv / sql) × empty-`this` (simulated first load).
+(dict / csv / sql) × empty-`this`.
 
 These are bespoke (NOT vendored from dbt-duckdb). If a combination fails, that is a
 real duckrun finding — fix the adapter, never weaken the test.
 """
 import pytest
 
-from dbt.tests.util import run_dbt
+from dbt.tests.util import relation_from_name, run_dbt
 
 
-# A tiny upstream model. Its content is only used by `dbt build` (the unit tests
-# mock it); the columns/types are what matter. Safe types only (int/varchar/date).
+# Shared upstream, WINDOWED by a `load` var so a second run is a real change:
+#   load 1 -> {id 1: region a, ts 2024-01-01, amount 10}                       (initial)
+#   load 2 -> id 1 RE-EMITTED (region a, ts 2024-01-03, amount 99) + new id 2  (the change)
+# Deduped to the latest load per id so each window yields one row per id. Its content drives the
+# REAL build (the unit tests mock it); the columns/types are what the unit tests rely on.
 STG_SQL = """
-select
-    cast(1 as integer)         as id,
-    cast('a' as varchar)       as region,
-    cast('2024-01-01' as date) as ts,
-    cast(10 as integer)        as amount
+select id, region, ts, amount
+from (
+    select load, id, region, ts, amount,
+           row_number() over (partition by id order by load desc) as rn
+    from (
+        values
+          (1, 1, 'a', cast('2024-01-01' as date), 10),
+          (2, 1, 'a', cast('2024-01-03' as date), 99),
+          (2, 2, 'b', cast('2024-01-02' as date), 20)
+    ) as t(load, id, region, ts, amount)
+    where load <= {{ var('load', 1) }}
+) ranked
+where rn = 1
 """
+
+# Real-output expectations after the windowed change (for the id/region/amount models).
+_INIT_IRA = [("1", "a", "10")]                                  # after the idempotent re-run
+_FINAL_UPSERT = [("1", "a", "99"), ("2", "b", "20")]           # merge / delete+insert / dedup / composite
+_FINAL_INSERT = [("1", "a", "10"), ("2", "b", "20")]           # insert: existing key kept at old value
+_FINAL_APPEND = [("1", "a", "10"), ("1", "a", "99"), ("2", "b", "20")]  # append: a second copy of id 1
+_RESULT_IRA = "id, region, amount"
 
 
 class _IncrBase:
-    """Builds {stg_events, fct_events(+schema)} then exercises unit tests + writes.
+    """Builds {stg_events, fct_events(+schema)} then exercises unit tests + REAL writes + output.
 
     A unit test that references `input: this` needs the model relation to already
     exist (dbt reads the model's column TYPES off it — see dbt-core's
     get_fixture_sql.sql). Real projects always have a prior build; we mirror that by
     running `dbt run` first (models only, no unit tests), so the Delta `this`
     relation exists before the unit tests resolve it. The two following `dbt build`s
-    then run the unit tests AND the REAL incremental write for this strategy (1st =
-    already-created so it takes the incremental path; 2nd = a second incremental
-    write), so a green run means the whole combination held end to end.
+    then run the unit tests AND the REAL incremental write for this strategy, and we
+    read the Delta table back after each to assert the rows are exactly what the
+    strategy must produce — so a green run means the whole combination held end to end.
     """
 
     model_files: dict = {}
     build_extra: list = []
+    result_cols: str = _RESULT_IRA      # columns to read back from fct_events (schema-qualified at runtime)
+    expected_initial: list = None       # rows after the idempotent re-run (first build)
+    expected_final: list = None         # rows after the windowed change (second build)
 
     @pytest.fixture(scope="class")
     def models(self):
@@ -66,10 +97,17 @@ class _IncrBase:
         m.update(self.model_files)
         return m
 
+    def _rows(self, project):
+        rel = relation_from_name(project.adapter, "fct_events")
+        rows = project.run_sql(f"select {self.result_cols} from {rel}", fetch="all")
+        return sorted(tuple(str(c) for c in r) for r in rows)
+
     def test_unit_and_incremental(self, project):
-        run_dbt(["run", *self.build_extra])      # create the Delta model so `this` exists
-        run_dbt(["build", *self.build_extra])    # unit tests (this resolves) + incremental write
-        run_dbt(["build", *self.build_extra])    # again: a second real incremental write
+        run_dbt(["run", *self.build_extra])                 # create the Delta model so `this` exists
+        run_dbt(["build", *self.build_extra])               # unit tests + a first (idempotent) write
+        assert self._rows(project) == sorted(self.expected_initial), "idempotent re-run changed the table"
+        run_dbt(["build", *self.build_extra, "--vars", "{load: 2}"])  # unit tests + the REAL incr write
+        assert self._rows(project) == sorted(self.expected_final), "incremental write produced wrong rows"
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +170,8 @@ unit_tests:
 
 class TestIncrMergeIntKey(_IncrBase):
     model_files = {"fct_events.sql": _MERGE_MODEL, "schema.yml": _MERGE_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_UPSERT
 
 
 # ---------------------------------------------------------------------------
@@ -179,6 +219,8 @@ unit_tests:
 
 class TestIncrMergeCompositeKey(_IncrBase):
     model_files = {"fct_events.sql": _MERGE_COMPOSITE_MODEL, "schema.yml": _COMPOSITE_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_UPSERT
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +243,8 @@ where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }}
 
 class TestIncrDeleteInsertPredicates(_IncrBase):
     model_files = {"fct_events.sql": _DELINS_MODEL, "schema.yml": _MERGE_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_UPSERT
 
 
 # ---------------------------------------------------------------------------
@@ -218,6 +262,8 @@ where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }}
 
 class TestIncrInsertOnly(_IncrBase):
     model_files = {"fct_events.sql": _INSERT_MODEL, "schema.yml": _MERGE_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_INSERT       # id 1 NOT updated; only the new key 2 is inserted
 
 
 # ---------------------------------------------------------------------------
@@ -235,6 +281,8 @@ where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }}
 
 class TestIncrAppendNoKey(_IncrBase):
     model_files = {"fct_events.sql": _APPEND_MODEL, "schema.yml": _MERGE_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_APPEND       # blind append: a SECOND copy of id 1 (no dedup)
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +300,8 @@ where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }}
 
 class TestIncrSafeAppend(_IncrBase):
     model_files = {"fct_events.sql": _SAFEAPPEND_MODEL, "schema.yml": _MERGE_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_APPEND
 
 
 # ---------------------------------------------------------------------------
@@ -287,15 +337,27 @@ unit_tests:
 
 class TestIncrDedupQualify(_IncrBase):
     model_files = {"fct_events.sql": _DEDUP_MODEL, "schema.yml": _DEDUP_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_UPSERT       # full re-scan + dedup, upserted -> id 1 updated
 
 
 # ---------------------------------------------------------------------------
 # 8. TIMESTAMP (ntz) incremental key — probes duckrun's timestamp_ntz handling
 # ---------------------------------------------------------------------------
 _STG_TS_NTZ = """
-select cast(1 as integer) as id,
-       cast('2024-01-01 00:00:00' as timestamp) as event_ts,
-       cast(10 as integer) as amount
+select id, event_ts, amount
+from (
+    select load, id, event_ts, amount,
+           row_number() over (partition by id order by load desc) as rn
+    from (
+        values
+          (1, 1, cast('2024-01-01 00:00:00' as timestamp), 10),
+          (2, 1, cast('2024-01-02 12:30:00' as timestamp), 99),
+          (2, 2, cast('2024-01-02 00:00:00' as timestamp), 20)
+    ) as t(load, id, event_ts, amount)
+    where load <= {{ var('load', 1) }}
+) ranked
+where rn = 1
 """
 
 _TS_NTZ_MODEL = """
@@ -328,6 +390,10 @@ unit_tests:
 
 
 class TestIncrTimestampNtzKey(_IncrBase):
+    result_cols = "id, amount"
+    expected_initial = [("1", "10")]
+    expected_final = [("1", "99"), ("2", "20")]   # merge on a timestamp key: id 1 updated, id 2 added
+
     @pytest.fixture(scope="class")
     def models(self):
         return {"stg_ts.sql": _STG_TS_NTZ, "fct_events.sql": _TS_NTZ_MODEL, "schema.yml": _TS_NTZ_SCHEMA}
@@ -337,9 +403,19 @@ class TestIncrTimestampNtzKey(_IncrBase):
 # 9. TIMESTAMPTZ incremental key
 # ---------------------------------------------------------------------------
 _STG_TS_TZ = """
-select cast(1 as integer) as id,
-       cast('2024-01-01 00:00:00+00' as timestamptz) as event_ts,
-       cast(10 as integer) as amount
+select id, event_ts, amount
+from (
+    select load, id, event_ts, amount,
+           row_number() over (partition by id order by load desc) as rn
+    from (
+        values
+          (1, 1, cast('2024-01-01 00:00:00+00' as timestamptz), 10),
+          (2, 1, cast('2024-01-02 12:30:00+00' as timestamptz), 99),
+          (2, 2, cast('2024-01-02 00:00:00+00' as timestamptz), 20)
+    ) as t(load, id, event_ts, amount)
+    where load <= {{ var('load', 1) }}
+) ranked
+where rn = 1
 """
 
 _TS_TZ_MODEL = """
@@ -372,6 +448,10 @@ unit_tests:
 
 
 class TestIncrTimestampTzKey(_IncrBase):
+    result_cols = "id, amount"
+    expected_initial = [("1", "10")]
+    expected_final = [("1", "99"), ("2", "20")]   # merge on a timestamptz key: id 1 updated, id 2 added
+
     @pytest.fixture(scope="class")
     def models(self):
         return {"stg_ts.sql": _STG_TS_TZ, "fct_events.sql": _TS_TZ_MODEL, "schema.yml": _TS_TZ_SCHEMA}
@@ -411,6 +491,12 @@ unit_tests:
 
 
 class TestIncrDecimalMeasure(_IncrBase):
+    # Static upstream (one row): the point is decimal precision surviving the real delta_rs
+    # round-trip, so we assert the computed revenue rather than an incremental change.
+    result_cols = "id, revenue"
+    expected_initial = [("1", "12.02")]   # 3 * 4.005 = 12.015 -> decimal(12,2) -> 12.02
+    expected_final = [("1", "12.02")]
+
     @pytest.fixture(scope="class")
     def models(self):
         return {"stg_dec.sql": _STG_DEC, "fct_events.sql": _DEC_MODEL, "schema.yml": _DEC_SCHEMA}
@@ -447,6 +533,8 @@ unit_tests:
 
 class TestIncrFixtureCsv(_IncrBase):
     model_files = {"fct_events.sql": _MERGE_MODEL, "schema.yml": _CSV_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_UPSERT
 
 
 # ---------------------------------------------------------------------------
@@ -478,6 +566,8 @@ unit_tests:
 
 class TestIncrFixtureSql(_IncrBase):
     model_files = {"fct_events.sql": _MERGE_MODEL, "schema.yml": _SQL_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_UPSERT
 
 
 # ---------------------------------------------------------------------------
@@ -485,9 +575,9 @@ class TestIncrFixtureSql(_IncrBase):
 # ---------------------------------------------------------------------------
 _STG_MB = """
 {{ config(materialized='view', event_time='ts') }}
-select cast(1 as integer) as id,
-       cast('2024-01-01' as date) as ts,
-       cast(10 as integer) as amount
+select 1 as id, cast('2024-01-01' as date) as ts, 10 as amount
+union all
+select 2 as id, cast('2024-01-02' as date) as ts, 20 as amount
 """
 
 _MB_MODEL = """
@@ -520,8 +610,13 @@ unit_tests:
 
 
 class TestIncrMicrobatch(_IncrBase):
-    # Microbatch needs an event-time window; pin it so the batch set is deterministic.
+    # Microbatch needs an event-time window; pin it so the batch set is deterministic. Two daily
+    # batches (id 1 on day 1, id 2 on day 2) must both land in the real table. (Deep batching
+    # behaviour — reprocess / new-batch / lookback — lives in test_incremental_microbatch.py.)
     build_extra = ["--event-time-start", "2024-01-01", "--event-time-end", "2024-01-03"]
+    result_cols = "id, amount"
+    expected_initial = [("1", "10"), ("2", "20")]
+    expected_final = [("1", "10"), ("2", "20")]
 
     @pytest.fixture(scope="class")
     def models(self):
