@@ -91,8 +91,6 @@ class Plugin(BasePlugin):
                 except Exception as e:  # best-effort: a transient refresh failure keeps the old secret
                     if os.environ.get("DUCKRUN_AUTH_DEBUG"):
                         print(f"[duckrun-auth] configure_cursor: re-mint failed: {e!r}", flush=True)
-            elif os.environ.get("DUCKRUN_AUTH_DEBUG"):
-                print("[duckrun-auth] configure_cursor: token still fresh, no re-mint", flush=True)
 
     def _cursor(self):
         # Prefer the live per-model cursor (shares the session where pre-hook variables and

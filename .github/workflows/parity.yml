@@ -33,6 +33,11 @@ on:
       - 'dbt/include/duckrun/**'
       - '.github/workflows/parity.yml'
   workflow_dispatch:
+    inputs:
+      run_tuva:
+        description: "Also run the heavy Tuva build (hours on OneLake) — off by default."
+        type: boolean
+        default: false
 
 # id-token for the OIDC Azure login (mints the OneLake token); contents to checkout.
 permissions:
@@ -237,9 +242,10 @@ jobs:
   tuva:
     # Heavy (~40 min): the full Tuva data model (every vertical, synthetic_data_size=small) built
     # UNMODIFIED on duckrun → OneLake. `dbt build` runs Tuva's own models, snapshots, data-quality and
-    # tests, so green here means the DuckDB/Delta port reproduces Tuva's expected results. Manual-only
-    # (workflow_dispatch) so it doesn't run on every push.
-    if: github.event_name == 'workflow_dispatch'
+    # tests, so green here means the DuckDB/Delta port reproduces Tuva's expected results. Opt-in only:
+    # even on a manual dispatch it stays skipped unless run_tuva is ticked, because the build runs for
+    # HOURS on OneLake (the token-refresh fix lets it outlive the ~1h token — verified at ~5h).
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_tuva }}
     runs-on: ubuntu-latest
     concurrency:
       group: parity-tuva-onelake
