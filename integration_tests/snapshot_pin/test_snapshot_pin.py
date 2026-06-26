@@ -240,6 +240,23 @@ def test_plain_append_is_unfenced_but_nondestructive(tmp_path):
     assert rows == {**_seed_rows(), 1: 999, 11: 110}  # writer's 999 kept AND our id=11 landed
 
 
+def test_insert_content(tmp_path):
+    """insert-only upsert: the matched key id=1 is NOT updated; only the new key id=11 is inserted."""
+    wh, path = _warehouse(tmp_path, "events_insert")
+    assert _dbt(wh, "events_insert").success          # seed ids 1..10
+    assert _dbt(wh, "events_insert").success          # batch: id=1 skipped, id=11 inserted
+    assert _rows(path) == {**_seed_rows(), 11: 110}
+
+
+def test_insert_race_is_fenced(tmp_path):
+    """insert-only routes through the fenced merge_delta. Even though the batch only INSERTs a
+    disjoint new key (id=11), delta-rs's OCC still refuses the commit when a foreign writer landed
+    since vB ("a concurrent transactions added new data") — so the run fails loud, no lost update."""
+    res, rows = _race(tmp_path, "events_insert", ["merge_delta"])
+    assert not res.success                          # OCC conflict — the run failed
+    assert rows == {**_seed_rows(), 1: 999}         # writer's 999 stands; batch (id=11) never landed
+
+
 def test_full_overwrite_is_unfenced_last_writer_wins(tmp_path):
     """A full-rebuild `table` model is UNFENCED by design: the overwrite replaces the whole table, so
     a concurrent commit mid-run is clobbered (last-writer-wins). This is correct — a full refresh is
