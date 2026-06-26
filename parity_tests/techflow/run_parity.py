@@ -160,6 +160,15 @@ def diff() -> bool:
         d_rows = _rows(c, f"select {sel} from delta_scan('{uri}')")
         ok = o_rows == d_rows
         all_ok = all_ok and ok
+        if not ok:  # show what actually diverges (multiset diff), so a CI mismatch is diagnosable
+            from collections import Counter
+            co, cd = Counter(o_rows), Counter(d_rows)
+            only_o, only_d = list((co - cd).elements()), list((cd - co).elements())
+            hdr = [col for col, _dt in ocols if col not in drop]
+            print(f"   diff: {len(only_o)} oracle-only, {len(only_d)} duckrun-only rows; cols={hdr}")
+            for tag, rows in (("oracle-only", only_o), ("duckrun-only", only_d)):
+                for r in rows[:6]:
+                    print(f"     [{tag}] {r}")
         bits = []
         if drop:
             bits.append(f"excl {sorted(drop)}")
