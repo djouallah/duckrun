@@ -455,6 +455,19 @@ class TestDeltaTable:
             .whenMatchedUpdate(set={"val": "source.val"}).whenNotMatchedInsertAll().execute()
         assert conn.sql("select val from m where id = 1").fetchone()[0] == 555
 
+    def test_merge_rejects_duplicate_source_keys(self, conn):
+        # Parity with the dbt merge strategy: a keyed upsert whose SOURCE has two rows for one key
+        # must FAIL LOUD (delta_rs would otherwise silently produce duplicate target rows), exactly
+        # like the dbt incremental merge. Both land in engine.merge_delta_clauses -> same behaviour.
+        self._seed(conn)
+        src = conn.sql("select * from (values (2,99),(2,98)) t(id, val)")  # duplicate id=2
+        with pytest.raises(Exception, match="(?i)unique|duplicate"):
+            DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
+                .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        # and the table is untouched (the guard runs before any write)
+        assert conn.table("m").count() == 3
+        assert conn.sql("select val from m where id = 2").fetchone()[0] == 10
+
     def test_merge_insert_only(self, conn):
         self._seed(conn)
         src = conn.sql("select * from (values (2,99),(5,99)) t(id, val)")

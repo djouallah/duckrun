@@ -1224,6 +1224,35 @@ def _apply_merge_clause(merger, c: dict):
     raise ValueError(f"unsupported merge clause/action: {clause}/{action}")
 
 
+# Equality pair in a MERGE ON predicate, either order: `source.x = target.y` / `target.y = source.x`.
+_MERGE_EQ_RE = re.compile(r'(?i)(source|target)\.("?)(\w+)\2\s*=\s*(source|target)\.("?)(\w+)\5')
+
+
+def _merge_source_keys(predicate: str) -> List[str]:
+    """The SOURCE-side columns of each ``target.col = source.col`` equality in a MERGE ON predicate.
+
+    Used to enforce the keyed-merge cardinality rule (the source must be unique on the join key).
+    Returns ``[]`` when the predicate isn't a plain AND-of-equalities — an ``OR`` (or a non-equality
+    join) means per-key uniqueness no longer bounds how many source rows can match a target row, so
+    we don't guess and skip the guard there (advanced merges with no dbt-strategy equivalent)."""
+    if not predicate or re.search(r'(?i)\bor\b', predicate):
+        return []
+    keys: List[str] = []
+    for m in _MERGE_EQ_RE.finditer(predicate):
+        lside, lcol, rside, rcol = m.group(1).lower(), m.group(3), m.group(4).lower(), m.group(6)
+        if lside == "source" and rside == "target":
+            keys.append(lcol)
+        elif lside == "target" and rside == "source":
+            keys.append(rcol)
+    seen: set = set()
+    out: List[str] = []
+    for k in keys:
+        if k.lower() not in seen:
+            seen.add(k.lower())
+            out.append(k)
+    return out
+
+
 def merge_delta_clauses(
     path: str,
     data,
@@ -1286,6 +1315,42 @@ def merge_delta_clauses(
         )
     if not clauses:
         raise ValueError("merge has no clauses")
+
+    # Cardinality guard — applied to EVERY merge path (the dbt materialization, raw-SQL MERGE, and the
+    # DataFrame DeltaTable.merge all land here), so a keyed upsert behaves identically across them. A
+    # keyed merge/insert cannot resolve two source rows for one target row: Spark/Snowflake/BigQuery
+    # raise, but delta_rs silently produces duplicate rows. So when the merge has an update/insert
+    # clause keyed on an equality predicate, require the source to be unique on that key. Skipped when
+    # streamed_exec is set (the caller has a huge source it explicitly does NOT want collected) or when
+    # the predicate isn't a plain AND-of-equalities (OR / non-equality / by-source-only — no key to check).
+    _has_upsert = any(
+        c.get("clause") in ("matched", "not_matched")
+        and c.get("action") in ("update", "update_all", "insert", "insert_all")
+        for c in clauses
+    )
+    if _has_upsert and not streamed_exec and hasattr(data, "query"):
+        src_keys = _merge_source_keys(predicate)
+        if src_keys:
+            keycols = ", ".join('"' + k.replace('"', '""') + '"' for k in src_keys)
+            try:
+                dup = data.query(
+                    "__merge_src",
+                    f"SELECT {keycols}, count(*) AS __n FROM __merge_src "
+                    f"GROUP BY {keycols} HAVING count(*) > 1 LIMIT 1",
+                ).fetchone()
+            except Exception as e:  # never let the guard ITSELF break a valid merge; surface and proceed
+                logger.warning(f"merge duplicate-key guard could not run ({e!r}); proceeding")
+                dup = None
+            if dup is not None:
+                keyval = ", ".join(f"{k}={v!r}" for k, v in zip(src_keys, dup[:-1]))
+                raise ValueError(
+                    f"MERGE source is not unique on the join key ({', '.join(src_keys)}): "
+                    f"{dup[-1]} rows for {keyval}. A keyed merge/insert cannot resolve duplicate "
+                    f"source keys — Spark, Snowflake and BigQuery raise the same error, and delta_rs "
+                    f"would silently produce duplicate rows. Deduplicate the source, e.g. "
+                    f"qualify row_number() over (partition by {keycols} order by <tiebreak>) = 1."
+                )
+
     dt = _delta_table(path, storage_options)
     # Pin the target to the snapshot the model read (vB) so OCC validates (vB, HEAD] — one snapshot
     # for both the read and the commit.
