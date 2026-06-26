@@ -10,7 +10,8 @@ name: cores
 #                               (tests/connection_api/test_connection_api.py: the per-method matrix,
 #                               the local-fs contract/discovery tests, the conn.sql raw-DML matrix,
 #                               AND the cross-API write-correctness matrix), engine-level snapshot-pin
-#                               correctness, and the single-snapshot MERGE through a real dbt run.
+#                               correctness, the single-snapshot MERGE through a real dbt run, and dbt
+#                               native unit tests (given/expect value rows) on the duckrun adapter.
 #   • conformance             — the official dbt adapter conformance suite, gated on REGRESSIONS
 #                               only (baseline diff). Refreshes the README card on push to main.
 #   • connection-card         — the duckrun.connect() per-method ✅/❌ scorecard, rendered from the
@@ -97,6 +98,15 @@ jobs:
         run: |
           python -m pytest \
             integration_tests/snapshot_pin/test_snapshot_pin.py \
+            -q -p no:cacheprovider
+
+      - name: dbt native unit tests on duckrun (realistic jaffle-style project)
+        # A small seeds -> staging -> marts project carrying dbt `unit_tests:` (given/expect value
+        # rows, incl. the dim_customers email-validation case). Proves the native unit-test feature
+        # works on the duckrun adapter end to end via `dbt build`, plus a real-Delta read-back.
+        run: |
+          python -m pytest \
+            tests/dbt_unit_tests/test_dbt_unit_tests.py \
             -q -p no:cacheprovider
 
   conformance:

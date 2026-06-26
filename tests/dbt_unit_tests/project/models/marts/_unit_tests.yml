@@ -1,0 +1,111 @@
+unit_tests:
+
+  # --- the canonical email-validation test (given rows -> expected is_valid_email_address) ---------
+  - name: test_is_valid_email_address
+    description: >
+      is_valid_email_address captures the known edge cases — emails without a dot, without an @,
+      and from a domain that isn't in the accepted list.
+    model: dim_customers
+    given:
+      - input: ref('stg_customers')
+        format: dict
+        rows:
+          - {email: cool@example.com,    email_top_level_domain: example.com}
+          - {email: cool@unknown.com,    email_top_level_domain: unknown.com}
+          - {email: badgmail.com,        email_top_level_domain: gmail.com}
+          - {email: missingdot@gmailcom, email_top_level_domain: gmail.com}
+      - input: ref('top_level_email_domains')
+        format: dict
+        rows:
+          - {tld: example.com}
+          - {tld: gmail.com}
+    expect:
+      format: dict
+      rows:
+        - {email: cool@example.com,    is_valid_email_address: true}
+        - {email: cool@unknown.com,    is_valid_email_address: false}
+        - {email: badgmail.com,        is_valid_email_address: false}
+        - {email: missingdot@gmailcom, is_valid_email_address: false}
+
+  # --- more email edge cases: uppercase, plus-addressing, subdomain, empty local part -------------
+  - name: test_valid_email_more_edge_cases
+    description: "Uppercase + plus-addressing validate; an unaccepted subdomain and an empty local part don't."
+    model: dim_customers
+    given:
+      - input: ref('stg_customers')
+        format: dict
+        rows:
+          - {email: Alice.Smith@Example.com, email_top_level_domain: example.com}
+          - {email: bob+promo@example.com,   email_top_level_domain: example.com}
+          - {email: carol@mail.gmail.com,    email_top_level_domain: mail.gmail.com}
+          - {email: "@example.com",          email_top_level_domain: example.com}
+      - input: ref('top_level_email_domains')
+        format: dict
+        rows:
+          - {tld: example.com}
+          - {tld: gmail.com}
+    expect:
+      format: dict
+      rows:
+        - {email: Alice.Smith@Example.com, is_valid_email_address: true}
+        - {email: bob+promo@example.com,   is_valid_email_address: true}
+        - {email: carol@mail.gmail.com,    is_valid_email_address: false}
+        - {email: "@example.com",          is_valid_email_address: false}
+
+  # --- staging logic: the top-level domain is everything after @, lowercased --------------------
+  - name: test_stg_customers_extracts_tld
+    description: "email_top_level_domain is the part after @, lowercased (regardless of input casing)."
+    model: stg_customers
+    given:
+      - input: ref('raw_customers')
+        format: dict
+        rows:
+          - {customer_id: 1, first_name: alice, last_name: smith, email: alice@Example.COM}
+          - {customer_id: 2, first_name: bob,   last_name: jones, email: bob@sub.gmail.com}
+    expect:
+      format: dict
+      rows:
+        - {customer_id: 1, email_top_level_domain: example.com}
+        - {customer_id: 2, email_top_level_domain: sub.gmail.com}
+
+  # --- staging logic: the large-order flag flips at exactly $100 --------------------------------
+  - name: test_stg_orders_is_large_order
+    description: "is_large_order is true iff amount >= 100 (boundary lands on 100)."
+    model: stg_orders
+    given:
+      - input: ref('raw_orders')
+        format: dict
+        rows:
+          - {order_id: 1, customer_id: 1, amount: 99.99,  status: completed}
+          - {order_id: 2, customer_id: 1, amount: 100.00, status: completed}
+          - {order_id: 3, customer_id: 1, amount: 250.00, status: completed}
+    expect:
+      format: dict
+      rows:
+        - {order_id: 1, is_large_order: false}
+        - {order_id: 2, is_large_order: true}
+        - {order_id: 3, is_large_order: true}
+
+  # --- mart aggregation: counts/sums per customer; a customer with no orders still appears -------
+  - name: test_customer_orders_aggregation
+    description: "Per-customer order_count/total/has_large_order; a customer with no orders is 0/0/false."
+    model: customer_orders
+    given:
+      - input: ref('stg_customers')
+        format: dict
+        rows:
+          - {customer_id: 1, first_name: Alice}
+          - {customer_id: 2, first_name: Bob}
+          - {customer_id: 3, first_name: Carol}
+      - input: ref('stg_orders')
+        format: dict
+        rows:
+          - {order_id: 10, customer_id: 1, amount: 120.0, is_large_order: true}
+          - {order_id: 11, customer_id: 1, amount: 30.0,  is_large_order: false}
+          - {order_id: 12, customer_id: 2, amount: 50.0,  is_large_order: false}
+    expect:
+      format: dict
+      rows:
+        - {customer_id: 1, num_orders: 2, total_amount: 150.0, has_large_order: true}
+        - {customer_id: 2, num_orders: 1, total_amount: 50.0,  has_large_order: false}
+        - {customer_id: 3, num_orders: 0, total_amount: 0,     has_large_order: false}

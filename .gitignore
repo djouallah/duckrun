@@ -65,6 +65,8 @@ conformance.xml
 !integration_tests/**/*.json
 # ...and the vendored connection-API fixtures (coffee dimension CSVs)
 !tests/connection_api/**/*.csv
+# ...and the native-unit-test project's seeds (raw_customers / raw_orders / top_level_email_domains)
+!tests/dbt_unit_tests/**/*.csv
 
 # Keep the Claude Code plugin marketplace manifests (the *.json rule above ignores them)
 !.claude-plugin/marketplace.json
@@ -80,6 +82,11 @@ integration_tests/*/target/
 integration_tests/*/dbt_packages/
 integration_tests/*/logs/
 integration_tests/*/package-lock.yml
+# dbt run artifacts from the native-unit-test project (the harness runs dbt build into PROJECT_DIR)
+tests/dbt_unit_tests/project/target/
+tests/dbt_unit_tests/project/dbt_packages/
+tests/dbt_unit_tests/project/logs/
+tests/dbt_unit_tests/project/.user.yml
 # Runtime artifacts from the performance projects (merge_spill / tpch write to external dirs by
 # default, but a local run may drop these inside the project)
 performance_test/*/warehouse/

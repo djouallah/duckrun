@@ -1,0 +1,27 @@
+name: 'dbt_unit_tests'
+version: '1.0.0'
+
+profile: 'dbt_unit_tests'
+
+model-paths: ["models"]
+seed-paths: ["seeds"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+# A small, realistic jaffle-style project (seeds -> staging -> marts with real business logic, incl.
+# the email-validation `dim_customers`) that materializes REAL Delta tables through duckrun. Its
+# point is to carry dbt NATIVE unit tests (the `unit_tests:` given/expect blocks in
+# models/marts/_unit_tests.yml) with explicit value rows — run on duckrun via `dbt build`.
+models:
+  dbt_unit_tests:
+    +materialized: table
+
+seeds:
+  dbt_unit_tests:
+    raw_orders:
+      # Without this, CSV inference reads amount as an integer type, so a unit-test fixture value
+      # like 99.99 rounds to 100 and the is_large_order boundary test is wrong. Pin it to double.
+      +column_types:
+        amount: double
