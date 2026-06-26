@@ -6,6 +6,7 @@ connection (``configure_connection``), and on ``store()`` hands the model relati
 straight to delta_rs. DuckDB relations expose the Arrow C-stream interface, which
 deltalake 1.x consumes directly, so there is no pyarrow dependency.
 """
+import os
 import re
 from typing import Any, Optional
 
@@ -85,8 +86,13 @@ class Plugin(BasePlugin):
                 self._storage_options = fresh
                 try:
                     secret.ensure_azure_secret(cursor, fresh)  # re-mint the read secret with it
-                except Exception:  # best-effort: a transient refresh failure keeps the old secret
-                    pass
+                    if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+                        print("[duckrun-auth] configure_cursor: re-minted DuckDB secret with refreshed token", flush=True)
+                except Exception as e:  # best-effort: a transient refresh failure keeps the old secret
+                    if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+                        print(f"[duckrun-auth] configure_cursor: re-mint failed: {e!r}", flush=True)
+            elif os.environ.get("DUCKRUN_AUTH_DEBUG"):
+                print("[duckrun-auth] configure_cursor: token still fresh, no re-mint", flush=True)
 
     def _cursor(self):
         # Prefer the live per-model cursor (shares the session where pre-hook variables and

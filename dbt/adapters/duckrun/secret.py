@@ -42,18 +42,40 @@ def refreshed(storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, s
     pay nothing.
     """
     tok = bearer_token(storage_options)
+    debug = os.environ.get("DUCKRUN_AUTH_DEBUG")
     if not tok:
         return storage_options
     try:
         from duckrun import auth  # lazy: keep the adapter importable without the connect package
     except Exception:
         return storage_options
-    if not auth.token_is_expiring(tok):
+    # DUCKRUN_AUTH_FORCE_REFRESH treats the token as always expiring — a CI escape hatch to exercise
+    # the full refresh+re-mint path on every model (a 30s build) instead of waiting for real expiry.
+    forced = bool(os.environ.get("DUCKRUN_AUTH_FORCE_REFRESH"))
+    expiring = forced or auth.token_is_expiring(tok)
+    if debug:
+        exp = auth._token_expiry_epoch(tok)
+        import time as _t
+        remaining = None if exp is None else round(exp - _t.time())
+        print(
+            f"[duckrun-auth] refreshed: tok_len={len(tok)} exp={exp} remaining={remaining}s "
+            f"expiring={expiring} forced={forced}",
+            flush=True,
+        )
+    if not expiring:
         return storage_options
     try:
         fresh = auth.refresh_storage_token()
-    except Exception:
+    except Exception as e:
+        if debug:
+            print(f"[duckrun-auth] refresh_storage_token raised: {e!r}", flush=True)
         fresh = None
+    if debug:
+        print(
+            f"[duckrun-auth] refresh result: "
+            f"{('OK len=%d' % len(fresh)) if fresh else 'NONE'} changed={bool(fresh and fresh != tok)}",
+            flush=True,
+        )
     if not fresh or fresh == tok:
         return storage_options  # best effort — keep the (stale) token; nothing better available
     out = dict(storage_options)
