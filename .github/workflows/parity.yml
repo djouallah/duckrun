@@ -56,6 +56,10 @@ jobs:
       # The azure extension's default transport fails the OneLake TLS handshake on the runner; curl
       # respects the system CA bundle (same as the integration suite).
       AZURE_TRANSPORT_OPTION_TYPE: curl
+      # Workload-identity federation, for re-minting the OneLake token if a long build outlives it
+      # (auth._github_oidc_token). No-op on short jobs (the token never nears expiry); harmless here.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -100,6 +104,8 @@ jobs:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       DBT_SCHEMA: parity_sde
       AZURE_TRANSPORT_OPTION_TYPE: curl
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -145,6 +151,8 @@ jobs:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       DBT_SCHEMA: parity_mrr
       AZURE_TRANSPORT_OPTION_TYPE: curl
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -192,6 +200,8 @@ jobs:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       DBT_SCHEMA: parity_techflow
       AZURE_TRANSPORT_OPTION_TYPE: curl
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -242,6 +252,10 @@ jobs:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       AZURE_TRANSPORT_OPTION_TYPE: curl
       DBT_SCHEMA: tuva
+      # Workload-identity federation: lets the adapter re-mint the OneLake token mid-build when this
+      # ~40-66 min run outlives the ~1h token (auth._github_oidc_token / secret.refreshed).
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5

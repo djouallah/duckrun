@@ -58,13 +58,62 @@ def _azure_identity_token() -> Optional[str]:
     return None
 
 
+def _github_oidc_assertion() -> Optional[str]:
+    """A FRESH GitHub Actions OIDC JWT to present as an Azure AD client assertion, or None when not
+    running under GitHub Actions with ``id-token: write``. The request endpoint
+    (``ACTIONS_ID_TOKEN_REQUEST_URL``) stays live for the whole job and mints a new JWT on every call,
+    so it can re-authenticate long after the initial login token has expired — which is exactly what a
+    multi-hour OneLake build needs."""
+    import urllib.request
+
+    req_url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+    req_tok = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+    if not (req_url and req_tok):
+        return None
+    # api://AzureADTokenExchange is the audience azure/login configures the federated credential for.
+    sep = "&" if "?" in req_url else "?"
+    request = urllib.request.Request(
+        f"{req_url}{sep}audience=api://AzureADTokenExchange",
+        headers={"Authorization": f"Bearer {req_tok}"},
+    )
+    with urllib.request.urlopen(request, timeout=15) as resp:  # nosec - GitHub-internal endpoint
+        return json.loads(resp.read().decode()).get("value")
+
+
+def _github_oidc_token() -> Optional[str]:
+    """A storage token via GitHub Actions **workload-identity federation**: exchange a fresh GitHub
+    OIDC JWT for an Azure AD storage token (client-assertion flow — no client secret, no refresh
+    token). This keeps working after an ``az``-CLI session token has expired, which the CLI cannot
+    renew under OIDC (the federated assertion it logged in with is long gone), so it is the one source
+    that survives a build longer than the token's ~1h life. None unless running under GitHub Actions
+    with ``AZURE_CLIENT_ID`` / ``AZURE_TENANT_ID`` set and azure-identity present."""
+    client_id = os.environ.get("AZURE_CLIENT_ID")
+    tenant_id = os.environ.get("AZURE_TENANT_ID")
+    if not (client_id and tenant_id and os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")):
+        return None
+    try:
+        from azure.identity import ClientAssertionCredential
+    except ImportError:
+        return None
+    try:
+        cred = ClientAssertionCredential(tenant_id, client_id, _github_oidc_assertion)
+        return cred.get_token(_STORAGE_SCOPE).token
+    except Exception:
+        return None
+
+
 def get_onelake_token() -> str:
     """Return a OneLake storage bearer token, trying Fabric → env → azure-identity in turn.
 
     Raises ``RuntimeError`` with actionable guidance if none is available, rather than handing
     back an empty/placeholder token that would fail later as an opaque 403.
     """
-    token = _fabric_token() or os.environ.get("AZURE_STORAGE_TOKEN") or _azure_identity_token()
+    token = (
+        _fabric_token()
+        or _github_oidc_token()
+        or os.environ.get("AZURE_STORAGE_TOKEN")
+        or _azure_identity_token()
+    )
     if token:
         return token
     raise RuntimeError(
@@ -98,7 +147,10 @@ def token_is_expiring(token: Optional[str], margin_seconds: int = 600) -> bool:
 
 def refresh_storage_token() -> Optional[str]:
     """A FRESH OneLake storage token from a *live, self-refreshing* source — the Fabric notebook
-    runtime, then ``azure-identity`` (Azure CLI / managed identity). Deliberately SKIPS the static
-    ``AZURE_STORAGE_TOKEN`` env var, which is exactly what may have gone stale on a long run. Returns
-    None when no live source is available (then the caller keeps the token it has)."""
-    return _fabric_token() or _azure_identity_token()
+    runtime, then GitHub Actions workload-identity federation, then ``azure-identity`` (Azure CLI /
+    managed identity). Deliberately SKIPS the static ``AZURE_STORAGE_TOKEN`` env var, which is exactly
+    what may have gone stale on a long run. The GitHub-OIDC source is ordered before plain
+    azure-identity because, under OIDC CI, ``AzureCliCredential`` cannot renew an expired token (no
+    refresh token) whereas re-exchanging a fresh OIDC assertion always can. Returns None when no live
+    source is available (then the caller keeps the token it has)."""
+    return _fabric_token() or _github_oidc_token() or _azure_identity_token()
