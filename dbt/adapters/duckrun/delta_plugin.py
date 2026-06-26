@@ -198,9 +198,10 @@ class Plugin(BasePlugin):
         strategy = strategy or ("merge" if unique_key else "append")
 
         # delete+insert: delete the target rows whose unique_key appears in the incoming batch, then
-        # insert EVERY incoming row (duplicates preserved) — one atomic replaceWhere fenced to vB. NOT
-        # an alias for merge: merge UPDATEs matched rows and rejects duplicate source keys, whereas
-        # delete+insert replaces whole rows and tolerates duplicate keys — matching dbt-duckdb exactly.
+        # insert EVERY incoming row (duplicates preserved) — computed in DuckDB and written as a
+        # fenced full-table overwrite (overwrite_if_unchanged, CAS to vB). NOT an alias for merge:
+        # merge UPDATEs matched rows and rejects duplicate source keys, whereas delete+insert replaces
+        # whole rows and tolerates duplicate keys — matching dbt-duckdb exactly.
         if strategy in ("delete+insert", "delete_insert"):
             if not unique_key:
                 raise ValueError("incremental_strategy='delete+insert' requires a unique_key.")
@@ -406,12 +407,27 @@ class Plugin(BasePlugin):
             f"UNION ALL SELECT * FROM {name}"
         )
         try:
-            engine.write_delta(
-                path, cur.sql(f'SELECT * FROM "{tmp}"'), "overwrite",
-                partition_by=partition_by,
-                storage_options=storage_options,
-                compaction_threshold=self._compaction_threshold,
-            )
+            data = cur.sql(f'SELECT * FROM "{tmp}"')
+            if read_version is not None:
+                # Fence the overwrite to vB (the version the kept rows were read at): CAS via
+                # overwrite_if_unchanged so a writer that committed since vB fails the run loudly
+                # instead of being silently clobbered by this full-table overwrite. Same snapshot
+                # for the read (delta_scan version => vB above) and the commit, exactly like merge.
+                engine.overwrite_if_unchanged(
+                    path, data,
+                    read_version=read_version,
+                    partition_by=partition_by,
+                    storage_options=storage_options,
+                    compaction_threshold=self._compaction_threshold,
+                )
+            else:
+                # No prior version to pin (brand-new table / first build) — nothing to fence against.
+                engine.write_delta(
+                    path, data, "overwrite",
+                    partition_by=partition_by,
+                    storage_options=storage_options,
+                    compaction_threshold=self._compaction_threshold,
+                )
         finally:
             cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
 

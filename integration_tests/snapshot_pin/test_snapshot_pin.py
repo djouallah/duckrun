@@ -48,13 +48,13 @@ PROJECT_DIR = str(Path(__file__).parent)
 SCHEMA = "main"
 
 
-def _dbt(warehouse: str) -> object:
-    """One in-process `dbt run --select events` against a local-fs warehouse. Returns the
+def _dbt(warehouse: str, model: str = "events") -> object:
+    """One in-process `dbt run --select <model>` against a local-fs warehouse. Returns the
     dbtRunnerResult (`.success`, `.result`, `.exception`)."""
     os.environ["WAREHOUSE_PATH"] = warehouse
     os.environ["DBT_SCHEMA"] = SCHEMA
     return dbtRunner().invoke(
-        ["run", "--select", "events", "--project-dir", PROJECT_DIR, "--profiles-dir", PROJECT_DIR]
+        ["run", "--select", model, "--project-dir", PROJECT_DIR, "--profiles-dir", PROJECT_DIR]
     )
 
 
@@ -64,9 +64,9 @@ def _rows(path: str) -> dict:
     return dict(zip(t.column("id").to_pylist(), t.column("value").to_pylist()))
 
 
-def _warehouse(tmp_path) -> tuple:
+def _warehouse(tmp_path, model: str = "events") -> tuple:
     wh = (tmp_path / "wh").as_posix()          # forward slashes so delta paths are clean on Windows
-    return wh, f"{wh}/{SCHEMA}/events"
+    return wh, f"{wh}/{SCHEMA}/{model}"
 
 
 # ------------------------------------------------------- 1. baseline: no concurrent writer
@@ -111,6 +111,56 @@ def test_pin_fails_the_run_when_a_writer_commits_during_the_merge(tmp_path):
     rows = _rows(path)
     assert rows[1] == 999                         # the concurrent writer's value stands (not 111) ...
     assert rows == {**_seed_rows(), 1: 999}       # ... and our merge never landed (no lost update)
+
+
+# --------------------- 2b. SAME race, delete+insert strategy -> its overwrite must be fenced too
+
+def test_delete_insert_pin_fails_the_run_when_a_writer_commits_during_the_run(tmp_path):
+    """delete+insert is a read-modify-write too: duckrun reads the kept rows pinned to vB and writes
+    (kept rows UNION the batch) back as a FULL-table overwrite. That overwrite must be fenced to vB
+    just like the merge — otherwise a concurrent writer that commits during the run is silently
+    clobbered (a lost update, *worse* than classic row-level delete+insert, which preserves untouched
+    rows). Same concurrent-writer race as the merge case (test above), against the delete+insert model.
+
+    The foreign commit is landed inside whichever write the store path calls — we patch BOTH the fenced
+    primitive (engine.overwrite_if_unchanged, used today) and the unfenced one (engine.write_delta,
+    the pre-fix behaviour) — so this stays a real regression guard: if the write ever reverts to the
+    unfenced overwrite, the run would SUCCEED and lose 999, tripping the `not res.success` assert."""
+    wh, path = _warehouse(tmp_path, "events_di")
+    assert _dbt(wh, "events_di").success         # seed -> v0 {1:10 .. 10:100}
+
+    real_oiu = engine.overwrite_if_unchanged
+    real_wd = engine.write_delta
+    fired = []
+
+    def _concurrent_once(p):
+        # Another writer commits to the SAME table now — after this run captured vB but before it
+        # commits its own overwrite. This moves HEAD into the fenced commit's (vB, HEAD] window. Fire
+        # exactly once so the table advances v0 -> v1 regardless of how many writes the run issues.
+        if not fired:
+            fired.append(True)
+            DeltaTable(p).update(predicate="id = 1", updates={"value": "999"})   # v0 -> v1
+
+    def wrapped_oiu(*a, **kw):
+        _concurrent_once(a[0])
+        return real_oiu(*a, **kw)                 # pinned overwrite -> CAS conflict -> raises
+
+    def wrapped_wd(*a, **kw):
+        _concurrent_once(a[0])
+        return real_wd(*a, **kw)                  # unfenced fallback (pre-fix) -> would clobber 999
+
+    engine.overwrite_if_unchanged = wrapped_oiu
+    engine.write_delta = wrapped_wd
+    try:
+        res = _dbt(wh, "events_di")
+    finally:
+        engine.overwrite_if_unchanged = real_oiu
+        engine.write_delta = real_wd
+
+    assert not res.success                         # the run FAILED — the fenced overwrite caught it
+    rows = _rows(path)
+    assert rows[1] == 999                          # the concurrent writer's value stands (not 111) ...
+    assert rows == {**_seed_rows(), 1: 999}        # ... and our overwrite never landed (no lost update)
 
 
 # ------------------------------------- 3. writer commits BEFORE the run -> it just succeeds

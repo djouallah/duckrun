@@ -6,8 +6,8 @@
     - merge  (default when unique_key set): upsert on unique_key
     - insert : insert only new keys (idempotent append / dedupe), requires unique_key
     - delete+insert: delete target rows whose unique_key is in the batch, then insert the WHOLE
-      batch (duplicates preserved) — one atomic replaceWhere; requires unique_key. Differs from
-      merge: merge updates matched rows and rejects duplicate source keys.
+      batch (duplicates preserved) — a fenced full-table overwrite (CAS to vB); requires unique_key.
+      Differs from merge: merge updates matched rows and rejects duplicate source keys.
     - append (default when no unique_key): blind append
     - safeappend: optimistic append — commit only if the table version has not moved
       since the write began, else fail (no dedup; that's the model SQL's job)
