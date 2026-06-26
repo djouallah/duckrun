@@ -256,6 +256,8 @@ jobs:
       # ~40-66 min run outlives the ~1h token (auth._github_oidc_token / secret.refreshed).
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      # Low-noise (only prints when the token actually nears expiry): proves the mid-build refresh fired.
+      DUCKRUN_AUTH_DEBUG: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
