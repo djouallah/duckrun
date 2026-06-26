@@ -44,6 +44,20 @@ EXCLUDE_COLS = {
     "user_plan_snapshot": _SCD2,
 }
 
+# Tables whose DOUBLE columns are compared rounded to cents instead of bit-exactly.
+# fct_mrr_daily's MRR columns are built by a parallel `GROUP BY sum(<double>)` (int_daily_mrr_changes)
+# feeding a running-`sum()` window (cumulative_mrr). DuckDB combines partial float sums in a
+# thread-scheduling order that depends on the runner's core count, so two INDEPENDENT builds drift in
+# the last ULPs (e.g. 24813.09999999998 vs 24813.10000000025). dbt-duckdb has the exact same behavior
+# — it is NOT a duckrun divergence (it reproduces locally only when the two builds happen to combine
+# identically). Every value here is genuine currency: measured residue from an exact cent is <= 3e-12
+# and zero rows are >1e-4 off a cent. So comparing rounded to cents drops only the float noise — it
+# changes no real value, has no boundary risk (values sit at cents, 0.005 from any rounding boundary),
+# and any real divergence >= $0.01 still fails. Same approach as the MRR fct_mrr_movements parity.
+# Non-float columns (keys, date_day, product, event_count) are always compared exactly.
+ROUND_CENTS_TABLES = {"fct_mrr_daily"}
+_FLOAT_TYPES = {"DOUBLE", "REAL", "FLOAT"}
+
 
 def sh(cmd, cwd=None, env=None):
     print(f"$ {' '.join(cmd)}  (cwd={cwd})")
@@ -127,17 +141,31 @@ def diff() -> bool:
             print(f"{schema}.{t:36} SKIP (not persisted by duckrun)")
             continue
         uri = _duckrun_uri(dr_schema, t)
-        ocols = [r[0] for r in c.execute(
-            "select column_name from duckdb_columns() where database_name='o' "
-            f"and schema_name='{schema}' and table_name='{t}' order by column_index").fetchall()]
+        ocols = c.execute(
+            "select column_name, data_type from duckdb_columns() where database_name='o' "
+            f"and schema_name='{schema}' and table_name='{t}' order by column_index").fetchall()
         drop = EXCLUDE_COLS.get(t, set())
-        cols = [col for col in ocols if col not in drop]
-        sel = ", ".join('"' + col + '"' for col in cols)
+        round_cents = t in ROUND_CENTS_TABLES
+
+        def _expr(col, dtype):
+            q = '"' + col + '"'
+            # Round only this table's float columns to cents (see ROUND_CENTS_TABLES); everything else
+            # is compared bit-exactly. Applied identically to oracle and duckrun.
+            if round_cents and (dtype or "").upper() in _FLOAT_TYPES:
+                return f"round({q}, 2)"
+            return q
+
+        sel = ", ".join(_expr(col, dt) for col, dt in ocols if col not in drop)
         o_rows = _rows(c, f'select {sel} from o."{schema}"."{t}"')
         d_rows = _rows(c, f"select {sel} from delta_scan('{uri}')")
         ok = o_rows == d_rows
         all_ok = all_ok and ok
-        note = f" (excl {sorted(drop)})" if drop else ""
+        bits = []
+        if drop:
+            bits.append(f"excl {sorted(drop)}")
+        if round_cents:
+            bits.append("floats rounded to cents")
+        note = f" ({'; '.join(bits)})" if bits else ""
         print(f"{schema}.{t:36} oracle={len(o_rows):<5} duckrun={len(d_rows):<5} "
               f"-> {'MATCH' if ok else 'MISMATCH'}{note}")
     return all_ok
