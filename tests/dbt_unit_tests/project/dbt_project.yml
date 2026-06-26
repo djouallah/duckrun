@@ -17,6 +17,11 @@ clean-targets:
 models:
   dbt_unit_tests:
     +materialized: table
+    # The incremental/ marts exercise every duckrun incremental strategy (merge / insert /
+    # delete+insert / append / safeappend / microbatch) through a real two-run dbt build -- see
+    # the harness for the per-strategy row-content assertions.
+    incremental:
+      +materialized: incremental
 
 seeds:
   dbt_unit_tests:
@@ -25,3 +30,9 @@ seeds:
       # like 99.99 rounds to 100 and the is_large_order boundary test is wrong. Pin it to double.
       +column_types:
         amount: double
+    raw_events:
+      # Same reasoning as raw_orders (amount stays double); event_ts is the microbatch event_time,
+      # so pin it to timestamp rather than letting CSV inference pick a type.
+      +column_types:
+        amount: double
+        event_ts: timestamp

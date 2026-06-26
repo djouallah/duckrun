@@ -1,0 +1,56 @@
+unit_tests:
+
+  # --- incremental SELECT, full-refresh path: is_incremental() false -> every window row passes -----
+  # Proves the unit_tests feature works on an incremental-materialized model on duckrun, not just on
+  # tables. dbt requires the is_incremental override to be stated explicitly for incremental models.
+  - name: test_events_append_full_refresh
+    description: "On a full refresh (is_incremental() false) the model passes through every stg_events row."
+    model: events_append
+    overrides:
+      macros:
+        is_incremental: false
+    given:
+      - input: ref('stg_events')
+        format: dict
+        rows:
+          - {event_id: 1, amount: 100.0}
+          - {event_id: 2, amount: 200.0}
+          - {event_id: 3, amount: 300.0}
+    expect:
+      format: dict
+      rows:
+        - {event_id: 1, amount: 100.0}
+        - {event_id: 2, amount: 200.0}
+        - {event_id: 3, amount: 300.0}
+
+  # --- incremental SELECT, incremental path: is_incremental() override + a `this` input ------------
+  # With is_incremental() forced true and `this` holding events up to id 3, the model emits only the
+  # genuinely new rows (event_id > 3) -- exercising the overrides.macros + `this` input mechanics.
+  - name: test_events_append_incremental_only_new
+    description: "is_incremental()=true + `this` (max event_id 3) -> only the new rows 4-6 are emitted."
+    model: events_append
+    overrides:
+      macros:
+        is_incremental: true
+    given:
+      - input: ref('stg_events')
+        format: dict
+        rows:
+          - {event_id: 1, amount: 100.0}
+          - {event_id: 2, amount: 200.0}
+          - {event_id: 3, amount: 300.0}
+          - {event_id: 4, amount: 400.0}
+          - {event_id: 5, amount: 500.0}
+          - {event_id: 6, amount: 600.0}
+      - input: this
+        format: dict
+        rows:
+          - {event_id: 1}
+          - {event_id: 2}
+          - {event_id: 3}
+    expect:
+      format: dict
+      rows:
+        - {event_id: 4, amount: 400.0}
+        - {event_id: 5, amount: 500.0}
+        - {event_id: 6, amount: 600.0}
