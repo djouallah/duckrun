@@ -200,8 +200,9 @@ class Plugin(BasePlugin):
         # delete+insert: delete the target rows whose unique_key appears in the incoming batch, then
         # insert EVERY incoming row (duplicates preserved) — computed in DuckDB and written as a
         # fenced full-table overwrite (overwrite_if_unchanged, CAS to vB). NOT an alias for merge:
-        # merge UPDATEs matched rows and rejects duplicate source keys, whereas delete+insert replaces
-        # whole rows and tolerates duplicate keys — matching dbt-duckdb exactly.
+        # merge UPDATEs matched rows and REJECTS a duplicate-key source (duckrun fails loud, like
+        # Spark/Snowflake/BigQuery), whereas delete+insert replaces whole rows and tolerates duplicate
+        # keys — matching dbt-duckdb's delete+insert exactly.
         if strategy in ("delete+insert", "delete_insert"):
             if not unique_key:
                 raise ValueError("incremental_strategy='delete+insert' requires a unique_key.")
@@ -222,6 +223,11 @@ class Plugin(BasePlugin):
                 raise ValueError(
                     f"incremental_strategy='{strategy}' requires a unique_key."
                 )
+            # Fail loud on a source with duplicate unique_key rows, BEFORE any Delta access or write.
+            # A keyed merge/insert can't resolve two source rows for one key; delta_rs does NOT raise
+            # (it would silently emit duplicate rows), so we enforce the cardinality rule here — the
+            # same one Spark/Snowflake/BigQuery's MERGE raise on. Leaves the table untouched on failure.
+            self._assert_unique_source_key(cur, name, unique_key, strategy)
             # on_schema_change: detect added/removed columns vs the existing table and
             # decide whether to let delta_rs evolve the schema (or fail). Default 'ignore'.
             on_schema_change = (cfg.get("on_schema_change") or "ignore").lower()
@@ -496,6 +502,40 @@ class Plugin(BasePlugin):
                     f"NOT NULL constraint failed: column '{col}' in this contracted model "
                     f"produced {cnt} null value(s). Fix the model SQL or relax the contract."
                 )
+
+    @staticmethod
+    def _assert_unique_source_key(cur, name: str, unique_key, strategy: str) -> None:
+        """Raise if the merge/insert SOURCE has more than one row per ``unique_key``.
+
+        A keyed upsert needs at most one source row per key — the cardinality rule MERGE enforces on
+        Spark/Snowflake/BigQuery (they raise otherwise). delta_rs does NOT enforce it and would
+        silently emit duplicate rows, so we guard here with a cheap DuckDB aggregation BEFORE any
+        Delta access or write, leaving the existing table (and its version) untouched on failure.
+        Deduplicate the model SQL (e.g. a ``row_number()``/``qualify``) if duplicate keys are expected.
+        """
+        keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
+        # De-dup the key list itself: unique_key=['state', 'state'] is legal and means ['state'].
+        seen: set = set()
+        cols: list = []
+        for k in keys:
+            kk = str(k).strip().strip('"')
+            if kk and kk.lower() not in seen:
+                seen.add(kk.lower())
+                cols.append(kk)
+        keycols = ", ".join('"' + c.replace('"', '""') + '"' for c in cols)
+        dup = cur.sql(
+            f"SELECT {keycols}, count(*) AS n FROM {name} "
+            f"GROUP BY {keycols} HAVING count(*) > 1 LIMIT 1"
+        ).fetchone()
+        if dup:
+            keyval = ", ".join(f"{c}={v!r}" for c, v in zip(cols, dup[:-1]))
+            raise CompilationError(
+                f"incremental_strategy='{strategy}' requires the source to be unique on its "
+                f"unique_key ({', '.join(cols)}), but it has {dup[-1]} rows for {keyval}. A keyed "
+                f"merge/insert cannot resolve duplicate source keys — Spark, Snowflake and BigQuery "
+                f"raise the same error. Deduplicate the model SQL, e.g. "
+                f"qualify row_number() over (partition by {keycols} order by <tiebreak>) = 1."
+            )
 
     @staticmethod
     def _validate_merge_config(cfg: dict) -> None:

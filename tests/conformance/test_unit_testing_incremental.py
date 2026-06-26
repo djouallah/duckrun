@@ -621,3 +621,128 @@ class TestIncrMicrobatch(_IncrBase):
     @pytest.fixture(scope="class")
     def models(self):
         return {"stg_mb.sql": _STG_MB, "fct_events.sql": _MB_MODEL, "schema.yml": _MB_SCHEMA}
+
+
+# ---------------------------------------------------------------------------
+# 14. PARTITIONED incremental — merge onto a partition_by table (delta_rs partitioned write path)
+# ---------------------------------------------------------------------------
+# duckrun supports partition_by (engine wires it through every write path) but nothing else in the
+# suite exercises it. A partitioned merge stresses a distinct delta_rs code path: the cold run
+# CREATES a Hive-partitioned table, and the later MERGE must upsert correctly across partitions.
+_PARTITIONED_MODEL = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='merge',
+    unique_key='id',
+    partition_by=['region']
+) }}
+select id, region, ts, amount
+from {{ ref('stg_events') }}
+{% if is_incremental() %}
+where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }})
+{% endif %}
+"""
+
+
+class TestIncrPartitioned(_IncrBase):
+    model_files = {"fct_events.sql": _PARTITIONED_MODEL, "schema.yml": _MERGE_SCHEMA}
+    expected_initial = _INIT_IRA
+    expected_final = _FINAL_UPSERT       # same rows as plain merge; the point is it works partitioned
+
+
+# ---------------------------------------------------------------------------
+# 15. NULL round-trip — UPDATE a value to NULL + INSERT a row with NULL dim & measure
+# ---------------------------------------------------------------------------
+# delta_rs/arrow null handling is a real correctness trap. The change build updates id 1's amount
+# from 10 to NULL (a MERGE ... SET col = NULL) and inserts id 2 with a NULL region and NULL amount;
+# we assert the nulls survive the round-trip (read back as None).
+_STG_NULL = """
+select id, region, ts, amount
+from (
+    values
+      (1, 1, 'a', cast('2024-01-01' as date), 10),
+      (2, 1, 'a', cast('2024-01-03' as date), cast(null as integer)),
+      (2, 2, cast(null as varchar), cast('2024-01-02' as date), cast(null as integer))
+    ) as t(load, id, region, ts, amount)
+where load <= {{ var('load', 1) }}
+"""
+
+_NULL_MODEL = """
+{{ config(materialized='incremental', incremental_strategy='merge', unique_key='id') }}
+select id, region, ts, amount
+from {{ ref('stg_nulls') }}
+{% if is_incremental() %}
+where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }})
+{% endif %}
+"""
+
+_NULL_SCHEMA = """
+unit_tests:
+  - name: null_dim_and_measure_round_trip
+    model: fct_events
+    overrides:
+      macros: {is_incremental: false}
+    given:
+      - input: ref('stg_nulls')
+        rows:
+          - {id: 1, region: 'a',  ts: '2024-01-01', amount: 10}
+          - {id: 2, region: null, ts: '2024-01-02', amount: null}
+    expect:
+      rows:
+          - {id: 1, region: 'a',  ts: '2024-01-01', amount: 10}
+          - {id: 2, region: null, ts: '2024-01-02', amount: null}
+"""
+
+
+class TestIncrNullRoundTrip(_IncrBase):
+    expected_initial = [("1", "a", "10")]
+    expected_final = [("1", "a", "None"), ("2", "None", "None")]  # id 1 amount->NULL; id 2 all-null inserted
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"stg_nulls.sql": _STG_NULL, "fct_events.sql": _NULL_MODEL, "schema.yml": _NULL_SCHEMA}
+
+
+# ---------------------------------------------------------------------------
+# 16. merge REJECTS a source with duplicate unique_key rows (a documented contract)
+# ---------------------------------------------------------------------------
+# incremental.sql promises merge "rejects duplicate source keys" (unlike delete+insert). Nothing
+# verified it. The first load creates the table; the change batch then carries TWO rows for id 1,
+# which must FAIL the build rather than silently pick one.
+_STG_DUPS = """
+select id, region, ts, amount
+from (
+    values
+      (1, 1, 'a', cast('2024-01-01' as date), 10),
+      (2, 1, 'a', cast('2024-01-03' as date), 99),
+      (2, 1, 'a', cast('2024-01-04' as date), 98)
+    ) as t(load, id, region, ts, amount)
+where load <= {{ var('load', 1) }}
+"""
+
+_MERGE_DUP_MODEL = """
+{{ config(materialized='incremental', incremental_strategy='merge', unique_key='id') }}
+select id, region, ts, amount
+from {{ ref('stg_dups') }}
+{% if is_incremental() %}
+where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }})
+{% endif %}
+"""
+
+
+class TestIncrMergeDuplicateSourceRejected(_IncrBase):
+    """merge must REJECT a source carrying duplicate unique_key rows. First load creates the table;
+    a second load whose batch has two rows for id 1 must fail the build, not silently pick one."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"stg_dups.sql": _STG_DUPS, "fct_events.sql": _MERGE_DUP_MODEL}
+
+    def test_unit_and_incremental(self, project):
+        run_dbt(["run"])                                              # load 1: single id 1, table created
+        res = run_dbt(["build", "--vars", "{load: 2}"], expect_pass=False)  # batch has 2x id 1
+        # ...and it must fail for the RIGHT reason: the duplicate-key cardinality guard, not some
+        # unrelated error. (delta_rs would otherwise silently produce two rows for id 1.) Scan every
+        # node's message — the failing one is fct_events, not necessarily results[0].
+        msgs = " ".join((r.message or "") for r in res.results).lower()
+        assert "unique" in msgs or "duplicate" in msgs, [r.message for r in res.results]
