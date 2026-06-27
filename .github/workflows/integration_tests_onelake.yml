@@ -50,10 +50,50 @@ permissions:
   id-token: write
 
 jobs:
+  changes:
+    # Per-PROJECT path filter. The workflow-level `paths` above decides whether this workflow runs at
+    # all; this job decides WHICH project jobs run inside it, so a change to one project no longer
+    # drags in the others (an aemo edit used to also fire merge_spill / coffee / taxi / multicatalog).
+    runs-on: ubuntu-latest
+    outputs:
+      aemo: ${{ steps.filter.outputs.aemo }}
+      merge_spill: ${{ steps.filter.outputs.merge_spill }}
+      coffee: ${{ steps.filter.outputs.coffee }}
+      taxi: ${{ steps.filter.outputs.taxi }}
+      multicatalog: ${{ steps.filter.outputs.multicatalog }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            aemo:
+              - 'integration_tests/aemo/**'
+              - '.github/workflows/integration_tests_onelake.yml'
+            merge_spill:
+              - 'performance_test/merge_spill/**'
+              - 'tests/performance/merge_tpch_bench.py'
+              - 'tests/connection_api/**'
+              - '.github/workflows/integration_tests_onelake.yml'
+            coffee:
+              - 'integration_tests/coffee/**'
+              - 'tests/connection_api/**'
+              - '.github/workflows/integration_tests_onelake.yml'
+            taxi:
+              - 'integration_tests/taxi/**'
+              - 'tests/connection_api/**'
+              - '.github/workflows/integration_tests_onelake.yml'
+            multicatalog:
+              - 'integration_tests/multicatalog/**'
+              - 'tests/connection_api/**'
+              - '.github/workflows/integration_tests_onelake.yml'
+
   aemo:
     # The AEMO project, built against live OneLake (abfss://) — the build IS the OneLake exercise,
     # and the standalone `dbt test` is the abfss:// read-path regression gate. Then static docs.
     # Serialize across branches: it writes a single shared OneLake lakehouse.
+    needs: changes
+    if: ${{ needs.changes.outputs.aemo == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     concurrency:
       group: aemo-onelake
@@ -115,6 +155,8 @@ jobs:
     # The incremental-MERGE project (SQL-only): the MERGE chain over OneLake at a SMALL scale factor
     # (the abfss:// merge write/read path via conn.sql). The heavy SF=10 memory-spill version is a
     # local release gate (local_stress_tests.yml), not this.
+    needs: changes
+    if: ${{ needs.changes.outputs.merge_spill == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     concurrency:
       group: merge-onelake
@@ -158,6 +200,8 @@ jobs:
     # build-on-OneLake-then-docs pattern aemo uses), so the published coffee.html DAG/catalog reflects
     # the live OneLake tables — not a throwaway local build. Then the connection-API coffee scenario
     # (duckrun.connect) over OneLake, into an isolated schema.
+    needs: changes
+    if: ${{ needs.changes.outputs.coffee == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     concurrency:
       group: coffee-onelake
@@ -224,6 +268,8 @@ jobs:
     # Yellow Taxi data over https and lands it into OneLake via conn.sql(...) DML, into its own
     # schema so it never collides with the coffee tables in the shared lakehouse. Its own job so it
     # shows up as a visible node; non-fatal so a flaky live source can't redden the run.
+    needs: changes
+    if: ${{ needs.changes.outputs.taxi == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     concurrency:
       group: taxi-onelake
@@ -270,6 +316,8 @@ jobs:
     # The multi-catalog connection-API showcase (a runnable demo, not a gate): one session binds the
     # writable OneLake lakehouse, a READ-ONLY Fabric Warehouse, and a local scratch dir as three
     # catalogs, JOINs across them, and writes a mart back to the lakehouse. Non-fatal like taxi.
+    needs: changes
+    if: ${{ needs.changes.outputs.multicatalog == 'true' || github.event_name == 'workflow_dispatch' }}
     runs-on: ubuntu-latest
     concurrency:
       group: multicatalog-onelake
