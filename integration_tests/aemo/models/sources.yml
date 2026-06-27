@@ -53,9 +53,9 @@ sources:
           Read by fct_scada and fct_price via read_csv with the file list from stg_csv_archive_log.
       - name: scada_today
         description: >
-          Intraday Dispatch_SCADA CSVs. Read by fct_scada_today via read_csv with the file list
-          from stg_csv_archive_log.
+          Intraday Dispatch_SCADA CSVs. Merged into fct_scada (as the preliminary, source_priority=0
+          rows) via read_csv with the file list from stg_csv_archive_log.
       - name: price_today
         description: >
-          Intraday DispatchIS price CSVs. Read by fct_price_today via read_csv with the file list
-          from stg_csv_archive_log.
+          Intraday DispatchIS price CSVs. Merged into fct_price (as the preliminary, source_priority=0
+          rows) via read_csv with the file list from stg_csv_archive_log.

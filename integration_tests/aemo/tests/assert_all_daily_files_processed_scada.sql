@@ -7,6 +7,7 @@ SELECT
 FROM {{ ref('stg_csv_archive_log') }}
 WHERE source_type = 'daily'
   AND csv_filename NOT IN (
-    SELECT DISTINCT file
+    SELECT DISTINCT daily_file
     FROM {{ ref('fct_scada') }}
+    WHERE daily_file IS NOT NULL
   )

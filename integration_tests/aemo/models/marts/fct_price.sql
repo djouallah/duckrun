@@ -5,16 +5,32 @@
 {{ config(
     materialized='incremental',
     incremental_strategy='merge',
-    unique_key=['file', 'REGIONID', 'SETTLEMENTDATE', 'INTERVENTION'],
-    pre_hook="SET VARIABLE price_daily_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT file FROM {{ this }}){% endif %} LIMIT {{ env_var('process_limit', '1000') }}))"
+    unique_key=['REGIONID', 'SETTLEMENTDATE', 'INTERVENTION'],
+    partition_by=['month_key'],
+    incremental_predicates=['target.month_key = source.month_key'],
+    merge_update_condition='source.source_priority >= target.source_priority',
+    merge_exclude_columns=['intraday_file'],
+    pre_hook=[
+      "SET VARIABLE price_daily_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT daily_file FROM {{ this }} WHERE daily_file IS NOT NULL){% endif %} LIMIT {{ env_var('process_limit', '1000') }}))",
+      "SET VARIABLE price_today_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'price_today'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT intraday_file FROM {{ this }} WHERE intraday_file IS NOT NULL){% endif %} LIMIT {{ env_var('process_limit', '1000') }}))"
+    ]
 ) }}
 
+{#-- ONE price table fed by TWO sources — the price twin of fct_scada (see that model for the full
+    rationale). Intraday DispatchIS (source_priority = 0) inserts preliminary RRP rows; the daily
+    settled DREGION file (source_priority = 1) merges over them, overwriting the price columns and
+    backfilling the daily-only demand/dispatch columns. Same merge knobs: business-key unique_key,
+    merge_update_condition keeps daily authoritative, merge_exclude_columns preserves intraday_file,
+    and the QUALIFY dedup satisfies the duplicate-source-key guard. Intraday-only DispatchIS columns
+    (DISPATCHINTERVAL, PRE_AP_*, CUMUL_*, 1-sec FCAS) are not in the daily schema and are dropped. --#}
+
 {%- set check_files_query -%}
-SELECT COUNT(*) as cnt FROM {{ ref('stg_csv_archive_log') }}
-WHERE source_type = 'daily'
-{%- if is_incremental() %}
-AND csv_filename NOT IN (SELECT DISTINCT file FROM {{ this }})
-{%- endif -%}
+SELECT
+  (SELECT COUNT(*) FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'
+   {%- if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT daily_file FROM {{ this }} WHERE daily_file IS NOT NULL){% endif %})
+  +
+  (SELECT COUNT(*) FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'price_today'
+   {%- if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT intraday_file FROM {{ this }} WHERE intraday_file IS NOT NULL){% endif %}) AS cnt
 {%- endset -%}
 
 {%- if execute and flags.WHICH == 'run' -%}
@@ -25,7 +41,7 @@ AND csv_filename NOT IN (SELECT DISTINCT file FROM {{ this }})
 {%- endif -%}
 
 {% if has_files %}
-WITH price_staging AS (
+WITH price_daily AS (
   SELECT *
   FROM read_csv(
     getvariable('price_daily_paths'),
@@ -171,9 +187,100 @@ WITH price_staging AS (
     hive_partitioning = false
   )
   WHERE I = 'D' AND UNIT = 'DREGION' AND VERSION = '3'
-)
+),
 
+price_intraday AS (
+  SELECT *
+  FROM read_csv(
+    getvariable('price_today_paths'),
+    skip = 1,
+    header = 0,
+    all_varchar = 1,
+    columns = {
+      'I': 'VARCHAR',
+      'DISPATCH': 'VARCHAR',
+      'PRICE': 'VARCHAR',
+      'xx': 'VARCHAR',
+      'SETTLEMENTDATE': 'VARCHAR',
+      'RUNNO': 'VARCHAR',
+      'REGIONID': 'VARCHAR',
+      'DISPATCHINTERVAL': 'VARCHAR',
+      'INTERVENTION': 'VARCHAR',
+      'RRP': 'VARCHAR',
+      'EEP': 'VARCHAR',
+      'ROP': 'VARCHAR',
+      'APCFLAG': 'VARCHAR',
+      'MARKETSUSPENDEDFLAG': 'VARCHAR',
+      'LASTCHANGED': 'VARCHAR',
+      'RAISE6SECRRP': 'VARCHAR',
+      'RAISE6SECROP': 'VARCHAR',
+      'RAISE6SECAPCFLAG': 'VARCHAR',
+      'RAISE60SECRRP': 'VARCHAR',
+      'RAISE60SECROP': 'VARCHAR',
+      'RAISE60SECAPCFLAG': 'VARCHAR',
+      'RAISE5MINRRP': 'VARCHAR',
+      'RAISE5MINROP': 'VARCHAR',
+      'RAISE5MINAPCFLAG': 'VARCHAR',
+      'RAISEREGRRP': 'VARCHAR',
+      'RAISEREGROP': 'VARCHAR',
+      'RAISEREGAPCFLAG': 'VARCHAR',
+      'LOWER6SECRRP': 'VARCHAR',
+      'LOWER6SECROP': 'VARCHAR',
+      'LOWER6SECAPCFLAG': 'VARCHAR',
+      'LOWER60SECRRP': 'VARCHAR',
+      'LOWER60SECROP': 'VARCHAR',
+      'LOWER60SECAPCFLAG': 'VARCHAR',
+      'LOWER5MINRRP': 'VARCHAR',
+      'LOWER5MINROP': 'VARCHAR',
+      'LOWER5MINAPCFLAG': 'VARCHAR',
+      'LOWERREGRRP': 'VARCHAR',
+      'LOWERREGROP': 'VARCHAR',
+      'LOWERREGAPCFLAG': 'VARCHAR',
+      'PRICE_STATUS': 'VARCHAR',
+      'PRE_AP_ENERGY_PRICE': 'VARCHAR',
+      'PRE_AP_RAISE6_PRICE': 'VARCHAR',
+      'PRE_AP_RAISE60_PRICE': 'VARCHAR',
+      'PRE_AP_RAISE5MIN_PRICE': 'VARCHAR',
+      'PRE_AP_RAISEREG_PRICE': 'VARCHAR',
+      'PRE_AP_LOWER6_PRICE': 'VARCHAR',
+      'PRE_AP_LOWER60_PRICE': 'VARCHAR',
+      'PRE_AP_LOWER5MIN_PRICE': 'VARCHAR',
+      'PRE_AP_LOWERREG_PRICE': 'VARCHAR',
+      'RAISE1SECRRP': 'VARCHAR',
+      'RAISE1SECROP': 'VARCHAR',
+      'RAISE1SECAPCFLAG': 'VARCHAR',
+      'LOWER1SECRRP': 'VARCHAR',
+      'LOWER1SECROP': 'VARCHAR',
+      'LOWER1SECAPCFLAG': 'VARCHAR',
+      'PRE_AP_RAISE1_PRICE': 'VARCHAR',
+      'PRE_AP_LOWER1_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_ENERGY_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_RAISE6_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_RAISE60_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_RAISE5MIN_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_RAISEREG_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_LOWER6_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_LOWER60_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_LOWER5MIN_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_LOWERREG_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_RAISE1_PRICE': 'VARCHAR',
+      'CUMUL_PRE_AP_LOWER1_PRICE': 'VARCHAR',
+      'OCD_STATUS': 'VARCHAR',
+      'MII_STATUS': 'VARCHAR'
+    },
+    filename = 1,
+    null_padding = true,
+    ignore_errors = 1,
+    auto_detect = false,
+    hive_partitioning = false
+  )
+  WHERE I = 'D' AND PRICE = 'PRICE'
+),
+
+-- Daily settled DREGION rows: full schema, authoritative (source_priority = 1).
+daily_rows AS (
 SELECT
+  1 AS source_priority,
   UNIT,
   REGIONID,
   CAST(VERSION AS DOUBLE) AS VERSION,
@@ -301,11 +408,77 @@ SELECT
   CAST(LOWERREGACTUALAVAILABILITY AS DOUBLE) AS LOWERREGACTUALAVAILABILITY,
   CAST(LORSURPLUS AS DOUBLE) AS LORSURPLUS,
   CAST(LRCSURPLUS AS DOUBLE) AS LRCSURPLUS,
-  {{ parse_filename('filename') }} AS file,
+  {{ parse_filename('filename') }} AS daily_file,
   CAST(SETTLEMENTDATE AS TIMESTAMPTZ) AS SETTLEMENTDATE,
   CAST(SETTLEMENTDATE AS DATE) AS DATE,
-  CAST(YEAR(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS YEAR
-FROM price_staging
+  CAST(YEAR(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS YEAR,
+  CAST(YEAR(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) * 100
+    + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
+FROM price_daily
+),
+
+-- Intraday preliminary rows: the DispatchIS columns that overlap the daily schema; UNION ALL BY
+-- NAME fills every daily-only column (demand, dispatch, violations, …) with NULL.
+intraday_rows AS (
+  SELECT
+    0 AS source_priority,
+    REGIONID,
+    CAST(RUNNO AS DOUBLE) AS RUNNO,
+    CAST(INTERVENTION AS DOUBLE) AS INTERVENTION,
+    CAST(RRP AS DOUBLE) AS RRP,
+    CAST(EEP AS DOUBLE) AS EEP,
+    CAST(ROP AS DOUBLE) AS ROP,
+    CAST(APCFLAG AS DOUBLE) AS APCFLAG,
+    CAST(MARKETSUSPENDEDFLAG AS DOUBLE) AS MARKETSUSPENDEDFLAG,
+    CAST(RAISE6SECRRP AS DOUBLE) AS RAISE6SECRRP,
+    CAST(RAISE6SECROP AS DOUBLE) AS RAISE6SECROP,
+    CAST(RAISE6SECAPCFLAG AS DOUBLE) AS RAISE6SECAPCFLAG,
+    CAST(RAISE60SECRRP AS DOUBLE) AS RAISE60SECRRP,
+    CAST(RAISE60SECROP AS DOUBLE) AS RAISE60SECROP,
+    CAST(RAISE60SECAPCFLAG AS DOUBLE) AS RAISE60SECAPCFLAG,
+    CAST(RAISE5MINRRP AS DOUBLE) AS RAISE5MINRRP,
+    CAST(RAISE5MINROP AS DOUBLE) AS RAISE5MINROP,
+    CAST(RAISE5MINAPCFLAG AS DOUBLE) AS RAISE5MINAPCFLAG,
+    CAST(RAISEREGRRP AS DOUBLE) AS RAISEREGRRP,
+    CAST(RAISEREGROP AS DOUBLE) AS RAISEREGROP,
+    CAST(RAISEREGAPCFLAG AS DOUBLE) AS RAISEREGAPCFLAG,
+    CAST(LOWER6SECRRP AS DOUBLE) AS LOWER6SECRRP,
+    CAST(LOWER6SECROP AS DOUBLE) AS LOWER6SECROP,
+    CAST(LOWER6SECAPCFLAG AS DOUBLE) AS LOWER6SECAPCFLAG,
+    CAST(LOWER60SECRRP AS DOUBLE) AS LOWER60SECRRP,
+    CAST(LOWER60SECROP AS DOUBLE) AS LOWER60SECROP,
+    CAST(LOWER60SECAPCFLAG AS DOUBLE) AS LOWER60SECAPCFLAG,
+    CAST(LOWER5MINRRP AS DOUBLE) AS LOWER5MINRRP,
+    CAST(LOWER5MINROP AS DOUBLE) AS LOWER5MINROP,
+    CAST(LOWER5MINAPCFLAG AS DOUBLE) AS LOWER5MINAPCFLAG,
+    CAST(LOWERREGRRP AS DOUBLE) AS LOWERREGRRP,
+    CAST(LOWERREGROP AS DOUBLE) AS LOWERREGROP,
+    CAST(LOWERREGAPCFLAG AS DOUBLE) AS LOWERREGAPCFLAG,
+    {{ parse_filename('filename') }} AS intraday_file,
+    CAST(SETTLEMENTDATE AS TIMESTAMPTZ) AS SETTLEMENTDATE,
+    CAST(SETTLEMENTDATE AS DATE) AS DATE,
+    CAST(YEAR(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS YEAR,
+    CAST(YEAR(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) * 100
+      + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
+  FROM price_intraday
+),
+
+unioned AS (
+  SELECT * FROM daily_rows
+  UNION ALL BY NAME
+  SELECT * FROM intraday_rows
+)
+
+SELECT
+  *,
+  -- Authoritative source file for the surviving row (daily once settled, else the intraday file).
+  COALESCE(daily_file, intraday_file) AS file
+FROM unioned
+-- One row per business key for the merge source: daily beats intraday, then latest file wins.
+QUALIFY row_number() OVER (
+  PARTITION BY REGIONID, SETTLEMENTDATE, INTERVENTION
+  ORDER BY source_priority DESC, COALESCE(daily_file, intraday_file) DESC
+) = 1
 {% else %}
 SELECT * FROM {{ this }} WHERE FALSE
 {% endif %}

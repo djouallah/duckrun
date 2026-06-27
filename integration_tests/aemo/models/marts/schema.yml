@@ -2,8 +2,16 @@ version: 2
 
 models:
   - name: fct_price
-    description: Price data from daily AEMO dispatch files
+    description: >
+      Unified price fact: daily settled DREGION rows MERGED over preliminary intraday DispatchIS
+      rows (source_priority 1 beats 0) on REGIONID + SETTLEMENTDATE + INTERVENTION.
     columns:
+      - name: source_priority
+        description: 1 = daily settled, 0 = intraday preliminary.
+        tests:
+          - not_null
+          - accepted_values:
+              values: [0, 1]
       - name: REGIONID
         tests:
           - not_null
@@ -17,8 +25,17 @@ models:
           - not_null
 
   - name: fct_scada
-    description: SCADA data from daily AEMO dispatch files
+    description: >
+      Unified SCADA fact: daily settled DUNIT rows MERGED over preliminary intraday Dispatch_SCADA
+      rows (source_priority 1 beats 0) on DUID + SETTLEMENTDATE + INTERVENTION. Intraday-only DUIDs
+      (never in settlement) remain as preliminary rows.
     columns:
+      - name: source_priority
+        description: 1 = daily settled, 0 = intraday preliminary.
+        tests:
+          - not_null
+          - accepted_values:
+              values: [0, 1]
       - name: DUID
         tests:
           - not_null
@@ -27,34 +44,6 @@ models:
               field: DUID
               config:
                 severity: warn
-      - name: SETTLEMENTDATE
-        tests:
-          - not_null
-      - name: file
-        tests:
-          - not_null
-
-  - name: fct_price_today
-    description: Intraday price data from AEMO dispatch files
-    columns:
-      - name: REGIONID
-        tests:
-          - not_null
-          - accepted_values:
-              values: ['QLD1', 'NSW1', 'VIC1', 'SA1', 'TAS1', 'WA1']
-      - name: SETTLEMENTDATE
-        tests:
-          - not_null
-      - name: file
-        tests:
-          - not_null
-
-  - name: fct_scada_today
-    description: Intraday SCADA data from AEMO dispatch files
-    columns:
-      - name: DUID
-        tests:
-          - not_null
       - name: SETTLEMENTDATE
         tests:
           - not_null
