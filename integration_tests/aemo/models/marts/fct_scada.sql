@@ -4,17 +4,18 @@
 
 {{ config(
     materialized='incremental',
-    incremental_strategy='append_if_unchanged',
+    incremental_strategy='merge',
+    unique_key=['file', 'DUID', 'SETTLEMENTDATE', 'INTERVENTION'],
     partition_by=['month_key'],
     pre_hook="SET VARIABLE scada_daily_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT file FROM {{ this }}){% endif %} LIMIT {{ env_var('process_limit', '1000') }}))"
 ) }}
 
-{#-- This is the most expensive table to build, so it uses `append_if_unchanged` rather than a
-     merge/insert: dedup is already done in SQL (the pre_hook + staging only load files NOT
-     already in {{ this }}), so a key-join merge is redundant work. `append_if_unchanged` is a plain
-     append (no target scan, no join — DuckDB keeps full memory like append/overwrite) plus a
-     compare-and-swap: it commits only if the table version has not moved since this run read
-     it, else it fails so the run re-runs against the new state. No duplicate files slip in. --#}
+{#-- Keyed merge on the natural primary key (file, DUID, SETTLEMENTDATE, INTERVENTION). A cheaper
+     append would do here (the pre_hook only loads files NOT already in {{ this }}), but the
+     integration suite deliberately exercises the full merge path — predicate build, the
+     source-uniqueness cardinality guard, the delta_rs MERGE, and the snapshot-pinned OCC — rather
+     than optimizing it away. The pre_hook keeps the source unique on the key, so the merge inserts
+     the new rows without ever hitting a duplicate-key conflict. --#}
 
 {%- set check_files_query -%}
 SELECT COUNT(*) as cnt FROM {{ ref('stg_csv_archive_log') }}
