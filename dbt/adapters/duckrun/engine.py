@@ -383,14 +383,21 @@ def _parse_byte_size(text: Optional[str]) -> Optional[int]:
 
 
 def configure_duckdb_session(con) -> None:
-    """Always-on DuckDB tuning for duckrun's Delta write path, applied once per connection:
-    ``preserve_insertion_order=false`` and a ``temp_directory`` to spill to. These are NOT the
-    memory split — they're write-path correctness that helps every materialization.
+    """Always-on DuckDB tuning for duckrun, applied once per connection:
+    ``preserve_insertion_order=false``, ``parquet_metadata_cache=true``, and a ``temp_directory`` to
+    spill to. These are NOT the memory split — they're correctness/perf tuning for every connection.
 
     preserve_insertion_order=false: with DuckDB's default (true), streaming a large result into
     delta_rs makes DuckDB buffer the *whole* result to keep row order, which OOMs big writes /
     merges. Delta tables are unordered and explicit ORDER BY still works, so duckrun turns it
     off by default — users no longer need to set it in their profile ``settings``.
+
+    parquet_metadata_cache=true: DuckDB defaults this OFF because a cached parquet footer goes stale
+    if a file is overwritten in place — but Delta never rewrites a data file (a change writes NEW
+    files with new names and tombstones the old), so the path→metadata mapping can't go stale here.
+    Turning it on lets repeated ``delta_scan`` reads in a session reuse row-group stats instead of
+    re-parsing every footer each scan — a real win over OneLake/remote where each footer is a
+    round-trip. (DuckDB's data cache — ``enable_external_file_cache`` — is already on by default.)
 
     The DuckDB ``memory_limit`` is deliberately left ALONE here; it's set per model in ``store()``.
     The write path clamps it to ``_WRITE_MEM_FRACTION`` of the effective limit
@@ -400,6 +407,13 @@ def configure_duckdb_session(con) -> None:
     try:
         con.execute("SET preserve_insertion_order=false")
     except Exception:  # best-effort tuning: a failed SET must not abort connection setup
+        pass
+    try:
+        # Safe because Delta data files are immutable (never overwritten in place), so a cached
+        # footer can't go stale; lets repeated delta_scans reuse row-group metadata. Best-effort —
+        # an older build without the setting must not abort connection setup.
+        con.execute("SET parquet_metadata_cache=true")
+    except Exception:
         pass
     # An in-memory DuckDB can default to an empty temp_directory and then *cannot* spill; give it
     # one so a tight memory_limit (set later for a merge) degrades to disk instead of an error.

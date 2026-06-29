@@ -148,6 +148,15 @@ def test_configure_duckdb_session_disables_preserve_insertion_order():
     assert ("preserve_insertion_order", "false") in con.sets
 
 
+def test_configure_duckdb_session_enables_parquet_metadata_cache():
+    """duckrun turns parquet_metadata_cache on (DuckDB defaults it off) — safe because Delta files
+    are immutable, and it lets repeated delta_scans reuse row-group metadata instead of re-parsing
+    every footer."""
+    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
+    engine.configure_duckdb_session(con)
+    assert ("parquet_metadata_cache", "true") in con.sets
+
+
 def test_configure_duckdb_session_sets_temp_dir_when_empty(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ""})
