@@ -18,55 +18,55 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 
 ## 🐤 TPC-H benchmark — duckrun on Delta Lake
 
-**What this checks:** duckrun ingests the full TPC-H schema (8 tables) from Parquet into Delta through its write path (`conn.read.parquet(...).write.saveAsTable(...)`), then runs the 22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is duckrun's write path; the **query** times are DuckDB reading Delta — there is no second engine to race here, so read them as "the whole schema loads and all 22 queries run at this scale", not a *duckrun is fast* claim.
+**What this checks:** duckrun registers the full TPC-H schema (8 tables) as Delta in place via `DeltaTable.convertToDelta` (zero-copy — writes only the `_delta_log`), then runs the 22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is the (near-free) convert; the **query** times are DuckDB reading Delta — there is no second engine to race here, so read them as "the whole schema loads and all 22 queries run at this scale", not a *duckrun is fast* claim.
 
-> **Ingest 8 tables in 544.4s** &middot; **run 22 queries in 456.6s** &middot; SF 100 &middot; 866.0M rows &middot; 4 cores
+> **Ingest 8 tables in 0.0s** &middot; **run 22 queries in 3.2s** &middot; SF 1 &middot; 8.7M rows &middot; 4 cores
 
 ### Setup
 | | |
 |---|---|
 | Engine | duckrun &middot; DuckDB 1.5.4 &middot; delta_rs 1.5.0 |
-| Scale factor | **100** |
+| Scale factor | **1** |
 | Runner | GitHub-hosted &middot; 4 cores |
 
-### Ingestion — Parquet → Delta (duckrun write path)
-| Table | Rows | Write (s) |
+### Ingestion — Parquet → Delta (zero-copy convertToDelta)
+| Table | Rows | Convert (s) |
 |---|---:|---:|
-| `nation` | 25 | 0.97 |
-| `region` | 5 | 0.01 |
-| `customer` | 15,000,000 | 11.86 |
-| `supplier` | 1,000,000 | 0.94 |
-| `lineitem` | 600,037,902 | 372.51 |
-| `orders` | 150,000,000 | 90.73 |
-| `partsupp` | 80,000,000 | 54.93 |
-| `part` | 20,000,000 | 12.42 |
-| **Total** | **866,037,932** | **544.37** |
+| `nation` | 25 | 0.01 |
+| `region` | 5 | 0.00 |
+| `customer` | 150,000 | 0.01 |
+| `supplier` | 10,000 | 0.01 |
+| `lineitem` | 6,001,215 | 0.01 |
+| `orders` | 1,500,000 | 0.01 |
+| `partsupp` | 800,000 | 0.01 |
+| `part` | 200,000 | 0.01 |
+| **Total** | **8,661,245** | **0.04** |
 
 ### Queries — 22 TPC-H over `delta_scan`
 | Query | Duration (s) |
 |:---|---:|
-| Q01 | 18.816 |
-| Q02 | 3.915 |
-| Q03 | 11.980 |
-| Q04 | 7.913 |
-| Q05 | 22.632 |
-| Q06 | 6.011 |
-| Q07 | 16.280 |
-| Q08 | 19.226 |
-| Q09 | 32.982 |
-| Q10 | 14.542 |
-| Q11 | 1.963 |
-| Q12 | 8.605 |
-| Q13 | 19.895 |
-| Q14 | 11.449 |
-| Q15 | 9.740 |
-| Q16 | 3.607 |
-| Q17 | 120.950 |
-| Q18 | 22.122 |
-| Q19 | 14.268 |
-| Q20 | 19.024 |
-| Q21 | 65.033 |
-| Q22 | 5.665 |
-| **Total** | **456.62** |
+| Q01 | 0.205 |
+| Q02 | 0.098 |
+| Q03 | 0.106 |
+| Q04 | 0.074 |
+| Q05 | 0.167 |
+| Q06 | 0.054 |
+| Q07 | 0.138 |
+| Q08 | 0.196 |
+| Q09 | 0.228 |
+| Q10 | 0.136 |
+| Q11 | 0.050 |
+| Q12 | 0.081 |
+| Q13 | 0.166 |
+| Q14 | 0.079 |
+| Q15 | 0.063 |
+| Q16 | 0.049 |
+| Q17 | 0.306 |
+| Q18 | 0.203 |
+| Q19 | 0.121 |
+| Q20 | 0.132 |
+| Q21 | 0.475 |
+| Q22 | 0.078 |
+| **Total** | **3.20** |
 
 <!-- TPCH:END -->
