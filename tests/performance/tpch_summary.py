@@ -28,10 +28,10 @@ def render_card(t: dict) -> str:
 
     L = ["## 🐤 TPC-H benchmark — duckrun on Delta Lake", ""]
     L.append(
-        "**What this checks:** duckrun ingests the full TPC-H schema (8 tables) from Parquet into "
-        "Delta through its write path (`conn.read.parquet(...).write.saveAsTable(...)`), then runs "
-        "the 22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is "
-        "duckrun's write path; the **query** times are DuckDB reading Delta — there is no second "
+        "**What this checks:** duckrun registers the full TPC-H schema (8 tables) as Delta in place "
+        "via `DeltaTable.convertToDelta` (zero-copy — writes only the `_delta_log`), then runs the "
+        "22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is the "
+        "(near-free) convert; the **query** times are DuckDB reading Delta — there is no second "
         "engine to race here, so read them as \"the whole schema loads and all 22 queries run at "
         "this scale\", not a *duckrun is fast* claim."
     )
@@ -50,8 +50,8 @@ def render_card(t: dict) -> str:
     L.append(f"| Runner | GitHub-hosted &middot; {t['cpu']} cores |")
     L.append("")
 
-    L += ["### Ingestion — Parquet → Delta (duckrun write path)",
-          "| Table | Rows | Write (s) |", "|---|---:|---:|"]
+    L += ["### Ingestion — Parquet → Delta (zero-copy convertToDelta)",
+          "| Table | Rows | Convert (s) |", "|---|---:|---:|"]
     for r in ingestion:
         L.append(f"| `{r['table']}` | {r['rows']:,} | {r['dur']:.2f} |")
     L.append(f"| **Total** | **{rows_total:,}** | **{ing_total:.2f}** |")
