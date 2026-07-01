@@ -4,6 +4,25 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.28] - 2026-07-01
+
+### Fixed
+- **Wrong-`deltalake` runtime guard is now exact.** The startup version check only enforced a
+  `deltalake >= 1.5.0` floor, but duckrun needs *exactly* 1.5.0 — every newer release breaks
+  MERGE-at-scale and batch DELETE. A Microsoft Fabric kernel that keeps a newer `deltalake` loaded
+  (installed-but-not-`restartPython()`) previously sailed past the guard and silently ran broken
+  merges/deletes; it now raises a loud, actionable error.
+- **Single-thread pin is verified, not assumed.** The adapter pins `config.threads = 1` (the Delta
+  write path is not thread-safe). If that pin can't take, it now raises instead of silently
+  continuing with parallel models that would collide on the shared connection and corrupt tables.
+- **`ALTER TABLE … ADD COLUMN <c> <type> NOT NULL`** no longer mis-parses the type: the trailing
+  `NOT NULL` is stripped whole instead of leaving `not` glued onto the type name.
+
+### Changed
+- Added debug-level traces to two previously-silent best-effort paths (drop-tombstone scan
+  failures; the DuckDB-filtered overwrite fallback for `DELETE` predicates with a subquery), so
+  they're visible under `--debug`.
+
 ## [0.3.27] - 2026-06-26
 
 ### Fixed
