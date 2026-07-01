@@ -69,7 +69,11 @@ Supported / unsupported (what reaches delta_rs):
 import re
 from typing import List, Optional, Tuple
 
+from dbt.adapters.events.logging import AdapterLogger
+
 from . import engine
+
+logger = AdapterLogger("Duckrun")
 
 # `drop table` tombstone: a dropped relation is overwritten (via delta_rs) to a table whose ONLY
 # column is this marker, so (a) discovery recognizes it as dropped and hides it, and (b) anyone who
@@ -93,7 +97,8 @@ def is_dropped(con, location: str, storage_options=None) -> bool:
     try:
         rel = con.execute(f"select * from delta_scan('{loc_sql}') limit 0")
         return _columns_are_tombstone([d[0] for d in rel.description])
-    except Exception:
+    except Exception as exc:  # best-effort: treat unreadable as 'not a tombstone', but leave a trace
+        logger.debug(f"duckrun: is_dropped could not scan {location!r}, treating as live: {exc}")
         return False
 
 # --- statement matchers (leading-anchored, DOTALL so multi-line bodies match) ----------------
@@ -791,6 +796,10 @@ class _DeltaDML:
             # set DELETE keeps — rows where the predicate is false OR null (3-valued logic), not just
             # `NOT (P)`. Materialize survivors into a native temp first so the read is fully detached
             # from the Delta table being replaced. Simple predicates still take the fenced path below.
+            logger.debug(
+                f"duckrun: DELETE predicate on {loc!r} references a subquery; delta_rs can't "
+                "evaluate it, falling back to a DuckDB-filtered full overwrite (slower)."
+            )
             loc_sql = loc.replace("'", "''")
             tmp = f"__duckrun_del_{abs(hash(loc)) & 0xFFFFFFFF}"
             self.cursor.execute(
@@ -920,9 +929,13 @@ class _DeltaDML:
 
     def _alter_add(self, m, rel, schema, loc) -> None:
         col = m.group("col").strip().strip('"')
-        # Keep only the column type (drop any DEFAULT/NULL clause); add it as an all-null column by
-        # rewriting the table with overwrite_schema so delta_rs accepts the widened schema.
-        coltype = re.split(r"\s+default\b|\s+null\b", m.group("def"), flags=re.I)[0].strip() or "VARCHAR"
+        # Keep only the column type (drop any trailing DEFAULT / NOT NULL / NULL clause); add it as
+        # an all-null column by rewriting the table with overwrite_schema so delta_rs accepts the
+        # widened schema. `not null` must be matched before a bare `null`, else the `\s+null\b`
+        # alternative eats only the ` null` and leaves `... not` glued onto the type.
+        coltype = re.split(
+            r"\s+default\b|\s+not\s+null\b|\s+null\b", m.group("def"), flags=re.I
+        )[0].strip() or "VARCHAR"
         loc_sql = loc.replace("'", "''")
         data = self.cursor.sql(
             f'select *, cast(null as {coltype}) as "{col}" from delta_scan(\'{loc_sql}\')'

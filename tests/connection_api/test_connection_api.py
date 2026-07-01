@@ -630,6 +630,15 @@ class TestSqlDml:
         conn.sql("alter table src add column qty integer")
         assert "qty" in conn.sql("select * from src").columns
 
+    def test_sql_alter_add_column_not_null(self, conn):
+        # the trailing NOT NULL clause must be stripped WITHOUT gluing `not` onto the type; the
+        # column lands as an all-null INTEGER (delta_rs widens the schema, existing rows get NULL).
+        conn.sql("alter table src add column qty integer not null")
+        df = conn.sql("select * from src")
+        qty_type = dict(zip(df.columns, df.types))["qty"]
+        assert str(qty_type).upper().startswith("INT")
+        assert conn.sql("select count(*) from src where qty is not null").fetchone()[0] == 0
+
     def test_sql_drop_tombstone(self, conn):
         # drop is a tombstone (no data deleted); the table leaves the catalog.
         conn.sql("drop table src")

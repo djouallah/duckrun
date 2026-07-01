@@ -74,8 +74,18 @@ class DuckrunAdapter(DuckDBAdapter):
         except Exception:  # pragma: no cover - frozen config fallback
             try:
                 object.__setattr__(config, "threads", 1)
-            except Exception:  # last resort: if even __setattr__ is blocked, leave threads as-is
+            except Exception:  # pragma: no cover
                 pass
+        # Verify the pin actually took. Leaving threads > 1 is not a degraded run — it silently
+        # corrupts data (parallel models collide on the shared connection's open Arrow stream), so
+        # fail loud rather than let it through. A failed run is strictly better than a corrupt table.
+        if getattr(config, "threads", None) != 1:
+            raise RuntimeError(
+                "duckrun could not pin the run to a single thread (config.threads is "
+                f"{getattr(config, 'threads', None)!r}). The Delta write path is not thread-safe: "
+                "parallel models would collide on the shared DuckDB connection and can corrupt "
+                "tables. Set `threads: 1` in your profile and re-run."
+            )
 
     @available
     def delta_table_exists(self, location) -> bool:
