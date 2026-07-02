@@ -5,11 +5,17 @@ multicatalog_dbt:
       type: duckrun
       # A medallion across THREE Fabric Lakehouses. The default catalog is the Silver lakehouse;
       # Bronze and Gold are declared as named catalogs. Point each at its own `abfss://` Lakehouse
-      # root on OneLake, or (the local de-risk) at three separate folders. Tokens are automatic on
-      # OneLake — add `storage_options: { bearer_token: ... }` per catalog only when needed.
+      # root on OneLake, or (the local de-risk) at three separate folders.
       # (The default catalog is DuckDB's own `memory`; Silver is just its root_path. Don't set
       # `database:` here — dbt-duckdb requires it to match the `:memory:` path.)
+      # A dedicated schema keeps the demo's tables out of the way of anything else in the lakehouse.
+      schema: "{{ env_var('DBT_SCHEMA', 'main') }}"
       root_path: "{{ env_var('LH_SILVER_PATH') }}"
+      # One OneLake token authenticates all three lakehouses (same storage resource): the default
+      # catalog's unscoped secret covers reads across all abfss roots, and Bronze/Gold writes inherit
+      # this token. Empty locally -> no secret, plain local-filesystem writes.
+      storage_options:
+        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"
       catalogs:
         lh_bronze:
           root_path: "{{ env_var('LH_BRONZE_PATH') }}"

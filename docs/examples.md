@@ -27,6 +27,14 @@ Microsoft Fabric OneLake lakehouse.*
 
     *source: [JosueBogran/coffeeshopdatageneratorv2](https://github.com/JosueBogran/coffeeshopdatageneratorv2)*
 
+-   __[multi-lakehouse — Bronze/Silver/Gold across three Lakehouses](multicatalog_dbt.html)__
+
+    One dbt project, a medallion whose layers each materialize into a **separate** Fabric
+    Lakehouse via the `catalogs:` profile key + `+database: <alias>` on a model. Built for real
+    on OneLake; `ref()` and joins resolve across the Lakehouses.
+
+    *source: [demo_multicatalog_dbt.py](https://github.com/djouallah/duckrun/blob/main/integration_tests/multicatalog/demo_multicatalog_dbt.py)*
+
 </div>
 
 ## Pure SQL — the connection API

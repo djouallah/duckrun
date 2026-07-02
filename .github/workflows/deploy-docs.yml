@@ -103,11 +103,12 @@ jobs:
           cp_art docs-artifacts/docs-techflow/static_index.html    techflow.html        || true
           cp_art docs-artifacts/docs-taxi-page/taxi_run.html       taxi.html            || true
           cp_art docs-artifacts/docs-multicatalog-page/multicatalog_run.html multicatalog.html || true
+          cp_art docs-artifacts/docs-multicatalog-dbt-page/multicatalog_dbt_run.html multicatalog_dbt.html || true
           cp_art docs-artifacts/docs-jaffle_shop/static_index.html jaffle_shop.html     || true
           cp_art docs-artifacts/docs-tuva/static_index.html        tuva.html            || true
           # Safety net: for any example page still absent (artifact download failed and no committed
           # fallback), preserve whatever is currently published so a deploy never wipes a live page.
-          for p in aemo coffee sde mrr techflow taxi multicatalog jaffle_shop tuva; do
+          for p in aemo coffee sde mrr techflow taxi multicatalog multicatalog_dbt jaffle_shop tuva; do
             if [ ! -f "site/$p.html" ]; then
               if curl -fsS "https://djouallah.github.io/duckrun/$p.html" -o "site/$p.html"; then
                 echo "  preserved live: $p.html"
