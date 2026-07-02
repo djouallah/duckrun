@@ -117,6 +117,13 @@ def test_list_delta_tables_no_token_returns_empty():
 class _Creds:
     root_path = "abfss://duckrun@onelake.dfs.fabric.microsoft.com/dev.Lakehouse/Tables"
     storage_options = {"bearer_token": "TOK"}
+    catalogs = None
+
+    def root_for(self, database=None):
+        return (self.root_path, self.storage_options)
+
+    def storage_options_for_location(self, location):
+        return self.storage_options
 
 
 class _Config:

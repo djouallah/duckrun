@@ -359,6 +359,28 @@ def _split_leading_with(sql: str) -> Tuple[str, str]:
     return sql[:idx].rstrip(), sql[idx:]
 
 
+# DML target-relation matcher (verb → relation), used only to detect a 3-part cross-catalog target.
+_DML_REL = re.compile(
+    r"^(?:insert\s+into|delete\s+from|update|merge\s+into|alter\s+table|"
+    r"drop\s+table(?:\s+if\s+exists)?|"
+    r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?)\s+(?P<rel>[\w.\"]+)",
+    re.IGNORECASE,
+)
+
+
+def dml_target_catalog(query: str) -> Optional[str]:
+    """The leading catalog token of a DML statement's target when it's 3-part
+    (``catalog.schema.table``), else ``None``. Lets a caller route raw DML to the named catalog's
+    root (rather than the current/default one). Shared by the native session and the dbt adapter's
+    cursor wrapper so the two use one matcher."""
+    _, body = _split_leading_with(_strip_leading(query))  # peel a leading WITH so the verb is visible
+    m = _DML_REL.match(_strip_leading(body))
+    if not m:
+        return None
+    parts = [p.strip().strip('"') for p in m.group("rel").split(".")]
+    return parts[0] if len(parts) >= 3 else None
+
+
 def _fullmatch(pattern, sql):
     return pattern.fullmatch(sql.strip())
 

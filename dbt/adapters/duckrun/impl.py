@@ -91,7 +91,7 @@ class DuckrunAdapter(DuckDBAdapter):
     def delta_table_exists(self, location) -> bool:
         """True if a Delta table already exists at ``location``."""
         from . import engine
-        so = getattr(self.config.credentials, "storage_options", None)
+        so = self.config.credentials.storage_options_for_location(location)
         return engine.table_exists(location, so)
 
     @available
@@ -102,7 +102,7 @@ class DuckrunAdapter(DuckDBAdapter):
         duplicate."""
         from . import engine
         from deltalake.exceptions import TableNotFoundError
-        so = getattr(self.config.credentials, "storage_options", None)
+        so = self.config.credentials.storage_options_for_location(location)
         try:
             return engine._delta_table(location, so).version()
         except TableNotFoundError:
@@ -118,7 +118,7 @@ class DuckrunAdapter(DuckDBAdapter):
         survive into a later ``dbt docs generate`` (a fresh process that rebuilds the views from
         disk). Called from the materialization after the write. Best-effort."""
         from . import engine
-        so = getattr(self.config.credentials, "storage_options", None)
+        so = self.config.credentials.storage_options_for_location(location)
         try:
             engine.persist_docs_to_delta(location, relation_docs, dict(column_docs or {}), so)
         except Exception as exc:  # best-effort: docs persistence must not fail the build
@@ -129,7 +129,7 @@ class DuckrunAdapter(DuckDBAdapter):
         on a freshly (re-)registered delta_scan view, so catalog queries (``dbt docs generate``)
         return non-null comments even in a process that never ran the model. Best-effort."""
         from . import engine
-        so = getattr(self.config.credentials, "storage_options", None)
+        so = self.config.credentials.storage_options_for_location(location)
         relation_docs, column_docs = engine.read_delta_docs(location, so)
         if not relation_docs and not column_docs:
             return
@@ -177,7 +177,10 @@ class DuckrunAdapter(DuckDBAdapter):
         model and so never hit a materialization, still query the table. For ``run``/``build``
         the materialization re-creates the view anyway (pre-register {{ this }} + step-4 view).
         """
-        root_path = getattr(self.config.credentials, "root_path", None)
+        # Resolve the root/token of the catalog this (database, schema) belongs to: the default
+        # catalog for the target database, an attached catalog for a `+database: <alias>` model.
+        # Single-catalog projects resolve to the top-level root_path/storage_options, unchanged.
+        root_path, storage_options = self.config.credentials.root_for(schema_relation.database)
         if not root_path:
             return []
 
@@ -188,7 +191,7 @@ class DuckrunAdapter(DuckDBAdapter):
         # enumerate table directories with the OneLake DFS REST API; local / az:// stores use
         # DuckDB glob, which works there.
         if remote.is_abfss(root_path):
-            names = self._discover_via_rest(root_path, schema)
+            names = self._discover_via_rest(root_path, schema, storage_options)
         else:
             names = self._discover_via_glob(root_path, schema)
 
@@ -199,9 +202,9 @@ class DuckrunAdapter(DuckDBAdapter):
             for name in names
         ]
 
-    def _discover_via_rest(self, root_path, schema):
-        """Table names under ``<root_path>/<schema>`` on a OneLake/ADLS store, via REST."""
-        so = getattr(self.config.credentials, "storage_options", None)
+    def _discover_via_rest(self, root_path, schema, so=None):
+        """Table names under ``<root_path>/<schema>`` on a OneLake/ADLS store, via REST. ``so`` is
+        the catalog's storage_options (the token for THIS root)."""
         try:
             return remote.list_delta_tables(root_path, str(schema).strip('"'), so)
         except Exception as exc:
@@ -228,7 +231,7 @@ class DuckrunAdapter(DuckDBAdapter):
         But for a command that runs no models, this is the only place the physical view gets
         created from the Delta tables discovered on disk.
         """
-        root_path = getattr(self.config.credentials, "root_path", None)
+        root_path, _ = self.config.credentials.root_for(relation.database)
         if not root_path:
             return
         location = (
@@ -264,9 +267,10 @@ class DuckrunAdapter(DuckDBAdapter):
             return in_memory
 
         # Hide drop-tombstones: a `drop table` overwrites the table to a one-column marker (no data
-        # deleted). Such a table must not surface as a relation. Check before registering.
-        root_path = getattr(self.config.credentials, "root_path", "") or ""
-        so = getattr(self.config.credentials, "storage_options", None)
+        # deleted). Such a table must not surface as a relation. Check before registering. Every
+        # discovered relation shares this schema_relation's catalog, so resolve its root/token once.
+        root_path, so = self.config.credentials.root_for(schema_relation.database)
+        root_path = root_path or ""
         cur = self._cursor()
         live = []
         for rel in discovered:
@@ -331,17 +335,22 @@ class DuckrunAdapter(DuckDBAdapter):
         from dbt_common.clients.agate_helper import table_from_data_flat
         from . import engine
 
-        root_path = getattr(self.config.credentials, "root_path", "") or ""
-        if not root_path or len(table.rows) == 0:
+        creds = self.config.credentials
+        if len(table.rows) == 0 or not (creds.root_path or creds.catalogs):
             return table
-        so = getattr(self.config.credentials, "storage_options", None)
         cur = self._cursor()
 
         cache = {}
 
-        def stats_for(schema, name):
-            key = (schema, name)
+        def stats_for(database, schema, name):
+            key = (database, schema, name)
             if key not in cache:
+                # Each row carries its catalog (table_database); resolve that catalog's root/token
+                # so stats for a `+database: <alias>` model come from the right Lakehouse.
+                root_path, so = creds.root_for(database)
+                if not root_path:
+                    cache[key] = None
+                    return None
                 loc = (root_path.rstrip("/") + "/" + str(schema).strip('"')
                        + "/" + str(name).strip('"'))
                 cache[key] = (None if delta_dml.is_dropped(cur, loc, so)
@@ -354,7 +363,7 @@ class DuckrunAdapter(DuckDBAdapter):
         rows = []
         for r in table.rows:
             d = dict(zip(cols, r))
-            st = stats_for(d.get("table_schema"), d.get("table_name"))
+            st = stats_for(d.get("table_database"), d.get("table_schema"), d.get("table_name"))
             for k, label, desc in self._STATS_SPEC:
                 present = st is not None and st.get(k) is not None
                 if k == "last_modified" and present:

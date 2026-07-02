@@ -19,10 +19,16 @@ path (the plugin's ``configure_connection``) and the discovery path (the adapter
 two can't drift.
 """
 import os
+import re
 from typing import Dict, Optional
 
 # Stable name so repeated creation is an idempotent CREATE OR REPLACE, not a pile-up.
 SECRET_NAME = "duckrun_onelake"
+
+
+def scoped_secret_name(catalog_name: str) -> str:
+    """A stable DuckDB secret name for an attached catalog's path-scoped Azure token."""
+    return "duckrun_cat_" + re.sub(r"[^0-9A-Za-z_]", "_", str(catalog_name))
 
 
 def bearer_token(storage_options: Optional[Dict[str, str]]) -> Optional[str]:
@@ -116,5 +122,31 @@ def ensure_azure_secret(conn, storage_options: Optional[Dict[str, str]]) -> bool
     conn.execute(
         f"CREATE OR REPLACE SECRET {SECRET_NAME} "
         f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}')"
+    )
+    return True
+
+
+def mint_scoped_secret(conn, secret_name: str, root: str,
+                       storage_options: Optional[Dict[str, str]]) -> bool:
+    """Mint a path-**scoped** DuckDB Azure secret for an attached (non-default) catalog.
+
+    Two different OneLake bearer tokens (one per Lakehouse/workspace) can then coexist in one
+    connection: DuckDB picks the longest-matching ``SCOPE`` per ``delta_scan``, so each catalog's
+    reads use its own token. The default catalog keeps the unscoped ``ensure_azure_secret``. No-op
+    (returns False) when there is no token. Lifted from ``duckrun.session._mint_scoped_secret`` so
+    the dbt adapter and the notebook session share one implementation."""
+    token = bearer_token(storage_options)
+    if not token:
+        return False
+    conn.execute("INSTALL azure; LOAD azure;")
+    transport = os.environ.get("AZURE_TRANSPORT_OPTION_TYPE")
+    if transport:
+        transport_sql = transport.replace("'", "''")
+        conn.execute(f"SET GLOBAL azure_transport_option_type = '{transport_sql}'")
+    token_sql = token.replace("'", "''")
+    scope_sql = str(root).replace("'", "''")
+    conn.execute(
+        f"CREATE OR REPLACE SECRET {secret_name} "
+        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}', SCOPE '{scope_sql}')"
     )
     return True

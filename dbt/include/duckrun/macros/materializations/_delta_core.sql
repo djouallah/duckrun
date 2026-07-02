@@ -26,10 +26,18 @@
         type=('table' if is_py else 'view')) -%}
   {%- set location = config.get('location') -%}
   {%- if not location -%}
-    {%- set root_path = target.root_path -%}
+    {#-- Resolve the write root by the model's database: the default catalog uses target.root_path,
+         a `+database: <alias>` that names a declared catalog uses that catalog's root. --#}
+    {%- set _db = target_relation.database -%}
+    {%- set _catalogs = target.catalog_locations or {} -%}
+    {%- if _db and _db != target.database and _db in _catalogs -%}
+      {%- set root_path = _catalogs[_db] -%}
+    {%- else -%}
+      {%- set root_path = target.root_path -%}
+    {%- endif -%}
     {%- if not root_path -%}
       {{ exceptions.raise_compiler_error(
-          "duckrun: model '" ~ model.name ~ "' needs config(location=...) or a 'root_path' in the profile.") }}
+          "duckrun: model '" ~ model.name ~ "' needs config(location=...), a 'root_path' in the profile, or a matching entry in the profile's 'catalogs:' for database '" ~ _db ~ "'.") }}
     {%- endif -%}
     {%- set location = root_path ~ '/' ~ target_relation.schema ~ '/' ~ target_relation.identifier -%}
   {%- endif -%}

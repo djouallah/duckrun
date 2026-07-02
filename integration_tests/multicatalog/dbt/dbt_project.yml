@@ -1,0 +1,17 @@
+name: multicatalog_dbt
+version: "1.0"
+config-version: 2
+profile: multicatalog_dbt
+
+model-paths: ["models"]
+
+# A Bronze / Silver / Gold medallion, each layer materialized into a SEPARATE Fabric Lakehouse via
+# the duckrun `catalogs:` feature. The layer -> catalog mapping is declared once here with
+# `+database`, so the model SQL stays clean (no per-model database config needed).
+models:
+  multicatalog_dbt:
+    bronze:
+      +database: lh_bronze
+    silver: {}                 # the default catalog (lh_silver)
+    gold:
+      +database: lh_gold

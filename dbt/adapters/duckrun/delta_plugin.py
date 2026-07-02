@@ -28,6 +28,11 @@ class Plugin(BasePlugin):
     def initialize(self, config: dict) -> None:
         config = config or {}
         self._storage_options: Optional[dict] = config.get("storage_options")
+        # Per-catalog write config (issue #7): {alias: {root_path, storage_options}} + the default
+        # catalog's name, so store() can pick the write token by the relation's database. Empty for
+        # a single-catalog project — store() then always uses the default storage_options.
+        self._catalogs: dict = config.get("catalogs") or {}
+        self._default_database = config.get("default_database")
         self._compaction_threshold: int = int(config.get("compaction_threshold", 100))
         self._conn = None
         self._cursor_handle = None
@@ -79,18 +84,42 @@ class Plugin(BasePlugin):
         # (the token is captured once at connection-open). dbt calls this once per model, so it's the
         # natural place to re-mint just before this model's reads (delta_scan of {{ this }}) and its
         # store() write. No-op unless the token is a JWT near expiry AND a live source can refresh it
-        # (Fabric / azure-identity), so short jobs and the local path are untouched.
-        if secret.bearer_token(self._storage_options):
-            fresh = secret.refreshed(self._storage_options)
-            if fresh is not self._storage_options:  # token was actually re-acquired
-                self._storage_options = fresh
-                try:
-                    secret.ensure_azure_secret(cursor, fresh)  # re-mint the read secret with it
-                    if os.environ.get("DUCKRUN_AUTH_DEBUG"):
-                        print("[duckrun-auth] configure_cursor: re-minted DuckDB secret with refreshed token", flush=True)
-                except Exception as e:  # best-effort: a transient refresh failure keeps the old secret
-                    if os.environ.get("DUCKRUN_AUTH_DEBUG"):
-                        print(f"[duckrun-auth] configure_cursor: re-mint failed: {e!r}", flush=True)
+        # (Fabric / azure-identity), so short jobs and the local path are untouched. Refresh the
+        # default AND every catalog: a stale aliased token would 401 only on that Lakehouse.
+        self._refresh_token(cursor, self._storage_options, self._default_database, is_default=True,
+                            setter=lambda so: setattr(self, "_storage_options", so))
+        for alias, cat in self._catalogs.items():
+            cat = cat or {}
+            self._refresh_token(cursor, cat.get("storage_options"), alias, is_default=False,
+                                setter=lambda so, c=cat: c.__setitem__("storage_options", so))
+
+    def _catalog_storage_options(self, database):
+        """The write token for the catalog a relation lands in (its ``database``), falling back to
+        the default catalog's ``storage_options``. Identity for a single-catalog project."""
+        if database is not None:
+            db = str(database).strip('"')
+            if db in self._catalogs:
+                return (self._catalogs[db] or {}).get("storage_options")
+        return self._storage_options
+
+    def _refresh_token(self, cursor, so, catalog, is_default, setter) -> None:
+        if not secret.bearer_token(so):
+            return
+        fresh = secret.refreshed(so)
+        if fresh is so:  # token still valid (the common path)
+            return
+        setter(fresh)  # token was actually re-acquired — keep the live copy in sync
+        try:
+            if is_default:
+                secret.ensure_azure_secret(cursor, fresh)
+            else:
+                root = (self._catalogs.get(catalog) or {}).get("root_path")
+                secret.mint_scoped_secret(cursor, secret.scoped_secret_name(catalog), root, fresh)
+            if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+                print(f"[duckrun-auth] configure_cursor: re-minted DuckDB secret for catalog {catalog!r}", flush=True)
+        except Exception as e:  # best-effort: a transient refresh failure keeps the old secret
+            if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+                print(f"[duckrun-auth] configure_cursor: re-mint failed for {catalog!r}: {e!r}", flush=True)
 
     def _cursor(self):
         # Prefer the live per-model cursor (shares the session where pre-hook variables and
@@ -118,9 +147,13 @@ class Plugin(BasePlugin):
         incremental = bool(cfg.get("incremental", False))
         full_refresh = bool(cfg.get("full_refresh", False))
         strategy = cfg.get("incremental_strategy")
-        # Per-model override wins; fall back to the credential-level storage_options.
-        # (Use `or` because the macro always sets the key, often to None.)
-        storage_options = cfg.get("storage_options") or self._storage_options
+        # Per-model override wins; fall back to the write token of the catalog this relation lands
+        # in (its `database`), then the default catalog's token. (Use `or` because the macro always
+        # sets the key, often to None.) For a single-catalog project this is exactly the default
+        # storage_options, unchanged.
+        storage_options = cfg.get("storage_options") or self._catalog_storage_options(
+            getattr(target_config.relation, "database", None)
+        )
 
         # Keep `cur` referenced for the whole write so the relation's Arrow stream
         # stays valid while deltalake consumes it.

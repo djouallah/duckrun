@@ -79,6 +79,40 @@ extra config. In a notebook where the storage secret is already provided to Duck
 Verified end-to-end against real remote object storage: `table` overwrite, `incremental` merge, and
 `delta_scan` reads / tests.
 
+### Multiple Lakehouses in one project
+
+One dbt project can write across several Lakehouses (e.g. a medallion `LH_Bronze` / `LH_Silver` /
+`LH_Gold`). Declare each extra write root as a named **catalog** under `catalogs:`, then send a model
+to it with the standard dbt `+database: <alias>` config. The default catalog is `database`
+(`root_path` / `storage_options` at the top level); a project with no `catalogs:` behaves exactly as
+before.
+
+```yaml
+    dev:
+      type: duckrun
+      # The default catalog is the top-level root_path/storage_options (Silver here). Don't set a
+      # `database:` — dbt-duckdb requires it to match the `:memory:` path; the default catalog is
+      # DuckDB's own `memory`.
+      root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
+      storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
+      catalogs:
+        lh_bronze:
+          root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
+          storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
+        lh_gold:
+          root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Gold.Lakehouse/Tables"
+```
+
+```sql
+-- models/bronze/raw_events.sql — lands in LH_Bronze
+{{ config(materialized='incremental', database='lh_bronze', unique_key='id') }}
+select ...
+```
+
+Each catalog carries its own `storage_options`, so a per-Lakehouse OneLake token works (the adapter
+mints a path-scoped DuckDB secret per catalog). `ref()` resolves across catalogs, and
+`is_incremental()` / `dbt docs generate` work per Lakehouse.
+
 ## Materializations
 
 | materialized      | backed by                | notes                                                                 |

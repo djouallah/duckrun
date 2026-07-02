@@ -69,7 +69,10 @@ def test_delta_version_reraises_generic_error(monkeypatch):
     # Build a bare adapter shell: delta_version only touches self.config.credentials.
     adapter = DuckrunAdapter.__new__(DuckrunAdapter)
     adapter.config = types.SimpleNamespace(
-        credentials=types.SimpleNamespace(storage_options=None)
+        credentials=types.SimpleNamespace(
+            storage_options=None,
+            storage_options_for_location=lambda location: None,
+        )
     )
     with pytest.raises(OSError):
         adapter.delta_version("/some/path")

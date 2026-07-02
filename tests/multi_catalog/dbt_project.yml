@@ -1,0 +1,10 @@
+name: multi_catalog
+version: "1.0"
+config-version: 2
+profile: multi_catalog
+
+model-paths: ["models"]
+
+models:
+  multi_catalog:
+    +materialized: table

@@ -109,6 +109,17 @@ jobs:
             tests/dbt_unit_tests/test_dbt_unit_tests.py \
             -q -p no:cacheprovider
 
+      - name: Multi-catalog (multi-Lakehouse) end-to-end dbt run (issue #7)
+        # One dbt project writing across two physical Delta roots via `+database: <alias>`: proves
+        # cross-catalog materialization, cross-lakehouse ref(), cross-catalog is_incremental, and
+        # docs. Its own pytest invocation — it attaches a second DuckDB catalog, so keeping it out
+        # of the shared conformance session avoids cross-test contamination (same reason the native
+        # unit-test project runs standalone).
+        run: |
+          python -m pytest \
+            tests/multi_catalog/test_multi_catalog_e2e.py \
+            -q -p no:cacheprovider
+
   conformance:
     # The official dbt adapter conformance suite (dbt-labs/dbt-adapters). REQUIRED check, gated on
     # REGRESSIONS only: duckrun is Delta-only, so some standard tests are expected not to pass — what

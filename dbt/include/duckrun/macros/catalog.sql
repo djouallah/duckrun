@@ -13,6 +13,9 @@
   num_records / size_bytes from DeltaTable.get_add_actions and cache per build.)
 #}
 {% macro duckrun__get_catalog(information_schema, schemas) -%}
+  {#-- Scope to the catalog dbt asked about (matches duckrun__get_catalog_relations), so
+       `dbt docs generate` reports each attached catalog's relations under its own database. --#}
+  {%- set database = information_schema.database -%}
   {%- call statement('catalog', fetch_result=True) -%}
     with relations AS (
       select

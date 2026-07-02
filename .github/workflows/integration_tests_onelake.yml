@@ -329,8 +329,15 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install duckrun (pulls duckdb + deltalake)
-        run: pip install -e .
+      - name: Install duckrun + pytest (pulls duckdb + deltalake)
+        run: pip install -e . pytest
+      - name: Multi-lakehouse dbt demo — local de-risk (network-free, always runs)
+        # The dbt medallion across three catalogs, run against three local folders. Proves the
+        # `catalogs:` + `+database` write/read/incremental paths before the OneLake steps below.
+        run: |
+          python -m pytest \
+            integration_tests/multicatalog/dbt/test_multicatalog_dbt.py \
+            -q -p no:cacheprovider
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:

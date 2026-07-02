@@ -23,10 +23,6 @@ silently interleaving.
 
 ## Install
 
-```bash
-pip install duckrun
-```
-
 In a **Microsoft Fabric** notebook, upgrade and restart the kernel (duckrun needs `duckdb` ≥ 1.5.4,
 which is newer than the bundled stable build; it fails loud at `connect()` otherwise):
 
@@ -103,6 +99,25 @@ my_project:
     dev:
       type: duckrun
       root_path: "abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables"
+```
+
+**Multiple lakehouses in one project** — declare extra write roots as named `catalogs:` and send a
+model to one with the standard dbt `+database: <alias>` config (e.g. a Bronze/Silver/Gold medallion
+across three Fabric Lakehouses). `ref()` and joins resolve across them:
+
+```yaml
+    dev:
+      type: duckrun
+      root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"  # default
+      catalogs:
+        lh_bronze: { root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables" }
+        lh_gold:   { root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Gold.Lakehouse/Tables" }
+```
+
+```sql
+-- models/bronze/raw_events.sql → lands in LH_Bronze
+{{ config(materialized='incremental', database='lh_bronze', unique_key='id') }}
+select ...
 ```
 
 Profiles, materializations, incremental strategies (incl. `append_if_unchanged`), sources, and

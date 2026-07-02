@@ -323,51 +323,14 @@ def _derive_catalog_name(root_path: str) -> Optional[str]:
     return sanitized or None
 
 
-def _secret_name(catalog_name: str) -> str:
-    """A stable DuckDB secret name for an attached catalog's scoped Azure token."""
-    return "duckrun_cat_" + re.sub(r"[^0-9A-Za-z_]", "_", catalog_name)
+# Scoped-secret minting lives in ``secret`` so the dbt adapter and this session share it.
+_secret_name = secret.scoped_secret_name
+_mint_scoped_secret = secret.mint_scoped_secret
 
 
-def _mint_scoped_secret(con, secret_name: str, root: str, storage_options) -> bool:
-    """Mint a path-**scoped** DuckDB Azure secret for an attached OneLake catalog, so two different
-    bearer tokens (one per workspace) coexist in one connection — DuckDB picks the longest-matching
-    scope, so each catalog's reads use its own token. No-op (False) when there's no token."""
-    token = secret.bearer_token(storage_options)
-    if not token:
-        return False
-    con.execute("INSTALL azure; LOAD azure;")
-    transport = os.environ.get("AZURE_TRANSPORT_OPTION_TYPE")
-    if transport:
-        con.execute(f"SET GLOBAL azure_transport_option_type = '{transport.replace(chr(39), chr(39) * 2)}'")
-    token_sql = token.replace("'", "''")
-    scope_sql = str(root).replace("'", "''")
-    con.execute(
-        f"CREATE OR REPLACE SECRET {secret_name} "
-        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}', SCOPE '{scope_sql}')"
-    )
-    return True
-
-
-# DML target-relation matcher (verb → relation), used only to detect a 3-part cross-catalog target.
-_DML_REL = re.compile(
-    r"^(?:insert\s+into|delete\s+from|update|merge\s+into|alter\s+table|"
-    r"drop\s+table(?:\s+if\s+exists)?|"
-    r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?)\s+(?P<rel>[\w.\"]+)",
-    re.IGNORECASE,
-)
-
-
-def _dml_target_catalog(query: str) -> Optional[str]:
-    """The leading catalog token of a DML statement's target when it's 3-part
-    (``catalog.schema.table``), else ``None``. Lets ``sql()`` route raw DML to the named catalog's
-    root (rather than the current one)."""
-    s = _strip_leading(query)
-    _, body = delta_dml._split_leading_with(s)  # peel a leading WITH so the verb is visible
-    m = _DML_REL.match(_strip_leading(body))
-    if not m:
-        return None
-    parts = [p.strip().strip('"') for p in m.group("rel").split(".")]
-    return parts[0] if len(parts) >= 3 else None
+# Detect a 3-part cross-catalog DML target. The matcher lives in delta_dml so the native session
+# and the dbt adapter's cursor wrapper share one implementation.
+_dml_target_catalog = delta_dml.dml_target_catalog
 
 
 class DuckSession:

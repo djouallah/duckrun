@@ -1,0 +1,17 @@
+multicatalog_dbt:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      # A medallion across THREE Fabric Lakehouses. The default catalog is the Silver lakehouse;
+      # Bronze and Gold are declared as named catalogs. Point each at its own `abfss://` Lakehouse
+      # root on OneLake, or (the local de-risk) at three separate folders. Tokens are automatic on
+      # OneLake — add `storage_options: { bearer_token: ... }` per catalog only when needed.
+      # (The default catalog is DuckDB's own `memory`; Silver is just its root_path. Don't set
+      # `database:` here — dbt-duckdb requires it to match the `:memory:` path.)
+      root_path: "{{ env_var('LH_SILVER_PATH') }}"
+      catalogs:
+        lh_bronze:
+          root_path: "{{ env_var('LH_BRONZE_PATH') }}"
+        lh_gold:
+          root_path: "{{ env_var('LH_GOLD_PATH') }}"

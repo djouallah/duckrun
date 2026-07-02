@@ -1,0 +1,14 @@
+multi_catalog:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      # Default catalog (the "silver" lakehouse). A second local folder is declared as the
+      # "lh_bronze" catalog so one project writes across two physical roots — the local-filesystem
+      # stand-in for two Fabric Lakehouses. The harness points these at fresh tmp dirs per test.
+      root_path: "{{ env_var('SILVER_PATH') }}"
+      catalogs:
+        lh_bronze:
+          root_path: "{{ env_var('BRONZE_PATH') }}"
+        lh_gold:
+          root_path: "{{ env_var('GOLD_PATH') }}"

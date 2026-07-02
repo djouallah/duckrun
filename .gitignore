@@ -82,11 +82,21 @@ integration_tests/*/target/
 integration_tests/*/dbt_packages/
 integration_tests/*/logs/
 integration_tests/*/package-lock.yml
+# multicatalog's dbt demo is one level deeper (integration_tests/multicatalog/dbt/)
+integration_tests/multicatalog/dbt/target/
+integration_tests/multicatalog/dbt/dbt_packages/
+integration_tests/multicatalog/dbt/logs/
+integration_tests/multicatalog/dbt/.user.yml
 # dbt run artifacts from the native-unit-test project (the harness runs dbt build into PROJECT_DIR)
 tests/dbt_unit_tests/project/target/
 tests/dbt_unit_tests/project/dbt_packages/
 tests/dbt_unit_tests/project/logs/
 tests/dbt_unit_tests/project/.user.yml
+# dbt run artifacts from the multi-catalog end-to-end project (harness runs dbt into the dir)
+tests/multi_catalog/target/
+tests/multi_catalog/dbt_packages/
+tests/multi_catalog/logs/
+tests/multi_catalog/.user.yml
 # Runtime artifacts from the performance projects (merge_spill / tpch write to external dirs by
 # default, but a local run may drop these inside the project)
 performance_test/*/warehouse/
