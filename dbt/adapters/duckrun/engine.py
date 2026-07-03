@@ -34,14 +34,15 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# Row group = one VertiPaq segment. 2^23 rows (8 × delta-rs's 1,048,576 default). Bigger row
-# groups give Direct Lake / Power BI fewer, larger segments at the cost of more write-time memory
-# (arrow-rs buffers a full row group per open writer).
-_MAX_ROW_GROUP_SIZE = 1_048_576 * 8
+# Row group ~= one Power BI / Direct Lake segment: 6 × delta-rs's 1,048,576 default = ~6M rows, the
+# current Power BI segment standard. Bigger row groups give fewer, larger segments at the cost of
+# more write-time memory (arrow-rs buffers a full row group per open writer). delta-rs enforces this
+# (a row group flushes once accumulated rows cross the cap); the exact value needn't be aligned.
+_MAX_ROW_GROUP_SIZE = 1_048_576 * 6
 # Bounded-but-large dictionary page limit (256 MB). arrow-rs's ~1 MB default silently falls back
-# to PLAIN mid column chunk on wide columns at 8M rows/group, defeating the dictionary encoding
-# Direct Lake transcodes into VertiPaq hash encoding. 256 MB holds any dictionary worth having and
-# caps the per-column write RAM; a column that overflows it was never a good dictionary candidate.
+# to PLAIN mid column chunk on wide columns at multi-million rows/group, defeating the dictionary
+# encoding Direct Lake transcodes into its hash encoding. 256 MB holds any dictionary worth having
+# and caps the per-column write RAM; a column that overflows it was never a good dictionary candidate.
 _DICT_PAGE_SIZE_LIMIT = 256 * 1024 * 1024
 # Bigger data pages → fewer page headers and runs that survive page boundaries.
 _DATA_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
