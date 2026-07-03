@@ -111,6 +111,19 @@ def test_dim_customers_real_delta_rows(tmp_path):
     }
 
 
+def test_sort_by_writes_physically_ordered(tmp_path):
+    """sort_by (review #6) writes rows physically ordered by the sort key. Read the Delta table's
+    parquet back in FILE order (not via an ORDER BY query) and assert it's sorted — proving the
+    ordering survives to disk under preserve_insertion_order=false."""
+    from deltalake import DeltaTable
+
+    wh = _wh(tmp_path)
+    _cold_start(wh)
+    uri = f"{wh}/{SCHEMA}/sorted_layout"
+    keys = DeltaTable(uri).to_pyarrow_table().column("sort_key").to_pylist()
+    assert keys == [1, 2, 3, 4, 5], keys  # physically sorted, not the shuffled input order
+
+
 # Per-strategy two-run expectations: load 1 = events 1-3 @ original amounts, load 2 = events 1-3
 # RE-EMITTED @ changed amounts + new 4-6. The final {event_id: amount} below is what each strategy's
 # real Delta table must hold after both runs — the row content is what distinguishes the strategies.

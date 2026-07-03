@@ -166,7 +166,18 @@ class Plugin(BasePlugin):
         # safeappend/microbatch, and the 0.3/0.6 split applies to merge ONLY.
         engine.set_write_memory_limit(cur, self._baseline_memory_limit)
         name = self._relation_name(target_config.relation)
-        data = cur.sql(f"SELECT * FROM {name}")
+        # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
+        # honored here — the staged relation is read through a wrapper SELECT *, and with
+        # preserve_insertion_order=false DuckDB may reorder any result lacking a top-level ORDER BY.
+        # A top-level ORDER BY on this read IS honored, so long RLE runs / dictionary locality (the
+        # point of the Parquet tuning) are deterministic regardless of the global flag.
+        sort_by = cfg.get("sort_by")
+        if sort_by:
+            cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
+            order = ", ".join('"' + str(c).strip().strip('"').replace('"', '""') + '"' for c in cols)
+            data = cur.sql(f"SELECT * FROM {name} ORDER BY {order}")
+        else:
+            data = cur.sql(f"SELECT * FROM {name}")
 
         exists = engine.table_exists(path, storage_options)
 

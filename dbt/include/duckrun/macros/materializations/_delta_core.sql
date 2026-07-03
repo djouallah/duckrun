@@ -146,6 +146,7 @@
       'full_refresh': should_full_refresh(),
       'unique_key': config.get('unique_key'),
       'partition_by': config.get('partition_by'),
+      'sort_by': config.get('sort_by'),
       'merge_schema': config.get('merge_schema', false),
       'storage_options': config.get('storage_options'),
       'merge_update_columns': config.get('merge_update_columns'),
