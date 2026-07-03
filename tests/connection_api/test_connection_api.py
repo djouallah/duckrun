@@ -646,6 +646,14 @@ class TestDeltaTable:
         with pytest.raises(ValueError):
             DeltaTable.forName(conn, "dbo.m").optimize(sort="nope")
 
+    def test_conn_optimize_shortcut(self, conn):
+        # conn.optimize(name, ...) is the one-liner over DeltaTable.forName(conn, name).optimize(...).
+        conn.sql("select (i % 5) as r, i as id from range(5000) t(i)") \
+            .write.mode("overwrite").saveAsTable("co")
+        m = conn.optimize("co", sort="experimental")
+        assert m["operation"] == "sortRewrite" and m["sizeBytesBefore"] > 0
+        assert isinstance(conn.optimize("co"), dict)   # plain compaction path still works
+
     def test_vacuum(self, conn):
         # dry_run lists removable files without deleting; never errors on a healthy table.
         self._seed(conn)

@@ -847,6 +847,17 @@ class DuckSession:
             raise ValueError(f"get_stats: no files to describe for source={source!r}.")
         return DataFrame(self.con.sql(" UNION ALL ".join(parts)), self)
 
+    def optimize(self, name: str, *, sort: Optional[str] = None,
+                 zorder_by: Optional[List[str]] = None, target_size: Optional[int] = None) -> Dict:
+        """Optimize the Delta table ``name`` — the one-liner over
+        ``DeltaTable.forName(conn, name).optimize(...)``. Plain call compacts small files; ``zorder_by``
+        z-orders; ``sort='experimental'`` profiles the table and rewrites it physically sorted by the
+        recommended key, returning the REAL measured on-disk size
+        (``sizeBytesBefore`` / ``sizeBytesAfter`` / ``savedPct``)."""
+        from .delta_table import DeltaTable
+        return DeltaTable.forName(self, name).optimize(
+            sort=sort, zorder_by=zorder_by, target_size=target_size)
+
     def _resolve_stats_targets(self, source: Optional[str]) -> List[tuple]:
         """Resolve a ``get_stats`` source to ``(catalog, schema, table)`` targets: ``None`` → every
         table in the current schema; a known table (1/2/3-part) → itself; a schema name → its tables."""

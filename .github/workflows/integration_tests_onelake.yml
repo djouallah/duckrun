@@ -158,12 +158,11 @@ jobs:
         run: |
           python - <<'PY'
           import os, duckrun
-          from duckrun.delta_table import DeltaTable
           conn = duckrun.connect(
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema="mart", read_only=False)
-          result = DeltaTable.forName(conn, "fct_summary").optimize(sort="experimental")
+          result = conn.optimize("fct_summary", sort="experimental")
           print("=== optimize(sort='experimental') result ===")
           print("sort order:", result.get("sortedBy", result))
           b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
@@ -280,12 +279,11 @@ jobs:
         run: |
           python - <<'PY'
           import os, duckrun
-          from duckrun.delta_table import DeltaTable
           conn = duckrun.connect(
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema=os.environ["DBT_SCHEMA"], read_only=False)
-          result = DeltaTable.forName(conn, "fact_sales").optimize(sort="experimental")
+          result = conn.optimize("fact_sales", sort="experimental")
           print("=== optimize(sort='experimental') result ===")
           print("sort order:", result.get("sortedBy", result))
           b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
@@ -362,12 +360,11 @@ jobs:
         run: |
           python - <<'PY'
           import os, duckrun
-          from duckrun.delta_table import DeltaTable
           conn = duckrun.connect(
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema=os.environ["DUCKRUN_TAXI_SCHEMA"], read_only=False)
-          result = DeltaTable.forName(conn, "trips").optimize(sort="experimental")
+          result = conn.optimize("trips", sort="experimental")
           print("=== optimize(sort='experimental') result ===")
           print("sort order:", result.get("sortedBy", result))
           b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
