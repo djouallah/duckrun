@@ -108,7 +108,15 @@
     {%- set columns = adapter.get_columns_in_relation(merge_src) -%}
 
     {#-- Merge on dbt_scd_id; matched (closes) update only dbt_valid_to, unmatched (new versions)
-         insert. read_version pins OCC to the version the staging read. --#}
+         insert. read_version pins OCC to the version the staging read.
+
+         on_schema_change='append_new_columns' matches dbt's default snapshot, which unconditionally
+         appends new source columns (get_missing_columns -> create_columns). It evolves the Delta
+         schema additively when a column appears upstream (new versions carry it), never drops
+         columns, and is a no-op when nothing was added. Hardcoded, not config.get(): dbt's
+         SnapshotConfig.on_schema_change defaults to 'ignore', so a passthrough would silently keep
+         dropping columns. (delta_rs back-fills the added column on the matched close row from the
+         source rather than NULL — an accepted syntax-vs-behavior diff; the point is it's tracked.) --#}
     {% do adapter.store_relation('duckrun', merge_src, columns, location, 'delta', {
         'incremental': true,
         'incremental_strategy': 'merge',
@@ -117,7 +125,7 @@
         'read_version': read_version,
         'dbt_believes_exists': true,
         'full_refresh': false,
-        'on_schema_change': 'ignore',
+        'on_schema_change': 'append_new_columns',
         'invocation_id': invocation_id,
     }) %}
 
