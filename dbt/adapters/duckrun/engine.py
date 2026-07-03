@@ -25,27 +25,60 @@ except ImportError:  # pragma: no cover - older layouts
     except ImportError:
         WriterProperties = None
 
+try:  # per-column knobs (dictionary_enabled, statistics_enabled) — deltalake 1.x
+    from deltalake import ColumnProperties
+except ImportError:  # pragma: no cover - older layouts
+    try:
+        from deltalake.writer import ColumnProperties
+    except ImportError:
+        ColumnProperties = None
 
-# 6 row groups' worth of delta-rs's default (1,048,576 rows) per group. Bigger row groups
-# give Power BI / DirectLake fewer, larger scan ranges at the cost of more write-time memory.
-_MAX_ROW_GROUP_SIZE = 1_048_576 * 6
+
+# Row group = one VertiPaq segment. 2^23 rows (8 × delta-rs's 1,048,576 default). Bigger row
+# groups give Direct Lake / Power BI fewer, larger segments at the cost of more write-time memory
+# (arrow-rs buffers a full row group per open writer).
+_MAX_ROW_GROUP_SIZE = 1_048_576 * 8
+# Bounded-but-large dictionary page limit (256 MB). arrow-rs's ~1 MB default silently falls back
+# to PLAIN mid column chunk on wide columns at 8M rows/group, defeating the dictionary encoding
+# Direct Lake transcodes into VertiPaq hash encoding. 256 MB holds any dictionary worth having and
+# caps the per-column write RAM; a column that overflows it was never a good dictionary candidate.
+_DICT_PAGE_SIZE_LIMIT = 256 * 1024 * 1024
+# Bigger data pages → fewer page headers and runs that survive page boundaries.
+_DATA_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
+# Approximate target file size (~1 GB). delta-rs has no ROW_GROUPS_PER_FILE knob; this is the only
+# lever, and it keeps Direct Lake off the many-small-files cliff (1–2 fat row groups per file).
+_TARGET_FILE_SIZE = 1024 * 1024 * 1024
 
 
 def _writer_properties():
-    # ZSTD compression for a good Parquet footprint (Power BI / DirectLake friendly), plus
-    # larger row groups. If a WriterProperties build ever rejects max_row_group_size, fall
-    # back to compression-only rather than losing ZSTD entirely (ZSTD is the property we most
-    # care about keeping).
+    # Parquet writer config tuned for downstream columnar readers: ZSTD(3) for a
+    # small footprint, large row groups, a bounded-but-large dictionary page limit
+    # so wide dictionaries stay dictionary-encoded, big data pages, and chunk-level stats. Degrade
+    # gracefully if the pinned wheel rejects a newer parameter rather than losing the write — the
+    # last rung (ZSTD-only) is the property we most care about keeping.
     if WriterProperties is None:
         return None
-    try:
-        return WriterProperties(compression="ZSTD", max_row_group_size=_MAX_ROW_GROUP_SIZE)
-    except Exception:  # best-effort: any build rejection falls back to compression-only below
-        pass
-    try:
-        return WriterProperties(compression="ZSTD")
-    except Exception:  # best-effort: if even ZSTD-only is rejected, write without writer props
-        return None
+    col_props = None
+    if ColumnProperties is not None:
+        try:
+            col_props = ColumnProperties(dictionary_enabled=True, statistics_enabled="CHUNK")
+        except Exception:  # best-effort: fall through to writer-level props without per-column knobs
+            col_props = None
+    for kwargs in (
+        dict(compression="ZSTD", compression_level=3,
+             max_row_group_size=_MAX_ROW_GROUP_SIZE,
+             dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
+             data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
+             statistics_truncate_length=64,
+             default_column_properties=col_props),
+        dict(compression="ZSTD", compression_level=3, max_row_group_size=_MAX_ROW_GROUP_SIZE),
+        dict(compression="ZSTD"),
+    ):
+        try:
+            return WriterProperties(**{k: v for k, v in kwargs.items() if v is not None})
+        except Exception:  # best-effort: any build rejection tries the next, simpler rung
+            continue
+    return None
 
 
 def _win_mem_status():
@@ -525,6 +558,7 @@ def build_write_deltalake_args(
     # mode only) — delta-rs's own schema_mode values, passed straight through.
     if schema_mode in ("merge", "overwrite"):
         args["schema_mode"] = schema_mode
+    args["target_file_size"] = _TARGET_FILE_SIZE
     wp = _writer_properties()
     if wp is not None:
         args["writer_properties"] = wp
@@ -730,9 +764,13 @@ def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:
     has more than ``compaction_threshold`` files, compact small files, vacuum tombstoned old
     versions (safe 7-day default retention — no concurrent reader broken), and clean up expired
     log entries. Without it a table written on every run fragments into small files and keeps old
-    versions forever. (The overwrite path vacuums unconditionally instead and does not use this.)"""
+    versions forever. (The overwrite path vacuums unconditionally instead and does not use this.)
+
+    compact() reuses _writer_properties() so the rewrite keeps the tuned layout (ZSTD, large row
+    groups, dictionary limits); with delta-rs's default props it would silently revert every write's
+    Direct Lake tuning."""
     if len(dt.file_uris()) > compaction_threshold:
-        dt.optimize.compact()
+        dt.optimize.compact(writer_properties=_writer_properties())
         dt.vacuum(dry_run=False)
         dt.cleanup_metadata()
 
@@ -1098,11 +1136,21 @@ def optimize(
 ) -> Dict:
     """Compact small files into larger ones (delta_rs ``DeltaTable.optimize``) and return the
     operation metrics. With ``zorder_by`` the files are Z-ordered on those columns
-    (``optimize.z_order``); otherwise a plain bin-packing compaction (``optimize.compact``)."""
+    (``optimize.z_order``); otherwise a plain bin-packing compaction (``optimize.compact``).
+
+    Both rewrites reuse ``_writer_properties()`` so they preserve the tuned Direct Lake layout.
+    Note that ``z_order`` rewrites files in bit-interleaved order, which *destroys* the long RLE
+    runs the writer settings build for VertiPaq transcode — a lexicographic ``ORDER BY`` at write
+    time is what Direct Lake wants; only reach for z-order when multi-dimensional file pruning
+    matters more than transcode cost."""
     dt = _delta_table(path, storage_options)
+    wp = _writer_properties()
     if zorder_by:
-        return dt.optimize.z_order(zorder_by, target_size=target_size)
-    return dt.optimize.compact(target_size=target_size)
+        logger.warning(
+            "optimize.z_order bit-interleaves rows, which breaks the RLE runs that make Direct "
+            "Lake / VertiPaq transcode fast; prefer a lexicographic ORDER BY at write time.")
+        return dt.optimize.z_order(zorder_by, target_size=target_size, writer_properties=wp)
+    return dt.optimize.compact(target_size=target_size, writer_properties=wp)
 
 
 def restore_to_version(
