@@ -86,6 +86,15 @@ class DuckrunCredentials(DuckDBCredentials):
         return (self.root_path, self.storage_options)
 
     def __post_init__(self):
+        # Normalize a trailing slash off every root once, here, so every consumer sees one spelling.
+        # The write-path macros concatenate ``root ~ '/' ~ schema ~ '/' ~ id`` while discovery / DML /
+        # stats all rstrip('/'), so a profile root_path ending in '/' produced a distinct ``root//…``
+        # key on an object store — a location discovery never lists. Strip it at the source instead.
+        if self.root_path:
+            self.root_path = self.root_path.rstrip("/")
+        for cfg in (self.catalogs or {}).values():
+            if cfg and cfg.get("root_path"):
+                cfg["root_path"] = cfg["root_path"].rstrip("/")
         # Token-free alias -> root_path map for the Jinja target (see catalog_locations).
         self.catalog_locations = {
             alias: (cfg or {}).get("root_path") for alias, cfg in (self.catalogs or {}).items()

@@ -417,7 +417,7 @@ _WRITE_MEM_FRACTION = 0.85
 
 
 def _default_merge_spill_size() -> Optional[int]:
-    """delta_rs merge ``max_spill_size`` default: ~40% of the *effective* memory limit
+    """delta_rs merge ``max_spill_size`` default: ~60% of the *effective* memory limit
     (the tightest of physical RAM, the cgroup/container cap, and the RAM free at startup), so
     the merge spills to disk instead of being OOM-killed. None if the limit is unknown (then the
     merge runs unbounded, as it did before).
@@ -814,9 +814,10 @@ def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:
 
     compact() reuses the plain _writer_properties() (ZSTD + row groups) — the same config the write
     used. The aggressive Direct Lake tuning is not applied here; it belongs only to the opt-in
-    experimental sort-rewrite."""
+    experimental sort-rewrite. It also passes the same _TARGET_FILE_SIZE the write path targets, so
+    maintenance keeps the few-fat-files layout instead of binning to delta-rs's smaller default."""
     if len(dt.file_uris()) > compaction_threshold:
-        dt.optimize.compact(writer_properties=_writer_properties())
+        dt.optimize.compact(target_size=_TARGET_FILE_SIZE, writer_properties=_writer_properties())
         dt.vacuum(dry_run=False)
         dt.cleanup_metadata()
 
@@ -1257,7 +1258,7 @@ def merge_delta(
     - merge_schema=True lets delta_rs evolve the table schema (new columns), backing
       ``on_schema_change='append_new_columns'`` / ``'sync_all_columns'``.
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
-      join to disk instead of OOMing. None -> default to ~40% of RAM (_default_merge_spill_size);
+      join to disk instead of OOMing. None -> default to ~60% of RAM (_default_merge_spill_size);
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
     - read_version (REQUIRED): pin the merge TARGET to this Delta version (the model's ``vB``).
       delta_rs then validates OCC over ``(vB, HEAD]`` — the exact window the model's pinned read of
@@ -1285,7 +1286,12 @@ def merge_delta(
     Without this an incremental table that is merged on every run grows old files forever.
     """
     keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
-    conditions = [f"target.{k} = source.{k}" for k in keys]
+    # Quote the join keys: a unique_key that needs quoting (mixed case on a case-sensitive path, a
+    # reserved word, spaces) would otherwise emit an invalid datafusion predicate. Strip any quotes
+    # the user already put on, then double-quote and escape — datafusion accepts "…" identifiers.
+    def _q(k):
+        return '"' + str(k).strip().strip('"').replace('"', '""') + '"'
+    conditions = [f"target.{_q(k)} = source.{_q(k)}" for k in keys]
     if predicates:
         extra = predicates if isinstance(predicates, (list, tuple)) else [predicates]
         conditions.extend(p for p in extra if p)

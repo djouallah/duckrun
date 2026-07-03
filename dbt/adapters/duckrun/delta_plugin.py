@@ -522,12 +522,18 @@ class Plugin(BasePlugin):
         NOT NULL constraint when the materialization is a delta_rs write rather than SQL DDL.
         Runs before the Delta write, so a violation leaves the existing table (and its version)
         untouched. The double-quoted identifiers handle column names that need quoting.
+
+        One pass: a single ``count(*) FILTER (WHERE col IS NULL)`` per column over one evaluation of
+        the staged view, rather than N full model evaluations. Raise for the first non-zero column,
+        keeping the same message.
         """
-        for col in columns:
-            quoted = '"' + str(col).replace('"', '""') + '"'
-            cnt = cur.sql(
-                f"SELECT count(*) FROM {name} WHERE {quoted} IS NULL"
-            ).fetchone()[0]
+        cols = list(columns)
+        if not cols:
+            return
+        quoted = ['"' + str(col).replace('"', '""') + '"' for col in cols]
+        selects = ", ".join(f"count(*) FILTER (WHERE {q} IS NULL)" for q in quoted)
+        counts = cur.sql(f"SELECT {selects} FROM {name}").fetchone()
+        for col, cnt in zip(cols, counts):
             if cnt:
                 raise CompilationError(
                     f"NOT NULL constraint failed: column '{col}' in this contracted model "
@@ -707,7 +713,13 @@ class Plugin(BasePlugin):
         the clause-core path (merge_clauses / merge_update_set_expressions), which takes the predicate
         directly rather than a unique_key."""
         keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
-        conditions = [f"target.{k} = source.{k}" for k in keys]
+        # Quote the join keys (mixed case / reserved word / spaces produce invalid datafusion SQL
+        # otherwise); strip any quotes the user already added, then double-quote and escape. Mirrors
+        # engine.merge_delta so both merge paths emit the same ON predicate.
+        conditions = [
+            f'target.{q} = source.{q}'
+            for q in ('"' + str(k).strip().strip('"').replace('"', '""') + '"' for k in keys)
+        ]
         preds = cls._merge_predicates(cfg, columns)
         if preds:
             conditions.extend(p for p in preds if p)
