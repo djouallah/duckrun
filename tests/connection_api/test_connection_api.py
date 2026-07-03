@@ -641,6 +641,50 @@ class TestDeltaTable:
         regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
         assert regs == sorted(regs)
 
+    def test_get_rle_scan_count_is_constant(self, conn):
+        # Regression: the auto profiler must NOT re-scan the (possibly remote) table once per column.
+        # Those O(columns) full-table reads are what made optimize take 20 min on a 142M-row OneLake
+        # table. _get_rle now materializes ONE reservoir sample and profiles that, so the number of
+        # delta_scan reads it issues is a small constant independent of table width.
+        class _Spy:   # session.con is a plain attribute; _get_rle reads it via self.con
+            def __init__(self, real, log):
+                self._real, self._log = real, log
+
+            def __getattr__(self, name):
+                attr = getattr(self._real, name)
+                if name in ("sql", "execute") and callable(attr):
+                    def wrapped(q, *a, **k):
+                        if "delta_scan(" in str(q):
+                            self._log.append(str(q))
+                        return attr(q, *a, **k)
+                    return wrapped
+                return attr
+
+        def _is_profiling(q):
+            # Ignore catalog view-registration reads (CREATE VIEW … + its backing SELECT *) — those are
+            # catalog-state churn, not per-column profiling. What we're guarding is the profiling reads:
+            # the DESCRIBE and the single sample materialize (CREATE … TEMP TABLE _rle_src AS …). A
+            # regression that re-scanned per column would show as extra aggregate reads kept here.
+            s = q.strip().lower()
+            return not (s.startswith("create or replace view") or s.startswith("select * from delta_scan"))
+
+        def _scan_count(name, ncols):
+            proj = ", ".join(f"(i % {j + 2}) as c{j}" for j in range(ncols))
+            conn.sql(f"select {proj}, i as id from range(3000) t(i)") \
+                .write.mode("overwrite").saveAsTable(name)
+            seen, real = [], conn.con
+            conn.con = _Spy(real, seen)   # _get_rle uses no add_actions replacement scan, so proxy is safe
+            try:
+                conn._get_rle(f"dbo.{name}")
+            finally:
+                conn.con = real
+            return [q for q in seen if _is_profiling(q)]
+
+        narrow = _scan_count("rle_narrow", 4)
+        wide = _scan_count("rle_wide", 16)
+        # DESCRIBE + one sample materialize, independent of column count — NOT one scan per column.
+        assert len(narrow) == len(wide) == 2
+
     def test_optimize_sort_bad_value(self, conn):
         self._seed(conn)
         with pytest.raises(ValueError):

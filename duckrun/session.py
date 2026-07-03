@@ -53,6 +53,13 @@ _DELETE_USING_MSG = (
 _MULTI_MSG = (
     "conn.sql() runs one statement at a time — split the batch into separate conn.sql() calls."
 )
+
+# _get_rle profiles a reservoir SAMPLE of the table, not the whole thing: key selection only needs to
+# rank columns by cardinality/skew and test functional dependencies, all of which survive sampling.
+# 1M rows is plenty to separate the candidates' ndv, and it turns the ~dozen profiling scans from
+# full-table passes (minutes on a remote 142M-row table) into millisecond local-temp-table scans. A
+# table at/below this size samples to itself, so small tables stay exact.
+_RLE_SAMPLE_ROWS = 1_000_000
 _READ_ONLY_MSG = (
     "catalog '{catalog}' is read-only — cannot {op}. duckrun opens read-only by default; enable "
     "Delta writes (saveAsTable / insertInto / save / merge / insert / update / delete / replaceWhere) "
@@ -890,6 +897,14 @@ class DuckSession:
         key** that minimises a table's estimated **in-memory columnar** footprint, and
         return a per-column :class:`DataFrame`. Recommendation-only — it never rewrites the table.
 
+        Profiled on a reservoir SAMPLE of ``_RLE_SAMPLE_ROWS`` rows (materialised once into a temp
+        table) rather than the whole table: the key model only ranks columns by cardinality/skew and
+        tests functional dependencies, which survive sampling, and this keeps the ~dozen profiling
+        scans off the (possibly remote) full table. ``ndv``/``skew``/``current_runs`` are therefore
+        SAMPLE estimates; a table at/below the sample size is profiled exactly. Uniqueness is only
+        asserted when the profile was exact — a sample can't tell a unique key from a merely
+        higher-than-sample-cardinality column (see ``exact`` below).
+
         The target is an in-memory columnar encoding, **not** parquet-on-disk: each column is value- or hash/dictionary-encoded
         (indices bit-packed at ``ceil(log2 ndv)`` bits) and then RLE is kept only when it beats the
         bit-packed form. There is **no general-purpose byte compressor** (no ZSTD), so a column that is
@@ -944,24 +959,35 @@ class DuckSession:
         if not cols:
             raise ValueError(f"_get_rle: table '{table}' has no columns.")
 
-        # 1) current physical-order runs + exact ndv per column, one pass. Physical order =
-        # (filename, file_row_number); a run starts on row 1 or where the value changes (IS DISTINCT
-        # FROM treats NULL↔NULL equal, so the explicit row-1 start avoids undercounting a leading NULL).
-        lag_sel = ", ".join(
-            f"{_qid(c)}, lag({_qid(c)}) OVER w AS {_qid('__lag_' + str(i))}"
-            for i, c in enumerate(cols))
+        # Profile a materialized reservoir SAMPLE, not the full table. Every statistic below then scans
+        # a local temp table (~1M rows) instead of re-reading all N rows from storage per pass — the
+        # difference between a few minutes and milliseconds on a remote 142M-row table. Key selection
+        # only ranks columns by cardinality/skew and tests functional dependencies, all of which survive
+        # sampling. A table at/below _RLE_SAMPLE_ROWS samples to itself, so small tables stay exact.
+        src = "_rle_src"
+        self.con.execute(
+            f"CREATE OR REPLACE TEMP TABLE {src} AS "
+            f"SELECT * FROM delta_scan('{plit}') USING SAMPLE {_RLE_SAMPLE_ROWS} ROWS")
+        try:
+            return self._rle_from_sample(sch, tbl, src, cols, types, partition_cols,
+                                         sort_key_cap, min_gain_pct, key_sort_below_pct)
+        finally:
+            self.con.execute(f"DROP TABLE IF EXISTS {src}")
+
+    def _rle_from_sample(self, sch, tbl, src, cols, types, partition_cols,
+                         sort_key_cap, min_gain_pct, key_sort_below_pct) -> "DataFrame":
+        """The sort-key model, run against the materialized sample ``src`` (see _get_rle). All counts
+        (``n``, ``ndv``, run estimates) are SAMPLE counts — enough to rank candidates and test
+        functional dependencies, not exact table cardinalities."""
+        # 1) sample ndv per column, one pass. NOTE: a random sample has no physical row order, so the
+        # table's *actual* current run count can't be measured. current_runs is set below (once skew is
+        # known) to the iid / arbitrary-order estimate — the honest neutral for an unknown layout, which
+        # matches a freshly-appended unsorted table and drives the "does sorting even help?" comparison.
         agg_sel = ", ".join(
-            f"SUM(CASE WHEN __rn = 1 OR {_qid(c)} IS DISTINCT FROM {_qid('__lag_' + str(i))} "
-            f"THEN 1 ELSE 0 END) AS r{i}, COUNT(DISTINCT {_qid(c)}) AS n{i}"
-            for i, c in enumerate(cols))
-        row = self.con.sql(
-            f"SELECT {agg_sel}, COUNT(*) AS total FROM ("
-            f"SELECT row_number() OVER w AS __rn, {lag_sel} "
-            f"FROM delta_scan('{plit}', filename=1, file_row_number=1) "
-            f"WINDOW w AS (ORDER BY filename, file_row_number))").fetchone()
+            f"COUNT(DISTINCT {_qid(c)}) AS n{i}" for i, c in enumerate(cols))
+        row = self.con.sql(f"SELECT {agg_sel}, COUNT(*) AS total FROM {src}").fetchone()
         n = row[-1] or 0
-        current_runs = {c: row[2 * i] for i, c in enumerate(cols)}
-        ndv = {c: row[2 * i + 1] for i, c in enumerate(cols)}
+        ndv = {c: row[i] for i, c in enumerate(cols)}
 
         # value-encoded = numeric/temporal (no dictionary); hash = strings/blobs (dictionary of ndv
         # distinct values). An in-memory engine may force hash for relationship columns too, but we can't see that.
@@ -992,12 +1018,12 @@ class DuckSession:
             wsel = ", ".join(
                 f"avg(octet_length(encode({_qid(c)}::VARCHAR))) AS w{j}"
                 for j, c in enumerate(hash_cols))
-            wr = self.con.sql(f"SELECT {wsel} FROM delta_scan('{plit}')").fetchone()
+            wr = self.con.sql(f"SELECT {wsel} FROM {src}").fetchone()
             avg_width = {c: (wr[j] or 1.0) for j, c in enumerate(hash_cols)}
         for c in cols:
             s = self.con.sql(
                 f"SELECT COALESCE(SUM(cnt * cnt), 0)::DOUBLE FROM "
-                f"(SELECT COUNT(*) AS cnt FROM delta_scan('{plit}') GROUP BY {_qid(c)})").fetchone()[0]
+                f"(SELECT COUNT(*) AS cnt FROM {src} GROUP BY {_qid(c)})").fetchone()[0]
             simpson[c] = (s / (n * n)) if n else 1.0
 
         # 3) in-memory columnar byte model. A column stores min(bit-packed indices, RLE runs) + a dictionary
@@ -1012,6 +1038,10 @@ class DuckSession:
 
         def _iid_runs(c):  # runs of a column left in ~arbitrary order (skew-governed)
             return min(float(n), max(float(ndv[c]), n * (1.0 - simpson[c])))
+
+        # current layout is unknown from a sample → assume arbitrary (iid) order. For an unsorted table
+        # this matches the real physical runs; it drives comp_saved (how much sorting would help) below.
+        current_runs = {c: _iid_runs(c) for c in cols}
 
         def _col_bytes(c, runs):
             b = _bits(ndv[c])
@@ -1051,7 +1081,7 @@ class DuckSession:
             # per candidate — a handful of scans for an occasional diagnostic.
             runs = self.con.sql(
                 f"SELECT COUNT(DISTINCT hash({', '.join(_qid(x) for x in sort_key + [c])})) "
-                f"FROM delta_scan('{plit}')").fetchone()[0]
+                f"FROM {src}").fetchone()[0]
             # R5 — functional dependency (the standard test: distinct(X) == distinct(X, c) ⇒ X → c):
             # if adding c doesn't grow the prefix's distinct count, c is already determined by the
             # prefix (year ← date, subcategory ← category). It's then clustered for free by sorting the
@@ -1083,7 +1113,15 @@ class DuckSession:
         # compress meaningfully (a real fact) we keep the compression key.
         _, comp_total = _bytes_for(sorted_runs)
         comp_saved = 100.0 * (current_total - comp_total) / current_total if current_total else 0.0
-        unique_cols = [c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols]
+        # is_unique can't be judged from a sample: any column whose true ndv exceeds the sample size
+        # saturates to ndv≈n and looks unique, so a high-cardinality measure (an INT64 price) would be
+        # falsely flagged and could hijack the key-organized branch below as the sort key. Only trust
+        # uniqueness when the "sample" actually covered the whole table (n < _RLE_SAMPLE_ROWS ⇒ USING
+        # SAMPLE returned every row). When we truly sampled, claim no unique column — the conservative
+        # direction: fall back to the compression key and leave dictionaries on (plain_cols stays empty).
+        exact = n < _RLE_SAMPLE_ROWS
+        unique_cols = ([c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols]
+                       if exact else [])
         note = None
         if unique_cols and comp_saved < key_sort_below_pct:
             pk, comp_alt = unique_cols[0], list(sort_key)  # schema-order first unique col (usually the PK)
@@ -1116,6 +1154,8 @@ class DuckSession:
         # R8: partition columns lead the physical ORDER BY (write-locality) but hold no key slot.
         order_cols = partition_cols + [c for c in sort_key if c not in partition_cols]
         print(f"\n_get_rle('{sch}.{tbl}') — sort-key recommendation (experimental):")
+        if not exact:
+            print(f"  (profiled a {_RLE_SAMPLE_ROWS:,}-row sample — ndv/skew/runs are estimates)")
         print(f"  ORDER BY {', '.join(order_cols) if order_cols else '(no key pays off)'}")
         if partition_cols:
             print(f"  (partition columns lead the sort but carry no compression weight: "
