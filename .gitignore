@@ -127,6 +127,9 @@ simple_test.ipynb
 # import profiling artifact
 importtime.log
 
+# Local scratch folder — review data, ad-hoc parquet, notes (never packaged/committed)
+/_scratch/
+
 # Draft blog post (not part of the package)
 intro-blog.md
 
