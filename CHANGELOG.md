@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.31] - 2026-07-03
+
+### Added
+- **`df.sort()` / `df.orderBy()`** — the vanilla Spark DataFrame methods, returning a new *writable*
+  DataFrame ordered by a native DuckDB `ORDER BY` (`orderBy` is an alias of `sort`, `ascending=` bool
+  or per-column list). Previously these fell through to the raw relation and lost `.write`; now
+  `conn.sql(...).sort("a", "b").write…saveAsTable(...)` works and composes with `.partitionBy(...)`.
+- **`conn.optimize(name, …)` — experimental sort rewrite.** `conn.optimize(name, sort="experimental")`
+  (a one-liner over `DeltaTable.forName(conn, name).optimize(...)`) profiles the table, picks a
+  run-length-friendly sort key (partition columns lead but take no key slot; a column functionally
+  determined by the key is dropped; measures excluded), and rewrites every file physically sorted with
+  the tuned writer properties. Returns the **real measured** on-disk size from the Delta log
+  (`sizeBytesBefore` / `sizeBytesAfter` / `savedPct`) — never an estimate. The plain compaction and
+  z-order forms are `conn.optimize(name)` / `conn.optimize(name, zorder_by=[...])`.
+
+### Changed
+- **Parquet writer properties tuned for columnar / Direct Lake readers** — ZSTD level 3, ~6M-row row
+  groups (Power BI segment standard), a 256 MB dictionary-page limit so wide columns stay
+  dictionary-encoded (no mid-chunk PLAIN fallback), 8 MB data pages, chunk-level statistics, and a
+  ~1 GB target file size. Applied on the initial write **and** on compaction/optimize (compaction
+  previously reverted the tuned layout).
+
 ## [0.3.30] - 2026-07-03
 
 ### Added
