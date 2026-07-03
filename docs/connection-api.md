@@ -203,8 +203,8 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 96 passed   ❌ 0 failed  │
-│ 96 methods · 100% passing │
+│ ✅ 99 passed   ❌ 0 failed  │
+│ 99 methods · 100% passing │
 └───────────────────────────┘
 ```
 
@@ -221,7 +221,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `sort`, `orderBy_alias_and_desc`, `sort_then_partition_write`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 13/13 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `optimize_experimental_sort`, `optimize_sort_bad_value`, `conn_optimize_shortcut`, `vacuum`, `restoreToVersion` | 14/14 ✅ |
 
-### duckrun-specific helpers — 24/24 ✅
+### duckrun-specific helpers — 27/27 ✅
 
 > Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).
 
@@ -247,6 +247,9 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `insert…values` | `sql()` | ✅ |
 | `update` | `sql()` | ✅ |
 | `delete` | `sql()` | ✅ |
+| `sql_update_where_inside_set_literal` | `sql()` | ✅ |
+| `sql_update_subquery_predicate` | `sql()` | ✅ |
+| `sql_delete_subquery_predicate` | `sql()` | ✅ |
 | `alter add column` | `sql()` | ✅ |
 | `sql_alter_add_column_not_null` | `sql()` | ✅ |
 | `drop (tombstone)` | `sql()` | ✅ |
