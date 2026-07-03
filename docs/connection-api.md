@@ -149,6 +149,85 @@ Leading `--` / `/* … */` comments are fine. The exact behaviour is pinned, sta
 in [`tests/connection_api/test_connection_api.py`](../tests/connection_api/test_connection_api.py)
 (the cross-API write-correctness matrix + the `TestSqlDml` class).
 
+## Table layout — sort, partition, and how the Parquet is written
+
+### Sorting a write
+
+`df.sort(*cols)` / `df.orderBy(*cols)` are the vanilla Spark DataFrame methods — `orderBy` is an
+alias of `sort`, and both return a **new, writable** DataFrame ordered by a native DuckDB `ORDER BY`
+(`ascending=` is a bool or a per-column list). Sorting a write physically clusters equal values
+together, which is what makes run-length and dictionary encoding pay off — smaller files and faster
+column scans for any analytics reader.
+
+```python
+# sorted write — clusters low-cardinality columns for better compression
+conn.sql("select * from stg_sales") \
+    .orderBy("region", "order_date") \
+    .write.mode("overwrite").saveAsTable("sales")
+
+# composes with partitioning: partition columns should lead the sort so delta-rs keeps
+# ~one partition writer open at a time (less write memory); it writes the folders either way
+conn.sql("select * from stg_sales") \
+    .sort("region", "order_date") \
+    .write.partitionBy("region").saveAsTable("sales")
+```
+
+Partitioning itself is `df.write.partitionBy(*cols)` — delta-rs writes Hive-style `col=value/`
+folders and strips the column from the data files (it's re-materialized from the path on read). Sort
+and partition are orthogonal: partitioning decides the folder layout, sorting decides row order.
+
+### `conn.optimize` — compaction, z-order, and the experimental sort rewrite
+
+```python
+conn.optimize("sales")                       # bin-packing compaction (merge small files)
+conn.optimize("sales", zorder_by=["a", "b"]) # z-order (multi-dimensional file pruning)
+```
+
+Both are the delta-rs `OPTIMIZE` operations, exposed as a one-liner over
+`DeltaTable.forName(conn, "sales").optimize(...)`. The name resolves like everywhere else — bare =
+current schema, `schema.table` or `catalog.schema.table` to be explicit.
+
+!!! warning "Experimental — `sort="experimental"`"
+    `conn.optimize(name, sort="experimental")` **profiles the table and rewrites every file
+    physically sorted** by a key it picks automatically, then reports the **real, measured** on-disk
+    size change (from the Delta log — never an estimate):
+
+    ```python
+    r = conn.optimize("sales", sort="experimental")
+    # {'operation': 'sortRewrite', 'sortedBy': ['region', 'order_date'],
+    #  'sizeBytesBefore': 15_197_312, 'sizeBytesAfter': 6_785_450, 'savedPct': 55.3}
+    ```
+
+    The key heuristic, briefly: partition columns lead the physical order but take no key slot;
+    a date/temporal column is favoured to lead; a column *functionally determined* by a column
+    already in the key (e.g. `year` ← `date`) is dropped, since sorting the key already clusters it
+    for free; measures (decimals/floats you aggregate, never filter on) are excluded. If nothing
+    pays off it falls back to a plain compaction. It's a **full read → sort → overwrite**, not a
+    bin-pack — run it occasionally, not on every write. `forName` tables only (it needs to profile a
+    catalog table). **Experimental**: the heuristic and the return shape may change.
+
+### How duckrun writes Parquet
+
+Every Delta write — and every compaction / optimize rewrite — goes through **one fixed set of
+Parquet writer properties**, tuned so the files land well for in-memory columnar readers (Power BI
+Direct Lake, DuckDB, Spark, Trino) without any per-table configuration. delta-rs (the arrow-rs
+Parquet writer) does the writing; DuckDB only executes the SQL and streams Arrow into it. The knobs
+and *why* each one is set:
+
+| Property | Value | Why |
+| --- | --- | --- |
+| **Compression** | `ZSTD` level 3 | A meaningfully smaller footprint than Snappy at a low, fast level. On a lakehouse the read is usually **network-I/O-bound**, so smaller files beat marginally-faster decompression. |
+| **Row group size** | ~6M rows | A row group is the unit an in-memory engine loads as one segment. DuckDB/arrow-rs default to ~1M — thousands of tiny segments trip reader guardrails. ~6M (the current Power BI segment target) gives fewer, larger scan ranges; bigger costs more write-time memory (a full row group is buffered per open writer). |
+| **Dictionary page limit** | 256 MB | The single most important knob for fast transcoding. The arrow-rs default (~1 MB) makes a **wide, repetitive column silently fall back to plain encoding mid-column** once its dictionary grows — the file looks dictionary-encoded in the first pages and isn't after. In-memory readers ingest a Parquet dictionary almost directly into their own hash encoding, so keeping the whole column dictionary-encoded is what makes framing cheap. 256 MB holds any dictionary actually worth having and still bounds per-column write memory; a column that overflows it was never a good dictionary candidate (drop / hash / truncate it upstream). |
+| **Data page size** | 8 MB | Fewer page headers, and run-length runs survive across page boundaries instead of being chopped at ~1 MB. |
+| **Statistics** | chunk-level | Row-group-level min/max is all a reader needs to skip row groups; page-level stats just bloat the footer. |
+| **Target file size** | ~1 GB | Few large files rather than many small ones — small files are as bad for a columnar reader as small row groups. |
+| **Data pages / bloom filters** | v1 pages, bloom off (defaults) | The boring, maximally-compatible layout; bloom filters aren't read here and only inflate the footer. |
+
+Because these are applied **on the initial write and on every `optimize`/compaction**, the layout
+never silently reverts (a compaction that used the writer's defaults would undo it). The exact same
+properties apply on a local path and on OneLake / S3 / GCS / ADLS — storage is neutral.
+
 The card below — every public method with a ✅ — is regenerated on every push by
 the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from the `Test*` classes of
 [`tests/connection_api/test_connection_api.py`](../tests/connection_api/test_connection_api.py).
