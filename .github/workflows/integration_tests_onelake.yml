@@ -270,6 +270,28 @@ jobs:
         with:
           name: docs-coffee
           path: integration_tests/coffee/target/static_index.html
+      - name: optimize(sort='experimental') on coffee 'fact_sales' — sort rewrite (dogfood)
+        # Non-blocking dogfood on the partitioned coffee fact: connect writable to the dbt build's
+        # schema, run the sort rewrite, print the chosen sort order + the REAL on-disk size reduction.
+        # fact_sales is partitioned by region (R8) and has season<-order_date (R5), so it exercises both.
+        continue-on-error: true
+        env:
+          DBT_SCHEMA: duckrun_dbt_it
+        run: |
+          python - <<'PY'
+          import os, duckrun
+          from duckrun.delta_table import DeltaTable
+          conn = duckrun.connect(
+              os.environ["WAREHOUSE_PATH"],
+              storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
+              schema=os.environ["DBT_SCHEMA"], read_only=False)
+          result = DeltaTable.forName(conn, "fact_sales").optimize(sort="experimental")
+          print("=== optimize(sort='experimental') result ===")
+          print("sort order:", result.get("sortedBy", result))
+          b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
+          if b:
+              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB ({result.get('savedPct')}% smaller)")
+          PY
       - name: Run the coffee-shop scenario against OneLake (connection-API smoke)
         env:
           DUCKRUN_IT_SCHEMA: duckrun_conn_it
