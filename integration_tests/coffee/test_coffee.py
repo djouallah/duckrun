@@ -236,6 +236,33 @@ def test_coffee_onelake():
     run_coffee_scenario(conn, ONELAKE_SCHEMA, ONELAKE_ROWS)
 
 
+@pytest.mark.skipif(
+    not (WAREHOUSE_PATH and WAREHOUSE_PATH.startswith("abfss://") and ONELAKE_TOKEN),
+    reason="OneLake not configured (set WAREHOUSE_PATH=abfss://…/Tables and ONELAKE_TOKEN)",
+)
+def test_onelake_files_copy_download_roundtrip(tmp_path):
+    """The live gate for conn.copy()/conn.download() on OneLake — the offline suite can't prove the
+    azure COPY … (FORMAT BLOB) write path (a laptop's az session is a different tenant). Uploads a
+    couple of files to the lakehouse **Files** scratch (never Tables), pulls them back, asserts the
+    bytes round-trip. Writes under a per-run folder so concurrent branches don't collide."""
+    conn = duckrun.connect(WAREHOUSE_PATH, storage_options={"bearer_token": ONELAKE_TOKEN},
+                           read_only=False)
+    scratch = f"_probe/coffee_{os.getpid()}"
+    src = tmp_path / "src"
+    (src / "sub").mkdir(parents=True)
+    a, b = os.urandom(4096), os.urandom(1024)
+    (src / "a.csv").write_bytes(a)
+    (src / "sub" / "b.parquet").write_bytes(b)
+    (src / "skip.txt").write_bytes(b"no")
+
+    conn.copy(str(src), scratch, file_extensions=[".csv", "parquet"], overwrite=True)
+    dst = tmp_path / "dl"
+    conn.download(scratch, str(dst), overwrite=True)
+    assert (dst / "a.csv").read_bytes() == a
+    assert (dst / "sub" / "b.parquet").read_bytes() == b
+    assert not (dst / "skip.txt").exists()  # extension filter carried through
+
+
 # A friendly-name abfss path (workspace/lakehouse names instead of GUIDs) over the SAME lakehouse.
 # OneLake's delta_scan can't enumerate a valid table's _delta_log via friendly names
 # (duckdb-delta#307); GUID paths read fine. This is the live gate for the connect() error hygiene:

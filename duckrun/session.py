@@ -236,6 +236,14 @@ def _qlit(text: str) -> str:
     return str(text).replace("'", "''")
 
 
+def _norm_exts(file_extensions: Optional[List[str]]) -> Optional[set]:
+    """Normalise a file-extension filter to a lowercase set with leading dots (``csv`` → ``.csv``),
+    or ``None`` for no filter."""
+    if not file_extensions:
+        return None
+    return {("" if e.startswith(".") else ".") + e.lower() for e in file_extensions}
+
+
 def _strip_query_context(msg: str) -> str:
     """DuckDB appends the offending statement to errors as ``\\nLINE N: <sql>\\n   ^``. When that
     statement is one duckrun generated internally (the ``delta_scan`` view), echoing it back is
@@ -509,8 +517,8 @@ class DuckSession:
                 # no data is deleted, the files persist, but the table must not surface).
                 if delta_dml.is_dropped(self.con, f"{root}/{schema}/{table}", so):
                     continue
-                self._register_view(name, schema, table)
-                registered.append(f"{schema}.{table}")
+                if self._register_view(name, schema, table):
+                    registered.append(f"{schema}.{table}")
 
         schemas = list(mapping.keys())
         if name == self._current_catalog and self._current_database is None:
@@ -524,7 +532,10 @@ class DuckSession:
                   + (": " + ", ".join(registered) if registered else ""))
         return registered
 
-    def _register_view(self, catalog: str, schema: str, table: str):
+    def _register_view(self, catalog: str, schema: str, table: str) -> bool:
+        """Register a discovered table as a ``delta_scan`` view. Returns True if registered, False if
+        the directory turned out not to be a Delta table (no ``_delta_log``) and was skipped — so
+        ``connect()`` tolerates ANY root (a Files section, a mixed dir), not only a clean Tables root."""
         entry = self._catalogs[catalog]
         path = f"{entry.root_path}/{schema}/{table}"
         try:
@@ -532,11 +543,16 @@ class DuckSession:
                 f"CREATE OR REPLACE VIEW {_qid(catalog)}.{_qid(schema)}.{_qid(table)} AS "
                 f"SELECT * FROM delta_scan('{_qlit(path)}')"
             )
+            return True
         except Exception as exc:
-            # delta_scan failed reading the table. Keep the real engine error (it's the signal —
-            # e.g. the OneLake "No files in log segment" delta-kernel bug), but drop DuckDB's echo
-            # of the CREATE VIEW statement *we* generated, and say which table/path it was. Suppress
-            # the chained original (`from None`) so the noisy SQL echo doesn't reappear in tracebacks.
+            # delta_scan failed. On abfss, discovery lists directory NAMES (it can't cheaply tell a
+            # Delta table from a plain folder), so a dir with no `_delta_log` is simply not a table —
+            # skip it silently rather than aborting the whole connect. But a dir that HAS a `_delta_log`
+            # and still won't read is a real failure (e.g. the delta-kernel #307 friendly-name bug) →
+            # fail loud, keeping the engine error but dropping DuckDB's echo of the CREATE VIEW we
+            # generated (`from None` so the noisy SQL echo doesn't reappear in tracebacks).
+            if remote.is_abfss(entry.root_path) and not remote.has_delta_log(path, entry.storage_options):
+                return False
             hint = _onelake_guid_hint(entry.root_path)
             raise RuntimeError(
                 f"duckrun: could not read Delta table {catalog}.{schema}.{table} at '{path}':\n"
@@ -687,6 +703,122 @@ class DuckSession:
         if types is not None:
             rel = _project_cast(rel, types)
         return DataFrame(rel, self)
+
+    # ---- file transfer (OneLake Files / any store) -----------------------------------------
+
+    def _files_base(self, remote_folder: str) -> str:
+        """Resolve ``remote_folder`` to an absolute store URL. A full URL (``…://``) is used as-is.
+        Otherwise it is relative to the current catalog's store: for a OneLake lakehouse root ending
+        in ``…/Tables`` the sibling ``…/Files`` section is used (Tables holds Delta tables, Files holds
+        loose files); for every other store the catalog root itself is the base."""
+        rf = remote_folder.replace("\\", "/").strip("/")
+        if "://" in remote_folder:
+            return remote_folder.replace("\\", "/").rstrip("/")
+        base = self.root_path.rstrip("/")
+        if remote.is_abfss(base) and base.endswith("/Tables"):
+            base = base[: -len("/Tables")] + "/Files"
+        return f"{base}/{rf}" if rf else base
+
+    def copy(self, local_folder: str, remote_folder: str,
+             file_extensions: Optional[List[str]] = None, overwrite: bool = False) -> bool:
+        """Upload every file under ``local_folder`` to ``remote_folder`` on the store, preserving the
+        directory tree. Storage-neutral: files move via DuckDB's ``COPY (SELECT content FROM
+        read_blob(local)) TO remote (FORMAT BLOB)`` over the secret ``connect()`` already minted — no
+        extra auth, no obstore. ``remote_folder`` is relative to the lakehouse Files section on OneLake
+        (or a full ``…://`` URL); ``file_extensions`` filters by suffix (``['.csv', '.parquet']``);
+        ``overwrite=False`` (default) skips files already present remotely. Returns ``True`` on success.
+
+        Each file is read whole into memory as one BLOB, so this suits ordinary files, not multi-GB blobs.
+        """
+        exts = _norm_exts(file_extensions)
+        base = self._files_base(remote_folder)
+        pairs = []
+        for dirpath, _dirs, names in os.walk(local_folder):
+            for n in names:
+                if exts and os.path.splitext(n)[1].lower() not in exts:
+                    continue
+                local_path = os.path.join(dirpath, n)
+                rel = os.path.relpath(local_path, local_folder).replace("\\", "/")
+                pairs.append((local_path.replace("\\", "/"), f"{base}/{rel}"))
+        if not pairs:
+            print(f"⚠️  no files to upload from '{local_folder}'"
+                  + (f" (filtered by {file_extensions})" if exts else ""))
+            return True
+        print(f"📁 Uploading {len(pairs)} file(s) to '{base}'...")
+        for local_path, remote_path in pairs:
+            if not overwrite and self._remote_exists(remote_path):
+                print(f"  ⏭ exists: {remote_path}")
+                continue
+            if "://" not in remote_path:  # local target: object stores need no dirs, a local FS does
+                os.makedirs(os.path.dirname(remote_path) or ".", exist_ok=True)
+            self.con.execute(
+                f"COPY (SELECT content FROM read_blob('{_qlit(local_path)}')) "
+                f"TO '{_qlit(remote_path)}' (FORMAT BLOB)")
+            print(f"  ✓ {local_path} → {remote_path}")
+        print("✅ upload complete")
+        return True
+
+    def download(self, remote_folder: str = "", local_folder: str = "./downloaded_files",
+                 file_extensions: Optional[List[str]] = None, overwrite: bool = False) -> bool:
+        """Download every file under ``remote_folder`` to ``local_folder``, preserving the directory
+        tree. The mirror of :meth:`copy`: remote files are enumerated with ``glob`` and pulled via
+        ``COPY (SELECT content FROM read_blob(remote)) TO local (FORMAT BLOB)`` over the existing secret.
+        ``remote_folder`` is relative to the OneLake Files section (or a full ``…://`` URL);
+        ``file_extensions`` filters by suffix; ``overwrite=False`` (default) skips files already present
+        locally. Returns ``True`` on success."""
+        base = self._files_base(remote_folder)
+        pairs = [(fp, os.path.join(local_folder, *rel.split("/")))
+                 for fp, rel in self._enumerate_remote(base, _norm_exts(file_extensions))]
+        if not pairs:
+            print(f"⚠️  no files to download from '{base}'"
+                  + (f" (filtered by {file_extensions})" if exts else ""))
+            return True
+        print(f"📁 Downloading {len(pairs)} file(s) to '{local_folder}'...")
+        for remote_path, local_path in pairs:
+            if not overwrite and os.path.exists(local_path):
+                print(f"  ⏭ exists: {local_path}")
+                continue
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            self.con.execute(
+                f"COPY (SELECT content FROM read_blob('{_qlit(remote_path)}')) "
+                f"TO '{_qlit(local_path.replace(chr(92), '/'))}' (FORMAT BLOB)")
+            print(f"  ✓ {remote_path} → {local_path}")
+        print("✅ download complete")
+        return True
+
+    def list_files(self, remote_folder: str = "",
+                   file_extensions: Optional[List[str]] = None) -> List[str]:
+        """List the files under ``remote_folder`` on the store, as **relative path strings** (e.g.
+        ``['csv/daily/a.csv.gz', 'csv/log.parquet']``) — the companion to :meth:`copy`/:meth:`download`
+        (the returned paths feed straight back into ``download``). ``remote_folder`` is relative to the
+        OneLake Files section (or a full ``…://`` URL); ``file_extensions`` filters by suffix. Recurses.
+        Storage-neutral: abfss via the DFS REST API (DuckDB can't glob OneLake, duckdb-azure#174),
+        local/s3/gcs/az via ``glob``."""
+        base = self._files_base(remote_folder)
+        return [rel for _fp, rel in self._enumerate_remote(base, _norm_exts(file_extensions))]
+
+    def _enumerate_remote(self, base: str, exts) -> List[tuple]:
+        """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
+        relative_path)`` pairs honouring the extension filter. Shared by ``list_files``/``download``."""
+        if remote.is_abfss(base):
+            raw = remote.list_files(base, self.storage_options)
+        else:
+            raw = [r[0] for r in self.con.execute(f"SELECT file FROM glob('{_qlit(base)}/**')").fetchall()]
+        out = []
+        for p in raw:
+            fp = p.replace("\\", "/")
+            if exts and os.path.splitext(fp)[1].lower() not in exts:
+                continue
+            rel = fp[len(base):].lstrip("/") if fp.startswith(base) else os.path.basename(fp)
+            out.append((fp, rel))
+        return out
+
+    def _remote_exists(self, path: str) -> bool:
+        """True if a single file exists at ``path``. OneLake can't be globbed (duckdb-azure#174), so
+        abfss uses a REST HEAD; local/s3/gcs/az use ``glob`` on the exact path."""
+        if remote.is_abfss(path):
+            return remote.file_exists(path, self.storage_options)
+        return bool(self.con.execute(f"SELECT 1 FROM glob('{_qlit(path)}') LIMIT 1").fetchall())
 
     @property
     def read(self) -> "DataFrameReader":

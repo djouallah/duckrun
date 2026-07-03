@@ -117,6 +117,41 @@ class TestSession:
     def test_show_tables(self, conn):
         assert "src" in {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
 
+    def test_copy(self, conn, tmp_path):
+        # upload preserves the tree and honours the extension filter (COPY … FORMAT BLOB, no obstore).
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "a.csv").write_bytes(b"hello")
+        (src / "sub" / "b.parquet").write_bytes(b"world")
+        (src / "skip.txt").write_bytes(b"no")
+        conn.copy(str(src), "uploaded", file_extensions=[".csv", "parquet"])
+        base = Path(conn.root_path) / "uploaded"
+        assert (base / "a.csv").read_bytes() == b"hello"
+        assert (base / "sub" / "b.parquet").read_bytes() == b"world"
+        assert not (base / "skip.txt").exists()  # filtered out
+
+    def test_download(self, conn, tmp_path):
+        # download mirrors copy; overwrite=False (default) skips files already present locally.
+        remote = Path(conn.root_path) / "remote"
+        remote.mkdir()
+        (remote / "x.bin").write_bytes(b"payload")
+        dst = tmp_path / "dl"
+        conn.download("remote", str(dst))
+        assert (dst / "x.bin").read_bytes() == b"payload"
+        (dst / "x.bin").write_bytes(b"changed")
+        conn.download("remote", str(dst))  # skips existing
+        assert (dst / "x.bin").read_bytes() == b"changed"
+
+    def test_list_files(self, conn, tmp_path):
+        # list the files copy() lands, as relative paths; the extension filter is honoured.
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "a.csv").write_bytes(b"x")
+        (src / "sub" / "b.parquet").write_bytes(b"y")
+        conn.copy(str(src), "listed")
+        assert set(conn.list_files("listed")) == {"a.csv", "sub/b.parquet"}
+        assert conn.list_files("listed", file_extensions=[".csv"]) == ["a.csv"]
+
 
 class TestCatalog:
     def test_listTables(self, conn):

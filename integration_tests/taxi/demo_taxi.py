@@ -822,6 +822,47 @@ def run_taxi_demo(conn, schema):
         say(f"builder full-sync off a recompute: refreshed {n_zones} live zones (re-banded via CASE), "
             f"purged {before - after} departed; {before:,} → {after:,} rows, 0 drift")
 
+    _part("Part 5 · loose files — conn.copy() / conn.download() (non-Delta, storage-neutral)",
+          "Not everything is a Delta table: source drops, exports, sidecar files live in the lakehouse "
+          "Files section. conn.copy()/conn.download() move a local folder tree to/from the store via "
+          "DuckDB's COPY … (FORMAT BLOB) — same secret as every read/write above, no extra dependency.")
+
+    # 22 ── conn.copy(): export a result as a loose CSV and upload it to the Files section ──────────────
+    with _step(22, "conn.copy(local_dir, 'demo_files/…'): export zone_scorecard to a local CSV, then "
+                   "upload the folder to the lakehouse Files section") as say:
+        t0 = time.perf_counter()
+        stage = tempfile.mkdtemp(prefix="duckrun_files_up_")
+        csv_local = os.path.join(stage, "zone_scorecard.csv").replace("\\", "/")
+        # COPY to a LOCAL path is a plain DuckDB pass-through (not Delta DML) — a real loose export.
+        conn.sql(f"COPY (SELECT * FROM zone_scorecard ORDER BY zone_id) TO '{csv_local}' (FORMAT CSV, HEADER)")
+        rows_local = q("SELECT count(*) FROM zone_scorecard")
+        remote_dir = f"demo_files/{schema}"
+        _emit('  <pre class="py"># export a result as a loose CSV, then upload the folder to the store:\n'
+              'conn.sql("COPY (SELECT * FROM zone_scorecard) TO \'stage/zone_scorecard.csv\' (FORMAT CSV, HEADER)")\n'
+              'conn.copy(stage, "demo_files/…", overwrite=True)   # → lakehouse Files (…/Files/demo_files/…)</pre>')
+        conn.copy(stage, remote_dir, overwrite=True)
+        results.append(_row("conn.copy (upload to Files)", 0, 1, 1, True, rows_local > 0,
+                            time.perf_counter() - t0))
+        say(f"exported {rows_local} zone_scorecard rows to a loose CSV and uploaded it to Files/{remote_dir}")
+
+    # 23 ── conn.download(): pull the folder back and re-read it — byte-faithful round-trip ─────────────
+    with _step(23, "conn.download('demo_files/…', local_dir): pull the Files folder back and re-read the "
+                   "CSV — the round-trip must match") as say:
+        t0 = time.perf_counter()
+        back = tempfile.mkdtemp(prefix="duckrun_files_dl_")
+        _emit('  <pre class="py">conn.download("demo_files/…", local_dir, overwrite=True)  # OneLake → local\n'
+              'conn.read.csv(local_dir + "/zone_scorecard.csv").count()   # re-read what came back</pre>')
+        conn.download(remote_dir, back, overwrite=True)
+        csv_back = os.path.join(back, "zone_scorecard.csv").replace("\\", "/")
+        rows_back = conn.read.csv(csv_back).count()
+        rows_local = q("SELECT count(*) FROM zone_scorecard")
+        results.append(_row("conn.download (Files round-trip)", rows_local, rows_back, rows_local,
+                            rows_back == rows_local, rows_back == rows_local, time.perf_counter() - t0))
+        _table([(f"{rows_local:,}", f"{rows_back:,}", "match ✅" if rows_back == rows_local else "MISMATCH ❌")],
+               ["exported rows", "downloaded rows", "round-trip"], "  copy() → download() over the Files section")
+        say(f"downloaded the folder back and re-read {rows_back:,} rows (uploaded {rows_local:,}) — "
+            f"{'round-trip matches' if rows_back == rows_local else 'MISMATCH'}")
+
     _scorecard(results)
 
     # Emit the standalone HTML report when asked (CI sets DUCKRUN_TAXI_PAGE → published as taxi.html).

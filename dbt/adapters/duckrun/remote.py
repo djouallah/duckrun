@@ -16,8 +16,46 @@ from .secret import bearer_token
 _DFS_API_VERSION = "2023-11-03"
 
 
+class OneLakeAccessError(RuntimeError):
+    """The store itself is unreachable (wrong tenant, item not in workspace, missing filesystem) —
+    distinct from a genuinely-empty directory. A distinct type so callers that otherwise treat a
+    listing failure as 'no tables' (the dbt adapter's best-effort discovery) can still let a real
+    access failure fail loud instead of masquerading as an empty lakehouse."""
+
+
 def is_abfss(root_path: Optional[str]) -> bool:
     return bool(root_path) and root_path.startswith("abfss://")
+
+
+# A 404 from the DFS API is only benign when the *directory itself* is absent (a schema / folder not
+# created yet → genuinely no tables/files). Every other 404 means the store is unreachable — the
+# workspace/item isn't there or the token's tenant can't see it (TargetItemNotInWorkspace,
+# FilesystemNotFound). Those MUST fail loud, not masquerade as "empty" (a silent 404 made a
+# wrong-tenant token look like an empty lakehouse).
+_BENIGN_404_CODES = {"PathNotFound", "SourcePathNotFound"}
+
+
+def _error_code(resp) -> str:
+    code = resp.headers.get("x-ms-error-code")
+    if code:
+        return code
+    try:
+        return str(resp.json().get("error", {}).get("code", ""))
+    except Exception:
+        return ""
+
+
+def _benign_404_or_raise(resp, directory: str) -> None:
+    """Return (caller then yields ``[]``) only for a genuinely-absent directory; otherwise raise a
+    clear error so an auth/access failure can't hide behind an empty result."""
+    code = _error_code(resp)
+    if code in _BENIGN_404_CODES:
+        return
+    raise OneLakeAccessError(
+        f"duckrun: OneLake path not accessible (HTTP {resp.status_code} {code or '?'}) at "
+        f"{directory!r} — check the workspace/lakehouse name and that your token's tenant can reach "
+        f"it. Server said: {resp.text[:200]}"
+    )
 
 
 def _parse_abfss(root_path: str) -> Tuple[str, str, str]:
@@ -81,7 +119,8 @@ def list_delta_tables(root_path: str, schema: str, storage_options) -> List[str]
         timeout=30,
     )
     if resp.status_code == 404:
-        return []  # schema directory not created yet -> no tables
+        _benign_404_or_raise(resp, directory)  # absent schema dir -> []; access failure -> raise
+        return []
     resp.raise_for_status()
     names = []
     for entry in resp.json().get("paths", []) or []:
@@ -93,3 +132,76 @@ def list_delta_tables(root_path: str, schema: str, storage_options) -> List[str]
         if name:
             names.append(name)
     return names
+
+
+def list_files(dir_url: str, storage_options) -> List[str]:
+    """Recursively list FILE paths (not directories) under a OneLake/ADLS directory, as full
+    ``abfss://`` URLs. DuckDB's azure extension can't glob OneLake (duckdb-azure#174), so file
+    transfer (``conn.download``) enumerates via the DFS REST API instead — same mechanism as
+    :func:`list_delta_tables`. Returns ``[]`` if the directory doesn't exist yet (HTTP 404) or
+    there's no token; raises if the store is unreachable (wrong tenant / item not found)."""
+    import requests  # dbt dependency; imported lazily
+
+    token = bearer_token(storage_options)
+    if not token:
+        return []
+    filesystem, host, directory = _parse_abfss(dir_url)
+    resp = requests.get(
+        f"https://{host}/{filesystem}",
+        params={"resource": "filesystem", "recursive": "true", "directory": directory},
+        headers={"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
+        timeout=60,
+    )
+    if resp.status_code == 404:
+        _benign_404_or_raise(resp, directory)  # absent folder -> []; access failure -> raise
+        return []
+    resp.raise_for_status()
+    files = []
+    for entry in resp.json().get("paths", []) or []:
+        if str(entry.get("isDirectory", "")).lower() == "true":
+            continue
+        name = str(entry.get("name", "")).lstrip("/")  # full path within the filesystem
+        if name:
+            files.append(f"abfss://{filesystem}@{host}/{name}")
+    return files
+
+
+def has_delta_log(table_url: str, storage_options) -> bool:
+    """True if the directory at ``table_url`` contains a ``_delta_log`` — i.e. it really IS a Delta
+    table. Discovery uses this to tell a non-Delta directory (skip it, don't error) from a genuine
+    table that merely fails to read (fail loud — the delta-kernel #307 case). Same REST mechanism as
+    :func:`list_delta_tables`, so a table found via REST is always confirmable via REST."""
+    import requests  # dbt dependency; imported lazily
+
+    token = bearer_token(storage_options)
+    if not token:
+        return False
+    filesystem, host, base = _parse_abfss(table_url)
+    resp = requests.get(
+        f"https://{host}/{filesystem}",
+        params={"resource": "filesystem", "recursive": "false",
+                "directory": f"{base}/_delta_log", "maxResults": 1},
+        headers={"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
+        timeout=30,
+    )
+    if resp.status_code == 404:
+        return False  # no _delta_log → not a Delta table
+    resp.raise_for_status()
+    return bool(resp.json().get("paths", []))
+
+
+def file_exists(file_url: str, storage_options) -> bool:
+    """True if a single file exists on a OneLake/ADLS store (a HEAD on the DFS path). Used by the
+    ``overwrite=False`` guard in ``conn.copy`` — DuckDB glob can't be used on OneLake."""
+    import requests  # dbt dependency; imported lazily
+
+    token = bearer_token(storage_options)
+    if not token:
+        return False
+    filesystem, host, path = _parse_abfss(file_url)
+    resp = requests.head(
+        f"https://{host}/{filesystem}/{path}",
+        headers={"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
+        timeout=30,
+    )
+    return resp.status_code == 200

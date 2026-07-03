@@ -21,6 +21,14 @@ def model(dbt, session):
     max_workers = 4          # keep concurrency modest to avoid AEMO rate-limiting
     batch_pause_seconds = 2  # pause between batches to spread requests out
 
+    # A duckrun session over the SAME store, used to upload the extracted CSVs to the Files section
+    # via conn.copy() (dogfooding the storage-neutral file-transfer API). connect() now tolerates a
+    # Files root — it discovers 0 Delta tables there and moves on.
+    import duckrun
+    _so = ({"bearer_token": os.environ["ONELAKE_TOKEN"]}
+           if root_path.startswith(("abfss://", "az://")) and os.environ.get("ONELAKE_TOKEN") else None)
+    conn = duckrun.connect(root_path, read_only=False, storage_options=_so)
+
     def sql_with_retry(query, attempts=4, base_delay=5):
         """Run a session.sql that hits the network (the read_text listing fetches).
         nemweb / the GitHub API occasionally throw a transient 403 or time out on a
@@ -116,17 +124,6 @@ def model(dbt, session):
                 results.append((name, gz_name, gz_path))
         return results
 
-    def copy_to_onelake(temp_path, dest_path):
-        """Copy a local file to OneLake via DuckDB COPY."""
-        escaped_temp = temp_path.replace("\\", "/")
-        if not dest_path.startswith(("az://", "abfss://")):
-            dest_dir = dest_path.rsplit("/", 1)[0]
-            os.makedirs(dest_dir, exist_ok=True)
-        session.sql(
-            f"COPY (SELECT content FROM read_blob('{escaped_temp}')) "
-            f"TO '{dest_path}' (FORMAT BLOB, COMPRESSION 'none')"
-        )
-
     def save_log():
         """Save current log state to parquet."""
         session.sql(f"COPY _csv_archive_log TO '{csv_log_path}' (FORMAT PARQUET)")
@@ -151,11 +148,13 @@ def model(dbt, session):
                         except Exception as e:
                             print(f"  WARN: skipping {src_fn}: {e}")
 
+                # Upload the whole batch's extracted files in ONE call — conn.copy mirrors the flat
+                # tmpdir into …/Files/csv/<subfolder>/, byte-identical to the old per-file COPY.
+                if extracted:
+                    conn.copy(tmpdir, f"csv/{subfolder}", overwrite=True)
                 now = datetime.now(timezone.utc).isoformat()
                 for src_fn, csv_name, temp_path, url in extracted:
                     csv_base = csv_name.removesuffix(".gz").removesuffix(".CSV").removesuffix(".csv")
-                    dest = f"{csv_archive_path}/{subfolder}/{csv_name}"
-                    copy_to_onelake(temp_path, dest)
                     session.sql(f"""
                         INSERT INTO _csv_archive_log VALUES (
                             '{source_type}', '{src_fn}', '/{subfolder}/{csv_name}',

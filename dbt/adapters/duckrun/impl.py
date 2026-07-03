@@ -207,10 +207,14 @@ class DuckrunAdapter(DuckDBAdapter):
         the catalog's storage_options (the token for THIS root)."""
         try:
             return remote.list_delta_tables(root_path, str(schema).strip('"'), so)
+        except remote.OneLakeAccessError:
+            # A genuine access failure (wrong tenant / item not in workspace) must fail loud, NOT
+            # masquerade as "no Delta tables" — otherwise a dbt test/docs run goes silently green
+            # against a store it can't even see.
+            raise
         except Exception as exc:
-            # Don't let a listing failure masquerade as "no Delta tables" — that silently
-            # surfaces downstream as "schema does not exist" for every model. Log (debug) so
-            # an empty remote discovery is visible, then fall back to the in-memory catalog.
+            # A transient/other listing failure stays best-effort: log (debug) and fall back to the
+            # in-memory catalog, so a momentary blip doesn't abort the run (writes fail loud anyway).
             logger.debug(f"duckrun: OneLake table listing failed under {root_path}/{schema}: {exc}")
             return []
 

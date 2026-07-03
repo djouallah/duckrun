@@ -14,6 +14,8 @@ block, so it can't catch this. These tests pin the two things that fix it:
      with a fake cursor whose glob throws until the secret has been created (mirroring how a
      real abfss:// glob fails without the secret).
 """
+import pytest
+
 from dbt.adapters.duckrun import remote, secret
 from dbt.adapters.duckrun.impl import DuckrunAdapter
 
@@ -112,6 +114,50 @@ def test_list_delta_tables_no_token_returns_empty():
     assert remote.list_delta_tables("abfss://x@h/y", "landing", None) == []
 
 
+# ------------------------------------------------ 404: absent dir vs inaccessible store
+# A 404 means two different things. Only "the directory isn't there" (PathNotFound — a schema
+# not created yet) is genuinely empty; "the store is unreachable" (wrong tenant, item not in
+# workspace) must fail loud, not masquerade as an empty lakehouse (the silent-auth-failure bug).
+
+def _resp_404(code):
+    class _Resp:
+        status_code = 404
+        headers = {"x-ms-error-code": code}
+        text = '{"error":{"code":"%s"}}' % code
+        def raise_for_status(self):  # pragma: no cover - must not be reached on a 404
+            raise AssertionError("raise_for_status should not run on a handled 404")
+        def json(self):
+            return {"error": {"code": code}}
+    return _Resp()
+
+
+def test_list_delta_tables_absent_dir_is_empty(monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _resp_404("PathNotFound"))
+    assert remote.list_delta_tables("abfss://x@h/y", "landing", {"bearer_token": "T"}) == []
+
+
+def test_list_delta_tables_inaccessible_store_raises(monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _resp_404("TargetItemNotInWorkspace"))
+    with pytest.raises(RuntimeError) as e:
+        remote.list_delta_tables("abfss://x@h/y", "landing", {"bearer_token": "T"})
+    assert "not accessible" in str(e.value) and "TargetItemNotInWorkspace" in str(e.value)
+
+
+def test_list_files_absent_dir_is_empty(monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _resp_404("PathNotFound"))
+    assert remote.list_files("abfss://x@h/y/Files", {"bearer_token": "T"}) == []
+
+
+def test_list_files_inaccessible_store_raises(monkeypatch):
+    import requests
+    monkeypatch.setattr(requests, "get", lambda *a, **k: _resp_404("FilesystemNotFound"))
+    with pytest.raises(RuntimeError):
+        remote.list_files("abfss://x@h/y/Files", {"bearer_token": "T"})
+
+
 # ----------------------------------------------------------------- discovery wiring
 
 class _Creds:
@@ -157,8 +203,22 @@ def test_discovery_uses_rest_listing_for_abfss(monkeypatch):
 
 
 def test_discovery_swallows_rest_failure_as_empty(monkeypatch):
+    # A transient/other listing failure stays best-effort → [] (a momentary blip mustn't abort a run;
+    # the actual write fails loud anyway).
     def boom(root, schema, so):
         raise RuntimeError("403 Forbidden")
     monkeypatch.setattr(remote, "list_delta_tables", boom)
     adapter = _bare_adapter()
     assert adapter._discover_delta_relations(_SchemaRelation()) == []
+
+
+def test_discovery_propagates_access_error(monkeypatch):
+    # But a GENUINE access failure (wrong tenant / item not in workspace) must fail loud, not
+    # masquerade as an empty schema — otherwise dbt test/docs go silently green against a store it
+    # can't see. Option A: OneLakeAccessError is re-raised through discovery.
+    def boom(root, schema, so):
+        raise remote.OneLakeAccessError("OneLake path not accessible (TargetItemNotInWorkspace)")
+    monkeypatch.setattr(remote, "list_delta_tables", boom)
+    adapter = _bare_adapter()
+    with pytest.raises(remote.OneLakeAccessError):
+        adapter._discover_delta_relations(_SchemaRelation())
