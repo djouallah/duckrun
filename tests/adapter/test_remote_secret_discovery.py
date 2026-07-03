@@ -89,6 +89,7 @@ def test_list_delta_tables_returns_immediate_subdirs(monkeypatch):
 
     class _Resp:
         status_code = 200
+        headers = {}  # real requests.Response always has headers; no continuation -> single page
         def raise_for_status(self): pass
         def json(self): return payload
 
@@ -222,3 +223,72 @@ def test_discovery_propagates_access_error(monkeypatch):
     adapter = _bare_adapter()
     with pytest.raises(remote.OneLakeAccessError):
         adapter._discover_delta_relations(_SchemaRelation())
+
+
+# ----------------------------------------------------- #7 pagination / #11 retry (review)
+
+class _PageResp:
+    def __init__(self, status_code=200, paths=None, headers=None):
+        self.status_code = status_code
+        self._paths = paths or []
+        self.headers = headers or {}
+        self.text = ""
+    def json(self):
+        return {"paths": self._paths}
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise RuntimeError(f"HTTP {self.status_code}")
+
+
+def test_list_delta_tables_follows_continuation(monkeypatch):
+    # A schema with more tables than one DFS page: page 1 returns an x-ms-continuation header, page 2
+    # doesn't. Both pages must be enumerated (not silently truncated to page 1).
+    pages = [
+        _PageResp(paths=[{"name": f"root/landing/t{i}", "isDirectory": "true"} for i in (1, 2)],
+                  headers={"x-ms-continuation": "TOKEN2"}),
+        _PageResp(paths=[{"name": "root/landing/t3", "isDirectory": "true"}], headers={}),
+    ]
+    calls = []
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls.append(params.get("continuation"))
+        return pages[len(calls) - 1]
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+
+    names = remote.list_delta_tables(
+        "abfss://duckrun@onelake.dfs.fabric.microsoft.com/root", "landing", {"bearer_token": "TOK"})
+    assert names == ["t1", "t2", "t3"]
+    assert calls == [None, "TOKEN2"]  # 2nd page passed the continuation token back
+
+
+def test_dfs_request_retries_transient_then_succeeds(monkeypatch):
+    seq = [_PageResp(status_code=503), _PageResp(status_code=429, headers={"Retry-After": "0"}),
+           _PageResp(status_code=200, paths=[{"name": "root/s/t", "isDirectory": "true"}])]
+    n = {"i": 0}
+    def fake_get(url, params=None, headers=None, timeout=None):
+        r = seq[n["i"]]; n["i"] += 1; return r
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(remote, "_sleep", lambda s: None)  # no real waiting
+    monkeypatch.setattr(remote, "_MAX_ATTEMPTS", 3)
+
+    names = remote.list_delta_tables(
+        "abfss://duckrun@onelake.dfs.fabric.microsoft.com/root", "s", {"bearer_token": "TOK"})
+    assert names == ["t"]
+    assert n["i"] == 3  # two transient responses were retried
+
+
+def test_dfs_request_does_not_retry_404(monkeypatch):
+    calls = {"n": 0}
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls["n"] += 1
+        return _PageResp(status_code=404, headers={"x-ms-error-code": "PathNotFound"})
+    import requests
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(remote, "_sleep", lambda s: None)
+
+    # A benign 404 (absent schema dir) -> [] and exactly one call (no retry on 404).
+    names = remote.list_delta_tables(
+        "abfss://duckrun@onelake.dfs.fabric.microsoft.com/root", "missing", {"bearer_token": "TOK"})
+    assert names == []
+    assert calls["n"] == 1

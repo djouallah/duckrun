@@ -727,6 +727,27 @@ class TestSqlDml:
         conn.sql("delete from src where id = 1")
         assert conn.table("src").count() == 2
 
+    def test_sql_update_where_inside_set_literal(self, conn):
+        # A literal containing the word `where` in the SET list must not mis-split the statement
+        # (review #5): only the trailing WHERE is the predicate.
+        conn.sql("update src set name = 'a where b' where id = 1")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "a where b"
+        assert conn.sql("select name from src where id = 2").fetchone()[0] == "b"
+
+    def test_sql_update_subquery_predicate(self, conn):
+        # UPDATE with a subquery predicate: delta_rs's update() would panic, so duckrun evaluates it
+        # in DuckDB and commits a fenced overwrite (review #9). Rows matching the subquery update.
+        conn.sql("select * from (values (1),(3)) t(k)").write.mode("overwrite").saveAsTable("keys")
+        conn.sql("update src set name = 'Q' where id in (select k from keys)")
+        got = {r[0]: r[1] for r in conn.sql("select id, name from src").fetchall()}
+        assert got == {1: "Q", 2: "b", 3: "Q"}
+
+    def test_sql_delete_subquery_predicate(self, conn):
+        # DELETE with a subquery predicate takes the same DuckDB-evaluated fenced fallback (#8).
+        conn.sql("select * from (values (2)) t(k)").write.mode("overwrite").saveAsTable("dk")
+        conn.sql("delete from src where id in (select k from dk)")
+        assert {r[0] for r in conn.sql("select id from src").fetchall()} == {1, 3}
+
     def test_sql_alter_add_column(self, conn):
         conn.sql("alter table src add column qty integer")
         assert "qty" in conn.sql("select * from src").columns

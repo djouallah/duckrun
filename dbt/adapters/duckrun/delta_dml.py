@@ -820,16 +820,20 @@ class _DeltaDML:
                 f"duckrun: DELETE predicate on {loc!r} references a subquery; delta_rs can't "
                 "evaluate it, falling back to a DuckDB-filtered full overwrite (slower)."
             )
+            # Fence the read-modify-write to the version read at statement start (pin the delta_scan to
+            # vB, commit via overwrite_if_unchanged) so a writer that commits during this rewrite fails
+            # the run loudly instead of being silently clobbered — same CAS as the simple-predicate path.
+            vB = engine.table_version(loc, self.so)
             loc_sql = loc.replace("'", "''")
             tmp = f"__duckrun_del_{abs(hash(loc)) & 0xFFFFFFFF}"
             self.cursor.execute(
                 f'create or replace temp table "{tmp}" as '
-                f"select * from delta_scan('{loc_sql}') where ({where}) is not true"
+                f"select * from delta_scan('{loc_sql}', version => {vB}) where ({where}) is not true"
             )
             try:
                 keep = self.cursor.sql(f'select * from "{tmp}"')
-                engine.write_delta(loc, keep, "overwrite", overwrite_schema=True,
-                                   storage_options=self.so)
+                engine.overwrite_if_unchanged(loc, keep, read_version=vB, overwrite_schema=True,
+                                              storage_options=self.so)
             finally:
                 self.cursor.execute(f'drop table if exists "{tmp}"')
             return
@@ -857,6 +861,34 @@ class _DeltaDML:
         for assign in _split_top_level_commas(set_clause):
             col, _, expr = assign.partition("=")
             updates[col.strip().strip('"')] = expr.strip()
+        if where and _PREDICATE_SUBQUERY.search(where):
+            # delta_rs's update(predicate) hits the same datafusion "not implemented" panic on a
+            # subquery predicate as delete() does (`… where id in (select … from other)`). DuckDB CAN
+            # evaluate it, so compute the updated rows there — `CASE WHEN (pred) THEN <expr> ELSE col
+            # END` per SET column via SELECT * REPLACE — and commit a fenced full overwrite, mirroring
+            # _delete's fallback. Fenced to vB so a concurrent commit fails loud, not clobbered.
+            logger.debug(
+                f"duckrun: UPDATE predicate on {loc!r} references a subquery; delta_rs can't "
+                "evaluate it, falling back to a DuckDB-evaluated fenced full overwrite (slower)."
+            )
+            vB = engine.table_version(loc, self.so)
+            loc_sql = loc.replace("'", "''")
+            replaces = ", ".join(
+                f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"'
+                for col, expr in updates.items()
+            )
+            tmp = f"__duckrun_upd_{abs(hash(loc)) & 0xFFFFFFFF}"
+            self.cursor.execute(
+                f'create or replace temp table "{tmp}" as '
+                f"select * replace ({replaces}) from delta_scan('{loc_sql}', version => {vB})"
+            )
+            try:
+                new = self.cursor.sql(f'select * from "{tmp}"')
+                engine.overwrite_if_unchanged(loc, new, read_version=vB, overwrite_schema=True,
+                                              storage_options=self.so)
+            finally:
+                self.cursor.execute(f'drop table if exists "{tmp}"')
+            return
         # Same snapshot-fenced path as DeltaTable.forName(...).update() — SQL == DataFrame.
         engine.update_rows(
             loc, updates, where,
@@ -966,11 +998,15 @@ class _DeltaDML:
         deftext = m.group("def")
         tidx = _find_top_level(deftext, _ALTER_TAIL)
         coltype = (deftext if tidx == -1 else deftext[:tidx]).strip() or "VARCHAR"
+        # Fence this full rewrite to the version read at statement start: a writer that commits
+        # during the (potentially long) rewrite must fail the run loudly, not be silently clobbered.
+        vB = engine.table_version(loc, self.so)
         loc_sql = loc.replace("'", "''")
         data = self.cursor.sql(
-            f'select *, cast(null as {coltype}) as "{col}" from delta_scan(\'{loc_sql}\')'
+            f'select *, cast(null as {coltype}) as "{col}" from delta_scan(\'{loc_sql}\', version => {vB})'
         )
-        engine.write_delta(loc, data, "overwrite", overwrite_schema=True, storage_options=self.so)
+        engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
+                                      storage_options=self.so)
 
     # -- merge into <target> using <source> on <cond> when … : full delta_rs MERGE ---------------
     def _merge(self, m, rel, schema, loc) -> None:
@@ -1043,8 +1079,13 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc or not self._exists(loc):
             return False
+        # Fence the tombstone write to the version observed at drop time: a drop racing a live writer
+        # should fail loud (the writer's commit lands first → CommitFailedError), not silently
+        # tombstone over it.
+        vB = engine.table_version(loc, self.so)
         tombstone = self.cursor.sql(f"select true as {TOMBSTONE_COLUMN}")
-        engine.write_delta(loc, tombstone, "overwrite", overwrite_schema=True, storage_options=self.so)
+        engine.overwrite_if_unchanged(loc, tombstone, read_version=vB, overwrite_schema=True,
+                                      storage_options=self.so)
         self.cursor.execute(f"drop view if exists {rel}")
         return True
 

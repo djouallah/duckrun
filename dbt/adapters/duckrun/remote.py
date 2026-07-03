@@ -58,6 +58,47 @@ def _benign_404_or_raise(resp, directory: str) -> None:
     )
 
 
+# Transient DFS statuses worth retrying: OneLake throttles (429, usually with Retry-After) and
+# returns transient 5xx. Everything else (404, 403, auth failures) propagates immediately — a single
+# throttle response must not kill a `dbt test`/`docs` run.
+_RETRY_STATUS = {429, 500, 502, 503, 504}
+_MAX_ATTEMPTS = 3
+
+
+def _retry_delay(resp, attempt: int) -> float:
+    """Seconds to wait before the next attempt: honor a numeric ``Retry-After`` if present, else
+    exponential backoff (1s, 2s, …)."""
+    ra = resp.headers.get("Retry-After")
+    if ra and str(ra).strip().isdigit():
+        return float(ra)
+    return float(2 ** attempt)
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can stub out the wait."""
+    import time
+    time.sleep(seconds)
+
+
+def _dfs_request(method: str, url: str, headers: dict, params: Optional[dict] = None,
+                 timeout: int = 30):
+    """A DFS GET/HEAD with bounded retry for transient throttles/5xx (see ``_RETRY_STATUS``),
+    honoring ``Retry-After``. Non-retryable responses (including 404) are returned as-is for the
+    caller's own status handling; after the last attempt the final (still-transient) response is
+    returned so the caller's ``raise_for_status`` fails loud."""
+    import requests  # dbt dependency; imported lazily so non-remote paths don't need it
+
+    fn = requests.head if method == "HEAD" else requests.get
+    resp = None
+    for attempt in range(_MAX_ATTEMPTS):
+        resp = fn(url, params=params, headers=headers, timeout=timeout)
+        if resp.status_code not in _RETRY_STATUS:
+            return resp
+        if attempt < _MAX_ATTEMPTS - 1:
+            _sleep(_retry_delay(resp, attempt))
+    return resp
+
+
 def _parse_abfss(root_path: str) -> Tuple[str, str, str]:
     """``abfss://<filesystem>@<host>/<path...>`` -> (filesystem, host, path)."""
     rest = root_path[len("abfss://"):]
@@ -103,35 +144,37 @@ def list_delta_tables(root_path: str, schema: str, storage_options) -> List[str]
 
     Returns ``[]`` if the schema directory doesn't exist yet (HTTP 404) or there's no token.
     Raises on any other transport/HTTP error so discovery can log it rather than let an empty
-    result masquerade as "no tables".
+    result masquerade as "no tables". Follows ``x-ms-continuation`` so a schema with more tables
+    than one DFS page (≤5,000 entries) is fully enumerated, not silently truncated.
     """
-    import requests  # dbt dependency; imported lazily so non-remote paths don't need it
-
     token = bearer_token(storage_options)
     if not token:
         return []
     filesystem, host, base = _parse_abfss(root_path)
     directory = "/".join(p for p in (base, schema) if p)
-    resp = requests.get(
-        f"https://{host}/{filesystem}",
-        params={"resource": "filesystem", "recursive": "false", "directory": directory},
-        headers={"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
-        timeout=30,
-    )
-    if resp.status_code == 404:
-        _benign_404_or_raise(resp, directory)  # absent schema dir -> []; access failure -> raise
-        return []
-    resp.raise_for_status()
-    names = []
-    for entry in resp.json().get("paths", []) or []:
-        # Directories carry isDirectory == "true"; files omit the field. We only want the
-        # immediate table directories under the schema.
-        if str(entry.get("isDirectory", "")).lower() != "true":
-            continue
-        name = str(entry.get("name", "")).rstrip("/").rsplit("/", 1)[-1]
-        if name:
-            names.append(name)
-    return names
+    headers = {"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION}
+    names: List[str] = []
+    continuation: Optional[str] = None
+    while True:
+        params = {"resource": "filesystem", "recursive": "false", "directory": directory}
+        if continuation:
+            params["continuation"] = continuation
+        resp = _dfs_request("GET", f"https://{host}/{filesystem}", headers, params=params, timeout=30)
+        if resp.status_code == 404:
+            _benign_404_or_raise(resp, directory)  # absent schema dir -> []; access failure -> raise
+            return []
+        resp.raise_for_status()
+        for entry in resp.json().get("paths", []) or []:
+            # Directories carry isDirectory == "true"; files omit the field. We only want the
+            # immediate table directories under the schema.
+            if str(entry.get("isDirectory", "")).lower() != "true":
+                continue
+            name = str(entry.get("name", "")).rstrip("/").rsplit("/", 1)[-1]
+            if name:
+                names.append(name)
+        continuation = resp.headers.get("x-ms-continuation")
+        if not continuation:
+            return names
 
 
 def list_files(dir_url: str, storage_options) -> List[str]:
@@ -139,31 +182,34 @@ def list_files(dir_url: str, storage_options) -> List[str]:
     ``abfss://`` URLs. DuckDB's azure extension can't glob OneLake (duckdb-azure#174), so file
     transfer (``conn.download``) enumerates via the DFS REST API instead — same mechanism as
     :func:`list_delta_tables`. Returns ``[]`` if the directory doesn't exist yet (HTTP 404) or
-    there's no token; raises if the store is unreachable (wrong tenant / item not found)."""
-    import requests  # dbt dependency; imported lazily
-
+    there's no token; raises if the store is unreachable (wrong tenant / item not found). Follows
+    ``x-ms-continuation`` so a directory with more files than one DFS page is fully enumerated —
+    a truncated list here would silently drop files from a download / the safeappend ingest."""
     token = bearer_token(storage_options)
     if not token:
         return []
     filesystem, host, directory = _parse_abfss(dir_url)
-    resp = requests.get(
-        f"https://{host}/{filesystem}",
-        params={"resource": "filesystem", "recursive": "true", "directory": directory},
-        headers={"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
-        timeout=60,
-    )
-    if resp.status_code == 404:
-        _benign_404_or_raise(resp, directory)  # absent folder -> []; access failure -> raise
-        return []
-    resp.raise_for_status()
-    files = []
-    for entry in resp.json().get("paths", []) or []:
-        if str(entry.get("isDirectory", "")).lower() == "true":
-            continue
-        name = str(entry.get("name", "")).lstrip("/")  # full path within the filesystem
-        if name:
-            files.append(f"abfss://{filesystem}@{host}/{name}")
-    return files
+    headers = {"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION}
+    files: List[str] = []
+    continuation: Optional[str] = None
+    while True:
+        params = {"resource": "filesystem", "recursive": "true", "directory": directory}
+        if continuation:
+            params["continuation"] = continuation
+        resp = _dfs_request("GET", f"https://{host}/{filesystem}", headers, params=params, timeout=60)
+        if resp.status_code == 404:
+            _benign_404_or_raise(resp, directory)  # absent folder -> []; access failure -> raise
+            return []
+        resp.raise_for_status()
+        for entry in resp.json().get("paths", []) or []:
+            if str(entry.get("isDirectory", "")).lower() == "true":
+                continue
+            name = str(entry.get("name", "")).lstrip("/")  # full path within the filesystem
+            if name:
+                files.append(f"abfss://{filesystem}@{host}/{name}")
+        continuation = resp.headers.get("x-ms-continuation")
+        if not continuation:
+            return files
 
 
 def has_delta_log(table_url: str, storage_options) -> bool:
@@ -171,17 +217,15 @@ def has_delta_log(table_url: str, storage_options) -> bool:
     table. Discovery uses this to tell a non-Delta directory (skip it, don't error) from a genuine
     table that merely fails to read (fail loud — the delta-kernel #307 case). Same REST mechanism as
     :func:`list_delta_tables`, so a table found via REST is always confirmable via REST."""
-    import requests  # dbt dependency; imported lazily
-
     token = bearer_token(storage_options)
     if not token:
         return False
     filesystem, host, base = _parse_abfss(table_url)
-    resp = requests.get(
-        f"https://{host}/{filesystem}",
+    resp = _dfs_request(
+        "GET", f"https://{host}/{filesystem}",
+        {"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
         params={"resource": "filesystem", "recursive": "false",
                 "directory": f"{base}/_delta_log", "maxResults": 1},
-        headers={"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
         timeout=30,
     )
     if resp.status_code == 404:
@@ -193,15 +237,13 @@ def has_delta_log(table_url: str, storage_options) -> bool:
 def file_exists(file_url: str, storage_options) -> bool:
     """True if a single file exists on a OneLake/ADLS store (a HEAD on the DFS path). Used by the
     ``overwrite=False`` guard in ``conn.copy`` — DuckDB glob can't be used on OneLake."""
-    import requests  # dbt dependency; imported lazily
-
     token = bearer_token(storage_options)
     if not token:
         return False
     filesystem, host, path = _parse_abfss(file_url)
-    resp = requests.head(
-        f"https://{host}/{filesystem}/{path}",
-        headers={"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
+    resp = _dfs_request(
+        "HEAD", f"https://{host}/{filesystem}/{path}",
+        {"Authorization": f"Bearer {token}", "x-ms-version": _DFS_API_VERSION},
         timeout=30,
     )
     return resp.status_code == 200
