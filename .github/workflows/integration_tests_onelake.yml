@@ -136,6 +136,19 @@ jobs:
         run: python scripts/generate_calendar.py
       - name: dbt build (OneLake — creates Delta tables over abfss://)
         run: dbt build --target dev --exclude tag:heavy
+      - name: get_rle on mart.fct_summary — recommended sort key (dogfood on real data)
+        # Non-blocking diagnostic: run the RLE sort-order optimiser on the real summary table and
+        # print the recommended ORDER BY + projected run reduction to the log.
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import os, duckrun
+          conn = duckrun.connect(
+              os.environ["WAREHOUSE_PATH"],
+              storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
+              schema="mart")
+          conn.get_rle("fct_summary").show(max_rows=30)
+          PY
       - name: dbt test (fresh process — read-only delta_scan registration over abfss://)
         # A standalone `dbt test` materializes nothing, so it only passes if the adapter re-registers
         # every Delta table as a delta_scan view at run start — which on OneLake needs the Azure
