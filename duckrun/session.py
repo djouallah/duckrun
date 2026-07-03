@@ -1097,8 +1097,10 @@ class DuckSession:
         if partition_cols:
             print(f"  (partition columns lead the sort but carry no compression weight: "
                   f"{', '.join(partition_cols)})")
-        print(f"  est size: {_kb(current_total):,} KB (current) -> {_kb(sorted_total):,} KB "
-              f"(sorted)  ~{_saved(current_total, sorted_total)}% smaller")
+        # Deliberately NO projected-size line: _get_rle only profiles, it doesn't rewrite, so any
+        # "sorted size" would be a model estimate — and an estimate that reads like a measurement is
+        # worse than none. The real before/after bytes are printed by optimize(sort='experimental'),
+        # which actually rewrites and measures via the Delta log (get_stats).
         if note:
             print(f"  ({note})")
         if dict_bound:

@@ -285,14 +285,21 @@ class DeltaTable:
         order_cols = pcols + [c for c in key if c not in pcols]
         if not order_cols:  # nothing to sort → fall back to a plain bin-packing compaction
             return engine.optimize(self.path, storage_options=self.storage_options)
+        con = self._session.con
+        # REAL on-disk bytes (active files, from the Delta log's size_bytes — cross-storage, no
+        # estimate), measured before and after the rewrite so the caller sees the actual reduction.
+        _, before, _ = engine.delta_file_summary(con, self.path, self.storage_options)
         plit = self.path.replace("'", "''")
         order_expr = ", ".join('"' + c.replace('"', '""') + '"' for c in order_cols)
-        rel = self._session.con.sql(f"SELECT * FROM delta_scan('{plit}') ORDER BY {order_expr}")
+        rel = con.sql(f"SELECT * FROM delta_scan('{plit}') ORDER BY {order_expr}")
         engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
                            storage_options=self.storage_options,
                            compaction_threshold=self.compaction_threshold)
         self._resnapshot()
-        return {"operation": "sortRewrite", "sortedBy": order_cols}
+        _, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
+        saved = round(100.0 * (before - after) / before, 1) if before else 0.0
+        return {"operation": "sortRewrite", "sortedBy": order_cols,
+                "sizeBytesBefore": before, "sizeBytesAfter": after, "savedPct": saved}
 
     def restoreToVersion(self, version: int) -> None:
         """Restore the table to an earlier Delta ``version`` (delta-spark ``DeltaTable.restoreToVersion``).

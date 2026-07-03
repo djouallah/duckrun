@@ -632,6 +632,9 @@ class TestDeltaTable:
             .write.mode("overwrite").saveAsTable("os")
         m = DeltaTable.forName(conn, "dbo.os").optimize(sort="experimental")
         assert m["operation"] == "sortRewrite" and "region" in m["sortedBy"]
+        # reports REAL measured on-disk bytes (Delta-log size_bytes), never an estimate
+        assert m["sizeBytesBefore"] > 0 and m["sizeBytesAfter"] > 0
+        assert m["savedPct"] == round(100.0 * (m["sizeBytesBefore"] - m["sizeBytesAfter"]) / m["sizeBytesBefore"], 1)
         assert conn.table("os").count() == 20000
         # active file is clustered: reading it in file order, region is non-decreasing.
         f = engine._delta_table(conn.root_path + "/dbo/os", None).file_uris()[0].replace("file://", "")

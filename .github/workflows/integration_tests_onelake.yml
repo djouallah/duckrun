@@ -166,6 +166,9 @@ jobs:
           result = DeltaTable.forName(conn, "fct_summary").optimize(sort="experimental")
           print("=== optimize(sort='experimental') result ===")
           print("sort order:", result.get("sortedBy", result))
+          b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
+          if b:
+              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB ({result.get('savedPct')}% smaller)")
           PY
 
   merge_spill:
@@ -345,6 +348,9 @@ jobs:
           result = DeltaTable.forName(conn, "trips").optimize(sort="experimental")
           print("=== optimize(sort='experimental') result ===")
           print("sort order:", result.get("sortedBy", result))
+          b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
+          if b:
+              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB ({result.get('savedPct')}% smaller)")
           PY
 
       - name: Upload this run's HTML report for deploy-docs to publish as taxi.html
