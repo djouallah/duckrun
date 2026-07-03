@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.30] - 2026-07-03
+
+### Added
+- **Storage-neutral Files I/O on the connection API** — `conn.copy()`, `conn.download()`, and
+  `conn.list_files()` move loose files to/from any store (local / S3 / GCS / ADLS / OneLake) using
+  DuckDB `COPY … (FORMAT BLOB)` over the secret `connect()` already mints. No new dependency; copies
+  are byte-verbatim (a `.gz`/`.zst` target is never re-compressed). OneLake enumeration uses the DFS
+  REST API (DuckDB can't glob OneLake).
+- **`conn.get_stats()`** — per-table Delta statistics (rows, files, row-groups, avg row-group, size,
+  VORDER, compression) from the Delta log + parquet footers; `detailed=True` for one row per row
+  group. Live files only (tombstoned files excluded).
+
+### Changed
+- **`connect()` tolerates any root.** Discovery skips directories that aren't Delta tables (no
+  `_delta_log`) instead of hard-failing, so pointing at a Files section or a mixed folder works; a
+  genuine unreadable table still fails loud.
+- **Unreachable OneLake fails loud.** A wrong-tenant / not-in-workspace store now raises
+  `OneLakeAccessError` on both the connection API and the dbt discovery path, instead of silently
+  reporting an empty lakehouse.
+
 ## [0.3.28] - 2026-07-01
 
 ### Fixed
