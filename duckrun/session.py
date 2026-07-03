@@ -751,9 +751,12 @@ class DuckSession:
                 continue
             if "://" not in remote_path:  # local target: object stores need no dirs, a local FS does
                 os.makedirs(os.path.dirname(remote_path) or ".", exist_ok=True)
+            # COMPRESSION 'none' is load-bearing: a file copy must be byte-verbatim. Without it,
+            # COPY TO re-encodes by the destination extension (a '.gz'/'.zst' target would re-compress
+            # an already-compressed blob → double-compressed, corrupt).
             self.con.execute(
                 f"COPY (SELECT content FROM read_blob('{_qlit(local_path)}')) "
-                f"TO '{_qlit(remote_path)}' (FORMAT BLOB)")
+                f"TO '{_qlit(remote_path)}' (FORMAT BLOB, COMPRESSION 'none')")
             print(f"  ✓ {local_path} → {remote_path}")
         print("✅ upload complete")
         return True
@@ -771,7 +774,7 @@ class DuckSession:
                  for fp, rel in self._enumerate_remote(base, _norm_exts(file_extensions))]
         if not pairs:
             print(f"⚠️  no files to download from '{base}'"
-                  + (f" (filtered by {file_extensions})" if exts else ""))
+                  + (f" (filtered by {file_extensions})" if file_extensions else ""))
             return True
         print(f"📁 Downloading {len(pairs)} file(s) to '{local_folder}'...")
         for remote_path, local_path in pairs:
@@ -779,9 +782,10 @@ class DuckSession:
                 print(f"  ⏭ exists: {local_path}")
                 continue
             os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            # COMPRESSION 'none' → byte-verbatim (see copy(): a '.gz'/'.zst' target must not re-compress).
             self.con.execute(
                 f"COPY (SELECT content FROM read_blob('{_qlit(remote_path)}')) "
-                f"TO '{_qlit(local_path.replace(chr(92), '/'))}' (FORMAT BLOB)")
+                f"TO '{_qlit(local_path.replace(chr(92), '/'))}' (FORMAT BLOB, COMPRESSION 'none')")
             print(f"  ✓ {remote_path} → {local_path}")
         print("✅ download complete")
         return True

@@ -124,10 +124,16 @@ class TestSession:
         (src / "a.csv").write_bytes(b"hello")
         (src / "sub" / "b.parquet").write_bytes(b"world")
         (src / "skip.txt").write_bytes(b"no")
-        conn.copy(str(src), "uploaded", file_extensions=[".csv", "parquet"])
+        # a .gz-named file must be copied byte-verbatim, NOT re-compressed by the extension (the bug
+        # that double-gzipped AEMO's CSV.gz and broke fct_price). COMPRESSION 'none' guards it.
+        import gzip
+        gz = gzip.compress(b"col1,col2\n1,2\n" * 50)
+        (src / "d.csv.gz").write_bytes(gz)
+        conn.copy(str(src), "uploaded", file_extensions=[".csv", "parquet", ".gz"])
         base = Path(conn.root_path) / "uploaded"
         assert (base / "a.csv").read_bytes() == b"hello"
         assert (base / "sub" / "b.parquet").read_bytes() == b"world"
+        assert (base / "d.csv.gz").read_bytes() == gz  # byte-verbatim, not double-compressed
         assert not (base / "skip.txt").exists()  # filtered out
 
     def test_download(self, conn, tmp_path):
