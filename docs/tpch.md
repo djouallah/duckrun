@@ -20,7 +20,7 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 
 **What this checks:** duckrun registers the full TPC-H schema (8 tables) as Delta in place via `DeltaTable.convertToDelta` (zero-copy — writes only the `_delta_log`), then runs the 22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is the (near-free) convert; the **query** times are DuckDB reading Delta — there is no second engine to race here, so read them as "the whole schema loads and all 22 queries run at this scale", not a *duckrun is fast* claim.
 
-> **Ingest 8 tables in 0.2s** &middot; **run 22 queries in 679.3s** &middot; SF 100 &middot; 866.0M rows &middot; 4 cores
+> **Ingest 8 tables in 0.1s** &middot; **run 22 queries in 678.3s** &middot; SF 100 &middot; 866.0M rows &middot; 4 cores
 
 ### Setup
 | | |
@@ -45,28 +45,28 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 ### Queries — 22 TPC-H over `delta_scan`
 | Query | Duration (s) |
 |:---|---:|
-| Q01 | 22.442 |
-| Q02 | 8.689 |
-| Q03 | 29.767 |
-| Q04 | 9.474 |
-| Q05 | 38.841 |
-| Q06 | 8.676 |
-| Q07 | 26.630 |
-| Q08 | 45.282 |
-| Q09 | 68.157 |
-| Q10 | 25.534 |
-| Q11 | 4.696 |
-| Q12 | 12.037 |
-| Q13 | 18.140 |
-| Q14 | 23.905 |
-| Q15 | 22.064 |
-| Q16 | 4.140 |
-| Q17 | 116.351 |
-| Q18 | 29.899 |
-| Q19 | 32.723 |
-| Q20 | 37.236 |
-| Q21 | 86.231 |
-| Q22 | 8.419 |
-| **Total** | **679.34** |
+| Q01 | 22.004 |
+| Q02 | 6.058 |
+| Q03 | 31.265 |
+| Q04 | 9.201 |
+| Q05 | 39.129 |
+| Q06 | 8.656 |
+| Q07 | 26.598 |
+| Q08 | 45.391 |
+| Q09 | 67.968 |
+| Q10 | 25.414 |
+| Q11 | 4.589 |
+| Q12 | 11.976 |
+| Q13 | 17.858 |
+| Q14 | 24.032 |
+| Q15 | 22.107 |
+| Q16 | 3.920 |
+| Q17 | 116.213 |
+| Q18 | 29.987 |
+| Q19 | 32.435 |
+| Q20 | 38.173 |
+| Q21 | 86.901 |
+| Q22 | 8.375 |
+| **Total** | **678.25** |
 
 <!-- TPCH:END -->
