@@ -29,10 +29,19 @@
         identifier=target_relation.identifier ~ '__duckrun_tmp',
         type='table') -%}
 
-  {#-- Delta location: config(location=...) wins, else root_path/<schema>/<seed> (same as a model). --#}
+  {#-- Delta location: config(location=...) wins, else root_path/<schema>/<seed> (same as a model).
+        Resolve the write root by the seed's database exactly like duckrun__delta_paths: a
+        `+database: <alias>` naming a declared catalog uses that catalog's root, else target.root_path.
+        Without this a seed with +database silently landed in the default catalog. --#}
   {%- set location = config.get('location') -%}
   {%- if not location -%}
-    {%- set root_path = target.root_path -%}
+    {%- set _db = target_relation.database -%}
+    {%- set _catalogs = target.catalog_locations or {} -%}
+    {%- if _db and _db != target.database and _db in _catalogs -%}
+      {%- set root_path = _catalogs[_db] -%}
+    {%- else -%}
+      {%- set root_path = target.root_path -%}
+    {%- endif -%}
     {%- if not root_path -%}
       {{ exceptions.raise_compiler_error(
           "duckrun: seed '" ~ model.name ~ "' needs config(location=...) or a 'root_path' in the profile.") }}

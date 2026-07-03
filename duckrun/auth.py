@@ -16,6 +16,7 @@ Fabric-API-token branches — just what a storage read/write needs.
 import base64
 import json
 import os
+import sys
 import time
 from typing import Optional
 
@@ -43,14 +44,27 @@ def _fabric_token() -> Optional[str]:
     return None
 
 
-def _azure_identity_token() -> Optional[str]:
-    """A storage token via azure-identity (CLI, then interactive browser); None if the optional
-    dependency is missing or every credential fails."""
+def _azure_identity_token(interactive: bool = True) -> Optional[str]:
+    """A storage token via azure-identity; None if the optional dependency is missing or every
+    credential fails.
+
+    Non-interactive sources (``AzureCliCredential``) are always tried. ``InteractiveBrowserCredential``
+    is only appended when ``interactive`` is True AND we're attached to a TTY — never on a headless
+    runner, where it would try to open a browser and block on a local redirect listener (a long hang
+    mid-build). ``refresh_storage_token`` passes ``interactive=False`` so a best-effort token refresh
+    can never launch a browser."""
     try:
-        from azure.identity import AzureCliCredential, InteractiveBrowserCredential
+        from azure.identity import AzureCliCredential
     except ImportError:
         return None
-    for credential in (AzureCliCredential, InteractiveBrowserCredential):
+    credentials = [AzureCliCredential]
+    if interactive and sys.stdin.isatty():
+        try:
+            from azure.identity import InteractiveBrowserCredential
+            credentials.append(InteractiveBrowserCredential)
+        except ImportError:
+            pass
+    for credential in credentials:
         try:
             return credential().get_token(_STORAGE_SCOPE).token
         except Exception:
@@ -152,5 +166,8 @@ def refresh_storage_token() -> Optional[str]:
     what may have gone stale on a long run. The GitHub-OIDC source is ordered before plain
     azure-identity because, under OIDC CI, ``AzureCliCredential`` cannot renew an expired token (no
     refresh token) whereas re-exchanging a fresh OIDC assertion always can. Returns None when no live
-    source is available (then the caller keeps the token it has)."""
-    return _fabric_token() or _github_oidc_token() or _azure_identity_token()
+    source is available (then the caller keeps the token it has).
+
+    Non-interactive only: ``_azure_identity_token(interactive=False)`` so a mid-run refresh (called
+    from the per-statement cursor guard) can never pop a browser and hang a headless build."""
+    return _fabric_token() or _github_oidc_token() or _azure_identity_token(interactive=False)

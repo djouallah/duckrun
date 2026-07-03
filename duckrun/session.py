@@ -75,20 +75,32 @@ def _unsupported_dml(query: str) -> Optional[str]:
 
 
 def _is_multi_statement(s: str) -> bool:
-    """True if ``s`` holds more than one statement (a top-level ``;`` with anything after it)."""
-    depth, quote = 0, None
-    for i, ch in enumerate(s):
+    """True if ``s`` holds more than one statement (a top-level ``;`` with anything after it).
+
+    Skips ``$tag$…$tag$`` dollar-quoted bodies (reusing delta_dml's scanner) so a ``;`` inside a
+    dollar-quoted literal isn't mistaken for a statement separator — matching the other scanners."""
+    depth, quote, i, n = 0, None, 0, len(s)
+    while i < n:
+        ch = s[i]
         if quote:
             if ch == quote:
                 quote = None
-        elif ch in ("'", '"'):
+            i += 1
+            continue
+        if ch in ("'", '"'):
             quote = ch
+        elif ch == "$":
+            de = delta_dml._dollar_quote_end(s, i)
+            if de is not None:
+                i = de
+                continue
         elif ch in "([":
             depth += 1
         elif ch in ")]":
             depth -= 1
         elif ch == ";" and depth == 0 and s[i + 1:].strip():
             return True
+        i += 1
     return False
 
 
