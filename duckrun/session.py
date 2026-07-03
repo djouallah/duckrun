@@ -902,10 +902,22 @@ class DuckSession:
                 raise ValueError(f"_get_rle is single-table; '{table}' is a schema — pass one table.")
             raise ValueError(f"_get_rle: table '{table}' not found.")
         cat, sch, tbl = self._resolve(table)
-        plit = _qlit(f"{self._catalogs[cat].root_path}/{sch}/{tbl}")
+        path = f"{self._catalogs[cat].root_path}/{sch}/{tbl}"
+        plit = _qlit(path)
+        # Partition columns lead the physical ORDER BY but are NOT compression-key candidates: Delta
+        # strips them from the data files (zero RLE value), yet ordering by them first keeps ~one
+        # delta-rs partition writer open at a time (less write memory). Discover them from the Delta
+        # metadata; best-effort — an unreadable log just means "treat as unpartitioned".
+        try:
+            _pcols = engine._delta_table(
+                path, self._catalog_storage_options(cat)).metadata().partition_columns
+            partition_cols = list(_pcols or [])
+        except Exception:
+            partition_cols = []
         desc = self.con.sql(f"DESCRIBE SELECT * FROM delta_scan('{plit}')").fetchall()
         cols = [r[0] for r in desc]
         types = {r[0]: r[1] for r in desc}
+        partition_cols = [c for c in partition_cols if c in cols]
         if not cols:
             raise ValueError(f"_get_rle: table '{table}' has no columns.")
 
@@ -944,6 +956,9 @@ class DuckSession:
         # eligible: an INT can be a real dimension key, e.g. a HHMM time-of-day.)
         def _is_measure(t):
             return t.upper().startswith(("DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL"))
+
+        def _is_temporal(t):
+            return t.upper().startswith(("DATE", "TIME", "TIMESTAMP"))
 
         # 2) per-column skew term Σp_v² (Simpson index, from the value histogram) and, for hash
         # columns, average serialised value width (drives dictionary cost). One group-by per column
@@ -991,16 +1006,28 @@ class DuckSession:
         # once the prefix reaches the grain everything after is shredded, so stop.
         iid_bytes = {c: _col_bytes(c, _iid_runs(c)) for c in cols}
         baseline_total = sum(iid_bytes.values())
+        # R6: a non-(near-)unique date/temporal column leads the key even at moderate cardinality —
+        # on a fact table leading with the date preserves natural clustering and incremental framing,
+        # so give temporals a tier-0 thumb ahead of the plain ascending-cardinality order. A
+        # near-unique timestamp is demoted to the normal tier so it can't hijack the lead slot.
+        # R8: partition columns are excluded as candidates — they lead the ORDER BY (below) but carry
+        # no RLE value once Delta strips them from the files.
+        def _lead(c):
+            return _is_temporal(types[c]) and not (n and ndv[c] >= 0.9 * n)
+        candidates = sorted(
+            (c for c in cols if ndv[c] > 1 and not _is_measure(types[c]) and c not in partition_cols),
+            key=lambda c: (0 if _lead(c) else 1, ndv[c]))
         sort_key, sorted_runs = [], {}
-        for c in sorted((c for c in cols if ndv[c] > 1 and not _is_measure(types[c])),
-                        key=lambda c: ndv[c]):
+        for c in candidates:
             if len(sort_key) >= sort_key_cap:
                 break
             runs = self.con.sql(
                 f"SELECT approx_count_distinct(hash({', '.join(_qid(x) for x in sort_key + [c])})) "
                 f"FROM delta_scan('{plit}')").fetchone()[0]
             if iid_bytes[c] - _col_bytes(c, runs) <= baseline_total * (min_gain_pct / 100.0):
-                break  # doesn't compress at its position — the prefix has reached the grain
+                if _lead(c):
+                    continue  # a leading temporal that doesn't actually cluster — skip, keep scanning
+                break         # ascending-cardinality bulk: prefix reached the grain, stop
             sort_key.append(c)
             sorted_runs[c] = runs
 
@@ -1020,7 +1047,7 @@ class DuckSession:
         # compress meaningfully (a real fact) we keep the compression key.
         _, comp_total = _bytes_for(sorted_runs)
         comp_saved = 100.0 * (current_total - comp_total) / current_total if current_total else 0.0
-        unique_cols = [c for c in cols if n and ndv[c] >= 0.9 * n]
+        unique_cols = [c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols]
         note = None
         if unique_cols and comp_saved < key_sort_below_pct:
             pk, comp_alt = unique_cols[0], list(sort_key)  # schema-order first unique col (usually the PK)
@@ -1029,6 +1056,11 @@ class DuckSession:
                     f"is at its floor" + (f", best-effort compression sort {', '.join(comp_alt)} only "
                     f"~{comp_saved:.1f}%" if comp_alt else ""))
 
+        # Partition columns lead the physical order, so they end up perfectly grouped (runs = ndv) —
+        # and Delta stores them in the path, not the data file. Reflect that clustered state so they
+        # don't show a spurious size regression against their already-partitioned current layout.
+        for c in partition_cols:
+            sorted_runs[c] = ndv[c]
         est_sorted, sorted_total = _bytes_for(sorted_runs)
         pos = {c: i + 1 for i, c in enumerate(sort_key)}
         # a genuine unique key's dictionary is inherent — you cannot "cut" a key's cardinality — so a
@@ -1045,9 +1077,14 @@ class DuckSession:
         def _saved(cur, new):  # clamp: a column already ~free (in load order) balloons to a silly ratio
             return (max(-999.9, round(100.0 * (cur - new) / cur, 1)) + 0.0) if cur else 0.0
 
-        print(f"\n_get_rle('{sch}.{tbl}') — VertiPaq sort-key recommendation (experimental):")
-        print(f"  ORDER BY {', '.join(sort_key) if sort_key else '(no key pays off)'}")
-        print(f"  est VertiPaq size: {_kb(current_total):,} KB (current) -> {_kb(sorted_total):,} KB "
+        # R8: partition columns lead the physical ORDER BY (write-locality) but hold no key slot.
+        order_cols = partition_cols + [c for c in sort_key if c not in partition_cols]
+        print(f"\n_get_rle('{sch}.{tbl}') — sort-key recommendation (experimental):")
+        print(f"  ORDER BY {', '.join(order_cols) if order_cols else '(no key pays off)'}")
+        if partition_cols:
+            print(f"  (partition columns lead the sort but carry no compression weight: "
+                  f"{', '.join(partition_cols)})")
+        print(f"  est size: {_kb(current_total):,} KB (current) -> {_kb(sorted_total):,} KB "
               f"(sorted)  ~{_saved(current_total, sorted_total)}% smaller")
         if note:
             print(f"  ({note})")

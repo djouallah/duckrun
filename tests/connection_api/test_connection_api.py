@@ -1919,3 +1919,50 @@ def test_get_rle_hidden_single_table_only(conn):
         conn._get_rle("dbo")   # a schema, not a table
     with pytest.raises(ValueError):
         conn._get_rle(None)    # None → not single-table
+
+
+def test_get_rle_hidden_date_leads(conn):
+    # R6: a moderate-NDV date/temporal column leads the key even though a lower-cardinality flag
+    # exists (ndv 30 date ahead of the ndv-3 flag) — natural clustering wins the lead slot.
+    conn.sql("select (date '2024-01-01' + (i % 30)::int) as d, (i % 3) as flag, i as uid "
+             "from range(3000) t(i)").write.mode("overwrite").saveAsTable("dateleads")
+    df = conn._get_rle("dateleads")
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    assert recs["d"]["in_sort_key"] and recs["d"]["sort_position"] == 1     # date leads despite higher ndv
+    assert recs["flag"]["in_sort_key"] and recs["flag"]["sort_position"] == 2
+    assert not recs["uid"]["in_sort_key"]                                    # near-unique → out
+
+
+def test_get_rle_hidden_partition_leads(conn, capsys):
+    # R8: partition columns lead the printed ORDER BY (write-locality) but take no compression slot.
+    conn.sql("select (i % 4) as region, (i % 3) as cat, (i % 3) * 7 as catlike "
+             "from range(60000) t(i)").write.mode("overwrite").partitionBy("region").saveAsTable("parttbl")
+    df = conn._get_rle("parttbl")
+    out = capsys.readouterr().out
+    assert "ORDER BY region," in out                    # partition col leads the ORDER BY
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    assert not recs["region"]["in_sort_key"]            # ...but holds no compression-key slot
+    assert recs["cat"]["in_sort_key"]                   # the real low-card dimension is the key
+
+
+def test_writer_keeps_dictionary_encoding(conn):
+    # Regression guard for the tuned delta-rs writer properties: a low-cardinality column must stay
+    # dictionary-encoded (dictionary page present + RLE_DICTIONARY), never fall back to PLAIN. Reads
+    # the delta-rs-written footer via DuckDB's parquet_metadata (delta-rs writes; DuckDB only reads).
+    # Per-page encodings aren't exposed by any parquet reader, so this catches a full PLAIN fallback /
+    # dropped writer_properties — the real regression; genuine high-NDV columns are excluded upstream.
+    import glob
+    import os
+    conn.sql("select (i % 8) as lowcard, ('v' || (i % 5)) as lowstr from range(50000) t(i)") \
+        .write.mode("overwrite").saveAsTable("dicttbl")
+    files = [f.replace(os.sep, "/")
+             for f in glob.glob(os.path.join(conn.root_path, "dbo", "dicttbl", "**", "*.parquet"),
+                                recursive=True)]
+    assert files, "no parquet files written"
+    md = {r[0]: (r[1], r[2]) for r in conn.sql(
+        f"select path_in_schema, encodings, dictionary_page_offset "
+        f"from parquet_metadata({files!r})").collect()}
+    for col in ("lowcard", "lowstr"):
+        encodings, dict_off = md[col]
+        assert dict_off is not None, f"{col} lost its dictionary page (PLAIN fallback)"
+        assert "RLE_DICTIONARY" in encodings, f"{col} not dictionary-encoded: {encodings}"
