@@ -150,6 +150,23 @@ jobs:
         with:
           name: docs-aemo
           path: integration_tests/aemo/target/static_index.html
+      - name: optimize(sort='experimental') on mart.fct_summary — sort rewrite (dogfood on real data)
+        # Non-blocking: run the experimental sort-rewrite optimiser on the real summary table over
+        # OneLake and print the chosen sort order to the log. Last step on purpose — it's a rewrite
+        # the next dbt build supersedes, and it must not gate the integration on a new feature.
+        continue-on-error: true
+        run: |
+          python - <<'PY'
+          import os, duckrun
+          from duckrun.delta_table import DeltaTable
+          conn = duckrun.connect(
+              os.environ["WAREHOUSE_PATH"],
+              storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
+              schema="mart", read_only=False)
+          result = DeltaTable.forName(conn, "fct_summary").optimize(sort="experimental")
+          print("=== optimize(sort='experimental') result ===")
+          print("sort order:", result.get("sortedBy", result))
+          PY
 
   merge_spill:
     # The incremental-MERGE project (SQL-only): the MERGE chain over OneLake at a SMALL scale factor
