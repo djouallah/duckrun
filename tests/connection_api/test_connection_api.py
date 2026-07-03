@@ -175,17 +175,19 @@ class TestSession:
         # region (ndv 4) plus rderived = region*10 (functionally determined by region). The greedy
         # sort-order optimiser must exploit that dependency: putting rderived right after region adds
         # zero new distinct prefixes, so its projected runs stay at region's cardinality (4), not 16.
-        conn.sql("select (i%4) as region, (i%4)*10 as rderived, i as uid from range(1000) t(i)") \
-            .write.mode("overwrite").saveAsTable("rletbl")
+        conn.sql("select 1 as const, (i%4) as region, (i%4)*10 as rderived, i as uid "
+                 "from range(1000) t(i)").write.mode("overwrite").saveAsTable("rletbl")
         df = conn.get_rle("rletbl")
         recs = [dict(zip(df.columns, r)) for r in df.collect()]
-        assert sorted(r["sort_position"] for r in recs) == [1, 2, 3]      # a permutation
-        assert sum(r["projected_runs"] for r in recs) < sum(r["current_runs"] for r in recs)
-        # region & rderived are interchangeable (rderived determines region) → both lead, and the
-        # second one adds ZERO new distinct prefixes, so BOTH project to 4 runs, not 4*4=16.
-        assert {r["column"] for r in recs if r["sort_position"] in (1, 2)} == {"region", "rderived"}
+        assert sorted(r["sort_position"] for r in recs) == [1, 2, 3, 4]   # a permutation of all cols
+        # region & rderived are interchangeable (rderived determines region) → the two adjacent low-
+        # card columns; the second adds ZERO new distinct prefixes, so BOTH project to 4 runs, not 16.
         assert all(r["projected_runs"] == 4 for r in recs if r["column"] in ("region", "rderived"))
-        assert next(r for r in recs if r["sort_position"] == 3)["column"] == "uid"  # high-card last
+        # The recommended KEY is exactly {region, rderived}: `const` (ndv 1 — orders nothing) and
+        # `uid` (unique — can't cluster) are both excluded.
+        assert {r["column"] for r in recs if r["in_sort_key"]} == {"region", "rderived"}
+        assert next(r for r in recs if r["column"] == "const")["in_sort_key"] is False
+        assert next(r for r in recs if r["column"] == "uid")["in_sort_key"] is False
 
     def test_get_rle_single_table_only(self, conn):
         with pytest.raises(ValueError):

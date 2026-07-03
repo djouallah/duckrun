@@ -925,20 +925,29 @@ class DuckSession:
         proj = self.con.sql(f"SELECT {proj_sel} FROM delta_scan('{plit}')").fetchone()
         projected = {order[i]: proj[i] for i in range(len(order))}
 
+        # A column earns a place in the sort key only if it actually clusters: it must vary (ndv > 1 —
+        # a constant orders nothing) AND its sorted runs must cover < 95% of rows (at ≥95% it's
+        # ~unique given the prefix, a "run" of ~1 row = no run — a continuous measure with nothing to
+        # sort). Everything else is dropped from the recommended key.
+        def _p(x):
+            return 100.0 * x / total_rows if total_rows else 0.0
+        key = [c for c in order if ndv[c] > 1 and _p(projected[c]) < 95.0]
+        skip = [c for c in order if c not in key]
+
         cur_total, proj_total = sum(current.values()), sum(projected.values())
         pct = round(100.0 * (cur_total - proj_total) / cur_total, 1) if cur_total else 0.0
         print(f"\nget_rle('{sch}.{tbl}') — recommended sort key:")
-        print(f"  ORDER BY {', '.join(order)}")
+        print(f"  ORDER BY {', '.join(key) if key else '(nothing clusters — sorting will not help)'}")
+        if skip:
+            print(f"  (skip — constant or ~unique, nothing to sort: {', '.join(skip)})")
         print(f"  total RLE runs: {cur_total:,} (current) -> {proj_total:,} (sorted)  ~{pct}% fewer")
 
-        def _p(x):
-            return round(100.0 * x / total_rows, 2) if total_rows else 0.0
-        rows = [(f"{sch}.{tbl}", pos + 1, c, ndv[c], current[c], _p(current[c]),
-                 projected[c], _p(projected[c])) for pos, c in enumerate(order)]
+        rows = [(f"{sch}.{tbl}", pos + 1, c, c in key, ndv[c], current[c], round(_p(current[c]), 2),
+                 projected[c], round(_p(projected[c]), 2)) for pos, c in enumerate(order)]
         return self.createDataFrame(
             rows,
-            "table string, sort_position int, column string, ndv bigint, current_runs bigint, "
-            "current_run_pct double, projected_runs bigint, projected_run_pct double")
+            "table string, sort_position int, column string, in_sort_key boolean, ndv bigint, "
+            "current_runs bigint, current_run_pct double, projected_runs bigint, projected_run_pct double")
 
     def _enumerate_remote(self, base: str, exts) -> List[tuple]:
         """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
