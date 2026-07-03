@@ -292,9 +292,12 @@ class DeltaTable:
         plit = self.path.replace("'", "''")
         order_expr = ", ".join('"' + c.replace('"', '""') + '"' for c in order_cols)
         rel = con.sql(f"SELECT * FROM delta_scan('{plit}') ORDER BY {order_expr}")
+        # optimize_layout=True: this experimental sort-rewrite is the ONE path that writes the tuned
+        # Direct Lake read layout (aggressive writer properties + ~1 GB files). Normal writes don't.
         engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
                            storage_options=self.storage_options,
-                           compaction_threshold=self.compaction_threshold)
+                           compaction_threshold=self.compaction_threshold,
+                           optimize_layout=True)
         self._resnapshot()
         _, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
         saved = round(100.0 * (before - after) / before, 1) if before else 0.0
