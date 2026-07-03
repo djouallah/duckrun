@@ -1252,6 +1252,30 @@ class DataFrame:
         """``True`` if the DataFrame has no rows (Spark's ``DataFrame.isEmpty()``)."""
         return self.relation.limit(1).fetchone() is None
 
+    def sort(self, *cols, ascending=None) -> "DataFrame":
+        """A new DataFrame globally sorted by ``cols`` (Spark's ``DataFrame.sort``; ``orderBy`` is its
+        alias). ``cols`` are column names (or a single list of them); ``ascending`` is a bool or a
+        list of bools matching ``cols`` (default all ascending). This is a native DuckDB ``ORDER BY``,
+        so writing the result lands physically sorted Delta files — nothing sort-specific in the write
+        path. Without this, ``df.sort(...)`` fell through to the bare DuckDB relation and lost ``.write``."""
+        if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
+            cols = tuple(cols[0])
+        if not cols:
+            raise ValueError("sort/orderBy requires at least one column.")
+        names = [str(c) for c in cols]
+        if ascending is None:
+            dirs = ["ASC"] * len(names)
+        elif isinstance(ascending, (list, tuple)):
+            if len(ascending) != len(names):
+                raise ValueError("ascending list length must match the number of sort columns.")
+            dirs = ["ASC" if a else "DESC" for a in ascending]
+        else:
+            dirs = ["ASC" if ascending else "DESC"] * len(names)
+        order_expr = ", ".join(f"{_qid(n)} {d}" for n, d in zip(names, dirs))
+        return DataFrame(self.relation.order(order_expr), self.session)
+
+    orderBy = sort  # Spark: orderBy is an alias of sort
+
     @property
     def schema(self) -> StructType:
         """The schema as a :class:`StructType` of :class:`StructField` (Spark's ``DataFrame.schema``).

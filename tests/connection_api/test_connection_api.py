@@ -454,6 +454,24 @@ class TestDataFrameWriter:
             .write.mode("overwrite").partitionBy("region").saveAsTable("w")
         assert conn.table("w").count() == 2
 
+    def test_sort(self, conn):
+        df = conn.sql("select * from (values (3),(1),(2)) t(n)").sort("n")
+        assert isinstance(df, duckrun.session.DataFrame) and hasattr(df, "write")
+        assert [r[0] for r in df.collect()] == [1, 2, 3]
+
+    def test_orderBy_alias_and_desc(self, conn):
+        # orderBy is Spark's alias of sort; ascending=False sorts descending.
+        assert [r[0] for r in conn.sql("select * from (values (1),(3),(2)) t(n)")
+                .orderBy("n", ascending=False).collect()] == [3, 2, 1]
+
+    def test_sort_then_partition_write(self, conn):
+        # sort() returns a writable DataFrame that composes with partitionBy: delta-rs does the
+        # partitioning, sort only sets row order. Round-trips all rows across partitions.
+        conn.sql("select (i % 2) as region, (9 - i % 5) as k from range(40) t(i)") \
+            .sort("region", "k").write.mode("overwrite").partitionBy("region").saveAsTable("sp")
+        assert conn.table("sp").count() == 40
+        assert sorted(r[0] for r in conn.sql("select distinct region from sp").collect()) == [0, 1]
+
     def test_format(self, conn):
         with pytest.raises(ValueError):
             conn.sql("select 1 a").write.format("parquet").saveAsTable("w")  # only delta
