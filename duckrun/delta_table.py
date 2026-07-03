@@ -296,7 +296,7 @@ class DeltaTable:
         order_expr = ", ".join('"' + c.replace('"', '""') + '"' for c in order_cols)
         rel = con.sql(f"SELECT * FROM delta_scan('{plit}') ORDER BY {order_expr}")
         # optimize_layout=True: this experimental sort-rewrite is the ONE path that writes the tuned
-        # Direct Lake read layout (aggressive writer properties + ~1 GB files). Normal writes don't.
+        # tuned read layout (opinionated writer properties + ~1 GB files). Normal writes don't.
         # plain_cols disables the (useless) dictionary on the unique columns.
         engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
                            storage_options=self.storage_options,

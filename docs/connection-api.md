@@ -189,9 +189,11 @@ current schema, `schema.table` or `catalog.schema.table` to be explicit. Like ev
 they use a plain, boring Parquet layout (ZSTD + moderate row groups, delta-rs default file size).
 
 There is also an **experimental** third mode, `conn.optimize(name, sort="experimental")`, which
-sort-rewrites the table and writes a bespoke, aggressive Parquet layout tuned for Power BI Direct
-Lake. It's the *only* path that writes that layout — normal writes deliberately don't — and it's
-documented on its own page: [Experimental: the Direct Lake sort-rewrite](experimental-optimize.md).
+does a global sort rewrite — it picks a short sort key and physically orders the table so equal
+values cluster into long runs that RLE / dictionary encoding can compress, then writes an
+opinionated Parquet layout. It's the *only* path that writes that layout (normal writes
+deliberately don't), it's not guaranteed to shrink anything, and it's documented on its own page:
+[Auto optimize (experimental)](experimental-optimize.md).
 
 The card below — every public method with a ✅ — is regenerated on every push by
 the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from the `Test*` classes of

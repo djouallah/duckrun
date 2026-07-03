@@ -887,16 +887,16 @@ class DuckSession:
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
                  key_sort_below_pct: float = 10.0) -> "DataFrame":
         """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a short Delta **sort
-        key** that minimises a table's estimated **VertiPaq** (Power BI / Direct Lake) footprint, and
+        key** that minimises a table's estimated **in-memory columnar** footprint, and
         return a per-column :class:`DataFrame`. Recommendation-only — it never rewrites the table.
 
-        The target is VertiPaq, **not** parquet-on-disk: each column is value- or hash/dictionary-encoded
+        The target is an in-memory columnar encoding, **not** parquet-on-disk: each column is value- or hash/dictionary-encoded
         (indices bit-packed at ``ceil(log2 ndv)`` bits) and then RLE is kept only when it beats the
         bit-packed form. There is **no general-purpose byte compressor** (no ZSTD), so a column that is
         not part of the sort key can only shrink through RLE, and for a column left in ~arbitrary order
         its runs are governed by value **skew**: ``E[runs] ≈ N·(1 − Σ p_v²)`` where ``Σ p_v²`` is the
         Simpson/Herfindahl index of the value histogram. Uniform columns (``Σp_v² ≈ 1/ndv``) get ≈N runs
-        and fall back to bit-packing; skewed columns RLE well in any order. VertiPaq itself only sorts by
+        and fall back to bit-packing; skewed columns RLE well in any order. The target encoding itself only benefits from sorting by
         a short prefix, so this picks **1..sort_key_cap** columns from the eligible **dimensions/keys** —
         a **measure** (DECIMAL/FLOAT/DOUBLE — a continuous value you aggregate, never filter or sort on)
         is excluded, and a costly one is flagged to shrink by cutting precision / splitting instead. The
@@ -964,7 +964,7 @@ class DuckSession:
         ndv = {c: row[2 * i + 1] for i, c in enumerate(cols)}
 
         # value-encoded = numeric/temporal (no dictionary); hash = strings/blobs (dictionary of ndv
-        # distinct values). VertiPaq forces hash for relationship columns too, but we can't see that.
+        # distinct values). An in-memory engine may force hash for relationship columns too, but we can't see that.
         def _encoding(t):
             t = t.upper()
             return "value" if t.startswith((
@@ -1000,7 +1000,7 @@ class DuckSession:
                 f"(SELECT COUNT(*) AS cnt FROM delta_scan('{plit}') GROUP BY {_qid(c)})").fetchone()[0]
             simpson[c] = (s / (n * n)) if n else 1.0
 
-        # 3) VertiPaq byte model. A column stores min(bit-packed indices, RLE runs) + a dictionary
+        # 3) in-memory columnar byte model. A column stores min(bit-packed indices, RLE runs) + a dictionary
         # (hash only). RLE run entry ≈ one index (ceil(log2 ndv) bits) + a run length (up to N).
         cnt_bits = max(1, math.ceil(math.log2(n))) if n > 1 else 1
 
