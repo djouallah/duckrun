@@ -197,13 +197,13 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 ## duckrun connection API — method scorecard
 
 ```
-┌───────────────────────────┐
-│ ✅ 99 passed   ❌ 0 failed  │
-│ 99 methods · 100% passing │
-└───────────────────────────┘
+┌────────────────────────────┐
+│ ✅ 100 passed   ❌ 0 failed  │
+│ 100 methods · 100% passing │
+└────────────────────────────┘
 ```
 
-### DataFrame API — 72/72 ✅
+### DataFrame API — 73/73 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
@@ -214,7 +214,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow`, `first`, `head`, `take`, `isEmpty`, `schema`, `printSchema` | 12/12 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `json`, `schema_csv_ddl`, `schema_ddl_with_comma_type`, `schema_json_struct`, `schema_rejected_for_delta`, `versionAsOf`, `timestampAsOf_rejected` | 11/11 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `sort`, `orderBy_alias_and_desc`, `sort_then_partition_write`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 13/13 ✅ |
-| `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `optimize_experimental_sort`, `optimize_sort_bad_value`, `conn_optimize_shortcut`, `vacuum`, `restoreToVersion` | 14/14 ✅ |
+| `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `optimize_experimental_sort`, `get_rle_scan_count_is_constant`, `optimize_sort_bad_value`, `conn_optimize_shortcut`, `vacuum`, `restoreToVersion` | 15/15 ✅ |
 
 ### duckrun-specific helpers — 27/27 ✅
 
