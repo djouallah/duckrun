@@ -325,6 +325,26 @@ jobs:
           DUCKRUN_TAXI_PAGE: taxi_run.html   # the demo writes its full SQL+results HTML report here
         run: python integration_tests/taxi/demo_taxi.py
 
+      - name: optimize(sort='experimental') on the taxi 'trips' table — sort rewrite (dogfood)
+        # Non-blocking dogfood of the experimental sort rewrite on the demo fact table: connect
+        # writable, run the sort-rewrite optimize, and print the chosen sort order to the CI log.
+        continue-on-error: true
+        env:
+          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
+        run: |
+          python - <<'PY'
+          import os, duckrun
+          from duckrun.delta_table import DeltaTable
+          conn = duckrun.connect(
+              os.environ["WAREHOUSE_PATH"],
+              storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
+              schema=os.environ["DUCKRUN_TAXI_SCHEMA"], read_only=False)
+          result = DeltaTable.forName(conn, "trips").optimize(sort="experimental")
+          print("=== optimize(sort='experimental') result ===")
+          print("sort order:", result.get("sortedBy", result))
+          PY
+
       - name: Upload this run's HTML report for deploy-docs to publish as taxi.html
         # Named docs-* so deploy-docs picks it up with its existing `pattern: docs-*` download. The
         # report IS this run's page (no commit-back, no lag); deploy-docs copies it over taxi.html.
