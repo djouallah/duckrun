@@ -860,9 +860,14 @@ class DuckSession:
             f"get_stats: '{source}' is neither a known table nor a schema in catalog "
             f"'{self._current_catalog}'.")
 
-    def get_rle(self, table: str) -> "DataFrame":
-        """Recommend the ideal Delta **sort-key column order** for one table, to cut run-length
-        encoding runs (smaller files, faster scans). Returns a :class:`DataFrame`.
+    def _get_rle(self, table: str) -> "DataFrame":
+        """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a Delta **sort-key
+        column order** for one table to cut run-length encoding runs. Returns a :class:`DataFrame`.
+
+        The greedy min-Σ|distinct-prefix| objective is only a proxy: it ignores value **skew** (a
+        near-constant column with one dominant value compresses hugely regardless of NDV) and can
+        rank a real dimension low by marginal position. Needs a proper design before it's exposed —
+        for now it only auto-skips true constants (ndv 1) and leaves the rest for a human to judge.
 
         Under a lexicographic sort by ``(c1,…,ck)`` each column ``ci`` is piecewise-constant, so its
         RLE runs equal the number of distinct ``(c1,…,ci)`` prefixes and the table's total runs are
@@ -877,11 +882,11 @@ class DuckSession:
         present physical order). Also prints the recommended ``ORDER BY`` and the total run reduction.
         **Single table only** — a schema name / ``None`` raises."""
         if not isinstance(table, str) or not table.strip():
-            raise ValueError("get_rle is single-table; pass one table name, e.g. conn.get_rle('sales').")
+            raise ValueError("_get_rle is single-table; pass one table name.")
         if not self.catalog.tableExists(table):
             if "." not in table and self.catalog.databaseExists(table):
-                raise ValueError(f"get_rle is single-table; '{table}' is a schema — pass one table.")
-            raise ValueError(f"get_rle: table '{table}' not found.")
+                raise ValueError(f"_get_rle is single-table; '{table}' is a schema — pass one table.")
+            raise ValueError(f"_get_rle: table '{table}' not found.")
         cat, sch, tbl = self._resolve(table)
         plit = _qlit(f"{self._catalogs[cat].root_path}/{sch}/{tbl}")
         cols = [r[0] for r in self.con.sql(f"DESCRIBE SELECT * FROM delta_scan('{plit}')").fetchall()]
@@ -925,21 +930,20 @@ class DuckSession:
         proj = self.con.sql(f"SELECT {proj_sel} FROM delta_scan('{plit}')").fetchone()
         projected = {order[i]: proj[i] for i in range(len(order))}
 
-        # A column earns a place in the sort key only if it actually clusters: it must vary (ndv > 1 —
-        # a constant orders nothing) AND its sorted runs must cover < 95% of rows (at ≥95% it's
-        # ~unique given the prefix, a "run" of ~1 row = no run — a continuous measure with nothing to
-        # sort). Everything else is dropped from the recommended key.
+        # Auto-skip ONLY true constants (ndv 1 — a constant orders nothing). A near-constant/near-
+        # unique column is intentionally NOT dropped: under skew it can still compress hugely, and
+        # judging that properly is exactly the design work this parked function still needs.
         def _p(x):
             return 100.0 * x / total_rows if total_rows else 0.0
-        key = [c for c in order if ndv[c] > 1 and _p(projected[c]) < 95.0]
-        skip = [c for c in order if c not in key]
+        key = [c for c in order if ndv[c] > 1]
+        skip = [c for c in order if ndv[c] <= 1]
 
         cur_total, proj_total = sum(current.values()), sum(projected.values())
         pct = round(100.0 * (cur_total - proj_total) / cur_total, 1) if cur_total else 0.0
-        print(f"\nget_rle('{sch}.{tbl}') — recommended sort key:")
-        print(f"  ORDER BY {', '.join(key) if key else '(nothing clusters — sorting will not help)'}")
+        print(f"\n_get_rle('{sch}.{tbl}') — candidate sort key (experimental):")
+        print(f"  ORDER BY {', '.join(key) if key else '(nothing to sort)'}")
         if skip:
-            print(f"  (skip — constant or ~unique, nothing to sort: {', '.join(skip)})")
+            print(f"  (skip — constant, ndv 1: {', '.join(skip)})")
         print(f"  total RLE runs: {cur_total:,} (current) -> {proj_total:,} (sorted)  ~{pct}% fewer")
 
         rows = [(f"{sch}.{tbl}", pos + 1, c, c in key, ndv[c], current[c], round(_p(current[c]), 2),

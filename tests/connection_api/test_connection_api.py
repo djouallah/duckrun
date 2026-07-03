@@ -171,30 +171,6 @@ class TestSession:
         st = conn.get_stats("src", detailed=True)  # one row per parquet row group
         assert st.count() >= 1 and "table" in st.columns
 
-    def test_get_rle(self, conn):
-        # region (ndv 4) plus rderived = region*10 (functionally determined by region). The greedy
-        # sort-order optimiser must exploit that dependency: putting rderived right after region adds
-        # zero new distinct prefixes, so its projected runs stay at region's cardinality (4), not 16.
-        conn.sql("select 1 as const, (i%4) as region, (i%4)*10 as rderived, i as uid "
-                 "from range(1000) t(i)").write.mode("overwrite").saveAsTable("rletbl")
-        df = conn.get_rle("rletbl")
-        recs = [dict(zip(df.columns, r)) for r in df.collect()]
-        assert sorted(r["sort_position"] for r in recs) == [1, 2, 3, 4]   # a permutation of all cols
-        # region & rderived are interchangeable (rderived determines region) → the two adjacent low-
-        # card columns; the second adds ZERO new distinct prefixes, so BOTH project to 4 runs, not 16.
-        assert all(r["projected_runs"] == 4 for r in recs if r["column"] in ("region", "rderived"))
-        # The recommended KEY is exactly {region, rderived}: `const` (ndv 1 — orders nothing) and
-        # `uid` (unique — can't cluster) are both excluded.
-        assert {r["column"] for r in recs if r["in_sort_key"]} == {"region", "rderived"}
-        assert next(r for r in recs if r["column"] == "const")["in_sort_key"] is False
-        assert next(r for r in recs if r["column"] == "uid")["in_sort_key"] is False
-
-    def test_get_rle_single_table_only(self, conn):
-        with pytest.raises(ValueError):
-            conn.get_rle("dbo")   # a schema, not a table
-        with pytest.raises(ValueError):
-            conn.get_rle(None)    # None → not single-table
-
 
 class TestCatalog:
     def test_listTables(self, conn):
@@ -1905,3 +1881,24 @@ def test_weird_primary_catalog_name(tmp_path, weird):
     assert conn.sql("select id from t").fetchone()[0] == 5            # bare, current catalog
     qn = '"' + weird.replace('"', '""') + '"'
     assert conn.sql(f"select id from {qn}.dbo.t").fetchone()[0] == 5  # explicit 3-part, quoted
+
+
+# ── _get_rle: PRIVATE / experimental (parked) — deliberately OUT of the TestSession scorecard ──
+def test_get_rle_hidden(conn):
+    # Core still works: exploits the FD (rderived = region*10 → both project to 4 runs, not 16), and
+    # auto-skips ONLY true constants (ndv 1). uid (unique) is NOT skipped — under skew a high-NDV
+    # column can still matter, and that judgement is the parked design work. `_get_rle` is private.
+    conn.sql("select 1 as const, (i%4) as region, (i%4)*10 as rderived, i as uid "
+             "from range(1000) t(i)").write.mode("overwrite").saveAsTable("rletbl")
+    recs = [dict(zip(conn._get_rle("rletbl").columns, r)) for r in conn._get_rle("rletbl").collect()]
+    assert sorted(r["sort_position"] for r in recs) == [1, 2, 3, 4]
+    assert all(r["projected_runs"] == 4 for r in recs if r["column"] in ("region", "rderived"))
+    assert next(r for r in recs if r["column"] == "const")["in_sort_key"] is False   # only constant
+    assert all(r["in_sort_key"] for r in recs if r["column"] in ("region", "rderived", "uid"))
+
+
+def test_get_rle_hidden_single_table_only(conn):
+    with pytest.raises(ValueError):
+        conn._get_rle("dbo")   # a schema, not a table
+    with pytest.raises(ValueError):
+        conn._get_rle(None)    # None → not single-table
