@@ -9,6 +9,7 @@ It is storage-neutral — local path, ``s3://``, ``gs://``, ``az://``, OneLake `
 every storage concern (token → secret, table discovery, the Delta write path) is delegated to the
 ``dbt.adapters.duckrun`` modules that already handle all of them. This module is glue.
 """
+import math
 import os
 import re
 from collections import namedtuple
@@ -860,27 +861,40 @@ class DuckSession:
             f"get_stats: '{source}' is neither a known table nor a schema in catalog "
             f"'{self._current_catalog}'.")
 
-    def _get_rle(self, table: str) -> "DataFrame":
-        """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a Delta **sort-key
-        column order** for one table to cut run-length encoding runs. Returns a :class:`DataFrame`.
+    def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
+                 key_sort_below_pct: float = 10.0) -> "DataFrame":
+        """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a short Delta **sort
+        key** that minimises a table's estimated **VertiPaq** (Power BI / Direct Lake) footprint, and
+        return a per-column :class:`DataFrame`. Recommendation-only — it never rewrites the table.
 
-        The greedy min-Σ|distinct-prefix| objective is only a proxy: it ignores value **skew** (a
-        near-constant column with one dominant value compresses hugely regardless of NDV) and can
-        rank a real dimension low by marginal position. Needs a proper design before it's exposed —
-        for now it only auto-skips true constants (ndv 1) and leaves the rest for a human to judge.
+        The target is VertiPaq, **not** parquet-on-disk: each column is value- or hash/dictionary-encoded
+        (indices bit-packed at ``ceil(log2 ndv)`` bits) and then RLE is kept only when it beats the
+        bit-packed form. There is **no general-purpose byte compressor** (no ZSTD), so a column that is
+        not part of the sort key can only shrink through RLE, and for a column left in ~arbitrary order
+        its runs are governed by value **skew**: ``E[runs] ≈ N·(1 − Σ p_v²)`` where ``Σ p_v²`` is the
+        Simpson/Herfindahl index of the value histogram. Uniform columns (``Σp_v² ≈ 1/ndv``) get ≈N runs
+        and fall back to bit-packing; skewed columns RLE well in any order. VertiPaq itself only sorts by
+        a short prefix, so this picks **1..sort_key_cap** columns from the eligible **dimensions/keys** —
+        a **measure** (DECIMAL/FLOAT/DOUBLE — a continuous value you aggregate, never filter or sort on)
+        is excluded, and a costly one is flagged to shrink by cutting precision / splitting instead. The
+        chosen dimensions are ordered by **ascending cardinality** (the classic rule, which also respects
+        natural hierarchies — a coarse ``date`` leads the finer ``time`` nested within it rather than being
+        stranded behind it); columns are added while each still compresses at its position and dropped once
+        the prefix reaches the table's grain (marginal gain below ``min_gain_pct``). High-cardinality hash
+        columns whose cost is dominated by their dictionary are flagged — the sort key can't shrink those,
+        only cutting cardinality can.
 
-        Under a lexicographic sort by ``(c1,…,ck)`` each column ``ci`` is piecewise-constant, so its
-        RLE runs equal the number of distinct ``(c1,…,ci)`` prefixes and the table's total runs are
-        ``Σ |distinct(c1..ci)|``. This greedily builds the column order that minimises that sum from
-        the columns' **measured** joint distinctness — so it exploits real correlations / functional
-        dependencies (a column the prefix already determines adds ~0 runs) that the textbook
-        "order by ascending cardinality" rule misses. The greedy ranks candidates with
-        ``approx_count_distinct`` (HLL — scales to big tables); the reported projection is exact.
+        **Key-organized tables** (a dimension, or a table at its grain) are handled specially: if a
+        (near-)unique key column exists and the best compression sort saves less than ``key_sort_below_pct``
+        percent, the recommendation is ``ORDER BY <key>`` — the canonical join / segment-locality layout —
+        rather than the marginal compression sort, because a unique key leaves nothing for RLE to group so
+        compression is already at its floor. The compression alternative is still printed. A genuine unique
+        key is never flagged "cut cardinality" (you can't shrink a key).
 
-        One row per column in the recommended order: ``table, sort_position, column, ndv,
-        current_runs, current_run_pct, projected_runs, projected_run_pct`` (``current`` = the table's
-        present physical order). Also prints the recommended ``ORDER BY`` and the total run reduction.
-        **Single table only** — a schema name / ``None`` raises."""
+        One row per column: ``table, in_sort_key, sort_position, column, data_type, encoding, ndv,
+        skew_pct`` (``100·Σp_v²``) ``, current_runs, est_kb_current, est_kb_sorted, saved_pct``. Also
+        prints the recommended ``ORDER BY`` and the estimated size before/after. **Single table only** —
+        a schema name / ``None`` raises."""
         if not isinstance(table, str) or not table.strip():
             raise ValueError("_get_rle is single-table; pass one table name.")
         if not self.catalog.tableExists(table):
@@ -889,13 +903,15 @@ class DuckSession:
             raise ValueError(f"_get_rle: table '{table}' not found.")
         cat, sch, tbl = self._resolve(table)
         plit = _qlit(f"{self._catalogs[cat].root_path}/{sch}/{tbl}")
-        cols = [r[0] for r in self.con.sql(f"DESCRIBE SELECT * FROM delta_scan('{plit}')").fetchall()]
+        desc = self.con.sql(f"DESCRIBE SELECT * FROM delta_scan('{plit}')").fetchall()
+        cols = [r[0] for r in desc]
+        types = {r[0]: r[1] for r in desc}
         if not cols:
-            raise ValueError(f"get_rle: table '{table}' has no columns.")
+            raise ValueError(f"_get_rle: table '{table}' has no columns.")
 
-        # 1) current physical-order runs + ndv per column, one pass. Physical order = (filename,
-        # file_row_number); a run starts on row 1 or wherever the value changes (IS DISTINCT FROM
-        # treats NULL↔NULL as equal, so the explicit row-1 start avoids undercounting a leading NULL).
+        # 1) current physical-order runs + exact ndv per column, one pass. Physical order =
+        # (filename, file_row_number); a run starts on row 1 or where the value changes (IS DISTINCT
+        # FROM treats NULL↔NULL equal, so the explicit row-1 start avoids undercounting a leading NULL).
         lag_sel = ", ".join(
             f"{_qid(c)}, lag({_qid(c)}) OVER w AS {_qid('__lag_' + str(i))}"
             for i, c in enumerate(cols))
@@ -908,50 +924,148 @@ class DuckSession:
             f"SELECT row_number() OVER w AS __rn, {lag_sel} "
             f"FROM delta_scan('{plit}', filename=1, file_row_number=1) "
             f"WINDOW w AS (ORDER BY filename, file_row_number))").fetchone()
-        total_rows = row[-1]
-        current = {c: row[2 * i] for i, c in enumerate(cols)}
+        n = row[-1] or 0
+        current_runs = {c: row[2 * i] for i, c in enumerate(cols)}
         ndv = {c: row[2 * i + 1] for i, c in enumerate(cols)}
 
-        # 2) greedy: at each position add the column minimising the distinct-prefix count so far,
-        # ranked fast with approx_count_distinct(hash(prefix…, cand)); ties → lower ndv.
-        remaining, order = list(cols), []
-        while remaining:
-            cand_sel = ", ".join(
-                f"approx_count_distinct(hash({', '.join(_qid(c) for c in order + [cand])})) AS c{j}"
-                for j, cand in enumerate(remaining))
-            est = self.con.sql(f"SELECT {cand_sel} FROM delta_scan('{plit}')").fetchone()
-            best = min(range(len(remaining)), key=lambda j: (est[j], ndv[remaining[j]]))
-            order.append(remaining.pop(best))
+        # value-encoded = numeric/temporal (no dictionary); hash = strings/blobs (dictionary of ndv
+        # distinct values). VertiPaq forces hash for relationship columns too, but we can't see that.
+        def _encoding(t):
+            t = t.upper()
+            return "value" if t.startswith((
+                "TINYINT", "UTINYINT", "SMALLINT", "USMALLINT", "INT", "UINT", "BIGINT", "UBIGINT",
+                "HUGEINT", "UHUGEINT", "BOOL", "FLOAT", "DOUBLE", "REAL", "DEC", "NUMERIC",
+                "DATE", "TIME", "TIMESTAMP")) else "hash"
 
-        # 3) exact projected runs per column at its position in the recommended order
-        proj_sel = ", ".join(
-            f"COUNT(DISTINCT ({', '.join(_qid(c) for c in order[:i + 1])})) AS p{i}"
-            for i in range(len(order)))
-        proj = self.con.sql(f"SELECT {proj_sel} FROM delta_scan('{plit}')").fetchone()
-        projected = {order[i]: proj[i] for i in range(len(order))}
+        # A continuous/additive **measure** (DECIMAL/FLOAT/DOUBLE) is an output you aggregate, not a key
+        # you organise by: no query filters an exact price, and sorting a fact by a measure just scrambles
+        # the dimensions that queries DO filter. So measures are ineligible as sort-key columns — you
+        # shrink them by cutting precision / splitting, not by sorting. (Integer/temporal columns stay
+        # eligible: an INT can be a real dimension key, e.g. a HHMM time-of-day.)
+        def _is_measure(t):
+            return t.upper().startswith(("DECIMAL", "NUMERIC", "DOUBLE", "FLOAT", "REAL"))
 
-        # Auto-skip ONLY true constants (ndv 1 — a constant orders nothing). A near-constant/near-
-        # unique column is intentionally NOT dropped: under skew it can still compress hugely, and
-        # judging that properly is exactly the design work this parked function still needs.
-        def _p(x):
-            return 100.0 * x / total_rows if total_rows else 0.0
-        key = [c for c in order if ndv[c] > 1]
-        skip = [c for c in order if ndv[c] <= 1]
+        # 2) per-column skew term Σp_v² (Simpson index, from the value histogram) and, for hash
+        # columns, average serialised value width (drives dictionary cost). One group-by per column
+        # for the histogram — fine for an occasional diagnostic.
+        simpson, avg_width = {}, {}
+        hash_cols = [c for c in cols if _encoding(types[c]) == "hash"]
+        if hash_cols:
+            wsel = ", ".join(
+                f"avg(octet_length(encode({_qid(c)}::VARCHAR))) AS w{j}"
+                for j, c in enumerate(hash_cols))
+            wr = self.con.sql(f"SELECT {wsel} FROM delta_scan('{plit}')").fetchone()
+            avg_width = {c: (wr[j] or 1.0) for j, c in enumerate(hash_cols)}
+        for c in cols:
+            s = self.con.sql(
+                f"SELECT COALESCE(SUM(cnt * cnt), 0)::DOUBLE FROM "
+                f"(SELECT COUNT(*) AS cnt FROM delta_scan('{plit}') GROUP BY {_qid(c)})").fetchone()[0]
+            simpson[c] = (s / (n * n)) if n else 1.0
 
-        cur_total, proj_total = sum(current.values()), sum(projected.values())
-        pct = round(100.0 * (cur_total - proj_total) / cur_total, 1) if cur_total else 0.0
-        print(f"\n_get_rle('{sch}.{tbl}') — candidate sort key (experimental):")
-        print(f"  ORDER BY {', '.join(key) if key else '(nothing to sort)'}")
-        if skip:
-            print(f"  (skip — constant, ndv 1: {', '.join(skip)})")
-        print(f"  total RLE runs: {cur_total:,} (current) -> {proj_total:,} (sorted)  ~{pct}% fewer")
+        # 3) VertiPaq byte model. A column stores min(bit-packed indices, RLE runs) + a dictionary
+        # (hash only). RLE run entry ≈ one index (ceil(log2 ndv) bits) + a run length (up to N).
+        cnt_bits = max(1, math.ceil(math.log2(n))) if n > 1 else 1
 
-        rows = [(f"{sch}.{tbl}", pos + 1, c, c in key, ndv[c], current[c], round(_p(current[c]), 2),
-                 projected[c], round(_p(projected[c]), 2)) for pos, c in enumerate(order)]
+        def _bits(k):
+            return max(1, math.ceil(math.log2(k))) if k and k > 1 else 1
+
+        def _dict_bytes(c):
+            return 0.0 if _encoding(types[c]) == "value" else ndv[c] * avg_width.get(c, 1.0)
+
+        def _iid_runs(c):  # runs of a column left in ~arbitrary order (skew-governed)
+            return min(float(n), max(float(ndv[c]), n * (1.0 - simpson[c])))
+
+        def _col_bytes(c, runs):
+            b = _bits(ndv[c])
+            bitpack = n * b / 8.0
+            rle = runs * (b + cnt_bits) / 8.0
+            return min(bitpack, rle) + _dict_bytes(c)
+
+        # 4) short sort key. Candidates are the eligible dimensions/keys only (a constant sorts nothing;
+        # a measure is never a key), taken in ASCENDING cardinality — the classic rule, which also
+        # respects natural hierarchies: a coarse column (date) leads the finer one nested within it
+        # (time), so a currently-free coarse column is never stranded behind a higher-card column for a
+        # marginal byte win. Each column's runs at its position = distinct(prefix incl. it) via
+        # approx_count_distinct (HLL); its own values scatter across every prefix group, so this is >=
+        # ndv (the cap only holds at position 1). Keep adding while the next column still compresses;
+        # once the prefix reaches the grain everything after is shredded, so stop.
+        iid_bytes = {c: _col_bytes(c, _iid_runs(c)) for c in cols}
+        baseline_total = sum(iid_bytes.values())
+        sort_key, sorted_runs = [], {}
+        for c in sorted((c for c in cols if ndv[c] > 1 and not _is_measure(types[c])),
+                        key=lambda c: ndv[c]):
+            if len(sort_key) >= sort_key_cap:
+                break
+            runs = self.con.sql(
+                f"SELECT approx_count_distinct(hash({', '.join(_qid(x) for x in sort_key + [c])})) "
+                f"FROM delta_scan('{plit}')").fetchone()[0]
+            if iid_bytes[c] - _col_bytes(c, runs) <= baseline_total * (min_gain_pct / 100.0):
+                break  # doesn't compress at its position — the prefix has reached the grain
+            sort_key.append(c)
+            sorted_runs[c] = runs
+
+        # 5) assemble. "current" uses the table's real present physical order. A column in the key uses
+        # its prefix runs; everything else its iid estimate.
+        est_current = {c: _col_bytes(c, current_runs[c]) for c in cols}
+        current_total = sum(est_current.values())
+
+        def _bytes_for(key_runs):
+            est = {c: (_col_bytes(c, key_runs[c]) if c in key_runs else iid_bytes[c]) for c in cols}
+            return est, sum(est.values())
+
+        # If the table has a (near-)unique KEY and the compression sort barely helps, it is
+        # key-organized (a dimension, or a table at its grain): the sensible physical layout is ORDER BY
+        # the key (join / segment locality, stable refresh), NOT the marginal compression sort — a unique
+        # key leaves nothing for RLE to group, so compression is already at its floor. When sorting *does*
+        # compress meaningfully (a real fact) we keep the compression key.
+        _, comp_total = _bytes_for(sorted_runs)
+        comp_saved = 100.0 * (current_total - comp_total) / current_total if current_total else 0.0
+        unique_cols = [c for c in cols if n and ndv[c] >= 0.9 * n]
+        note = None
+        if unique_cols and comp_saved < key_sort_below_pct:
+            pk, comp_alt = unique_cols[0], list(sort_key)  # schema-order first unique col (usually the PK)
+            sort_key, sorted_runs = [pk], {pk: ndv[pk]}     # unique key → runs = ndv, no RLE to be had
+            note = (f"key-organized (unique key '{pk}') — sorted for join/segment locality; compression "
+                    f"is at its floor" + (f", best-effort compression sort {', '.join(comp_alt)} only "
+                    f"~{comp_saved:.1f}%" if comp_alt else ""))
+
+        est_sorted, sorted_total = _bytes_for(sorted_runs)
+        pos = {c: i + 1 for i, c in enumerate(sort_key)}
+        # a genuine unique key's dictionary is inherent — you cannot "cut" a key's cardinality — so a
+        # column flagged dictionary-bound is only the non-key high-card hash columns.
+        dict_bound = [c for c in cols if _encoding(types[c]) == "hash" and c not in unique_cols
+                      and _dict_bytes(c) > 0.5 * est_sorted[c] and ndv[c] > 0.5 * max(n, 1)]
+        # measures aren't sortable-away; a costly one shrinks by cutting precision / splitting the column.
+        heavy_measures = [c for c in cols if _is_measure(types[c])
+                          and est_sorted[c] > 0.15 * max(sorted_total, 1)]
+
+        def _kb(x):
+            return round(x / 1024.0, 1)
+
+        def _saved(cur, new):  # clamp: a column already ~free (in load order) balloons to a silly ratio
+            return (max(-999.9, round(100.0 * (cur - new) / cur, 1)) + 0.0) if cur else 0.0
+
+        print(f"\n_get_rle('{sch}.{tbl}') — VertiPaq sort-key recommendation (experimental):")
+        print(f"  ORDER BY {', '.join(sort_key) if sort_key else '(no key pays off)'}")
+        print(f"  est VertiPaq size: {_kb(current_total):,} KB (current) -> {_kb(sorted_total):,} KB "
+              f"(sorted)  ~{_saved(current_total, sorted_total)}% smaller")
+        if note:
+            print(f"  ({note})")
+        if dict_bound:
+            print(f"  (dictionary-bound — sort won't help, cut cardinality: {', '.join(dict_bound)})")
+        if heavy_measures:
+            print(f"  (measures — not sortable; cut precision / split to shrink: {', '.join(heavy_measures)})")
+
+        rest = sorted((c for c in cols if c not in pos), key=lambda c: -est_current[c])
+        rows = [(f"{sch}.{tbl}", c in pos, pos.get(c, 0), c, types[c], _encoding(types[c]), ndv[c],
+                 round(100.0 * simpson[c], 2), current_runs[c], _kb(est_current[c]),
+                 _kb(est_sorted[c]), _saved(est_current[c], est_sorted[c]))
+                for c in sort_key + rest]
         return self.createDataFrame(
             rows,
-            "table string, sort_position int, column string, in_sort_key boolean, ndv bigint, "
-            "current_runs bigint, current_run_pct double, projected_runs bigint, projected_run_pct double")
+            "table string, in_sort_key boolean, sort_position int, column string, data_type string, "
+            "encoding string, ndv bigint, skew_pct double, current_runs bigint, est_kb_current double, "
+            "est_kb_sorted double, saved_pct double")
 
     def _enumerate_remote(self, base: str, exts) -> List[tuple]:
         """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,

@@ -1885,16 +1885,33 @@ def test_weird_primary_catalog_name(tmp_path, weird):
 
 # ── _get_rle: PRIVATE / experimental (parked) — deliberately OUT of the TestSession scorecard ──
 def test_get_rle_hidden(conn):
-    # Core still works: exploits the FD (rderived = region*10 → both project to 4 runs, not 16), and
-    # auto-skips ONLY true constants (ndv 1). uid (unique) is NOT skipped — under skew a high-NDV
-    # column can still matter, and that judgement is the parked design work. `_get_rle` is private.
+    # VertiPaq byte model on a fact-shaped table: a constant (ndv 1) sorts nothing; a low-card
+    # dimension and its FD-derived twin both enter the sort key (sorting one collapses the other for
+    # free); a unique column can't be compressed by sorting and is left out. `_get_rle` is private.
     conn.sql("select 1 as const, (i%4) as region, (i%4)*10 as rderived, i as uid "
-             "from range(1000) t(i)").write.mode("overwrite").saveAsTable("rletbl")
-    recs = [dict(zip(conn._get_rle("rletbl").columns, r)) for r in conn._get_rle("rletbl").collect()]
-    assert sorted(r["sort_position"] for r in recs) == [1, 2, 3, 4]
-    assert all(r["projected_runs"] == 4 for r in recs if r["column"] in ("region", "rderived"))
-    assert next(r for r in recs if r["column"] == "const")["in_sort_key"] is False   # only constant
-    assert all(r["in_sort_key"] for r in recs if r["column"] in ("region", "rderived", "uid"))
+             "from range(1000) t(i)").write.mode("overwrite").saveAsTable("facttbl")
+    df = conn._get_rle("facttbl")
+    assert df.columns == ["table", "in_sort_key", "sort_position", "column", "data_type", "encoding",
+                          "ndv", "skew_pct", "current_runs", "est_kb_current", "est_kb_sorted",
+                          "saved_pct"]
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    assert not recs["const"]["in_sort_key"]        # ndv 1 → nothing to sort
+    assert recs["region"]["in_sort_key"]           # low-card dimension compresses
+    assert recs["rderived"]["in_sort_key"]         # FD on region → collapses too
+    assert not recs["uid"]["in_sort_key"]          # unique → sorting can't help
+    assert sorted(r["sort_position"] for r in recs.values() if r["in_sort_key"]) == [1, 2]
+
+
+def test_get_rle_hidden_key_organized(conn):
+    # A (near-)unique key with no compressible structure ⇒ key-organized (a dimension, or a table at
+    # its grain): recommend ORDER BY the key itself, not a marginal compression sort. The unique key
+    # is never told to "cut cardinality".
+    conn.sql("select i as pk, i * 2 as a, i * 3 as b from range(500) t(i)") \
+        .write.mode("overwrite").saveAsTable("dimtbl")
+    df = conn._get_rle("dimtbl")
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    assert recs["pk"]["in_sort_key"] and recs["pk"]["sort_position"] == 1
+    assert not recs["a"]["in_sort_key"] and not recs["b"]["in_sort_key"]
 
 
 def test_get_rle_hidden_single_table_only(conn):
