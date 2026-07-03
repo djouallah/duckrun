@@ -797,6 +797,65 @@ class DuckSession:
         base = self._files_base(remote_folder)
         return [rel for _fp, rel in self._enumerate_remote(base, _norm_exts(file_extensions))]
 
+    def get_stats(self, source: Optional[str] = None, detailed: bool = False) -> "DataFrame":
+        """Delta table statistics — the "why is my table slow / full of small files" view. Returns a
+        :class:`DataFrame`, one row per table (``detailed=False``) or one row per parquet **row group**
+        (``detailed=True``, the raw ``parquet_metadata`` columns).
+
+        ``source``: ``None`` → every table in the current schema; a table name (1/2/3-part) → that
+        table; a schema name → every table in it. Aggregated columns: ``catalog, schema, table,
+        total_rows, num_files, num_row_groups, avg_row_group, size_mb, vorder, compression``. Reads the
+        Delta log for the active file list + size + VORDER, then the parquet footers for row-group
+        shape — so it counts only live files (tombstoned ones are excluded)."""
+        targets = self._resolve_stats_targets(source)
+        if not targets:
+            raise ValueError(
+                f"get_stats: nothing to describe for source={source!r} "
+                f"(catalog '{self._current_catalog}', schema '{self._current_database}').")
+        parts = []
+        for cat, sch, tbl in targets:
+            entry = self._catalogs[cat]
+            files, size_bytes, vorder = engine.delta_file_summary(
+                self.con, f"{entry.root_path}/{sch}/{tbl}", entry.storage_options)
+            pre = (f"'{_qlit(cat)}' AS catalog, '{_qlit(sch)}' AS schema, "
+                   f"'{_qlit(tbl)}' AS \"table\"")
+            if not files:
+                if not detailed:
+                    parts.append(f"SELECT {pre}, 0 AS total_rows, 0 AS num_files, 0 AS num_row_groups, "
+                                 f"NULL::DOUBLE AS avg_row_group, 0.0 AS size_mb, {str(vorder).lower()} "
+                                 f"AS vorder, 'EMPTY' AS compression")
+                continue
+            lit = "[" + ", ".join(f"'{_qlit(f)}'" for f in files) + "]"
+            if detailed:
+                parts.append(f"SELECT {pre}, m.* FROM parquet_metadata({lit}) m")
+            else:
+                parts.append(
+                    f"SELECT {pre}, "
+                    f"SUM(fm.num_rows) AS total_rows, COUNT(*) AS num_files, "
+                    f"SUM(fm.num_row_groups) AS num_row_groups, "
+                    f"ROUND(SUM(fm.num_rows)::DOUBLE / NULLIF(SUM(fm.num_row_groups), 0), 1) AS avg_row_group, "
+                    f"ROUND({size_bytes} / 1048576.0, 2) AS size_mb, {str(vorder).lower()} AS vorder, "
+                    f"(SELECT COALESCE(STRING_AGG(DISTINCT compression, ', '), 'UNCOMPRESSED') "
+                    f"FROM parquet_metadata({lit})) AS compression "
+                    f"FROM parquet_file_metadata({lit}) fm")
+        if not parts:
+            raise ValueError(f"get_stats: no files to describe for source={source!r}.")
+        return DataFrame(self.con.sql(" UNION ALL ".join(parts)), self)
+
+    def _resolve_stats_targets(self, source: Optional[str]) -> List[tuple]:
+        """Resolve a ``get_stats`` source to ``(catalog, schema, table)`` targets: ``None`` → every
+        table in the current schema; a known table (1/2/3-part) → itself; a schema name → its tables."""
+        if source is None:
+            db = self._current_database
+            return [(self._current_catalog, db, t) for t in self.catalog.listTables(db)]
+        if self.catalog.tableExists(source):
+            return [self._resolve(source)]
+        if "." not in source and self.catalog.databaseExists(source):
+            return [(self._current_catalog, source, t) for t in self.catalog.listTables(source)]
+        raise ValueError(
+            f"get_stats: '{source}' is neither a known table nor a schema in catalog "
+            f"'{self._current_catalog}'.")
+
     def _enumerate_remote(self, base: str, exts) -> List[tuple]:
         """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
         relative_path)`` pairs honouring the extension filter. Shared by ``list_files``/``download``."""

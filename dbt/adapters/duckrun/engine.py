@@ -584,6 +584,24 @@ def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None
     }
 
 
+def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]] = None):
+    """Active-file list (absolute paths) + total size + VORDER flag for a Delta table — the Delta-log
+    half of ``get_stats`` (the parquet footers are read separately by the caller). ``file_uris()``
+    gives the live files (tombstoned ones excluded) as DuckDB-readable paths (bare local paths /
+    ``abfss://`` URIs); size + VORDER come from the same ``add_actions`` replacement-scan as
+    :func:`delta_stats` (no pyarrow)."""
+    dt = _delta_table(path, storage_options)
+    files = list(dt.file_uris())
+    add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
+    size = int(cur.sql("select coalesce(sum(size_bytes), 0)::bigint from add_actions").fetchone()[0])
+    # VORDER is a Fabric write tag; flatten=True surfaces it as a column named like "tags.VORDER".
+    vcols = [d[0] for d in cur.sql("select * from add_actions limit 0").description]
+    vcol = next((c for c in vcols if "vorder" in c.lower()), None)
+    vorder = bool(vcol) and cur.sql(
+        f'select count(*) from add_actions where "{vcol}" is not null').fetchone()[0] > 0
+    return files, size, vorder
+
+
 # Delta column-metadata key under which we stash a dbt column description, and the dollar-quote
 # label used to embed arbitrary comment text (newlines, quotes, dollar signs) in COMMENT ON SQL.
 _DELTA_COMMENT_KEY = "comment"

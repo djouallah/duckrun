@@ -784,6 +784,12 @@ def _generate_tables(conn, sf, schema):
         print(f"  {tbl}: {rows:,} rows convert→Delta in {dur:.2f}s (in place)")
     conn.refresh(quiet=True)                                    # surface the converted tables as views
     print("Done!")
+
+    # Stats of what we just landed: file counts / row groups / size / compression, straight off the
+    # Delta log + parquet footers via the connection API. A convertToDelta keeps the generator's own
+    # parquet layout, so this is how you see the row-group shape you inherited.
+    print("\nTPC-H table stats after ingestion (conn.get_stats):")
+    conn.get_stats().show()
     return ingestion
 
 

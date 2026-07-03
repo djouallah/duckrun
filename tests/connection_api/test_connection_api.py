@@ -152,6 +152,19 @@ class TestSession:
         assert set(conn.list_files("listed")) == {"a.csv", "sub/b.parquet"}
         assert conn.list_files("listed", file_extensions=[".csv"]) == ["a.csv"]
 
+    def test_get_stats(self, conn):
+        st = conn.get_stats("src")
+        d = dict(zip(st.columns, st.collect()[0]))
+        assert d["table"] == "src" and d["total_rows"] == 3 and d["num_files"] >= 1
+        assert d["num_row_groups"] >= 1 and d["compression"]  # a real parquet footer was read
+        # source=None → every table in the current schema (dbo has src)
+        allrows = conn.get_stats()
+        assert "src" in {r[allrows.columns.index("table")] for r in allrows.collect()}
+
+    def test_get_stats_detailed(self, conn):
+        st = conn.get_stats("src", detailed=True)  # one row per parquet row group
+        assert st.count() >= 1 and "table" in st.columns
+
 
 class TestCatalog:
     def test_listTables(self, conn):
