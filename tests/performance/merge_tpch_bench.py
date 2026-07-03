@@ -529,6 +529,14 @@ def main():
                          "the heavy SF=10 gate uses.")
     ap.set_defaults(func=run)
     args = ap.parse_args()
+    # --dir is the big disk this bench is meant to run on; the CI runner's / has only ~14 GB free.
+    # delta_rs's merge join and Arrow spill to the process temp dir, which defaults to /tmp on /.
+    # At SF=10 that join exceeds 14 GB and dies with "No space left on device", while --dir has room.
+    # Point the temp dir under --dir so ALL heavy files (data AND spill) land on the same big disk.
+    spill_tmp = os.path.join(args.dir, "tmp")
+    os.makedirs(spill_tmp, exist_ok=True)
+    for _v in ("TMPDIR", "TMP", "TEMP"):
+        os.environ[_v] = spill_tmp
     args.func(args)
 
 
