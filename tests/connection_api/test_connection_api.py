@@ -1921,9 +1921,9 @@ def test_weird_primary_catalog_name(tmp_path, weird):
 
 # ── _get_rle: PRIVATE / experimental (parked) — deliberately OUT of the TestSession scorecard ──
 def test_get_rle_hidden(conn):
-    # VertiPaq byte model on a fact-shaped table: a constant (ndv 1) sorts nothing; a low-card
-    # dimension and its FD-derived twin both enter the sort key (sorting one collapses the other for
-    # free); a unique column can't be compressed by sorting and is left out. `_get_rle` is private.
+    # Byte model on a fact-shaped table: a constant (ndv 1) sorts nothing; a low-card dimension enters
+    # the key; its FD-derived twin does NOT (sorting the dimension already clusters it for free — a key
+    # slot on it is meaningless, R5); a unique column can't be compressed by sorting. `_get_rle` is private.
     conn.sql("select 1 as const, (i%4) as region, (i%4)*10 as rderived, i as uid "
              "from range(1000) t(i)").write.mode("overwrite").saveAsTable("facttbl")
     df = conn._get_rle("facttbl")
@@ -1933,9 +1933,9 @@ def test_get_rle_hidden(conn):
     recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
     assert not recs["const"]["in_sort_key"]        # ndv 1 → nothing to sort
     assert recs["region"]["in_sort_key"]           # low-card dimension compresses
-    assert recs["rderived"]["in_sort_key"]         # FD on region → collapses too
+    assert not recs["rderived"]["in_sort_key"]     # FD on region → already clustered, not a key slot
     assert not recs["uid"]["in_sort_key"]          # unique → sorting can't help
-    assert sorted(r["sort_position"] for r in recs.values() if r["in_sort_key"]) == [1, 2]
+    assert sorted(r["sort_position"] for r in recs.values() if r["in_sort_key"]) == [1]
 
 
 def test_get_rle_hidden_key_organized(conn):
@@ -1960,7 +1960,8 @@ def test_get_rle_hidden_single_table_only(conn):
 def test_get_rle_hidden_date_leads(conn):
     # R6: a moderate-NDV date/temporal column leads the key even though a lower-cardinality flag
     # exists (ndv 30 date ahead of the ndv-3 flag) — natural clustering wins the lead slot.
-    conn.sql("select (date '2024-01-01' + (i % 30)::int) as d, (i % 3) as flag, i as uid "
+    # i%31 and i%3 are coprime → flag is independent of the date (not a functional dependency of it).
+    conn.sql("select (date '2024-01-01' + (i % 31)::int) as d, (i % 3) as flag, i as uid "
              "from range(3000) t(i)").write.mode("overwrite").saveAsTable("dateleads")
     df = conn._get_rle("dateleads")
     recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}

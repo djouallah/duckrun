@@ -1000,10 +1000,10 @@ class DuckSession:
         # a measure is never a key), taken in ASCENDING cardinality — the classic rule, which also
         # respects natural hierarchies: a coarse column (date) leads the finer one nested within it
         # (time), so a currently-free coarse column is never stranded behind a higher-card column for a
-        # marginal byte win. Each column's runs at its position = distinct(prefix incl. it) via
-        # approx_count_distinct (HLL); its own values scatter across every prefix group, so this is >=
-        # ndv (the cap only holds at position 1). Keep adding while the next column still compresses;
-        # once the prefix reaches the grain everything after is shredded, so stop.
+        # marginal byte win. Each column's runs at its position = exact distinct(prefix incl. it); its
+        # own values scatter across every prefix group, so this is >= ndv (the cap only holds at
+        # position 1). Keep adding while the next column still compresses AND actually refines the grain
+        # (R5); once the prefix reaches the grain everything after is shredded, so stop.
         iid_bytes = {c: _col_bytes(c, _iid_runs(c)) for c in cols}
         baseline_total = sum(iid_bytes.values())
         # R6: a non-(near-)unique date/temporal column leads the key even at moderate cardinality —
@@ -1018,18 +1018,31 @@ class DuckSession:
             (c for c in cols if ndv[c] > 1 and not _is_measure(types[c]) and c not in partition_cols),
             key=lambda c: (0 if _lead(c) else 1, ndv[c]))
         sort_key, sorted_runs = [], {}
+        prefix_distinct = 1  # distinct groups of the current (initially empty) prefix
         for c in candidates:
             if len(sort_key) >= sort_key_cap:
                 break
+            # EXACT distinct(prefix + c) — NOT approx_count_distinct. The R5 test below is an equality
+            # of distinct counts, and two independent HLL estimates of the same value disagree by
+            # several percent, so no tolerance band can decide it reliably. One exact COUNT(DISTINCT)
+            # per candidate — a handful of scans for an occasional diagnostic.
             runs = self.con.sql(
-                f"SELECT approx_count_distinct(hash({', '.join(_qid(x) for x in sort_key + [c])})) "
+                f"SELECT COUNT(DISTINCT hash({', '.join(_qid(x) for x in sort_key + [c])})) "
                 f"FROM delta_scan('{plit}')").fetchone()[0]
+            # R5 — functional dependency (the standard test: distinct(X) == distinct(X, c) ⇒ X → c):
+            # if adding c doesn't grow the prefix's distinct count, c is already determined by the
+            # prefix (year ← date, subcategory ← category). It's then clustered for free by sorting the
+            # prefix, so a key slot on it is meaningless — skip it; a later independent column may
+            # still refine the grain.
+            if sort_key and runs <= prefix_distinct:
+                continue
             if iid_bytes[c] - _col_bytes(c, runs) <= baseline_total * (min_gain_pct / 100.0):
                 if _lead(c):
                     continue  # a leading temporal that doesn't actually cluster — skip, keep scanning
                 break         # ascending-cardinality bulk: prefix reached the grain, stop
             sort_key.append(c)
             sorted_runs[c] = runs
+            prefix_distinct = runs
 
         # 5) assemble. "current" uses the table's real present physical order. A column in the key uses
         # its prefix runs; everything else its iid estimate.
