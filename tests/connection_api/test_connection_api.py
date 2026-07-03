@@ -625,6 +625,24 @@ class TestDeltaTable:
         assert metrics["numFilesAdded"] >= 1
         assert conn.table("m").count() == 4
 
+    def test_optimize_experimental_sort(self, conn):
+        # EXPERIMENTAL sort rewrite: profiles the table (_get_rle), rewrites physically ordered by the
+        # recommended key. Data is preserved and the active file comes out clustered by the key.
+        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
+            .write.mode("overwrite").saveAsTable("os")
+        m = DeltaTable.forName(conn, "dbo.os").optimize(sort="experimental")
+        assert m["operation"] == "sortRewrite" and "region" in m["sortedBy"]
+        assert conn.table("os").count() == 20000
+        # active file is clustered: reading it in file order, region is non-decreasing.
+        f = engine._delta_table(conn.root_path + "/dbo/os", None).file_uris()[0].replace("file://", "")
+        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
+        assert regs == sorted(regs)
+
+    def test_optimize_sort_bad_value(self, conn):
+        self._seed(conn)
+        with pytest.raises(ValueError):
+            DeltaTable.forName(conn, "dbo.m").optimize(sort="nope")
+
     def test_vacuum(self, conn):
         # dry_run lists removable files without deleting; never errors on a healthy table.
         self._seed(conn)

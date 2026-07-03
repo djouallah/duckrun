@@ -248,14 +248,51 @@ class DeltaTable:
                              storage_options=self.storage_options)
 
     def optimize(self, zorder_by: Optional[List[str]] = None,
-                 target_size: Optional[int] = None) -> Dict:
+                 target_size: Optional[int] = None, sort: Optional[str] = None) -> Dict:
         """Compact small files (delta-spark ``DeltaTable.optimize``), returning the operation
-        metrics. Pass ``zorder_by`` to Z-order on those columns instead of a plain compaction."""
+        metrics. Pass ``zorder_by`` to Z-order on those columns instead of a plain compaction.
+
+        ``sort='experimental'`` (EXPERIMENTAL) instead does a **sort rewrite**: it profiles this table
+        with the ``_get_rle`` model to pick a run-length-friendly sort key and rewrites every file
+        physically ordered by ``(partition columns…, key…)``. This is a full rewrite (read → ORDER BY
+        → overwrite with the tuned writer properties), not a bin-packing compaction, so it's only
+        worth running occasionally. If no key pays off it falls back to a plain compaction."""
         self._session._require_writable("optimize", self._catalog)
-        metrics = engine.optimize(self.path, zorder_by=zorder_by, target_size=target_size,
-                                  storage_options=self.storage_options)
+        if sort is not None:
+            if sort != "experimental":
+                raise ValueError("optimize(sort=...) only supports 'experimental'.")
+            metrics = self._optimize_experimental_sort()
+        else:
+            metrics = engine.optimize(self.path, zorder_by=zorder_by, target_size=target_size,
+                                      storage_options=self.storage_options)
         self._refresh_view()
         return metrics
+
+    def _optimize_experimental_sort(self) -> Dict:
+        """Sort-rewrite this table by the ``_get_rle`` recommended key. forName only (needs a catalog
+        table to profile). Partition columns lead the physical order and are preserved as partitions."""
+        if self._table is None:
+            raise ValueError("optimize(sort='experimental') needs a catalog table — use forName, not forPath.")
+        name = self._table if self._schema is None else f"{self._schema}.{self._table}"
+        recs = [dict(zip(rle.columns, r)) for rle in [self._session._get_rle(name)] for r in rle.collect()]
+        key = [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
+                                           key=lambda x: x["sort_position"])]
+        try:
+            pcols = list(engine._delta_table(self.path, self.storage_options)
+                         .metadata().partition_columns or [])
+        except Exception:
+            pcols = []
+        order_cols = pcols + [c for c in key if c not in pcols]
+        if not order_cols:  # nothing to sort → fall back to a plain bin-packing compaction
+            return engine.optimize(self.path, storage_options=self.storage_options)
+        plit = self.path.replace("'", "''")
+        order_expr = ", ".join('"' + c.replace('"', '""') + '"' for c in order_cols)
+        rel = self._session.con.sql(f"SELECT * FROM delta_scan('{plit}') ORDER BY {order_expr}")
+        engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
+                           storage_options=self.storage_options,
+                           compaction_threshold=self.compaction_threshold)
+        self._resnapshot()
+        return {"operation": "sortRewrite", "sortedBy": order_cols}
 
     def restoreToVersion(self, version: int) -> None:
         """Restore the table to an earlier Delta ``version`` (delta-spark ``DeltaTable.restoreToVersion``).
