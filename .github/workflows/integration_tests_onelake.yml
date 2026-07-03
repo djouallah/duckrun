@@ -200,9 +200,11 @@ jobs:
           TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Run the MERGE chain against OneLake (small scale factor)
-        # --warehouse abfss://… routes the whole chain to OneLake; --sf 1 keeps the fact small
-        # (network-bound, not a memory test). DBT_SCHEMA isolates it from aemo.
+      - name: Run the MERGE chain against OneLake (tiny scale factor)
+        # --warehouse abfss://… routes the whole chain to OneLake; this job only exercises the abfss://
+        # MERGE write/read path, NOT memory — the heavy SF=10 spill gate runs locally
+        # (local_stress_tests.yml). So keep the fact tiny (--sf 0.1) to cut the OneLake round-trip time.
+        # DBT_SCHEMA isolates it from aemo.
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DBT_SCHEMA: merge_spill_it
@@ -210,7 +212,7 @@ jobs:
           python tests/performance/merge_tpch_bench.py
           --dir /tmp/merge_onelake
           --warehouse "$WAREHOUSE_PATH"
-          --sf 1
+          --sf 0.1
 
   coffee:
     # The coffee-shop project: build the dbt models DIRECTLY on OneLake (the same
