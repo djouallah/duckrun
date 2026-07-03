@@ -159,8 +159,8 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌───────────────────────────┐
-│ ✅ 90 passed   ❌ 0 failed  │
-│ 90 methods · 100% passing │
+│ ✅ 92 passed   ❌ 0 failed  │
+│ 92 methods · 100% passing │
 └───────────────────────────┘
 ```
 
@@ -177,7 +177,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 10/10 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `vacuum`, `restoreToVersion` | 11/11 ✅ |
 
-### duckrun-specific helpers — 24/24 ✅
+### duckrun-specific helpers — 26/26 ✅
 
 > Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).
 
@@ -195,6 +195,8 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `list_files` | `DuckSession` | ✅ |
 | `get_stats` | `DuckSession` | ✅ |
 | `get_stats_detailed` | `DuckSession` | ✅ |
+| `get_rle` | `DuckSession` | ✅ |
+| `get_rle_single_table_only` | `DuckSession` | ✅ |
 | `__getattr__` | `DataFrame` | ✅ |
 | `SELECT (passthrough)` | `sql()` | ✅ |
 | `version-pinned read` | `sql()` | ✅ |
