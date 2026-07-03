@@ -46,9 +46,12 @@ _MAX_ROW_GROUP_SIZE = 1_048_576 * 6
 _DICT_PAGE_SIZE_LIMIT = 256 * 1024 * 1024
 # Bigger data pages → fewer page headers and runs that survive page boundaries.
 _DATA_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
-# Approximate target file size (~1 GB). delta-rs has no ROW_GROUPS_PER_FILE knob; this is the only
-# lever, and it keeps Direct Lake off the many-small-files cliff (1–2 fat row groups per file).
-_TARGET_FILE_SIZE = 1024 * 1024 * 1024
+# Approximate target file size (128 MB). File rolling is by target_file_size (bytes); the row-group
+# size is set separately by max_row_group_size (rows) above. Kept small, NOT 1 GB: an append/overwrite
+# writes these files, but an incremental MERGE then rewrites whole files for scattered updates — 1 GB
+# files made the SF=10 merge spill the uncompressed rewrite past the runner's disk. 128 MB is a
+# standard Parquet/Direct Lake file size.
+_TARGET_FILE_SIZE = 128 * 1024 * 1024
 
 
 def _writer_properties():
