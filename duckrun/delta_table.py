@@ -277,6 +277,9 @@ class DeltaTable:
         recs = [dict(zip(rle.columns, r)) for rle in [self._session._get_rle(name)] for r in rle.collect()]
         key = [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
                                            key=lambda x: x["sort_position"])]
+        # A unique / near-unique column (ndv >= 0.9*n) gains nothing from a dictionary — every value is
+        # distinct, so the dictionary just re-stores the whole column plus an index. Write those PLAIN.
+        plain_cols = [r["column"] for r in recs if r.get("is_unique")]
         try:
             pcols = list(engine._delta_table(self.path, self.storage_options)
                          .metadata().partition_columns or [])
@@ -294,10 +297,11 @@ class DeltaTable:
         rel = con.sql(f"SELECT * FROM delta_scan('{plit}') ORDER BY {order_expr}")
         # optimize_layout=True: this experimental sort-rewrite is the ONE path that writes the tuned
         # Direct Lake read layout (aggressive writer properties + ~1 GB files). Normal writes don't.
+        # plain_cols disables the (useless) dictionary on the unique columns.
         engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
                            storage_options=self.storage_options,
                            compaction_threshold=self.compaction_threshold,
-                           optimize_layout=True)
+                           optimize_layout=True, plain_cols=plain_cols)
         self._resnapshot()
         _, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
         saved = round(100.0 * (before - after) / before, 1) if before else 0.0

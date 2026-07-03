@@ -1939,14 +1939,18 @@ def test_get_rle_hidden(conn):
              "from range(1000) t(i)").write.mode("overwrite").saveAsTable("facttbl")
     df = conn._get_rle("facttbl")
     assert df.columns == ["table", "in_sort_key", "sort_position", "column", "data_type", "encoding",
-                          "ndv", "skew_pct", "current_runs", "est_kb_current", "est_kb_sorted",
-                          "saved_pct"]
+                          "ndv", "skew_pct", "current_runs", "is_unique", "est_kb_current",
+                          "est_kb_sorted", "saved_pct"]
     recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
     assert not recs["const"]["in_sort_key"]        # ndv 1 → nothing to sort
     assert recs["region"]["in_sort_key"]           # low-card dimension compresses
     assert not recs["rderived"]["in_sort_key"]     # FD on region → already clustered, not a key slot
     assert not recs["uid"]["in_sort_key"]          # unique → sorting can't help
     assert sorted(r["sort_position"] for r in recs.values() if r["in_sort_key"]) == [1]
+    # is_unique drives the PLAIN (no-dictionary) decision on the experimental optimize write path:
+    # only the unique column is flagged, low-card / constant columns keep their (useful) dictionary.
+    assert recs["uid"]["is_unique"]
+    assert not recs["region"]["is_unique"] and not recs["const"]["is_unique"]
 
 
 def test_get_rle_hidden_key_organized(conn):

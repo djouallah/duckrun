@@ -34,11 +34,14 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# Row group ~= one Power BI / Direct Lake segment: 6 × delta-rs's 1,048,576 default = ~6M rows, the
-# current Power BI segment standard. Bigger row groups give fewer, larger segments at the cost of
-# more write-time memory (arrow-rs buffers a full row group per open writer). delta-rs enforces this
-# (a row group flushes once accumulated rows cross the cap); the exact value needn't be aligned.
-_MAX_ROW_GROUP_SIZE = 1_048_576 * 6
+# Normal-write row group: 4M rows. Bigger row groups give fewer, larger scan ranges at the cost of
+# more write-time memory (arrow-rs buffers a full row group per open writer). Kept moderate on the hot
+# write paths; the experimental optimize uses the larger segment below.
+_MAX_ROW_GROUP_SIZE = 1_048_576 * 4
+# Optimize (experimental sort-rewrite) row group: 8 × 1,048,576 = 8,388,608 rows = one Power BI /
+# Direct Lake segment. A read-layout pass wants full segments; the extra write-time memory is
+# acceptable on an opt-in path.
+_OPTIMIZE_ROW_GROUP_SIZE = 1_048_576 * 8
 # Bounded-but-large dictionary page limit (256 MB). arrow-rs's ~1 MB default silently falls back
 # to PLAIN mid column chunk on wide columns at multi-million rows/group, defeating the dictionary
 # encoding Direct Lake transcodes into its hash encoding. 256 MB holds any dictionary worth having
@@ -72,28 +75,38 @@ def _writer_properties():
     return None
 
 
-def _tuned_writer_properties():
+def _tuned_writer_properties(plain_cols=None):
     # Aggressive Parquet config for the Direct Lake read layout: ZSTD(3), large row groups, a
     # bounded-but-large dictionary page limit so wide dictionaries stay dictionary-encoded, big data
     # pages, and chunk-level stats. Used ONLY by the experimental sort-rewrite (optimize_layout=True) —
     # deliberately kept off the hot write paths, where it made merges rewrite/spill fat files. Degrade
     # gracefully if the pinned wheel rejects a newer parameter (last rung: ZSTD-only).
+    #
+    # ``plain_cols`` are unique/near-unique columns whose dictionary buys nothing (every value distinct);
+    # they get a per-column ColumnProperties(dictionary_enabled=False) so arrow-rs writes them PLAIN.
     if WriterProperties is None:
         return None
     col_props = None
+    per_col = None
     if ColumnProperties is not None:
         try:
             col_props = ColumnProperties(dictionary_enabled=True, statistics_enabled="CHUNK")
         except Exception:  # best-effort: fall through to writer-level props without per-column knobs
             col_props = None
+        if plain_cols:
+            try:
+                per_col = {c: ColumnProperties(dictionary_enabled=False) for c in plain_cols}
+            except Exception:  # best-effort: a rejected per-column build just keeps the dictionary on
+                per_col = None
     for kwargs in (
         dict(compression="ZSTD", compression_level=3,
-             max_row_group_size=_MAX_ROW_GROUP_SIZE,
+             max_row_group_size=_OPTIMIZE_ROW_GROUP_SIZE,
              dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
              statistics_truncate_length=64,
-             default_column_properties=col_props),
-        dict(compression="ZSTD", compression_level=3, max_row_group_size=_MAX_ROW_GROUP_SIZE),
+             default_column_properties=col_props,
+             column_properties=per_col),
+        dict(compression="ZSTD", compression_level=3, max_row_group_size=_OPTIMIZE_ROW_GROUP_SIZE),
         dict(compression="ZSTD"),
     ):
         try:
@@ -566,13 +579,15 @@ def build_write_deltalake_args(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     optimize_layout: bool = False,
+    plain_cols: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
     ``optimize_layout`` selects the Direct Lake read layout — the aggressive tuned writer properties
     plus the ~1 GB ``target_file_size``. It is opt-in and used only by the experimental sort-rewrite;
     every normal write leaves it False and gets plain ZSTD + row groups with delta-rs's default file
-    size (so an incremental MERGE never has to rewrite fat files)."""
+    size (so an incremental MERGE never has to rewrite fat files). ``plain_cols`` (optimize_layout only)
+    are unique columns written PLAIN — no dictionary."""
     args: Dict[str, Any] = {
         "table_or_uri": path,
         "data": data,
@@ -588,7 +603,7 @@ def build_write_deltalake_args(
         args["schema_mode"] = schema_mode
     if optimize_layout:
         args["target_file_size"] = _TARGET_FILE_SIZE
-        wp = _tuned_writer_properties()
+        wp = _tuned_writer_properties(plain_cols=plain_cols)
     else:
         wp = _writer_properties()
     if wp is not None:
@@ -817,6 +832,7 @@ def write_delta(
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
     optimize_layout: bool = False,
+    plain_cols: Optional[List[str]] = None,
 ) -> None:
     """
     Materialize ``data`` (a DuckDB relation / Arrow C-stream) to Delta and maintain it.
@@ -852,6 +868,7 @@ def write_delta(
         partition_by=partition_by,
         storage_options=storage_options,
         optimize_layout=optimize_layout,
+        plain_cols=plain_cols,
     )
     write_deltalake(**args)
 

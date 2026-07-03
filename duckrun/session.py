@@ -1120,15 +1120,16 @@ class DuckSession:
             print(f"  (measures — not sortable; cut precision / split to shrink: {', '.join(heavy_measures)})")
 
         rest = sorted((c for c in cols if c not in pos), key=lambda c: -est_current[c])
+        unique_set = set(unique_cols)  # ndv >= 0.9*n (non-partition) — a dictionary buys nothing here
         rows = [(f"{sch}.{tbl}", c in pos, pos.get(c, 0), c, types[c], _encoding(types[c]), ndv[c],
-                 round(100.0 * simpson[c], 2), current_runs[c], _kb(est_current[c]),
+                 round(100.0 * simpson[c], 2), current_runs[c], c in unique_set, _kb(est_current[c]),
                  _kb(est_sorted[c]), _saved(est_current[c], est_sorted[c]))
                 for c in sort_key + rest]
         return self.createDataFrame(
             rows,
             "table string, in_sort_key boolean, sort_position int, column string, data_type string, "
-            "encoding string, ndv bigint, skew_pct double, current_runs bigint, est_kb_current double, "
-            "est_kb_sorted double, saved_pct double")
+            "encoding string, ndv bigint, skew_pct double, current_runs bigint, is_unique boolean, "
+            "est_kb_current double, est_kb_sorted double, saved_pct double")
 
     def _enumerate_remote(self, base: str, exts) -> List[tuple]:
         """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
