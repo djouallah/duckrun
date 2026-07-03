@@ -856,6 +856,86 @@ class DuckSession:
             f"get_stats: '{source}' is neither a known table nor a schema in catalog "
             f"'{self._current_catalog}'.")
 
+    def get_rle(self, table: str) -> "DataFrame":
+        """Recommend the ideal Delta **sort-key column order** for one table, to cut run-length
+        encoding runs (smaller files, faster scans). Returns a :class:`DataFrame`.
+
+        Under a lexicographic sort by ``(c1,…,ck)`` each column ``ci`` is piecewise-constant, so its
+        RLE runs equal the number of distinct ``(c1,…,ci)`` prefixes and the table's total runs are
+        ``Σ |distinct(c1..ci)|``. This greedily builds the column order that minimises that sum from
+        the columns' **measured** joint distinctness — so it exploits real correlations / functional
+        dependencies (a column the prefix already determines adds ~0 runs) that the textbook
+        "order by ascending cardinality" rule misses. The greedy ranks candidates with
+        ``approx_count_distinct`` (HLL — scales to big tables); the reported projection is exact.
+
+        One row per column in the recommended order: ``table, sort_position, column, ndv,
+        current_runs, current_run_pct, projected_runs, projected_run_pct`` (``current`` = the table's
+        present physical order). Also prints the recommended ``ORDER BY`` and the total run reduction.
+        **Single table only** — a schema name / ``None`` raises."""
+        if not isinstance(table, str) or not table.strip():
+            raise ValueError("get_rle is single-table; pass one table name, e.g. conn.get_rle('sales').")
+        if not self.catalog.tableExists(table):
+            if "." not in table and self.catalog.databaseExists(table):
+                raise ValueError(f"get_rle is single-table; '{table}' is a schema — pass one table.")
+            raise ValueError(f"get_rle: table '{table}' not found.")
+        cat, sch, tbl = self._resolve(table)
+        plit = _qlit(f"{self._catalogs[cat].root_path}/{sch}/{tbl}")
+        cols = [r[0] for r in self.con.sql(f"DESCRIBE SELECT * FROM delta_scan('{plit}')").fetchall()]
+        if not cols:
+            raise ValueError(f"get_rle: table '{table}' has no columns.")
+
+        # 1) current physical-order runs + ndv per column, one pass. Physical order = (filename,
+        # file_row_number); a run starts on row 1 or wherever the value changes (IS DISTINCT FROM
+        # treats NULL↔NULL as equal, so the explicit row-1 start avoids undercounting a leading NULL).
+        lag_sel = ", ".join(
+            f"{_qid(c)}, lag({_qid(c)}) OVER w AS {_qid('__lag_' + str(i))}"
+            for i, c in enumerate(cols))
+        agg_sel = ", ".join(
+            f"SUM(CASE WHEN __rn = 1 OR {_qid(c)} IS DISTINCT FROM {_qid('__lag_' + str(i))} "
+            f"THEN 1 ELSE 0 END) AS r{i}, COUNT(DISTINCT {_qid(c)}) AS n{i}"
+            for i, c in enumerate(cols))
+        row = self.con.sql(
+            f"SELECT {agg_sel}, COUNT(*) AS total FROM ("
+            f"SELECT row_number() OVER w AS __rn, {lag_sel} "
+            f"FROM delta_scan('{plit}', filename=1, file_row_number=1) "
+            f"WINDOW w AS (ORDER BY filename, file_row_number))").fetchone()
+        total_rows = row[-1]
+        current = {c: row[2 * i] for i, c in enumerate(cols)}
+        ndv = {c: row[2 * i + 1] for i, c in enumerate(cols)}
+
+        # 2) greedy: at each position add the column minimising the distinct-prefix count so far,
+        # ranked fast with approx_count_distinct(hash(prefix…, cand)); ties → lower ndv.
+        remaining, order = list(cols), []
+        while remaining:
+            cand_sel = ", ".join(
+                f"approx_count_distinct(hash({', '.join(_qid(c) for c in order + [cand])})) AS c{j}"
+                for j, cand in enumerate(remaining))
+            est = self.con.sql(f"SELECT {cand_sel} FROM delta_scan('{plit}')").fetchone()
+            best = min(range(len(remaining)), key=lambda j: (est[j], ndv[remaining[j]]))
+            order.append(remaining.pop(best))
+
+        # 3) exact projected runs per column at its position in the recommended order
+        proj_sel = ", ".join(
+            f"COUNT(DISTINCT ({', '.join(_qid(c) for c in order[:i + 1])})) AS p{i}"
+            for i in range(len(order)))
+        proj = self.con.sql(f"SELECT {proj_sel} FROM delta_scan('{plit}')").fetchone()
+        projected = {order[i]: proj[i] for i in range(len(order))}
+
+        cur_total, proj_total = sum(current.values()), sum(projected.values())
+        pct = round(100.0 * (cur_total - proj_total) / cur_total, 1) if cur_total else 0.0
+        print(f"\nget_rle('{sch}.{tbl}') — recommended sort key:")
+        print(f"  ORDER BY {', '.join(order)}")
+        print(f"  total RLE runs: {cur_total:,} (current) -> {proj_total:,} (sorted)  ~{pct}% fewer")
+
+        def _p(x):
+            return round(100.0 * x / total_rows, 2) if total_rows else 0.0
+        rows = [(f"{sch}.{tbl}", pos + 1, c, ndv[c], current[c], _p(current[c]),
+                 projected[c], _p(projected[c])) for pos, c in enumerate(order)]
+        return self.createDataFrame(
+            rows,
+            "table string, sort_position int, column string, ndv bigint, current_runs bigint, "
+            "current_run_pct double, projected_runs bigint, projected_run_pct double")
+
     def _enumerate_remote(self, base: str, exts) -> List[tuple]:
         """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
         relative_path)`` pairs honouring the extension filter. Shared by ``list_files``/``download``."""

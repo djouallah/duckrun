@@ -165,6 +165,28 @@ class TestSession:
         st = conn.get_stats("src", detailed=True)  # one row per parquet row group
         assert st.count() >= 1 and "table" in st.columns
 
+    def test_get_rle(self, conn):
+        # region (ndv 4) plus rderived = region*10 (functionally determined by region). The greedy
+        # sort-order optimiser must exploit that dependency: putting rderived right after region adds
+        # zero new distinct prefixes, so its projected runs stay at region's cardinality (4), not 16.
+        conn.sql("select (i%4) as region, (i%4)*10 as rderived, i as uid from range(1000) t(i)") \
+            .write.mode("overwrite").saveAsTable("rletbl")
+        df = conn.get_rle("rletbl")
+        recs = [dict(zip(df.columns, r)) for r in df.collect()]
+        assert sorted(r["sort_position"] for r in recs) == [1, 2, 3]      # a permutation
+        assert sum(r["projected_runs"] for r in recs) < sum(r["current_runs"] for r in recs)
+        # region & rderived are interchangeable (rderived determines region) → both lead, and the
+        # second one adds ZERO new distinct prefixes, so BOTH project to 4 runs, not 4*4=16.
+        assert {r["column"] for r in recs if r["sort_position"] in (1, 2)} == {"region", "rderived"}
+        assert all(r["projected_runs"] == 4 for r in recs if r["column"] in ("region", "rderived"))
+        assert next(r for r in recs if r["sort_position"] == 3)["column"] == "uid"  # high-card last
+
+    def test_get_rle_single_table_only(self, conn):
+        with pytest.raises(ValueError):
+            conn.get_rle("dbo")   # a schema, not a table
+        with pytest.raises(ValueError):
+            conn.get_rle(None)    # None → not single-table
+
 
 class TestCatalog:
     def test_listTables(self, conn):
