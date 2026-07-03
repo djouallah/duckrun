@@ -144,14 +144,23 @@ _DELETE = re.compile(
 # (delta_datafusion/expr.rs), so duckrun can't hand them to dt.delete(); see _delete for the DuckDB-
 # evaluated filtered-overwrite fallback. Plain column-vs-constant/expr predicates don't match.
 _PREDICATE_SUBQUERY = re.compile(r"\(\s*select\b", re.I)
+# Capture only the relation and the whole post-SET body; the SET/WHERE boundary is located
+# structurally in _update via _find_top_level (_TOP_WHERE), NOT by regex — a string literal in the
+# SET list that contains the word `where` (`set note = 'apply where needed'`) would otherwise
+# mis-split the statement. (Same class of bug already fixed for the MERGE THEN boundary.)
 _UPDATE = re.compile(
-    r"\s*update\s+(?P<rel>.+?)\s+set\s+(?P<set>.+?)(?:\s+where\s+(?P<where>.+?))?\s*;?\s*",
+    r"\s*update\s+(?P<rel>.+?)\s+set\s+(?P<body>.+?)\s*;?\s*",
     re.I | re.S,
 )
+_TOP_WHERE = re.compile(r"\bwhere\b", re.I)
 _ALTER_ADD = re.compile(
     r"\s*alter\s+table\s+(?P<rel>.+?)\s+add\s+column\s+(?P<col>\S+)\s+(?P<def>.+?)\s*;?\s*",
     re.I | re.S,
 )
+# Trailing column-definition clauses (DEFAULT / NOT NULL / NULL), located structurally in _alter_add
+# so a string DEFAULT containing one of these words doesn't truncate the column type. Leading \b is
+# load-bearing: _find_top_level probes every depth-0 index, so it must not match mid-identifier.
+_ALTER_TAIL = re.compile(r"\b(?:default|not\s+null|null)\b", re.I)
 _DROP = re.compile(
     r"\s*drop\s+table\s+(?:if\s+exists\s+)?(?P<rel>[^\s;]+)\s*;?\s*", re.I | re.S
 )
@@ -206,24 +215,13 @@ _NUMERIC_TYPE_RE = re.compile(
 # EXACT targets (e.g. 3.9 -> INTEGER lands 4). See _reject_lossy_numeric_narrowing.
 _APPROX_FLOAT_RE = re.compile(r"^(?:FLOAT|REAL|DOUBLE|FLOAT4|FLOAT8)\b", re.I)
 
-# PostgreSQL/DuckDB dollar-quoting: ``$tag$ … $tag$`` (the tag is optional, so ``$$ … $$`` too). The
-# body is OPAQUE — no escaping — so a ``;``, a ``'``/``"`` quote, or a ``--``/``/* */`` marker inside
-# it is literal text, NOT a structural token. Every quote/paren-aware scanner here must skip a
-# dollar-quoted run wholesale; otherwise dbt's persist_docs `COMMENT ON … IS
-# $dbt_comment_literal_block$ …text with "quotes"; and ';'… $dbt_comment_literal_block$` (a comment
-# body carrying embedded quotes/semicolons) is mis-split into fragments with an unterminated $-quote.
-_DOLLAR_OPEN = re.compile(r"\$(?:[A-Za-z_][A-Za-z0-9_]*)?\$")
-
-
-def _dollar_quote_end(s: str, i: int) -> Optional[int]:
-    """If a dollar-quote opens at ``s[i]`` (``$$`` or ``$tag$``), return the index just past its
-    matching close; else None (not a dollar-quote, or no close found — leave it to normal scanning)."""
-    m = _DOLLAR_OPEN.match(s, i)
-    if not m:
-        return None
-    delim = m.group(0)
-    close = s.find(delim, m.end())
-    return close + len(delim) if close != -1 else None
+# Dollar-quoting primitives (``$tag$ … $tag$``) live in the shared scanner module now, re-exported
+# here so this module's scanners and session.py keep importing them from delta_dml. The body is
+# OPAQUE — a ``;``, a quote, or a ``--``/``/* */`` marker inside it is literal text, not a structural
+# token — so every quote/paren-aware scanner here skips a dollar-quoted run wholesale; otherwise
+# dbt's persist_docs `COMMENT ON … IS $dbt_comment_literal_block$ …text with "quotes"; and ';'…
+# $dbt_comment_literal_block$` is mis-split into fragments with an unterminated $-quote.
+from .sqlscan import _DOLLAR_OPEN, _dollar_quote_end  # noqa: F401  (re-exported)
 
 
 def _strip_leading(query: str) -> str:
@@ -846,14 +844,22 @@ class _DeltaDML:
         )
 
     def _update(self, m, rel, schema, loc) -> None:
+        # Split SET / WHERE structurally (quote/paren/CASE-aware) so a literal containing `where`
+        # can't cut the statement in the wrong place.
+        body = m.group("body")
+        widx = _find_top_level(body, _TOP_WHERE)
+        if widx == -1:
+            set_clause, where = body, None
+        else:
+            set_clause = body[:widx]
+            where = body[widx + len("where"):].strip().rstrip(";").strip() or None
         updates = {}
-        for assign in _split_top_level_commas(m.group("set")):
+        for assign in _split_top_level_commas(set_clause):
             col, _, expr = assign.partition("=")
             updates[col.strip().strip('"')] = expr.strip()
-        where = m.group("where")
         # Same snapshot-fenced path as DeltaTable.forName(...).update() — SQL == DataFrame.
         engine.update_rows(
-            loc, updates, where.strip() if where else None,
+            loc, updates, where,
             read_version=engine.table_version(loc, self.so),
             storage_options=self.so,
         )
@@ -953,11 +959,13 @@ class _DeltaDML:
         col = m.group("col").strip().strip('"')
         # Keep only the column type (drop any trailing DEFAULT / NOT NULL / NULL clause); add it as
         # an all-null column by rewriting the table with overwrite_schema so delta_rs accepts the
-        # widened schema. `not null` must be matched before a bare `null`, else the `\s+null\b`
-        # alternative eats only the ` null` and leaves `... not` glued onto the type.
-        coltype = re.split(
-            r"\s+default\b|\s+not\s+null\b|\s+null\b", m.group("def"), flags=re.I
-        )[0].strip() or "VARCHAR"
+        # widened schema. Locate the DEFAULT/NOT NULL/NULL boundary structurally (quote/paren-aware
+        # via _find_top_level), NOT by a quote-blind re.split — a string DEFAULT containing ` not null`
+        # (`default 'not null'`) would otherwise truncate the type. Scanning left-to-right, the first
+        # top-level tail keyword is hit before its own `null`, so `not null` is handled correctly.
+        deftext = m.group("def")
+        tidx = _find_top_level(deftext, _ALTER_TAIL)
+        coltype = (deftext if tidx == -1 else deftext[:tidx]).strip() or "VARCHAR"
         loc_sql = loc.replace("'", "''")
         data = self.cursor.sql(
             f'select *, cast(null as {coltype}) as "{col}" from delta_scan(\'{loc_sql}\')'

@@ -6,6 +6,7 @@ Pure-Python unit tests for the small, self-contained fixes — the ones that don
 import duckdb
 import pytest
 
+from dbt.adapters.duckrun import delta_dml, sqlscan
 from dbt.adapters.duckrun.credentials import DuckrunCredentials
 from dbt.adapters.duckrun.delta_plugin import Plugin
 from duckrun.session import _is_multi_statement
@@ -101,6 +102,54 @@ def test_refresh_never_reaches_interactive_browser(monkeypatch):
     monkeypatch.setattr(auth, "_azure_identity_token", fake_identity)
     assert auth.refresh_storage_token() == "tok"
     assert seen["interactive"] is False
+
+
+# ------------------------------------------------------- #4 quote-aware predicate rewriting
+
+def test_qualify_predicate_leaves_string_literal_untouched():
+    # A column name inside a string literal must NOT be qualified.
+    got = Plugin._qualify_predicate("status != 'archived status'", ["status"])
+    assert got == "target.status != 'archived status'"
+
+
+def test_qualify_predicate_skips_qualified_and_functions():
+    assert Plugin._qualify_predicate("x.status = 1", ["status"]) == "x.status = 1"
+    assert Plugin._qualify_predicate("current_date > id", ["id"]) == "current_date > target.id"
+
+
+def test_delete_insert_predicates_strip_is_quote_aware():
+    got = Plugin._delete_insert_predicates(
+        ["DBT_INTERNAL_DEST.id = 1 and note = 'DBT_INTERNAL_DEST.x'"]
+    )
+    assert got == ["id = 1 and note = 'DBT_INTERNAL_DEST.x'"]
+
+
+def test_dollar_quote_reexport_is_shared():
+    assert delta_dml._dollar_quote_end is sqlscan._dollar_quote_end
+
+
+# ------------------------------------------------------- #5 structural UPDATE / ALTER splits
+
+def test_update_where_inside_set_literal_not_missplit():
+    sql = "update t set note = 'apply where needed', qty = 2 where id = 1"
+    m = delta_dml._fullmatch(delta_dml._UPDATE, sql)
+    body = m.group("body")
+    w = delta_dml._find_top_level(body, delta_dml._TOP_WHERE)
+    set_clause, where = body[:w], body[w + len("where"):].strip()
+    assert where == "id = 1"
+    assert "'apply where needed'" in set_clause
+
+
+@pytest.mark.parametrize("coldef, expected", [
+    ("varchar default 'not null'", "varchar"),   # 'not null' is a literal, not a NOT NULL clause
+    ("integer not null", "integer"),
+    ("varchar null", "varchar"),
+    ("decimal(10,2)", "decimal(10,2)"),          # no tail; parens don't confuse the scanner
+])
+def test_alter_add_type_split_is_quote_aware(coldef, expected):
+    t = delta_dml._find_top_level(coldef, delta_dml._ALTER_TAIL)
+    got = (coldef if t == -1 else coldef[:t]).strip()
+    assert got == expected
 
 
 def test_identity_token_no_browser_without_tty(monkeypatch):

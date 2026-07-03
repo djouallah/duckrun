@@ -15,6 +15,7 @@ from dbt.adapters.duckdb.utils import SourceConfig, TargetConfig
 
 from . import engine
 from . import secret
+from . import sqlscan
 
 try:  # raise on_schema_change='fail' as a dbt compilation error (matches dbt semantics)
     from dbt_common.exceptions import CompilationError
@@ -472,14 +473,17 @@ class Plugin(BasePlugin):
     def _delete_insert_predicates(incremental_predicates) -> list:
         """Normalize ``incremental_predicates`` (a list of SQL strings, or one string) to target-side
         predicates for the delta_rs DELETE — dropping dbt's ``DBT_INTERNAL_DEST`` alias, since the
-        delete runs against the target table directly."""
+        delete runs against the target table directly.
+
+        The alias strip is quote-aware (via ``sqlscan``) so a ``DBT_INTERNAL_DEST.`` appearing inside
+        a string literal is not removed."""
         if not incremental_predicates:
             return []
         preds = (incremental_predicates if isinstance(incremental_predicates, (list, tuple))
                  else [incremental_predicates])
         out = []
         for p in preds:
-            p = re.sub(r"(?i)\bDBT_INTERNAL_DEST\.", "", str(p).strip())
+            p = sqlscan.strip_qualifier(str(p).strip(), "DBT_INTERNAL_DEST")
             if p:
                 out.append(p)
         return out
@@ -684,15 +688,11 @@ class Plugin(BasePlugin):
         ``incremental_predicates`` constrain the existing/target rows (the delete+insert delete, the
         merge ON), so we qualify bare column tokens to ``target.``. Only exact column-name tokens
         that aren't already qualified (preceded by ``.``) or quoted/literal are rewritten — literals
-        and functions (e.g. ``current_date``, which is not a column) are left untouched."""
-        if not expr or not columns:
-            return expr
-        # Longest names first so a column that's a prefix of another isn't partially matched.
-        for col in sorted({str(c) for c in columns}, key=len, reverse=True):
-            # whole-word col, not preceded by '.', a word char, or a quote (already qualified/quoted).
-            pattern = re.compile(r'(?<![.\w"\'])' + re.escape(col) + r'\b', re.I)
-            expr = pattern.sub(lambda m: "target." + m.group(0), expr)
-        return expr
+        and functions (e.g. ``current_date``, which is not a column) are left untouched.
+
+        Quote-aware (via ``sqlscan``) rather than a regex over the raw text: a regex would rewrite a
+        column name that appears *inside* a string literal (``'archived status'`` -> corrupted)."""
+        return sqlscan.qualify_identifiers(expr, columns, prefix="target")
 
     @classmethod
     def _merge_predicates(cls, cfg: dict, columns=None):
