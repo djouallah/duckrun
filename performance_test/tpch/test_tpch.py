@@ -7,11 +7,10 @@ Ported from the Fabric/OneLake multi-engine notebook. Differences:
   * One engine only — duckrun (DuckDB over delta-rs). The chdb/polars/lakesail
     branches are gone; there is nothing to compare against locally.
   * Local storage — data and results live under a local folder, no abfss/OneLake.
-  * Ingestion registers the generated parquet as Delta IN PLACE with
-    ``DeltaTable.convertToDelta`` (delta-rs ``convert_to_deltalake``) — a zero-copy convert that
-    writes only the ``_delta_log``; the parquet is never rewritten. (We measured the alternatives —
-    rewriting sorted with fine row groups, or a native DuckDB file — and zero-rewrite convert was the
-    cheapest to load and the fastest to query, so it's the only arm kept.)
+  * Ingestion lands the generated parquet as Delta through the duckrun **write** path
+    (``conn.read.parquet(...).write.saveAsTable``), so the benchmark exercises the writer (the
+    read-layout profile) AND the DuckDB read side of the 22 queries — a real-world write+read test,
+    not a zero-copy ``convert_to_deltalake`` that only writes the ``_delta_log``.
   * Results are saved with the duckrun DataFrame API (createDataFrame + saveAsTable),
     not pandas write_deltalake.
 
@@ -22,6 +21,7 @@ file directly to drive it by hand:
     TPCH_SF=10 python performance_test/tpch/test_tpch.py
 """
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +30,6 @@ from datetime import datetime
 from pathlib import Path
 
 import duckrun
-from duckrun import DeltaTable
 
 # The scenario (and session.refresh) print Unicode; force utf-8 so a Windows cp1252 console doesn't
 # crash on it when watching the run with `pytest -s`.
@@ -751,43 +750,48 @@ def _execute_queries(conn, sql_script):
 
 
 def _generate_tables(conn, sf, schema):
-    """Generate TPCH parquet with tpchgen-cli (one ``--parts`` subdirectory per table) directly under
-    the schema root, then register each as Delta IN PLACE with ``DeltaTable.convertToDelta`` — a
-    zero-copy convert (writes only the ``_delta_log``; the parquet is never rewritten). One-time —
-    skipped when the tables already exist.
+    """Generate TPCH parquet with tpchgen-cli (one ``--parts`` subdirectory per table) into a scratch
+    dir, then land each table as Delta through the duckrun **write** path
+    (``conn.read.parquet(...).write.saveAsTable``). This deliberately exercises the writer — the
+    read-layout profile (SNAPPY, 6M row groups, 8MB dictionaries, 128MB files) — AND the DuckDB reads of
+    the 22 queries, rather than a zero-copy ``convertToDelta`` that only writes the ``_delta_log``.
+    One-time — skipped when the tables already exist.
 
-    Returns the per-table ingestion timings ``[{'table', 'rows', 'dur'}, …]`` (the convert/log-write
-    cost only; the row count is a cheap parquet-metadata read), or ``[]`` when the tables already
-    exist and nothing was written."""
+    Returns the per-table ingestion timings ``[{'table', 'rows', 'dur'}, …]`` (the write cost; the row
+    count is a cheap parquet-metadata read), or ``[]`` when the tables already exist and nothing was
+    written."""
     if conn.catalog.tableExists("supplier"):
         print("Data already exists")
         return []
-    schema_root = os.path.dirname(conn._table_path(schema, TPCH_TABLES[0]))
+    gen_root = os.path.join(tempfile.gettempdir(), f"tpch_gen_sf{sf}")
+    shutil.rmtree(gen_root, ignore_errors=True)
+    os.makedirs(gen_root, exist_ok=True)
     print(f"Generating TPC-H SF={sf}")
     t0 = time.time()
     subprocess.run(
-        ["tpchgen-cli", "-s", str(sf), "--output-dir", schema_root, "--format", "parquet",
+        ["tpchgen-cli", "-s", str(sf), "--output-dir", gen_root, "--format", "parquet",
          "--parts", str(max(2, os.cpu_count() or 2))],
         check=True,
     )
     print(f"Generated parquet in {time.time() - t0:.2f}s")
 
-    print("Registering parquet → Delta in place via convertToDelta...")
+    print("Landing parquet → Delta via the duckrun write path (writer + read coverage)...")
     ingestion = []
     for tbl in TPCH_TABLES:
-        tdir = conn._table_path(schema, tbl)
-        rows = conn.read.parquet(f"{tdir}/*.parquet").count()   # cheap: parquet footer metadata
+        src = f"{gen_root}/{tbl}/*.parquet"
+        rows = conn.read.parquet(src).count()                   # cheap: parquet footer metadata
         ts = time.time()
-        DeltaTable.convertToDelta(conn, tdir)                   # zero-copy: writes _delta_log only
+        conn.read.parquet(src).write.mode("overwrite").saveAsTable(f"{schema}.{tbl}")
         dur = time.time() - ts
         ingestion.append({"table": tbl, "rows": rows, "dur": dur})
-        print(f"  {tbl}: {rows:,} rows convert→Delta in {dur:.2f}s (in place)")
-    conn.refresh(quiet=True)                                    # surface the converted tables as views
+        print(f"  {tbl}: {rows:,} rows write→Delta in {dur:.2f}s")
+    shutil.rmtree(gen_root, ignore_errors=True)                 # scratch parquet no longer needed
+    conn.refresh(quiet=True)                                    # surface the written tables as views
     print("Done!")
 
-    # Stats of what we just landed: file counts / row groups / size / compression, straight off the
-    # Delta log + parquet footers via the connection API. A convertToDelta keeps the generator's own
-    # parquet layout, so this is how you see the row-group shape you inherited.
+    # Stats of what we just wrote: file counts / row groups / size / compression, straight off the Delta
+    # log + parquet footers via the connection API — the read-layout shape the duckrun writer produced
+    # (vs the generator's raw parquet a convertToDelta would have inherited).
     print("\nTPC-H table stats after ingestion (conn.get_stats):")
     conn.get_stats().show()
     return ingestion
