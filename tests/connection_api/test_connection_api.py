@@ -2075,6 +2075,20 @@ def test_get_rle_hidden(conn):
     assert not recs["region"]["is_unique"] and not recs["const"]["is_unique"]
 
 
+def test_get_rle_hidden_near_fd_dropped(conn):
+    # Threshold-FD: `b` equals `a` except for one perturbed group, so it's ~99% determined by `a` — a
+    # NEAR (not exact) functional dependency. The old exact-equality test kept such a column (distinct
+    # grew, if only by one), wasting a scarce key slot; the HLL threshold (fd_band) now drops it — it
+    # clusters for free under `a`. `a` is the one independent dimension. No exact COUNT(DISTINCT) runs.
+    conn.sql("select (i % 100) as a, "
+             "case when (i % 1000) = 7 then 999 else (i % 100) end as b "
+             "from range(40000) t(i)").write.mode("overwrite").saveAsTable("nearfd")
+    df = conn._get_rle("nearfd")
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    assert recs["a"]["in_sort_key"] and recs["a"]["sort_position"] == 1   # the independent dimension
+    assert not recs["b"]["in_sort_key"]                                   # 99%-determined by a → no slot
+
+
 def test_get_rle_hidden_key_organized(conn):
     # A (near-)unique key with no compressible structure ⇒ key-organized (a dimension, or a table at
     # its grain): recommend ORDER BY the key itself, not a marginal compression sort. The unique key

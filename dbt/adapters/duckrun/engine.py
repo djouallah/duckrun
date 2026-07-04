@@ -686,7 +686,26 @@ def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]]
     return files, size, vorder
 
 
-def delta_column_stats(cur, path: str, cols, storage_options: Optional[Dict[str, str]] = None):
+def _log_ndv_cap(cur, type_str: str, qmn: str, qmx: str):
+    """Exact NDV upper bound from a **discrete** column's value range, read from the Delta log:
+    ``bool → 2``; ``int/date → global_max − global_min + 1`` (a DATE casts to its day count, so the same
+    span arithmetic works). ``None`` for continuous/string types — a float span or a truncated string
+    min/max bounds nothing useful. Best-effort: any cast failure just yields ``None``."""
+    t = type_str.upper()
+    if t.startswith("BOOL"):
+        return 2
+    if not (t.startswith("DATE") or "INT" in t):
+        return None
+    try:
+        v = cur.sql(
+            f'select (max("{qmx}")::HUGEINT - min("{qmn}")::HUGEINT + 1) from add_actions '
+            f'where "{qmn}" is not null and "{qmx}" is not null').fetchone()[0]
+        return int(v) if v is not None and v > 0 else None
+    except Exception:
+        return None
+
+
+def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Dict[str, str]] = None):
     """Per-column statistics read from the Delta **log** only (no data scan), for the sort-key profiler.
     ``get_add_actions(flatten=True)`` carries, per active file, ``num_records`` and — for the first
     ``dataSkippingNumIndexedCols`` (default 32) columns — ``null_count.<c>`` / ``min.<c>`` / ``max.<c>``.
@@ -696,10 +715,13 @@ def delta_column_stats(cur, path: str, cols, storage_options: Optional[Dict[str,
       and shouldn't burn one of the few sort-key slots.
     - ``constancy`` — fraction of files with ``min == max`` (``S2``): the file-granularity clustering of
       the *current* layout. Reserved for later waves (it says nothing about a from-scratch re-sort).
+    - ``ndv_cap`` — exact NDV upper bound for a discrete column (``S3``, ``max − min + 1``): lets the
+      sample profiler tighten (and sanity-cap) its HLL estimate for free, ``None`` when the type gives no
+      usable bound.
 
     A column past the indexed-column cap, or a statless writer, simply gets no entry — the caller falls
-    back to the sample profile for it. Returns ``({c: {"null_frac", "constancy"}}, num_files, total_rows)``;
-    ``({}, 0, 0)`` on ANY failure — this is a best-effort refinement, never a hard dependency."""
+    back to the sample profile for it. Returns ``({c: {"null_frac", "constancy", "ndv_cap"}}, num_files,
+    total_rows)``; ``({}, 0, 0)`` on ANY failure — a best-effort refinement, never a hard dependency."""
     try:
         dt = _delta_table(path, storage_options)
         add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
@@ -722,7 +744,8 @@ def delta_column_stats(cur, path: str, cols, storage_options: Optional[Dict[str,
             if not withstats:
                 continue
             out[c] = {"null_frac": (int(nulls) / total) if total else 0.0,
-                      "constancy": int(const) / withstats}
+                      "constancy": int(const) / withstats,
+                      "ndv_cap": _log_ndv_cap(cur, types.get(c, ""), qmn, qmx)}
         return out, nfiles, total
     except Exception as exc:
         logger.debug(f"duckrun: no Delta column stats for {path!r}: {exc}")

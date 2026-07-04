@@ -885,7 +885,8 @@ class DuckSession:
             f"'{self._current_catalog}'.")
 
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
-                 key_sort_below_pct: float = 10.0, null_excl: float = 0.5) -> "DataFrame":
+                 key_sort_below_pct: float = 10.0, null_excl: float = 0.5,
+                 fd_band: float = 0.12) -> "DataFrame":
         """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a short Delta **sort
         key** that minimises a table's estimated **in-memory columnar** footprint, and
         return a per-column :class:`DataFrame`. Recommendation-only — it never rewrites the table.
@@ -963,7 +964,7 @@ class DuckSession:
         # (and constancy, reserved). Best-effort: an unreadable/statless log just yields {} and the
         # profiler runs exactly as before.
         stats, _, _ = engine.delta_column_stats(
-            self.con, path, cols, self._catalog_storage_options(cat))
+            self.con, path, cols, types, self._catalog_storage_options(cat))
         src = "_rle_src"
         self.con.execute(
             f"CREATE OR REPLACE TEMP TABLE {src} AS "
@@ -971,29 +972,44 @@ class DuckSession:
         try:
             return self._rle_from_sample(sch, tbl, src, cols, types, partition_cols,
                                          sort_key_cap, min_gain_pct, key_sort_below_pct,
-                                         stats=stats, null_excl=null_excl)
+                                         stats=stats, null_excl=null_excl, fd_band=fd_band)
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
 
     def _rle_from_sample(self, sch, tbl, src, cols, types, partition_cols,
                          sort_key_cap, min_gain_pct, key_sort_below_pct,
-                         stats=None, null_excl=0.5) -> "DataFrame":
+                         stats=None, null_excl=0.5, fd_band=0.12) -> "DataFrame":
         """The sort-key model, run against the materialized sample ``src`` (see _get_rle). All counts
-        (``n``, ``ndv``, run estimates) are SAMPLE counts — enough to rank candidates and test
+        (``n``, ``ndv``, run estimates) are SAMPLE estimates — enough to rank candidates and test
         functional dependencies, not exact table cardinalities.
 
-        ``stats`` is the optional Delta-log column profile (``engine.delta_column_stats``): a per-column
-        ``null_frac`` used to drop mostly-null columns from key candidacy (``null_excl``). ``None`` (the
-        pre-write relation path, or an unreadable log) means "no log stats" — the model runs unchanged."""
-        # 1) sample ndv per column, one pass. NOTE: a random sample has no physical row order, so the
-        # table's *actual* current run count can't be measured. current_runs is set below (once skew is
-        # known) to the iid / arbitrary-order estimate — the honest neutral for an unknown layout, which
-        # matches a freshly-appended unsorted table and drives the "does sorting even help?" comparison.
+        Per-column NDV is measured with ``approx_count_distinct`` (HLL sketches, fixed KB of state) rather
+        than exact ``COUNT(DISTINCT)`` — that was the OOM lever (an O(NDV·width) hash table per column, over
+        every high-card column at once). The functional-dependency test in key selection keeps an exact
+        prefix distinct on purpose (its decision is a ratio HLL is too noisy to call), but only over the
+        low-card prefixes the greedy actually builds. ``stats`` is the optional Delta-log column profile
+        (``engine.delta_column_stats``): ``null_frac`` drops mostly-null columns from candidacy
+        (``null_excl``); ``ndv_cap`` (discrete ``max−min+1``) caps the HLL estimate for free. ``None``
+        (pre-write relation path, or an unreadable log) means "no log stats". ``fd_band`` is the
+        near-functional-dependency tolerance for key selection (see step 4)."""
+        stats = stats or {}
+        # Exact NDV upper bound per discrete column, straight from the Delta log (zero data read) —
+        # approx_count_distinct can overshoot, and a value range caps it exactly.
+        ndv_cap = {c: stats[c]["ndv_cap"] for c in cols
+                   if c in stats and stats[c].get("ndv_cap")}
+        # 1) sample ndv per column, one pass, with HLL sketches. NOTE: a random sample has no physical
+        # row order, so the table's *actual* current run count can't be measured. current_runs is set
+        # below (once skew is known) to the iid / arbitrary-order estimate — the honest neutral for an
+        # unknown layout, which matches a freshly-appended unsorted table and drives "does sorting help?".
         agg_sel = ", ".join(
-            f"COUNT(DISTINCT {_qid(c)}) AS n{i}" for i, c in enumerate(cols))
+            f"approx_count_distinct({_qid(c)}) AS n{i}" for i, c in enumerate(cols))
         row = self.con.sql(f"SELECT {agg_sel}, COUNT(*) AS total FROM {src}").fetchone()
         n = row[-1] or 0
-        ndv = {c: row[i] for i, c in enumerate(cols)}
+        ndv = {}
+        for i, c in enumerate(cols):
+            v = int(row[i] or 0)
+            cap = ndv_cap.get(c)
+            ndv[c] = min(v, cap) if cap is not None else v
 
         # value-encoded = numeric/temporal (no dictionary); hash = strings/blobs (dictionary of ndv
         # distinct values). An in-memory engine may force hash for relationship columns too, but we can't see that.
@@ -1082,24 +1098,26 @@ class DuckSession:
             (c for c in cols if ndv[c] > 1 and not _is_measure(types[c])
              and c not in partition_cols and c not in null_heavy),
             key=lambda c: (0 if _lead(c) else 1, ndv[c]))
+        # Greedy prefix build. The per-column NDV above is an HLL estimate (the OOM fix — no O(NDV) hash
+        # table over a high-card column), but the FD decision below is a RATIO of two prefix distincts and
+        # HLL's few-percent error (measured: two independent sketches of ~100 values read 98 and 111) makes
+        # that ratio unusable. So the prefix distinct here stays EXACT — cheap and safe, because the greedy
+        # only ever tests LOW-card prefixes: it stops (below) before the ranking reaches the high-card
+        # columns, so no exact distinct is ever built over one. A handful of scans for an occasional call.
         sort_key, sorted_runs = [], {}
-        prefix_distinct = 1  # distinct groups of the current (initially empty) prefix
+        prefix_distinct = 1  # exact distinct groups of the current (initially empty) prefix
         for c in candidates:
             if len(sort_key) >= sort_key_cap:
                 break
-            # EXACT distinct(prefix + c) — NOT approx_count_distinct. The R5 test below is an equality
-            # of distinct counts, and two independent HLL estimates of the same value disagree by
-            # several percent, so no tolerance band can decide it reliably. One exact COUNT(DISTINCT)
-            # per candidate — a handful of scans for an occasional diagnostic.
             runs = self.con.sql(
                 f"SELECT COUNT(DISTINCT hash({', '.join(_qid(x) for x in sort_key + [c])})) "
                 f"FROM {src}").fetchone()[0]
-            # R5 — functional dependency (the standard test: distinct(X) == distinct(X, c) ⇒ X → c):
-            # if adding c doesn't grow the prefix's distinct count, c is already determined by the
-            # prefix (year ← date, subcategory ← category). It's then clustered for free by sorting the
-            # prefix, so a key slot on it is meaningless — skip it; a later independent column may
-            # still refine the grain.
-            if sort_key and runs <= prefix_distinct:
+            # R5 — threshold functional dependency: adding c grows the exact grain by less than fd_band ⇒ c
+            # is ≥ ~(1−fd_band) determined by the prefix (year ← date; subcategory ← category, and now a
+            # 99%-near-FD too). Clustered for free by the prefix sort ⇒ no key slot; a later independent
+            # column may still refine. The old test was exact EQUALITY (runs <= prefix), which caught only
+            # perfect FDs and missed near-FDs entirely — the band is the upgrade the exact count enables.
+            if sort_key and runs < prefix_distinct * (1.0 + fd_band):
                 continue
             if iid_bytes[c] - _col_bytes(c, runs) <= baseline_total * (min_gain_pct / 100.0):
                 if _lead(c):

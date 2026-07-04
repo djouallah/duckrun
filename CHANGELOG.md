@@ -30,6 +30,11 @@ All notable changes to this project will be documented in this file.
 - **Row group is 6M rows** (was 4M normal / 8M optimize). 6M sits mid-band in Fabric's 1M–16M segment
   guidance while bounding write-time memory (arrow-rs buffers a full uncompressed row group per open
   writer).
+- **Auto sort-key profiler drops mostly-null columns** using Delta-log statistics — a column that is
+  almost entirely NULL clusters for free and never earns a sort-key slot.
+- **TPC-H benchmark ingests through the duckrun write path** (`conn.read.parquet(...).write.saveAsTable`)
+  instead of a zero-copy `convert_to_deltalake`, so it exercises the writer and the DuckDB read side of
+  the 22 queries end-to-end.
 
 ## [0.3.31] - 2026-07-03
 
