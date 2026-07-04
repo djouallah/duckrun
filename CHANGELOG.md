@@ -20,12 +20,13 @@ All notable changes to this project will be documented in this file.
   is deliberately excluded:** it passes no writer properties and no target file size, so a merge stays
   quick and never rewrites fat files; the threshold-gated post-merge compaction folds merged files up
   into the read layout afterwards.
-- **Target file size 1 GB → 128 MB, one row group per file.** A Parquet row group can't span files, so
+- **Target file size 1 GB → 256 MB, one row group per file.** A Parquet row group can't span files, so
   a large file-size cap silently truncates the row group (delta-rs closes the file mid-group), leaving
-  small, non-uniform Direct Lake column segments — and on wide tables no segment ever reached the ideal
-  size. 128 MB matches the mainstream default (delta-rs's own ~100 MB, Databricks optimized-writes,
-  Hudi) and keeps segments uniform: narrow data lands whole 6M-row groups, wide data caps at ~128 MB /
-  one row group per file. Applies to every file write and to routine post-write compaction.
+  small, non-uniform Direct Lake column segments; 1 GB also forced the whole-file copy-on-write that blew
+  up merges on disk. 256 MB is large enough for a wide fact (lineitem) to reach a full 6M-row segment yet
+  far below the 1 GB that hurt merges — and with the dictionary page limit bounded (below), 128/256/512 MB
+  all merge in ~16s / ~5 GB (measured), so file size is free to serve the read layout. Applies to every
+  file write and to routine post-write compaction.
 - **Row group is 6M rows** (was 4M normal / 8M optimize). 6M sits mid-band in Fabric's 1M–16M segment
   guidance while bounding write-time memory (arrow-rs buffers a full uncompressed row group per open
   writer).

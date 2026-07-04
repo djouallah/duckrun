@@ -56,15 +56,15 @@ _DATA_PAGE_SIZE_LIMIT = 1_048_576
 # single page: ~10x write memory, and giant pages that blow the merge's read-side spill cap → out of disk
 # (arrow-rs #5797 / #4973). 20k rows/page is arrow-rs's intended default; measured +0 MB write overhead.
 _DATA_PAGE_ROW_LIMIT = 20_000
-# Target file size: 128 MB. A Parquet row group can't span files, so this byte cap is really a
-# segment cap: if a full 6M-row group would exceed it, delta-rs truncates the row group to fit —
-# which is what starves Direct Lake segments and leaves a non-uniform tail. 128 MB matches the
-# mainstream default (delta-rs's own ~100 MB, Databricks optimized-writes, Hudi ~120 MB) and keeps
-# segments uniform: small/narrow data lands whole 6M-row groups, wide data caps at ~128 MB one row
-# group per file. Deliberately NOT 1 GB — that truncated wide-table segments below the ideal size.
-# Applied by every file write (build_write_deltalake_args) and the routine post-write compaction, so the
-# whole table keeps the same 128 MB layout. MERGE is the exception — it sets no target_file_size.
-_TARGET_FILE_SIZE = 128 * 1024 * 1024
+# Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a segment
+# cap: it lets more of a table reach the full 6M-row group before the file rolls (a wide fact like
+# lineitem needs ~256 MB to fit a 6M-row segment), giving larger, more uniform Direct Lake segments. It
+# is NOT a merge-memory lever — that was the dictionary page limit (see _DICT_PAGE_SIZE_LIMIT); with that
+# bounded, 128/256/512 MB all merge in ~16s at ~4.5-5.2 GB (measured), so file size is free to serve the
+# read layout. Still deliberately far below 1 GB, which forced the whole-file copy-on-write that blew up
+# merges on disk. Applied by every file write (build_write_deltalake_args) and the routine post-write
+# compaction. MERGE is the exception — it sets no target_file_size.
+_TARGET_FILE_SIZE = 256 * 1024 * 1024
 
 
 def _writer_properties(plain_cols=None):
