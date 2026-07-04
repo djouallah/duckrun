@@ -436,47 +436,72 @@ class Plugin(BasePlugin):
         delta_rs's own ``delete(predicate)`` is avoided on purpose: it runs the predicate through the
         Delta kernel for file-skipping, which rejects an Int32-column vs Int64-literal comparison (the
         type bare integer literals get) — DuckDB just coerces. Staging through a TEMP table detaches
-        the read from the table before the overwrite replaces it."""
+        the read from the table before the overwrite replaces it.
+
+        The delete is an in-DuckDB anti-join (``EXISTS (SELECT 1 FROM batch s WHERE s.k = t.k)``), not
+        a Python-materialized ``IN (lit, …)`` set — so a multi-million-row batch does not round-trip
+        its whole key set into a giant SQL string. Plain ``=`` (not ``IS NOT DISTINCT FROM``) so a NULL
+        target key never matches, exactly like SQL ``IN`` / dbt-duckdb.
+
+        This path is only reached when the table already EXISTS (see store's dispatch), so it is always
+        fenced: pin the read and commit to ``read_version`` (or, if a concurrent writer created the
+        table mid-run so ``read_version`` is None, to the version captured now)."""
         keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
         keys = [str(k).strip().strip('"') for k in keys]
-        keycols = ", ".join('"' + k + '"' for k in keys)
-        rows = cur.sql(f"SELECT DISTINCT {keycols} FROM {name}").fetchall()
-        if not rows:
-            return  # empty batch → nothing to delete or insert (an incremental no-op)
-        delete_cond = self._key_set_predicate(keys, rows)
+        # Empty batch → nothing to delete or insert (an incremental no-op). Probe with LIMIT 1 rather
+        # than pulling DISTINCT keys into Python.
+        if cur.sql(f"SELECT 1 FROM {name} LIMIT 1").fetchone() is None:
+            return
+        loc_sql = path.replace("'", "''")
+        # Always fenced: reached only when the table exists. read_version is None only if a writer
+        # created it during this run — capture the current version and pin to that.
+        vB = read_version if read_version is not None else engine.table_version(path, storage_options)
+
+        target_cols = list(cur.sql(f"SELECT * FROM delta_scan('{loc_sql}', version => {vB}) LIMIT 0").columns)
+        batch_cols = list(cur.sql(f"SELECT * FROM {name} LIMIT 0").columns)
+        # Loud failure on a column mismatch instead of letting an explicit projection produce a DuckDB
+        # binder error (or a positional overwrite silently shift values) — mirror on_schema_change='fail'.
+        tset, bset = {c.lower() for c in target_cols}, {c.lower() for c in batch_cols}
+        if tset != bset:
+            added = sorted(c for c in batch_cols if c.lower() not in tset)
+            removed = sorted(c for c in target_cols if c.lower() not in bset)
+            raise CompilationError(
+                "delete+insert: the model's columns do not match the target table. "
+                + (f"Added: {added}. " if added else "")
+                + (f"Missing: {removed}. " if removed else "")
+                + "Reconcile the model SQL with the table (or use on_schema_change / --full-refresh)."
+            )
+
+        key_join = " AND ".join(f's."{k}" = t."{k}"' for k in keys)
+        delete_cond = f"EXISTS (SELECT 1 FROM {name} s WHERE {key_join})"
         preds = self._delete_insert_predicates(incremental_predicates)
         if preds:
+            # Qualify bare target columns to the target alias `t` (quote-aware, not regex — see #4).
+            preds = [sqlscan.qualify_identifiers(p, target_cols, prefix="t") for p in preds]
             delete_cond = "(" + delete_cond + ") AND " + " AND ".join(f"({p})" for p in preds)
-        loc_sql = path.replace("'", "''")
-        ver = f", version => {read_version}" if read_version is not None else ""
+        # Project the batch onto the target column list (by name, target order) so the UNION aligns by
+        # column regardless of the model SELECT's column order — a reorder can't shift values.
+        tcols_t = ", ".join(f't."{c}"' for c in target_cols)
+        tcols = ", ".join(f'"{c}"' for c in target_cols)
         tmp = f"__duckrun_di_{abs(hash(path)) & 0xFFFFFFFF}"
         cur.execute(
             f'CREATE OR REPLACE TEMP TABLE "{tmp}" AS '
-            f"SELECT * FROM delta_scan('{loc_sql}'{ver}) WHERE ({delete_cond}) IS NOT TRUE "
-            f"UNION ALL SELECT * FROM {name}"
+            f"SELECT {tcols_t} FROM delta_scan('{loc_sql}', version => {vB}) t "
+            f"WHERE ({delete_cond}) IS NOT TRUE "
+            f"UNION ALL SELECT {tcols} FROM {name}"
         )
         try:
             data = cur.sql(f'SELECT * FROM "{tmp}"')
-            if read_version is not None:
-                # Fence the overwrite to vB (the version the kept rows were read at): CAS via
-                # overwrite_if_unchanged so a writer that committed since vB fails the run loudly
-                # instead of being silently clobbered by this full-table overwrite. Same snapshot
-                # for the read (delta_scan version => vB above) and the commit, exactly like merge.
-                engine.overwrite_if_unchanged(
-                    path, data,
-                    read_version=read_version,
-                    partition_by=partition_by,
-                    storage_options=storage_options,
-                    compaction_threshold=self._compaction_threshold,
-                )
-            else:
-                # No prior version to pin (brand-new table / first build) — nothing to fence against.
-                engine.write_delta(
-                    path, data, "overwrite",
-                    partition_by=partition_by,
-                    storage_options=storage_options,
-                    compaction_threshold=self._compaction_threshold,
-                )
+            # Fence the overwrite to vB (the version the kept rows were read at): CAS via
+            # overwrite_if_unchanged so a writer that committed since vB fails the run loudly instead
+            # of being silently clobbered. Same snapshot for the read and the commit, exactly like merge.
+            engine.overwrite_if_unchanged(
+                path, data,
+                read_version=vB,
+                partition_by=partition_by,
+                storage_options=storage_options,
+                compaction_threshold=self._compaction_threshold,
+            )
         finally:
             cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
 
@@ -498,32 +523,6 @@ class Plugin(BasePlugin):
             if p:
                 out.append(p)
         return out
-
-    @staticmethod
-    def _sql_literal(v) -> str:
-        """Render a Python key value as a CAST-free SQL literal for a delta_rs/datafusion predicate.
-        Non-numeric values are single-quoted; delta_rs coerces the string literal to the column's
-        type (the same trick the microbatch window predicate relies on)."""
-        import numbers
-        if v is None:
-            return "NULL"
-        if isinstance(v, bool):
-            return "true" if v else "false"
-        if isinstance(v, numbers.Number):
-            return str(v)
-        return "'" + str(v).replace("'", "''") + "'"
-
-    def _key_set_predicate(self, keys, rows) -> str:
-        """A CAST-free predicate matching exactly the key tuples in ``rows``: ``"k" IN (…)`` for a
-        single key, else an OR of per-tuple AND-equalities for a composite key."""
-        if len(keys) == 1:
-            lits = ", ".join(self._sql_literal(r[0]) for r in rows)
-            return f'"{keys[0]}" IN ({lits})'
-        terms = [
-            "(" + " AND ".join(f'"{k}" = {self._sql_literal(v)}' for k, v in zip(keys, r)) + ")"
-            for r in rows
-        ]
-        return "(" + " OR ".join(terms) + ")"
 
     @staticmethod
     def _relation_name(relation: Any) -> str:
