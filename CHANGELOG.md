@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.35] - 2026-07-05
+
 ### Changed
 - **`optimize` operates on a table, not the session.** Removed the session-level `conn.optimize(name, …)`.
   Compaction and z-order are `DeltaTable.forName(conn, name).optimize()` / `.optimize(zorder_by=[…])`; the
