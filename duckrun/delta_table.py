@@ -261,47 +261,67 @@ class DeltaTable:
         if sort is not None:
             if sort != "experimental":
                 raise ValueError("optimize(sort=...) only supports 'experimental'.")
-            metrics = self._optimize_experimental_sort()
+            metrics = self._sort_rewrite()
         else:
             metrics = engine.optimize(self.path, zorder_by=zorder_by, target_size=target_size,
                                       storage_options=self.storage_options)
         self._refresh_view()
         return metrics
 
-    def _optimize_experimental_sort(self) -> Dict:
-        """Sort-rewrite this table by the ``_get_rle`` recommended key. forName only (needs a catalog
-        table to profile). Partition columns lead the physical order and are preserved as partitions."""
+    def _sort_rewrite(self, keys: Optional[List[str]] = None,
+                      where: Optional[str] = None) -> Dict:
+        """Sort-rewrite this table's files physically ordered by ``(partition columns…, key…)``. Reads
+        the table, applies ``ORDER BY``, and rewrites with the tuned read layout. forName only (needs a
+        catalog table). Partition columns always lead the physical order and are preserved as partitions.
+
+        ``keys`` is the sort key: ``None`` profiles the table with ``_get_rle`` and picks a
+        run-length-friendly key automatically (and writes unique columns PLAIN); an explicit list sorts
+        by exactly those columns. ``where`` (a CAST-free delta_rs SQL predicate, e.g. ``"year = 2026"``)
+        scopes the rewrite to only the matching partitions via a snapshot-fenced ``replaceWhere`` commit
+        instead of a full-table overwrite."""
         if self._table is None:
-            raise ValueError("optimize(sort='experimental') needs a catalog table — use forName, not forPath.")
-        name = self._table if self._schema is None else f"{self._schema}.{self._table}"
-        recs = [dict(zip(rle.columns, r)) for rle in [self._session._get_rle(name)] for r in rle.collect()]
-        key = [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
-                                           key=lambda x: x["sort_position"])]
-        # A unique / near-unique column (ndv >= 0.9*n) gains nothing from a dictionary — every value is
-        # distinct, so the dictionary just re-stores the whole column plus an index. Write those PLAIN.
-        plain_cols = [r["column"] for r in recs if r.get("is_unique")]
+            raise ValueError("optimize() needs a catalog table — use conn.table(name)/forName, not forPath.")
         try:
             pcols = list(engine._delta_table(self.path, self.storage_options)
                          .metadata().partition_columns or [])
         except Exception:
             pcols = []
+        if keys:
+            key, plain_cols = list(keys), []
+        else:
+            name = self._table if self._schema is None else f"{self._schema}.{self._table}"
+            recs = [dict(zip(rle.columns, r)) for rle in [self._session._get_rle(name)] for r in rle.collect()]
+            key = [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
+                                               key=lambda x: x["sort_position"])]
+            # A unique / near-unique column (ndv >= 0.9*n) gains nothing from a dictionary — every value
+            # is distinct, so the dictionary just re-stores the whole column plus an index. Write PLAIN.
+            plain_cols = [r["column"] for r in recs if r.get("is_unique")]
         order_cols = pcols + [c for c in key if c not in pcols]
-        if not order_cols:  # nothing to sort → fall back to a plain bin-packing compaction
+        if not order_cols and where is None:  # nothing to sort, whole table → plain bin-packing compaction
             return engine.optimize(self.path, storage_options=self.storage_options)
         con = self._session.con
         # REAL on-disk bytes (active files, from the Delta log's size_bytes — cross-storage, no
         # estimate), measured before and after the rewrite so the caller sees the actual reduction.
         _, before, _ = engine.delta_file_summary(con, self.path, self.storage_options)
         plit = self.path.replace("'", "''")
-        order_expr = ", ".join('"' + c.replace('"', '""') + '"' for c in order_cols)
-        rel = con.sql(f"SELECT * FROM delta_scan('{plit}') ORDER BY {order_expr}")
-        # optimize_layout=True: this experimental sort-rewrite is the ONE path that writes the tuned
-        # tuned read layout (opinionated writer properties + ~1 GB files). Normal writes don't.
-        # plain_cols disables the (useless) dictionary on the unique columns.
-        engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
-                           storage_options=self.storage_options,
-                           compaction_threshold=self.compaction_threshold,
-                           optimize_layout=True, plain_cols=plain_cols)
+        where_sql = f" WHERE {where}" if where else ""
+        order_sql = (" ORDER BY " + ", ".join('"' + c.replace('"', '""') + '"' for c in order_cols)) \
+            if order_cols else ""
+        rel = con.sql(f"SELECT * FROM delta_scan('{plit}'){where_sql}{order_sql}")
+        # optimize_layout=True: the sort-rewrite is the ONE path that writes the tuned read layout
+        # (opinionated writer properties + ~1 GB files). Normal writes don't. plain_cols disables the
+        # (useless) dictionary on the unique columns.
+        if where is None:
+            engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
+                               storage_options=self.storage_options,
+                               compaction_threshold=self.compaction_threshold,
+                               optimize_layout=True, plain_cols=plain_cols)
+        else:
+            # Scoped rewrite: replace ONLY the matching partitions in one atomic, snapshot-fenced commit.
+            engine.replace_where(self.path, rel, where, read_version=self._read_version,
+                                 partition_by=(pcols or None), storage_options=self.storage_options,
+                                 compaction_threshold=self.compaction_threshold,
+                                 optimize_layout=True, plain_cols=plain_cols)
         self._resnapshot()
         _, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
         saved = round(100.0 * (before - after) / before, 1) if before else 0.0

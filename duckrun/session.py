@@ -674,8 +674,11 @@ class DuckSession:
 
     def table(self, name: str) -> "DataFrame":
         catalog, schema, table = self._resolve(name)
+        # source_table lets the returned DataFrame resolve back to its Delta table for .optimize();
+        # a transformed/query DataFrame (createDataFrame, .sort(), a read) carries no name and can't.
         return DataFrame(
-            self.con.sql(f"SELECT * FROM {_qid(catalog)}.{_qid(schema)}.{_qid(table)}"), self)
+            self.con.sql(f"SELECT * FROM {_qid(catalog)}.{_qid(schema)}.{_qid(table)}"), self,
+            source_table=name)
 
     def createDataFrame(self, data, schema=None, samplingRatio=None,
                         verifySchema: bool = True) -> "DataFrame":
@@ -1284,13 +1287,37 @@ class DataFrame:
     ``.arrow()``, ``.fetchall()``, ``.fetchnumpy()`` etc. all keep working.
     """
 
-    def __init__(self, relation, session: DuckSession):
+    def __init__(self, relation, session: DuckSession, source_table: Optional[str] = None):
         self.relation = relation
         self.session = session
+        # Set only by conn.table(name): the Delta table this frame maps to, so .optimize() can rewrite
+        # it. None for any derived/query frame (createDataFrame, reader, .sort()) — .optimize() refuses.
+        self._source_table = source_table
 
     @property
     def write(self) -> "DataFrameWriter":
         return DataFrameWriter(self)
+
+    def optimize(self, *keys: str, where: Optional[str] = None) -> Dict:
+        """Rewrite this table's files physically sorted for better compression / read pruning, returning
+        the operation metrics (REAL measured on-disk ``sizeBytesBefore`` / ``sizeBytesAfter`` /
+        ``savedPct``). Only available on ``conn.table(name)`` — a derived/query DataFrame has no Delta
+        table to rewrite.
+
+        - ``optimize()`` — full rewrite; the sort key is chosen automatically by profiling the table.
+        - ``optimize("region", "status")`` — full rewrite sorted by exactly those columns.
+        - ``optimize(where="year = 2026")`` — rewrite ONLY the partitions matching the predicate (a
+          CAST-free delta_rs SQL expression), as one atomic snapshot-fenced ``replaceWhere`` commit.
+
+        Partition columns always lead the physical order and are preserved. This is a full rewrite, not a
+        bin-packing compaction, so run it occasionally."""
+        if self._source_table is None:
+            raise ValueError(
+                "optimize() is only available on conn.table(name); a derived/query DataFrame has no "
+                "Delta table to rewrite.")
+        from .delta_table import DeltaTable
+        return DeltaTable.forName(self.session, self._source_table)._sort_rewrite(
+            keys=list(keys) or None, where=where)
 
     # DataFrame aliases over the DuckDB relation.
     def show(self, *a, **k):

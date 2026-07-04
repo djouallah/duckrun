@@ -641,6 +641,50 @@ class TestDeltaTable:
         regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
         assert regs == sorted(regs)
 
+    def test_table_optimize_auto_keys(self, conn):
+        # conn.table(name).optimize() — full rewrite, sort key chosen automatically (same as the
+        # sort='experimental' path). Data preserved; active file clustered by the recommended key.
+        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
+            .write.mode("overwrite").saveAsTable("to_auto")
+        m = conn.table("dbo.to_auto").optimize()
+        assert m["operation"] == "sortRewrite" and "region" in m["sortedBy"]
+        assert conn.table("to_auto").count() == 20000
+        f = engine._delta_table(conn.root_path + "/dbo/to_auto", None).file_uris()[0].replace("file://", "")
+        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
+        assert regs == sorted(regs)
+
+    def test_table_optimize_user_keys(self, conn):
+        # conn.table(name).optimize("region") — full rewrite sorted by exactly the given columns, no
+        # profiler. The active file comes out ordered by region regardless of what the profiler'd pick.
+        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
+            .write.mode("overwrite").saveAsTable("to_keys")
+        m = conn.table("dbo.to_keys").optimize("region")
+        assert m["sortedBy"] == ["region"]
+        assert conn.table("to_keys").count() == 20000
+        f = engine._delta_table(conn.root_path + "/dbo/to_keys", None).file_uris()[0].replace("file://", "")
+        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
+        assert regs == sorted(regs)
+
+    def test_table_optimize_where_scopes_partitions(self, conn):
+        # conn.table(name).optimize(where=...) rewrites ONLY the matching partition; the untouched
+        # partitions keep their data and total count is preserved.
+        conn.sql("select (i % 3) as region, i as id from range(300) t(i)") \
+            .write.mode("overwrite").partitionBy("region").saveAsTable("to_where")
+        v_before = engine.table_version(conn.root_path + "/dbo/to_where", None)
+        m = conn.table("dbo.to_where").optimize("id", where="region = 1")
+        assert m["operation"] == "sortRewrite"
+        # a replaceWhere commit landed (new version) and every row survived across all partitions
+        assert engine.table_version(conn.root_path + "/dbo/to_where", None) > v_before
+        assert conn.table("to_where").count() == 300
+        assert sorted(r[0] for r in conn.sql("select distinct region from to_where").collect()) == [0, 1, 2]
+        # the rewritten partition is sorted by id; other partitions still hold their rows
+        assert conn.sql("select count(*) from to_where where region = 0").fetchone()[0] == 100
+
+    def test_table_optimize_rejects_query_frame(self, conn):
+        # optimize() is only meaningful on a real table handle; a derived/query DataFrame refuses.
+        with pytest.raises(ValueError):
+            conn.sql("select 1 x").optimize()
+
     def test_get_rle_scan_count_is_constant(self, conn):
         # Regression: the auto profiler must NOT re-scan the (possibly remote) table once per column.
         # Those O(columns) full-table reads are what made optimize take 20 min on a 142M-row OneLake

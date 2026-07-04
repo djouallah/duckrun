@@ -1034,6 +1034,8 @@ def replace_where(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
+    optimize_layout: bool = False,
+    plain_cols: Optional[List[str]] = None,
 ) -> None:
     """``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
     replace the rows matching ``predicate`` with ``data``. One commit, not a delete-then-append
@@ -1054,7 +1056,8 @@ def replace_where(
             "a read-modify-write and must be pinned to its snapshot."
         )
     args = build_write_deltalake_args(
-        path, data, "overwrite", partition_by=partition_by, storage_options=storage_options
+        path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
+        optimize_layout=optimize_layout, plain_cols=plain_cols,
     )
     args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
     # Pin to the read snapshot and disable rebasing, so a concurrent commit since vB fails this
