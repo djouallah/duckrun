@@ -2119,6 +2119,22 @@ def test_get_rle_hidden_partition_leads(conn, capsys):
     assert recs["cat"]["in_sort_key"]                   # the real low-card dimension is the key
 
 
+def test_get_rle_hidden_null_heavy_excluded(conn, capsys):
+    # S1: a mostly-null column is dropped from sort-key candidacy. `sparse` is 70% null with 3 non-null
+    # values → by its ndv (3) it would otherwise out-rank and lead ahead of `region` (ndv 4); but its
+    # nulls already collapse to one run under any order, so a key slot on it clusters little and crowds
+    # out the real dimension. The null share is read from the Delta LOG (get_add_actions), not the sample.
+    conn.sql("select (i % 4) as region, "
+             "case when (i % 10) < 7 then null else (i % 3) end as sparse, i as uid "
+             "from range(20000) t(i)").write.mode("overwrite").saveAsTable("nullheavy")
+    df = conn._get_rle("nullheavy")
+    out = capsys.readouterr().out
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    assert recs["region"]["in_sort_key"] and recs["region"]["sort_position"] == 1   # real dimension keys
+    assert not recs["sparse"]["in_sort_key"]                     # 70% null → excluded from candidacy
+    assert "null-heavy" in out and "sparse" in out               # and the exclusion is reported
+
+
 def test_writer_keeps_dictionary_encoding(conn):
     # Regression guard for the tuned delta-rs writer properties: a low-cardinality column must stay
     # dictionary-encoded (dictionary page present + RLE_DICTIONARY), never fall back to PLAIN. Reads

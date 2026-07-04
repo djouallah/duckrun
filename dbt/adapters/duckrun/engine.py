@@ -686,6 +686,49 @@ def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]]
     return files, size, vorder
 
 
+def delta_column_stats(cur, path: str, cols, storage_options: Optional[Dict[str, str]] = None):
+    """Per-column statistics read from the Delta **log** only (no data scan), for the sort-key profiler.
+    ``get_add_actions(flatten=True)`` carries, per active file, ``num_records`` and — for the first
+    ``dataSkippingNumIndexedCols`` (default 32) columns — ``null_count.<c>`` / ``min.<c>`` / ``max.<c>``.
+    Aggregating those over the (small) file list gives, per column:
+
+    - ``null_frac`` — table-wide null share (``S1``): a mostly-null column is a poor thing to organise by
+      and shouldn't burn one of the few sort-key slots.
+    - ``constancy`` — fraction of files with ``min == max`` (``S2``): the file-granularity clustering of
+      the *current* layout. Reserved for later waves (it says nothing about a from-scratch re-sort).
+
+    A column past the indexed-column cap, or a statless writer, simply gets no entry — the caller falls
+    back to the sample profile for it. Returns ``({c: {"null_frac", "constancy"}}, num_files, total_rows)``;
+    ``({}, 0, 0)`` on ANY failure — this is a best-effort refinement, never a hard dependency."""
+    try:
+        dt = _delta_table(path, storage_options)
+        add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
+        have = {d[0] for d in cur.sql("select * from add_actions limit 0").description}
+        nfiles, total = cur.sql(
+            "select count(*), coalesce(sum(num_records), 0)::bigint from add_actions").fetchone()
+        nfiles, total = int(nfiles or 0), int(total or 0)
+        out = {}
+        for c in cols:
+            nc, mn, mx = f"null_count.{c}", f"min.{c}", f"max.{c}"
+            if nc not in have or mn not in have or mx not in have:
+                continue
+            qnc, qmn, qmx = (s.replace('"', '""') for s in (nc, mn, mx))
+            nulls, const, withstats = cur.sql(
+                f'select coalesce(sum("{qnc}"), 0)::bigint, '
+                f'  coalesce(sum(case when "{qmn}" = "{qmx}" then 1 else 0 end), 0)::bigint, '
+                f'  coalesce(sum(case when "{qmn}" is not null then 1 else 0 end), 0)::bigint '
+                f'from add_actions').fetchone()
+            withstats = int(withstats or 0)
+            if not withstats:
+                continue
+            out[c] = {"null_frac": (int(nulls) / total) if total else 0.0,
+                      "constancy": int(const) / withstats}
+        return out, nfiles, total
+    except Exception as exc:
+        logger.debug(f"duckrun: no Delta column stats for {path!r}: {exc}")
+        return {}, 0, 0
+
+
 # Delta column-metadata key under which we stash a dbt column description, and the dollar-quote
 # label used to embed arbitrary comment text (newlines, quotes, dollar signs) in COMMENT ON SQL.
 _DELTA_COMMENT_KEY = "comment"

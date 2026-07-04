@@ -885,7 +885,7 @@ class DuckSession:
             f"'{self._current_catalog}'.")
 
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
-                 key_sort_below_pct: float = 10.0) -> "DataFrame":
+                 key_sort_below_pct: float = 10.0, null_excl: float = 0.5) -> "DataFrame":
         """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a short Delta **sort
         key** that minimises a table's estimated **in-memory columnar** footprint, and
         return a per-column :class:`DataFrame`. Recommendation-only — it never rewrites the table.
@@ -957,21 +957,34 @@ class DuckSession:
         # difference between a few minutes and milliseconds on a remote 142M-row table. Key selection
         # only ranks columns by cardinality/skew and tests functional dependencies, all of which survive
         # sampling. A table at/below _RLE_SAMPLE_ROWS samples to itself, so small tables stay exact.
+        # Delta-LOG column stats (no data scan): the sample gives ndv/skew but not each column's null
+        # share, so a mostly-null column can wrongly win a scarce sort-key slot. get_add_actions carries
+        # per-file null_count/min/max — sum them once here and hand the profiler a per-column null_frac
+        # (and constancy, reserved). Best-effort: an unreadable/statless log just yields {} and the
+        # profiler runs exactly as before.
+        stats, _, _ = engine.delta_column_stats(
+            self.con, path, cols, self._catalog_storage_options(cat))
         src = "_rle_src"
         self.con.execute(
             f"CREATE OR REPLACE TEMP TABLE {src} AS "
             f"SELECT * FROM delta_scan('{plit}') USING SAMPLE {_RLE_SAMPLE_ROWS} ROWS")
         try:
             return self._rle_from_sample(sch, tbl, src, cols, types, partition_cols,
-                                         sort_key_cap, min_gain_pct, key_sort_below_pct)
+                                         sort_key_cap, min_gain_pct, key_sort_below_pct,
+                                         stats=stats, null_excl=null_excl)
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
 
     def _rle_from_sample(self, sch, tbl, src, cols, types, partition_cols,
-                         sort_key_cap, min_gain_pct, key_sort_below_pct) -> "DataFrame":
+                         sort_key_cap, min_gain_pct, key_sort_below_pct,
+                         stats=None, null_excl=0.5) -> "DataFrame":
         """The sort-key model, run against the materialized sample ``src`` (see _get_rle). All counts
         (``n``, ``ndv``, run estimates) are SAMPLE counts — enough to rank candidates and test
-        functional dependencies, not exact table cardinalities."""
+        functional dependencies, not exact table cardinalities.
+
+        ``stats`` is the optional Delta-log column profile (``engine.delta_column_stats``): a per-column
+        ``null_frac`` used to drop mostly-null columns from key candidacy (``null_excl``). ``None`` (the
+        pre-write relation path, or an unreadable log) means "no log stats" — the model runs unchanged."""
         # 1) sample ndv per column, one pass. NOTE: a random sample has no physical row order, so the
         # table's *actual* current run count can't be measured. current_runs is set below (once skew is
         # known) to the iid / arbitrary-order estimate — the honest neutral for an unknown layout, which
@@ -1060,8 +1073,14 @@ class DuckSession:
         # no RLE value once Delta strips them from the files.
         def _lead(c):
             return _is_temporal(types[c]) and not (n and ndv[c] >= 0.9 * n)
+        # S1 — a mostly-null column (Delta-log null share > null_excl) is dropped from candidacy: its
+        # nulls already collapse to one run under any order, so a key slot on it clusters little of value
+        # and crowds out a denser dimension. Log-only signal; absent stats → empty set → no change.
+        null_heavy = {c for c in cols
+                      if stats and c in stats and stats[c]["null_frac"] > null_excl}
         candidates = sorted(
-            (c for c in cols if ndv[c] > 1 and not _is_measure(types[c]) and c not in partition_cols),
+            (c for c in cols if ndv[c] > 1 and not _is_measure(types[c])
+             and c not in partition_cols and c not in null_heavy),
             key=lambda c: (0 if _lead(c) else 1, ndv[c]))
         sort_key, sorted_runs = [], {}
         prefix_distinct = 1  # distinct groups of the current (initially empty) prefix
@@ -1163,6 +1182,9 @@ class DuckSession:
             print(f"  (dictionary-bound — sort won't help, cut cardinality: {', '.join(dict_bound)})")
         if heavy_measures:
             print(f"  (measures — not sortable; cut precision / split to shrink: {', '.join(heavy_measures)})")
+        if null_heavy:
+            print(f"  (null-heavy — excluded from the sort key (>{null_excl:.0%} null): "
+                  f"{', '.join(sorted(null_heavy))})")
 
         rest = sorted((c for c in cols if c not in pos), key=lambda c: -est_current[c])
         unique_set = set(unique_cols)  # ndv >= 0.9*n (non-partition) — a dictionary buys nothing here
