@@ -20,7 +20,7 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 
 **What this checks:** duckrun registers the full TPC-H schema (8 tables) as Delta in place via `DeltaTable.convertToDelta` (zero-copy — writes only the `_delta_log`), then runs the 22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is the (near-free) convert; the **query** times are DuckDB reading Delta — there is no second engine to race here, so read them as "the whole schema loads and all 22 queries run at this scale", not a *duckrun is fast* claim.
 
-> **Ingest 8 tables in 0.1s** &middot; **run 22 queries in 672.8s** &middot; SF 100 &middot; 866.0M rows &middot; 4 cores
+> **Ingest 8 tables in 0.2s** &middot; **run 22 queries in 666.7s** &middot; SF 100 &middot; 866.0M rows &middot; 4 cores
 
 ### Setup
 | | |
@@ -32,11 +32,11 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 ### Ingestion — Parquet → Delta (zero-copy convertToDelta)
 | Table | Rows | Convert (s) |
 |---|---:|---:|
-| `nation` | 25 | 0.03 |
-| `region` | 5 | 0.01 |
+| `nation` | 25 | 0.04 |
+| `region` | 5 | 0.00 |
 | `customer` | 15,000,000 | 0.01 |
 | `supplier` | 1,000,000 | 0.01 |
-| `lineitem` | 600,037,902 | 0.06 |
+| `lineitem` | 600,037,902 | 0.07 |
 | `orders` | 150,000,000 | 0.02 |
 | `partsupp` | 80,000,000 | 0.01 |
 | `part` | 20,000,000 | 0.01 |
@@ -45,28 +45,28 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 ### Queries — 22 TPC-H over `delta_scan`
 | Query | Duration (s) |
 |:---|---:|
-| Q01 | 23.667 |
-| Q02 | 6.368 |
-| Q03 | 30.320 |
-| Q04 | 9.319 |
-| Q05 | 38.787 |
-| Q06 | 8.762 |
-| Q07 | 26.246 |
-| Q08 | 45.304 |
-| Q09 | 63.714 |
-| Q10 | 24.783 |
-| Q11 | 4.570 |
-| Q12 | 12.914 |
-| Q13 | 17.407 |
-| Q14 | 23.706 |
-| Q15 | 21.963 |
-| Q16 | 3.817 |
-| Q17 | 116.766 |
-| Q18 | 29.363 |
-| Q19 | 32.802 |
-| Q20 | 38.430 |
-| Q21 | 85.511 |
-| Q22 | 8.303 |
-| **Total** | **672.82** |
+| Q01 | 22.014 |
+| Q02 | 5.934 |
+| Q03 | 31.751 |
+| Q04 | 9.244 |
+| Q05 | 38.782 |
+| Q06 | 8.660 |
+| Q07 | 26.607 |
+| Q08 | 45.266 |
+| Q09 | 61.684 |
+| Q10 | 25.045 |
+| Q11 | 4.580 |
+| Q12 | 11.179 |
+| Q13 | 17.773 |
+| Q14 | 23.664 |
+| Q15 | 21.892 |
+| Q16 | 3.849 |
+| Q17 | 116.297 |
+| Q18 | 29.386 |
+| Q19 | 32.260 |
+| Q20 | 38.469 |
+| Q21 | 84.009 |
+| Q22 | 8.372 |
+| **Total** | **666.72** |
 
 <!-- TPCH:END -->
