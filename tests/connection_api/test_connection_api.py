@@ -2121,6 +2121,26 @@ def test_get_rle_hidden_date_leads(conn):
     assert not recs["uid"]["in_sort_key"]                                    # near-unique → out
 
 
+def test_get_rle_hidden_date_plus_lowcard_dims(conn):
+    # A fact table with TWO independent dates + low-card dimensions. Only ONE date leads; the low-card
+    # dims queries actually filter on (status, flag) must make the key too — they must not be crowded out
+    # by the second high-card date, and the near-unique id stays out. Regression guard: before the ranking
+    # fix the temporal thumb promoted every date, and the byte-gain gate starved the low-card dims, so the
+    # key collapsed to a single date. Periods 53/7/11/59 are pairwise coprime → all four are independent
+    # (no column is a functional dependency of another).
+    conn.sql("select (date '2024-01-01' + (i % 53)::int) as d1, "
+             "(date '2024-01-01' + (i % 59)::int) as d2, "
+             "(i % 7) as status, (i % 11) as flag, i as id "
+             "from range(60000) t(i)").write.mode("overwrite").saveAsTable("factdims")
+    df = conn._get_rle("factdims")
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    key = sorted((c for c, r in recs.items() if r["in_sort_key"]), key=lambda c: recs[c]["sort_position"])
+    assert recs[key[0]]["data_type"] == "DATE"                          # a date leads
+    assert recs["status"]["in_sort_key"] and recs["flag"]["in_sort_key"]  # low-card dims make the key
+    assert not recs["id"]["in_sort_key"]                               # near-unique id does not
+    assert sum(recs[c]["data_type"] == "DATE" for c in key) == 1       # ONE date, not both crowding out dims
+
+
 def test_get_rle_hidden_partition_leads(conn, capsys):
     # R8: partition columns lead the printed ORDER BY (write-locality) but take no compression slot.
     conn.sql("select (i % 4) as region, (i % 3) as cat, (i % 3) * 7 as catlike "
