@@ -652,12 +652,15 @@ class TestDeltaTable:
         assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
 
     def test_optimize(self, conn):
-        # write two commits → two files, then compact; data unchanged, metrics returned.
+        # optimize operates on a TABLE (DeltaTable.forName), not on the session: bin-packing compaction,
+        # or a z-order with zorder_by. write two commits → two files, then compact/z-order; data
+        # unchanged, metrics returned. (The experimental sort rewrite is conn.table(name).optimize().)
         self._seed(conn)
         conn.sql("select 4 id, 10 val").write.mode("append").saveAsTable("m")
-        metrics = DeltaTable.forName(conn, "dbo.m").optimize()
+        metrics = DeltaTable.forName(conn, "dbo.m").optimize()          # bin-packing compaction
         assert metrics["numFilesAdded"] >= 1
         assert conn.table("m").count() == 4
+        assert isinstance(DeltaTable.forName(conn, "dbo.m").optimize(zorder_by=["id"]), dict)  # z-order
 
     def test_table_optimize_auto_keys(self, conn):
         # conn.table(name).optimize() — the experimental sort rewrite: profiles the table (_get_rle),
@@ -751,15 +754,6 @@ class TestDeltaTable:
         wide = _scan_count("rle_wide", 16)
         # DESCRIBE + one sample materialize, independent of column count — NOT one scan per column.
         assert len(narrow) == len(wide) == 2
-
-    def test_conn_optimize_shortcut(self, conn):
-        # conn.optimize(name, ...) is the one-liner over DeltaTable.forName(conn, name).optimize(...):
-        # bin-packing compaction, or a z-order with zorder_by. (The experimental sort rewrite is a
-        # separate op — conn.table(name).optimize(), covered by test_table_optimize_auto_keys.)
-        conn.sql("select (i % 5) as r, i as id from range(5000) t(i)") \
-            .write.mode("overwrite").saveAsTable("co")
-        assert isinstance(conn.optimize("co"), dict)                  # plain compaction
-        assert isinstance(conn.optimize("co", zorder_by=["r"]), dict)  # z-order
 
     def test_vacuum(self, conn):
         # dry_run lists removable files without deleting; never errors on a healthy table.

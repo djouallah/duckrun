@@ -176,17 +176,18 @@ Partitioning itself is `df.write.partitionBy(*cols)` — delta-rs writes Hive-st
 folders and strips the column from the data files (it's re-materialized from the path on read). Sort
 and partition are orthogonal: partitioning decides the folder layout, sorting decides row order.
 
-### `conn.optimize` — compaction and z-order
+### `optimize` — compaction and z-order
+
+Optimize operates on a **table**, not the session:
 
 ```python
-conn.optimize("sales")                       # bin-packing compaction (merge small files)
-conn.optimize("sales", zorder_by=["a", "b"]) # z-order (multi-dimensional file pruning)
+DeltaTable.forName(conn, "sales").optimize()                       # bin-packing compaction
+DeltaTable.forName(conn, "sales").optimize(zorder_by=["a", "b"])   # z-order (file pruning)
 ```
 
-Both are the delta-rs `OPTIMIZE` operations, exposed as a one-liner over
-`DeltaTable.forName(conn, "sales").optimize(...)`. The name resolves like everywhere else — bare =
-current schema, `schema.table` or `catalog.schema.table` to be explicit. Like every ordinary write,
-they use a plain, boring Parquet layout (ZSTD + moderate row groups, delta-rs default file size).
+Both are the delta-rs `OPTIMIZE` operations. The name resolves like everywhere else — bare =
+current schema, `schema.table` or `catalog.schema.table` to be explicit. The experimental sort
+rewrite is a separate operation on the table's DataFrame — `conn.table("sales").optimize()`.
 
 The card below — every public method with a ✅ — is regenerated on every push by
 the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from the `Test*` classes of

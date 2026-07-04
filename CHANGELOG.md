@@ -5,10 +5,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
-- **Experimental sort rewrite moved to `conn.table(name).optimize()`.** The `sort='experimental'` kwarg
-  is removed from `conn.optimize(name, …)` and `DeltaTable.forName(conn, name).optimize(…)` — those now
-  only compact (`conn.optimize("sales")`) or z-order (`conn.optimize("sales", zorder_by=["a","b"])`). The
-  full profiled sort rewrite is `conn.table("sales").optimize()` (auto key) or `.optimize("a","b")`.
+- **`optimize` operates on a table, not the session.** Removed the session-level `conn.optimize(name, …)`.
+  Compaction and z-order are `DeltaTable.forName(conn, name).optimize()` / `.optimize(zorder_by=[…])`; the
+  experimental profiled sort rewrite is `conn.table(name).optimize()` (auto key) or `.optimize("a","b")`.
+  The old `sort='experimental'` kwarg on `DeltaTable.optimize()` is gone.
 - **Single read-layout writer profile for every file write.** The separate "normal" (ZSTD) and
   "optimize" writer configs are collapsed into one Direct-Lake-friendly profile — SNAPPY, 6M-row groups,
   large dictionary page limit (columns stay dictionary-encoded), chunk-level stats, and unique columns
