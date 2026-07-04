@@ -133,6 +133,11 @@ importtime.log
 # Draft blog post (not part of the package)
 intro-blog.md
 
+# Local planning / design docs — untracked scratch, never packaged/committed
+*-plan.md
+optimize-delta-stats-plan*.md
+*vorder-mimic-plan*.md
+
 # MkDocs build output — rebuilt from docs/*.md by `mkdocs build` on every deploy.
 # (docs/taxi.html & docs/multicatalog.html are committed live-report fallbacks that
 # mkdocs copies into the site verbatim, then CI overwrites with the live run.)
