@@ -150,10 +150,10 @@ jobs:
         with:
           name: docs-aemo
           path: integration_tests/aemo/target/static_index.html
-      - name: optimize(sort='experimental') on mart.fct_summary — sort rewrite (dogfood on real data)
-        # Non-blocking: run the experimental sort-rewrite optimiser on the real summary table over
-        # OneLake and print the chosen sort order to the log. Last step on purpose — it's a rewrite
-        # the next dbt build supersedes, and it must not gate the integration on a new feature.
+      - name: conn.table('fct_summary').optimize() — sort rewrite (dogfood on real data)
+        # Non-blocking: run the fluent auto-key sort-rewrite on the real summary table over OneLake and
+        # print the chosen sort order to the log. Last step on purpose — it's a rewrite the next dbt
+        # build supersedes, and it must not gate the integration on a new feature.
         continue-on-error: true
         run: |
           python - <<'PY'
@@ -162,8 +162,8 @@ jobs:
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema="mart", read_only=False)
-          result = conn.optimize("fct_summary", sort="experimental")
-          print("=== optimize(sort='experimental') result ===")
+          result = conn.table("fct_summary").optimize()
+          print("=== conn.table('fct_summary').optimize() result ===")
           print("sort order:", result.get("sortedBy", result))
           b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
           if b:
@@ -269,10 +269,11 @@ jobs:
         with:
           name: docs-coffee
           path: integration_tests/coffee/target/static_index.html
-      - name: optimize(sort='experimental') on coffee 'fact_sales' — sort rewrite (dogfood)
+      - name: conn.table('fact_sales').optimize() — sort rewrite (dogfood)
         # Non-blocking dogfood on the partitioned coffee fact: connect writable to the dbt build's
-        # schema, run the sort rewrite, print the chosen sort order + the REAL on-disk size reduction.
-        # fact_sales is partitioned by region (R8) and has season<-order_date (R5), so it exercises both.
+        # schema, run the fluent auto-key sort rewrite, print the chosen sort order + the REAL on-disk
+        # size reduction. fact_sales is partitioned by region (R8) and has season<-order_date (R5), so
+        # it exercises both partition-leading order and the profiler.
         continue-on-error: true
         env:
           DBT_SCHEMA: duckrun_dbt_it
@@ -283,8 +284,8 @@ jobs:
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema=os.environ["DBT_SCHEMA"], read_only=False)
-          result = conn.optimize("fact_sales", sort="experimental")
-          print("=== optimize(sort='experimental') result ===")
+          result = conn.table("fact_sales").optimize()
+          print("=== conn.table('fact_sales').optimize() result ===")
           print("sort order:", result.get("sortedBy", result))
           b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
           if b:
@@ -350,9 +351,9 @@ jobs:
           DUCKRUN_TAXI_PAGE: taxi_run.html   # the demo writes its full SQL+results HTML report here
         run: python integration_tests/taxi/demo_taxi.py
 
-      - name: optimize(sort='experimental') on the taxi 'trips' table — sort rewrite (dogfood)
-        # Non-blocking dogfood of the experimental sort rewrite on the demo fact table: connect
-        # writable, run the sort-rewrite optimize, and print the chosen sort order to the CI log.
+      - name: conn.table('trips').optimize() — sort rewrite (dogfood)
+        # Non-blocking dogfood of the fluent auto-key sort rewrite on the demo fact table: connect
+        # writable, run conn.table('trips').optimize(), and print the chosen sort order to the CI log.
         continue-on-error: true
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
@@ -364,8 +365,8 @@ jobs:
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema=os.environ["DUCKRUN_TAXI_SCHEMA"], read_only=False)
-          result = conn.optimize("trips", sort="experimental")
-          print("=== optimize(sort='experimental') result ===")
+          result = conn.table("trips").optimize()
+          print("=== conn.table('trips').optimize() result ===")
           print("sort order:", result.get("sortedBy", result))
           b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
           if b:
