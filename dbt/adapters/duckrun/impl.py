@@ -113,6 +113,21 @@ class DuckrunAdapter(DuckDBAdapter):
             return None
 
     @available
+    def delta_state(self, location) -> dict:
+        """``{'exists': bool, 'version': int|None}`` from a SINGLE DeltaTable open, so a model's
+        materialization asks the log once instead of twice (delta_table_exists + delta_version were
+        two separate opens = two remote log replays per model). Same semantics as calling both:
+        a genuinely-missing table -> ``{exists: False, version: None}``; a real fault (transient
+        storage error, bad token) RE-RAISES rather than masquerading as absent (see delta_version)."""
+        from . import engine
+        from deltalake.exceptions import TableNotFoundError
+        so = self.config.credentials.storage_options_for_location(location)
+        try:
+            return {"exists": True, "version": engine._delta_table(location, so).version()}
+        except TableNotFoundError:
+            return {"exists": False, "version": None}
+
+    @available
     def persist_delta_docs(self, location, relation_docs, column_docs) -> None:
         """Persist a model's relation/column descriptions into the Delta table's metadata so they
         survive into a later ``dbt docs generate`` (a fresh process that rebuilds the views from

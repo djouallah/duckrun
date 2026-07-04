@@ -53,11 +53,14 @@
   {%- set tmp_relation = p['tmp'] -%}
   {%- set location = p['location'] -%}
 
-  {#-- Capture the target's Delta version NOW, before pre-hooks or the model read `{{ this }}`,
-       so `safeappend` can pin to it: if any writer commits during this build, the optimistic
-       append fails (rather than appending against a newer version and risking a duplicate).
-       None when the table doesn't exist yet (first run overwrites anyway). --#}
-  {%- set read_version = adapter.delta_version(location) -%}
+  {#-- Capture the target's Delta version AND existence NOW, before pre-hooks or the model read
+       `{{ this }}`, in a SINGLE log open (delta_state) instead of two — so `safeappend` can pin to
+       the version (if any writer commits during this build, the optimistic append fails rather than
+       appending against a newer version and risking a duplicate), and the plugin gets the "table
+       exists" belief for its contradiction guard. read_version is None when the table doesn't exist
+       yet (first run overwrites anyway). --#}
+  {%- set _delta_state = adapter.delta_state(location) -%}
+  {%- set read_version = _delta_state['version'] -%}
 
   {#-- Pre-register {{ this }} as a delta_scan view when the Delta table already exists on
        disk, so pre-hooks and the model's own SQL (is_incremental self-reference) can read the
@@ -68,7 +71,7 @@
        same "table exists" belief here so the plugin can detect a contradiction (discovery said
        it exists, but the Delta table can't be opened at store time → a transient storage error,
        NOT a real absence) and refuse to overwrite an incremental dataset. --#}
-  {%- set dbt_believes_exists = adapter.delta_table_exists(location) -%}
+  {%- set dbt_believes_exists = _delta_state['exists'] -%}
   {#-- Pin the self-reference view to the captured `vB` (delta_scan version => N, requires the
        duckdb-delta version param). This makes the model's `is_incremental()` read of `{{ this }}`
        resolve at EXACTLY the version the write commit will validate OCC against — one snapshot for

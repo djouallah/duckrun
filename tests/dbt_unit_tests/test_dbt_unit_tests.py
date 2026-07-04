@@ -151,6 +151,19 @@ def test_incremental_strategy_two_runs(tmp_path, strategy):
     assert rows == _STRATEGY_EXPECTED[strategy], rows
 
 
+def test_merge_materialize_source_two_runs(tmp_path):
+    """merge with merge_materialize_source=true (review #14): the model is staged once into a temp
+    table before the guards + delta_rs merge. Result must match the ordinary merge upsert."""
+    wh = _wh(tmp_path)
+    assert _dbt(wh, "seed").success
+    assert _dbt(wh, "run", "--select", "+events_merge_materialized", "--vars", "{load: 1}").success
+    assert _dbt(wh, "run", "--select", "+events_merge_materialized", "--vars", "{load: 2}").success
+    con = duckrun.connect(wh, schema=SCHEMA, read_only=True)
+    rows = dict(con.sql(
+        "select event_id, amount from events_merge_materialized order by event_id").fetchall())
+    assert rows == {1: 111.0, 2: 222.0, 3: 333.0, 4: 400.0, 5: 500.0, 6: 600.0}, rows
+
+
 def test_incremental_microbatch_two_batches(tmp_path):
     """The microbatch strategy: dbt runs one delete+insert per daily event_time batch. Process day 1
     (events 1-3) then day 2 (events 4-6) with bounded --event-time windows and assert the real Delta

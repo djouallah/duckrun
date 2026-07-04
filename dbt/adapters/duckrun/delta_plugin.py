@@ -202,6 +202,24 @@ class Plugin(BasePlugin):
         # (the rollback the constraint tests assert). Message carries "NOT NULL constraint failed"
         # to match dbt's standard contract-error phrasing.
         not_null_columns = cfg.get("not_null_columns") or []
+
+        # #14: for a keyed merge, optionally evaluate the model SQL ONCE into a DuckDB temp table so
+        # the not-null guard, the merge cardinality guard, and delta_rs's source collection all see
+        # IDENTICAL rows — otherwise a nondeterministic model (now(), a moved external source) lets the
+        # guards vouch for rows that aren't the ones merged, and the SQL is re-run 2-3x. Opt in via
+        # merge_materialize_source, or automatically when a not-null contract is active. Streaming
+        # stays the default (memory behavior unchanged) for merges without a guard. The temp is bounded
+        # by the write memory clamp + spill dir like any other DuckDB result.
+        src_tmp = None
+        _resolved_strategy = strategy or ("merge" if unique_key else "append")
+        _merge_path = (incremental and not full_refresh and exists
+                       and _resolved_strategy in ("merge", "insert"))
+        if _merge_path and (cfg.get("merge_materialize_source") or not_null_columns):
+            src_tmp = f'"__duckrun_msrc_{abs(hash(path)) & 0xFFFFFFFF}"'
+            cur.execute(f"CREATE OR REPLACE TEMP TABLE {src_tmp} AS SELECT * FROM {name}")
+            name = src_tmp                       # guard + view name both read the one materialization
+            data = cur.sql(f"SELECT * FROM {src_tmp}")
+
         if not_null_columns:
             self._assert_not_null(cur, name, not_null_columns)
 
@@ -319,6 +337,8 @@ class Plugin(BasePlugin):
                         storage_options=storage_options,
                         compaction_threshold=self._compaction_threshold,
                     )
+            if src_tmp is not None:
+                cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")  # #14: release the materialized source
         elif strategy == "append":
             with engine.mem_profile("append", con=cur):
                 engine.write_delta(

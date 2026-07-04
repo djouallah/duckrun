@@ -33,10 +33,12 @@
   {%- set location = p['location'] -%}
   {%- set _loc_sql = location | replace("'", "''") -%}
 
-  {#-- Version/existence of the Delta table, captured before the model reads anything, so the
-       merge can pin OCC to it (single snapshot for the staging read and the merge commit). --#}
-  {%- set read_version = adapter.delta_version(location) -%}
-  {%- set exists = adapter.delta_table_exists(location) -%}
+  {#-- Version/existence of the Delta table, captured before the model reads anything (one log open
+       via delta_state, not two), so the merge can pin OCC to it (single snapshot for the staging
+       read and the merge commit). --#}
+  {%- set _delta_state = adapter.delta_state(location) -%}
+  {%- set read_version = _delta_state['version'] -%}
+  {%- set exists = _delta_state['exists'] -%}
 
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
   {%- do adapter.create_schema(target_relation) -%}
