@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Target file size 1 GB → 128 MB, one row group per file.** A Parquet row group can't span files, so
+  a large file-size cap silently truncates the row group (delta-rs closes the file mid-group), leaving
+  small, non-uniform Direct Lake column segments — and on wide tables no segment ever reached the ideal
+  size. 128 MB matches the mainstream default (delta-rs's own ~100 MB, Databricks optimized-writes,
+  Hudi) and keeps segments uniform: narrow data lands whole 6M-row groups, wide data caps at ~128 MB /
+  one row group per file. Applies to the optimize-layout writes and to routine post-write compaction.
+- **Row group unified to 6M rows for both the normal write and the sort-rewrite** (was 4M / 8M). 6M sits
+  mid-band in Fabric's 1M–16M segment guidance while bounding write-time memory (arrow-rs buffers a full
+  uncompressed row group per open writer).
+
 ## [0.3.31] - 2026-07-03
 
 ### Added

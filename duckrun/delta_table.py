@@ -309,7 +309,7 @@ class DeltaTable:
             if order_cols else ""
         rel = con.sql(f"SELECT * FROM delta_scan('{plit}'){where_sql}{order_sql}")
         # optimize_layout=True: the sort-rewrite is the ONE path that writes the tuned read layout
-        # (opinionated writer properties + ~1 GB files). Normal writes don't. plain_cols disables the
+        # (opinionated writer properties + 128 MB files). Normal writes don't. plain_cols disables the
         # (useless) dictionary on the unique columns.
         if where is None:
             engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),

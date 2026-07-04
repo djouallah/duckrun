@@ -34,14 +34,11 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# Normal-write row group: 4M rows. Bigger row groups give fewer, larger scan ranges at the cost of
-# more write-time memory (arrow-rs buffers a full row group per open writer). Kept moderate on the hot
-# write paths; the experimental optimize uses the larger segment below.
-_MAX_ROW_GROUP_SIZE = 1_048_576 * 4
-# Optimize (experimental sort-rewrite) row group: 8 × 1,048,576 = 8,388,608 rows = one large
-# in-memory-reader segment. A read-layout pass wants full segments; the extra write-time memory is
-# acceptable on an opt-in path.
-_OPTIMIZE_ROW_GROUP_SIZE = 1_048_576 * 8
+# Row group size: 6M rows, used by BOTH the normal write path and the experimental sort-rewrite.
+# A Parquet row group maps 1:1 to a Direct Lake column segment, and Fabric wants segments
+# in the 1M–16M row band, uniform in size. 6M sits mid-band while bounding write-time memory — arrow-rs
+# buffers a full uncompressed row group per open writer, which is the real OOM lever on the hot path.
+_ROW_GROUP_SIZE = 1_048_576 * 6
 # Bounded-but-large dictionary page limit (256 MB). arrow-rs's ~1 MB default silently falls back
 # to PLAIN mid column chunk on wide columns at multi-million rows/group, defeating the dictionary
 # encoding an in-memory columnar reader transcodes into its hash encoding. 256 MB holds any dictionary worth having
@@ -50,11 +47,15 @@ _OPTIMIZE_ROW_GROUP_SIZE = 1_048_576 * 8
 _DICT_PAGE_SIZE_LIMIT = 256 * 1024 * 1024
 # Bigger data pages → fewer page headers and runs that survive page boundaries. Tuned-path only.
 _DATA_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
-# Target file size (~1 GB) for the experimental sort-rewrite ONLY — a pure read-layout pass that wants
-# fewer, fatter files for a columnar reader. NOT a normal-write default: normal append/overwrite/merge writes
-# leave target_file_size unset (delta-rs default), so an incremental MERGE never has to rewrite whole
-# 1 GB files. Applied only when build_write_deltalake_args is called with optimize_layout=True.
-_TARGET_FILE_SIZE = 1024 * 1024 * 1024
+# Target file size: 128 MB. A Parquet row group can't span files, so this byte cap is really a
+# segment cap: if a full 6M-row group would exceed it, delta-rs truncates the row group to fit —
+# which is what starves Direct Lake segments and leaves a non-uniform tail. 128 MB matches the
+# mainstream default (delta-rs's own ~100 MB, Databricks optimized-writes, Hudi ~120 MB) and keeps
+# segments uniform: small/narrow data lands whole 6M-row groups, wide data caps at ~128 MB one row
+# group per file. Deliberately NOT 1 GB — that truncated wide-table segments below the ideal size.
+# Applied by the optimize-layout writes (build_write_deltalake_args, optimize_layout=True) and by the
+# routine post-write compaction so maintenance keeps the same 128 MB layout.
+_TARGET_FILE_SIZE = 128 * 1024 * 1024
 
 
 def _writer_properties():
@@ -65,7 +66,7 @@ def _writer_properties():
     if WriterProperties is None:
         return None
     for kwargs in (
-        dict(compression="ZSTD", max_row_group_size=_MAX_ROW_GROUP_SIZE),
+        dict(compression="ZSTD", max_row_group_size=_ROW_GROUP_SIZE),
         dict(compression="ZSTD"),
     ):
         try:
@@ -100,13 +101,13 @@ def _tuned_writer_properties(plain_cols=None):
                 per_col = None
     for kwargs in (
         dict(compression="SNAPPY",
-             max_row_group_size=_OPTIMIZE_ROW_GROUP_SIZE,
+             max_row_group_size=_ROW_GROUP_SIZE,
              dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
              statistics_truncate_length=64,
              default_column_properties=col_props,
              column_properties=per_col),
-        dict(compression="SNAPPY", max_row_group_size=_OPTIMIZE_ROW_GROUP_SIZE),
+        dict(compression="SNAPPY", max_row_group_size=_ROW_GROUP_SIZE),
         dict(compression="SNAPPY"),
     ):
         try:
@@ -595,7 +596,7 @@ def build_write_deltalake_args(
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
     ``optimize_layout`` selects the read layout — the tuned writer properties
-    plus the ~1 GB ``target_file_size``. It is opt-in and used only by the experimental sort-rewrite;
+    plus the 128 MB ``target_file_size``. It is opt-in and used only by the experimental sort-rewrite;
     every normal write leaves it False and gets plain ZSTD + row groups with delta-rs's default file
     size (so an incremental MERGE never has to rewrite fat files). ``plain_cols`` (optimize_layout only)
     are unique columns written PLAIN — no dictionary."""
@@ -825,8 +826,8 @@ def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:
 
     compact() reuses the plain _writer_properties() (ZSTD + row groups) — the same config the write
     used. The read-layout tuning is not applied here; it belongs only to the opt-in
-    experimental sort-rewrite. It also passes the same _TARGET_FILE_SIZE the write path targets, so
-    maintenance keeps the few-fat-files layout instead of binning to delta-rs's smaller default."""
+    experimental sort-rewrite. It also passes the same 128 MB _TARGET_FILE_SIZE, so maintenance keeps
+    the uniform 128 MB / one-row-group-per-file layout Direct Lake wants."""
     if len(dt.file_uris()) > compaction_threshold:
         dt.optimize.compact(target_size=_TARGET_FILE_SIZE, writer_properties=_writer_properties())
         dt.vacuum(dry_run=False)
@@ -856,7 +857,7 @@ def write_delta(
     ``merge_schema`` evolves the schema (adds columns); ``overwrite_schema`` replaces it wholesale
     (overwrite mode only — Delta's ``overwriteSchema``). They are mutually exclusive.
 
-    ``optimize_layout`` opts into the read layout (tuned writer properties + ~1 GB files);
+    ``optimize_layout`` opts into the read layout (tuned writer properties + 128 MB files);
     only the experimental sort-rewrite sets it. Normal writes leave it False (plain ZSTD + row groups).
     """
     if mode not in {"overwrite", "append", "ignore"}:
