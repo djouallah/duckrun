@@ -39,53 +39,38 @@ except ImportError:  # pragma: no cover - older layouts
 # in the 1M–16M row band, uniform in size. 6M sits mid-band while bounding write-time memory — arrow-rs
 # buffers a full uncompressed row group per open writer, which is the real OOM lever on the hot path.
 _ROW_GROUP_SIZE = 1_048_576 * 6
-# Bounded-but-large dictionary page limit (256 MB). arrow-rs's ~1 MB default silently falls back
+# Bounded-but-large dictionary page limit (128 MB). arrow-rs's ~1 MB default silently falls back
 # to PLAIN mid column chunk on wide columns at multi-million rows/group, defeating the dictionary
-# encoding an in-memory columnar reader transcodes into its hash encoding. 256 MB holds any dictionary worth having
+# encoding an in-memory columnar reader transcodes into its hash encoding. 128 MB holds any dictionary worth having
 # and caps the per-column write RAM; a column that overflows it was never a good dictionary candidate.
-# Used ONLY by _tuned_writer_properties() (the experimental sort-rewrite), not by normal writes.
-_DICT_PAGE_SIZE_LIMIT = 256 * 1024 * 1024
-# Bigger data pages → fewer page headers and runs that survive page boundaries. Tuned-path only.
-_DATA_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
+_DICT_PAGE_SIZE_LIMIT = 134_217_728
+# Data page byte limit (1 MB) — governs wide / PLAIN (non-dictionary) columns; the row-group row count
+# is the real cutter (data_page_row_count_limit is set to the row group size, i.e. off).
+_DATA_PAGE_SIZE_LIMIT = 1_048_576
 # Target file size: 128 MB. A Parquet row group can't span files, so this byte cap is really a
 # segment cap: if a full 6M-row group would exceed it, delta-rs truncates the row group to fit —
 # which is what starves Direct Lake segments and leaves a non-uniform tail. 128 MB matches the
 # mainstream default (delta-rs's own ~100 MB, Databricks optimized-writes, Hudi ~120 MB) and keeps
 # segments uniform: small/narrow data lands whole 6M-row groups, wide data caps at ~128 MB one row
 # group per file. Deliberately NOT 1 GB — that truncated wide-table segments below the ideal size.
-# Applied by the optimize-layout writes (build_write_deltalake_args, optimize_layout=True) and by the
-# routine post-write compaction so maintenance keeps the same 128 MB layout.
+# Applied by every file write (build_write_deltalake_args) and the routine post-write compaction, so the
+# whole table keeps the same 128 MB layout. MERGE is the exception — it sets no target_file_size.
 _TARGET_FILE_SIZE = 128 * 1024 * 1024
 
 
-def _writer_properties():
-    # Plain, boring writer config for every normal write path (append/overwrite/if_unchanged),
-    # compaction, and classic optimize: ZSTD + large row groups, nothing else.
-    # The opinionated read-layout tuning lives in _tuned_writer_properties() and is reached only by the
-    # opt-in experimental sort-rewrite. Fall back to ZSTD-only if a pinned wheel rejects a parameter.
-    if WriterProperties is None:
-        return None
-    for kwargs in (
-        dict(compression="ZSTD", max_row_group_size=_ROW_GROUP_SIZE),
-        dict(compression="ZSTD"),
-    ):
-        try:
-            return WriterProperties(**kwargs)
-        except Exception:  # best-effort: any build rejection tries the next, simpler rung
-            continue
-    return None
-
-
-def _tuned_writer_properties(plain_cols=None):
-    # Opinionated Parquet config for the read layout: ZSTD (same codec as the normal write — SNAPPY
-    # tripled on-disk size for no read-layout benefit), large row groups, a bounded-but-large dictionary
-    # page limit so wide dictionaries stay dictionary-encoded, big data pages, and chunk-level stats.
-    # Used ONLY by the experimental sort-rewrite (optimize_layout=True) — deliberately kept off the hot
-    # write paths, where it made merges rewrite/spill fat files. Degrade gracefully if the pinned wheel
-    # rejects a newer parameter (last rung: ZSTD-only).
+def _writer_properties(plain_cols=None):
+    # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
+    # compaction, and the optimize sort-rewrite: SNAPPY, 6M-row row groups, a bounded-but-large
+    # dictionary page limit so wide dictionaries stay dictionary-encoded, small data pages with the
+    # per-page row cap set to the row group size (byte limit is the only page cutter), and chunk-level
+    # stats. MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults)
+    # so a merge stays quick and never rewrites fat files; post-merge compaction folds merged files up
+    # into this layout later. Degrade gracefully if the pinned wheel rejects a newer parameter
+    # (last rung: SNAPPY-only).
     #
     # ``plain_cols`` are unique/near-unique columns whose dictionary buys nothing (every value distinct);
     # they get a per-column ColumnProperties(dictionary_enabled=False) so arrow-rs writes them PLAIN.
+    # Only the sort-rewrite passes them (it profiles for uniqueness); other writes leave it None.
     if WriterProperties is None:
         return None
     col_props = None
@@ -101,15 +86,16 @@ def _tuned_writer_properties(plain_cols=None):
             except Exception:  # best-effort: a rejected per-column build just keeps the dictionary on
                 per_col = None
     for kwargs in (
-        dict(compression="ZSTD",
+        dict(compression="SNAPPY",
              max_row_group_size=_ROW_GROUP_SIZE,
              dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
+             data_page_row_count_limit=_ROW_GROUP_SIZE,   # effectively off — byte limit is the cutter
              statistics_truncate_length=64,
              default_column_properties=col_props,
              column_properties=per_col),
-        dict(compression="ZSTD", max_row_group_size=_ROW_GROUP_SIZE),
-        dict(compression="ZSTD"),
+        dict(compression="SNAPPY", max_row_group_size=_ROW_GROUP_SIZE),
+        dict(compression="SNAPPY"),
     ):
         try:
             return WriterProperties(**{k: v for k, v in kwargs.items() if v is not None})
@@ -591,16 +577,14 @@ def build_write_deltalake_args(
     schema_mode: Optional[str] = None,
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    optimize_layout: bool = False,
     plain_cols: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
-    ``optimize_layout`` selects the read layout — the tuned writer properties
-    plus the 128 MB ``target_file_size``. It is opt-in and used only by the experimental sort-rewrite;
-    every normal write leaves it False and gets plain ZSTD + row groups with delta-rs's default file
-    size (so an incremental MERGE never has to rewrite fat files). ``plain_cols`` (optimize_layout only)
-    are unique columns written PLAIN — no dictionary."""
+    Every file write gets the one read-layout profile: the tuned writer properties plus the 128 MB
+    ``target_file_size``. (MERGE does not go through here — it passes no writer_properties, so a merge
+    stays quick and never rewrites fat files.) ``plain_cols`` are unique columns written PLAIN — no
+    dictionary; only the sort-rewrite passes them."""
     args: Dict[str, Any] = {
         "table_or_uri": path,
         "data": data,
@@ -614,11 +598,8 @@ def build_write_deltalake_args(
     # mode only) — delta-rs's own schema_mode values, passed straight through.
     if schema_mode in ("merge", "overwrite"):
         args["schema_mode"] = schema_mode
-    if optimize_layout:
-        args["target_file_size"] = _TARGET_FILE_SIZE
-        wp = _tuned_writer_properties(plain_cols=plain_cols)
-    else:
-        wp = _writer_properties()
+    args["target_file_size"] = _TARGET_FILE_SIZE
+    wp = _writer_properties(plain_cols=plain_cols)
     if wp is not None:
         args["writer_properties"] = wp
     return args
@@ -825,10 +806,9 @@ def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:
     log entries. Without it a table written on every run fragments into small files and keeps old
     versions forever. (The overwrite path vacuums unconditionally instead and does not use this.)
 
-    compact() reuses the plain _writer_properties() (ZSTD + row groups) — the same config the write
-    used. The read-layout tuning is not applied here; it belongs only to the opt-in
-    experimental sort-rewrite. It also passes the same 128 MB _TARGET_FILE_SIZE, so maintenance keeps
-    the uniform 128 MB / one-row-group-per-file layout Direct Lake wants."""
+    compact() reuses the same _writer_properties() read layout every file write uses, and the same
+    128 MB _TARGET_FILE_SIZE — so maintenance (including the consolidation of files a lean MERGE left
+    behind) keeps the uniform 128 MB / one-row-group-per-file layout Direct Lake wants."""
     if len(dt.file_uris()) > compaction_threshold:
         dt.optimize.compact(target_size=_TARGET_FILE_SIZE, writer_properties=_writer_properties())
         dt.vacuum(dry_run=False)
@@ -845,7 +825,6 @@ def write_delta(
     overwrite_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
-    optimize_layout: bool = False,
     plain_cols: Optional[List[str]] = None,
 ) -> None:
     """
@@ -858,8 +837,8 @@ def write_delta(
     ``merge_schema`` evolves the schema (adds columns); ``overwrite_schema`` replaces it wholesale
     (overwrite mode only — Delta's ``overwriteSchema``). They are mutually exclusive.
 
-    ``optimize_layout`` opts into the read layout (tuned writer properties + 128 MB files);
-    only the experimental sort-rewrite sets it. Normal writes leave it False (plain ZSTD + row groups).
+    Every write lands in the one read-layout profile (tuned writer properties + 128 MB files).
+    ``plain_cols`` (sort-rewrite only) are unique columns written PLAIN — no dictionary.
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
@@ -881,7 +860,6 @@ def write_delta(
         schema_mode=schema_mode,
         partition_by=partition_by,
         storage_options=storage_options,
-        optimize_layout=optimize_layout,
         plain_cols=plain_cols,
     )
     write_deltalake(**args)
@@ -1036,7 +1014,6 @@ def replace_where(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
-    optimize_layout: bool = False,
     plain_cols: Optional[List[str]] = None,
 ) -> None:
     """``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
@@ -1059,7 +1036,7 @@ def replace_where(
         )
     args = build_write_deltalake_args(
         path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
-        optimize_layout=optimize_layout, plain_cols=plain_cols,
+        plain_cols=plain_cols,
     )
     args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
     # Pin to the read snapshot and disable rebasing, so a concurrent commit since vB fails this
@@ -1208,8 +1185,7 @@ def optimize(
     operation metrics. With ``zorder_by`` the files are Z-ordered on those columns
     (``optimize.z_order``); otherwise a plain bin-packing compaction (``optimize.compact``).
 
-    Both rewrites reuse the plain ``_writer_properties()`` (ZSTD + row groups); the opinionated
-    read-layout tuning belongs only to the experimental sort-rewrite. Note that ``z_order`` rewrites
+    Both rewrites reuse the one ``_writer_properties()`` read layout. Note that ``z_order`` rewrites
     files in bit-interleaved order, which *destroys* long run-length runs — a lexicographic
     ``ORDER BY`` at write time is what a columnar reader wants; only reach for z-order when
     multi-dimensional file pruning matters more."""

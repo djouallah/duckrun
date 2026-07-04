@@ -499,7 +499,7 @@ class TestDataFrameWriter:
         conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
             .write.optimize("region").mode("overwrite").saveAsTable("wo")
         assert conn.table("wo").count() == 20000
-        assert conn.get_stats("wo").df()["compression"].tolist() == ["ZSTD"]
+        assert conn.get_stats("wo").df()["compression"].tolist() == ["SNAPPY"]
         f = engine._delta_table(conn.root_path + "/dbo/wo", None).file_uris()[0].replace("file://", "")
         regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
         assert regs == sorted(regs)
@@ -510,7 +510,7 @@ class TestDataFrameWriter:
         conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
             .write.optimize().mode("overwrite").saveAsTable("wo_auto")
         assert conn.table("wo_auto").count() == 20000
-        assert conn.get_stats("wo_auto").df()["compression"].tolist() == ["ZSTD"]
+        assert conn.get_stats("wo_auto").df()["compression"].tolist() == ["SNAPPY"]
         f = engine._delta_table(conn.root_path + "/dbo/wo_auto", None).file_uris()[0].replace("file://", "")
         regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
         assert regs == sorted(regs)  # region is the low-cardinality key the profiler leads with
@@ -2152,8 +2152,8 @@ def test_writer_keeps_dictionary_encoding(conn):
 # optimize() end-to-end — INGEST raw data from a file, land it through every optimize combination,
 # and assert the one invariant that matters: OPTIMIZE CHANGES THE LAYOUT, NEVER THE DATA. Each variant
 # must hold the exact same row multiset as the raw baseline, and the optimized layout must be physically
-# clustered by its sort key. Codec stays ZSTD throughout (optimize re-lays-out, it doesn't recompress).
-# All local-fs, network-free.
+# clustered by its sort key. Codec is SNAPPY throughout — the one read-layout profile every file write
+# uses. All local-fs, network-free.
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 # A realistic sales fact with no unique column (max ndv 5000 << 60000 rows), so the profiler picks the
@@ -2214,7 +2214,7 @@ def test_optimize_e2e_ingest_then_write_variants(raw_sales):
     conn, praw, expected = raw_sales
     read = lambda: conn.read.format("parquet").load(praw)  # a fresh source relation per write
 
-    read().write.mode("overwrite").saveAsTable("s_raw")                       # baseline: ZSTD, unsorted
+    read().write.mode("overwrite").saveAsTable("s_raw")                       # baseline: SNAPPY, unsorted
     read().write.optimize().mode("overwrite").saveAsTable("s_auto")           # DL layout, auto key
     read().write.optimize("category").mode("overwrite").saveAsTable("s_cat")  # DL layout, explicit key
     read().write.optimize("day").partitionBy("region").mode("overwrite").saveAsTable("s_part")
@@ -2223,9 +2223,9 @@ def test_optimize_e2e_ingest_then_write_variants(raw_sales):
     for name in ("s_raw", "s_auto", "s_cat", "s_part"):
         assert _rows(conn, name) == expected, f"{name} changed the data"
 
-    # 2) CODECS — ZSTD throughout; optimize re-lays-out the data, it doesn't recompress.
+    # 2) CODECS — SNAPPY throughout; one read-layout profile for normal write and optimize alike.
     for name in ("s_raw", "s_auto", "s_cat", "s_part"):
-        assert _codecs(conn, name) == {"ZSTD"}, f"{name} is not ZSTD"
+        assert _codecs(conn, name) == {"SNAPPY"}, f"{name} is not SNAPPY"
 
     # 3) CLUSTERING — the file is physically ordered by its sort key.
     assert _clustered_by(conn, "s_auto", "region")  # region is the leading low-card dimension
@@ -2236,15 +2236,15 @@ def test_optimize_e2e_ingest_then_write_variants(raw_sales):
 
 def test_optimize_e2e_write_raw_then_table_optimize(raw_sales):
     # The other entry point: land raw, THEN rewrite in place via conn.table(name).optimize(). Auto and
-    # explicit keys both preserve the data; the codec stays ZSTD (re-layout, not recompress).
+    # explicit keys both preserve the data; the codec is SNAPPY (the one read-layout profile).
     conn, praw, expected = raw_sales
     conn.read.format("parquet").load(praw).write.mode("overwrite").saveAsTable("t1")
-    assert _codecs(conn, "t1") == {"ZSTD"}
+    assert _codecs(conn, "t1") == {"SNAPPY"}
 
     m = conn.table("t1").optimize()                       # auto-key rewrite
     assert m["operation"] == "sortRewrite" and m["sortedBy"]
     assert _rows(conn, "t1") == expected
-    assert _codecs(conn, "t1") == {"ZSTD"}
+    assert _codecs(conn, "t1") == {"SNAPPY"}
     assert _clustered_by(conn, "t1", m["sortedBy"][0])    # clustered by whatever the profiler led with
 
     # Re-optimizing with an explicit key re-clusters the same data (idempotent on rows).
@@ -2258,7 +2258,7 @@ def test_optimize_e2e_chain_write_optimize_then_rekey(raw_sales):
     # handle. Data survives every hop; the clustering follows the most recent key.
     conn, praw, expected = raw_sales
     conn.read.format("parquet").load(praw).write.optimize("category").mode("overwrite").saveAsTable("c1")
-    assert _clustered_by(conn, "c1", "category") and _codecs(conn, "c1") == {"ZSTD"}
+    assert _clustered_by(conn, "c1", "category") and _codecs(conn, "c1") == {"SNAPPY"}
 
     conn.table("c1").optimize("day")
     assert _rows(conn, "c1") == expected

@@ -300,20 +300,19 @@ class DeltaTable:
         order_sql = (" ORDER BY " + ", ".join('"' + c.replace('"', '""') + '"' for c in order_cols)) \
             if order_cols else ""
         rel = con.sql(f"SELECT * FROM delta_scan('{plit}'){where_sql}{order_sql}")
-        # optimize_layout=True: the sort-rewrite is the ONE path that writes the tuned read layout
-        # (opinionated writer properties + 128 MB files). Normal writes don't. plain_cols disables the
-        # (useless) dictionary on the unique columns.
+        # The sort-rewrite passes plain_cols so the unique columns skip the (useless) dictionary; the
+        # read layout (writer properties + 128 MB files) is the single profile every file write uses.
         if where is None:
             engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
                                storage_options=self.storage_options,
                                compaction_threshold=self.compaction_threshold,
-                               optimize_layout=True, plain_cols=plain_cols)
+                               plain_cols=plain_cols)
         else:
             # Scoped rewrite: replace ONLY the matching partitions in one atomic, snapshot-fenced commit.
             engine.replace_where(self.path, rel, where, read_version=self._read_version,
                                  partition_by=(pcols or None), storage_options=self.storage_options,
                                  compaction_threshold=self.compaction_threshold,
-                                 optimize_layout=True, plain_cols=plain_cols)
+                                 plain_cols=plain_cols)
         self._resnapshot()
         _, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
         saved = round(100.0 * (before - after) / before, 1) if before else 0.0

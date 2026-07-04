@@ -1676,7 +1676,7 @@ class DataFrameWriter:
                 path, rel, mode="overwrite", partition_by=(pcols or None),
                 overwrite_schema=self._overwrite_schema, storage_options=so,
                 compaction_threshold=session.compaction_threshold,
-                optimize_layout=True, plain_cols=plain_cols,
+                plain_cols=plain_cols,
             )
             return
 
