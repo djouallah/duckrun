@@ -493,6 +493,40 @@ class TestDataFrameWriter:
         with pytest.raises(ValueError):
             conn.sql("select 2 a").write.save(p)  # default error, path exists
 
+    def test_write_optimize_user_keys(self, conn):
+        # .write.optimize("region").mode("overwrite") lands the write sorted by region in the tuned
+        # SNAPPY layout in ONE pass. Data preserved; the active file is clustered by region.
+        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
+            .write.optimize("region").mode("overwrite").saveAsTable("wo")
+        assert conn.table("wo").count() == 20000
+        assert conn.get_stats("wo").df()["compression"].tolist() == ["SNAPPY"]
+        f = engine._delta_table(conn.root_path + "/dbo/wo", None).file_uris()[0].replace("file://", "")
+        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
+        assert regs == sorted(regs)
+
+    def test_write_optimize_auto_keys(self, conn):
+        # .write.optimize() with no args profiles the data being written to pick the sort key, then
+        # writes in the tuned layout — the write-time twin of conn.table(name).optimize().
+        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
+            .write.optimize().mode("overwrite").saveAsTable("wo_auto")
+        assert conn.table("wo_auto").count() == 20000
+        assert conn.get_stats("wo_auto").df()["compression"].tolist() == ["SNAPPY"]
+        f = engine._delta_table(conn.root_path + "/dbo/wo_auto", None).file_uris()[0].replace("file://", "")
+        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
+        assert regs == sorted(regs)  # region is the low-cardinality key the profiler leads with
+
+    def test_write_optimize_partitioned(self, conn):
+        # optimize composes with partitionBy: partitions are preserved and lead the physical order.
+        conn.sql("select (i % 3) as region, (9 - i % 5) as k, i as id from range(300) t(i)") \
+            .write.optimize("k").partitionBy("region").mode("overwrite").saveAsTable("wo_part")
+        assert conn.table("wo_part").count() == 300
+        assert sorted(r[0] for r in conn.sql("select distinct region from wo_part").collect()) == [0, 1, 2]
+
+    def test_write_optimize_requires_overwrite(self, conn):
+        conn.sql("select 1 region, 1 id").write.mode("overwrite").saveAsTable("wo_bad")
+        with pytest.raises(ValueError):
+            conn.sql("select 2 region, 2 id").write.optimize("region").mode("append").saveAsTable("wo_bad")
+
 
 class TestDeltaTable:
     def _seed(self, conn):

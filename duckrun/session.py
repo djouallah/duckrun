@@ -1186,6 +1186,32 @@ class DuckSession:
             "encoding string, ndv bigint, skew_pct double, current_runs bigint, is_unique boolean, "
             "est_kb_current double, est_kb_sorted double, saved_pct double")
 
+    def _rle_keys_for_relation(self, relation, path: str,
+                               partition_cols: Optional[List[str]] = None):
+        """Profile a PRE-WRITE relation (not yet a table) with the ``_get_rle`` sort-key model and return
+        ``(sort_keys, plain_cols)`` — the auto path for ``df.write.optimize()``. Mirrors ``_get_rle`` but
+        samples the relation directly instead of ``delta_scan(path)``; ``path`` only labels the printout."""
+        cols = list(relation.columns)
+        types = {n: str(t) for n, t in zip(relation.columns, relation.types)}
+        pcols = [c for c in (partition_cols or []) if c in cols]
+        parts = path.replace("\\", "/").rstrip("/").split("/")
+        sch, tbl = (parts[-2] if len(parts) >= 2 else ""), (parts[-1] if parts else "table")
+        src = "_rle_src"
+        relation.create_view("_rle_relsrc", replace=True)
+        try:
+            self.con.execute(
+                f"CREATE OR REPLACE TEMP TABLE {src} AS "
+                f"SELECT * FROM _rle_relsrc USING SAMPLE {_RLE_SAMPLE_ROWS} ROWS")
+            rle = self._rle_from_sample(sch, tbl, src, cols, types, pcols, 4, 1.0, 10.0)
+        finally:
+            self.con.execute(f"DROP TABLE IF EXISTS {src}")
+            self.con.execute("DROP VIEW IF EXISTS _rle_relsrc")
+        recs = [dict(zip(rle.columns, r)) for r in rle.collect()]
+        keys = [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
+                                            key=lambda x: x["sort_position"])]
+        plain = [r["column"] for r in recs if r.get("is_unique")]
+        return keys, plain
+
     def _enumerate_remote(self, base: str, exts) -> List[tuple]:
         """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
         relative_path)`` pairs honouring the extension filter. Shared by ``list_files``/``download``."""
@@ -1544,6 +1570,9 @@ class DataFrameWriter:
         self._overwrite_schema = False
         self._partition_by: Optional[List[str]] = None
         self._replace_where: Optional[str] = None
+        # optimize(): land the write in the tuned read ("DL") layout, physically sorted. None = off;
+        # [] = on with auto-picked keys; [cols…] = on with explicit sort columns.
+        self._optimize_keys: Optional[List[str]] = None
 
     def format(self, fmt: str) -> "DataFrameWriter":
         if fmt.lower() != "delta":
@@ -1585,6 +1614,20 @@ class DataFrameWriter:
         self._partition_by = list(cols)
         return self
 
+    def optimize(self, *keys: str) -> "DataFrameWriter":
+        """Land this write directly in the tuned read (Direct-Lake-friendly) layout — SNAPPY, large row
+        groups / files, dictionaries — physically sorted for compression and file pruning. It is the
+        write-time counterpart of ``conn.table(name).optimize()``: instead of writing raw then rewriting,
+        the data is sorted and written in the layout in a single overwrite.
+
+        - ``.optimize()`` — the sort key is auto-picked by profiling the data being written.
+        - ``.optimize("region", "status")`` — sort by exactly those columns.
+
+        Requires ``mode('overwrite')`` (it is a full-rewrite layout). Partition columns (``partitionBy``)
+        always lead the physical order. Chainable before ``saveAsTable``/``save``."""
+        self._optimize_keys = list(keys)
+        return self
+
     def _write(self, path: str, descr: str, so=None, catalog=None) -> None:
         """Apply the configured mode to the Delta table at ``path`` (storage-neutral). ``descr``
         names the target in the mode='error' message. ``so`` / ``catalog`` are the target catalog's
@@ -1610,6 +1653,31 @@ class DataFrameWriter:
                 partition_by=self._partition_by,
                 storage_options=so,
                 compaction_threshold=session.compaction_threshold,
+            )
+            return
+
+        if self._optimize_keys is not None:
+            # df.write.optimize(...).mode("overwrite").saveAsTable(...) — sort the data and write it in
+            # the tuned read layout in a single overwrite (the write-time twin of table.optimize()).
+            if self._mode in ("append", "append_if_unchanged", "ignore"):
+                raise ValueError(
+                    "optimize() lays out a full rewrite; use mode('overwrite'), got mode('%s')." % self._mode)
+            if self._mode in ("error", "errorifexists") and engine.table_exists(path, so):
+                raise ValueError(f"{descr} already exists (mode='error'). Use mode('overwrite').")
+            pcols = list(self._partition_by or [])
+            if self._optimize_keys:
+                keys, plain_cols = list(self._optimize_keys), []
+            else:  # auto: profile the data being written to pick a run-length-friendly key
+                keys, plain_cols = session._rle_keys_for_relation(self._df.relation, path, pcols)
+            order_cols = pcols + [c for c in keys if c not in pcols]
+            rel = self._df.relation
+            if order_cols:
+                rel = rel.order(", ".join(f"{_qid(c)} ASC" for c in order_cols))
+            engine.write_delta(
+                path, rel, mode="overwrite", partition_by=(pcols or None),
+                overwrite_schema=self._overwrite_schema, storage_options=so,
+                compaction_threshold=session.compaction_threshold,
+                optimize_layout=True, plain_cols=plain_cols,
             )
             return
 
