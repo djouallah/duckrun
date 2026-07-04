@@ -54,9 +54,12 @@ def test_available_ram_bytes_is_plausible():
 
 def test_effective_limit_is_min_of_all_signals(monkeypatch):
     # Pin the leaves so the assertion isn't racing two live samples of fluctuating free RAM.
+    # RSS is pinned to 0 here so this test isolates the min-of-signals rule; the RSS add-back
+    # is exercised on its own in test_effective_limit_adds_own_rss_back.
     monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 16 * 2 ** 30)
     monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
     monkeypatch.setattr(engine, "_available_ram_bytes", lambda: 9 * 2 ** 30)
+    monkeypatch.setattr(engine, "_proc_rss_bytes", lambda: 0)
     assert engine._effective_mem_limit_bytes() == 9 * 2 ** 30
 
 
@@ -66,6 +69,7 @@ def test_effective_limit_recomputed_fresh_every_call(monkeypatch):
     drop with it — no stale connection-time snapshot."""
     monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 32 * 2 ** 30)
     monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
+    monkeypatch.setattr(engine, "_proc_rss_bytes", lambda: 0)
     seq = iter([20 * 2 ** 30, 8 * 2 ** 30])  # free RAM at job 1, then less at job 2
     monkeypatch.setattr(engine, "_available_ram_bytes", lambda: next(seq))
     assert engine._effective_mem_limit_bytes() == 20 * 2 ** 30
@@ -78,8 +82,26 @@ def test_effective_limit_folds_in_available(monkeypatch):
     monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 16 * 2 ** 30)
     monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
     monkeypatch.setattr(engine, "_available_ram_bytes", lambda: 6 * 2 ** 30)
+    monkeypatch.setattr(engine, "_proc_rss_bytes", lambda: 0)
     assert engine._effective_mem_limit_bytes() == 6 * 2 ** 30
     assert engine._effective_mem_limit_source() == "available RAM"
+
+
+def test_effective_limit_adds_own_rss_back(monkeypatch):
+    """The anti-ratchet fix (c3e2ad7): our own resident memory is reclaimable for the next job, so
+    it's added back into the available term before the min() clamp — otherwise each model's cap would
+    shrink partly because the previous model's RSS hadn't been freed yet (counting the process against
+    itself)."""
+    monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 16 * 2 ** 30)
+    monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
+    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: 6 * 2 ** 30)
+    monkeypatch.setattr(engine, "_proc_rss_bytes", lambda: 2 * 2 ** 30)
+    # available (6) + our RSS (2) = 8, still under total (16) → the add-back shows through.
+    assert engine._effective_mem_limit_bytes() == 8 * 2 ** 30
+    # And the final min() still clamps: RSS added back can never push past the physical ceiling.
+    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: 15 * 2 ** 30)
+    monkeypatch.setattr(engine, "_proc_rss_bytes", lambda: 8 * 2 ** 30)
+    assert engine._effective_mem_limit_bytes() == 16 * 2 ** 30
 
 
 def test_default_merge_spill_size_is_fraction_of_effective_limit(monkeypatch):
