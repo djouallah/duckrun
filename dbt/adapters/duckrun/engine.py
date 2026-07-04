@@ -244,9 +244,20 @@ def _effective_mem_limit_bytes() -> Optional[int]:
     The available-RAM term is also what catches Fabric: there the cgroup is the unlimited *root*
     (`/proc/self/cgroup` = `0::/`, `memory.max` = `max`), so the cap would otherwise fall back to
     *total* node RAM — ignoring that another runtime, the kernel, and any background DuckDB job
-    already hold most of it. Available RAM reflects that pressure; total RAM does not."""
-    vals = [v for v in (_total_ram_bytes(), _cgroup_mem_limit_bytes(),
-                        _available_ram_bytes()) if v]
+    already hold most of it. Available RAM reflects that pressure; total RAM does not.
+
+    But *our own* resident memory (DuckDB buffers, delta_rs pool, spill-file page cache) also lowers
+    the available term, so a naive fresh sample would ratchet DOWN each model — each cap smaller partly
+    because the previous model's memory hasn't been reclaimed yet, i.e. counting the process against
+    itself. So add this process's RSS back into the available term: that memory is ours to reuse for
+    the next job. The final min() with total/cgroup still clamps the result, so adding RSS back can
+    never exceed the real physical/container ceiling — it just stops the self-throttling ratchet."""
+    avail = _available_ram_bytes()
+    if avail is not None:
+        rss = _proc_rss_bytes()
+        if rss:
+            avail += rss  # reclaimable-by-us; the min() below re-clamps to total/cgroup
+    vals = [v for v in (_total_ram_bytes(), _cgroup_mem_limit_bytes(), avail) if v]
     return min(vals) if vals else None
 
 

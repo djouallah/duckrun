@@ -6,7 +6,7 @@ Pure-Python unit tests for the small, self-contained fixes — the ones that don
 import duckdb
 import pytest
 
-from dbt.adapters.duckrun import delta_dml, sqlscan
+from dbt.adapters.duckrun import delta_dml, engine, sqlscan
 from dbt.adapters.duckrun.credentials import DuckrunCredentials
 from dbt.adapters.duckrun.delta_plugin import Plugin
 from duckrun.session import _is_multi_statement
@@ -85,6 +85,27 @@ def test_multi_statement_still_detects_real_split():
     assert _is_multi_statement("select 1; select 2") is True
     assert _is_multi_statement("select ';'") is False
     assert _is_multi_statement("select 1") is False
+
+
+# ------------------------------------------------------- #16 memory limit doesn't self-throttle
+
+def test_effective_mem_limit_adds_rss_back(monkeypatch):
+    # Our own 6 GiB RSS dragged the available term down to 3 GiB; adding it back gives 9 GiB, so the
+    # per-model cap doesn't ratchet down by counting the process against itself.
+    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: 3 * 2 ** 30)
+    monkeypatch.setattr(engine, "_proc_rss_bytes", lambda: 6 * 2 ** 30)
+    monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 64 * 2 ** 30)
+    monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: 10 * 2 ** 30)
+    assert engine._effective_mem_limit_bytes() == 9 * 2 ** 30
+
+
+def test_effective_mem_limit_still_clamped_to_cgroup(monkeypatch):
+    # Adding RSS back can never exceed the real container ceiling: min() re-clamps to the cgroup.
+    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: 8 * 2 ** 30)
+    monkeypatch.setattr(engine, "_proc_rss_bytes", lambda: 6 * 2 ** 30)
+    monkeypatch.setattr(engine, "_total_ram_bytes", lambda: 64 * 2 ** 30)
+    monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: 10 * 2 ** 30)
+    assert engine._effective_mem_limit_bytes() == 10 * 2 ** 30
 
 
 # ------------------------------------------------------- #10 non-interactive token refresh
