@@ -2161,3 +2161,142 @@ def test_writer_keeps_dictionary_encoding(conn):
         encodings, dict_off = md[col]
         assert dict_off is not None, f"{col} lost its dictionary page (PLAIN fallback)"
         assert "RLE_DICTIONARY" in encodings, f"{col} not dictionary-encoded: {encodings}"
+
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# optimize() end-to-end — INGEST raw data from a file, land it through every optimize combination,
+# and assert the one invariant that matters: OPTIMIZE CHANGES THE LAYOUT, NEVER THE DATA. Each variant
+# must hold the exact same row multiset as the raw baseline; the optimized layout must be SNAPPY and
+# physically clustered by its sort key; the plain baseline must stay ZSTD. All local-fs, network-free.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+
+# A realistic sales fact with no unique column (max ndv 5000 << 60000 rows), so the profiler picks the
+# low-cardinality dimensions by ascending cardinality — region (5) leads, then category (23), day (90) —
+# and treats `amount` as a measure (never a sort key). Deterministic: derived from range(), no RNG.
+_SALES_SQL = """
+    select (i % 5)                             as region,
+           (i % 23)                            as category,
+           (i % 90)                            as day,
+           (i % 5000)                          as customer_id,
+           ((i % 997) + 1) * 1.25              as amount,
+           (i % 7) + 1                         as qty
+    from range(60000) t(i)
+"""
+_SALES_COLS = "region, category, day, customer_id, amount, qty"
+
+
+@pytest.fixture
+def raw_sales(tmp_path):
+    """A writable local warehouse plus a STAGED RAW PARQUET (the 'raw data' we ingest). Returns
+    ``(conn, parquet_path, expected_rows)`` — expected_rows is the raw row multiset in ``_SALES_COLS``
+    order, the oracle every optimized write must reproduce exactly."""
+    conn = duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False)
+    praw = (tmp_path / "raw_sales.parquet").as_posix()
+    conn._connection.execute(f"COPY ({_SALES_SQL}) TO '{praw}' (FORMAT PARQUET)")
+    expected = sorted(
+        conn.sql(f"select {_SALES_COLS} from parquet_scan('{praw}')").fetchall(), key=_k)
+    return conn, praw, expected
+
+
+def _rows(conn, name):
+    """The table's row multiset projected in a stable column order (partition-layout-independent)."""
+    return sorted(conn.sql(f"select {_SALES_COLS} from {name}").fetchall(), key=_k)
+
+
+def _codecs(conn, name):
+    """The set of parquet codecs across the table's active files (e.g. {'SNAPPY'} or {'ZSTD'})."""
+    return set(conn.get_stats(name).df()["compression"].tolist())
+
+
+def _active_files(conn, name):
+    return [f.replace("file://", "")
+            for f in engine._delta_table(conn.root_path + f"/dbo/{name}", None).file_uris()]
+
+
+def _clustered_by(conn, name, col):
+    """True iff EVERY active file is internally non-decreasing on ``col`` (the sort-key signature)."""
+    for f in _active_files(conn, name):
+        vals = [r[0] for r in conn.sql(f"select {col} from parquet_scan('{f}')").fetchall()]
+        if vals != sorted(vals):
+            return False
+    return True
+
+
+def test_optimize_e2e_ingest_then_write_variants(raw_sales):
+    # Ingest the raw parquet once, then land it four ways: raw baseline, write.optimize() auto,
+    # write.optimize(explicit), and write.optimize()+partitionBy. Every table must hold the SAME rows.
+    conn, praw, expected = raw_sales
+    read = lambda: conn.read.format("parquet").load(praw)  # a fresh source relation per write
+
+    read().write.mode("overwrite").saveAsTable("s_raw")                       # baseline: ZSTD, unsorted
+    read().write.optimize().mode("overwrite").saveAsTable("s_auto")           # DL layout, auto key
+    read().write.optimize("category").mode("overwrite").saveAsTable("s_cat")  # DL layout, explicit key
+    read().write.optimize("day").partitionBy("region").mode("overwrite").saveAsTable("s_part")
+
+    # 1) DATA INVARIANCE — the whole point. Layout differs, the row multiset is byte-identical.
+    for name in ("s_raw", "s_auto", "s_cat", "s_part"):
+        assert _rows(conn, name) == expected, f"{name} changed the data"
+
+    # 2) CODECS — plain write stays ZSTD; every optimize path lands SNAPPY.
+    assert _codecs(conn, "s_raw") == {"ZSTD"}
+    for name in ("s_auto", "s_cat", "s_part"):
+        assert _codecs(conn, name) == {"SNAPPY"}, f"{name} is not the SNAPPY DL layout"
+
+    # 3) CLUSTERING — the file is physically ordered by its sort key.
+    assert _clustered_by(conn, "s_auto", "region")  # region is the leading low-card dimension
+    assert _clustered_by(conn, "s_cat", "category")  # explicit key honoured verbatim
+    assert _clustered_by(conn, "s_part", "day")      # secondary sort within each region partition
+    assert sorted({r[0] for r in conn.sql("select distinct region from s_part").collect()}) == [0, 1, 2, 3, 4]
+
+
+def test_optimize_e2e_write_raw_then_table_optimize(raw_sales):
+    # The other entry point: land raw, THEN rewrite in place via conn.table(name).optimize(). Auto and
+    # explicit keys both preserve the data and flip the codec ZSTD → SNAPPY.
+    conn, praw, expected = raw_sales
+    conn.read.format("parquet").load(praw).write.mode("overwrite").saveAsTable("t1")
+    assert _codecs(conn, "t1") == {"ZSTD"}
+
+    m = conn.table("t1").optimize()                       # auto-key rewrite
+    assert m["operation"] == "sortRewrite" and m["sortedBy"]
+    assert _rows(conn, "t1") == expected
+    assert _codecs(conn, "t1") == {"SNAPPY"}
+    assert _clustered_by(conn, "t1", m["sortedBy"][0])    # clustered by whatever the profiler led with
+
+    # Re-optimizing with an explicit key re-clusters the same data (idempotent on rows).
+    conn.table("t1").optimize("category")
+    assert _rows(conn, "t1") == expected
+    assert _clustered_by(conn, "t1", "category")
+
+
+def test_optimize_e2e_chain_write_optimize_then_rekey(raw_sales):
+    # Chain the two surfaces: write in the DL layout keyed by category, then re-key to day via the table
+    # handle. Data survives every hop; the clustering follows the most recent key.
+    conn, praw, expected = raw_sales
+    conn.read.format("parquet").load(praw).write.optimize("category").mode("overwrite").saveAsTable("c1")
+    assert _clustered_by(conn, "c1", "category") and _codecs(conn, "c1") == {"SNAPPY"}
+
+    conn.table("c1").optimize("day")
+    assert _rows(conn, "c1") == expected
+    assert _clustered_by(conn, "c1", "day")
+
+
+def test_optimize_e2e_where_scopes_one_partition(raw_sales):
+    # Partition by region, then optimize(where="region = 2") — a scoped rewrite. Only region 2's files
+    # move; all rows across all partitions survive, and region 2 comes out clustered by customer_id.
+    conn, praw, expected = raw_sales
+    conn.read.format("parquet").load(praw) \
+        .write.partitionBy("region").mode("overwrite").saveAsTable("p1")
+    v0 = engine.table_version(conn.root_path + "/dbo/p1", None)
+
+    m = conn.table("p1").optimize("customer_id", where="region = 2")
+    assert m["operation"] == "sortRewrite"
+    assert engine.table_version(conn.root_path + "/dbo/p1", None) > v0     # a replaceWhere commit landed
+    assert _rows(conn, "p1") == expected                                   # nothing lost, nothing dup'd
+    # per-region counts are unchanged (the scope didn't touch other partitions' data)
+    counts = dict(conn.sql("select region, count(*) from p1 group by region").collect())
+    assert counts == {r: 12000 for r in range(5)}
+    # the rewritten partition's file is now sorted by the requested key
+    f2 = [f for f in _active_files(conn, "p1") if "region=2" in f.replace(os.sep, "/")]
+    assert f2, "region=2 partition file not found"
+    vals = [r[0] for r in conn.sql(f"select customer_id from parquet_scan('{f2[0]}')").fetchall()]
+    assert vals == sorted(vals)
