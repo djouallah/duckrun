@@ -59,7 +59,9 @@ _MULTI_MSG = (
 # 1M rows is plenty to separate the candidates' ndv, and it turns the ~dozen profiling scans from
 # full-table passes (minutes on a remote 142M-row table) into millisecond local-temp-table scans. A
 # table at/below this size samples to itself, so small tables stay exact.
-_RLE_SAMPLE_ROWS = 1_000_000
+_RLE_SAMPLE_ROWS = 1_000_000        # sample floor — a small table at/below this samples to itself
+_RLE_SAMPLE_FRAC = 100              # and above the floor the sample scales to 1/this of the table (1%)
+_RLE_SAMPLE_MAX = 10_000_000        # capped here so the in-memory sample stays bounded on small compute
 # Above this distinct-value count the exact Σp² histogram (a GROUP BY = O(NDV) hash table) is skipped for
 # the uniform approximation Σp² ≈ 1/ndv — a high-card column is ~uniform and its runs are ndv-bound, so
 # the skew term barely moves, and this keeps the skew pass from rebuilding the OOM we just removed.
@@ -957,33 +959,35 @@ class DuckSession:
         if not cols:
             raise ValueError(f"_get_rle: table '{table}' has no columns.")
 
-        # Profile a materialized reservoir SAMPLE, not the full table. Every statistic below then scans
-        # a local temp table (~1M rows) instead of re-reading all N rows from storage per pass — the
-        # difference between a few minutes and milliseconds on a remote 142M-row table. Key selection
-        # only ranks columns by cardinality/skew and tests functional dependencies, all of which survive
-        # sampling. A table at/below _RLE_SAMPLE_ROWS samples to itself, so small tables stay exact.
         # Delta-LOG column stats (no data scan): the sample gives ndv/skew but not each column's null
         # share, so a mostly-null column can wrongly win a scarce sort-key slot. get_add_actions carries
         # per-file null_count/min/max — sum them once here and hand the profiler a per-column null_frac
         # (and constancy, reserved). Best-effort: an unreadable/statless log just yields {} and the
-        # profiler runs exactly as before.
-        stats, _, _ = engine.delta_column_stats(
+        # profiler runs exactly as before. total_rows also sizes the sample below.
+        stats, _, total_rows = engine.delta_column_stats(
             self.con, path, cols, types, self._catalog_storage_options(cat))
+        # Profile a MATERIALIZED delta_scan sample held in memory, then scan that local temp table for
+        # every pass below — never the remote table per pass. DYNAMIC size: scale to ~1% of the table
+        # between a 1M floor and a 10M cap, so a 1B-row table gets a representative sample instead of a
+        # fixed 1M. A table at/below the target samples to itself, so small tables stay exact.
+        target = (min(_RLE_SAMPLE_MAX, max(_RLE_SAMPLE_ROWS, total_rows // _RLE_SAMPLE_FRAC))
+                  if total_rows else _RLE_SAMPLE_ROWS)
         src = "_rle_src"
         self.con.execute(
             f"CREATE OR REPLACE TEMP TABLE {src} AS "
-            f"SELECT * FROM delta_scan('{plit}') USING SAMPLE {_RLE_SAMPLE_ROWS} ROWS")
+            f"SELECT * FROM delta_scan('{plit}') USING SAMPLE {target} ROWS")
         try:
             return self._rle_from_sample(sch, tbl, src, cols, types, partition_cols,
                                          sort_key_cap, min_gain_pct, key_sort_below_pct,
                                          stats=stats, null_excl=null_excl, fd_band=fd_band,
-                                         grain_frac=grain_frac)
+                                         grain_frac=grain_frac, sample_rows=target)
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
 
     def _rle_from_sample(self, sch, tbl, src, cols, types, partition_cols,
                          sort_key_cap, min_gain_pct, key_sort_below_pct,
-                         stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5) -> "DataFrame":
+                         stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,
+                         sample_rows=_RLE_SAMPLE_ROWS) -> "DataFrame":
         """The sort-key model, run against the materialized sample ``src`` (see _get_rle). All counts
         (``n``, ``ndv``, run estimates) are SAMPLE estimates — enough to rank candidates and test
         functional dependencies, not exact table cardinalities.
@@ -1172,10 +1176,10 @@ class DuckSession:
         # is_unique can't be judged from a sample: any column whose true ndv exceeds the sample size
         # saturates to ndv≈n and looks unique, so a high-cardinality measure (an INT64 price) would be
         # falsely flagged and could hijack the key-organized branch below as the sort key. Only trust
-        # uniqueness when the "sample" actually covered the whole table (n < _RLE_SAMPLE_ROWS ⇒ USING
+        # uniqueness when the "sample" actually covered the whole table (n < sample_rows ⇒ USING
         # SAMPLE returned every row). When we truly sampled, claim no unique column — the conservative
         # direction: fall back to the compression key and leave dictionaries on (plain_cols stays empty).
-        exact = n < _RLE_SAMPLE_ROWS
+        exact = n < sample_rows
         unique_cols = ([c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols]
                        if exact else [])
         note = None
@@ -1211,7 +1215,7 @@ class DuckSession:
         order_cols = partition_cols + [c for c in sort_key if c not in partition_cols]
         print(f"\n_get_rle('{sch}.{tbl}') — sort-key recommendation (experimental):")
         if not exact:
-            print(f"  (profiled a {_RLE_SAMPLE_ROWS:,}-row sample — ndv/skew/runs are estimates)")
+            print(f"  (profiled a {sample_rows:,}-row sample — ndv/skew/runs are estimates)")
         print(f"  ORDER BY {', '.join(order_cols) if order_cols else '(no key pays off)'}")
         if partition_cols:
             print(f"  (partition columns lead the sort but carry no compression weight: "
