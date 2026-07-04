@@ -1255,8 +1255,12 @@ def merge_delta(
       ``merge_insert_condition``): per-clause predicates gating which matched rows update and
       which unmatched rows insert. Reference the ``target``/``source`` aliases (the caller has
       already rewritten dbt's DBT_INTERNAL_DEST/SOURCE).
-    - merge_schema=True lets delta_rs evolve the table schema (new columns), backing
-      ``on_schema_change='append_new_columns'`` / ``'sync_all_columns'``.
+    - merge_schema=True evolves the table schema for new columns, backing
+      ``on_schema_change='append_new_columns'`` / ``'sync_all_columns'``. The evolution is
+      DECOUPLED from the merge (see ``merge_delta_clauses``): the new columns are added as a
+      metadata-only commit BEFORE the merge so existing rows read NULL, and the merger itself
+      always runs ``merge_schema=False`` — never letting delta_rs back-fill a new column onto a
+      matched row from the source.
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
       join to disk instead of OOMing. None -> default to ~60% of RAM (_default_merge_spill_size);
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
@@ -1490,16 +1494,55 @@ def merge_delta_clauses(
                     f"qualify row_number() over (partition by {keycols} order by <tiebreak>) = 1."
                 )
 
+    # Schema evolution is DECOUPLED from the merge: never pass merge_schema to the merger. delta_rs,
+    # evolving mid-merge, back-fills a newly added column onto matched rows from the source — which is
+    # wrong for a narrow matched-update (a snapshot's close-row updates ONLY dbt_valid_to, so the new
+    # column must read NULL on the already-closed version, not the current source value). Instead, when
+    # new columns are present, add them as a metadata-only commit FIRST — existing rows (including every
+    # closed SCD2 version) then read NULL — and merge with the schema already in place. This keeps the
+    # merger byte-identical whether or not evolution happened; the update clause is never schema-dependent.
+    effective_version = read_version
+    if merge_schema:
+        existing = {c.lower() for c in delta_columns(path, storage_options)}
+        added = [c for c in data.columns if c.lower() not in existing]
+        if added:
+            # Compare-and-swap add-columns pinned to read_version (same primitive as
+            # append_if_unchanged): a zero-row append with schema_mode="merge" adds only the new columns
+            # (delta_rs derives their types from the source's Arrow stream) and commits nothing else.
+            # max_commit_retries=0 + load_as_version make it a CAS — a concurrent writer that moved HEAD
+            # since vB fails the evolution loud, preserving the merge's concurrency guarantee. On success
+            # it lands deterministically at read_version+1, which the merge then pins to (so the full
+            # (vB, HEAD] OCC window is still covered: (vB, vB+1] by this CAS, (vB+1, HEAD] by the merge).
+            dt0 = _delta_table(path, storage_options)
+            dt0.load_as_version(read_version)
+            evo_args = build_write_deltalake_args(
+                path, data.limit(0), "append",
+                schema_mode="merge",
+                storage_options=storage_options,
+            )
+            evo_args["table_or_uri"] = dt0
+            evo_args.pop("storage_options", None)
+            evo_args["commit_properties"] = CommitProperties(max_commit_retries=0)
+            try:
+                write_deltalake(**evo_args)
+            except CommitFailedError as e:
+                raise CommitFailedError(
+                    f"schema evolution: table '{path}' changed since version {read_version} "
+                    f"(a concurrent write committed); the on_schema_change add-columns commit was "
+                    f"refused before the merge. Re-read and retry."
+                ) from e
+            effective_version = read_version + 1
+
     dt = _delta_table(path, storage_options)
-    # Pin the target to the snapshot the model read (vB) so OCC validates (vB, HEAD] — one snapshot
-    # for both the read and the commit.
-    dt.load_as_version(read_version)
+    # Pin the target to the snapshot the model read (vB, or vB+1 after a decoupled add-columns commit)
+    # so OCC validates (effective_version, HEAD] — one snapshot for both the read and the commit.
+    dt.load_as_version(effective_version)
     merger = dt.merge(
         source=data,
         predicate=predicate,
         source_alias="source",
         target_alias="target",
-        merge_schema=merge_schema,
+        merge_schema=False,
         streamed_exec=streamed_exec,
         **spill_kwargs,
     )

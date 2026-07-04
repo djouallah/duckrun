@@ -115,8 +115,9 @@
          schema additively when a column appears upstream (new versions carry it), never drops
          columns, and is a no-op when nothing was added. Hardcoded, not config.get(): dbt's
          SnapshotConfig.on_schema_change defaults to 'ignore', so a passthrough would silently keep
-         dropping columns. (delta_rs back-fills the added column on the matched close row from the
-         source rather than NULL — an accepted syntax-vs-behavior diff; the point is it's tracked.) --#}
+         dropping columns. The added column is evolved as a metadata-only commit BEFORE the merge
+         (engine.merge_delta_clauses), so it reads NULL on the already-closed version — the close row's
+         update touches only dbt_valid_to — matching dbt-core's default snapshot exactly. --#}
     {% do adapter.store_relation('duckrun', merge_src, columns, location, 'delta', {
         'incremental': true,
         'incremental_strategy': 'merge',
