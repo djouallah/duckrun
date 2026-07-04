@@ -44,9 +44,14 @@ _ROW_GROUP_SIZE = 1_048_576 * 6
 # encoding an in-memory columnar reader transcodes into its hash encoding. 128 MB holds any dictionary worth having
 # and caps the per-column write RAM; a column that overflows it was never a good dictionary candidate.
 _DICT_PAGE_SIZE_LIMIT = 134_217_728
-# Data page byte limit (1 MB) — governs wide / PLAIN (non-dictionary) columns; the row-group row count
-# is the real cutter (data_page_row_count_limit is set to the row group size, i.e. off).
+# Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
+# column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
+# Data page ROW-COUNT limit — the real page safeguard, set EXPLICITLY (delta-rs 1.5.0's default is far
+# higher than 20k, measured). Without it a highly compressible column buffers its whole 6M-row group as a
+# single page: ~10x write memory, and giant pages that blow the merge's read-side spill cap → out of disk
+# (arrow-rs #5797 / #4973). 20k rows/page is arrow-rs's intended default; measured +0 MB write overhead.
+_DATA_PAGE_ROW_LIMIT = 20_000
 # Target file size: 128 MB. A Parquet row group can't span files, so this byte cap is really a
 # segment cap: if a full 6M-row group would exceed it, delta-rs truncates the row group to fit —
 # which is what starves Direct Lake segments and leaves a non-uniform tail. 128 MB matches the
@@ -61,9 +66,10 @@ _TARGET_FILE_SIZE = 128 * 1024 * 1024
 def _writer_properties(plain_cols=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
     # compaction, and the optimize sort-rewrite: SNAPPY, 6M-row row groups, a bounded-but-large
-    # dictionary page limit so wide dictionaries stay dictionary-encoded, small data pages with the
-    # per-page row cap set to the row group size (byte limit is the only page cutter), and chunk-level
-    # stats. MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults)
+    # dictionary page limit so wide dictionaries stay dictionary-encoded, a 1 MB data-page byte cap, an
+    # EXPLICIT 20k-row data-page cap (the load-bearing safeguard — see _DATA_PAGE_ROW_LIMIT), and
+    # chunk-level stats.
+    # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults)
     # so a merge stays quick and never rewrites fat files; post-merge compaction folds merged files up
     # into this layout later. Degrade gracefully if the pinned wheel rejects a newer parameter
     # (last rung: SNAPPY-only).
@@ -90,7 +96,7 @@ def _writer_properties(plain_cols=None):
              max_row_group_size=_ROW_GROUP_SIZE,
              dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
-             data_page_row_count_limit=_ROW_GROUP_SIZE,   # effectively off — byte limit is the cutter
+             data_page_row_count_limit=_DATA_PAGE_ROW_LIMIT,
              statistics_truncate_length=64,
              default_column_properties=col_props,
              column_properties=per_col),
