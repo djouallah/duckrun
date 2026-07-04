@@ -39,11 +39,15 @@ except ImportError:  # pragma: no cover - older layouts
 # in the 1M–16M row band, uniform in size. 6M sits mid-band while bounding write-time memory — arrow-rs
 # buffers a full uncompressed row group per open writer, which is the real OOM lever on the hot path.
 _ROW_GROUP_SIZE = 1_048_576 * 6
-# Bounded-but-large dictionary page limit (128 MB). arrow-rs's ~1 MB default silently falls back
-# to PLAIN mid column chunk on wide columns at multi-million rows/group, defeating the dictionary
-# encoding an in-memory columnar reader transcodes into its hash encoding. 128 MB holds any dictionary worth having
-# and caps the per-column write RAM; a column that overflows it was never a good dictionary candidate.
-_DICT_PAGE_SIZE_LIMIT = 134_217_728
+# Dictionary page limit: 8 MB. This is the load-bearing knob for merge memory. A large limit (the old
+# 128 MB) keeps HIGH-cardinality columns dictionary-encoded instead of overflowing to PLAIN; a delta_rs
+# MERGE reading the table then materializes those giant per-column dictionaries — measured 25 GB RSS vs
+# ~4 GB on an 18M-row merge (OOM / disk-spill on a normal runner). 8 MB caps any one column's dictionary
+# so high-card / join-key columns (l_orderkey, l_comment) fall to PLAIN — cheap to merge and no loss for a
+# columnar reader (a near-unique dictionary is as big as the data) — while MID-cardinality columns
+# (≲1M distinct) still keep a real dictionary the reader can remap. 16 MB already doubled merge RSS to
+# ~8.7 GB, so 8 MB is the safe ceiling.
+_DICT_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
@@ -65,10 +69,10 @@ _TARGET_FILE_SIZE = 128 * 1024 * 1024
 
 def _writer_properties(plain_cols=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, 6M-row row groups, a bounded-but-large
-    # dictionary page limit so wide dictionaries stay dictionary-encoded, a 1 MB data-page byte cap, an
-    # EXPLICIT 20k-row data-page cap (the load-bearing safeguard — see _DATA_PAGE_ROW_LIMIT), and
-    # chunk-level stats.
+    # compaction, and the optimize sort-rewrite: SNAPPY, 6M-row row groups, an 8 MB dictionary page limit
+    # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
+    # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap, an EXPLICIT
+    # 20k-row data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
     # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults)
     # so a merge stays quick and never rewrites fat files; post-merge compaction folds merged files up
     # into this layout later. Degrade gracefully if the pinned wheel rejects a newer parameter

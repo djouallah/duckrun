@@ -11,10 +11,12 @@ All notable changes to this project will be documented in this file.
   The old `sort='experimental'` kwarg on `DeltaTable.optimize()` is gone.
 - **Single read-layout writer profile for every file write.** The separate "normal" (ZSTD) and
   "optimize" writer configs are collapsed into one Direct-Lake-friendly profile — SNAPPY, 6M-row groups,
-  large dictionary page limit (columns stay dictionary-encoded), chunk-level stats, data pages bounded to
-  20k rows (an unbounded page row-count buffers a whole row group as one page on compressible columns,
-  ~10x write memory and giant pages that overflow the merge's disk spill — arrow-rs #5797), and unique
-  columns written PLAIN — used by append / overwrite / safeappend / compaction / the sort-rewrite alike. **MERGE
+  an **8 MB dictionary page limit** (mid-cardinality columns keep a remappable dictionary; near-unique
+  columns overflow to PLAIN — a 128 MB limit instead kept them dictionary-encoded and made a merge reading
+  the table materialize 25 GB of dictionaries vs ~4 GB), **data pages bounded to 20k rows** (an unbounded
+  page row-count buffers a whole row group as one page on compressible columns — arrow-rs #5797), chunk
+  stats, and unique columns written PLAIN — used by append / overwrite / safeappend / compaction / the
+  sort-rewrite alike. **MERGE
   is deliberately excluded:** it passes no writer properties and no target file size, so a merge stays
   quick and never rewrites fat files; the threshold-gated post-merge compaction folds merged files up
   into the read layout afterwards.
