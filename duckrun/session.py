@@ -60,6 +60,10 @@ _MULTI_MSG = (
 # full-table passes (minutes on a remote 142M-row table) into millisecond local-temp-table scans. A
 # table at/below this size samples to itself, so small tables stay exact.
 _RLE_SAMPLE_ROWS = 1_000_000
+# Above this distinct-value count the exact Σp² histogram (a GROUP BY = O(NDV) hash table) is skipped for
+# the uniform approximation Σp² ≈ 1/ndv — a high-card column is ~uniform and its runs are ndv-bound, so
+# the skew term barely moves, and this keeps the skew pass from rebuilding the OOM we just removed.
+_SKEW_EXACT_NDV = 100_000
 _READ_ONLY_MSG = (
     "catalog '{catalog}' is read-only — cannot {op}. duckrun opens read-only by default; enable "
     "Delta writes (saveAsTable / insertInto / save / merge / insert / update / delete / replaceWhere) "
@@ -1033,8 +1037,7 @@ class DuckSession:
             return t.upper().startswith(("DATE", "TIME", "TIMESTAMP"))
 
         # 2) per-column skew term Σp_v² (Simpson index, from the value histogram) and, for hash
-        # columns, average serialised value width (drives dictionary cost). One group-by per column
-        # for the histogram — fine for an occasional diagnostic.
+        # columns, average serialised value width (drives dictionary cost).
         simpson, avg_width = {}, {}
         hash_cols = [c for c in cols if _encoding(types[c]) == "hash"]
         if hash_cols:
@@ -1043,7 +1046,14 @@ class DuckSession:
                 for j, c in enumerate(hash_cols))
             wr = self.con.sql(f"SELECT {wsel} FROM {src}").fetchone()
             avg_width = {c: (wr[j] or 1.0) for j, c in enumerate(hash_cols)}
+        # The exact Σp² is a GROUP BY that materialises one row per distinct value — an O(NDV) hash table,
+        # the same OOM lever the exact COUNT(DISTINCT) was. Skew only matters (and the histogram is only
+        # cheap) for LOW-cardinality columns; a high-card column is ~uniform, so Σp² ≈ 1/ndv (its runs are
+        # ndv-bound anyway). Cap the exact histogram at _SKEW_EXACT_NDV distinct values; approximate above.
         for c in cols:
+            if ndv[c] > _SKEW_EXACT_NDV:
+                simpson[c] = 1.0 / ndv[c] if ndv[c] else 1.0
+                continue
             s = self.con.sql(
                 f"SELECT COALESCE(SUM(cnt * cnt), 0)::DOUBLE FROM "
                 f"(SELECT COUNT(*) AS cnt FROM {src} GROUP BY {_qid(c)})").fetchone()[0]
