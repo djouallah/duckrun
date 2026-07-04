@@ -77,11 +77,12 @@ def _writer_properties():
 
 
 def _tuned_writer_properties(plain_cols=None):
-    # Opinionated Parquet config for the read layout: SNAPPY, large row groups, a
-    # bounded-but-large dictionary page limit so wide dictionaries stay dictionary-encoded, big data
-    # pages, and chunk-level stats. Used ONLY by the experimental sort-rewrite (optimize_layout=True) —
-    # deliberately kept off the hot write paths, where it made merges rewrite/spill fat files. Degrade
-    # gracefully if the pinned wheel rejects a newer parameter (last rung: SNAPPY-only).
+    # Opinionated Parquet config for the read layout: ZSTD (same codec as the normal write — SNAPPY
+    # tripled on-disk size for no read-layout benefit), large row groups, a bounded-but-large dictionary
+    # page limit so wide dictionaries stay dictionary-encoded, big data pages, and chunk-level stats.
+    # Used ONLY by the experimental sort-rewrite (optimize_layout=True) — deliberately kept off the hot
+    # write paths, where it made merges rewrite/spill fat files. Degrade gracefully if the pinned wheel
+    # rejects a newer parameter (last rung: ZSTD-only).
     #
     # ``plain_cols`` are unique/near-unique columns whose dictionary buys nothing (every value distinct);
     # they get a per-column ColumnProperties(dictionary_enabled=False) so arrow-rs writes them PLAIN.
@@ -100,15 +101,15 @@ def _tuned_writer_properties(plain_cols=None):
             except Exception:  # best-effort: a rejected per-column build just keeps the dictionary on
                 per_col = None
     for kwargs in (
-        dict(compression="SNAPPY",
+        dict(compression="ZSTD",
              max_row_group_size=_ROW_GROUP_SIZE,
              dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
              statistics_truncate_length=64,
              default_column_properties=col_props,
              column_properties=per_col),
-        dict(compression="SNAPPY", max_row_group_size=_ROW_GROUP_SIZE),
-        dict(compression="SNAPPY"),
+        dict(compression="ZSTD", max_row_group_size=_ROW_GROUP_SIZE),
+        dict(compression="ZSTD"),
     ):
         try:
             return WriterProperties(**{k: v for k, v in kwargs.items() if v is not None})

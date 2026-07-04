@@ -248,23 +248,15 @@ class DeltaTable:
                              storage_options=self.storage_options)
 
     def optimize(self, zorder_by: Optional[List[str]] = None,
-                 target_size: Optional[int] = None, sort: Optional[str] = None) -> Dict:
+                 target_size: Optional[int] = None) -> Dict:
         """Compact small files (delta-spark ``DeltaTable.optimize``), returning the operation
         metrics. Pass ``zorder_by`` to Z-order on those columns instead of a plain compaction.
 
-        ``sort='experimental'`` (EXPERIMENTAL) instead does a **sort rewrite**: it profiles this table
-        with the ``_get_rle`` model to pick a run-length-friendly sort key and rewrites every file
-        physically ordered by ``(partition columns…, key…)``. This is a full rewrite (read → ORDER BY
-        → overwrite with the tuned writer properties), not a bin-packing compaction, so it's only
-        worth running occasionally. If no key pays off it falls back to a plain compaction."""
+        The experimental sort rewrite (profile the table, rewrite it physically sorted by a
+        run-length-friendly key) is a separate operation — use ``conn.table(name).optimize(...)``."""
         self._session._require_writable("optimize", self._catalog)
-        if sort is not None:
-            if sort != "experimental":
-                raise ValueError("optimize(sort=...) only supports 'experimental'.")
-            metrics = self._sort_rewrite()
-        else:
-            metrics = engine.optimize(self.path, zorder_by=zorder_by, target_size=target_size,
-                                      storage_options=self.storage_options)
+        metrics = engine.optimize(self.path, zorder_by=zorder_by, target_size=target_size,
+                                  storage_options=self.storage_options)
         self._refresh_view()
         return metrics
 

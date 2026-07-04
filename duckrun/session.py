@@ -869,16 +869,15 @@ class DuckSession:
             raise ValueError(f"get_stats: no files to describe for source={source!r}.")
         return DataFrame(self.con.sql(" UNION ALL ".join(parts)), self)
 
-    def optimize(self, name: str, *, sort: Optional[str] = None,
-                 zorder_by: Optional[List[str]] = None, target_size: Optional[int] = None) -> Dict:
+    def optimize(self, name: str, *, zorder_by: Optional[List[str]] = None,
+                 target_size: Optional[int] = None) -> Dict:
         """Optimize the Delta table ``name`` — the one-liner over
-        ``DeltaTable.forName(conn, name).optimize(...)``. Plain call compacts small files; ``zorder_by``
-        z-orders; ``sort='experimental'`` profiles the table and rewrites it physically sorted by the
-        recommended key, returning the REAL measured on-disk size
-        (``sizeBytesBefore`` / ``sizeBytesAfter`` / ``savedPct``)."""
+        ``DeltaTable.forName(conn, name).optimize(...)``. Plain call compacts small files (bin-packing);
+        ``zorder_by`` z-orders for multi-dimensional file pruning. The experimental sort rewrite is a
+        separate operation — use ``conn.table(name).optimize(...)``."""
         from .delta_table import DeltaTable
         return DeltaTable.forName(self, name).optimize(
-            sort=sort, zorder_by=zorder_by, target_size=target_size)
+            zorder_by=zorder_by, target_size=target_size)
 
     def _resolve_stats_targets(self, source: Optional[str]) -> List[tuple]:
         """Resolve a ``get_stats`` source to ``(catalog, schema, table)`` targets: ``None`` → every
@@ -1165,7 +1164,7 @@ class DuckSession:
                   f"{', '.join(partition_cols)})")
         # Deliberately NO projected-size line: _get_rle only profiles, it doesn't rewrite, so any
         # "sorted size" would be a model estimate — and an estimate that reads like a measurement is
-        # worse than none. The real before/after bytes are printed by optimize(sort='experimental'),
+        # worse than none. The real before/after bytes are printed by conn.table(name).optimize(),
         # which actually rewrites and measures via the Delta log (get_stats).
         if note:
             print(f"  ({note})")

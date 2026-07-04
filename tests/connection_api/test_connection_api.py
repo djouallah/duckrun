@@ -495,11 +495,11 @@ class TestDataFrameWriter:
 
     def test_write_optimize_user_keys(self, conn):
         # .write.optimize("region").mode("overwrite") lands the write sorted by region in the tuned
-        # SNAPPY layout in ONE pass. Data preserved; the active file is clustered by region.
+        # read layout in ONE pass. Data preserved; the active file is clustered by region.
         conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
             .write.optimize("region").mode("overwrite").saveAsTable("wo")
         assert conn.table("wo").count() == 20000
-        assert conn.get_stats("wo").df()["compression"].tolist() == ["SNAPPY"]
+        assert conn.get_stats("wo").df()["compression"].tolist() == ["ZSTD"]
         f = engine._delta_table(conn.root_path + "/dbo/wo", None).file_uris()[0].replace("file://", "")
         regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
         assert regs == sorted(regs)
@@ -510,7 +510,7 @@ class TestDataFrameWriter:
         conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
             .write.optimize().mode("overwrite").saveAsTable("wo_auto")
         assert conn.table("wo_auto").count() == 20000
-        assert conn.get_stats("wo_auto").df()["compression"].tolist() == ["SNAPPY"]
+        assert conn.get_stats("wo_auto").df()["compression"].tolist() == ["ZSTD"]
         f = engine._delta_table(conn.root_path + "/dbo/wo_auto", None).file_uris()[0].replace("file://", "")
         regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
         assert regs == sorted(regs)  # region is the low-cardinality key the profiler leads with
@@ -659,30 +659,19 @@ class TestDeltaTable:
         assert metrics["numFilesAdded"] >= 1
         assert conn.table("m").count() == 4
 
-    def test_optimize_experimental_sort(self, conn):
-        # EXPERIMENTAL sort rewrite: profiles the table (_get_rle), rewrites physically ordered by the
-        # recommended key. Data is preserved and the active file comes out clustered by the key.
-        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
-            .write.mode("overwrite").saveAsTable("os")
-        m = DeltaTable.forName(conn, "dbo.os").optimize(sort="experimental")
-        assert m["operation"] == "sortRewrite" and "region" in m["sortedBy"]
-        # reports REAL measured on-disk bytes (Delta-log size_bytes), never an estimate
-        assert m["sizeBytesBefore"] > 0 and m["sizeBytesAfter"] > 0
-        assert m["savedPct"] == round(100.0 * (m["sizeBytesBefore"] - m["sizeBytesAfter"]) / m["sizeBytesBefore"], 1)
-        assert conn.table("os").count() == 20000
-        # active file is clustered: reading it in file order, region is non-decreasing.
-        f = engine._delta_table(conn.root_path + "/dbo/os", None).file_uris()[0].replace("file://", "")
-        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
-        assert regs == sorted(regs)
-
     def test_table_optimize_auto_keys(self, conn):
-        # conn.table(name).optimize() — full rewrite, sort key chosen automatically (same as the
-        # sort='experimental' path). Data preserved; active file clustered by the recommended key.
+        # conn.table(name).optimize() — the experimental sort rewrite: profiles the table (_get_rle),
+        # picks the sort key automatically, and rewrites every file physically ordered by it. Data is
+        # preserved and the active file comes out clustered by the key.
         conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
             .write.mode("overwrite").saveAsTable("to_auto")
         m = conn.table("dbo.to_auto").optimize()
         assert m["operation"] == "sortRewrite" and "region" in m["sortedBy"]
+        # reports REAL measured on-disk bytes (Delta-log size_bytes), never an estimate
+        assert m["sizeBytesBefore"] > 0 and m["sizeBytesAfter"] > 0
+        assert m["savedPct"] == round(100.0 * (m["sizeBytesBefore"] - m["sizeBytesAfter"]) / m["sizeBytesBefore"], 1)
         assert conn.table("to_auto").count() == 20000
+        # active file is clustered: reading it in file order, region is non-decreasing.
         f = engine._delta_table(conn.root_path + "/dbo/to_auto", None).file_uris()[0].replace("file://", "")
         regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
         assert regs == sorted(regs)
@@ -763,18 +752,14 @@ class TestDeltaTable:
         # DESCRIBE + one sample materialize, independent of column count — NOT one scan per column.
         assert len(narrow) == len(wide) == 2
 
-    def test_optimize_sort_bad_value(self, conn):
-        self._seed(conn)
-        with pytest.raises(ValueError):
-            DeltaTable.forName(conn, "dbo.m").optimize(sort="nope")
-
     def test_conn_optimize_shortcut(self, conn):
-        # conn.optimize(name, ...) is the one-liner over DeltaTable.forName(conn, name).optimize(...).
+        # conn.optimize(name, ...) is the one-liner over DeltaTable.forName(conn, name).optimize(...):
+        # bin-packing compaction, or a z-order with zorder_by. (The experimental sort rewrite is a
+        # separate op — conn.table(name).optimize(), covered by test_table_optimize_auto_keys.)
         conn.sql("select (i % 5) as r, i as id from range(5000) t(i)") \
             .write.mode("overwrite").saveAsTable("co")
-        m = conn.optimize("co", sort="experimental")
-        assert m["operation"] == "sortRewrite" and m["sizeBytesBefore"] > 0
-        assert isinstance(conn.optimize("co"), dict)   # plain compaction path still works
+        assert isinstance(conn.optimize("co"), dict)                  # plain compaction
+        assert isinstance(conn.optimize("co", zorder_by=["r"]), dict)  # z-order
 
     def test_vacuum(self, conn):
         # dry_run lists removable files without deleting; never errors on a healthy table.
@@ -2166,8 +2151,9 @@ def test_writer_keeps_dictionary_encoding(conn):
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # optimize() end-to-end — INGEST raw data from a file, land it through every optimize combination,
 # and assert the one invariant that matters: OPTIMIZE CHANGES THE LAYOUT, NEVER THE DATA. Each variant
-# must hold the exact same row multiset as the raw baseline; the optimized layout must be SNAPPY and
-# physically clustered by its sort key; the plain baseline must stay ZSTD. All local-fs, network-free.
+# must hold the exact same row multiset as the raw baseline, and the optimized layout must be physically
+# clustered by its sort key. Codec stays ZSTD throughout (optimize re-lays-out, it doesn't recompress).
+# All local-fs, network-free.
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 
 # A realistic sales fact with no unique column (max ndv 5000 << 60000 rows), so the profiler picks the
@@ -2237,10 +2223,9 @@ def test_optimize_e2e_ingest_then_write_variants(raw_sales):
     for name in ("s_raw", "s_auto", "s_cat", "s_part"):
         assert _rows(conn, name) == expected, f"{name} changed the data"
 
-    # 2) CODECS — plain write stays ZSTD; every optimize path lands SNAPPY.
-    assert _codecs(conn, "s_raw") == {"ZSTD"}
-    for name in ("s_auto", "s_cat", "s_part"):
-        assert _codecs(conn, name) == {"SNAPPY"}, f"{name} is not the SNAPPY DL layout"
+    # 2) CODECS — ZSTD throughout; optimize re-lays-out the data, it doesn't recompress.
+    for name in ("s_raw", "s_auto", "s_cat", "s_part"):
+        assert _codecs(conn, name) == {"ZSTD"}, f"{name} is not ZSTD"
 
     # 3) CLUSTERING — the file is physically ordered by its sort key.
     assert _clustered_by(conn, "s_auto", "region")  # region is the leading low-card dimension
@@ -2251,7 +2236,7 @@ def test_optimize_e2e_ingest_then_write_variants(raw_sales):
 
 def test_optimize_e2e_write_raw_then_table_optimize(raw_sales):
     # The other entry point: land raw, THEN rewrite in place via conn.table(name).optimize(). Auto and
-    # explicit keys both preserve the data and flip the codec ZSTD → SNAPPY.
+    # explicit keys both preserve the data; the codec stays ZSTD (re-layout, not recompress).
     conn, praw, expected = raw_sales
     conn.read.format("parquet").load(praw).write.mode("overwrite").saveAsTable("t1")
     assert _codecs(conn, "t1") == {"ZSTD"}
@@ -2259,7 +2244,7 @@ def test_optimize_e2e_write_raw_then_table_optimize(raw_sales):
     m = conn.table("t1").optimize()                       # auto-key rewrite
     assert m["operation"] == "sortRewrite" and m["sortedBy"]
     assert _rows(conn, "t1") == expected
-    assert _codecs(conn, "t1") == {"SNAPPY"}
+    assert _codecs(conn, "t1") == {"ZSTD"}
     assert _clustered_by(conn, "t1", m["sortedBy"][0])    # clustered by whatever the profiler led with
 
     # Re-optimizing with an explicit key re-clusters the same data (idempotent on rows).
@@ -2273,7 +2258,7 @@ def test_optimize_e2e_chain_write_optimize_then_rekey(raw_sales):
     # handle. Data survives every hop; the clustering follows the most recent key.
     conn, praw, expected = raw_sales
     conn.read.format("parquet").load(praw).write.optimize("category").mode("overwrite").saveAsTable("c1")
-    assert _clustered_by(conn, "c1", "category") and _codecs(conn, "c1") == {"SNAPPY"}
+    assert _clustered_by(conn, "c1", "category") and _codecs(conn, "c1") == {"ZSTD"}
 
     conn.table("c1").optimize("day")
     assert _rows(conn, "c1") == expected

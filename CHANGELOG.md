@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **Experimental sort rewrite moved to `conn.table(name).optimize()`.** The `sort='experimental'` kwarg
+  is removed from `conn.optimize(name, …)` and `DeltaTable.forName(conn, name).optimize(…)` — those now
+  only compact (`conn.optimize("sales")`) or z-order (`conn.optimize("sales", zorder_by=["a","b"])`). The
+  full profiled sort rewrite is `conn.table("sales").optimize()` (auto key) or `.optimize("a","b")`.
+- **Tuned (sort-rewrite) writer uses ZSTD, not SNAPPY.** SNAPPY roughly tripled the on-disk size for no
+  read-layout benefit; the optimize path now uses the same ZSTD as every normal write.
 - **Target file size 1 GB → 128 MB, one row group per file.** A Parquet row group can't span files, so
   a large file-size cap silently truncates the row group (delta-rs closes the file mid-group), leaving
   small, non-uniform Direct Lake column segments — and on wide tables no segment ever reached the ideal
