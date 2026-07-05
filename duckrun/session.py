@@ -673,11 +673,11 @@ class DuckSession:
 
     def table(self, name: str) -> "DataFrame":
         catalog, schema, table = self._resolve(name)
-        # source_table lets the returned DataFrame resolve back to its Delta table for .optimize();
-        # a transformed/query DataFrame (createDataFrame, .sort(), a read) carries no name and can't.
+        # source_table + pristine: this frame IS the Delta table unchanged, so .optimize() can rewrite
+        # it and the writer can catch a self-overwrite. .sort() keeps source_table but clears pristine.
         return DataFrame(
             self.con.sql(f"SELECT * FROM {_qid(catalog)}.{_qid(schema)}.{_qid(table)}"), self,
-            source_table=name)
+            source_table=name, pristine=True)
 
     def createDataFrame(self, data, schema=None) -> "DataFrame":
         """Create a :class:`DataFrame` from in-memory data — the ``createDataFrame`` API.
@@ -1063,6 +1063,16 @@ class DuckSession:
         # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
         return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
 
+    def _auto_sort_cols_from_table(self, source_table: str, seed: Optional[int] = None) -> List[str]:
+        """No-arg ``df.sort()`` key for a frame that carries a source TABLE: profile it via ``_get_rle``,
+        which sizes its sample from the Delta **log**'s real row width (exact when the table fits the
+        byte budget) rather than a schema-only estimate — the same profiler the sort rewrite uses.
+        Returns the recommended ORDER BY columns, or ``[]`` if nothing pays off."""
+        prof = self._get_rle(source_table, seed=seed)
+        recs = [dict(zip(prof.columns, row)) for row in prof.collect()]
+        return [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
+                                            key=lambda x: x["sort_position"])]
+
     def _enumerate_remote(self, base: str, exts) -> List[tuple]:
         """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
         relative_path)`` pairs honouring the extension filter. Shared by ``list_files``/``download``."""
@@ -1164,12 +1174,20 @@ class DataFrame:
     ``.arrow()``, ``.fetchall()``, ``.fetchnumpy()`` etc. all keep working.
     """
 
-    def __init__(self, relation, session: DuckSession, source_table: Optional[str] = None):
+    def __init__(self, relation, session: DuckSession, source_table: Optional[str] = None,
+                 pristine: bool = False):
         self.relation = relation
         self.session = session
-        # Set only by conn.table(name): the Delta table this frame maps to, so .optimize() can rewrite
-        # it. None for any derived/query frame (createDataFrame, reader, .sort()) — .optimize() refuses.
+        # Lineage back to a catalog table, in two fields:
+        #  _source_table: the Delta table this frame reads from — set by conn.table(name) and PRESERVED
+        #    through a projection like .sort() (a sorted frame still reads table X). None for a
+        #    createDataFrame / reader / conn.sql() frame with no single source. The self-overwrite guard
+        #    and the no-arg sort() profiler key off this.
+        #  _pristine: True only while the relation IS the table unchanged (straight conn.table(name));
+        #    .sort() clears it (the rows are reordered/projected). .optimize() requires BOTH — a rewrite
+        #    key is chosen by profiling the table, not implied by a frame's current order.
         self._source_table = source_table
+        self._pristine = pristine and source_table is not None
 
     @property
     def write(self) -> "DataFrameWriter":
@@ -1206,6 +1224,11 @@ class DataFrame:
             raise ValueError(
                 "optimize() is only available on conn.table(name); a derived/query DataFrame has no "
                 "Delta table to optimize.")
+        if not self._pristine:
+            raise ValueError(
+                f"optimize() on a sorted frame is refused — sorting a frame does not choose the "
+                f"rewrite key. Use conn.table('{self._source_table}').optimize('<col>', ...) to "
+                f"rewrite in place, or write the sorted frame to a new table.")
         from .delta_table import DeltaTable
         dt = DeltaTable.forName(self.session, self._source_table)
         if analyze:
@@ -1269,7 +1292,13 @@ class DataFrame:
         if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
             cols = tuple(cols[0])
         if not cols:
-            names = self.session._auto_sort_cols(self.relation, seed=seed)
+            # No-arg auto-key: profile the SOURCE TABLE via its Delta log (real row width, exact when
+            # the table fits the byte budget) when this frame carries one; otherwise a schema-only
+            # estimate over the bare relation. Needs source_table only — a sorted frame still profiles
+            # its table.
+            names = (self.session._auto_sort_cols_from_table(self._source_table, seed=seed)
+                     if self._source_table is not None
+                     else self.session._auto_sort_cols(self.relation, seed=seed))
             if not names:
                 return self  # profiler found no key worth sorting by — leave order untouched
             dirs = ["ASC"] * len(names)
@@ -1284,7 +1313,10 @@ class DataFrame:
             else:
                 dirs = ["ASC" if ascending else "DESC"] * len(names)
         order_expr = ", ".join(f"{_qid(n)} {d}" for n, d in zip(names, dirs))
-        return DataFrame(self.relation.order(order_expr), self.session)
+        # Keep the lineage (source_table) so a self-overwrite is caught, but drop pristine — the rows
+        # are reordered now, so .optimize() must refuse (it profiles the table, not this order).
+        return DataFrame(self.relation.order(order_expr), self.session,
+                         source_table=self._source_table, pristine=False)
 
     orderBy = sort  # Spark: orderBy is an alias of sort
 
@@ -1487,12 +1519,27 @@ class DataFrameWriter:
         self._partition_by = list(cols)
         return self
 
-    def _write(self, path: str, descr: str, so=None, catalog=None) -> None:
+    def _write(self, path: str, descr: str, so=None, catalog=None, target=None) -> None:
         """Apply the configured mode to the Delta table at ``path`` (storage-neutral). ``descr``
         names the target in the mode='error' message. ``so`` / ``catalog`` are the target catalog's
-        storage_options / name (default to the current catalog's). Shared by saveAsTable and save."""
+        storage_options / name (default to the current catalog's). ``target`` is the resolved
+        ``(catalog, schema, table)`` for saveAsTable — used to refuse a self-overwrite; save(path)
+        has no catalog name and passes None. Shared by saveAsTable and save."""
         session = self._df.session
         session._require_writable("write a Delta table", catalog)
+        # Self-overwrite guard: a full overwrite of a table with a frame READ FROM that same table
+        # (compare resolved names, not strings) is an unfenced read-modify-write — the classic
+        # conn.table("t").sort(...).write.mode("overwrite").saveAsTable("t"). Only overwrite modes
+        # clobber the whole table; append / *_if_unchanged / replaceWhere don't. optimize() is the
+        # fenced, measured way to rewrite in place.
+        if (target is not None and self._df._source_table is not None
+                and self._replace_where is None
+                and self._mode in ("overwrite", "overwrite_if_unchanged")
+                and session._resolve(self._df._source_table) == target):
+            raise ValueError(
+                "overwriting a table with a sort/projection of itself is an unfenced rewrite — use "
+                f"conn.table('{self._df._source_table}').optimize(...) which is snapshot-fenced and "
+                "measured.")
         if so is None:
             so = session.storage_options
 
@@ -1606,7 +1653,8 @@ class DataFrameWriter:
         catalog, schema, table = session._resolve(name)
         path = session._table_path(schema, table, catalog)
         self._write(path, f"table '{catalog}.{schema}.{table}'",
-                    session._catalog_storage_options(catalog), catalog)
+                    session._catalog_storage_options(catalog), catalog,
+                    target=(catalog, schema, table))
         # Surface the (new or grown) table immediately — no manual refresh() needed.
         session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(catalog)}.{_qid(schema)}")
         session._register_view(catalog, schema, table)

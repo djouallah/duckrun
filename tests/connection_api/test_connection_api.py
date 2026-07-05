@@ -712,6 +712,41 @@ class TestDeltaTable:
         with pytest.raises(ValueError):
             conn.sql("select 1 x").optimize()
 
+    def test_optimize_refuses_on_sorted_frame(self, conn):
+        # A sorted frame keeps its table lineage but is NOT pristine: optimize() refuses (sorting a
+        # frame does not choose the rewrite key) and points at conn.table(name).optimize.
+        conn.sql("select (i%5) g, i id from range(500) t(i)").write.mode("overwrite").saveAsTable("srt")
+        with pytest.raises(ValueError, match="sorted frame is refused"):
+            conn.table("srt").sort("g").optimize()
+
+    def test_self_overwrite_guard(self, conn):
+        # conn.table("t").sort(...).write.mode("overwrite").saveAsTable("t") is an unfenced self-rewrite
+        # — refused (the lineage survived the sort). Resolved-name compare: 3-part addressing of the
+        # SAME table is still refused; a DIFFERENT table is fine.
+        conn.sql("select (i%5) g, i id from range(500) t(i)").write.mode("overwrite").saveAsTable("selfw")
+        with pytest.raises(ValueError, match="unfenced rewrite"):
+            conn.table("selfw").sort("g").write.mode("overwrite").saveAsTable("selfw")
+        with pytest.raises(ValueError, match="unfenced rewrite"):
+            conn.table("selfw").sort("g").write.mode("overwrite").saveAsTable("wh.dbo.selfw")  # 3-part, same table
+        conn.table("selfw").sort("g").write.mode("overwrite").saveAsTable("selfw2")            # other table: ok
+        assert conn.table("selfw2").count() == 500
+
+    def test_sort_no_args_on_table_uses_log_stats(self, conn, monkeypatch):
+        # No-arg sort() on a conn.table frame profiles the SOURCE TABLE via _get_rle (Delta-log row
+        # width), not a schema-only estimate over the bare relation, then writes to a NEW table.
+        conn.sql("select (i%5) g, i id from range(500) t(i)").write.mode("overwrite").saveAsTable("logsrc")
+        seen, orig = [], conn.__class__._get_rle
+        monkeypatch.setattr(conn.__class__, "_get_rle",
+                            lambda self, name, **kw: (seen.append(name), orig(self, name, **kw))[1])
+        conn.table("logsrc").sort().write.mode("overwrite").saveAsTable("logdst")
+        assert "logsrc" in seen  # profiled the source table through the log-stats profiler
+        assert conn.table("logdst").count() == 500
+
+    def test_bare_table_optimize_still_works(self, conn):
+        # Sanity: a pristine conn.table(name).optimize() (the safe button) is unaffected by the guard.
+        conn.sql("select i id from range(100) t(i)").write.mode("overwrite").saveAsTable("bare")
+        assert conn.table("bare").optimize()["operation"] in ("noop", "compact")
+
     def test_table_optimize_rewrite_refuses_on_concurrent_commit(self, conn, monkeypatch):
         # The full-table sort rewrite is snapshot-fenced (overwrite_if_unchanged): the handle pins the
         # version it read, so a foreign commit landing before the rewrite makes it fail loud instead of

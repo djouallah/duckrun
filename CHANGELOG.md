@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Self-overwrite is refused.** `conn.table("t").sort(...).write.mode("overwrite").saveAsTable("t")`
+  (an unfenced read-modify-write of a table with a projection of itself) now raises and points at
+  `conn.table("t").optimize(...)`, which is snapshot-fenced and measured. A frame from `conn.table`
+  carries its table lineage through `.sort()`, so the guard fires even after a sort; writing to any
+  other table is unaffected. `.optimize()` on a sorted frame is likewise refused (sorting a frame
+  doesn't choose the rewrite key), and no-arg `df.sort()` on a `conn.table` frame now sizes its
+  profiling sample from the Delta log's real row width.
+
 ### Removed
 - **`safeappend`** — the deprecated alias is gone, on both surfaces. `df.write.mode("safeappend")`
   raises (use `mode("append_if_unchanged")`), and `incremental_strategy='safeappend'` is no longer
