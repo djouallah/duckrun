@@ -1315,26 +1315,15 @@ def vacuum(
 def optimize(
     path: str,
     *,
-    zorder_by: Optional[List[str]] = None,
     target_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> Dict:
-    """Compact small files into larger ones (delta_rs ``DeltaTable.optimize``) and return the
-    operation metrics. With ``zorder_by`` the files are Z-ordered on those columns
-    (``optimize.z_order``); otherwise a plain bin-packing compaction (``optimize.compact``).
-
-    Both rewrites reuse the one ``_writer_properties()`` read layout. Note that ``z_order`` rewrites
-    files in bit-interleaved order, which *destroys* long run-length runs — a lexicographic
-    ``ORDER BY`` at write time is what a columnar reader wants; only reach for z-order when
-    multi-dimensional file pruning matters more."""
+    """Compact small files into larger ones (delta_rs ``optimize.compact``) and return the operation
+    metrics. Reuses the one ``_writer_properties()`` read layout. A lexicographic ``ORDER BY`` at
+    write time (``conn.table(name).optimize(...)``) is what a columnar reader wants; there is no
+    z-order path — bit-interleaving destroys the run-length runs the in-memory reader relies on."""
     dt = _delta_table(path, storage_options)
-    wp = _writer_properties()
-    if zorder_by:
-        logger.warning(
-            "optimize.z_order bit-interleaves rows, which breaks the RLE runs that make an "
-            "in-memory columnar reader transcode fast; prefer a lexicographic ORDER BY at write time.")
-        return dt.optimize.z_order(zorder_by, target_size=target_size, writer_properties=wp)
-    return dt.optimize.compact(target_size=target_size, writer_properties=wp)
+    return dt.optimize.compact(target_size=target_size, writer_properties=_writer_properties())
 
 
 def compaction_debt(cur, path: str, *, dt: Optional[DeltaTable] = None,

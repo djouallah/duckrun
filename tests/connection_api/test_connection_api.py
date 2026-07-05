@@ -655,16 +655,12 @@ class TestDeltaTable:
         DeltaTable.forName(conn, "dbo.m").update(condition="id = 1", set={"val": "val + 1"})
         assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
 
-    def test_optimize(self, conn):
-        # optimize operates on a TABLE (DeltaTable.forName), not on the session: bin-packing compaction,
-        # or a z-order with zorder_by. write two commits → two files, then compact/z-order; data
-        # unchanged, metrics returned. (The experimental sort rewrite is conn.table(name).optimize().)
+    def test_optimize_removed_from_deltatable(self, conn):
+        # DeltaTable.optimize (delta-spark compaction / z-order) is gone — the ONLY optimize surface is
+        # the tiered conn.table(name).optimize() (see test_table_optimize_*). z-order is removed
+        # entirely: bit-interleaving destroys the RLE runs a columnar reader relies on.
         self._seed(conn)
-        conn.sql("select 4 id, 10 val").write.mode("append").saveAsTable("m")
-        metrics = DeltaTable.forName(conn, "dbo.m").optimize()          # bin-packing compaction
-        assert metrics["numFilesAdded"] >= 1
-        assert conn.table("m").count() == 4
-        assert isinstance(DeltaTable.forName(conn, "dbo.m").optimize(zorder_by=["id"]), dict)  # z-order
+        assert not hasattr(DeltaTable.forName(conn, "dbo.m"), "optimize")
 
     def test_table_optimize_auto_keys(self, conn):
         # conn.table(name).optimize(rewrite=True) — the experimental sort rewrite: profiles the table

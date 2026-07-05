@@ -246,19 +246,6 @@ class DeltaTable:
                              enforce_retention_duration=enforce_retention_duration,
                              storage_options=self.storage_options)
 
-    def optimize(self, zorder_by: Optional[List[str]] = None,
-                 target_size: Optional[int] = None) -> Dict:
-        """Compact small files (delta-spark ``DeltaTable.optimize``), returning the operation
-        metrics. Pass ``zorder_by`` to Z-order on those columns instead of a plain compaction.
-
-        The experimental sort rewrite (profile the table, rewrite it physically sorted by a
-        run-length-friendly key) is a separate operation — use ``conn.table(name).optimize(...)``."""
-        self._session._require_writable("optimize", self._catalog)
-        metrics = engine.optimize(self.path, zorder_by=zorder_by, target_size=target_size,
-                                  storage_options=self.storage_options)
-        self._refresh_view()
-        return metrics
-
     def _maintain(self) -> Dict:
         """Tier-0 'safe button' (bare ``conn.table(name).optimize()``): a compaction policy plus a
         vacuum, and **never a data rewrite**. Reads the Delta log; if the small-file debt clears the
