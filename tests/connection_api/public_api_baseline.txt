@@ -10,6 +10,7 @@ DuckSession.download(remote_folder='', local_folder='./downloaded_files', file_e
 DuckSession.get_stats(source=None, detailed=False)
 DuckSession.list_files(remote_folder='', file_extensions=None)
 DuckSession.refresh(quiet=False, catalog=None)
+DuckSession.register(name, obj)
 DuckSession.sql(query)
 duckrun.DataFrame (class)
 duckrun.DeltaTable (class)

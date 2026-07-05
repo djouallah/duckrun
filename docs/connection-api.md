@@ -38,17 +38,20 @@ conn.sql("CREATE OR REPLACE TABLE orders_copy AS SELECT * FROM orders")
 conn.sql("SELECT * FROM orders_copy").show()
 ```
 
-## In-memory data — no `createDataFrame` needed
+## In-memory data — `conn.register`
 
-A local pandas / polars / pyarrow object is directly queryable by name via DuckDB's replacement
-scan — no wrapper, no import of a duckrun type:
+Register a local pandas / polars / pyarrow object (or a DuckDB relation) under a name, then read it
+in SQL — no wrapper, no import of a duckrun type. This is the `createDataFrame` replacement.
+Registration is explicit because DuckDB's replacement scan only sees the immediate calling frame
+(the `conn.sql` method), not yours, so a bare `conn.sql("FROM df")` can't find a caller-local `df`.
 
 ```python
 import pandas as pd
-seeded = pd.DataFrame({"id": [1, 2], "name": ["a", "b"]})
+df = pd.DataFrame({"id": [1, 2], "name": ["a", "b"]})
 
-conn.sql("CREATE OR REPLACE TABLE seeded AS SELECT * FROM seeded")   # the local df is the source
-conn.sql("SELECT * FROM seeded").df()                               # back out as pandas
+conn.register("df", df)
+conn.sql("SELECT * FROM df").df()                                # query it
+conn.sql("CREATE OR REPLACE TABLE seeded AS SELECT * FROM df")   # or persist it to Delta
 ```
 
 ## Multiple catalogs with `conn.attach`

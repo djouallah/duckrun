@@ -671,6 +671,17 @@ class DuckSession:
             raise ValueError(_delta_write_message(query))
         return DataFrame(self.con.sql(query), self)
 
+    def register(self, name: str, obj) -> None:
+        """Register an in-memory object (pandas / polars / pyarrow / a DuckDB relation) as ``name`` so
+        SQL can read it: ``conn.register("df", df); conn.sql("SELECT * FROM df")``.
+
+        This is the ``createDataFrame`` replacement. A bare ``conn.sql("FROM df")`` can't find a
+        caller-local ``df`` — DuckDB's replacement scan only inspects the immediate calling frame,
+        which is this method, not the user's — so registration is explicit. Forwards to DuckDB's
+        native ``register``; it's an in-memory view (no Delta write), so a read-only session allows it.
+        Persist it with the normal write path: ``conn.sql("CREATE TABLE t AS SELECT * FROM df")``."""
+        self.con.register(name, obj)
+
     def _live_table_exists(self, path: str, so=None) -> bool:
         """True iff a LIVE Delta table exists at ``path``. A drop-tombstone counts as NONEXISTENT — the
         same ``is_dropped`` predicate discovery and the raw-DML router use — so every existence check

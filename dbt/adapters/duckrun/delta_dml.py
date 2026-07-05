@@ -379,6 +379,46 @@ def dml_target_catalog(query: str) -> Optional[str]:
     return parts[0] if len(parts) >= 3 else None
 
 
+# ── statement route classification — the router's single form-classifier ────────────────────────
+_C_CREATE_TABLE = re.compile(r"\s*create\s+(?:or\s+replace\s+)?table\b", re.I)
+_C_FROM = re.compile(r"\bfrom\b", re.I)
+_C_USING = re.compile(r"\busing\b", re.I)
+_C_DELTA_HEAD = re.compile(
+    r"\s*(?:insert\s+into|update|delete\s+from|merge\s+into|alter\s+table|drop\s+table)\b", re.I)
+
+
+def classify(sql: str) -> str:
+    """Route ONE statement by form:
+
+      * ``'delta'``       — a DML form applied via delta_rs when the target is a Delta table
+                            (CREATE [OR REPLACE] TABLE … , INSERT / UPDATE / DELETE / MERGE /
+                            ALTER TABLE / DROP TABLE).
+      * ``'reject'``      — a single-statement form delta_rs's predicate engine can't express
+                            (``UPDATE … FROM`` / ``DELETE … USING``).
+      * ``'passthrough'`` — native DuckDB: reads, ``CREATE TEMP/TEMPORARY`` / ``CREATE VIEW``
+                            scratch, ``SHOW`` / ``DESCRIBE`` / ``SET`` / ``PRAGMA``, ….
+
+    Form-level only: it does NOT check whether the target actually exists (the executor falls a
+    non-Delta target back to passthrough) and does NOT decide multi-statement policy (the caller
+    does). It reuses the same quote / paren / CASE / comment-aware scanners as the executor, so the
+    classifier and the code that runs the statement can't drift on the hard parsing cases."""
+    body = _strip_comments(_strip_leading(sql))
+    low = body.lower()
+    # forms delta_rs can't express — a top-level FROM/USING (not one buried in a string or subquery)
+    if low.startswith("update") and _find_top_level(body, _C_FROM) != -1:
+        return "reject"
+    if low.startswith("delete") and _find_top_level(body, _C_USING) != -1:
+        return "reject"
+    _, inner = _split_leading_with(body)        # peel a leading WITH so the driving verb is visible
+    if _CREATE_TEMP_RE.match(inner):            # CREATE TEMP/TEMPORARY … → native scratch
+        return "passthrough"
+    if _C_CREATE_TABLE.match(inner):            # CREATE [OR REPLACE] TABLE … → Delta-backed
+        return "delta"
+    if _C_DELTA_HEAD.match(inner):             # insert/update/delete/merge/alter/drop → delta_rs
+        return "delta"
+    return "passthrough"                        # select, create view, show, describe, set, pragma, …
+
+
 def _fullmatch(pattern, sql):
     return pattern.fullmatch(sql.strip())
 
