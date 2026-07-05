@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.3.36] - 2026-07-05
+
+### Changed
+- **`conn.table(name).optimize()` is now a maintenance ladder.** The bare call is the *safe button*:
+  it compacts small files (a byte trigger bin-packs only partitions carrying real debt) and vacuums,
+  commits `dataChange=false`, and **never rewrites row data** — idempotent, safe under concurrent
+  writers, schedule-friendly. The profiled sort rewrite moves behind `optimize(rewrite=True)` (auto
+  key), an explicit `optimize("a", "b")`, or a scoped `optimize(where=…)`, and now returns a
+  `dataChange=true` warning. `optimize(analyze=True)` returns the sort-key recommendation as a
+  DataFrame and commits nothing.
+- **The full-table sort rewrite is snapshot-fenced.** It commits via `overwrite_if_unchanged` (CAS to
+  the version the scan read) instead of a plain overwrite, so a concurrent write fails it loudly
+  rather than being clobbered — matching the scoped (`replaceWhere`) path. No unfenced overwrite hole
+  is left.
+- **Auto sort-key profiler**: a near-unique timestamp is no longer lead-eligible (leading with a
+  ~unique temporal grain-stopped the first pick and left an empty key); plus approximate/dynamic
+  sampling refinements (dynamic sample size, bounded skew histogram, fully-approximate key selection).
+
+### Removed
+- **`df.write.optimize()`** (the write-time layout twin). Every write already lands in the parquet read
+  layout, so it added only the sort — land the table then `conn.table(name).optimize(rewrite=True)`.
+
 ## [0.3.35] - 2026-07-05
 
 ### Changed
