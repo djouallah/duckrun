@@ -295,8 +295,9 @@ class DeltaTable:
         ``keys`` is the sort key: ``None`` profiles the table with ``_get_rle`` and picks a
         run-length-friendly key automatically (and writes unique columns PLAIN); an explicit list sorts
         by exactly those columns. ``where`` (a CAST-free delta_rs SQL predicate, e.g. ``"year = 2026"``)
-        scopes the rewrite to only the matching partitions via a snapshot-fenced ``replaceWhere`` commit
-        instead of a full-table overwrite."""
+        scopes the rewrite to only the matching partitions instead of the whole table. Either way the
+        commit is snapshot-fenced to the version the scan read (full table → ``overwrite_if_unchanged``,
+        scoped → ``replaceWhere``), so a concurrent write fails it loudly rather than being clobbered."""
         if self._table is None:
             raise ValueError("optimize() needs a catalog table — use conn.table(name)/forName, not forPath.")
         try:
@@ -328,11 +329,14 @@ class DeltaTable:
         rel = con.sql(f"SELECT * FROM delta_scan('{plit}'){where_sql}{order_sql}")
         # The sort-rewrite passes plain_cols so the unique columns skip the (useless) dictionary; the
         # read layout (writer properties + 128 MB files) is the single profile every file write uses.
+        # Both paths are snapshot-fenced to the version the scan read (self._read_version): a foreign
+        # write that landed since the handle was taken fails the commit loudly (CAS, max_commit_retries=0)
+        # instead of silently clobbering it — the whole-table overwrite is no longer the one unfenced hole.
         if where is None:
-            engine.write_delta(self.path, rel, mode="overwrite", partition_by=(pcols or None),
-                               storage_options=self.storage_options,
-                               compaction_threshold=self.compaction_threshold,
-                               plain_cols=plain_cols)
+            engine.overwrite_if_unchanged(self.path, rel, read_version=self._read_version,
+                                          partition_by=(pcols or None), storage_options=self.storage_options,
+                                          compaction_threshold=self.compaction_threshold,
+                                          plain_cols=plain_cols)
         else:
             # Scoped rewrite: replace ONLY the matching partitions in one atomic, snapshot-fenced commit.
             engine.replace_where(self.path, rel, where, read_version=self._read_version,
@@ -343,7 +347,9 @@ class DeltaTable:
         _, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
         saved = round(100.0 * (before - after) / before, 1) if before else 0.0
         return {"operation": "sortRewrite", "sortedBy": order_cols,
-                "sizeBytesBefore": before, "sizeBytesAfter": after, "savedPct": saved}
+                "sizeBytesBefore": before, "sizeBytesAfter": after, "savedPct": saved,
+                "warning": "commits as dataChange=true — CDF / streaming consumers will see a "
+                           "full-table change"}
 
     def restoreToVersion(self, version: int) -> None:
         """Restore the table to an earlier Delta ``version`` (delta-spark ``DeltaTable.restoreToVersion``).

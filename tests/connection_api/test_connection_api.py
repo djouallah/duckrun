@@ -636,6 +636,7 @@ class TestDeltaTable:
             .write.mode("overwrite").saveAsTable("to_auto")
         m = conn.table("dbo.to_auto").optimize(rewrite=True)
         assert m["operation"] == "sortRewrite" and "region" in m["sortedBy"]
+        assert "dataChange=true" in m["warning"]  # full rewrite is a dataChange commit
         # reports REAL measured on-disk bytes (Delta-log size_bytes), never an estimate
         assert m["sizeBytesBefore"] > 0 and m["sizeBytesAfter"] > 0
         assert m["savedPct"] == round(100.0 * (m["sizeBytesBefore"] - m["sizeBytesAfter"]) / m["sizeBytesBefore"], 1)
@@ -676,6 +677,19 @@ class TestDeltaTable:
         # optimize() is only meaningful on a real table handle; a derived/query DataFrame refuses.
         with pytest.raises(ValueError):
             conn.sql("select 1 x").optimize()
+
+    def test_table_optimize_rewrite_refuses_on_concurrent_commit(self, conn, monkeypatch):
+        # The full-table sort rewrite is snapshot-fenced (overwrite_if_unchanged): the handle pins the
+        # version it read, so a foreign commit landing before the rewrite makes it fail loud instead of
+        # clobbering the concurrent write — the whole-table path is no longer the one unfenced hole.
+        conn.sql("select (i % 5) as region, i as id from range(2000) t(i)") \
+            .write.mode("overwrite").saveAsTable("to_race")
+        path = conn._table_path("dbo", "to_race")
+        stale = engine.table_version(path, conn.storage_options)
+        engine.write_delta(path, duckdb.connect().sql("select 1 region, 99999 id"), mode="append")
+        monkeypatch.setattr(engine, "table_version", lambda *a, **k: stale)  # handle reads the stale version
+        with pytest.raises(CommitFailedError):
+            conn.table("dbo.to_race").optimize("region")
 
     def test_table_optimize_maintain_noop(self, conn):
         # Bare conn.table(name).optimize() is the safe button: compaction policy + vacuum, never a

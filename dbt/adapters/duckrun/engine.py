@@ -1033,13 +1033,14 @@ def overwrite_if_unchanged(
     read_version: Optional[int],
     partition_by: Optional[List[str]] = None,
     overwrite_schema: bool = False,
+    plain_cols: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     compaction_threshold: int = 100,
 ) -> None:
     """Optimistic FULL-TABLE overwrite: replace every row with ``data`` only if the table version
     has not moved since we read it — otherwise refuse with ``CommitFailedError``. The overwrite
     sibling of :func:`append_if_unchanged`, for the read-whole-table -> recompute -> write-it-back
-    pattern.
+    pattern. ``plain_cols`` (sort-rewrite only) are unique columns written PLAIN — no dictionary.
 
     Same compare-and-swap trick: pin to ``read_version`` and ``max_commit_retries=0`` so a concurrent
     commit fails the overwrite instead of clobbering it. (An overwrite, like an append, is
@@ -1061,6 +1062,7 @@ def overwrite_if_unchanged(
         path, data, "overwrite",
         schema_mode=schema_mode,
         partition_by=partition_by,
+        plain_cols=plain_cols,
         storage_options=storage_options,
     )
     args["table_or_uri"] = dt
