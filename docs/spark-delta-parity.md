@@ -108,8 +108,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `write.option(k, v)` | `write.option(k, v)` | ✅ | `overwriteSchema`, `mergeSchema`. |
 | `write.partitionBy(*cols)` | `write.partitionBy(*cols)` | ✅ | |
 | `write.save(path)` | `write.save(path)` | ✅ | Write Delta by **path**. |
-| `write.saveAsTable(name)` | `write.saveAsTable(name)` | ✅ | Write Delta by **catalog name**. |
-| `write.insertInto(name)` | — | 🚫 | Removed — use `write.mode("append").saveAsTable(name)` (or `mode("overwrite")` to replace). |
+| `write.saveAsTable(name)` | `write.saveAsTable(name)` | ✅ | Write Delta by **catalog name**. Append/replace an existing table with `mode("append"\|"overwrite")`. |
 | `write.bucketBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 | `write.sortBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 
