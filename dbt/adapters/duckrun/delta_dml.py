@@ -671,7 +671,16 @@ class _DeltaDML:
 
     def _refresh_view(self, rel: str, schema: str, loc: str) -> None:
         loc_sql = loc.replace("'", "''")
-        self.cursor.execute(f'create schema if not exists "{schema}"')
+        # A 3-part rel (catalog.schema.table) targets an ATTACHED catalog: the schema must be created
+        # IN that catalog and the view registered there — an unqualified `create schema` would land in
+        # the current catalog, then the qualified view create fails on the missing schema (a partial
+        # CTAS: data committed, view never registered). A 1/2-part rel stays unqualified in the current
+        # catalog, preserving the dbt single-catalog path.
+        parts = [p.strip().strip('"') for p in rel.split(".")]
+        if len(parts) >= 3:
+            self.cursor.execute(f'create schema if not exists "{parts[-3]}"."{schema}"')
+        else:
+            self.cursor.execute(f'create schema if not exists "{schema}"')
         self.cursor.execute(
             f"create or replace view {rel} as select * from delta_scan('{loc_sql}')"
         )
