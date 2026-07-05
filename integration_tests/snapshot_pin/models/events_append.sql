@@ -7,7 +7,7 @@
 
 -- Plain append is UNFENCED by design: it rebases onto HEAD and only ADDS rows, so a concurrent
 -- writer's change is never clobbered (both coexist). The race test proves the run still succeeds and
--- nothing is lost — the deliberate contrast with the fenced strategies (merge/delete+insert/safeappend).
+-- nothing is lost — the deliberate contrast with the fenced strategies (merge/delete+insert/append_if_unchanged).
 
 {% if is_incremental() %}
 

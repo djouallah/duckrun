@@ -8,7 +8,7 @@ name: local_stress_tests
 # Jobs:
 #   • merge-spill   — generate a large TPCH lineitem (gate SF=10 ≈ 60M rows) and merge several
 #                     incremental batches back into it (mixed / insert-only / update-only /
-#                     idempotent), plus append / safeappend / overwrite for comparison, on the
+#                     idempotent), plus append / append_if_unchanged / overwrite for comparison, on the
 #                     runner's real RAM with duckrun's shipping defaults. Pinned deltalake 1.5.0
 #                     (1.6.0's merge is broken at scale). Renders the MERGE scorecard into docs and
 #                     commits to main on the release path.

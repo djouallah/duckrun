@@ -1,11 +1,11 @@
 {{
   config(
     materialized = 'incremental',
-    incremental_strategy = 'safeappend',
+    incremental_strategy = 'append_if_unchanged',
   )
 }}
 
--- safeappend is a FENCED strategy: the append is committed compare-and-swap (max_commit_retries=0)
+-- append_if_unchanged is a FENCED strategy: the append is committed compare-and-swap (max_commit_retries=0)
 -- against vB, so a concurrent writer that commits during the run makes the append refuse rather than
 -- land a (possibly duplicate) row on a drifted HEAD. The race test proves that through a real run.
 

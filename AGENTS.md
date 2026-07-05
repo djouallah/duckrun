@@ -18,7 +18,7 @@ usual behavior:
 - Single-threaded by design — do **not** set `threads:`.
 - DuckDB is in-memory; there is no database file. The Delta tables are the only state.
 - Incremental strategy defaults depend on `unique_key` (`merge` with it, `append`
-  without). For large tables, `merge` vs `safeappend` matters a lot.
+  without). For large tables, `merge` vs `append_if_unchanged` matters a lot.
 - OneLake/Fabric auth is just a bearer token; paths use lakehouse **GUIDs**, not names.
 
 Consult the SKILL.md before writing `profiles.yml` or any incremental model.

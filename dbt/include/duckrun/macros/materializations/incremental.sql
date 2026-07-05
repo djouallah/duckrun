@@ -13,7 +13,7 @@
       Differs from merge: merge updates matched rows and rejects a duplicate-key source, whereas
       delete+insert replaces whole rows and TOLERATES duplicate keys.
     - append (default when no unique_key): blind append
-    - safeappend: optimistic append — commit only if the table version has not moved
+    - append_if_unchanged: optimistic append — commit only if the table version has not moved
       since the write began, else fail (no dedup; that's the model SQL's job)
     - microbatch: delete+insert the model's event_time window per dbt-driven batch
 #}

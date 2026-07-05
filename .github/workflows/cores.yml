@@ -17,7 +17,7 @@ name: cores
 #   • connection-card         — the duckrun.connect() per-method ✅/❌ scorecard, rendered from the
 #                               Test* classes of that same suite; every method must pass. Refreshes
 #                               the README card on push to main.
-#   • concurrency-correctness — proves MERGE snapshot safety + safeappend CAS + pre-snapshot window.
+#   • concurrency-correctness — proves MERGE snapshot safety + append_if_unchanged CAS + pre-snapshot window.
 #   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • coffee-smoke            — fast connect/read/write/merge smoke at a small row count.
@@ -283,7 +283,7 @@ jobs:
 
   concurrency-correctness:
     name: concurrency correctness
-    # Proves duckrun's concurrency-correctness: MERGE snapshot safety, safeappend CAS, and the
+    # Proves duckrun's concurrency-correctness: MERGE snapshot safety, append_if_unchanged CAS, and the
     # pre-snapshot window. Exits non-zero if any invariant is ever violated, so a regression blocks
     # the PR. REQUIRED check — runs on every push/PR (no paths filter; a filtered-out required check
     # never reports and stays stuck "Expected"). The expensive steps self-skip on docs-only changes.
@@ -328,7 +328,7 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         run: pip install -e ".[test]"
 
-      - name: Prove concurrency correctness (merge snapshot safety + safeappend)
+      - name: Prove concurrency correctness (merge snapshot safety + append_if_unchanged)
         if: steps.changes.outputs.code == 'true'
         # Exit 0 = both invariants hold (expected). Exit 1 = a case behaved unexpectedly.
         run: python tests/correctness/concurrency_correctness.py

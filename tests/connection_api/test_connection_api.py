@@ -7,7 +7,7 @@
    shows a ✅/❌. Granularity is the point — one concept per test.
 
 2. **Local-filesystem contract & plumbing** (``test_*`` functions on the ``wh`` fixture) — discovery,
-   catalog introspection, save-MODE contracts (error/ignore/safeappend), the connect() error
+   catalog introspection, save-MODE contracts (error/ignore/append_if_unchanged), the connect() error
    formatting, reader round-trips, and the merge-builder contracts. Behaviour, not data equality.
    Storage-neutrality (s3/gcs/abfss) shares this exact code path — only the secret/discovery backend
    differs — so the local run is representative.

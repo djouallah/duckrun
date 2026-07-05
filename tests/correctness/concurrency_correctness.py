@@ -12,20 +12,20 @@ Three guarantees are checked here. (MERGE single-snapshot pinning — read_versi
 `load_as_version`, OCC over `(vB, HEAD]` — is proved separately in `test_correctness.py`;
 merge now ALWAYS pins, there is no unpinned path to demo.)
 
-B. safeappend (pin intended). The `safeappend` incremental strategy appends only if the table
+B. append_if_unchanged (pin intended). The `append_if_unchanged` incremental strategy appends only if the table
    version has not moved since it was read — a compare-and-swap via delta-rs max_commit_retries=0.
    A plain `append` has no such guard: it silently lands on whatever the latest version is.
-   safeappend instead REFUSES (CommitFailedError) when a concurrent write slipped in, so the
+   append_if_unchanged instead REFUSES (CommitFailedError) when a concurrent write slipped in, so the
    caller re-runs against the new HEAD. Dedup is NOT its job — that's the model SQL's.
 
 D. DELETE / UPDATE snapshot safety. A connection-API delete()/update() is a genuinely conflicting
    Delta op, so delta-rs OCC fails it (CommitFailedError) when a foreign commit changed the same
    rows after its snapshot opened — native conflict detection, no max_commit_retries hack.
 
-E. Connection-API safeappend (self-reference). The same B guarantee, but driven end-to-end through
-   the connection API — `conn.sql("select … from t").write.mode("safeappend").saveAsTable("t")` —
+E. Connection-API append_if_unchanged (self-reference). The same B guarantee, but driven end-to-end through
+   the connection API — `conn.sql("select … from t").write.mode("append_if_unchanged").saveAsTable("t")` —
    where the source reads the SAME table it writes to. A plain `append` silently lands on the new
-   HEAD; `safeappend` REFUSES (CommitFailedError) when a foreign commit moved the table since the
+   HEAD; `append_if_unchanged` REFUSES (CommitFailedError) when a foreign commit moved the table since the
    writer read it.
 """
 import os
@@ -54,10 +54,10 @@ def _batch(ids):
     return pa.table({"id": pa.array(ids, pa.int64())})
 
 
-# ----------------------------------------------------------------------------- B. safeappend
+# ----------------------------------------------------------------------------- B. append_if_unchanged
 
-def safeappend_run(mode: str, concurrent: bool) -> dict:
-    """mode: 'append' (plain, no guard) or 'safeappend' (CAS)."""
+def append_if_unchanged_run(mode: str, concurrent: bool) -> dict:
+    """mode: 'append' (plain, no guard) or 'append_if_unchanged' (CAS)."""
     path = str(Path(tempfile.mkdtemp()) / "t")
     engine.write_delta(path, _batch([0]), "overwrite")            # v0
     cap = {"mode": mode, "concurrent": concurrent}
@@ -69,7 +69,7 @@ def safeappend_run(mode: str, concurrent: bool) -> dict:
         if mode == "append":
             engine.write_delta(path, _batch([1]), "append")
         else:
-            # safeappend pinned to the version we read (v0); refuses if HEAD moved past it.
+            # append_if_unchanged pinned to the version we read (v0); refuses if HEAD moved past it.
             engine.append_if_unchanged(path, _batch([1]), read_version=0)
         cap["outcome"], cap["final"] = "committed", _ids(path)
     except CommitFailedError:
@@ -77,7 +77,7 @@ def safeappend_run(mode: str, concurrent: bool) -> dict:
     return cap
 
 
-def safeappend_display(rows):
+def append_if_unchanged_display(rows):
     out = []
     for c in rows:
         if c["mode"] == "append":
@@ -85,7 +85,7 @@ def safeappend_display(rows):
             res_md = "⚠️ committed anyway — no version guard"
             res_txt = "committed (no guard)"
         elif c["concurrent"]:
-            ok = c["outcome"] == "refused"              # safeappend must refuse a moved table
+            ok = c["outcome"] == "refused"              # append_if_unchanged must refuse a moved table
             res_md = "🛡️ refused — `CommitFailedError`"
             res_txt = "refused (CommitFailedError)"
         else:
@@ -163,13 +163,13 @@ def mutate_display(rows):
     return out
 
 
-# ------------------------------------------ E. connection-API safeappend (self-reference)
+# ------------------------------------------ E. connection-API append_if_unchanged (self-reference)
 
-def conn_safeappend_run(mode: str, concurrent: bool) -> dict:
+def conn_append_if_unchanged_run(mode: str, concurrent: bool) -> dict:
     """Same guarantee as B, but driven end-to-end through the **connection API** — and where the
     source query reads the SAME table it writes to (``select … from t`` → ``saveAsTable('t')``).
-    ``mode`` is 'append' (no guard) or 'safeappend' (CAS). The real race: the writer captures the
-    version it read (vB), a foreign writer then commits, and safeappend's CAS must refuse the commit
+    ``mode`` is 'append' (no guard) or 'append_if_unchanged' (CAS). The real race: the writer captures the
+    version it read (vB), a foreign writer then commits, and append_if_unchanged's CAS must refuse the commit
     (HEAD moved past vB) while a plain append silently lands on the new HEAD."""
     root = tempfile.mkdtemp()
     conn = duckrun.connect(root, schema="dbo", read_only=False)
@@ -187,8 +187,8 @@ def conn_safeappend_run(mode: str, concurrent: bool) -> dict:
     src = conn.sql("select id + 100 as id from t")
 
     real_tv = engine.table_version
-    if mode == "safeappend" and concurrent:
-        # safeappend fences to the version the writer read (vB); a foreign commit since then must
+    if mode == "append_if_unchanged" and concurrent:
+        # append_if_unchanged fences to the version the writer read (vB); a foreign commit since then must
         # make the CAS refuse. Force the captured version to vB to model "read vB, then it moved".
         engine.table_version = lambda *a, **k: read_ver
     try:
@@ -201,14 +201,14 @@ def conn_safeappend_run(mode: str, concurrent: bool) -> dict:
     return cap
 
 
-def conn_safeappend_display(rows):
+def conn_append_if_unchanged_display(rows):
     out = []
     for c in rows:
         if c["mode"] == "append":
             ok = c["outcome"] == "committed"            # plain append has no guard — expected
             res_md, res_txt = "⚠️ committed anyway — no version guard", "committed (no guard)"
         elif c["concurrent"]:
-            ok = c["outcome"] == "refused"              # safeappend must refuse a moved table
+            ok = c["outcome"] == "refused"              # append_if_unchanged must refuse a moved table
             res_md, res_txt = "🛡️ refused — `CommitFailedError`", "refused (CommitFailedError)"
         else:
             ok = c["outcome"] == "committed"            # unchanged -> commits
@@ -244,17 +244,17 @@ def render_console(sa_disp, mut_disp, conn_disp, safe):
     e = _ascii_table(
         ["mode", "concurrent write", "read", "head", "result"],
         [[x["mode"], x["concurrent"], x["read"], x["head"], x["res_txt"]] for x in conn_disp])
-    verdict = ("CONCURRENCY-CORRECT: safeappend refuses a moved table, plain append has no guard;\n"
-               "  DELETE/UPDATE fail on a conflicting commit; conn-API safeappend refuses a moved\n"
+    verdict = ("CONCURRENCY-CORRECT: append_if_unchanged refuses a moved table, plain append has no guard;\n"
+               "  DELETE/UPDATE fail on a conflicting commit; conn-API append_if_unchanged refuses a moved\n"
                "  table even when reading the same table it writes. (MERGE pinning: test_correctness.)"
                if safe else
                "INVARIANT VIOLATED — a case behaved unexpectedly (see tables). Investigate.")
     return ("\n  duckrun — concurrency correctness\n\n"
-            "  B) safeappend (pin intended) — append only if the table version didn't move\n"
+            "  B) append_if_unchanged (pin intended) — append only if the table version didn't move\n"
             + b + "\n\n"
             "  D) DELETE / UPDATE — do they fail on a conflicting concurrent commit (like merge)?\n"
             + d + "\n\n"
-            "  E) connection-API safeappend — self-reference (read t, write t) refuses a moved table\n"
+            "  E) connection-API append_if_unchanged — self-reference (read t, write t) refuses a moved table\n"
             + e + "\n\n  " + verdict + "\n")
 
 
@@ -263,14 +263,14 @@ def render_markdown(sa_disp, mut_disp, conn_disp, safe):
     L = [f"## duckrun — concurrency correctness {tick}", "",
          "> MERGE single-snapshot pinning is proved separately in `test_correctness.py` "
          "(read_version → `load_as_version`, OCC over `(vB, HEAD]`).", "",
-         "### B) safeappend — *append only if the version didn't move*", "",
+         "### B) append_if_unchanged — *append only if the version didn't move*", "",
          "| mode | concurrent write | read | head | result |",
          "|:---:|:---:|:---:|:---:|:---|"]
     for d in sa_disp:
         cc = "**yes**" if d["concurrent"] == "yes" else "no"
         L.append(f"| `{d['mode']}` | {cc} | {d['read']} | {d['head']} | {d['res_md']} |")
     L += ["",
-          "> `safeappend` pins the version it read and commits with `max_commit_retries=0`, so a "
+          "> `append_if_unchanged` pins the version it read and commits with `max_commit_retries=0`, so a "
           "concurrent write makes it **refuse** (`CommitFailedError`) instead of silently landing "
           "on the new version like a plain `append`. Re-run against the new HEAD.", "",
           "### D) DELETE / UPDATE — *do they fail on a conflicting concurrent commit?*", "",
@@ -284,8 +284,8 @@ def render_markdown(sa_disp, mut_disp, conn_disp, safe):
           "conflicting Delta operations, so — like `MERGE` — delta-rs OCC **refuses** them with "
           "`CommitFailedError` when a foreign commit changed the same rows after the snapshot was "
           "opened. No `max_commit_retries` hack: the conflict detection is native (the hack was only "
-          "needed for non-conflicting appends in `safeappend`). Uncontended, they just commit.", "",
-          "### E) connection-API safeappend — *self-reference (read `t`, write `t`)*", "",
+          "needed for non-conflicting appends in `append_if_unchanged`). Uncontended, they just commit.", "",
+          "### E) connection-API append_if_unchanged — *self-reference (read `t`, write `t`)*", "",
           "| mode | concurrent write | read | head | result |",
           "|:---:|:---:|:---:|:---:|:---|"]
     for d in conn_disp:
@@ -294,7 +294,7 @@ def render_markdown(sa_disp, mut_disp, conn_disp, safe):
     L += ["",
           "> Driven end-to-end through the connection API — `conn.sql(\"select … from t\")"
           ".write.mode(m).saveAsTable(\"t\")` — where the source reads the **same table it writes**. "
-          "`safeappend` still **refuses** (`CommitFailedError`) when a foreign commit moved the table "
+          "`append_if_unchanged` still **refuses** (`CommitFailedError`) when a foreign commit moved the table "
           "since the writer read it, while a plain `append` silently lands on the new HEAD.", "",
           ("> ✅ **Concurrency-correct.**" if safe
            else "> ❌ **Invariant violated** — see tables above.")]
@@ -307,17 +307,17 @@ def main() -> int:
     except Exception:
         pass
 
-    sa_rows = [safeappend_run("append", True),
-               safeappend_run("safeappend", False),
-               safeappend_run("safeappend", True)]
+    sa_rows = [append_if_unchanged_run("append", True),
+               append_if_unchanged_run("append_if_unchanged", False),
+               append_if_unchanged_run("append_if_unchanged", True)]
     mut_rows = [mutate_run("delete", False), mutate_run("delete", True),
                 mutate_run("update", False), mutate_run("update", True)]
-    conn_rows = [conn_safeappend_run("append", True),
-                 conn_safeappend_run("safeappend", False),
-                 conn_safeappend_run("safeappend", True)]
+    conn_rows = [conn_append_if_unchanged_run("append", True),
+                 conn_append_if_unchanged_run("append_if_unchanged", False),
+                 conn_append_if_unchanged_run("append_if_unchanged", True)]
 
-    sa_disp, mut_disp = safeappend_display(sa_rows), mutate_display(mut_rows)
-    conn_disp = conn_safeappend_display(conn_rows)
+    sa_disp, mut_disp = append_if_unchanged_display(sa_rows), mutate_display(mut_rows)
+    conn_disp = conn_append_if_unchanged_display(conn_rows)
     safe = (all(d["ok"] for d in sa_disp) and all(d["ok"] for d in mut_disp)
             and all(d["ok"] for d in conn_disp))
 

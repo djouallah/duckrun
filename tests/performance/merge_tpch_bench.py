@@ -16,7 +16,7 @@ RAM:
     -> full_sync           (matched UPDATE + WHEN NOT MATCHED BY SOURCE DELETE)                [local]
     -> expr_update         (100%-match UPDATE via arbitrary SET expressions + CASE)            [local]
     -> append_only         (~5% sample appended -- no target scan/join)
-    -> safeappend_only     (~5% sample via append_if_unchanged -- version-guarded append)
+    -> append_if_unchanged_only     (~5% sample via append_if_unchanged -- version-guarded append)
     -> overwrite_all       (~5% sample, table overwrite -- replaces the whole table)
 
 Each op's SQL lives in ``performance_test/merge_spill/sql/<op>.sql`` (plain DuckDB, no Jinja):
@@ -65,7 +65,7 @@ SEEDS = {
     "full_sync": ("mixed_upsert", 50),
     "expr_update": ("mixed_upsert", 50),
     "append_only": ("idempotent_remerge", None),
-    "safeappend_only": ("append_only", None),
+    "append_if_unchanged_only": ("append_only", None),
 }
 
 
@@ -228,11 +228,11 @@ class Bench:
         with _RssSampler() as sampler:
             for stmt in statements:
                 self.conn.sql(stmt)
-            if model == "safeappend_only":
-                # No raw-SQL safeappend form — append the batch via the DataFrame write API (same
+            if model == "append_if_unchanged_only":
+                # No raw-SQL append_if_unchanged form — append the batch via the DataFrame write API (same
                 # engine path, with the version-guard fence).
                 self.conn.sql("SELECT * FROM _batch").write.mode("append_if_unchanged") \
-                    .saveAsTable(self.t("safeappend_only"))
+                    .saveAsTable(self.t("append_if_unchanged_only"))
             if model == "full_sync":
                 # No raw-SQL way to set streamed_exec, and a by-source MERGE must STREAM its big ~50%
                 # source (collecting it whole builds a non-spillable hash → OOM), so apply it via the
@@ -427,8 +427,8 @@ def run(args):
         b.seed("full_sync");       results.append(b.full_sync("full_sync"))
         b.seed("expr_update");     results.append(b.expr_update("expr_update"))
     b.seed("append_only");         results.append(b.appendish("append_only", "Append"))
-    b.seed("safeappend_only");     results.append(b.appendish("safeappend_only", "Safeappend"))
-    results.append(b.overwrite("overwrite_all", "safeappend_only"))
+    b.seed("append_if_unchanged_only");     results.append(b.appendish("append_if_unchanged_only", "append_if_unchanged"))
+    results.append(b.overwrite("overwrite_all", "append_if_unchanged_only"))
 
     ok = True
     for r in results:
@@ -442,7 +442,7 @@ def run(args):
         if not r["verify_ok"]:
             print(f"   FAIL: value check failed ({r['verify']})", file=sys.stderr)
 
-    final_rows = b.count("safeappend_only")
+    final_rows = b.count("append_if_unchanged_only")
     op_peaks = [r["peak_mb"] for r in results if r.get("peak_mb")]
     peak = max(op_peaks) if op_peaks else _peak_rss_mb()
     peak_s = f"{peak}MB" if peak is not None else "n/a (/proc RSS sampling is Linux-only)"
@@ -470,7 +470,7 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
              "*fact* table **through the connection API** — a chain of `conn.sql(...)` MERGEs (the "
              "delta_rs spill cap + the per-merge DuckDB memory pin) — applying UPDATEs and INSERTs "
              "correctly without being OOM-killed, and how the same shape compares against a plain "
-             "`append` / `safeappend` / `overwrite` (which never scan the target).")
+             "`append` / `append_if_unchanged` / `overwrite` (which never scan the target).")
     L += ["", "### Setup (the inputs)", "| | |", "|---|---|"]
     L.append(f"| Engine | duckrun &middot; DuckDB {setup['duckdb_ver']} &middot; delta_rs {setup['deltalake_ver']} |")
     L.append(f"| Target fact table | TPCH `lineitem`, scale factor **{setup['sf']}** → **{setup['target_rows']:,} rows** |")
@@ -491,7 +491,7 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
     L.append("7. **Expression update:** a 100%-match UPDATE whose SET is an arbitrary expression + `CASE` "
              "over the source, not a plain column copy.")
     L.append("8. **Append (no merge):** the batch appended — no target scan/join (far cheaper).")
-    L.append("9. **Safeappend (no merge):** same cheap append, version-guarded against concurrent writers.")
+    L.append("9. **append_if_unchanged (no merge):** same cheap append, version-guarded against concurrent writers.")
     L.append("10. **Overwrite (no merge):** the table replaced by the batch — also no target scan/join.")
     L.append("")
     L.append("_Operations 5–7 exercise delta-rs's full MERGE clause set and run on the LOCAL stress gate "

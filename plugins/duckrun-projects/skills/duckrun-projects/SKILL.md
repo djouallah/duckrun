@@ -1,6 +1,6 @@
 ---
 name: duckrun-projects
-description: How to build, configure, and run dbt projects on the duckrun adapter — dbt models executed in DuckDB and materialized as Delta Lake tables via delta-rs, locally or on S3/GCS/ADLS/OneLake (Microsoft Fabric). Use this skill whenever a data engineer is setting up a duckrun profile, writing models or sources for it, choosing an incremental strategy (merge, insert, append, safeappend, microbatch), pointing dbt at OneLake/a Fabric Lakehouse, debugging a duckrun run, or asking "dbt + DuckDB + Delta" questions in general. Consult it BEFORE writing profiles.yml or any incremental model config — several defaults differ from other dbt adapters.
+description: How to build, configure, and run dbt projects on the duckrun adapter — dbt models executed in DuckDB and materialized as Delta Lake tables via delta-rs, locally or on S3/GCS/ADLS/OneLake (Microsoft Fabric). Use this skill whenever a data engineer is setting up a duckrun profile, writing models or sources for it, choosing an incremental strategy (merge, insert, append, append_if_unchanged, microbatch), pointing dbt at OneLake/a Fabric Lakehouse, debugging a duckrun run, or asking "dbt + DuckDB + Delta" questions in general. Consult it BEFORE writing profiles.yml or any incremental model config — several defaults differ from other dbt adapters.
 ---
 
 # Building dbt projects with duckrun
@@ -201,16 +201,16 @@ select * from {{ ref('stg_orders') }}
 | `merge` (default with `unique_key`) | upsert: update matched, insert new | `unique_key` | Rows change after first load |
 | `insert` | insert only keys not present | `unique_key` | Append-only data but you want key-level idempotency |
 | `append` (default without `unique_key`) | blind append | — | Event streams where duplicates are impossible or acceptable |
-| `append_if_unchanged` (alias `safeappend`) | append, but only if the table version hasn't moved since the model started; else fail | — | Your SQL already dedups against `{{ this }}` and the table is big |
+| `append_if_unchanged` | append, but only if the table version hasn't moved since the model started; else fail | — | Your SQL already dedups against `{{ this }}` and the table is big |
 | `microbatch` | delete+insert per `event_time` window | `event_time` config; rejects `unique_key` | dbt-driven backfills by time window |
 
 First run, `--full-refresh`, or a missing table always overwrites.
 
-**Steer big tables toward `append_if_unchanged`** (alias `safeappend`). A `merge` scans the target and joins on the
+**Steer big tables toward `append_if_unchanged`** (alias `append_if_unchanged`). A `merge` scans the target and joins on the
 key — expensive on a large fact table, and the merge path splits the memory budget
 between DuckDB and delta-rs. If the model SQL already excludes rows present in
 `{{ this }}` (the classic "load only files not yet seen" pattern), that join is pure
-waste. `safeappend` is a plain append (no target scan, full DuckDB memory budget) plus
+waste. `append_if_unchanged` is a plain append (no target scan, full DuckDB memory budget) plus
 a compare-and-swap: it commits only if the table version is unchanged since the model
 started — captured BEFORE the model read `{{ this }}` — so a concurrent writer makes it
 fail with `CommitFailedError` instead of letting a duplicate slip in. Re-running is
@@ -328,7 +328,7 @@ OPTIMIZE for these tables", the answer is: you don't, it's built in.
   is missing or expired — discovery needs it before anything runs. Check
   `storage_options.bearer_token` resolves (env var set?) and that the token is fresh
   (OneLake tokens expire ~1h; long runs in CI should mint per-run).
-- **`CommitFailedError` on safeappend or merge**: a concurrent writer touched the
+- **`CommitFailedError` on append_if_unchanged or merge**: a concurrent writer touched the
   table mid-run. Not a bug — re-run; the strategies are idempotent by design. If it's
   chronic, two schedules overlap: stagger them.
 - **dbt resolved incremental but "Delta table is not found at store time"**: duckrun
@@ -338,7 +338,7 @@ OPTIMIZE for these tables", the answer is: you don't, it's built in.
 - **Merge OOM / slow on a big target**: add `incremental_predicates` on the partition
   column to prune; check the logged "merge spill cap" line; lower
   `merge_max_spill_size` in a tight container; consider whether the model qualifies for
-  `safeappend` instead.
+  `append_if_unchanged` instead.
 - **Huge merge SOURCE (not target)**: set `merge_streamed_exec: true` so the source
   streams instead of being collected.
 - **NULLs in `unique_key`**: SQL `NULL != NULL` — merge cannot match null keys and you
@@ -355,10 +355,10 @@ OPTIMIZE for these tables", the answer is: you don't, it's built in.
 models/
   staging/      -- views (or python models for ingestion); cheap, rebuilt every run
   dimensions/   -- table or incremental merge on a natural key
-  marts/        -- big facts: incremental, safeappend where SQL dedups, else merge
+  marts/        -- big facts: incremental, append_if_unchanged where SQL dedups, else merge
 ```
 
 Wire file-driven ingestion as: a small `merge` log model tracking which files exist →
-fact models that `safeappend` only files not yet in `{{ this }}` (use a `pre_hook` with
+fact models that `append_if_unchanged` only files not yet in `{{ this }}` (use a `pre_hook` with
 `SET VARIABLE` to build the file list, as in the reference project). Keep
 `partition_by` low-cardinality (month keys, not timestamps).

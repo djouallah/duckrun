@@ -65,7 +65,7 @@ Every still-failing test in the card below falls into one of three categories:
 | `materialized='table'` (overwrite) | ✅ | full rewrite each run (delta_rs overwrite) |
 | first run / `--full-refresh` | ✅ | overwrites |
 | `append` | ✅ | blind append; default when no `unique_key` |
-| `safeappend` | ✅ | append only if the table version is unchanged since the model read it (else fail); cheap, no dedup scan |
+| `append_if_unchanged` | ✅ | append only if the table version is unchanged since the model read it (else fail); cheap, no dedup scan |
 | `merge` (upsert) | ✅ | update matched + insert new, on `unique_key`; default with `unique_key` |
 | `insert` (insert-only) | ✅ | insert new keys only (idempotent / dedupe) |
 | `merge_update_columns` | ✅ | update only the listed columns on match |

@@ -54,7 +54,7 @@
   {%- set location = p['location'] -%}
 
   {#-- Capture the target's Delta version AND existence NOW, before pre-hooks or the model read
-       `{{ this }}`, in a SINGLE log open (delta_state) instead of two — so `safeappend` can pin to
+       `{{ this }}`, in a SINGLE log open (delta_state) instead of two — so `append_if_unchanged` can pin to
        the version (if any writer commits during this build, the optimistic append fails rather than
        appending against a newer version and risking a duplicate), and the plugin gets the "table
        exists" belief for its contradiction guard. read_version is None when the table doesn't exist
@@ -76,7 +76,7 @@
        duckdb-delta version param). This makes the model's `is_incremental()` read of `{{ this }}`
        resolve at EXACTLY the version the write commit will validate OCC against — one snapshot for
        the read and the commit (single-snapshot MERGE semantics). Applies to every incremental
-       strategy (merge / microbatch / safeappend), all of which self-reference `{{ this }}`. When
+       strategy (merge / microbatch / append_if_unchanged), all of which self-reference `{{ this }}`. When
        read_version is None (brand-new table) there is nothing to pin — scan HEAD. --#}
   {%- if dbt_believes_exists -%}
     {%- do adapter.create_schema(target_relation) -%}

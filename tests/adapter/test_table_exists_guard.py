@@ -58,7 +58,7 @@ def test_table_exists_true_for_real_table(tmp_path):
 # ----------------------------------------------------------------- unit: delta_version
 
 def test_delta_version_reraises_generic_error(monkeypatch):
-    """delta_version feeds safeappend's start-of-build pin; a real error must NOT silently
+    """delta_version feeds append_if_unchanged's start-of-build pin; a real error must NOT silently
     become None (which would degrade the pin to HEAD-at-write and reopen the race)."""
     from dbt.adapters.duckrun.impl import DuckrunAdapter
 

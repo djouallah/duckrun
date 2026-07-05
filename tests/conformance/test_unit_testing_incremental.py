@@ -27,7 +27,7 @@ with a new value at a later timestamp, plus a brand-new key):
 
 That final assertion is what distinguishes the strategies — merge UPDATES the
 re-emitted key, insert KEEPS the old value, delete+insert REPLACES it, and
-append/safeappend leave a SECOND copy. Without reading the rows back these were
+append/append_if_unchanged leave a SECOND copy. Without reading the rows back these were
 mere "does it crash" smoke tests; now wrong output fails the suite.
 
 Matrix axes: incremental_strategy × is_incremental(true/false) × key shape
@@ -286,7 +286,7 @@ class TestIncrAppendNoKey(_IncrBase):
 
 
 # ---------------------------------------------------------------------------
-# 6. safeappend (CAS append)
+# 6. append_if_unchanged (CAS append)
 # ---------------------------------------------------------------------------
 _SAFEAPPEND_MODEL = """
 {{ config(materialized='incremental', incremental_strategy='append_if_unchanged') }}
