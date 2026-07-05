@@ -171,6 +171,18 @@ class TestSession:
         st = conn.get_stats("src", detailed=True)  # one row per parquet row group
         assert st.count() >= 1 and "table" in st.columns
 
+    def test_get_stats_glob(self, conn):
+        # wildcard patterns match table names across schemas in the current catalog.
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("fct_a")
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("fct_b")
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("dim_x")
+        names = lambda st: {r[st.columns.index("table")] for r in st.collect()}
+        assert names(conn.get_stats("fct_*")) == {"fct_a", "fct_b"}       # bare pattern
+        assert names(conn.get_stats("dbo.fct_*")) == {"fct_a", "fct_b"}   # schema.table pattern
+        assert names(conn.get_stats("*")) >= {"fct_a", "fct_b", "dim_x", "src"}
+        with pytest.raises(ValueError):  # a pattern that matches nothing is a reported miss
+            conn.get_stats("nope_*")
+
 
 class TestCatalog:
     def test_listTables(self, conn):

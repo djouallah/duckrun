@@ -830,7 +830,8 @@ class DuckSession:
         (``detailed=True``, the raw ``parquet_metadata`` columns).
 
         ``source``: ``None`` → every table in the current schema; a table name (1/2/3-part) → that
-        table; a schema name → every table in it. Aggregated columns: ``catalog, schema, table,
+        table; a schema name → every table in it; a wildcard pattern (``fct_*``, ``mart.fct_*``) →
+        every matching table in the current catalog. Aggregated columns: ``catalog, schema, table,
         total_rows, num_files, num_row_groups, avg_row_group, size_mb, vorder, compression``. Reads the
         Delta log for the active file list + size + VORDER, then the parquet footers for row-group
         shape — so it counts only live files (tombstoned ones are excluded)."""
@@ -872,10 +873,14 @@ class DuckSession:
 
     def _resolve_stats_targets(self, source: Optional[str]) -> List[tuple]:
         """Resolve a ``get_stats`` source to ``(catalog, schema, table)`` targets: ``None`` → every
-        table in the current schema; a known table (1/2/3-part) → itself; a schema name → its tables."""
+        table in the current schema; a known table (1/2/3-part) → itself; a schema name → its tables;
+        a wildcard pattern (``*``/``?``/``[...]``, e.g. ``fct_*`` or ``mart.fct_*``) → every matching
+        table in the current catalog."""
         if source is None:
             db = self._current_database
             return [(self._current_catalog, db, t) for t in self.catalog.listTables(db)]
+        if any(ch in source for ch in "*?["):
+            return self._glob_stats_targets(source)
         if self.catalog.tableExists(source):
             return [self._resolve(source)]
         if "." not in source and self.catalog.databaseExists(source):
@@ -883,6 +888,36 @@ class DuckSession:
         raise ValueError(
             f"get_stats: '{source}' is neither a known table nor a schema in catalog "
             f"'{self._current_catalog}'.")
+
+    def _glob_stats_targets(self, source: str) -> List[tuple]:
+        """Wildcard-match ``source`` (fnmatch ``*``/``?``/``[...]``, case-insensitive) against tables in
+        the current catalog. Accepts ``table``, ``schema.table``, or ``catalog.schema.table`` patterns;
+        a missing leading segment defaults to ``*`` (schema) / the current catalog. Returns the matched
+        ``(catalog, schema, table)`` targets (possibly empty — the caller reports the miss)."""
+        import fnmatch
+        parts = source.split(".")
+        if len(parts) == 1:
+            cat_pat, schema_pat, table_pat = self._current_catalog, "*", parts[0]
+        elif len(parts) == 2:
+            cat_pat, schema_pat, table_pat = self._current_catalog, parts[0], parts[1]
+        elif len(parts) == 3:
+            cat_pat, schema_pat, table_pat = parts
+        else:
+            raise ValueError(
+                f"get_stats: too many segments in pattern {source!r} "
+                f"(use table, schema.table, or catalog.schema.table).")
+        cat = self._current_catalog
+        if not fnmatch.fnmatchcase(cat.lower(), cat_pat.lower()):
+            return []
+        sp, tp = schema_pat.lower(), table_pat.lower()
+        out = []
+        for sch in self.catalog.listDatabases():
+            if not fnmatch.fnmatchcase(sch.lower(), sp):
+                continue
+            for tbl in self.catalog.listTables(sch):
+                if fnmatch.fnmatchcase(tbl.lower(), tp):
+                    out.append((cat, sch, tbl))
+        return out
 
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
                  key_sort_below_pct: float = 10.0, null_excl: float = 0.5,
