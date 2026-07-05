@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **A dropped table is absent on every surface.** A `drop table` tombstone now reports nonexistent
+  consistently through one oracle (`_live_table_exists`, reusing the `is_dropped` predicate discovery
+  uses): `catalog.tableExists` is `False`, `mode('error').saveAsTable` recreates it (was: raised
+  "already exists"), and `mode('ignore')` writes it rather than no-oping. Previously the writer
+  disagreed with the SQL/discovery surfaces.
 - **Self-overwrite is refused.** `conn.table("t").sort(...).write.mode("overwrite").saveAsTable("t")`
   (an unfenced read-modify-write of a table with a projection of itself) now raises and points at
   `conn.table("t").optimize(...)`, which is snapshot-fenced and measured. A frame from `conn.table`

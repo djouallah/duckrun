@@ -671,6 +671,13 @@ class DuckSession:
             raise ValueError(_delta_write_message(query))
         return DataFrame(self.con.sql(query), self)
 
+    def _live_table_exists(self, path: str, so=None) -> bool:
+        """True iff a LIVE Delta table exists at ``path``. A drop-tombstone counts as NONEXISTENT — the
+        same ``is_dropped`` predicate discovery and the raw-DML router use — so every existence check
+        (the writer's error/ignore mode, ``catalog.tableExists``, the reader) agrees a dropped table is
+        gone. One oracle, no per-surface duplication."""
+        return engine.table_exists(path, so) and not delta_dml.is_dropped(self.con, path, so)
+
     def table(self, name: str) -> "DataFrame":
         catalog, schema, table = self._resolve(name)
         # source_table + pristine: this frame IS the Delta table unchanged, so .optimize() can rewrite
@@ -1564,18 +1571,20 @@ class DataFrameWriter:
 
         mode = self._mode
         replacing_tombstone = False
-        if mode in ("error", "errorifexists"):
-            # A drop-tombstone (a table `drop table` marked deleted, data not yet purged) is ABSENT to
-            # the SQL surface — `create table` recreates it. mode='error' must agree: only a LIVE table
-            # blocks. Reuse the same is_dropped predicate discovery/SQL use, so both surfaces see one
-            # truth. Recreating over the tombstone forces overwrite_schema (its marker column differs).
-            exists = engine.table_exists(path, so)
-            if exists and not delta_dml.is_dropped(session.con, path, so):
+        if mode in ("error", "errorifexists", "ignore"):
+            # A drop-tombstone (a `drop table` marker, data not yet purged) is ABSENT on every surface —
+            # `create table` / mode('error') recreate it, mode('ignore') writes it. Only a LIVE table
+            # blocks error / no-ops ignore. One oracle (_live_table_exists) so all surfaces agree.
+            # Recreating over a tombstone forces overwrite_schema (its marker column differs).
+            live = session._live_table_exists(path, so)
+            if live:
+                if mode == "ignore":
+                    return  # a live table → ignore is a no-op
                 raise ValueError(
                     f"{descr} already exists (mode='error'). "
                     f"Use mode('overwrite'), mode('append'), mode('append_if_unchanged'), or mode('ignore')."
                 )
-            replacing_tombstone = exists
+            replacing_tombstone = engine.table_exists(path, so)  # exists but not live → a tombstone
             mode = "overwrite"
 
         if mode == "append_if_unchanged":
@@ -1704,16 +1713,13 @@ class Catalog:
         self.session._use(self.session._current_catalog, dbName)
 
     def tableExists(self, tableName: str, dbName: Optional[str] = None) -> bool:
-        self.session.refresh(quiet=True)  # safe: reflect on-store truth, not stale views
+        # One existence oracle (_live_table_exists), read from the store, so a drop-tombstone reports
+        # False here exactly as it does to the writer and discovery — no surface disagreement.
         catalog, schema, table = self.session._resolve(tableName)
         if dbName is not None:
             schema = dbName
-        rows = self.session.con.execute(
-            "SELECT 1 FROM information_schema.tables "
-            "WHERE table_catalog = ? AND table_schema = ? AND table_name = ?",
-            [catalog, schema, table],
-        ).fetchall()
-        return len(rows) > 0
+        path = self.session._table_path(schema, table, catalog)
+        return self.session._live_table_exists(path, self.session._catalog_storage_options(catalog))
 
     def getTable(self, tableName: str, dbName: Optional[str] = None) -> Table:
         """Return a :class:`Table` record for ``tableName`` (Spark's ``catalog.getTable``), or raise

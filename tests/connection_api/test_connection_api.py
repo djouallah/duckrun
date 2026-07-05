@@ -230,6 +230,26 @@ class TestCatalog:
         conn.sql("select 1 a").write.mode("overwrite").saveAsTable("fresh")
         assert conn.catalog.tableExists("fresh") is True
 
+    def test_drop_parity_across_surfaces(self, conn):
+        # A dropped (tombstoned) table is ABSENT on every surface — one existence oracle.
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("gone")
+        conn.sql("drop table gone")
+        assert conn.catalog.tableExists("gone") is False            # (b) catalog surface
+        conn.sql("select 3 a").write.mode("error").saveAsTable("gone")  # (a) writer error → recreate
+        assert conn.table("gone").collect() == [(3,)]               # readable with the new data
+        # ignore over a tombstone WRITES (the table is absent, so it isn't a no-op)
+        conn.sql("drop table gone")
+        conn.sql("select 5 a").write.mode("ignore").saveAsTable("gone")
+        assert conn.table("gone").collect() == [(5,)]
+
+    def test_reader_table_absent_after_drop(self, conn):
+        # (c) reader surface: conn.table on a dropped table does not read stale rows.
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("rdrop")
+        conn.sql("drop table rdrop")
+        assert conn.catalog.tableExists("rdrop") is False
+        with pytest.raises(Exception):
+            conn.table("rdrop").collect()
+
     def test_databaseExists(self, conn):
         assert conn.catalog.databaseExists("dbo") is True
         assert conn.catalog.databaseExists("ghost") is False
