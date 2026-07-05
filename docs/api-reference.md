@@ -1,4 +1,4 @@
-# Supported API
+# API reference
 
 <!-- CONNECTION_API:START -->
 

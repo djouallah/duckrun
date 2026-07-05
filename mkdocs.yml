@@ -107,6 +107,7 @@ nav:
   - dbt: dbt-adapter.md
   - Notebook:
       - Connection API: connection-api.md
+  - API reference: api-reference.md
   - Examples:
       - examples.md
       - dbt projects:
@@ -126,7 +127,6 @@ nav:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
   - Advanced:
-      - Supported API: api-reference.md
       - How it works:
           - Overview: overview.md
           - Design document: design_document.md

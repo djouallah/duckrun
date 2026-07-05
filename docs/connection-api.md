@@ -22,7 +22,7 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
 write can't mutate a shared lakehouse. Pass `read_only=False` to enable writes; reads and native
 `CREATE TEMP`/`CREATE VIEW` scratch are always allowed.
 
-For the exact list of supported methods, see [Supported API](api-reference.md).
+For the exact list of supported methods, see the [API reference](api-reference.md).
 
 `merge` is **snapshot-pinned by default** — single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit validates against it, so a concurrent writer fails the

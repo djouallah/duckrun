@@ -82,7 +82,7 @@ conn.sql("select * from warehouse.mart.facts f join local.dbo.lookup l on l.id =
 ```
 
 Works the same against a local path, `s3://`, `gs://`, or `az://`. Full method map:
-**[Connection API](docs/connection-api.md)** · **[Supported API](docs/api-reference.md)** ·
+**[Connection API](docs/connection-api.md)** · **[API reference](docs/api-reference.md)** ·
 [live multi-catalog demo](https://djouallah.github.io/duckrun/multicatalog.html).
 
 ## dbt adapter
@@ -164,7 +164,7 @@ Browse the rendered docs site at **[djouallah.github.io/duckrun](https://djouall
 | Doc | What's in it |
 |---|---|
 | [Connection API](docs/connection-api.md) | The `duckrun.connect()` notebook API + examples. |
-| [Supported API](docs/api-reference.md) | The exact public method contract, introspected from the code. |
+| [API reference](docs/api-reference.md) | The exact public method contract, introspected from the code. |
 | [dbt adapter](docs/dbt-adapter.md) | Profiles, materializations, incremental strategies, sources, maintenance, limitations. |
 | [Design document](docs/design_document.md) | Why delta-rs (not DuckDB's native Delta writer), why Delta (not Iceberg), why a separate adapter. |
 | [Snapshot isolation](docs/snapshot-isolation.md) | How a read-modify-write is fenced to the version you read, and how it compares to delta-rs/Spark/SQL Server. |
