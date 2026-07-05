@@ -4,7 +4,7 @@
 
 ## duckrun connection API — supported methods
 
-✅ **11 public methods** · 279/280 tests passing · 1 skipped
+✅ **11 public methods** · 152/152 tests passing
 
 > Introspected from the shipped classes — the exact public surface of `duckrun.connect()`, signatures and all, not a hand-maintained list. The green suite ([`test_connection_api.py`](../tests/connection_api/test_connection_api.py)) vouches it works. `conn.sql()` also routes raw Delta DML — see the DML matrix on the [Connection API](connection-api.md) page.
 
