@@ -1,13 +1,5 @@
 # Supported API
 
-The exact contract: every public method of `duckrun.connect()`. The list below is **introspected
-from the shipped classes** — not hand-maintained and not derived from test names — so it's the real
-public surface, nothing more, nothing less. It's regenerated on every push by the `connection-card`
-job in [`cores.yml`](../.github/workflows/cores.yml); the same job runs the full
-[`test_connection_api.py`](../tests/connection_api/test_connection_api.py) suite and **fails if any
-test regresses**, so the green badge vouches the surface works. Prose, examples, and the design
-rationale live in [Connection API](connection-api.md).
-
 <!-- CONNECTION_API:START -->
 
 ## duckrun connection API — supported methods
