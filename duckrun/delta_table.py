@@ -277,7 +277,13 @@ class DeltaTable:
             result = {"operation": "compact",
                       "filesRemoved": int(m.get("numFilesRemoved", 0)),
                       "filesAdded": int(m.get("numFilesAdded", 0)),
-                      "partitionsTouched": debt["partitions"]}
+                      "partitionsTouched": debt["partitions"],
+                      # A nudge, not a promise: point at analyze rather than naming a key with a
+                      # projected saving. _get_rle deliberately refuses to print a projected size (a
+                      # model estimate that reads like a measurement is worse than none); the safe
+                      # button holds the same line and stays cheap — no profiler pass on every run.
+                      "advice": "run .optimize(analyze=True) to see whether a sort rewrite would "
+                                "compress this table further"}
         else:
             result = {"operation": "noop", "reason": "no small-file debt"}
         # Vacuum runs either way — it reclaims files tombstoned by this or any earlier operation.
@@ -285,6 +291,19 @@ class DeltaTable:
         result["filesVacuumed"] = len(engine.vacuum(self.path, storage_options=self.storage_options))
         self._refresh_view()
         return result
+
+    def _analyze(self):
+        """``conn.table(name).optimize(analyze=True)``: the ``_get_rle`` sort-key profile promoted to
+        public — the per-column recommendation DataFrame — plus a printed small-file debt line. Reads
+        only (a sampled ``delta_scan`` + the Delta log); commits nothing, so it works read-only."""
+        name = self._table if self._schema is None else f"{self._schema}.{self._table}"
+        df = self._session._get_rle(name)  # prints the ORDER BY recommendation, returns the profile
+        debt = engine.compaction_debt(self._session.con, self.path, storage_options=self.storage_options)
+        mb = debt["small_bytes"] / (1024.0 * 1024.0)
+        where = f" across {len(debt['partitions'])} partition(s)" if debt["partitions"] else ""
+        print(f"  small-file debt: {debt['small_files']} file(s) under half-target ({mb:.1f} MB){where}"
+              f" — run .optimize() to compact")
+        return df
 
     def _sort_rewrite(self, keys: Optional[List[str]] = None,
                       where: Optional[str] = None) -> Dict:

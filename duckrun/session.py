@@ -1361,7 +1361,8 @@ class DataFrame:
     def write(self) -> "DataFrameWriter":
         return DataFrameWriter(self)
 
-    def optimize(self, *keys: str, rewrite: bool = False, where: Optional[str] = None) -> Dict:
+    def optimize(self, *keys: str, rewrite: bool = False, where: Optional[str] = None,
+                 analyze: bool = False):
         """Maintain this table. Only available on ``conn.table(name)`` — a derived/query DataFrame has
         no Delta table to touch.
 
@@ -1380,6 +1381,9 @@ class DataFrame:
         - ``optimize("region", where="year = 2026")`` — rewrite ONLY the partitions matching the
           predicate (a CAST-free delta_rs SQL expression), as one atomic snapshot-fenced commit.
 
+        **Advisory** — ``optimize(analyze=True)`` returns the sort-key recommendation as a DataFrame
+        (the profiler promoted to public) and prints the small-file debt, and commits nothing.
+
         Partition columns always lead the physical order and are preserved."""
         if self._source_table is None:
             raise ValueError(
@@ -1387,6 +1391,12 @@ class DataFrame:
                 "Delta table to optimize.")
         from .delta_table import DeltaTable
         dt = DeltaTable.forName(self.session, self._source_table)
+        if analyze:
+            if keys or where or rewrite:
+                raise ValueError(
+                    "optimize(analyze=True) is advisory-only and commits nothing — drop the "
+                    "keys / rewrite / where.")
+            return dt._analyze()
         if keys or where or rewrite:
             return dt._sort_rewrite(keys=list(keys) or None, where=where)
         return dt._maintain()

@@ -186,8 +186,10 @@ DeltaTable.forName(conn, "sales").optimize(zorder_by=["a", "b"])   # z-order (fi
 ```
 
 Both are the delta-rs `OPTIMIZE` operations. The name resolves like everywhere else — bare =
-current schema, `schema.table` or `catalog.schema.table` to be explicit. The experimental sort
-rewrite is a separate operation on the table's DataFrame — `conn.table("sales").optimize()`.
+current schema, `schema.table` or `catalog.schema.table` to be explicit. The table's DataFrame
+carries a separate, richer `conn.table("sales").optimize(...)` — a safe compact-and-vacuum button,
+an opt-in sort rewrite, and an advisory — documented in
+[Experimental: optimize](experimental-optimize.md).
 
 The card below — every public method with a ✅ — is regenerated on every push by
 the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from the `Test*` classes of

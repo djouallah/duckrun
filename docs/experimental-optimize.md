@@ -1,41 +1,51 @@
-# Experimental: auto optimize (a sort rewrite)
+# Experimental: optimize (the safe button and the sort rewrite)
 
 !!! warning "Experimental — opt-in, and no promises"
-    `conn.table(name).optimize()` is an opt-in, best-effort **sort rewrite**. It profiles the
-    table, picks a short sort key, and rewrites every file physically ordered by that key so equal
-    values cluster into long runs that compress well and transcode fast into a columnar reader
-    (Direct Lake). The heuristic and the writer tuning may **change between releases**, and it is
-    **not guaranteed to make anything smaller** — see [No guarantee of improvement](#no-guarantee-of-improvement).
-    It is a full **read → `ORDER BY` → overwrite** (not a bin-packing compaction), so run it
-    **occasionally** (after a batch load, not on every write). It needs a catalog table to profile.
+    `conn.table(name).optimize(...)` covers table maintenance in one method, from a safe
+    schedule-it button to an opt-in **sort rewrite**. The sort-rewrite heuristic and the writer
+    tuning may **change between releases**, and the rewrite is **not guaranteed to make anything
+    smaller** — see [No guarantee of improvement](#no-guarantee-of-improvement). It needs a catalog
+    table to profile.
 
 ## What it does
 
+`optimize()` is a ladder — the bare call is safe, and you opt into the heavier operations.
+
 ```python
-# auto: profile the table, pick the sort key, rewrite the whole table ordered by it
-r = conn.table("sales").optimize()
-# {'operation': 'sortRewrite', 'sortedBy': ['region', 'order_date'],
-#  'sizeBytesBefore': 15_197_312, 'sizeBytesAfter': 6_785_450, 'savedPct': 55.3}
+# ── Bare: the safe button — compact small files + vacuum, NEVER rewrites data ──────────
+conn.table("sales").optimize()
+# Compacts only partitions with real small-file debt (a byte trigger), then vacuums.
+# Commits dataChange=false, safe under concurrent writers, idempotent, schedule-friendly.
+# → {'operation': 'compact', 'filesRemoved': 41, 'filesAdded': 3,
+#    'partitionsTouched': ['date=2026-07-04'], 'filesVacuumed': 12,
+#    'advice': 'run .optimize(analyze=True) to see whether a sort rewrite would compress …'}
+# Nothing to do → {'operation': 'noop', 'reason': 'no small-file debt', 'filesVacuumed': 0}
 
-# explicit key — sort by exactly these columns
-conn.table("sales").optimize("region", "order_date")
+# ── Deliberate: a sort rewrite — profile, ORDER BY, rewrite in the read layout ─────────
+conn.table("sales").optimize(rewrite=True)              # auto-profiled sort key
+conn.table("sales").optimize("region", "order_date")   # explicit key
+conn.table("sales").optimize("order_date", where="year = 2026")   # scoped to matching partitions
+# → {'operation': 'sortRewrite', 'sortedBy': ['region', 'order_date'],
+#    'sizeBytesBefore': 15_197_312, 'sizeBytesAfter': 6_785_450, 'savedPct': 55.3,
+#    'warning': 'commits as dataChange=true — CDF / streaming consumers will see a full-table change'}
 
-# scoped — rewrite ONLY the matching partitions, as one atomic snapshot-fenced commit
-conn.table("sales").optimize("order_date", where="year = 2026")
+# ── Advisory: the profiler, no writes ─────────────────────────────────────────────────
+conn.table("sales").optimize(analyze=True)   # sort-key recommendation DataFrame + small-file debt
 ```
 
-Every write already lands in this read layout by default (see [The read layout it
-writes](#the-read-layout-it-writes)), so there is no write-time flavour of the sort rewrite — to
-sort an existing table, land it and then call `conn.table(name).optimize()`.
+The bare button never rewrites row data; only `rewrite=True` / an explicit key / `where` do, and
+those commit `dataChange=true`. Both rewrite paths are snapshot-fenced (full table →
+`overwrite_if_unchanged`, scoped → `replaceWhere`), so a concurrent write fails the rewrite loudly
+rather than being clobbered.
 
-Note the API split: `DeltaTable.forName(conn, name).optimize(...)` is the **plain compaction /
-z-order** operation — *not* this sort rewrite. The sort rewrite lives on the table's DataFrame
+Note the other `optimize`: `DeltaTable.forName(conn, name).optimize(...)` is the **plain compaction
+/ z-order** operation. The safe button and the sort rewrite live on the table's DataFrame
 (`conn.table(name).optimize(...)`).
 
-The pipeline is: **profile the table → pick a sort key → `ORDER BY` → overwrite → measure.**
-The returned `savedPct` is the **real, measured** on-disk change — active-file `size_bytes`
-read from the Delta log before and after the rewrite, never an estimate. If no key pays off it
-falls back to a plain compaction.
+The sort-rewrite pipeline is: **profile the table → pick a sort key → `ORDER BY` → overwrite →
+measure.** The returned `savedPct` is the **real, measured** on-disk change — active-file
+`size_bytes` read from the Delta log before and after the rewrite, never an estimate. If no key
+pays off it falls back to a plain compaction.
 
 ## It's a plain global `ORDER BY` — nothing clever
 

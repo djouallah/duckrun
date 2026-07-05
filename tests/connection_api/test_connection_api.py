@@ -715,6 +715,22 @@ class TestDeltaTable:
         assert m["operation"] == "compact"
         assert m["filesRemoved"] >= 8 and m["filesAdded"] >= 1
         assert conn.table("mt_debt").count() == 55000
+        assert "analyze=True" in m["advice"]  # nudge toward the advisory, no projected magnitude
+
+    def test_table_optimize_analyze(self, conn):
+        # optimize(analyze=True) is advisory-only: returns the sort-key recommendation as a DataFrame
+        # (the _get_rle profiler promoted to public) and commits nothing — the table version is unmoved.
+        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
+            .write.mode("overwrite").saveAsTable("an")
+        v0 = engine.table_version(conn.root_path + "/dbo/an", None)
+        df = conn.table("dbo.an").optimize(analyze=True)
+        recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+        assert set(recs) == {"region", "amount", "id"}          # a row per column
+        assert recs["region"]["in_sort_key"]                    # the low-card dimension is recommended
+        assert engine.table_version(conn.root_path + "/dbo/an", None) == v0  # zero commits
+        # advisory is exclusive — it can't be combined with a rewrite
+        with pytest.raises(ValueError):
+            conn.table("dbo.an").optimize("region", analyze=True)
 
     def test_get_rle_scan_count_is_constant(self, conn):
         # Regression: the auto profiler must NOT re-scan the (possibly remote) table once per column.
