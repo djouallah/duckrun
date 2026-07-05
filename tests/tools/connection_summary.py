@@ -5,9 +5,9 @@ summary and the docs (docs/api-reference.md).
     python tests/tools/connection_summary.py connection.xml            # print the card
     python tests/tools/connection_summary.py connection.xml --check    # exit 1 if any test failed
 
-The method list is **introspected from the shipped classes** (DuckSession, Catalog, DataFrame,
-DataFrameReader, DataFrameWriter, DeltaTable, DeltaMergeBuilder) — NOT from pytest test names — so
-it lists the exact public API and can't drift or invent a "method" out of a test-case name. The
+The method list is **introspected from the shipped classes** (the SQL-only surface — DuckSession) —
+NOT from pytest test names — so it lists the exact public API and can't drift or invent a "method"
+out of a test-case name. The
 pytest JUnit XML from tests/connection_api/test_connection_api.py contributes only the pass/fail
 badge (and the `--check` CI gate): the card is honest that it's a contract, and the green suite
 vouches the contract works.
@@ -66,19 +66,12 @@ def _test_totals(path):
 
 _MARKERS = {"(property)": "property", "(accessor)": "accessor", "(attr)": "attribute"}
 
-# Surfaces still shipped in the code but no longer advertised in the reference — the Spark-style
-# DeltaTable / DeltaMergeBuilder entry points are being consolidated onto conn.table(). They're hidden
-# from the card only; the code + the removal-gate baseline still track them until the refactor lands.
-_CARD_HIDE = {"DeltaTable", "DeltaMergeBuilder"}
-
 
 def _rows():
     """The code-derived contract as flat (surface, method, params) rows — one per public member, with
     `params` taken from the real signature. `nmethods` is the row count."""
     rows = [("duckrun", "connect", signature(duckrun.connect)[1:-1])]   # module entry point
     for surface, cls, extra in SURFACES:
-        if surface in _CARD_HIDE:
-            continue
         for m in _members(cls, extra):
             if (surface, m) in EXCLUDE:
                 continue

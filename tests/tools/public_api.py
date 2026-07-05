@@ -21,28 +21,30 @@ import os
 import sys
 
 import duckrun
-from duckrun import session as _S, delta_table as _D
+from duckrun import session as _S
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-# The reachable public API surfaces, keyed by how a user gets to each: the top-level module, then the
-# objects hung off a session (conn.catalog / conn.read / df.write / dt.merge(...)). (label, class,
-# extra members introspection can't see because they're instance attributes set in __init__).
+# The reachable public API surface. The SQL-only refactor amputates the DataFrame veneer: the notebook
+# surface is now ~just DuckSession + SQL. The wrapper classes (Catalog / DataFrame / DataFrameReader /
+# DataFrameWriter / DeltaTable / DeltaMergeBuilder) and the DuckSession members that hand them out
+# (table / read / createDataFrame / catalog) still exist in the code during the strangler transition,
+# but are no longer advertised — dropped from SURFACES / added to EXCLUDE so the reference card and the
+# removal gate track only the target surface. They're physically deleted in the final phase.
 SURFACES = [
-    ("DuckSession", _S.DuckSession, ["catalog"]),   # self.catalog = Catalog(self)
-    ("Catalog", _S.Catalog, []),
-    ("DataFrame", _S.DataFrame, []),
-    ("DataFrameReader", _S.DataFrameReader, []),
-    ("DataFrameWriter", _S.DataFrameWriter, []),
-    ("DeltaTable", _D.DeltaTable, []),
-    ("DeltaMergeBuilder", _D.DeltaMergeBuilder, []),
+    ("DuckSession", _S.DuckSession, []),
 ]
 
-# Public members that exist but aren't part of the advertised contract (internal plumbing accessors).
-EXCLUDE = {("DuckSession", "root_path"), ("DuckSession", "storage_options")}
+# Public members that exist but aren't part of the advertised contract: internal plumbing accessors,
+# plus the DataFrame-veneer entry points being removed by the SQL-only refactor (still in code, hidden).
+EXCLUDE = {
+    ("DuckSession", "root_path"), ("DuckSession", "storage_options"),
+    ("DuckSession", "table"), ("DuckSession", "read"),
+    ("DuckSession", "createDataFrame"), ("DuckSession", "catalog"),
+}
 
 BASELINE = os.path.join(os.path.dirname(__file__), os.pardir,
                         "connection_api", "public_api_baseline.txt")

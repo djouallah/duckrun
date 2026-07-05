@@ -28,7 +28,8 @@ conn = duckrun.connect("./lakehouse/Tables", read_only=False)
 conn.sql("SHOW TABLES").show()
 conn.sql("SELECT status, count(*) FROM orders GROUP BY status").show()
 
-reader = conn.sql("SELECT * FROM orders").toArrow()   # streaming pyarrow.RecordBatchReader
+reader = conn.sql("SELECT * FROM orders").fetch_arrow_reader()   # streaming pyarrow.RecordBatchReader
+# conn.sql(...) returns DuckDB's native relation — .df() / .arrow() / .pl() / .fetchall() all work
 ```
 
 ## 3. Write a table — plain SQL

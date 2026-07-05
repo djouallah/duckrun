@@ -42,31 +42,29 @@ conn = duckrun.connect("abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/
 
 conn.sql("SHOW TABLES").show()
 conn.sql("select status, count(*) from orders group by status").show()
-df = conn.table("orders").toPandas()          # or .toArrow() for a streaming RecordBatchReader
+conn.sql("select * from orders").df()          # native DuckDB relation → pandas (.arrow(), .pl() too)
 
-# Time travel: list the versions, then read one
-from duckrun import DeltaTable
-DeltaTable.forName(conn, "orders").history()   # newest-first commits: version, timestamp, operation, …
-conn.read.format("delta").option("versionAsOf", 0).load(".../Tables/dbo/orders").show()
+# Time travel: read an older version with delta_scan(…, version => N)
+conn.sql("select * from delta_scan('.../Tables/dbo/orders', version => 0)").show()
 ```
 
-Need to **write**? Opt in with `read_only=False`:
+Need to **write**? Opt in with `read_only=False` — everything is SQL:
 
 ```python
 conn = duckrun.connect("abfss://…/Tables/dbo", read_only=False)
 
-# write Delta straight from SQL
-conn.sql("select * from orders where amount > 0") \
-    .write.mode("overwrite").saveAsTable("clean_orders")
+# write Delta straight from SQL — CREATE TABLE AS routes to delta-rs
+conn.sql("CREATE OR REPLACE TABLE clean_orders AS SELECT * FROM orders WHERE amount > 0")
 
-# raw DML routes to delta-rs (insert / update / delete / create table as / alter / drop)
+# raw DML routes to delta-rs (insert / update / delete / alter / drop)
 conn.sql("delete from clean_orders where amount = 0")
 
 # upsert — snapshot-pinned automatically, nothing extra to pass
-from duckrun import DeltaTable
-src = conn.sql("select * from updates")
-DeltaTable.forName(conn, "clean_orders").merge(src, "target.id = source.id") \
-    .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+conn.sql("""
+    MERGE INTO clean_orders t USING updates s ON t.id = s.id
+    WHEN MATCHED THEN UPDATE SET *
+    WHEN NOT MATCHED THEN INSERT *
+""")
 
 conn.stop()
 ```

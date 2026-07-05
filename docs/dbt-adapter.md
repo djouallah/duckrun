@@ -301,8 +301,8 @@ be "fixed" away:
 - **`DROP TABLE` is a soft tombstone, not a physical delete.** delta_rs has no `DROP`, and duckrun
   **deliberately will not delete your data files** — as a precaution it leaves that to you — so
   `conn.sql("drop table x")` overwrites the table with a one-column tombstone marker and unregisters
-  it. The table vanishes from `conn.catalog` and discovery, and a later `create table x as …` revives
+  it. The table vanishes from discovery, and a later `create table x as …` revives
   the path with real data, but the **files are not reclaimed** (you purge them yourself when you're
   sure). One consequence: reading the path *directly*
-  (`conn.read.format("delta").load("…/x")`) bypasses discovery and returns the one-row tombstone
+  (`conn.sql("SELECT * FROM delta_scan('…/x')")`) bypasses discovery and returns the one-row tombstone
   marker rather than erroring — address dropped tables by name, not by path.
