@@ -11,8 +11,6 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   `append_if_unchanged` / `overwrite_if_unchanged` / `ignore` (the `_if_unchanged` modes are the
   fenced, fail-loud siblings), plus
   `option("replaceWhere", …)` for an atomic slice overwrite — plus `conn.read` and `conn.catalog`.
-- a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
-  `.merge(...)`, `.delete()`, `.update()`, `.version()`, `.history()`.
 - **multiple catalogs**: `connect()` binds one lakehouse root (the primary catalog); attach more with
   `conn.attach(path, name=…)` and read/join across them by three-part `catalog.schema.table` name —
   see [Multiple catalogs with `conn.attach`](#multiple-catalogs-with-connattach) below.
@@ -40,16 +38,9 @@ conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse
 conn.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
 conn.table("orders_copy").show()
 
-from duckrun import DeltaTable
-DeltaTable.forName(conn, "orders").delete("region = 'eu'")   # delete / update / version
-
 # overwrite just one slice, atomically
 conn.sql("select * from corrections").write.option("replaceWhere", "region = 'eu'") \
     .mode("overwrite").saveAsTable("orders")
-
-src = conn.sql("select * from updates")
-DeltaTable.forName(conn, "orders").merge(src, "target.id = source.id") \
-    .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()   # pinned automatically
 ```
 
 ## In-memory data with `conn.createDataFrame`
@@ -114,7 +105,7 @@ resolve. `name` is derived from a friendly path and is **mandatory for a GUID-on
 URL maps to one name (re-attaching either raises). `read_only` is **per-catalog**, independent of the
 session — a read-only reference store sits safely next to a writable lakehouse. Raw `conn.sql()` DML
 targets the current catalog; cross-catalog writes go through the DataFrame API
-(`df.write.saveAsTable("cat.schema.t")`) or `DeltaTable.forName(conn, "cat.schema.t")`.
+(`df.write.saveAsTable("cat.schema.t")`).
 
 See the full runnable walkthrough in
 [`integration_tests/multicatalog/demo_multicatalog.py`](../integration_tests/multicatalog/demo_multicatalog.py)
@@ -138,9 +129,9 @@ express are rejected up front with a pointer to the write API, rather than faili
 | `DELETE FROM x [WHERE …]` | delta_rs delete |
 | `ALTER TABLE x ADD COLUMN …` | Delta overwrite, widening the schema |
 | `DROP TABLE x` | **tombstone** — marks the table dropped (a one-column marker) without deleting data; files persist for a human to purge, a later `create … as` revives it |
-| `MERGE INTO x [a] USING s [b] ON a.k = b.k WHEN …` | delta_rs upsert (same engine + snapshot pin as the `DeltaTable.merge` builder). Write it like standard SQL — the `ON`/`WHEN` clauses may use **your own aliases or the table/relation names** (the literal `target`/`source` also work); fully-unqualified columns (`ON k = k`) are ambiguous and unsupported. Supports `UPDATE SET *` / `UPDATE SET col = <src>.col`, `INSERT *`, `WHEN NOT MATCHED BY SOURCE THEN DELETE`, and per-clause `AND` predicates |
+| `MERGE INTO x [a] USING s [b] ON a.k = b.k WHEN …` | delta_rs upsert (snapshot-pinned like every write). Write it like standard SQL — the `ON`/`WHEN` clauses may use **your own aliases or the table/relation names** (the literal `target`/`source` also work); fully-unqualified columns (`ON k = k`) are ambiguous and unsupported. Supports `UPDATE SET *` / `UPDATE SET col = <src>.col`, `INSERT *`, `WHEN NOT MATCHED BY SOURCE THEN DELETE`, and per-clause `AND` predicates |
 | `CREATE TEMP/TEMPORARY TABLE …`, `CREATE VIEW …` | **native DuckDB** — ephemeral, session-local; not a Delta artifact |
-| `UPDATE … FROM`, `DELETE … USING` | rejected → rewrite as a correlated subquery, or use `DeltaTable.forName(conn, name)` |
+| `UPDATE … FROM`, `DELETE … USING` | rejected → rewrite as a correlated subquery |
 | multiple statements in one call | rejected → one statement per `conn.sql()` |
 
 Leading `--` / `/* … */` comments are fine. The exact behaviour is pinned, statement-by-statement,

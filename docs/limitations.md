@@ -18,8 +18,7 @@ by deliberate caution. Most come with a "do this instead." Deeper detail lives i
 
 ## SQL DML (`conn.sql`)
 
-- **`UPDATE … FROM` and `DELETE … USING` are rejected** → rewrite as a correlated subquery, or use
-  `DeltaTable.forName(conn, name)`.
+- **`UPDATE … FROM` and `DELETE … USING` are rejected** → rewrite as a correlated subquery.
 - **One statement per `conn.sql()` call** — multiple statements in a single call are rejected.
 
 The full accepted/rejected matrix is in the [Connection API](connection-api.md#raw-sql-dml-through-connsql).
