@@ -55,12 +55,11 @@ _MULTI_MSG = (
 
 # _get_rle profiles a reservoir SAMPLE of the table, not the whole thing: key selection only needs to
 # rank columns by cardinality/skew and test functional dependencies, all of which survive sampling.
-# 1M rows is plenty to separate the candidates' ndv, and it turns the ~dozen profiling scans from
-# full-table passes (minutes on a remote 142M-row table) into millisecond local-temp-table scans. A
-# table at/below this size samples to itself, so small tables stay exact.
-_RLE_SAMPLE_ROWS = 1_000_000        # sample floor — a small table at/below this samples to itself
-_RLE_SAMPLE_FRAC = 100              # and above the floor the sample scales to 1/this of the table (1%)
-_RLE_SAMPLE_MAX = 10_000_000        # capped here so the in-memory sample stays bounded on small compute
+# The sample size is a byte-budgeted, width-aware plan (``sortkey.plan_sample``): a byte budget over
+# the table's real average row width (from the Delta log), so a wide table samples fewer rows and a
+# narrow one more, and a table that fits the budget is profiled EXACTLY (no sampling at all). This
+# turns the ~dozen profiling scans from full-table passes (minutes on a remote 142M-row table) into
+# millisecond local-temp-table scans.
 _READ_ONLY_MSG = (
     "catalog '{catalog}' is read-only — cannot {op}. duckrun opens read-only by default; enable "
     "Delta writes (saveAsTable / insertInto / save / merge / insert / update / delete / replaceWhere) "
@@ -921,18 +920,22 @@ class DuckSession:
 
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
                  key_sort_below_pct: float = 10.0, null_excl: float = 0.5,
-                 fd_band: float = 0.12, grain_frac: float = 0.5) -> "DataFrame":
+                 fd_band: float = 0.12, grain_frac: float = 0.5,
+                 seed: Optional[int] = None) -> "DataFrame":
         """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a short Delta **sort
         key** that minimises a table's estimated **in-memory columnar** footprint, and
         return a per-column :class:`DataFrame`. Recommendation-only — it never rewrites the table.
 
-        Profiled on a reservoir SAMPLE of ``_RLE_SAMPLE_ROWS`` rows (materialised once into a temp
-        table) rather than the whole table: the key model only ranks columns by cardinality/skew and
-        tests functional dependencies, which survive sampling, and this keeps the ~dozen profiling
-        scans off the (possibly remote) full table. ``ndv``/``skew``/``current_runs`` are therefore
-        SAMPLE estimates; a table at/below the sample size is profiled exactly. Uniqueness is only
-        asserted when the profile was exact — a sample can't tell a unique key from a merely
-        higher-than-sample-cardinality column (see ``exact`` below).
+        Profiled on a reservoir SAMPLE (materialised once into a temp table) rather than the whole
+        table: the key model only ranks columns by cardinality/skew and tests functional
+        dependencies, which survive sampling, and this keeps the ~dozen profiling scans off the
+        (possibly remote) full table. The sample size is a byte-budgeted, width-aware plan
+        (``sortkey.plan_sample`` over the Delta log's real average row width), so a table that fits
+        the byte budget is profiled EXACTLY (no ``USING SAMPLE`` at all) and larger ones sample fewer
+        rows the wider they are. ``ndv``/``skew``/``current_runs`` are SAMPLE estimates otherwise.
+        Uniqueness is only asserted when the profile was exact — a sample can't tell a unique key from
+        a merely higher-than-sample-cardinality column. ``seed`` makes the reservoir sample
+        reproducible (``REPEATABLE``): two runs on the same table return byte-identical rows.
 
         The target is an in-memory columnar encoding, **not** parquet-on-disk: each column is value- or hash/dictionary-encoded
         (indices bit-packed at ``ceil(log2 ndv)`` bits) and then RLE is kept only when it beats the
@@ -974,11 +977,16 @@ class DuckSession:
         # Partition columns lead the physical ORDER BY but are NOT compression-key candidates: Delta
         # strips them from the data files (zero RLE value), yet ordering by them first keeps ~one
         # delta-rs partition writer open at a time (less write memory). Discover them from the Delta
-        # metadata; best-effort — an unreadable log just means "treat as unpartitioned".
+        # metadata; best-effort — an unreadable log just means "treat as unpartitioned". The same
+        # add_actions carry each file's size_bytes; sum them here (in the SAME best-effort block, no
+        # extra open) to size the profiling sample below by the table's real average row width.
+        file_bytes = 0
         try:
-            _pcols = engine._delta_table(
-                path, self._catalog_storage_options(cat)).metadata().partition_columns
-            partition_cols = list(_pcols or [])
+            _dt = engine._delta_table(path, self._catalog_storage_options(cat))
+            partition_cols = list(_dt.metadata().partition_columns or [])
+            add_actions = _dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan
+            file_bytes = int(self.con.sql(
+                "select coalesce(sum(size_bytes), 0)::bigint from add_actions").fetchone()[0] or 0)
         except Exception:
             partition_cols = []
         desc = self.con.sql(f"DESCRIBE SELECT * FROM delta_scan('{plit}')").fetchall()
@@ -995,46 +1003,67 @@ class DuckSession:
         # profiler runs exactly as before. total_rows also sizes the sample below.
         stats, _, total_rows = engine.delta_column_stats(
             self.con, path, cols, types, self._catalog_storage_options(cat))
-        # Profile a MATERIALIZED delta_scan sample held in memory, then scan that local temp table for
-        # every pass below — never the remote table per pass. DYNAMIC size: scale to ~1% of the table
-        # between a 1M floor and a 10M cap, so a 1B-row table gets a representative sample instead of a
-        # fixed 1M. A table at/below the target samples to itself, so small tables stay exact.
-        target = (min(_RLE_SAMPLE_MAX, max(_RLE_SAMPLE_ROWS, total_rows // _RLE_SAMPLE_FRAC))
-                  if total_rows else _RLE_SAMPLE_ROWS)
+        # Byte-budgeted, width-aware sample plan. avg_row_bytes = real on-disk bytes/row × a
+        # decompression factor (the in-memory form is larger than parquet); fall back to a schema
+        # width estimate when the log gave nothing. plan_sample returns the row count AND whether the
+        # table fits the budget — if it does, profile it EXACTLY (no USING SAMPLE) so small tables
+        # stay exact and uniqueness can be trusted.
+        avg_row_bytes = ((file_bytes / total_rows) * sortkey._DECOMPRESSION_FACTOR
+                         if file_bytes and total_rows else sortkey.estimate_row_bytes(types))
+        plan_rows, exact = sortkey.plan_sample(total_rows or None, avg_row_bytes)
         src = "_rle_src"
-        self.con.execute(
-            f"CREATE OR REPLACE TEMP TABLE {src} AS "
-            f"SELECT * FROM delta_scan('{plit}') USING SAMPLE {target} ROWS")
+        if exact:
+            self.con.execute(
+                f"CREATE OR REPLACE TEMP TABLE {src} AS SELECT * FROM delta_scan('{plit}')")
+        else:
+            samp = (f"reservoir({plan_rows} ROWS) REPEATABLE ({int(seed)})"
+                    if seed is not None else f"{plan_rows} ROWS")
+            self.con.execute(
+                f"CREATE OR REPLACE TEMP TABLE {src} AS "
+                f"SELECT * FROM delta_scan('{plit}') USING SAMPLE {samp}")
         try:
-            rows, schema = sortkey.recommend_sort_key(
+            rows, schema, lines = sortkey.recommend_sort_key(
                 self.con, sch, tbl, src, cols, types, partition_cols,
                 sort_key_cap=sort_key_cap, min_gain_pct=min_gain_pct,
                 key_sort_below_pct=key_sort_below_pct, stats=stats, null_excl=null_excl,
-                fd_band=fd_band, grain_frac=grain_frac, sample_rows=target)
+                fd_band=fd_band, grain_frac=grain_frac, sample_rows=plan_rows, exact=exact)
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
+        for line in lines:   # the module is pure; the caller prints the advisory
+            print(line)
         return self.createDataFrame(rows, schema)
 
-    def _auto_sort_cols(self, relation) -> List[str]:
+    def _auto_sort_cols(self, relation, seed: Optional[int] = None) -> List[str]:
         """Run the sort-key recommender over an arbitrary relation (no Delta table behind it, so no
         partitions and no log stats) and return the recommended ORDER BY columns, or ``[]`` if nothing
         pays off. Backs the no-arg ``DataFrame.sort()``. Profiles a bounded reservoir sample, not the
-        whole relation."""
+        whole relation — sized by a schema-only width estimate (no Delta log to read real bytes), and
+        NEVER exact (a relation's row count is unknown without evaluating it, so uniqueness is never
+        claimed here). ``seed`` makes the reservoir sample reproducible."""
         cols = list(relation.columns)
         types = {n: str(t) for n, t in zip(relation.columns, relation.types)}
         if not cols:
             return []
+        # No Delta log → estimate the in-memory row width from the schema alone; total_rows unknown
+        # (None) → plan_sample never returns exact, so this path always samples.
+        plan_rows, exact = sortkey.plan_sample(None, sortkey.estimate_row_bytes(types))
+        samp = (f"reservoir({plan_rows} ROWS) REPEATABLE ({int(seed)})"
+                if seed is not None else f"{plan_rows} ROWS")
         view, src = "_rle_relation_src", "_rle_src"
         relation.create_view(view, replace=True)
         try:
             self.con.execute(
                 f"CREATE OR REPLACE TEMP TABLE {src} AS "
-                f"SELECT * FROM {view} USING SAMPLE {_RLE_SAMPLE_ROWS} ROWS")
-            rows, _ = sortkey.recommend_sort_key(
-                self.con, "df", "sort()", src, cols, types, [], sample_rows=_RLE_SAMPLE_ROWS)
+                f"SELECT * FROM {view} USING SAMPLE {samp}")
+            rows, _, lines = sortkey.recommend_sort_key(
+                self.con, "df", "sort()", src, cols, types, [], sample_rows=plan_rows, exact=exact)
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
             self.con.execute(f"DROP VIEW IF EXISTS {view}")
+        # The no-arg sort() path prints ONLY the ORDER BY line (not the full advisory block).
+        for line in lines:
+            if line.strip().startswith("ORDER BY"):
+                print(line)
         # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
         return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
 
@@ -1151,7 +1180,7 @@ class DataFrame:
         return DataFrameWriter(self)
 
     def optimize(self, *keys: str, rewrite: bool = False, where: Optional[str] = None,
-                 analyze: bool = False):
+                 analyze: bool = False, seed: Optional[int] = None):
         """Maintain this table. Only available on ``conn.table(name)`` — a derived/query DataFrame has
         no Delta table to touch.
 
@@ -1173,6 +1202,9 @@ class DataFrame:
         **Advisory** — ``optimize(analyze=True)`` returns the sort-key recommendation as a DataFrame
         (the profiler promoted to public) and prints the small-file debt, and commits nothing.
 
+        ``seed`` makes the profiling sample reproducible (the auto-key paths — ``analyze=True`` and
+        the auto-picked ``rewrite=True``); two runs with the same seed pick the same key.
+
         Partition columns always lead the physical order and are preserved."""
         if self._source_table is None:
             raise ValueError(
@@ -1185,9 +1217,9 @@ class DataFrame:
                 raise ValueError(
                     "optimize(analyze=True) is advisory-only and commits nothing — drop the "
                     "keys / rewrite / where.")
-            return dt._analyze()
+            return dt._analyze(seed=seed)
         if keys or where or rewrite:
-            return dt._sort_rewrite(keys=list(keys) or None, where=where)
+            return dt._sort_rewrite(keys=list(keys) or None, where=where, seed=seed)
         return dt._maintain()
 
     # DataFrame aliases over the DuckDB relation.
@@ -1229,16 +1261,19 @@ class DataFrame:
         """``True`` if the DataFrame has no rows (Spark's ``DataFrame.isEmpty()``)."""
         return self.relation.limit(1).fetchone() is None
 
-    def sort(self, *cols, ascending=None) -> "DataFrame":
+    def sort(self, *cols, ascending=None, seed: Optional[int] = None) -> "DataFrame":
         """A new DataFrame globally sorted by ``cols`` (Spark's ``DataFrame.sort``; ``orderBy`` is its
         alias). ``cols`` are column names (or a single list of them); ``ascending`` is a bool or a
         list of bools matching ``cols`` (default all ascending). This is a native DuckDB ``ORDER BY``,
         so writing the result lands physically sorted Delta files — nothing sort-specific in the write
-        path. Without this, ``df.sort(...)`` fell through to the bare DuckDB relation and lost ``.write``."""
+        path. Without this, ``df.sort(...)`` fell through to the bare DuckDB relation and lost ``.write``.
+
+        The no-arg ``df.sort()`` auto-picks a run-length-friendly key by profiling; ``seed`` makes
+        that profiling sample reproducible."""
         if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
             cols = tuple(cols[0])
         if not cols:
-            names = self.session._auto_sort_cols(self.relation)
+            names = self.session._auto_sort_cols(self.relation, seed=seed)
             if not names:
                 return self  # profiler found no key worth sorting by — leave order untouched
             dirs = ["ASC"] * len(names)
@@ -1489,12 +1524,19 @@ class DataFrameWriter:
             return
 
         mode = self._mode
+        replacing_tombstone = False
         if mode in ("error", "errorifexists"):
-            if engine.table_exists(path, so):
+            # A drop-tombstone (a table `drop table` marked deleted, data not yet purged) is ABSENT to
+            # the SQL surface — `create table` recreates it. mode='error' must agree: only a LIVE table
+            # blocks. Reuse the same is_dropped predicate discovery/SQL use, so both surfaces see one
+            # truth. Recreating over the tombstone forces overwrite_schema (its marker column differs).
+            exists = engine.table_exists(path, so)
+            if exists and not delta_dml.is_dropped(session.con, path, so):
                 raise ValueError(
                     f"{descr} already exists (mode='error'). "
                     f"Use mode('overwrite'), mode('append'), mode('safeappend'), or mode('ignore')."
                 )
+            replacing_tombstone = exists
             mode = "overwrite"
 
         if mode == "append_if_unchanged":
@@ -1552,7 +1594,7 @@ class DataFrameWriter:
                 mode=mode,
                 partition_by=self._partition_by,
                 merge_schema=self._merge_schema,
-                overwrite_schema=self._overwrite_schema,
+                overwrite_schema=self._overwrite_schema or replacing_tombstone,
                 storage_options=so,
                 cur=session.con,
             )
