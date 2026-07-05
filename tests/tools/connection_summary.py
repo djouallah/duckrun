@@ -20,39 +20,17 @@ import sys
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-# The API surface (which classes, which excluded members) is defined once in public_api.py — the same
-# definition the removal gate checks — so the card and the gate can never disagree about what's public.
+# The API surface (which classes, which excluded members) and the signature/entry formatting are
+# defined once in public_api.py — the same definitions the removal gate checks — so the card and the
+# gate can never disagree about what's public or what a method's parameters are.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from public_api import SURFACES, EXCLUDE   # noqa: E402
+import duckrun   # noqa: E402
+from public_api import SURFACES, EXCLUDE, member_entry, signature   # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
-
-MODULE_FUNCS = [("connect", "DuckSession")]   # duckrun.connect(...) -> a DuckSession
-
-# Which established API each method mirrors, so a reader can tell a real DataFrame/Delta method from a
-# duckrun-specific convenience. Default per surface; per-method overrides for the handful of exceptions.
-_SURFACE_API = {
-    "DuckSession": "duckrun",       # the session is duckrun's; a few entry points mirror the DataFrame API
-    "Catalog": "spark",
-    "DataFrame": "spark",
-    "DataFrameReader": "spark",
-    "DataFrameWriter": "spark",
-    "DeltaTable": "spark",          # delta.tables.DeltaTable
-    "DeltaMergeBuilder": "spark",   # delta.tables.DeltaMergeBuilder
-}
-_METHOD_API = {
-    ("DuckSession", "sql"): "spark", ("DuckSession", "table"): "spark",
-    ("DuckSession", "read"): "spark", ("DuckSession", "catalog"): "spark",
-    ("DataFrame", "optimize"): "duckrun",   # duckrun's profiling maintenance ladder, not a Spark method
-}
-
-
-def _api(surface: str, method: str) -> str:
-    return _METHOD_API.get((surface, method), _SURFACE_API.get(surface, "duckrun"))
-
 
 def _members(cls, extra):
     """Public methods + properties of a class (names without a leading underscore), plus the named
@@ -86,24 +64,21 @@ def _test_totals(path):
     return total, fails
 
 
-def _contract():
-    """The code-derived method contract: two lists of (surface, [methods]) — Spark/Delta-mirroring
-    vs duckrun-specific — plus the total method count."""
-    spark, duck, n = [], [], 0
-    # duckrun.connect() is a module function; show it as a DuckSession entry point.
-    duck_extra = {"DuckSession": [m for m, _ in MODULE_FUNCS]}
+_MARKERS = {"(property)": "property", "(accessor)": "accessor", "(attr)": "attribute"}
+
+
+def _rows():
+    """The code-derived contract as flat (surface, method, params) rows — one per public member, with
+    `params` taken from the real signature. `nmethods` is the row count."""
+    rows = [("duckrun", "connect", signature(duckrun.connect)[1:-1])]   # module entry point
     for surface, cls, extra in SURFACES:
-        sp, dk = [], list(duck_extra.get(surface, []))
         for m in _members(cls, extra):
             if (surface, m) in EXCLUDE:
                 continue
-            (sp if _api(surface, m) == "spark" else dk).append(m)
-        n += len(sp) + len(dk)
-        if sp:
-            spark.append((surface, sp))
-        if dk:
-            duck.append((surface, sorted(dk)))
-    return spark, duck, n
+            entry = member_entry(cls, m)                      # "sql(query)" | "read (property)"
+            params = entry[len(m) + 1:-1] if entry.startswith(m + "(") else entry[len(m):].strip()
+            rows.append((surface, m, params))
+    return rows
 
 
 def _render(path):
@@ -111,37 +86,33 @@ def _render(path):
     passed, failed, error, skipped = (total["passed"], total["failed"], total["error"], total["skipped"])
     ntests = sum(total.values())
     green = not (failed or error)
-    spark, duck, nmethods = _contract()
+    rows = _rows()
 
     out = ["## duckrun connection API — supported methods", ""]
-    badge = f"✅ {nmethods} public methods" if green else f"⚠️  {nmethods} methods · {failed + error} TESTS FAILING"
+    badge = f"✅ {len(rows)} public methods" if green else f"⚠️  {len(rows)} methods · {failed + error} TESTS FAILING"
     sub = f"suite: {passed}/{ntests} tests passing" + (f" · {skipped} skipped" if skipped else "")
     width = max(len(badge), len(sub)) + 2
     out += ["```", "┌" + "─" * width + "┐", "│ " + badge.ljust(width - 1) + "│",
             "│ " + sub.ljust(width - 1) + "│", "└" + "─" * width + "┘", "```", ""]
-    out += ["> Introspected from the shipped classes — this is the exact public surface of "
-            "`duckrun.connect()`, not a hand-maintained list. The green suite "
-            f"([`test_connection_api.py`](../tests/connection_api/test_connection_api.py)) vouches it works.", ""]
+    out += ["> Introspected from the shipped classes — the exact public surface of `duckrun.connect()`, "
+            "signatures and all, not a hand-maintained list. The green suite "
+            f"([`test_connection_api.py`](../tests/connection_api/test_connection_api.py)) vouches it works. "
+            "`conn.sql()` also routes raw Delta DML — see the DML matrix on the "
+            "[Connection API](connection-api.md) page.", ""]
 
     if not green:
-        out += ["", f"**{failed + error} failing:** " + ", ".join(f"`{f}`" for f in fails), ""]
+        out += [f"**{failed + error} failing:** " + ", ".join(f"`{f}`" for f in fails), ""]
 
-    def _table(title, note, groups):
-        rows = ["### " + title, "", "> " + note, "", "| Surface | Methods | # |", "| --- | --- | :-: |"]
-        for surface, methods in groups:
-            names = ", ".join(f"`{m}`" for m in methods)
-            rows.append(f"| `{surface}` | {names} | {len(methods)} |")
-        rows.append("")
-        return rows
-
-    sp_n = sum(len(m) for _, m in spark)
-    dk_n = sum(len(m) for _, m in duck)
-    out += _table(f"DataFrame / Delta API — {sp_n} methods",
-                  "Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.", spark)
-    out += _table(f"duckrun-specific helpers — {dk_n} methods",
-                  "Conveniences with no DataFrame-API equivalent (session plumbing + shortcuts). "
-                  "`conn.sql()` also routes raw Delta DML — see the DML matrix on the "
-                  "[Connection API](connection-api.md) page.", duck)
+    out += ["| Surface | Method | Parameters |", "| --- | --- | --- |"]
+    for surface, method, params in rows:
+        if params in _MARKERS:
+            cell = f"*{_MARKERS[params]}*"
+        elif params == "":
+            cell = "*(none)*"
+        else:
+            cell = f"`{params}`"
+        out.append(f"| `{surface}` | `{method}` | {cell} |")
+    out.append("")
     return "\n".join(out), (failed + error)
 
 

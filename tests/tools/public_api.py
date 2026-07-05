@@ -46,9 +46,17 @@ EXCLUDE = {("DuckSession", "root_path"), ("DuckSession", "storage_options")}
 
 BASELINE = os.path.join(os.path.dirname(__file__), os.pardir,
                         "connection_api", "public_api_baseline.txt")
+TEST_FILE = os.path.join(os.path.dirname(__file__), os.pardir,
+                         "connection_api", "test_connection_api.py")
+
+# Optional parameters that can't be honestly unit-tested on a local filesystem — covered elsewhere.
+# Keep this list tiny and reasoned; everything else must be exercised by the suite.
+COVERAGE_EXEMPT = {
+    ("DuckSession", "attach", "storage_options"),   # needs real S3/OneLake creds — integration_tests
+}
 
 
-def _signature(func):
+def signature(func):
     """A method's parameter contract as a normalized string — param names, order, defaults, and
     ``*args`` / ``**kwargs``, with ``self`` / ``cls`` and type annotations stripped (so a pure
     type-hint edit doesn't trip the gate, but adding / removing / renaming a parameter, or flipping
@@ -59,7 +67,7 @@ def _signature(func):
     return str(s.replace(parameters=ps, return_annotation=inspect.Signature.empty))
 
 
-def _member_entry(cls, name):
+def member_entry(cls, name):
     """`name(sig)` for a method, `name (property)` / `name (accessor)` for a non-callable accessor."""
     if isinstance(inspect.getattr_static(cls, name, None), property):
         return f"{name} (property)"
@@ -67,7 +75,7 @@ def _member_entry(cls, name):
         attr = getattr(cls, name)
     except AttributeError:                       # instance attribute (e.g. self.catalog) — an accessor
         return f"{name} (accessor)"
-    return f"{name}{_signature(attr)}" if callable(attr) else f"{name} (attr)"
+    return f"{name}{signature(attr)}" if callable(attr) else f"{name} (attr)"
 
 
 def _members(cls, extra):
@@ -84,12 +92,12 @@ def public_api():
         if n.startswith("_"):
             continue
         obj = getattr(duckrun, n)
-        entries.append(f"duckrun.{n}{_signature(obj)}" if inspect.isfunction(obj)
+        entries.append(f"duckrun.{n}{signature(obj)}" if inspect.isfunction(obj)
                        else f"duckrun.{n} (class)")
     for surface, cls, extra in SURFACES:
         for m in _members(cls, extra):
             if (surface, m) not in EXCLUDE:
-                entries.append(f"{surface}.{_member_entry(cls, m)}")
+                entries.append(f"{surface}.{member_entry(cls, m)}")
     return sorted(entries)
 
 
@@ -126,7 +134,100 @@ def diff():
     return removed, added, changed
 
 
+import re as _re
+
+
+def _call_arg_strings(method, src):
+    """Every ``method(...)`` / ``.method(...)`` call in the test source, as its raw arg string
+    (balanced-paren aware). Lookbehind excludes a word char so ``submethod(`` doesn't match, but
+    allows a leading ``.`` so ``obj.method(`` does."""
+    for m in _re.finditer(r"(?<!\w)" + _re.escape(method) + r"\s*\(", src):
+        i, depth, buf = m.end(), 1, []
+        while i < len(src) and depth:
+            c = src[i]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            buf.append(c)
+            i += 1
+        yield "".join(buf)
+
+
+def _split_top(s):
+    parts, depth, cur = [], 0, ""
+    for c in s:
+        if c in "([{":
+            depth += 1
+        elif c in ")]}":
+            depth -= 1
+        if c == "," and depth == 0:
+            parts.append(cur)
+            cur = ""
+        else:
+            cur += c
+    if cur.strip():
+        parts.append(cur)
+    return [p.strip() for p in parts if p.strip()]
+
+
+def uncovered_params():
+    """Optional parameters the test suite never exercises — reached neither positionally nor by
+    keyword in test_connection_api.py — minus the documented exemptions. Empty == full coverage.
+
+    An optional param is 'covered' if some call to its method either passes it by keyword (``p=``) or
+    supplies enough positional args to reach its position. Required params are covered by any call;
+    ``*args`` / ``**kwargs`` are skipped."""
+    src = open(TEST_FILE, encoding="utf-8").read()
+    out = []
+    for surface, cls, extra in SURFACES:
+        for name in _members(cls, extra):
+            if (surface, name) in EXCLUDE:
+                continue
+            if isinstance(inspect.getattr_static(cls, name, None), property):
+                continue
+            try:
+                attr = getattr(cls, name)
+            except AttributeError:
+                continue
+            if not callable(attr):
+                continue
+            try:
+                params = [(n, p) for n, p in inspect.signature(attr).parameters.items()
+                          if n not in ("self", "cls")]
+            except (TypeError, ValueError):
+                continue
+            max_pos, kw = 0, set()
+            for a in _call_arg_strings(name, src):
+                pos = 0
+                for part in _split_top(a):
+                    mm = _re.match(r"([a-zA-Z_]\w*)\s*=(?!=)", part)
+                    if mm:
+                        kw.add(mm.group(1))
+                    else:
+                        pos += 1
+                max_pos = max(max_pos, pos)
+            for idx, (n, p) in enumerate(params):
+                if p.default is inspect.Parameter.empty or p.kind in (
+                        p.VAR_POSITIONAL, p.VAR_KEYWORD):
+                    continue
+                if (n in kw) or (idx < max_pos) or ((surface, name, n) in COVERAGE_EXEMPT):
+                    continue
+                out.append(f"{surface}.{name}({n}=)")
+    return sorted(out)
+
+
 def main(argv):
+    if "--coverage" in argv:
+        miss = uncovered_params()
+        if not miss:
+            print("every method + optional parameter is exercised by the test suite")
+            return 0
+        print(f"{len(miss)} optional parameter(s) never exercised in test_connection_api.py:")
+        print("\n".join(f"  - {e}" for e in miss))
+        return 1
     if "--write" in argv:
         api = write_baseline()
         print(f"wrote {len(api)} entries to {os.path.relpath(BASELINE)}")
