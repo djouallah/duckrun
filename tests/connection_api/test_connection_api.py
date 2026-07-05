@@ -904,6 +904,57 @@ class TestDeltaTable:
         assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
 
 
+class TestTableParity:
+    """conn.table(name) carries the same DML/maintenance verbs as DeltaTable.forName(conn, name) —
+    the additive parity path. Same engine, same snapshot fence; only the entry point differs."""
+    def _seed(self, conn):
+        conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
+            .write.mode("overwrite").saveAsTable("m")
+
+    def test_table_merge(self, conn):
+        # the headline shape: conn.table(name).merge(...).whenMatchedUpdateAll()...execute()
+        self._seed(conn)
+        src = conn.sql("select * from (values (2,99),(4,99)) t(id, val)")
+        conn.table("m").merge(src, "target.id = source.id") \
+            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        assert dict(conn.sql("select id, val from m").collect()) == {1: 10, 2: 99, 3: 10, 4: 99}
+
+    def test_table_delete_update(self, conn):
+        self._seed(conn)
+        conn.table("m").delete("id = 2")
+        conn.table("m").update(condition="id = 1", set={"val": "val + 5"})
+        assert dict(conn.sql("select id, val from m").collect()) == {1: 15, 3: 10}
+
+    def test_table_version_history_restore(self, conn):
+        self._seed(conn)                                                     # v0
+        conn.sql("select 9 id, 9 val").write.mode("append").saveAsTable("m")  # v1
+        assert conn.table("m").version() == 1
+        assert [h["version"] for h in conn.table("m").history()] == [1, 0]
+        conn.table("m").restoreToVersion(0)
+        assert sorted(r[0] for r in conn.table("m").collect()) == [1, 2, 3]
+
+    def test_table_vacuum(self, conn):
+        self._seed(conn)
+        assert isinstance(conn.table("m").vacuum(dry_run=True), list)
+
+    def test_table_dml_matches_deltatable(self, conn):
+        # cross-entry equivalence: the two surfaces land byte-identical results from the same merge.
+        self._seed(conn)
+        conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
+            .write.mode("overwrite").saveAsTable("m2")
+        src = lambda: conn.sql("select * from (values (2,99),(5,99)) t(id, val)")
+        conn.table("m").merge(src(), "target.id = source.id") \
+            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        DeltaTable.forName(conn, "dbo.m2").merge(src(), "target.id = source.id") \
+            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        assert sorted(conn.table("m").collect()) == sorted(conn.table("m2").collect())
+
+    def test_table_dml_needs_a_table(self, conn):
+        # a derived/query frame has no backing table — the verbs refuse rather than mis-resolve.
+        with pytest.raises(ValueError, match="table operation"):
+            conn.sql("select 1 id").delete("id = 1")
+
+
 class TestSqlDml:
     """conn.sql(): reads (incl. version-pinned delta_scan) pass through, and Delta DML is applied
     via delta_rs — create-as / insert-select / insert-values / update / delete / alter-add, drop

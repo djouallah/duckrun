@@ -1248,6 +1248,49 @@ class DataFrame:
             return dt._sort_rewrite(keys=list(keys) or None, where=where, seed=seed)
         return dt._maintain()
 
+    # ---- Table DML / maintenance on conn.table(name) --------------------------------------------
+    # conn.table(name) gains the same verbs as DeltaTable.forName(conn, name): the handle is the
+    # backing Delta table, so each op resolves + snapshot-fences through the one DeltaTable
+    # construction. Only a conn.table(name) frame has a backing table (a derived/query frame does not).
+    def _table_handle(self):
+        if self._source_table is None:
+            raise ValueError(
+                "this is a table operation — call it on conn.table(name); a derived/query DataFrame "
+                "has no Delta table to mutate.")
+        from .delta_table import DeltaTable
+        return DeltaTable.forName(self.session, self._source_table)
+
+    def merge(self, source, condition: str, streamed_exec: bool = False):
+        """Upsert ``source`` into this table on ``condition``, returning the snapshot-pinned merge
+        builder — ``conn.table(name).merge(...)`` mirrors ``DeltaTable.forName(conn, name).merge(...)``."""
+        return self._table_handle().merge(source, condition, streamed_exec=streamed_exec)
+
+    def delete(self, predicate: Optional[str] = None) -> None:
+        """Delete rows matching ``predicate`` (or all rows when None) — like ``DeltaTable.delete``."""
+        self._table_handle().delete(predicate)
+
+    def update(self, condition: Optional[str] = None, set: Optional[Dict[str, str]] = None) -> None:
+        """Set ``{column: expression}`` for rows matching ``condition`` — like ``DeltaTable.update``."""
+        self._table_handle().update(condition=condition, set=set)
+
+    def vacuum(self, retention_hours: Optional[int] = None, dry_run: bool = False,
+               enforce_retention_duration: bool = True) -> List[str]:
+        """Delete unreferenced files older than the retention window — like ``DeltaTable.vacuum``."""
+        return self._table_handle().vacuum(retention_hours=retention_hours, dry_run=dry_run,
+                                           enforce_retention_duration=enforce_retention_duration)
+
+    def history(self, limit: Optional[int] = None) -> List[Dict]:
+        """Delta commit history, newest first — like ``DeltaTable.history``."""
+        return self._table_handle().history(limit)
+
+    def version(self) -> int:
+        """The current Delta version of this table — like ``DeltaTable.version``."""
+        return self._table_handle().version()
+
+    def restoreToVersion(self, version: int) -> None:
+        """Restore this table to an earlier Delta ``version`` — like ``DeltaTable.restoreToVersion``."""
+        self._table_handle().restoreToVersion(version)
+
     # DataFrame aliases over the DuckDB relation.
     def show(self, *a, **k):
         return self.relation.show(*a, **k)

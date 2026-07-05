@@ -4,7 +4,7 @@
 
 ## duckrun connection API — supported methods
 
-✅ **58 public methods** · 152/152 tests passing
+✅ **65 public methods** · 278/279 tests passing · 1 skipped
 
 > Introspected from the shipped classes — the exact public surface of `duckrun.connect()`, signatures and all, not a hand-maintained list. The green suite ([`test_connection_api.py`](../tests/connection_api/test_connection_api.py)) vouches it works. `conn.sql()` also routes raw Delta DML — see the DML matrix on the [Connection API](connection-api.md) page.
 
@@ -41,18 +41,25 @@
 | `DataFrame` | `collect` | *(none)* |
 | `DataFrame` | `count` | *(none)* |
 | `DataFrame` | `createOrReplaceTempView` | `name` |
+| `DataFrame` | `delete` | `predicate=None` |
 | `DataFrame` | `first` | *(none)* |
 | `DataFrame` | `head` | `n=None` |
+| `DataFrame` | `history` | `limit=None` |
 | `DataFrame` | `isEmpty` | *(none)* |
+| `DataFrame` | `merge` | `source, condition, streamed_exec=False` |
 | `DataFrame` | `optimize` | `*keys, rewrite=False, where=None, analyze=False, seed=None` |
 | `DataFrame` | `orderBy` | `*cols, ascending=None, seed=None` |
 | `DataFrame` | `printSchema` | *(none)* |
+| `DataFrame` | `restoreToVersion` | `version` |
 | `DataFrame` | `schema` | *property* |
 | `DataFrame` | `show` | `*a, **k` |
 | `DataFrame` | `sort` | `*cols, ascending=None, seed=None` |
 | `DataFrame` | `take` | `n` |
 | `DataFrame` | `toArrow` | *(none)* |
 | `DataFrame` | `toPandas` | *(none)* |
+| `DataFrame` | `update` | `condition=None, set=None` |
+| `DataFrame` | `vacuum` | `retention_hours=None, dry_run=False, enforce_retention_duration=True` |
+| `DataFrame` | `version` | *(none)* |
 | `DataFrame` | `write` | *property* |
 | `DataFrameReader` | `csv` | `path` |
 | `DataFrameReader` | `format` | `fmt` |
