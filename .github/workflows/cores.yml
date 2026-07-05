@@ -264,14 +264,14 @@ jobs:
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
-          python tests/tools/inject_readme.py docs/connection-api.md docs/connection_card.md CONNECTION_API
-          if git diff --quiet -- docs/connection-api.md; then
+          python tests/tools/inject_readme.py docs/api-reference.md docs/connection_card.md CONNECTION_API
+          if git diff --quiet -- docs/api-reference.md; then
             echo "Connection card unchanged."
             exit 0
           fi
           git config user.name "djouallah"
           git config user.email "mimoune.djouallah@gmail.com"
-          git add docs/connection-api.md
+          git add docs/api-reference.md
           git commit -m "docs: refresh connection API method scorecard [skip ci]"
           for i in 1 2 3; do
             git pull --rebase origin main && git push origin main && break

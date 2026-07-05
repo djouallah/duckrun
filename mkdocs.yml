@@ -125,6 +125,7 @@ nav:
       - TPC-H benchmark: tpch.md
   - Advanced:
       - Connection API: connection-api.md
+      - Supported API: api-reference.md
       - Spark / Delta coverage: spark-delta-parity.md
       - How it works:
           - Overview: overview.md
