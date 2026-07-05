@@ -260,6 +260,32 @@ class DeltaTable:
         self._refresh_view()
         return metrics
 
+    def _maintain(self) -> Dict:
+        """Tier-0 'safe button' (bare ``conn.table(name).optimize()``): a compaction policy plus a
+        vacuum, and **never a data rewrite**. Reads the Delta log; if the small-file debt clears the
+        byte trigger — at least 8 files under half the target size **and** at least 2× the target in
+        small bytes — it bin-packs those files up into the read layout, then vacuums files past the
+        retention window. The compaction commits ``dataChange=false`` (concurrency-safe under delta-rs
+        OCC) and the whole thing is idempotent: a clean table is a ``noop``."""
+        self._session._require_writable("optimize", self._catalog)
+        con = self._session.con
+        target = engine._TARGET_FILE_SIZE
+        debt = engine.compaction_debt(con, self.path, target_size=target,
+                                      storage_options=self.storage_options)
+        if debt["small_files"] >= 8 and debt["small_bytes"] >= 2 * target:
+            m = engine.optimize(self.path, target_size=target, storage_options=self.storage_options)
+            result = {"operation": "compact",
+                      "filesRemoved": int(m.get("numFilesRemoved", 0)),
+                      "filesAdded": int(m.get("numFilesAdded", 0)),
+                      "partitionsTouched": debt["partitions"]}
+        else:
+            result = {"operation": "noop", "reason": "no small-file debt"}
+        # Vacuum runs either way — it reclaims files tombstoned by this or any earlier operation.
+        # Default retention (delta-rs 7 days, enforced) never touches files a live reader/writer holds.
+        result["filesVacuumed"] = len(engine.vacuum(self.path, storage_options=self.storage_options))
+        self._refresh_view()
+        return result
+
     def _sort_rewrite(self, keys: Optional[List[str]] = None,
                       where: Optional[str] = None) -> Dict:
         """Sort-rewrite this table's files physically ordered by ``(partition columns…, key…)``. Reads

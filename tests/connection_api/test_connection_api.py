@@ -629,12 +629,12 @@ class TestDeltaTable:
         assert isinstance(DeltaTable.forName(conn, "dbo.m").optimize(zorder_by=["id"]), dict)  # z-order
 
     def test_table_optimize_auto_keys(self, conn):
-        # conn.table(name).optimize() — the experimental sort rewrite: profiles the table (_get_rle),
-        # picks the sort key automatically, and rewrites every file physically ordered by it. Data is
-        # preserved and the active file comes out clustered by the key.
+        # conn.table(name).optimize(rewrite=True) — the experimental sort rewrite: profiles the table
+        # (_get_rle), picks the sort key automatically, and rewrites every file physically ordered by
+        # it. Data is preserved and the active file comes out clustered by the key.
         conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
             .write.mode("overwrite").saveAsTable("to_auto")
-        m = conn.table("dbo.to_auto").optimize()
+        m = conn.table("dbo.to_auto").optimize(rewrite=True)
         assert m["operation"] == "sortRewrite" and "region" in m["sortedBy"]
         # reports REAL measured on-disk bytes (Delta-log size_bytes), never an estimate
         assert m["sizeBytesBefore"] > 0 and m["sizeBytesAfter"] > 0
@@ -676,6 +676,31 @@ class TestDeltaTable:
         # optimize() is only meaningful on a real table handle; a derived/query DataFrame refuses.
         with pytest.raises(ValueError):
             conn.sql("select 1 x").optimize()
+
+    def test_table_optimize_maintain_noop(self, conn):
+        # Bare conn.table(name).optimize() is the safe button: compaction policy + vacuum, never a
+        # rewrite. A single-file table has no small-file debt, so it's a noop; vacuum finds nothing
+        # to reclaim (every file is inside the retention window). Idempotent.
+        conn.sql("select i as id from range(1000) t(i)").write.mode("overwrite").saveAsTable("mt_clean")
+        m = conn.table("dbo.mt_clean").optimize()
+        assert m == {"operation": "noop", "reason": "no small-file debt", "filesVacuumed": 0}
+        assert conn.table("mt_clean").count() == 1000
+        assert conn.table("dbo.mt_clean").optimize()["operation"] == "noop"  # idempotent
+
+    def test_table_optimize_maintain_compacts_small_files(self, conn, monkeypatch):
+        # Below-target files accumulated by many small appends ARE compacted once the byte trigger
+        # fires (>= 8 files AND >= 2x target bytes). Shrink the target so a handful of small commits
+        # trips it. Compaction commits dataChange=false and preserves every row.
+        monkeypatch.setattr(engine, "_TARGET_FILE_SIZE", 64 * 1024)  # 64 KB: small = <32 KB, fire >=128 KB
+        conn.sql("select i as id, repeat('x', 200) as pad from range(5000) t(i)") \
+            .write.mode("overwrite").saveAsTable("mt_debt")
+        for b in range(10):
+            conn.sql(f"select i as id, repeat('x', 200) as pad from range({b}*5000, {b}*5000+5000) t(i)") \
+                .write.mode("append").saveAsTable("mt_debt")
+        m = conn.table("dbo.mt_debt").optimize()
+        assert m["operation"] == "compact"
+        assert m["filesRemoved"] >= 8 and m["filesAdded"] >= 1
+        assert conn.table("mt_debt").count() == 55000
 
     def test_get_rle_scan_count_is_constant(self, conn):
         # Regression: the auto profiler must NOT re-scan the (possibly remote) table once per column.
@@ -2240,7 +2265,7 @@ def test_optimize_e2e_write_raw_then_table_optimize(raw_sales):
     conn.read.format("parquet").load(praw).write.mode("overwrite").saveAsTable("t1")
     assert _codecs(conn, "t1") == {"SNAPPY"}
 
-    m = conn.table("t1").optimize()                       # auto-key rewrite
+    m = conn.table("t1").optimize(rewrite=True)           # auto-key rewrite
     assert m["operation"] == "sortRewrite" and m["sortedBy"]
     assert _rows(conn, "t1") == expected
     assert _codecs(conn, "t1") == {"SNAPPY"}

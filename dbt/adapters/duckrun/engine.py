@@ -1275,6 +1275,26 @@ def optimize(
     return dt.optimize.compact(target_size=target_size, writer_properties=wp)
 
 
+def compaction_debt(cur, path: str, *, target_size: int = _TARGET_FILE_SIZE,
+                    storage_options: Optional[Dict[str, str]] = None) -> Dict:
+    """Small-file debt for the Tier-0 maintenance button, read from the Delta **log** (no data scan).
+    A file is 'small' if it is under **half** the target size; returns the count and total bytes of
+    the small files and the distinct partitions they sit in (``col=value`` labels). Pure read — no
+    commit. The caller applies the fire trigger (enough small files AND enough small bytes)."""
+    dt = _delta_table(path, storage_options)
+    add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
+    have = [d[0] for d in cur.sql("select * from add_actions limit 0").description]
+    pcols = [c for c in have if c.startswith("partition.")]
+    psel = "".join(f', "{c}"' for c in pcols)
+    rows = cur.sql(
+        f"select size_bytes{psel} from add_actions where size_bytes < {int(target_size * 0.5)}"
+    ).fetchall()
+    parts = sorted({
+        "/".join(f"{c.split('.', 1)[1]}={r[i + 1]}" for i, c in enumerate(pcols)) for r in rows
+    }) if pcols else []
+    return {"small_files": len(rows), "small_bytes": sum(int(r[0]) for r in rows), "partitions": parts}
+
+
 def restore_to_version(
     path: str,
     version: int,

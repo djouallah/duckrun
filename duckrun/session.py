@@ -1361,26 +1361,35 @@ class DataFrame:
     def write(self) -> "DataFrameWriter":
         return DataFrameWriter(self)
 
-    def optimize(self, *keys: str, where: Optional[str] = None) -> Dict:
-        """Rewrite this table's files physically sorted for better compression / read pruning, returning
-        the operation metrics (REAL measured on-disk ``sizeBytesBefore`` / ``sizeBytesAfter`` /
-        ``savedPct``). Only available on ``conn.table(name)`` — a derived/query DataFrame has no Delta
-        table to rewrite.
+    def optimize(self, *keys: str, rewrite: bool = False, where: Optional[str] = None) -> Dict:
+        """Maintain this table. Only available on ``conn.table(name)`` — a derived/query DataFrame has
+        no Delta table to touch.
 
-        - ``optimize()`` — full rewrite; the sort key is chosen automatically by profiling the table.
+        **The safe button** — ``optimize()`` (no arguments) compacts small files and vacuums; it
+        **never rewrites data**. It applies a byte trigger (bin-pack only partitions carrying real
+        small-file debt), commits ``dataChange=false``, and is idempotent — a clean table is a
+        ``noop``. Safe to run on a schedule and safe under concurrent writers.
+
+        **The deliberate rewrite** — pass a key, ``rewrite=True``, or ``where`` to sort-rewrite the
+        table physically ordered for compression / read pruning (returns the REAL measured on-disk
+        ``sizeBytesBefore`` / ``sizeBytesAfter`` / ``savedPct``). This is a full rewrite that commits
+        ``dataChange=true``, so run it occasionally, not on every load:
+
+        - ``optimize(rewrite=True)`` — full rewrite; the sort key is auto-picked by profiling.
         - ``optimize("region", "status")`` — full rewrite sorted by exactly those columns.
-        - ``optimize(where="year = 2026")`` — rewrite ONLY the partitions matching the predicate (a
-          CAST-free delta_rs SQL expression), as one atomic snapshot-fenced ``replaceWhere`` commit.
+        - ``optimize("region", where="year = 2026")`` — rewrite ONLY the partitions matching the
+          predicate (a CAST-free delta_rs SQL expression), as one atomic snapshot-fenced commit.
 
-        Partition columns always lead the physical order and are preserved. This is a full rewrite, not a
-        bin-packing compaction, so run it occasionally."""
+        Partition columns always lead the physical order and are preserved."""
         if self._source_table is None:
             raise ValueError(
                 "optimize() is only available on conn.table(name); a derived/query DataFrame has no "
-                "Delta table to rewrite.")
+                "Delta table to optimize.")
         from .delta_table import DeltaTable
-        return DeltaTable.forName(self.session, self._source_table)._sort_rewrite(
-            keys=list(keys) or None, where=where)
+        dt = DeltaTable.forName(self.session, self._source_table)
+        if keys or where or rewrite:
+            return dt._sort_rewrite(keys=list(keys) or None, where=where)
+        return dt._maintain()
 
     # DataFrame aliases over the DuckDB relation.
     def show(self, *a, **k):
