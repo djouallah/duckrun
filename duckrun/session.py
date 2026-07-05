@@ -826,6 +826,21 @@ class DuckSession:
         base = self._files_base(remote_folder)
         return [rel for _fp, rel in self._enumerate_remote(base, _norm_exts(file_extensions))]
 
+    def convert_to_delta(self, identifier: str, partition_schema=None) -> str:
+        """Convert an existing parquet directory to Delta **in place, zero-copy** — a ``_delta_log`` is
+        written over the parquet, the data files are not rewritten. Unlike the table verbs this is a
+        session op: the table doesn't exist yet, there's nothing to fence. ``identifier`` is the
+        delta-spark form ``"parquet.`<path>`"`` (a bare ``<path>`` is also accepted); ``partition_schema``
+        is a pyarrow ``Schema`` of the Hive-partition columns for a partitioned dir, or ``None``. Returns
+        the converted path; ``conn.refresh()`` (or ``conn.catalog.refreshTable(name)``) then surfaces it
+        as a discoverable table when it sits under a catalog root. Storage-neutral (local / s3 / gs / az /
+        OneLake) — uses the session's already-minted credentials."""
+        from .delta_table import _parse_parquet_identifier
+        path = _parse_parquet_identifier(identifier).replace("\\", "/").rstrip("/")
+        self._require_writable("convert parquet to Delta")
+        engine.convert_to_delta(path, self.storage_options, partition_by=partition_schema)
+        return path
+
     def get_stats(self, source: Optional[str] = None, detailed: bool = False) -> "DataFrame":
         """Delta table statistics — the "why is my table slow / full of small files" view. Returns a
         :class:`DataFrame`, one row per table (``detailed=False``) or one row per parquet **row group**

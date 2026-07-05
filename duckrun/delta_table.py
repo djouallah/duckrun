@@ -199,10 +199,11 @@ class DeltaTable:
 
         The result is a by-path table: read it back with ``conn.read.format('delta').load(path)``, or
         if it sits under a catalog root, ``conn.refresh()`` to surface it as a discoverable view.
+
+        This delegates to the session utility ``conn.convert_to_delta(...)`` (where conversion belongs —
+        the table doesn't exist yet) and wraps its result in a handle.
         """
-        path = _parse_parquet_identifier(identifier).replace("\\", "/").rstrip("/")
-        session._require_writable("convert parquet to Delta")
-        engine.convert_to_delta(path, session.storage_options, partition_by=partitionSchema)
+        path = session.convert_to_delta(identifier, partition_schema=partitionSchema)
         return cls(session, path)
 
     def merge(self, source, condition: str, streamed_exec: bool = False) -> DeltaMergeBuilder:

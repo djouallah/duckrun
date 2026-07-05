@@ -203,6 +203,13 @@ class TestSession:
         assert vorder_of("plain_t") is False
         assert vorder_of("vo_t") is True
 
+    def test_convert_to_delta(self, conn):
+        # session-level convert (no DeltaTable needed): parquet dir → Delta in place, returns the path.
+        path = _stage_parquet(conn, "dbo/sconv")
+        assert conn.convert_to_delta(f"parquet.`{path}`") == path
+        conn.refresh()
+        assert conn.table("sconv").fetchall() == [(1, "a")]
+
 
 class TestCatalog:
     def test_listTables(self, conn):
