@@ -222,8 +222,3 @@ lexicographic key via `conn.table(name).optimize(...)` instead).
 
 Names resolve like everywhere else — bare = current schema, `schema.table` or
 `catalog.schema.table` to be explicit.
-
-## The exact contract
-
-For the precise list of what this API supports — every public method with a passing-test ✅,
-regenerated from the test suite on every push — see [Supported API](api-reference.md).
