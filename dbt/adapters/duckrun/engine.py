@@ -9,6 +9,7 @@ pyarrow dependency.
 import ctypes
 import os
 import re
+import time
 from typing import Any, Dict, List, Optional
 
 from dbt.adapters.events.logging import AdapterLogger
@@ -875,20 +876,63 @@ def convert_to_delta(path: str, storage_options: Optional[Dict[str, str]] = None
     convert_to_deltalake(path, **kwargs)
 
 
-def _maintain(dt: DeltaTable, compaction_threshold: int) -> None:
-    """Threshold-gated upkeep shared by the append / merge / delete+insert paths: once the table
-    has more than ``compaction_threshold`` files, compact small files, vacuum tombstoned old
-    versions (safe 7-day default retention — no concurrent reader broken), and clean up expired
-    log entries. Without it a table written on every run fragments into small files and keeps old
-    versions forever. (The overwrite path vacuums unconditionally instead and does not use this.)
+# Post-write maintenance gates (see _maintain). The compaction trigger is the same byte policy the
+# Tier-0 safe button uses (compaction_debt): small files under half the target, enough of them AND
+# enough small bytes to be worth a rewrite. Vacuum and cleanup are decoupled from it — each reclaims
+# nothing on a fresh table, so running them on every microbatch write is pure store-listing cost.
+_MAINT_VACUUM_INTERVAL_MS = 168 * 3600 * 1000   # match the safe 7-day retention — nothing is reclaimable faster
+_MAINT_CLEANUP_EVERY = 50                        # commits between metadata cleanups
+_last_cleanup_version: Dict[str, int] = {}       # path -> version at its last cleanup (per process)
 
-    compact() reuses the same _writer_properties() read layout every file write uses, and the same
-    128 MB _TARGET_FILE_SIZE — so maintenance (including the consolidation of files a lean MERGE left
-    behind) keeps the uniform 128 MB / one-row-group-per-file layout Direct Lake wants."""
-    if len(dt.file_uris()) > compaction_threshold:
-        dt.optimize.compact(target_size=_TARGET_FILE_SIZE, writer_properties=_writer_properties())
-        dt.vacuum(dry_run=False)
-        dt.cleanup_metadata()
+
+def _vacuum_due(dt: DeltaTable) -> bool:
+    """True if it has been at least _MAINT_VACUUM_INTERVAL_MS since the last VACUUM commit (delta_rs
+    logs VACUUM START/END to the history). No VACUUM in the recent window → treat as due (a table
+    never vacuumed, or one whose last vacuum has aged out — either way, run it)."""
+    for entry in dt.history(limit=200):
+        if str(entry.get("operation", "")).startswith("VACUUM"):
+            ts = entry.get("timestamp")
+            return ts is None or (int(time.time() * 1000) - ts) >= _MAINT_VACUUM_INTERVAL_MS
+    return True
+
+
+def _cleanup_due(path: str, dt: DeltaTable) -> bool:
+    """True once the log has grown at least _MAINT_CLEANUP_EVERY commits since we last cleaned it.
+    cleanup_metadata writes no commit, so the marker is per-process (a dict, not the log): it runs at
+    a process's first maintenance of a table, then every _MAINT_CLEANUP_EVERY commits within that
+    process — enough to keep the log bounded without listing it on every microbatch write."""
+    return dt.version() - _last_cleanup_version.get(path, -_MAINT_CLEANUP_EVERY) >= _MAINT_CLEANUP_EVERY
+
+
+def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) -> None:
+    """Best-effort post-write upkeep shared by the append / merge / delete+insert paths: compact
+    small files when the byte debt is worth it, then (only if a compaction happened) vacuum, and —
+    on its own log-growth gate — clean up expired log entries. Without it a table written on every
+    run fragments into small files and keeps old versions forever. (The overwrite path vacuums
+    unconditionally instead and does not use this.)
+
+    NEVER fatal. It runs *after* the data has already committed, so a lost maintenance commit (a
+    compaction that races a concurrent writer) must not fail the model — the durable outcome the
+    caller asked for already succeeded, and the byte trigger simply re-fires next run since the small
+    files are still small. So CommitFailedError is caught and logged, not raised.
+
+    The compaction trigger matches the Tier-0 safe button exactly (compaction_debt: at least 8 files
+    under half the target AND at least 2x the target in small bytes). compact() reuses the same
+    _writer_properties() read layout and _TARGET_FILE_SIZE every file write uses, so maintenance
+    (including the consolidation of files a lean MERGE left behind) keeps the uniform, one-row-group-
+    per-file layout Direct Lake wants."""
+    dt = _delta_table(path, storage_options)
+    try:
+        debt = compaction_debt(cur, path, dt=dt, storage_options=storage_options)
+        if debt["small_files"] >= 8 and debt["small_bytes"] >= 2 * _TARGET_FILE_SIZE:
+            dt.optimize.compact(target_size=_TARGET_FILE_SIZE, writer_properties=_writer_properties())
+            if _vacuum_due(dt):  # fresh tombstones queued AND past the retention-length gate
+                dt.vacuum(dry_run=False)
+        if _cleanup_due(path, dt):  # independent gate — NOT piggybacked on compaction
+            dt.cleanup_metadata()
+            _last_cleanup_version[path] = dt.version()
+    except CommitFailedError as e:
+        logger.warning("post-write maintenance skipped (data commit already succeeded): %s", e)
 
 
 def write_delta(

@@ -80,6 +80,39 @@ across multiple columns by reordering rows generalizes problems that are provabl
 polynomial exact algorithm almost certainly doesn't exist. The honest engineering answer isn't "try
 harder" — it's **don't try to be optimal.**
 
+## What the research says — and why its best ideas are too slow
+
+None of this is new. Daniel Lemire and co-authors studied exactly this problem — reordering rows so
+run-length compression pays off — in *Sorting improves word-aligned bitmap indexes* (Lemire, Kaser,
+Aouiche, 2010). Two of their findings frame the whole trade-off, and both are worth internalizing:
+
+- **Sorting is a huge lever, not a rounding error.** A plain lexicographic sort of the table "can
+  divide the index size by 9." Physical row order is one of the biggest compression knobs there is —
+  bigger than the choice of codec. This is *why* the feature exists at all.
+- **Which columns you sort by, and in what order, is itself a real decision.** Simply permuting the
+  columns before sorting changed compression efficiency by about **40%**. The order of columns in the
+  key is not cosmetic; it is most of the win.
+
+Now push the second point to its conclusion. If the column order is worth 40%, you'd want the *best*
+column order — but there are `n!` of them, and the only faithful way to score one is to sort and
+measure. And that's the *easy* version of the problem. The truly optimal layout isn't a column
+permutation at all; it's a free reordering of the **rows** to minimize the transitions between
+neighbours — the same combinatorial monster from the section above, a cousin of the travelling
+salesman problem, NP-hard, no shortcut.
+
+That is exactly why the clever ideas in this literature — Gray-code orderings, Hilbert-curve tuple
+orderings, nearest-neighbour (TSP-style) row chaining — are genuinely interesting but **impractical
+at warehouse scale**. They reason about *relationships between rows*, which means computing pairwise
+distances: quadratic work, or a heavy approximation, over a table that might hold billions of rows.
+You do not have unlimited time to reorder stuff. A nightly maintenance job gets **one pass**, not a
+week of graph search to shave off a few more percent.
+
+So Lemire's own practical recommendation is the one this code lands on: don't chase the optimum. Do a
+single cheap lexicographic sort — `O(n log n)`, affordable every night — and spend your one real
+degree of freedom on the **column order**, arranging the key so the lowest-cardinality columns lead.
+That captures most of the 9× for almost none of the cost. The heuristic below is that recommendation,
+plus a few duckrun-specific rules (lead with a date, stop at the grain, drop measures).
+
 ## How the automatic picker chooses instead
 
 `rewrite=True` gives up on optimal and uses a cheap, greedy heuristic — a stack of rules of thumb,
@@ -118,3 +151,23 @@ heuristic, and you will get better or worse results depending on your data's car
 Having said that — and I am not even joking — it is my personal test for AGI: the day an AI can give
 me a good-enough algorithm that returns an optimal sort order (not a row reordering, that is too much
 work) in minimal time, I'll know we have AGI 😊. It is not there yet.
+
+## Sources & further reading
+
+- **Daniel Lemire, Owen Kaser, Kamel Aouiche — "Sorting improves word-aligned bitmap indexes"**
+  (*Data & Knowledge Engineering* 69(1), 2010). The result this page leans on: physical row order is
+  a huge compression lever (a lexicographic sort divided their index size by ~9×), the column order
+  within the sort matters a lot (~40%), and a well-chosen cheap lexicographic sort — low-cardinality
+  columns first — captures most of the win while the true optimum stays intractable. This is the
+  conceptual basis for the column-ordering heuristic here.
+  [arXiv:0901.3751](https://arxiv.org/abs/0901.3751) ·
+  [author's page](https://lemire.me/en/publication/dke2010/)
+- **HyperLogLog** (Flajolet, Fusy, Gandouet, Meunier, 2007). Every cardinality and
+  functional-dependency estimate in the picker is a HyperLogLog sketch — DuckDB's
+  [`approx_count_distinct`](https://duckdb.org/docs/current/sql/functions/aggregates) — never an exact
+  `COUNT(DISTINCT)`, which is what keeps profiling cheap and bounded in memory.
+  [HyperLogLog overview](https://en.wikipedia.org/wiki/HyperLogLog)
+- The **run-count model** `E[runs] ≈ N·(1 − Σ pᵥ²)` uses the Simpson / Herfindahl index of the value
+  histogram — a standard statistical result, not from a single source.
+- The **functional-dependency test** `distinct(X) == distinct(X, c) ⇒ X → c` is textbook relational
+  database theory.
