@@ -13,10 +13,10 @@ rationale live in [Connection API](connection-api.md).
 ## duckrun connection API — supported methods
 
 ```
-┌──────────────────────────────────────────┐
-│ ✅ 77 public methods                      │
-│ suite: 272/273 tests passing · 1 skipped │
-└──────────────────────────────────────────┘
+┌──────────────────────────────┐
+│ ✅ 77 public methods          │
+│ suite: 152/152 tests passing │
+└──────────────────────────────┘
 ```
 
 > Introspected from the shipped classes — this is the exact public surface of `duckrun.connect()`, not a hand-maintained list. The green suite ([`test_connection_api.py`](../tests/connection_api/test_connection_api.py)) vouches it works.
