@@ -9,12 +9,14 @@ algorithm" is a meaningful ask, which is exactly why it lives on its own.
 
 Input  → a DuckDB connection + the name of a temp table holding a random sample of the Delta table,
          the column list/types, the partition columns, and optional Delta-log column stats.
-Output → ``(rows, schema)``: one row per column describing the recommendation
+Output → ``(rows, schema, lines)``: one row per column describing the recommendation
          (``in_sort_key`` / ``sort_position`` are the decision; the rest is the profile that
-         justifies it). The caller wraps ``rows`` into a DataFrame.
+         justifies it), and ``lines`` — the human-readable advisory the CALLER prints (this module
+         does no I/O). The caller wraps ``rows`` into a DataFrame.
 
 The model is a *deterministic function of the sample statistics*; the only run-to-run variance comes
-from the (unseeded) sample the caller materialises — seed that sample and this is reproducible.
+from the sample the caller materialises — seed that sample (the caller threads a ``REPEATABLE``
+seed) and this is reproducible.
 
 The recommendation, in order:
   1. sample each column's cardinality (``approx_count_distinct`` HLL — never an exact
@@ -32,7 +34,26 @@ import math
 # for the uniform approximation Σp² ≈ 1/ndv — a high-card column is ~uniform and its runs are
 # ndv-bound, so the skew term barely moves, and this keeps the skew pass from rebuilding an OOM.
 _SKEW_EXACT_NDV = 100_000
-_RLE_SAMPLE_ROWS = 1_000_000  # default sample size the caller is assumed to have materialized
+
+# MODEL_VERSION: bump on ANY change to an R-rule, a threshold default, or the byte model. Pure
+# plumbing — sample sizing, the explicit exact flag, seeding, returning lines instead of printing —
+# does NOT bump it. Appended to the recommendation header so a recommendation is attributable to the
+# model that produced it, making future threshold churn traceable.
+MODEL_VERSION = "1"
+
+# Sample-sizing knobs — NOT the recommendation byte model. A byte budget divided by an estimated
+# in-memory row width gives a width-aware row count: a wide table samples fewer rows, a narrow one
+# more. These only decide how many rows the caller materializes to profile; they never feed a
+# recommendation.
+_SAMPLE_BYTE_BUDGET = 256 * 1024 * 1024   # 256 MiB target for the in-memory profiling sample
+_DECOMPRESSION_FACTOR = 3.0               # parquet-on-disk → in-memory expansion, a rule of thumb
+# In-memory byte width per column type, for the relation path (no Delta log → no real file sizes).
+# Crude on purpose; VARCHAR/BLOB/INTERVAL/structured/unknown fall through to 24. Sizing only.
+_TYPE_WIDTHS = (
+    ("BOOL", 1), ("TINYINT", 1), ("UTINYINT", 1), ("SMALLINT", 2), ("USMALLINT", 2),
+    ("INTEGER", 4), ("UINTEGER", 4), ("BIGINT", 8), ("UBIGINT", 8), ("HUGEINT", 16),
+    ("UHUGEINT", 16), ("FLOAT", 4), ("REAL", 4), ("DOUBLE", 8), ("DECIMAL", 8), ("NUMERIC", 8),
+    ("DATE", 4), ("TIMESTAMP", 8), ("TIME", 8), ("UUID", 16))
 
 _SCHEMA = (
     "table string, in_sort_key boolean, sort_position int, column string, data_type string, "
@@ -45,10 +66,45 @@ def _qid(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
+def plan_sample(total_rows, avg_row_bytes, *, byte_budget=_SAMPLE_BYTE_BUDGET,
+                min_rows=100_000, max_rows=8_000_000):
+    """Rows to materialize for profiling, and whether that profile will be EXACT (the whole table).
+
+    ``rows = clamp(byte_budget // max(avg_row_bytes, 1), min_rows, max_rows)`` — a byte budget over
+    an estimated in-memory row width, so a wide table samples fewer rows and a narrow one more.
+    ``exact`` is True only when the table is known to fit within that many rows (then ``rows``
+    collapses to ``total_rows`` and the caller skips sampling entirely — no ``USING SAMPLE`` at all).
+    ``total_rows=None`` (an unknown size, e.g. a derived relation) is never exact. Pure — no I/O."""
+    rows = int(byte_budget // max(avg_row_bytes, 1))
+    rows = max(min_rows, min(rows, max_rows))
+    if total_rows is not None and total_rows <= rows:
+        return int(total_rows), True
+    return rows, False
+
+
+def estimate_row_bytes(types):
+    """A crude in-memory row width (bytes) from the schema ALONE — no data read. Used only to size
+    the profiling sample on the relation path, where there is no Delta log to give real file sizes.
+    Value types map to their fixed width; VARCHAR/BLOB/INTERVAL/anything unknown to 24. Crude on
+    purpose — the point is that a 300-column frame no longer samples like a 5-column one. This never
+    feeds the recommendation byte model, so it is not a ``MODEL_VERSION`` concern. ``types`` may be a
+    ``{col: type}`` mapping or an iterable of type strings."""
+    total = 0.0
+    for t in (types.values() if isinstance(types, dict) else types):
+        u = str(t).upper()
+        for prefix, width in _TYPE_WIDTHS:
+            if u.startswith(prefix):
+                total += width
+                break
+        else:
+            total += 24.0   # VARCHAR / BLOB / INTERVAL / structured / unknown
+    return total
+
+
 def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        sort_key_cap=4, min_gain_pct=1.0, key_sort_below_pct=10.0,
                        stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,
-                       sample_rows=_RLE_SAMPLE_ROWS):
+                       *, sample_rows, exact):
     """The sort-key model, run against the materialized sample ``src`` on connection ``con``. All
     counts (``n``, ``ndv``, run estimates) are SAMPLE estimates — enough to rank candidates and test
     functional dependencies, not exact table cardinalities.
@@ -63,8 +119,13 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     stats". ``fd_band`` is the near-FD tolerance and ``grain_frac`` the stop-at-grain fraction for key
     selection (step 4). This is all heuristic ranking, not exact science.
 
-    Returns ``(rows, schema)`` — one row per column, ``schema`` a DuckDB DDL string — for the caller
-    to wrap into a DataFrame."""
+    ``sample_rows`` is the number of rows the caller materialized, and ``exact`` says whether that
+    sample IS the whole table (the caller knows — it planned the sample). ``exact`` gates the
+    uniqueness claim (a sample can't tell a unique key from a merely higher-than-sample column) and
+    the "profiled a N-row sample" advisory line.
+
+    Returns ``(rows, schema, lines)`` — one row per column, ``schema`` a DuckDB DDL string, and
+    ``lines`` the advisory text for the CALLER to print (this module prints nothing)."""
     stats = stats or {}
     # Exact NDV upper bound per discrete column, straight from the Delta log (zero data read) —
     # approx_count_distinct can overshoot, and a value range caps it exactly.
@@ -88,6 +149,11 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # distinct values). An in-memory engine may force hash for relationship columns too, but we can't see that.
     def _encoding(t):
         t = t.upper()
+        # INTERVAL starts with "INT" but is NOT a value-encoded fixed-width number — it is a
+        # duration, ineligible as a key (see _is_interval). Guard it before the "INT" prefix so it is
+        # never misclassified as value-encoded; treat it as hash if it ever reaches the byte model.
+        if t.startswith("INTERVAL"):
+            return "hash"
         return "value" if t.startswith((
             "TINYINT", "UTINYINT", "SMALLINT", "USMALLINT", "INT", "UINT", "BIGINT", "UBIGINT",
             "HUGEINT", "UHUGEINT", "BOOL", "FLOAT", "DOUBLE", "REAL", "DEC", "NUMERIC",
@@ -103,6 +169,12 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
 
     def _is_temporal(t):
         return t.upper().startswith(("DATE", "TIME", "TIMESTAMP"))
+
+    # An INTERVAL is a duration/offset, not a filterable dimension: no query filters an exact
+    # duration and sorting by one clusters nothing queries actually filter — so, like a measure, it
+    # is ineligible as a sort-key column (excluded from candidacy in _elig below).
+    def _is_interval(t):
+        return t.upper().startswith("INTERVAL")
 
     # 2) per-column skew term Σp_v² (Simpson index, from the value histogram) and, for hash
     # columns, average serialised value width (drives dictionary cost).
@@ -168,7 +240,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # R8: partition columns are excluded as candidates — they lead the ORDER BY (below) but carry no
     # RLE value once Delta strips them from the files; a measure / constant / null-heavy column is out.
     def _elig(c):
-        return (ndv[c] > 1 and not _is_measure(types[c])
+        return (ndv[c] > 1 and not _is_measure(types[c]) and not _is_interval(types[c])
                 and c not in partition_cols and c not in null_heavy)
     # R6: ONE non-(near-)unique temporal leads the key — on a fact table, leading with the date keeps
     # natural clustering and incremental framing. Only the single coarsest date gets the tier-0 thumb
@@ -224,8 +296,9 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         kept_ndv = marg[chosen]
         remaining.remove(chosen)
 
-    # 5) assemble. "current" uses the table's real present physical order. A column in the key uses
-    # its prefix runs; everything else its iid estimate.
+    # 5) assemble. "current" uses current_runs — the iid / arbitrary-order estimate, because a random
+    # sample has no physical order to measure (see step 1); it is the honest neutral for an unknown
+    # layout. A column in the key uses its prefix runs; everything else its iid estimate.
     est_current = {c: _col_bytes(c, current_runs[c]) for c in cols}
     current_total = sum(est_current.values())
 
@@ -243,10 +316,11 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # is_unique can't be judged from a sample: any column whose true ndv exceeds the sample size
     # saturates to ndv≈n and looks unique, so a high-cardinality measure (an INT64 price) would be
     # falsely flagged and could hijack the key-organized branch below as the sort key. Only trust
-    # uniqueness when the "sample" actually covered the whole table (n < sample_rows ⇒ USING
-    # SAMPLE returned every row). When we truly sampled, claim no unique column — the conservative
-    # direction: fall back to the compression key and leave dictionaries on (plain_cols stays empty).
-    exact = n < sample_rows
+    # uniqueness when the profile was EXACT — the caller sampled nothing and handed us the whole
+    # table (``exact`` is an explicit argument now: the caller planned the sample and KNOWS whether
+    # it covered the table, rather than us inferring it from ``n < sample_rows``, which conflated "the
+    # sample covered the table" with "the table is smaller than a constant"). When it truly sampled,
+    # claim no unique column — the conservative direction: fall back to the compression key.
     unique_cols = ([c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols]
                    if exact else [])
     note = None
@@ -278,28 +352,32 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     def _saved(cur, new):  # clamp: a column already ~free (in load order) balloons to a silly ratio
         return (max(-999.9, round(100.0 * (cur - new) / cur, 1)) + 0.0) if cur else 0.0
 
-    # R8: partition columns lead the printed ORDER BY (write-locality) but hold no key slot.
+    # R8: partition columns lead the printed ORDER BY (write-locality) but hold no key slot. This
+    # module PRINTS NOTHING — it collects the advisory into ``lines`` and the caller prints them
+    # (``_get_rle`` prints all; the no-arg ``sort()`` path prints only the ORDER BY line).
     order_cols = partition_cols + [c for c in sort_key if c not in partition_cols]
-    print(f"\nrecommend_sort_key('{sch}.{tbl}') — sort-key recommendation (experimental):")
+    lines = [f"\nrecommend_sort_key('{sch}.{tbl}') — sort-key recommendation (experimental) "
+             f"[model v{MODEL_VERSION}]:"]
     if not exact:
-        print(f"  (profiled a {sample_rows:,}-row sample — ndv/skew/runs are estimates)")
-    print(f"  ORDER BY {', '.join(order_cols) if order_cols else '(no key pays off)'}")
+        lines.append(f"  (profiled a {sample_rows:,}-row sample — ndv/skew/runs are estimates)")
+    lines.append(f"  ORDER BY {', '.join(order_cols) if order_cols else '(no key pays off)'}")
     if partition_cols:
-        print(f"  (partition columns lead the sort but carry no compression weight: "
-              f"{', '.join(partition_cols)})")
+        lines.append(f"  (partition columns lead the sort but carry no compression weight: "
+                     f"{', '.join(partition_cols)})")
     # Deliberately NO projected-size line: this only profiles, it doesn't rewrite, so any "sorted
     # size" would be a model estimate — and an estimate that reads like a measurement is worse than
     # none. The real before/after bytes are printed by conn.table(name).optimize(), which actually
     # rewrites and measures via the Delta log (get_stats).
     if note:
-        print(f"  ({note})")
+        lines.append(f"  ({note})")
     if dict_bound:
-        print(f"  (dictionary-bound — sort won't help, cut cardinality: {', '.join(dict_bound)})")
+        lines.append(f"  (dictionary-bound — sort won't help, cut cardinality: {', '.join(dict_bound)})")
     if heavy_measures:
-        print(f"  (measures — not sortable; cut precision / split to shrink: {', '.join(heavy_measures)})")
+        lines.append(f"  (measures — not sortable; cut precision / split to shrink: "
+                     f"{', '.join(heavy_measures)})")
     if null_heavy:
-        print(f"  (null-heavy — excluded from the sort key (>{null_excl:.0%} null): "
-              f"{', '.join(sorted(null_heavy))})")
+        lines.append(f"  (null-heavy — excluded from the sort key (>{null_excl:.0%} null): "
+                     f"{', '.join(sorted(null_heavy))})")
 
     rest = sorted((c for c in cols if c not in pos), key=lambda c: -est_current[c])
     unique_set = set(unique_cols)  # ndv >= 0.9*n (non-partition) — a dictionary buys nothing here
@@ -307,4 +385,4 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
              round(100.0 * simpson[c], 2), current_runs[c], c in unique_set, _kb(est_current[c]),
              _kb(est_sorted[c]), _saved(est_current[c], est_sorted[c]))
             for c in sort_key + rest]
-    return rows, _SCHEMA
+    return rows, _SCHEMA, lines

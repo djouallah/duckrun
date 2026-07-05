@@ -402,8 +402,16 @@ def _commit_ops(path):
 
 
 def _debt(small_files, small_bytes):
-    """Force the byte trigger's inputs (the real _maintain decision runs against these)."""
-    return lambda *a, **k: {"small_files": small_files, "small_bytes": small_bytes, "partitions": []}
+    """Force the byte trigger's inputs (the real _maintain decision runs against these). The policy
+    now reads the per-file ``small_sizes`` list (it filters < half-target and sums), so hand it
+    ``small_files`` evenly-split values that each stay under half the target and total ``small_bytes``
+    — the (count, sum) the trigger sees is then exactly (small_files, small_bytes)."""
+    per = small_bytes // small_files if small_files else 0
+    sizes = [per] * small_files
+    if small_files:
+        sizes[0] += small_bytes - per * small_files  # carry rounding remainder on the first file
+    return lambda *a, **k: {"small_files": small_files, "small_bytes": small_bytes,
+                            "small_sizes": sizes, "partitions": []}
 
 
 def test_merge_compacts_when_byte_debt_clears(tmp_path, monkeypatch):
@@ -463,6 +471,10 @@ class _MaintDT:
     def version(self):
         return self._version
 
+    def cleanup_metadata(self):
+        # _maintain runs cleanup on its own gate, independent of the (failed) compaction; a no-op here.
+        pass
+
 
 def test_maintain_is_non_fatal_when_compaction_loses_the_race(monkeypatch):
     """The data already committed before _maintain runs, so a compaction that loses an OCC race
@@ -474,18 +486,27 @@ def test_maintain_is_non_fatal_when_compaction_loses_the_race(monkeypatch):
     engine._maintain(duckdb.connect(), "some/path", storage_options=None)
 
 
+# The post-write vacuum gate is now split: _last_vacuum_age_s(dt) reads the history age, and the
+# policy's should_vacuum(compacted, age) decides. These pin the same due/not-due outcomes as before
+# (compaction just ran → compacted=True), through the new API.
+def _vacuum_due(dt):
+    return engine._policy().should_vacuum(compacted=True, last_vacuum_age_s=engine._last_vacuum_age_s(dt))
+
+
 def test_vacuum_due_when_no_vacuum_in_recent_history():
-    assert engine._vacuum_due(_MaintDT(history=[{"operation": "MERGE", "timestamp": 0}])) is True
+    dt = _MaintDT(history=[{"operation": "MERGE", "timestamp": 0}])
+    assert engine._last_vacuum_age_s(dt) == float("inf")  # never vacuumed → infinitely old
+    assert _vacuum_due(dt) is True
 
 
 def test_vacuum_not_due_right_after_a_vacuum():
     now = int(time.time() * 1000)
-    assert engine._vacuum_due(_MaintDT(history=[{"operation": "VACUUM END", "timestamp": now}])) is False
+    assert _vacuum_due(_MaintDT(history=[{"operation": "VACUUM END", "timestamp": now}])) is False
 
 
 def test_vacuum_due_once_past_the_retention_window():
     old = int(time.time() * 1000) - (169 * 3600 * 1000)  # just over 168h
-    assert engine._vacuum_due(_MaintDT(history=[{"operation": "VACUUM END", "timestamp": old}])) is True
+    assert _vacuum_due(_MaintDT(history=[{"operation": "VACUUM END", "timestamp": old}])) is True
 
 
 def test_cleanup_due_on_first_maintenance_of_a_table():

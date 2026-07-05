@@ -16,6 +16,8 @@ from dbt.adapters.events.logging import AdapterLogger
 from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_deltalake
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
+from dbt.adapters.duckrun.policy import MaintenancePolicy
+
 logger = AdapterLogger("Duckrun")
 
 try:  # deltalake 1.x exposes WriterProperties at the top level
@@ -880,20 +882,26 @@ def convert_to_delta(path: str, storage_options: Optional[Dict[str, str]] = None
 # Tier-0 safe button uses (compaction_debt): small files under half the target, enough of them AND
 # enough small bytes to be worth a rewrite. Vacuum and cleanup are decoupled from it — each reclaims
 # nothing on a fresh table, so running them on every microbatch write is pure store-listing cost.
-_MAINT_VACUUM_INTERVAL_MS = 168 * 3600 * 1000   # match the safe 7-day retention — nothing is reclaimable faster
 _MAINT_CLEANUP_EVERY = 50                        # commits between metadata cleanups
 _last_cleanup_version: Dict[str, int] = {}       # path -> version at its last cleanup (per process)
 
+# The compact/vacuum decision thresholds live in policy.MaintenancePolicy now instead of being inlined
+# at each write path. Built from the LIVE target size (read here, not frozen at import) so a
+# reconfigured/patched target is honored — the thresholds themselves are fixed: >= 8 files under half
+# the target AND >= 2x the target in small bytes, vacuum no more often than the safe 7-day retention.
+def _policy() -> MaintenancePolicy:
+    return MaintenancePolicy(target_file_size=_TARGET_FILE_SIZE)
 
-def _vacuum_due(dt: DeltaTable) -> bool:
-    """True if it has been at least _MAINT_VACUUM_INTERVAL_MS since the last VACUUM commit (delta_rs
-    logs VACUUM START/END to the history). No VACUUM in the recent window → treat as due (a table
-    never vacuumed, or one whose last vacuum has aged out — either way, run it)."""
+
+def _last_vacuum_age_s(dt: DeltaTable) -> float:
+    """Seconds since the last VACUUM commit (delta_rs logs VACUUM START/END to the history). No VACUUM
+    in the recent window — a table never vacuumed, or one whose last vacuum aged out — is infinitely
+    old, i.e. due."""
     for entry in dt.history(limit=200):
         if str(entry.get("operation", "")).startswith("VACUUM"):
             ts = entry.get("timestamp")
-            return ts is None or (int(time.time() * 1000) - ts) >= _MAINT_VACUUM_INTERVAL_MS
-    return True
+            return float("inf") if ts is None else (int(time.time() * 1000) - ts) / 1000.0
+    return float("inf")
 
 
 def _cleanup_due(path: str, dt: DeltaTable) -> bool:
@@ -929,17 +937,27 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) 
     if cur is None:
         return
     dt = _delta_table(path, storage_options)
+    debt = compaction_debt(cur, path, dt=dt, storage_options=storage_options)
+    policy = _policy()
+
+    def _compact():
+        dt.optimize.compact(target_size=_TARGET_FILE_SIZE, writer_properties=_writer_properties())
+
+    def _vacuum():  # past the retention-length gate only; a compaction just ran → compacted=True
+        if policy.should_vacuum(compacted=True, last_vacuum_age_s=_last_vacuum_age_s(dt)):
+            dt.vacuum(dry_run=False)
+
+    # The policy owns the compact trigger and swallows a lost-race CommitFailedError (the data commit
+    # already succeeded, so the byte trigger simply re-fires next run) — maintenance never fails the write.
+    policy.run_maintenance(_compact, _vacuum, should=policy.should_compact(debt["small_sizes"]))
+
+    # Metadata cleanup is on its OWN log-growth gate, independent of whether a compaction fired.
     try:
-        debt = compaction_debt(cur, path, dt=dt, storage_options=storage_options)
-        if debt["small_files"] >= 8 and debt["small_bytes"] >= 2 * _TARGET_FILE_SIZE:
-            dt.optimize.compact(target_size=_TARGET_FILE_SIZE, writer_properties=_writer_properties())
-            if _vacuum_due(dt):  # fresh tombstones queued AND past the retention-length gate
-                dt.vacuum(dry_run=False)
-        if _cleanup_due(path, dt):  # independent gate — NOT piggybacked on compaction
+        if _cleanup_due(path, dt):
             dt.cleanup_metadata()
             _last_cleanup_version[path] = dt.version()
     except CommitFailedError as e:
-        logger.warning(f"post-write maintenance skipped (data commit already succeeded): {e}")
+        logger.warning(f"post-write metadata cleanup skipped (data commit already succeeded): {e}")
 
 
 def write_delta(
@@ -953,6 +971,7 @@ def write_delta(
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
     plain_cols: Optional[List[str]] = None,
+    read_version: Optional[int] = None,
 ) -> None:
     """
     Materialize ``data`` (a DuckDB relation / Arrow C-stream) to Delta and maintain it.
@@ -963,6 +982,11 @@ def write_delta(
 
     ``merge_schema`` evolves the schema (adds columns); ``overwrite_schema`` replaces it wholesale
     (overwrite mode only — Delta's ``overwriteSchema``). They are mutually exclusive.
+
+    ``read_version`` turns the write into a compare-and-swap: the fenced siblings
+    ``append_if_unchanged`` / ``overwrite_if_unchanged`` route their writes through here (this is the
+    ONE Delta write seam), so a fenced write is pinned to the caller's snapshot and fails loudly on a
+    concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
     Every write lands in the one read-layout profile (tuned writer properties + 128 MB files).
     ``plain_cols`` (sort-rewrite only) are unique columns written PLAIN — no dictionary.
@@ -989,7 +1013,26 @@ def write_delta(
         storage_options=storage_options,
         plain_cols=plain_cols,
     )
-    write_deltalake(**args)
+    if read_version is None:
+        write_deltalake(**args)
+    else:
+        # Fenced (compare-and-swap): pin to the snapshot the caller read and disable rebasing
+        # (max_commit_retries=0), so any commit that landed since ``read_version`` already took our
+        # target version and this write fails loudly instead of silently landing on top of it. Keeping
+        # the actual write_deltalake here — not in the fenced wrappers — makes this the single seam a
+        # streamed mid-write race is observable at.
+        dt = _delta_table(path, storage_options)
+        dt.load_as_version(read_version)
+        args["table_or_uri"] = dt
+        args.pop("storage_options", None)
+        args["commit_properties"] = CommitProperties(max_commit_retries=0)
+        try:
+            write_deltalake(**args)
+        except CommitFailedError as e:
+            raise CommitFailedError(
+                f"{mode} refused: table '{path}' changed since version {read_version} "
+                f"(a concurrent write committed). Re-read and retry."
+            ) from e
 
     if mode == "overwrite":
         dt = _delta_table(path, storage_options)
@@ -1050,31 +1093,16 @@ def append_if_unchanged(
             "append must be pinned to its snapshot — a brand-new table's first write goes through "
             "write_delta, not here."
         )
-    dt = _delta_table(path, storage_options)
-    dt.load_as_version(read_version)
-    pinned = dt.version()
-
-    schema_mode = "merge" if merge_schema else None
-    args = build_write_deltalake_args(
+    # Route through the single write seam with the CAS pin; the append branch then runs the same
+    # threshold-gated maintenance as a plain append.
+    write_delta(
         path, data, "append",
-        schema_mode=schema_mode,
         partition_by=partition_by,
+        merge_schema=merge_schema,
         storage_options=storage_options,
+        cur=cur,
+        read_version=read_version,
     )
-    # Pin to the snapshot we read and disable rebasing so a concurrent commit fails the append
-    # instead of silently landing on top of it. storage_options live on the DeltaTable already.
-    args["table_or_uri"] = dt
-    args.pop("storage_options", None)
-    args["commit_properties"] = CommitProperties(max_commit_retries=0)
-    try:
-        write_deltalake(**args)
-    except CommitFailedError as e:
-        raise CommitFailedError(
-            f"append_if_unchanged: table '{path}' changed since version {pinned} "
-            f"(a concurrent write committed); append refused. Re-read and retry."
-        ) from e
-
-    _maintain(cur, path, storage_options=storage_options)
 
 
 def overwrite_if_unchanged(
@@ -1103,34 +1131,16 @@ def overwrite_if_unchanged(
             "overwrite_if_unchanged requires read_version (the version the caller read). A fenced "
             "overwrite must be pinned to its snapshot — a brand-new table goes through write_delta."
         )
-    dt = _delta_table(path, storage_options)
-    dt.load_as_version(read_version)
-    pinned = dt.version()
-
-    schema_mode = "overwrite" if overwrite_schema else None
-    args = build_write_deltalake_args(
+    # Route through the single write seam with the CAS pin. write_delta(overwrite) then vacuums +
+    # cleans up exactly as the plain overwrite path does, so the replaced version's files retire.
+    write_delta(
         path, data, "overwrite",
-        schema_mode=schema_mode,
         partition_by=partition_by,
+        overwrite_schema=overwrite_schema,
         plain_cols=plain_cols,
         storage_options=storage_options,
+        read_version=read_version,
     )
-    args["table_or_uri"] = dt
-    args.pop("storage_options", None)
-    args["commit_properties"] = CommitProperties(max_commit_retries=0)
-    try:
-        write_deltalake(**args)
-    except CommitFailedError as e:
-        raise CommitFailedError(
-            f"overwrite_if_unchanged: table '{path}' changed since version {pinned} "
-            f"(a concurrent write committed); overwrite refused. Re-read and retry."
-        ) from e
-
-    # Full overwrite → vacuum + cleanup like the plain overwrite path (not threshold-gated append
-    # maintenance): the replaced version's files become tombstones to retire.
-    dt = _delta_table(path, storage_options)
-    dt.vacuum(dry_run=False)
-    dt.cleanup_metadata()
 
 
 def replace_where(
@@ -1346,7 +1356,9 @@ def compaction_debt(cur, path: str, *, dt: Optional[DeltaTable] = None,
     parts = sorted({
         "/".join(f"{c.split('.', 1)[1]}={r[i + 1]}" for i, c in enumerate(pcols)) for r in rows
     }) if pcols else []
-    return {"small_files": len(rows), "small_bytes": sum(int(r[0]) for r in rows), "partitions": parts}
+    small_sizes = [int(r[0]) for r in rows]
+    return {"small_files": len(small_sizes), "small_bytes": sum(small_sizes),
+            "small_sizes": small_sizes, "partitions": parts}
 
 
 def restore_to_version(

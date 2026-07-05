@@ -271,7 +271,7 @@ class DeltaTable:
         target = engine._TARGET_FILE_SIZE
         debt = engine.compaction_debt(con, self.path, target_size=target,
                                       storage_options=self.storage_options)
-        if debt["small_files"] >= 8 and debt["small_bytes"] >= 2 * target:
+        if engine._policy().should_compact(debt["small_sizes"]):
             m = engine.optimize(self.path, target_size=target, storage_options=self.storage_options)
             result = {"operation": "compact",
                       "filesRemoved": int(m.get("numFilesRemoved", 0)),
@@ -291,12 +291,13 @@ class DeltaTable:
         self._refresh_view()
         return result
 
-    def _analyze(self):
+    def _analyze(self, seed: Optional[int] = None):
         """``conn.table(name).optimize(analyze=True)``: the ``_get_rle`` sort-key profile promoted to
         public — the per-column recommendation DataFrame — plus a printed small-file debt line. Reads
-        only (a sampled ``delta_scan`` + the Delta log); commits nothing, so it works read-only."""
+        only (a sampled ``delta_scan`` + the Delta log); commits nothing, so it works read-only.
+        ``seed`` makes the profiling sample reproducible."""
         name = self._table if self._schema is None else f"{self._schema}.{self._table}"
-        df = self._session._get_rle(name)  # prints the ORDER BY recommendation, returns the profile
+        df = self._session._get_rle(name, seed=seed)  # prints the recommendation, returns the profile
         debt = engine.compaction_debt(self._session.con, self.path, storage_options=self.storage_options)
         mb = debt["small_bytes"] / (1024.0 * 1024.0)
         where = f" across {len(debt['partitions'])} partition(s)" if debt["partitions"] else ""
@@ -305,7 +306,7 @@ class DeltaTable:
         return df
 
     def _sort_rewrite(self, keys: Optional[List[str]] = None,
-                      where: Optional[str] = None) -> Dict:
+                      where: Optional[str] = None, seed: Optional[int] = None) -> Dict:
         """Sort-rewrite this table's files physically ordered by ``(partition columns…, key…)``. Reads
         the table, applies ``ORDER BY``, and rewrites with the tuned read layout. forName only (needs a
         catalog table). Partition columns always lead the physical order and are preserved as partitions.
@@ -327,7 +328,7 @@ class DeltaTable:
             key, plain_cols = list(keys), []
         else:
             name = self._table if self._schema is None else f"{self._schema}.{self._table}"
-            recs = [dict(zip(rle.columns, r)) for rle in [self._session._get_rle(name)] for r in rle.collect()]
+            recs = [dict(zip(rle.columns, r)) for rle in [self._session._get_rle(name, seed=seed)] for r in rle.collect()]
             key = [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
                                                key=lambda x: x["sort_position"])]
             # A unique / near-unique column (ndv >= 0.9*n) gains nothing from a dictionary — every value
