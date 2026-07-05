@@ -920,7 +920,14 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) 
     under half the target AND at least 2x the target in small bytes). compact() reuses the same
     _writer_properties() read layout and _TARGET_FILE_SIZE every file write uses, so maintenance
     (including the consolidation of files a lean MERGE left behind) keeps the uniform, one-row-group-
-    per-file layout Direct Lake wants."""
+    per-file layout Direct Lake wants.
+
+    The byte debt is measured with the DuckDB cursor ``cur`` (a replacement scan over the Delta log's
+    add-actions); a caller with no cursor to lend — a bare engine write outside a session — simply
+    gets no maintenance. Every production write path (the dbt plugin, the DataFrame writer, the raw-DML
+    router, the table handles) wires one, so this only skips ad-hoc/direct engine calls."""
+    if cur is None:
+        return
     dt = _delta_table(path, storage_options)
     try:
         debt = compaction_debt(cur, path, dt=dt, storage_options=storage_options)
@@ -932,7 +939,7 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) 
             dt.cleanup_metadata()
             _last_cleanup_version[path] = dt.version()
     except CommitFailedError as e:
-        logger.warning("post-write maintenance skipped (data commit already succeeded): %s", e)
+        logger.warning(f"post-write maintenance skipped (data commit already succeeded): {e}")
 
 
 def write_delta(
@@ -944,14 +951,14 @@ def write_delta(
     merge_schema: bool = False,
     overwrite_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
+    cur=None,
     plain_cols: Optional[List[str]] = None,
 ) -> None:
     """
     Materialize ``data`` (a DuckDB relation / Arrow C-stream) to Delta and maintain it.
 
       - overwrite: write, then vacuum (safe 7-day default) + cleanup_metadata
-      - append:    write, then compact/vacuum/cleanup if file count exceeds threshold
+      - append:    write, then best-effort compact/vacuum/cleanup on the byte trigger (``_maintain``)
       - ignore:    write only if the table does not already exist
 
     ``merge_schema`` evolves the schema (adds columns); ``overwrite_schema`` replaces it wholesale
@@ -984,12 +991,12 @@ def write_delta(
     )
     write_deltalake(**args)
 
-    dt = _delta_table(path, storage_options)
     if mode == "overwrite":
+        dt = _delta_table(path, storage_options)
         dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
         dt.cleanup_metadata()
     else:  # append
-        _maintain(dt, compaction_threshold)
+        _maintain(cur, path, storage_options=storage_options)
 
 
 def create_empty_delta(
@@ -1017,7 +1024,7 @@ def append_if_unchanged(
     partition_by: Optional[List[str]] = None,
     merge_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
+    cur=None,
 ) -> None:
     """
     Optimistic ("safe") append: append ``data`` only if the table version has not moved since
@@ -1067,7 +1074,7 @@ def append_if_unchanged(
             f"(a concurrent write committed); append refused. Re-read and retry."
         ) from e
 
-    _maintain(_delta_table(path, storage_options), compaction_threshold)
+    _maintain(cur, path, storage_options=storage_options)
 
 
 def overwrite_if_unchanged(
@@ -1079,7 +1086,6 @@ def overwrite_if_unchanged(
     overwrite_schema: bool = False,
     plain_cols: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
 ) -> None:
     """Optimistic FULL-TABLE overwrite: replace every row with ``data`` only if the table version
     has not moved since we read it — otherwise refuse with ``CommitFailedError``. The overwrite
@@ -1135,7 +1141,7 @@ def replace_where(
     read_version: Optional[int],
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
+    cur=None,
     plain_cols: Optional[List[str]] = None,
 ) -> None:
     """``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
@@ -1179,7 +1185,7 @@ def replace_where(
 
     # Maintenance ALWAYS at a fresh HEAD — never the pinned snapshot (a stale file list would
     # compact/vacuum files live versions still reference and corrupt the table).
-    _maintain(_delta_table(path, storage_options), compaction_threshold)
+    _maintain(cur, path, storage_options=storage_options)
 
 
 def replace_window(
@@ -1192,7 +1198,7 @@ def replace_window(
     read_version: Optional[int],
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
+    cur=None,
 ) -> None:
     """Microbatch window replace: atomically replace the rows in ``[start, end)`` on ``column``
     with ``data`` (the batch's rows) — the Delta-native equivalent of dbt's microbatch "delete the
@@ -1205,7 +1211,7 @@ def replace_window(
     replace_where(
         path, data, predicate,
         read_version=read_version, partition_by=partition_by,
-        storage_options=storage_options, compaction_threshold=compaction_threshold,
+        storage_options=storage_options, cur=cur,
     )
 
 
@@ -1215,7 +1221,7 @@ def delete_rows(
     *,
     read_version: Optional[int],
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
+    cur=None,
 ) -> None:
     """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
     when ``predicate`` is None. The Delta-native ``DELETE FROM`` for the connection API.
@@ -1240,7 +1246,7 @@ def delete_rows(
             f"delete: table '{path}' changed since version {read_version} "
             f"(a conflicting concurrent write committed); delete refused. Re-read and retry."
         ) from e
-    _maintain(_delta_table(path, storage_options), compaction_threshold)
+    _maintain(cur, path, storage_options=storage_options)
 
 
 def update_rows(
@@ -1250,7 +1256,7 @@ def update_rows(
     *,
     read_version: Optional[int],
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
+    cur=None,
 ) -> None:
     """Update ``{column: expression}`` for rows matching ``predicate`` (delta_rs/datafusion SQL),
     or every row when ``predicate`` is None. The Delta-native ``UPDATE`` for the connection API.
@@ -1273,7 +1279,7 @@ def update_rows(
             f"update: table '{path}' changed since version {read_version} "
             f"(a conflicting concurrent write committed); update refused. Re-read and retry."
         ) from e
-    _maintain(_delta_table(path, storage_options), compaction_threshold)
+    _maintain(cur, path, storage_options=storage_options)
 
 
 def vacuum(
@@ -1321,13 +1327,15 @@ def optimize(
     return dt.optimize.compact(target_size=target_size, writer_properties=wp)
 
 
-def compaction_debt(cur, path: str, *, target_size: int = _TARGET_FILE_SIZE,
+def compaction_debt(cur, path: str, *, dt: Optional[DeltaTable] = None,
+                    target_size: int = _TARGET_FILE_SIZE,
                     storage_options: Optional[Dict[str, str]] = None) -> Dict:
     """Small-file debt for the Tier-0 maintenance button, read from the Delta **log** (no data scan).
     A file is 'small' if it is under **half** the target size; returns the count and total bytes of
     the small files and the distinct partitions they sit in (``col=value`` labels). Pure read — no
-    commit. The caller applies the fire trigger (enough small files AND enough small bytes)."""
-    dt = _delta_table(path, storage_options)
+    commit. The caller applies the fire trigger (enough small files AND enough small bytes). Pass a
+    pre-opened ``dt`` to avoid reopening the table (the post-write ``_maintain`` already holds one)."""
+    dt = dt or _delta_table(path, storage_options)
     add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
     have = [d[0] for d in cur.sql("select * from add_actions limit 0").description]
     pcols = [c for c in have if c.startswith("partition.")]
@@ -1370,7 +1378,7 @@ def merge_delta(
     read_version: Optional[int] = None,
     delete_unmatched_by_source=None,
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
+    cur=None,
 ) -> None:
     """
     Merge ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
@@ -1418,10 +1426,10 @@ def merge_delta(
       string deletes only those matching that predicate; None (default, used by the dbt incremental
       strategies) adds no such clause. Used by the connection-API ``df.merge`` full-sync option.
 
-    After the merge, run the same threshold-gated maintenance the append/delete+insert paths
-    use: when the file count exceeds ``compaction_threshold``, compact small files, vacuum
-    tombstoned old versions (safe 7-day default retention), and clean up expired log entries.
-    Without this an incremental table that is merged on every run grows old files forever.
+    After the merge, run the same best-effort maintenance the append/delete+insert paths use
+    (``_maintain``): compact small files when the byte debt is worth it, vacuum tombstoned old
+    versions (safe 7-day default retention), and clean up expired log entries. Without this an
+    incremental table that is merged on every run grows old files forever.
     """
     keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
     # Quote the join keys: a unique_key that needs quoting (mixed case on a case-sensitive path, a
@@ -1472,7 +1480,7 @@ def merge_delta(
         streamed_exec=streamed_exec,
         max_spill_size=max_spill_size,
         storage_options=storage_options,
-        compaction_threshold=compaction_threshold,
+        cur=cur,
     )
 
 
@@ -1541,7 +1549,7 @@ def merge_delta_clauses(
     streamed_exec: bool = False,
     max_spill_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    compaction_threshold: int = 100,
+    cur=None,
 ) -> None:
     """Run a MERGE described by an ORDERED list of clause dicts — the full delta-rs ``TableMerger``
     surface. Each clause is ``{"clause": "matched"|"not_matched"|"not_matched_by_source",
@@ -1684,6 +1692,6 @@ def merge_delta_clauses(
         merger = _apply_merge_clause(merger, c)
     merger.execute()
 
-    # Same threshold-gated maintenance as the append / delete+insert paths: a merged-on-every-run
+    # Same best-effort maintenance as the append / delete+insert paths: a merged-on-every-run
     # incremental table fragments into small files and leaves tombstoned old versions otherwise.
-    _maintain(_delta_table(path, storage_options), compaction_threshold)
+    _maintain(cur, path, storage_options=storage_options)

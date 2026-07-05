@@ -702,10 +702,15 @@ class TestDeltaTable:
         assert conn.table("dbo.mt_clean").optimize()["operation"] == "noop"  # idempotent
 
     def test_table_optimize_maintain_compacts_small_files(self, conn, monkeypatch):
-        # Below-target files accumulated by many small appends ARE compacted once the byte trigger
-        # fires (>= 8 files AND >= 2x target bytes). Shrink the target so a handful of small commits
-        # trips it. Compaction commits dataChange=false and preserves every row.
+        # Below-target files accumulated by many small appends ARE compacted by the manual safe button
+        # once the byte trigger fires (>= 8 files AND >= 2x target bytes). Shrink the target so a
+        # handful of small commits trips it. Compaction commits dataChange=false and preserves rows.
         monkeypatch.setattr(engine, "_TARGET_FILE_SIZE", 64 * 1024)  # 64 KB: small = <32 KB, fire >=128 KB
+        # Isolate the manual button: the automatic post-write maintenance now shares this exact byte
+        # trigger, so under the shrunk target it would compact these appends itself before the button
+        # is pressed. No-op it during setup so the debt survives for the button to clear (with the real
+        # 256 MB target, a few small appends never reach the trigger, so real debt accumulates the same).
+        monkeypatch.setattr(engine, "_maintain", lambda *a, **k: None)
         conn.sql("select i as id, repeat('x', 200) as pad from range(5000) t(i)") \
             .write.mode("overwrite").saveAsTable("mt_debt")
         for b in range(10):

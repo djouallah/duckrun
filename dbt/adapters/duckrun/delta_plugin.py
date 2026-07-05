@@ -34,7 +34,6 @@ class Plugin(BasePlugin):
         # a single-catalog project — store() then always uses the default storage_options.
         self._catalogs: dict = config.get("catalogs") or {}
         self._default_database = config.get("default_database")
-        self._compaction_threshold: int = int(config.get("compaction_threshold", 100))
         self._conn = None
         self._cursor_handle = None
         # DuckDB's memory_limit as it stood when the connection was configured (profile value,
@@ -253,7 +252,7 @@ class Plugin(BasePlugin):
                     merge_schema=merge_schema,
                     overwrite_schema=overwrite_schema,
                     storage_options=storage_options,
-                    compaction_threshold=self._compaction_threshold,
+                    cur=cur,
                 )
             return
 
@@ -317,7 +316,7 @@ class Plugin(BasePlugin):
                         streamed_exec=(False if sx is None else bool(sx)),
                         read_version=cfg.get("read_version"),
                         storage_options=storage_options,
-                        compaction_threshold=self._compaction_threshold,
+                        cur=cur,
                     )
                 else:
                     engine.merge_delta(
@@ -335,7 +334,7 @@ class Plugin(BasePlugin):
                         # read {{ this }}), so OCC validates (vB, HEAD] — read and commit are one snapshot.
                         read_version=cfg.get("read_version"),
                         storage_options=storage_options,
-                        compaction_threshold=self._compaction_threshold,
+                        cur=cur,
                     )
             if src_tmp is not None:
                 cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")  # #14: release the materialized source
@@ -346,7 +345,7 @@ class Plugin(BasePlugin):
                     partition_by=partition_by,
                     merge_schema=merge_schema,
                     storage_options=storage_options,
-                    compaction_threshold=self._compaction_threshold,
+                    cur=cur,
                 )
         elif strategy in ("append_if_unchanged", "safeappend"):
             # Optimistic append (``safeappend`` is the deprecated alias): commit only if the table
@@ -362,7 +361,7 @@ class Plugin(BasePlugin):
                     partition_by=partition_by,
                     merge_schema=merge_schema,
                     storage_options=storage_options,
-                    compaction_threshold=self._compaction_threshold,
+                    cur=cur,
                 )
         else:
             raise ValueError(
@@ -427,7 +426,7 @@ class Plugin(BasePlugin):
                 path, window, "overwrite",
                 partition_by=partition_by,
                 storage_options=storage_options,
-                compaction_threshold=self._compaction_threshold,
+                cur=cur,
             )
         else:
             engine.replace_window(
@@ -436,7 +435,7 @@ class Plugin(BasePlugin):
                 read_version=read_version,
                 partition_by=partition_by,
                 storage_options=storage_options,
-                compaction_threshold=self._compaction_threshold,
+                cur=cur,
             )
 
     def _store_delete_insert(
@@ -520,7 +519,6 @@ class Plugin(BasePlugin):
                 read_version=vB,
                 partition_by=partition_by,
                 storage_options=storage_options,
-                compaction_threshold=self._compaction_threshold,
             )
         finally:
             cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')

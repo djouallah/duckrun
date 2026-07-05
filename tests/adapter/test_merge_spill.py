@@ -9,10 +9,13 @@ currently-available RAM) and lets a model override it via ``merge_max_spill_size
 ``configure_duckdb_session`` + ``restore_memory_limit``). These tests pin that wiring down.
 """
 import re
+import time
 
+import duckdb
 import pyarrow as pa
 
 from deltalake import DeltaTable
+from deltalake.exceptions import CommitFailedError
 
 from dbt.adapters.duckrun import engine
 
@@ -308,15 +311,13 @@ class _FakeDeltaTable:
         self._captured.update(kwargs)
         return _FakeMerger()
 
-    def file_uris(self):
-        # Below the default compaction_threshold, so the post-merge maintenance block is
-        # skipped — these tests only care about the kwargs forwarded into .merge().
-        return []
-
 
 def _spy(monkeypatch):
     captured = {}
     monkeypatch.setattr(engine, "_delta_table", lambda path, so: _FakeDeltaTable(captured))
+    # These tests only care about the kwargs forwarded into .merge(); the post-merge maintenance
+    # (a real byte-debt read + optimize) is a no-op here so it can't touch the fake table.
+    monkeypatch.setattr(engine, "_maintain", lambda *a, **k: None)
     return captured
 
 
@@ -400,34 +401,99 @@ def _commit_ops(path):
     return [c.get("operation") for c in DeltaTable(path).history()]
 
 
-def test_merge_compacts_and_vacuums_when_over_threshold(tmp_path):
-    """Past compaction_threshold, the merge path must compact + vacuum + cleanup like append —
-    so a merged-on-every-run table doesn't grow small files and tombstoned versions forever."""
+def _debt(small_files, small_bytes):
+    """Force the byte trigger's inputs (the real _maintain decision runs against these)."""
+    return lambda *a, **k: {"small_files": small_files, "small_bytes": small_bytes, "partitions": []}
+
+
+def test_merge_compacts_when_byte_debt_clears(tmp_path, monkeypatch):
+    """When the small-file debt clears the byte trigger (>=8 small files AND >=2x the target in
+    small bytes), the merge path compacts like append — so a merged-on-every-run table doesn't grow
+    small files and tombstoned versions forever."""
     path = str(tmp_path / "t")
     engine.write_delta(path, _table([1, 2, 3]), "overwrite")
-    # Each merge adds a file; threshold=1 makes maintenance fire on this merge.
+    monkeypatch.setattr(engine, "compaction_debt", _debt(8, 2 * engine._TARGET_FILE_SIZE))
     engine.merge_delta(
         path,
         pa.table({"id": pa.array([4], pa.int64()), "value": pa.array([40], pa.int64())}),
         "id",
-        compaction_threshold=1,
         read_version=0,
+        cur=duckdb.connect(),
     )
     # Data is still correct, and an OPTIMIZE commit was added (compaction ran).
     assert _rows(path) == {1: 10, 2: 20, 3: 30, 4: 40}
     assert any(op and "OPTIMIZE" in op.upper() for op in _commit_ops(path))
 
 
-def test_merge_skips_maintenance_under_threshold(tmp_path):
-    """A high threshold leaves the merge untouched — maintenance is gated, not unconditional."""
+def test_merge_skips_compaction_below_the_byte_trigger(tmp_path, monkeypatch):
+    """Just under the file-count half of the AND (7 small files, however many bytes) leaves the
+    merge untouched — compaction is gated on real debt, not unconditional."""
     path = str(tmp_path / "t")
     engine.write_delta(path, _table([1, 2, 3]), "overwrite")
+    monkeypatch.setattr(engine, "compaction_debt", _debt(7, 2 * engine._TARGET_FILE_SIZE))
     engine.merge_delta(
         path,
         pa.table({"id": pa.array([4], pa.int64()), "value": pa.array([40], pa.int64())}),
         "id",
-        compaction_threshold=1000,
         read_version=0,
+        cur=duckdb.connect(),
     )
     assert _rows(path) == {1: 10, 2: 20, 3: 30, 4: 40}
     assert not any(op and "OPTIMIZE" in op.upper() for op in _commit_ops(path))
+
+
+# ----------------------------------------------- maintenance gates (non-fatal / vacuum / cleanup)
+
+class _FakeOptimize:
+    def compact(self, **kwargs):
+        raise CommitFailedError("simulated concurrent commit won the compaction race")
+
+
+class _MaintDT:
+    """Minimal stand-in for a DeltaTable in the _maintain gate tests."""
+    optimize = _FakeOptimize()
+
+    def __init__(self, history=None, version=0):
+        self._history = history or []
+        self._version = version
+
+    def history(self, limit=None):
+        return self._history
+
+    def version(self):
+        return self._version
+
+
+def test_maintain_is_non_fatal_when_compaction_loses_the_race(monkeypatch):
+    """The data already committed before _maintain runs, so a compaction that loses an OCC race
+    must be swallowed (logged, not raised) — otherwise dbt fails a model whose data succeeded."""
+    monkeypatch.setattr(engine, "compaction_debt", _debt(8, 2 * engine._TARGET_FILE_SIZE))
+    monkeypatch.setattr(engine, "_delta_table", lambda path, so: _MaintDT())
+    # Must NOT raise, even though optimize.compact() raises CommitFailedError. A real (non-None)
+    # cursor is required for _maintain to proceed past the no-cursor guard to the compaction.
+    engine._maintain(duckdb.connect(), "some/path", storage_options=None)
+
+
+def test_vacuum_due_when_no_vacuum_in_recent_history():
+    assert engine._vacuum_due(_MaintDT(history=[{"operation": "MERGE", "timestamp": 0}])) is True
+
+
+def test_vacuum_not_due_right_after_a_vacuum():
+    now = int(time.time() * 1000)
+    assert engine._vacuum_due(_MaintDT(history=[{"operation": "VACUUM END", "timestamp": now}])) is False
+
+
+def test_vacuum_due_once_past_the_retention_window():
+    old = int(time.time() * 1000) - (169 * 3600 * 1000)  # just over 168h
+    assert engine._vacuum_due(_MaintDT(history=[{"operation": "VACUUM END", "timestamp": old}])) is True
+
+
+def test_cleanup_due_on_first_maintenance_of_a_table():
+    assert engine._cleanup_due("cleanup-path-A", _MaintDT(version=3)) is True
+
+
+def test_cleanup_gate_counts_commits_since_last_cleanup(monkeypatch):
+    path = "cleanup-path-B"
+    monkeypatch.setitem(engine._last_cleanup_version, path, 10)
+    assert engine._cleanup_due(path, _MaintDT(version=12)) is False   # 12 - 10 = 2  < 50
+    assert engine._cleanup_due(path, _MaintDT(version=60)) is True    # 60 - 10 = 50 >= 50

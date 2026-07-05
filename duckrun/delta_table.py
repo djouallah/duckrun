@@ -122,7 +122,7 @@ class DeltaMergeBuilder:
             read_version=self._read_version,
             streamed_exec=self._streamed_exec,
             storage_options=self._table.storage_options,
-            compaction_threshold=self._table.compaction_threshold,
+            cur=self._table._session.con,
         )
         self._table._resnapshot()
         self._table._refresh_view()
@@ -139,7 +139,6 @@ class DeltaTable:
         # forName resolves the target catalog's storage_options; forPath / forName-in-current-catalog
         # fall back to the current catalog's (the session.storage_options property).
         self.storage_options = storage_options if storage_options is not None else session.storage_options
-        self.compaction_threshold = session.compaction_threshold
         self._schema = schema
         self._table = table
         self._catalog = catalog
@@ -220,7 +219,7 @@ class DeltaTable:
         self._session._require_writable("delete", self._catalog)
         engine.delete_rows(self.path, predicate, read_version=self._read_version,
                            storage_options=self.storage_options,
-                           compaction_threshold=self.compaction_threshold)
+                           cur=self._session.con)
         self._resnapshot()
         self._refresh_view()
 
@@ -232,7 +231,7 @@ class DeltaTable:
         self._session._require_writable("update", self._catalog)
         engine.update_rows(self.path, set, condition, read_version=self._read_version,
                            storage_options=self.storage_options,
-                           compaction_threshold=self.compaction_threshold)
+                           cur=self._session.con)
         self._resnapshot()
         self._refresh_view()
 
@@ -354,14 +353,12 @@ class DeltaTable:
         if where is None:
             engine.overwrite_if_unchanged(self.path, rel, read_version=self._read_version,
                                           partition_by=(pcols or None), storage_options=self.storage_options,
-                                          compaction_threshold=self.compaction_threshold,
                                           plain_cols=plain_cols)
         else:
             # Scoped rewrite: replace ONLY the matching partitions in one atomic, snapshot-fenced commit.
             engine.replace_where(self.path, rel, where, read_version=self._read_version,
                                  partition_by=(pcols or None), storage_options=self.storage_options,
-                                 compaction_threshold=self.compaction_threshold,
-                                 plain_cols=plain_cols)
+                                 cur=con, plain_cols=plain_cols)
         self._resnapshot()
         _, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
         saved = round(100.0 * (before - after) / before, 1) if before else 0.0

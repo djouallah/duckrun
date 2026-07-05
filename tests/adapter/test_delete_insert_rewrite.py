@@ -20,7 +20,6 @@ except Exception:  # pragma: no cover - older layouts
 
 def _plugin():
     p = object.__new__(Plugin)
-    p._compaction_threshold = 100
     return p
 
 

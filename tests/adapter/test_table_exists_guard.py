@@ -91,7 +91,6 @@ def _fake_target_config(path, relation_name, cfg):
 def _store_plugin(con):
     p = Plugin.__new__(Plugin)
     p._storage_options = None
-    p._compaction_threshold = 100
     p._conn = con
     p._cursor_handle = con
     p._baseline_memory_limit = None

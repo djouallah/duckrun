@@ -845,6 +845,7 @@ class _DeltaDML:
             loc, where,
             read_version=engine.table_version(loc, self.so),
             storage_options=self.so,
+            cur=self.cursor,
         )
 
     def _update(self, m, rel, schema, loc) -> None:
@@ -894,6 +895,7 @@ class _DeltaDML:
             loc, updates, where,
             read_version=engine.table_version(loc, self.so),
             storage_options=self.so,
+            cur=self.cursor,
         )
 
     def _insert_select(self, m, rel, schema, loc) -> None:
@@ -946,7 +948,7 @@ class _DeltaDML:
             for col, typ in zip(target_cols, target_types)
         ]
         data = self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
-        engine.write_delta(loc, data, "append", storage_options=self.so)
+        engine.write_delta(loc, data, "append", storage_options=self.so, cur=self.cursor)
 
     def _reject_lossy_numeric_narrowing(self, inner: str, provided, ttype) -> None:
         """Fail loud when a supplied numeric value would be SILENTLY changed by the cast onto its
@@ -1066,6 +1068,7 @@ class _DeltaDML:
             # .merge(), which captures the version at call time.
             read_version=engine.table_version(loc, self.so),
             storage_options=self.so,
+            cur=self.cursor,
         )
 
     def _drop(self, m) -> bool:

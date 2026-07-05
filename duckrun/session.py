@@ -366,9 +366,8 @@ class DuckSession:
     """A session handle bound to one or more Delta lakehouse roots, each surfaced as a catalog."""
 
     def __init__(self, path: str, storage_options: Optional[Dict[str, str]],
-                 schema: Optional[str], compaction_threshold: int, read_only: bool = True,
+                 schema: Optional[str], read_only: bool = True,
                  name: Optional[str] = None):
-        self.compaction_threshold = compaction_threshold
         self.read_only = read_only
 
         self.con = duckdb.connect()
@@ -1423,7 +1422,7 @@ class DataFrameWriter:
                 read_version=engine.table_version(path, so),
                 partition_by=self._partition_by,
                 storage_options=so,
-                compaction_threshold=session.compaction_threshold,
+                cur=session.con,
             )
             return
 
@@ -1449,7 +1448,7 @@ class DataFrameWriter:
                     partition_by=self._partition_by,
                     merge_schema=self._merge_schema,
                     storage_options=so,
-                    compaction_threshold=session.compaction_threshold,
+                    cur=session.con,
                 )
             else:
                 engine.write_delta(
@@ -1459,7 +1458,7 @@ class DataFrameWriter:
                     partition_by=self._partition_by,
                     merge_schema=self._merge_schema,
                     storage_options=so,
-                    compaction_threshold=session.compaction_threshold,
+                    cur=session.con,
                 )
         elif mode == "overwrite_if_unchanged":
             # Optimistic FULL overwrite (the overwrite sibling of append_if_unchanged): pin + CAS so
@@ -1473,7 +1472,6 @@ class DataFrameWriter:
                     partition_by=self._partition_by,
                     overwrite_schema=self._overwrite_schema,
                     storage_options=so,
-                    compaction_threshold=session.compaction_threshold,
                 )
             else:
                 engine.write_delta(
@@ -1483,7 +1481,7 @@ class DataFrameWriter:
                     partition_by=self._partition_by,
                     overwrite_schema=self._overwrite_schema,
                     storage_options=so,
-                    compaction_threshold=session.compaction_threshold,
+                    cur=session.con,
                 )
         else:
             engine.write_delta(
@@ -1494,7 +1492,7 @@ class DataFrameWriter:
                 merge_schema=self._merge_schema,
                 overwrite_schema=self._overwrite_schema,
                 storage_options=so,
-                compaction_threshold=session.compaction_threshold,
+                cur=session.con,
             )
 
     def save(self, path: str) -> str:
@@ -1698,7 +1696,7 @@ class Catalog:
 
 
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
-            schema: Optional[str] = None, compaction_threshold: int = 100,
+            schema: Optional[str] = None,
             read_only: bool = True, name: Optional[str] = None) -> DuckSession:
     """Open a storage-neutral, DataFrame-style session over a Delta lakehouse.
 
@@ -1713,7 +1711,6 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
         storage_options: forwarded to delta-rs (and used to mint DuckDB secrets). For OneLake you
             can omit it inside a Fabric notebook — a token is acquired automatically.
         schema: restrict to a single schema. Omit to discover every schema folder.
-        compaction_threshold: file-count threshold for post-append/merge compaction.
         read_only: **default True** — the session refuses every Delta write (saveAsTable / insertInto
             / save / merge / insert / update / delete / replaceWhere) with a ``PermissionError``, so
             an accidental write can't mutate a shared lakehouse. Pass ``read_only=False`` to enable
@@ -1731,4 +1728,4 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
         >>> lh = duckrun.connect("…/<guid>/Tables", name="lakehouse")   # name a GUID-path catalog
     """
     check_runtime_versions()  # fail loud if Fabric's stale duckdb/deltalake are still loaded
-    return DuckSession(path, storage_options, schema, compaction_threshold, read_only, name)
+    return DuckSession(path, storage_options, schema, read_only, name)
