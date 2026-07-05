@@ -229,26 +229,26 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 ## duckrun connection API — method scorecard
 
 ```
-┌────────────────────────────┐
-│ ✅ 105 passed   ❌ 0 failed  │
-│ 105 methods · 100% passing │
-└────────────────────────────┘
+┌───────────────────────────┐
+│ ✅ 84 passed   ❌ 21 failed │
+│ 105 methods · 80% passing │
+└───────────────────────────┘
 ```
 
-### DataFrame API — 78/78 ✅
+### DataFrame API — 63/78 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
 | Surface | Methods | Pass |
 | --- | --- | :-: |
 | `DuckSession` | `sql`, `table`, `read`, `catalog` | 4/4 ✅ |
-| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns`, `refreshTable`, `createTable_ddl`, `createTable_from_struct`, `createTable_bad_schema`, `getTable`, `getDatabase`, `dropTempView`, `listCatalogs`, `currentCatalog`, `setCurrentCatalog` | 18/18 ✅ |
+| `Catalog` | `listTables`, `listDatabases`, `currentDatabase`, `setCurrentDatabase`, `tableExists`, `tableExists_is_fresh`, `databaseExists`, `listColumns`, `refreshTable`, `createTable_ddl`, `createTable_from_struct`, `createTable_bad_schema`, `getTable`, `getDatabase`, `dropTempView`, `listCatalogs`, `currentCatalog`, `setCurrentCatalog` | 17/18 ❌ (createTable_ddl) |
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow`, `first`, `head`, `take`, `isEmpty`, `schema`, `printSchema` | 12/12 ✅ |
-| `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `json`, `schema_csv_ddl`, `schema_ddl_with_comma_type`, `schema_json_struct`, `schema_rejected_for_delta`, `versionAsOf`, `timestampAsOf_rejected` | 11/11 ✅ |
-| `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `sort`, `orderBy_alias_and_desc`, `sort_then_partition_write`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 13/13 ✅ |
-| `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `table_optimize_auto_keys`, `table_optimize_user_keys`, `table_optimize_where_scopes_partitions`, `table_optimize_rejects_query_frame`, `table_optimize_rewrite_refuses_on_concurrent_commit`, `table_optimize_maintain_noop`, `table_optimize_maintain_compacts_small_files`, `table_optimize_analyze`, `get_rle_scan_count_is_constant`, `vacuum`, `restoreToVersion` | 20/20 ✅ |
+| `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `json`, `schema_csv_ddl`, `schema_ddl_with_comma_type`, `schema_json_struct`, `schema_rejected_for_delta`, `versionAsOf`, `timestampAsOf_rejected` | 10/11 ❌ (versionAsOf) |
+| `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `sort`, `orderBy_alias_and_desc`, `sort_then_partition_write`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 9/13 ❌ (mode, option, insertInto, save_modes) |
+| `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `table_optimize_auto_keys`, `table_optimize_user_keys`, `table_optimize_where_scopes_partitions`, `table_optimize_rejects_query_frame`, `table_optimize_rewrite_refuses_on_concurrent_commit`, `table_optimize_maintain_noop`, `table_optimize_maintain_compacts_small_files`, `table_optimize_analyze`, `get_rle_scan_count_is_constant`, `vacuum`, `restoreToVersion` | 11/20 ❌ (merge, history, delete, update, optimize, table_optimize_where_scopes_partitions, table_optimize_rewrite_refuses_on_concurrent_commit, table_optimize_maintain_compacts_small_files, restoreToVersion) |
 
-### duckrun-specific helpers — 27/27 ✅
+### duckrun-specific helpers — 21/27 ✅
 
 > Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).
 
@@ -270,16 +270,16 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `SELECT (passthrough)` | `sql()` | ✅ |
 | `version-pinned read` | `sql()` | ✅ |
 | `create table as` | `sql()` | ✅ |
-| `insert…select` | `sql()` | ✅ |
-| `insert…values` | `sql()` | ✅ |
-| `update` | `sql()` | ✅ |
-| `delete` | `sql()` | ✅ |
-| `sql_update_where_inside_set_literal` | `sql()` | ✅ |
+| `insert…select` | `sql()` | ❌ |
+| `insert…values` | `sql()` | ❌ |
+| `update` | `sql()` | ❌ |
+| `delete` | `sql()` | ❌ |
+| `sql_update_where_inside_set_literal` | `sql()` | ❌ |
 | `sql_update_subquery_predicate` | `sql()` | ✅ |
 | `sql_delete_subquery_predicate` | `sql()` | ✅ |
 | `alter add column` | `sql()` | ✅ |
 | `sql_alter_add_column_not_null` | `sql()` | ✅ |
 | `drop (tombstone)` | `sql()` | ✅ |
-| `merge` | `sql()` | ✅ |
+| `merge` | `sql()` | ❌ |
 
 <!-- CONNECTION_API:END -->
