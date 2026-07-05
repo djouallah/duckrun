@@ -108,14 +108,10 @@ rewrite, not predicted: the picker optimizes a model of the size; only the disk 
 
 ## Pick your columns yourself
 
-My personal test for AGI is simple: the day an AI can look at a table and find a genuinely good sort
-order in minimal time, I'll accept that it has arrived. We are not there yet. Finding the optimal
-order is NP-hard, and every heuristic — this one included — is a fast approximation. It optimizes the
-one thing it can measure, bytes at rest, and it has never seen a single one of your queries.
+To be honest, I know the implementation is naïve and will probably give worse results than, perhaps,
+the natural order of a table — but I find it interesting, because it is not an exact science. It is a
+heuristic, and you will get better or worse results depending on your data's cardinality.
 
-You have. You know that every dashboard filters `region` then `date`, that nobody has touched
-`customer_id` since 2023, and that finance only ever asks for last month. That knowledge is what
-actually decides a good layout, and it lives in your head, not in the Delta log. So `optimize(rewrite=True)`
-is a reasonable default when you genuinely have no idea, but when you do know the workload — and you
-usually do — you will get a better result by naming the columns yourself: `optimize("region", "order_date")`.
-Until the profiler can match what you already know, that is the better choice.
+Having said that — and I am not even joking — it is my personal test for AGI: the day an AI can give
+me a good-enough algorithm that returns an optimal sort order (not a row reordering, that is too much
+work) in minimal time, I'll know we have AGI 😊. It is not there yet.
