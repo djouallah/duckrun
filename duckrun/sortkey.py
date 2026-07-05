@@ -39,7 +39,7 @@ _SKEW_EXACT_NDV = 100_000
 # plumbing — sample sizing, the explicit exact flag, seeding, returning lines instead of printing —
 # does NOT bump it. Appended to the recommendation header so a recommendation is attributable to the
 # model that produced it, making future threshold churn traceable.
-MODEL_VERSION = "1"
+MODEL_VERSION = "2"
 
 # Sample-sizing knobs — NOT the recommendation byte model. A byte budget divided by an estimated
 # in-memory row width gives a width-aware row count: a wide table samples fewer rows, a narrow one
@@ -239,19 +239,31 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                   if stats and c in stats and stats[c]["null_frac"] > null_excl}
     # R8: partition columns are excluded as candidates — they lead the ORDER BY (below) but carry no
     # RLE value once Delta strips them from the files; a measure / constant / null-heavy column is out.
+    # S2 — near-constant guard: ndv > 1 is not enough. A column with ndv=3 where one value holds
+    # 99% of rows (a refresh watermark, a status flag) is a constant for sorting purposes —
+    # effective cardinality 1/Σp² ≈ 1. Sorting it clusters nothing and steals a key slot from a
+    # real dimension (Simpson index is already in simpson[c], populated in step 2 above).
     def _elig(c):
-        return (ndv[c] > 1 and not _is_measure(types[c]) and not _is_interval(types[c])
+        eff = (1.0 / simpson[c]) if simpson.get(c) else float(ndv[c])
+        return (ndv[c] > 1 and eff >= 1.5
+                and not _is_measure(types[c]) and not _is_interval(types[c])
                 and c not in partition_cols and c not in null_heavy)
     # R6: ONE non-(near-)unique temporal leads the key — on a fact table, leading with the date keeps
     # natural clustering and incremental framing. Only the single coarsest date gets the tier-0 thumb
-    # (the lowest-ndv temporal, ties by schema order); the OTHER dates fall back to plain ascending
-    # cardinality, so the low-card dimensions queries actually filter on aren't stranded behind them.
-    # A temporal too fine to survive the grain stop (a raw microsecond timestamp is ~unique — real
-    # NYC-taxi tpep_pickup_datetime is ndv≈0.7·n) is NOT lead-eligible: promoting it would grain-stop
-    # the very first pick and leave an EMPTY key, when the low-card dimensions are the real key.
+    # (DATE-typed first, then lowest ndv, ties by schema order); the OTHER dates fall back to plain
+    # ascending cardinality, so the low-card dimensions queries actually filter on aren't stranded
+    # behind them. A temporal too fine to survive the grain stop (a raw microsecond timestamp is
+    # ~unique — real NYC-taxi tpep_pickup_datetime is ndv≈0.7·n) is NOT lead-eligible: promoting it
+    # would grain-stop the very first pick and leave an EMPTY key, when the low-card dims are the key.
     temporals = [c for c in cols if _elig(c) and _is_temporal(types[c])
                  and not (n and ndv[c] >= grain_frac * n)]
-    lead_temporal = min(temporals, key=lambda c: (ndv[c], cols.index(c))) if temporals else None
+    # DATE-typed columns outrank TIMESTAMP-typed for the tier-0 lead: the business calendar is a DATE;
+    # a low-ndv TIMESTAMP is almost always an audit/watermark column, and "lowest ndv" alone lets it
+    # hijack the lead (observed: a 3-value refresh watermark beat a 3000-value date, shredding date
+    # clustering). Tier by type, then ndv, then schema order.
+    lead_temporal = min(temporals, key=lambda c: (
+        0 if types[c].upper().startswith("DATE") else 1,
+        ndv[c], cols.index(c))) if temporals else None
     candidates = sorted(
         (c for c in cols if _elig(c)),
         key=lambda c: (0 if c == lead_temporal else 1, ndv[c]))

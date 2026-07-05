@@ -104,6 +104,24 @@ def test_raw_timestamp_demoted():
     assert recs["flag"]["in_sort_key"] and recs["vendor"]["in_sort_key"] and recs["kind"]["in_sort_key"]
 
 
+# ── 5b. Watermark TIMESTAMP (S2 + R6): a near-constant audit ts never leads or joins the key. ───
+def test_watermark_timestamp_never_leads_or_joins_key():
+    con = duckdb.connect()
+    # cutoff: 3 values, 99% of mass on one → effective cardinality ≈ 1, a constant for sorting.
+    # It is the lowest-ndv temporal, so pre-fix it stole the tier-0 lead from the ndv≈300 business
+    # date (unpatched this profiles to ``ORDER BY cutoff, time`` with date shredded out — the exact
+    # production failure): S2's near-constant guard keeps it out, R6 tiers the DATE ahead of it.
+    recs, _ = _profile(con,
+        "select (date '2018-01-01' + (i % 300)::int)::date as date, (i % 288) * 5 as time, "
+        "'DUID_' || (i % 470) as duid, (random() * 1000)::double as mw, "
+        "case when i % 1000 < 990 then timestamp '2026-07-05 08:05:00' "
+        "     when i % 1000 < 995 then timestamp '2026-07-05 18:00:00' "
+        "     else                    timestamp '2026-07-05 19:30:00' end as cutoff "
+        "from range(6000) t(i)")
+    assert not recs["cutoff"]["in_sort_key"]            # near-constant watermark stays out
+    assert recs["date"]["sort_position"] == 1           # DATE leads, not the low-ndv TIMESTAMP
+
+
 # ── 6. Grain stop: the key stops once the prefix reaches grain_frac·n; nothing finer admitted. ──
 def test_grain_stop():
     con = duckdb.connect()
