@@ -106,16 +106,16 @@ or one already organized by a unique key has no runs to make, and the rewrite fa
 compaction. That's also why the `savedPct` you get back is **measured from the Delta log** after the
 rewrite, not predicted: the picker optimizes a model of the size; only the disk knows the truth.
 
-## Or just pick your own keys
+## Pick your columns yourself
 
-Here's the part the profiler will never admit: it has never seen a single one of your queries. It
-squints at cardinalities and skew and *guesses* what you care about, then optimizes the one thing it
-can measure — bytes at rest. You, meanwhile, happen to know that every dashboard filters `region`
-then `date`, that nobody has touched `customer_id` since 2023, and that finance only ever asks for
-last month. That's the information that actually decides a good layout, and it lives in your head,
-not in the Delta log.
+My personal test for AGI is simple: the day an AI can look at a table and find a genuinely good sort
+order in minimal time, I'll accept that it has arrived. We are not there yet. Finding the optimal
+order is NP-hard, and every heuristic — this one included — is a fast approximation. It optimizes the
+one thing it can measure, bytes at rest, and it has never seen a single one of your queries.
 
-So sure — run `optimize(rewrite=True)` when you genuinely have no idea. It's a fine default for
-"surprise me." But if you *do* know the workload — and you usually do — just tell it:
-`optimize("region", "order_date")`. The machine spent all that theory solving the puzzle it could
-see. You're the only one holding the puzzle that matters.
+You have. You know that every dashboard filters `region` then `date`, that nobody has touched
+`customer_id` since 2023, and that finance only ever asks for last month. That knowledge is what
+actually decides a good layout, and it lives in your head, not in the Delta log. So `optimize(rewrite=True)`
+is a reasonable default when you genuinely have no idea, but when you do know the workload — and you
+usually do — you will get a better result by naming the columns yourself: `optimize("region", "order_date")`.
+Until the profiler can match what you already know, that is the better choice.
