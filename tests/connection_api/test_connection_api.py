@@ -561,9 +561,6 @@ class TestDeltaTable:
         self._seed(conn)
         assert DeltaTable.forName(conn, "dbo.m").path.endswith("dbo/m")
 
-    def test_forPath(self, conn):
-        assert DeltaTable.forPath(conn, conn._table_path("dbo", "src")).path.endswith("dbo/src")
-
     def test_convertToDelta(self, conn):
         path = _stage_parquet(conn, "dbo/conv")            # out-of-band parquet under the catalog root
         DeltaTable.convertToDelta(conn, f"parquet.`{path}`")  # zero-copy: writes a _delta_log over it
@@ -1507,17 +1504,14 @@ def test_catalog_database_and_column_introspection(wh):
     assert conn.sql("select n from orders").fetchone()[0] == 7   # unqualified resolves to sales
 
 
-def test_delta_table_for_path_and_version(wh):
+def test_delta_table_version(wh):
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
     conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("ver")
-    path = conn._table_path("dbo", "ver")
-
-    by_name = DeltaTable.forName(conn, "dbo.ver")
-    by_path = DeltaTable.forPath(conn, path)
-    assert by_path.version() == by_name.version() == 0
+    # version() reads the same through the DeltaTable handle and the conn.table() parity path
+    assert DeltaTable.forName(conn, "dbo.ver").version() == conn.table("ver").version() == 0
 
     conn.sql("select 2 id, 'b' v").write.mode("append").saveAsTable("ver")
-    assert DeltaTable.forPath(conn, path).version() == 1   # a new commit bumps the version
+    assert conn.table("ver").version() == 1   # a new commit bumps the version
 
 
 # ── createDataFrame: every input/schema form ──────────────────────────────────────────────────────

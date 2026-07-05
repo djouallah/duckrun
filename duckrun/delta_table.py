@@ -156,15 +156,15 @@ def _warn_if_lead_unclustered(con, files, lead_col):
 
 
 class DeltaTable:
-    """A handle to a Delta table for merging. Build with :meth:`forName` or :meth:`forPath`."""
+    """A handle to a Delta table for merging. Build with :meth:`forName`."""
 
     def __init__(self, session, path: str, schema: Optional[str] = None,
                  table: Optional[str] = None, catalog: Optional[str] = None,
                  storage_options=None):
         self._session = session
         self.path = path
-        # forName resolves the target catalog's storage_options; forPath / forName-in-current-catalog
-        # fall back to the current catalog's (the session.storage_options property).
+        # forName resolves the target catalog's storage_options; a bare construction (e.g. convertToDelta,
+        # forName in the current catalog) falls back to the current catalog's (session.storage_options).
         self.storage_options = storage_options if storage_options is not None else session.storage_options
         self._schema = schema
         self._table = table
@@ -187,10 +187,6 @@ class DeltaTable:
                    catalog, session._catalog_storage_options(catalog))
 
     @classmethod
-    def forPath(cls, session, path: str) -> "DeltaTable":
-        return cls(session, path)
-
-    @classmethod
     def convertToDelta(cls, session, identifier: str, partitionSchema=None) -> "DeltaTable":
         """Convert an existing parquet directory to Delta IN PLACE and return a handle to it
         (delta-spark ``DeltaTable.convertToDelta``). The conversion is **zero-copy** — a
@@ -207,13 +203,13 @@ class DeltaTable:
         path = _parse_parquet_identifier(identifier).replace("\\", "/").rstrip("/")
         session._require_writable("convert parquet to Delta")
         engine.convert_to_delta(path, session.storage_options, partition_by=partitionSchema)
-        return cls.forPath(session, path)
+        return cls(session, path)
 
     def merge(self, source, condition: str, streamed_exec: bool = False) -> DeltaMergeBuilder:
         """Begin a DataFrame-style merge of ``source`` into this table on ``condition``.
 
         The merge is snapshot-pinned to the version captured when this handle was taken
-        (``forName``/``forPath``): the commit validates OCC against it, so a concurrent writer that
+        (``forName``): the commit validates OCC against it, so a concurrent writer that
         landed since then fails the commit loudly instead of silently interleaving (single-snapshot
         MERGE). Nothing for the caller to pass.
 
@@ -343,7 +339,7 @@ class DeltaTable:
         commit is snapshot-fenced to the version the scan read (full table → ``overwrite_if_unchanged``,
         scoped → ``replaceWhere``), so a concurrent write fails it loudly rather than being clobbered."""
         if self._table is None:
-            raise ValueError("optimize() needs a catalog table — use conn.table(name)/forName, not forPath.")
+            raise ValueError("optimize() needs a catalog table — use conn.table(name).")
         try:
             pcols = list(engine._delta_table(self.path, self.storage_options)
                          .metadata().partition_columns or [])
@@ -407,7 +403,7 @@ class DeltaTable:
         self._refresh_view()
 
     def _refresh_view(self):
-        # Only a forName() table maps to a registered view; forPath() has no name to refresh.
+        # Only a named table maps to a registered view; a bare path handle has no name to refresh.
         if self._schema is not None and self._table is not None:
             catalog = self._catalog or self._session._current_catalog
             self._session._register_view(catalog, self._schema, self._table)

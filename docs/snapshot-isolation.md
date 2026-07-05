@@ -66,7 +66,7 @@ dt = DeltaTable.forName(conn, "orders")   # captures version V here
 dt.delete("status = 'cancelled'")          # pinned to V; fails loud if orders moved since V
 ```
 
-- `forName` / `forPath` capture the version **once**, when the handle is taken.
+- `conn.table(name)` / `DeltaTable.forName` capture the version **once**, when the handle is taken.
 - `merge` / `delete` / `update` through that handle all pin to that captured `V`.
 - After a *successful* mutation the handle **re-snapshots** to the new HEAD, so a second mutation on
   the same handle only fails on a *foreign* write, never on its own previous write.
@@ -104,7 +104,7 @@ for (it carries `V` explicitly).
 
 ## vs Spark + Delta
 
-duckrun deliberately mirrors the Delta-on-Spark surface — `DeltaTable.forName`/`forPath`,
+duckrun deliberately mirrors the Delta-on-Spark surface — `DeltaTable.forName`,
 `.merge(...).whenMatched*/whenNotMatched*`, `delete`, `update`, `SaveMode` append/overwrite,
 `replaceWhere` — and runs on the same OCC model (delta-rs is the Rust port of Delta's commit
 protocol), so semantics carry over: append is non-conflicting, delete/update/merge are
