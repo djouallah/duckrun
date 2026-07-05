@@ -128,6 +128,33 @@ class DeltaMergeBuilder:
         self._table._refresh_view()
 
 
+def _warn_if_lead_unclustered(con, files, lead_col):
+    """Warn (do NOT raise) if every row group of the leading sort key spans the full column min/max —
+    the sort was a pruning no-op. Called AFTER the commit has already landed, so a raise here would
+    make a completed rewrite look failed; a loud advisory line is the right severity. Catches the whole
+    class of degenerate key selections (a watermark hijacking the lead was the first; there will be
+    others) that today are only found by pulling metadata by hand. Skips the cases that trivially look
+    full-span without being a real failure: no row groups (a partition / absent column), a single row
+    group, or a constant column."""
+    lit = "[" + ", ".join("'" + f.replace("'", "''") + "'" for f in files) + "]"
+    total, degenerate, full_span = con.sql(f"""
+        WITH m AS (
+            SELECT stats_min_value, stats_max_value
+            FROM parquet_metadata({lit})
+            WHERE path_in_schema = '{lead_col.replace("'", "''")}'
+              AND stats_min_value IS NOT NULL
+        )
+        SELECT count(*),
+               min(stats_min_value) = max(stats_max_value),              -- constant column (global min = max)
+               count(*) FILTER (
+                   stats_min_value = (SELECT min(stats_min_value) FROM m)
+                   AND stats_max_value = (SELECT max(stats_max_value) FROM m))
+        FROM m""").fetchone()
+    if total and total > 1 and not degenerate and full_span == total:
+        print(f"⚠️  sort produced no clustering on lead key '{lead_col}' — "
+              f"all {total} row groups span the full column range")
+
+
 class DeltaTable:
     """A handle to a Delta table for merging. Build with :meth:`forName` or :meth:`forPath`."""
 
@@ -246,6 +273,17 @@ class DeltaTable:
                              enforce_retention_duration=enforce_retention_duration,
                              storage_options=self.storage_options)
 
+    def optimize(self, target_size: Optional[int] = None) -> Dict:
+        """Compact small files into larger ones (delta-spark ``DeltaTable.optimize``), returning the
+        operation metrics — a plain bin-packing compaction. There is no z-order: bit-interleaving
+        destroys the run-length runs a columnar reader relies on. The profiled sort rewrite (physically
+        reorder by a run-length-friendly key) is a separate op — ``conn.table(name).optimize(...)``."""
+        self._session._require_writable("optimize", self._catalog)
+        metrics = engine.optimize(self.path, target_size=target_size,
+                                  storage_options=self.storage_options)
+        self._refresh_view()
+        return metrics
+
     def _maintain(self) -> Dict:
         """Tier-0 'safe button' (bare ``conn.table(name).optimize()``): a compaction policy plus a
         vacuum, and **never a data rewrite**. Reads the Delta log; if the small-file debt clears the
@@ -348,7 +386,13 @@ class DeltaTable:
                                  partition_by=(pcols or None), storage_options=self.storage_options,
                                  cur=con, plain_cols=plain_cols)
         self._resnapshot()
-        _, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
+        files, after, _ = engine.delta_file_summary(con, self.path, self.storage_options)
+        # Post-commit clustering check: the first NON-partition sort key is the one that lives in the
+        # files (partition columns never appear in path_in_schema). Warns loudly if the sort clustered
+        # nothing — the guardrail that would have caught the watermark incident.
+        lead = next((c for c in order_cols if c not in pcols), None)
+        if lead:
+            _warn_if_lead_unclustered(con, files, lead)
         saved = round(100.0 * (before - after) / before, 1) if before else 0.0
         return {"operation": "sortRewrite", "sortedBy": order_cols,
                 "sizeBytesBefore": before, "sizeBytesAfter": after, "savedPct": saved,

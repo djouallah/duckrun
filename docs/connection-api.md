@@ -210,9 +210,15 @@ key is picked automatically by profiling the table — a heuristic, not an optim
 optimal choice is an NP-hard problem — see [Automatic sort](automatic-sort.md). Every write (this
 one included) lands in [the parquet layout](parquet-layout.md).
 
-Plain bin-packing compaction is the bare `conn.table(name).optimize()` above — there is no separate
-`DeltaTable.optimize()`, and no z-order (bit-interleaving destroys the run-length runs a columnar
-reader relies on; use a lexicographic key instead).
+**`DeltaTable.forName(conn, name).optimize()`** — the plain delta-rs `OPTIMIZE` (bin-packing
+compaction):
+
+```python
+DeltaTable.forName(conn, "sales").optimize()   # bin-packing compaction
+```
+
+There is no z-order (bit-interleaving destroys the run-length runs a columnar reader relies on; use a
+lexicographic key via `conn.table(name).optimize(...)` instead).
 
 Names resolve like everywhere else — bare = current schema, `schema.table` or
 `catalog.schema.table` to be explicit.

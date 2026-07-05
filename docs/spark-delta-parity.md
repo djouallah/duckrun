@@ -156,7 +156,7 @@ loudly (`CommitFailedError`) rather than silently interleaving.
 | `df.write.option("replaceWhere", …)` / `INSERT OVERWRITE` | `df.write.option("replaceWhere", pred).mode("overwrite").save()` / `.saveAsTable()` | ✅ | Single atomic commit; snapshot-fenced. |
 | `.history()` | `.history(limit=None)` | ✅ | delta-rs commit history (newest-first list of dicts: `version`, `timestamp`, `operation`, …). |
 | `.vacuum()` | `.vacuum(retention_hours=None, dry_run=False, …)` | ✅ | delta-rs `vacuum`; **deletes by default** (Spark-like), `dry_run=True` only lists. Returns the removed paths. |
-| `.optimize()` | — | 🚫 | No `DeltaTable.optimize` — compaction/sort is the tiered `conn.table(name).optimize(...)`. Z-order is removed (bit-interleaving breaks the RLE runs a columnar reader wants). |
+| `.optimize()` | `.optimize(target_size=None)` | ✅ | delta-rs `optimize.compact` (bin-packing). No z-order — bit-interleaving breaks the RLE runs a columnar reader wants; use a lexicographic key via `conn.table(name).optimize(...)`. |
 | `.restoreToVersion()` | `.restoreToVersion(version)` | ✅ | delta-rs `restore`; commits a new version, so the restore is itself revertible. |
 | `.generate()` | — | ➖ | TODO (delta-rs gap — no symlink-format-manifest generation). |
 | `.clone()` | — | ➖ | TODO (delta-rs gap). |

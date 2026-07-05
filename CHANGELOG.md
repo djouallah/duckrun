@@ -26,9 +26,9 @@ All notable changes to this project will be documented in this file.
   from the signature; passing them now raises `TypeError`.
 - **`DataFrameWriter.insertInto`** — removed. It was `df.write.mode("append").saveAsTable(name)` (or
   `mode("overwrite")` to replace all rows); use that directly. No shim.
-- **`DeltaTable.forName(conn, name).optimize(...)`** and its **z-order** path — removed. The only
-  optimize surface is the tiered `conn.table(name).optimize(...)`; z-order is gone entirely because
-  bit-interleaving destroys the run-length runs a columnar reader relies on.
+- **Z-order** — removed. `DeltaTable.optimize()` and the internal `engine.optimize` drop their
+  `zorder_by` parameter (`optimize()` stays as a plain bin-packing compaction); z-order is gone
+  entirely because bit-interleaving destroys the run-length runs a columnar reader relies on.
 
 ## [0.3.36] - 2026-07-05
 
