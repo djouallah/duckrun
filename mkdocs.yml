@@ -105,6 +105,8 @@ nav:
   - Home: index.md
   - Getting started: getting-started.md
   - dbt: dbt-adapter.md
+  - Notebook:
+      - Connection API: connection-api.md
   - Examples:
       - examples.md
       - dbt projects:
@@ -124,7 +126,6 @@ nav:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
   - Advanced:
-      - Connection API: connection-api.md
       - Supported API: api-reference.md
       - Spark / Delta coverage: spark-delta-parity.md
       - How it works:
