@@ -2,83 +2,83 @@
 # Introspected from the code; DO NOT hand-edit. Regenerate intentionally with:
 #     python tests/tools/public_api.py --write
 # A diff here means a public API was added or removed — a removal is a breaking change.
-Catalog.createTable
-Catalog.currentCatalog
-Catalog.currentDatabase
-Catalog.databaseExists
-Catalog.dropTempView
-Catalog.getDatabase
-Catalog.getTable
-Catalog.listCatalogs
-Catalog.listColumns
-Catalog.listDatabases
-Catalog.listTables
-Catalog.refreshTable
-Catalog.setCurrentCatalog
-Catalog.setCurrentDatabase
-Catalog.tableExists
-DataFrame.collect
-DataFrame.count
-DataFrame.createOrReplaceTempView
-DataFrame.first
-DataFrame.head
-DataFrame.isEmpty
-DataFrame.optimize
-DataFrame.orderBy
-DataFrame.printSchema
-DataFrame.schema
-DataFrame.show
-DataFrame.sort
-DataFrame.take
-DataFrame.toArrow
-DataFrame.toPandas
-DataFrame.write
-DataFrameReader.csv
-DataFrameReader.format
-DataFrameReader.json
-DataFrameReader.load
-DataFrameReader.option
-DataFrameReader.parquet
-DataFrameReader.schema
-DataFrameReader.table
-DataFrameWriter.format
-DataFrameWriter.mode
-DataFrameWriter.option
-DataFrameWriter.partitionBy
-DataFrameWriter.save
-DataFrameWriter.saveAsTable
-DeltaMergeBuilder.execute
-DeltaMergeBuilder.whenMatchedDelete
-DeltaMergeBuilder.whenMatchedUpdate
-DeltaMergeBuilder.whenMatchedUpdateAll
-DeltaMergeBuilder.whenNotMatchedBySourceDelete
-DeltaMergeBuilder.whenNotMatchedBySourceUpdate
-DeltaMergeBuilder.whenNotMatchedInsert
-DeltaMergeBuilder.whenNotMatchedInsertAll
-DeltaTable.convertToDelta
-DeltaTable.delete
-DeltaTable.forName
-DeltaTable.forPath
-DeltaTable.history
-DeltaTable.merge
-DeltaTable.optimize
-DeltaTable.restoreToVersion
-DeltaTable.update
-DeltaTable.vacuum
-DeltaTable.version
-DuckSession.attach
-DuckSession.catalog
-DuckSession.copy
-DuckSession.createDataFrame
-DuckSession.download
-DuckSession.get_stats
-DuckSession.list_files
-DuckSession.read
-DuckSession.refresh
-DuckSession.sql
-DuckSession.stop
-DuckSession.table
-duckrun.DataFrame
-duckrun.DeltaTable
-duckrun.DuckSession
-duckrun.connect
+Catalog.createTable(tableName, schema)
+Catalog.currentCatalog()
+Catalog.currentDatabase()
+Catalog.databaseExists(dbName)
+Catalog.dropTempView(viewName)
+Catalog.getDatabase(dbName)
+Catalog.getTable(tableName, dbName=None)
+Catalog.listCatalogs()
+Catalog.listColumns(tableName, dbName=None)
+Catalog.listDatabases()
+Catalog.listTables(dbName=None)
+Catalog.refreshTable(tableName)
+Catalog.setCurrentCatalog(catalogName)
+Catalog.setCurrentDatabase(dbName)
+Catalog.tableExists(tableName, dbName=None)
+DataFrame.collect()
+DataFrame.count()
+DataFrame.createOrReplaceTempView(name)
+DataFrame.first()
+DataFrame.head(n=None)
+DataFrame.isEmpty()
+DataFrame.optimize(*keys, rewrite=False, where=None, analyze=False, seed=None)
+DataFrame.orderBy(*cols, ascending=None, seed=None)
+DataFrame.printSchema()
+DataFrame.schema (property)
+DataFrame.show(*a, **k)
+DataFrame.sort(*cols, ascending=None, seed=None)
+DataFrame.take(n)
+DataFrame.toArrow()
+DataFrame.toPandas()
+DataFrame.write (property)
+DataFrameReader.csv(path)
+DataFrameReader.format(fmt)
+DataFrameReader.json(path)
+DataFrameReader.load(path)
+DataFrameReader.option(key, value)
+DataFrameReader.parquet(path)
+DataFrameReader.schema(schema)
+DataFrameReader.table(name)
+DataFrameWriter.format(fmt)
+DataFrameWriter.mode(mode)
+DataFrameWriter.option(key, value)
+DataFrameWriter.partitionBy(*cols)
+DataFrameWriter.save(path)
+DataFrameWriter.saveAsTable(name)
+DeltaMergeBuilder.execute()
+DeltaMergeBuilder.whenMatchedDelete(condition=None)
+DeltaMergeBuilder.whenMatchedUpdate(condition=None, set=None)
+DeltaMergeBuilder.whenMatchedUpdateAll(condition=None)
+DeltaMergeBuilder.whenNotMatchedBySourceDelete(condition=None)
+DeltaMergeBuilder.whenNotMatchedBySourceUpdate(condition=None, set=None)
+DeltaMergeBuilder.whenNotMatchedInsert(condition=None, values=None)
+DeltaMergeBuilder.whenNotMatchedInsertAll(condition=None)
+DeltaTable.convertToDelta(session, identifier, partitionSchema=None)
+DeltaTable.delete(predicate=None)
+DeltaTable.forName(session, name)
+DeltaTable.forPath(session, path)
+DeltaTable.history(limit=None)
+DeltaTable.merge(source, condition, streamed_exec=False)
+DeltaTable.optimize(target_size=None)
+DeltaTable.restoreToVersion(version)
+DeltaTable.update(condition=None, set=None)
+DeltaTable.vacuum(retention_hours=None, dry_run=False, enforce_retention_duration=True)
+DeltaTable.version()
+DuckSession.attach(path, name=None, storage_options=None, schema=None, read_only=None)
+DuckSession.catalog (accessor)
+DuckSession.copy(local_folder, remote_folder, file_extensions=None, overwrite=False)
+DuckSession.createDataFrame(data, schema=None)
+DuckSession.download(remote_folder='', local_folder='./downloaded_files', file_extensions=None, overwrite=False)
+DuckSession.get_stats(source=None, detailed=False)
+DuckSession.list_files(remote_folder='', file_extensions=None)
+DuckSession.read (property)
+DuckSession.refresh(quiet=False, catalog=None)
+DuckSession.sql(query)
+DuckSession.stop()
+DuckSession.table(name)
+duckrun.DataFrame (class)
+duckrun.DeltaTable (class)
+duckrun.DuckSession (class)
+duckrun.connect(path, storage_options=None, schema=None, read_only=True, name=None)

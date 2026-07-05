@@ -48,6 +48,28 @@ BASELINE = os.path.join(os.path.dirname(__file__), os.pardir,
                         "connection_api", "public_api_baseline.txt")
 
 
+def _signature(func):
+    """A method's parameter contract as a normalized string — param names, order, defaults, and
+    ``*args`` / ``**kwargs``, with ``self`` / ``cls`` and type annotations stripped (so a pure
+    type-hint edit doesn't trip the gate, but adding / removing / renaming a parameter, or flipping
+    it required↔optional, does)."""
+    s = inspect.signature(func)
+    ps = [p.replace(annotation=inspect.Parameter.empty)
+          for n, p in s.parameters.items() if n not in ("self", "cls")]
+    return str(s.replace(parameters=ps, return_annotation=inspect.Signature.empty))
+
+
+def _member_entry(cls, name):
+    """`name(sig)` for a method, `name (property)` / `name (accessor)` for a non-callable accessor."""
+    if isinstance(inspect.getattr_static(cls, name, None), property):
+        return f"{name} (property)"
+    try:
+        attr = getattr(cls, name)
+    except AttributeError:                       # instance attribute (e.g. self.catalog) — an accessor
+        return f"{name} (accessor)"
+    return f"{name}{_signature(attr)}" if callable(attr) else f"{name} (attr)"
+
+
 def _members(cls, extra):
     names = {n for n, _ in inspect.getmembers(cls) if not n.startswith("_")}
     names.update(extra)
@@ -56,12 +78,18 @@ def _members(cls, extra):
 
 def public_api():
     """The canonical, sorted contract: top-level exports (``duckrun.<name>``) + every surface's
-    public members (``Surface.member``)."""
-    entries = [f"duckrun.{n}" for n in duckrun.__all__ if not n.startswith("_")]
+    public members, each **with its parameter signature** (``Surface.member(params)``)."""
+    entries = []
+    for n in duckrun.__all__:
+        if n.startswith("_"):
+            continue
+        obj = getattr(duckrun, n)
+        entries.append(f"duckrun.{n}{_signature(obj)}" if inspect.isfunction(obj)
+                       else f"duckrun.{n} (class)")
     for surface, cls, extra in SURFACES:
         for m in _members(cls, extra):
             if (surface, m) not in EXCLUDE:
-                entries.append(f"{surface}.{m}")
+                entries.append(f"{surface}.{_member_entry(cls, m)}")
     return sorted(entries)
 
 
@@ -81,12 +109,21 @@ def write_baseline():
     return api
 
 
+def _key(entry):
+    """The method identity — the ``Surface.member`` part, dropping the ``(signature)`` / marker."""
+    return entry.split("(", 1)[0].rstrip()
+
+
 def diff():
-    """(removed, added) — baseline entries gone from the live surface, and live entries not yet in
-    the baseline. `removed` is the breaking one."""
-    current = set(public_api())
-    base = set(read_baseline())
-    return sorted(base - current), sorted(current - base)
+    """(removed, added, changed): methods gone from the surface, brand-new methods, and methods whose
+    parameter signature changed. `removed` is a method deletion; `changed` is a param add/remove/
+    rename or a required↔optional flip — both are breaking; `added` is additive."""
+    cur = {_key(e): e for e in public_api()}
+    base = {_key(e): e for e in read_baseline()}
+    removed = sorted(k for k in base if k not in cur)
+    added = sorted(k for k in cur if k not in base)
+    changed = sorted(f"{base[k]}  ->  {cur[k]}" for k in cur if k in base and cur[k] != base[k])
+    return removed, added, changed
 
 
 def main(argv):
@@ -95,13 +132,16 @@ def main(argv):
         print(f"wrote {len(api)} entries to {os.path.relpath(BASELINE)}")
         return 0
     if "--check" in argv:
-        removed, added = diff()
-        if not removed and not added:
+        removed, added, changed = diff()
+        if not removed and not added and not changed:
             print(f"public API matches baseline ({len(read_baseline())} entries)")
             return 0
         if removed:
             print("BREAKING — public API removed (regenerate the baseline only if intentional):")
             print("\n".join(f"  - {e}" for e in removed))
+        if changed:
+            print("BREAKING — parameter signature changed (regenerate the baseline if intentional):")
+            print("\n".join(f"  ~ {e}" for e in changed))
         if added:
             print("public API added (regenerate the baseline to record it):")
             print("\n".join(f"  + {e}" for e in added))

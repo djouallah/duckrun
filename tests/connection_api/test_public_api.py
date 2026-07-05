@@ -16,17 +16,11 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), os.pardir, "tools"))
 import public_api  # noqa: E402
 
 
+_HINT = "\n\nIf intentional, regenerate the baseline:\n    python tests/tools/public_api.py --write"
+
+
 def test_public_api_matches_baseline():
-    removed, added = public_api.diff()
-    assert not removed, (
-        "BREAKING — public API removed since the baseline:\n  "
-        + "\n  ".join(removed)
-        + "\n\nIf this removal is intentional, regenerate the baseline:\n"
-        "    python tests/tools/public_api.py --write"
-    )
-    assert not added, (
-        "public API added since the baseline:\n  "
-        + "\n  ".join(added)
-        + "\n\nRecord it by regenerating the baseline:\n"
-        "    python tests/tools/public_api.py --write"
-    )
+    removed, added, changed = public_api.diff()
+    assert not removed, "BREAKING — public API removed since the baseline:\n  " + "\n  ".join(removed) + _HINT
+    assert not changed, "BREAKING — parameter signature changed since the baseline:\n  " + "\n  ".join(changed) + _HINT
+    assert not added, "public API added since the baseline:\n  " + "\n  ".join(added) + _HINT
