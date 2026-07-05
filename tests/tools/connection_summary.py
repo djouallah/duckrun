@@ -89,11 +89,9 @@ def _render(path):
     rows = _rows()
 
     out = ["## duckrun connection API — supported methods", ""]
-    badge = f"✅ {len(rows)} public methods" if green else f"⚠️  {len(rows)} methods · {failed + error} TESTS FAILING"
-    sub = f"suite: {passed}/{ntests} tests passing" + (f" · {skipped} skipped" if skipped else "")
-    width = max(len(badge), len(sub)) + 2
-    out += ["```", "┌" + "─" * width + "┐", "│ " + badge.ljust(width - 1) + "│",
-            "│ " + sub.ljust(width - 1) + "│", "└" + "─" * width + "┘", "```", ""]
+    methods = f"✅ **{len(rows)} public methods**" if green else f"⚠️ **{len(rows)} methods · {failed + error} tests failing**"
+    suite = f"{passed}/{ntests} tests passing" + (f" · {skipped} skipped" if skipped else "")
+    out += [f"{methods} · {suite}", ""]
     out += ["> Introspected from the shipped classes — the exact public surface of `duckrun.connect()`, "
             "signatures and all, not a hand-maintained list. The green suite "
             f"([`test_connection_api.py`](../tests/connection_api/test_connection_api.py)) vouches it works. "
