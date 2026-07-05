@@ -192,7 +192,7 @@ conn.table("sales").optimize()
 #    'partitionsTouched': ['date=2026-07-04'], 'filesVacuumed': 12, 'advice': '…'}
 # nothing to do → {'operation': 'noop', 'reason': 'no small-file debt', 'filesVacuumed': 0}
 
-# Sort rewrite — profile → ORDER BY → rewrite in the read layout. Commits dataChange=true.
+# Sort rewrite — profile → ORDER BY → rewrite in the parquet layout. Commits dataChange=true.
 conn.table("sales").optimize(rewrite=True)             # auto-profiled sort key
 conn.table("sales").optimize("region", "order_date")  # explicit key
 conn.table("sales").optimize("order_date", where="year = 2026")   # scoped to matching partitions
@@ -208,7 +208,7 @@ rewrite paths are snapshot-fenced (full table → `overwrite_if_unchanged`, scop
 so a concurrent write fails the rewrite loudly rather than being clobbered. With `rewrite=True` the
 key is picked automatically by profiling the table — a heuristic, not an optimizer, because the
 optimal choice is an NP-hard problem — see [Automatic sort](automatic-sort.md). Every write (this
-one included) lands in [the read layout](read-layout.md).
+one included) lands in [the parquet layout](parquet-layout.md).
 
 **`DeltaTable.forName(conn, name).optimize(...)`** — the plain delta-rs `OPTIMIZE`:
 

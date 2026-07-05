@@ -12,7 +12,7 @@ conn.table("sales").optimize(analyze=True)            # just show me what you'd 
 ```
 
 Both forms do the same physical thing — one global `ORDER BY` streamed back out as new Delta files
-in [the read layout](read-layout.md). The only difference is **who chooses the columns**. The rest
+in [the parquet layout](parquet-layout.md). The only difference is **who chooses the columns**. The rest
 of this page is about why letting the machine choose is a genuinely hard problem — and why that
 matters when you decide whether to trust it.
 

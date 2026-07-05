@@ -125,7 +125,7 @@ nav:
       - TPC-H benchmark: tpch.md
   - Advanced:
       - Connection API: connection-api.md
-      - Read layout: read-layout.md
+      - Parquet layout: parquet-layout.md
       - Automatic sort: automatic-sort.md
       - Spark / Delta coverage: spark-delta-parity.md
       - How it works:
