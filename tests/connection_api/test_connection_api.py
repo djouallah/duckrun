@@ -493,40 +493,6 @@ class TestDataFrameWriter:
         with pytest.raises(ValueError):
             conn.sql("select 2 a").write.save(p)  # default error, path exists
 
-    def test_write_optimize_user_keys(self, conn):
-        # .write.optimize("region").mode("overwrite") lands the write sorted by region in the tuned
-        # read layout in ONE pass. Data preserved; the active file is clustered by region.
-        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
-            .write.optimize("region").mode("overwrite").saveAsTable("wo")
-        assert conn.table("wo").count() == 20000
-        assert conn.get_stats("wo").df()["compression"].tolist() == ["SNAPPY"]
-        f = engine._delta_table(conn.root_path + "/dbo/wo", None).file_uris()[0].replace("file://", "")
-        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
-        assert regs == sorted(regs)
-
-    def test_write_optimize_auto_keys(self, conn):
-        # .write.optimize() with no args profiles the data being written to pick the sort key, then
-        # writes in the tuned layout — the write-time twin of conn.table(name).optimize().
-        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
-            .write.optimize().mode("overwrite").saveAsTable("wo_auto")
-        assert conn.table("wo_auto").count() == 20000
-        assert conn.get_stats("wo_auto").df()["compression"].tolist() == ["SNAPPY"]
-        f = engine._delta_table(conn.root_path + "/dbo/wo_auto", None).file_uris()[0].replace("file://", "")
-        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
-        assert regs == sorted(regs)  # region is the low-cardinality key the profiler leads with
-
-    def test_write_optimize_partitioned(self, conn):
-        # optimize composes with partitionBy: partitions are preserved and lead the physical order.
-        conn.sql("select (i % 3) as region, (9 - i % 5) as k, i as id from range(300) t(i)") \
-            .write.optimize("k").partitionBy("region").mode("overwrite").saveAsTable("wo_part")
-        assert conn.table("wo_part").count() == 300
-        assert sorted(r[0] for r in conn.sql("select distinct region from wo_part").collect()) == [0, 1, 2]
-
-    def test_write_optimize_requires_overwrite(self, conn):
-        conn.sql("select 1 region, 1 id").write.mode("overwrite").saveAsTable("wo_bad")
-        with pytest.raises(ValueError):
-            conn.sql("select 2 region, 2 id").write.optimize("region").mode("append").saveAsTable("wo_bad")
-
 
 class TestDeltaTable:
     def _seed(self, conn):
@@ -2267,32 +2233,6 @@ def _clustered_by(conn, name, col):
     return True
 
 
-def test_optimize_e2e_ingest_then_write_variants(raw_sales):
-    # Ingest the raw parquet once, then land it four ways: raw baseline, write.optimize() auto,
-    # write.optimize(explicit), and write.optimize()+partitionBy. Every table must hold the SAME rows.
-    conn, praw, expected = raw_sales
-    read = lambda: conn.read.format("parquet").load(praw)  # a fresh source relation per write
-
-    read().write.mode("overwrite").saveAsTable("s_raw")                       # baseline: SNAPPY, unsorted
-    read().write.optimize().mode("overwrite").saveAsTable("s_auto")           # DL layout, auto key
-    read().write.optimize("category").mode("overwrite").saveAsTable("s_cat")  # DL layout, explicit key
-    read().write.optimize("day").partitionBy("region").mode("overwrite").saveAsTable("s_part")
-
-    # 1) DATA INVARIANCE — the whole point. Layout differs, the row multiset is byte-identical.
-    for name in ("s_raw", "s_auto", "s_cat", "s_part"):
-        assert _rows(conn, name) == expected, f"{name} changed the data"
-
-    # 2) CODECS — SNAPPY throughout; one read-layout profile for normal write and optimize alike.
-    for name in ("s_raw", "s_auto", "s_cat", "s_part"):
-        assert _codecs(conn, name) == {"SNAPPY"}, f"{name} is not SNAPPY"
-
-    # 3) CLUSTERING — the file is physically ordered by its sort key.
-    assert _clustered_by(conn, "s_auto", "region")  # region is the leading low-card dimension
-    assert _clustered_by(conn, "s_cat", "category")  # explicit key honoured verbatim
-    assert _clustered_by(conn, "s_part", "day")      # secondary sort within each region partition
-    assert sorted({r[0] for r in conn.sql("select distinct region from s_part").collect()}) == [0, 1, 2, 3, 4]
-
-
 def test_optimize_e2e_write_raw_then_table_optimize(raw_sales):
     # The other entry point: land raw, THEN rewrite in place via conn.table(name).optimize(). Auto and
     # explicit keys both preserve the data; the codec is SNAPPY (the one read-layout profile).
@@ -2310,18 +2250,6 @@ def test_optimize_e2e_write_raw_then_table_optimize(raw_sales):
     conn.table("t1").optimize("category")
     assert _rows(conn, "t1") == expected
     assert _clustered_by(conn, "t1", "category")
-
-
-def test_optimize_e2e_chain_write_optimize_then_rekey(raw_sales):
-    # Chain the two surfaces: write in the DL layout keyed by category, then re-key to day via the table
-    # handle. Data survives every hop; the clustering follows the most recent key.
-    conn, praw, expected = raw_sales
-    conn.read.format("parquet").load(praw).write.optimize("category").mode("overwrite").saveAsTable("c1")
-    assert _clustered_by(conn, "c1", "category") and _codecs(conn, "c1") == {"SNAPPY"}
-
-    conn.table("c1").optimize("day")
-    assert _rows(conn, "c1") == expected
-    assert _clustered_by(conn, "c1", "day")
 
 
 def test_optimize_e2e_where_scopes_one_partition(raw_sales):

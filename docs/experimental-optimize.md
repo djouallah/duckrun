@@ -24,16 +24,13 @@ conn.table("sales").optimize("region", "order_date")
 conn.table("sales").optimize("order_date", where="year = 2026")
 ```
 
-Or land the write **already** in this layout, with no separate rewrite pass — the write-time twin:
+Every write already lands in this read layout by default (see [The read layout it
+writes](#the-read-layout-it-writes)), so there is no write-time flavour of the sort rewrite — to
+sort an existing table, land it and then call `conn.table(name).optimize()`.
 
-```python
-conn.sql("select * from stg_sales").write.optimize().mode("overwrite").saveAsTable("sales")
-conn.sql("select * from stg_sales").write.optimize("region").mode("overwrite").saveAsTable("sales")
-```
-
-Note the API split: `conn.optimize(name)` and `DeltaTable.forName(conn, name).optimize(...)` are the
-**plain compaction / z-order** operations — *not* this sort rewrite. The sort rewrite lives on the
-table's DataFrame (`conn.table(name).optimize(...)`) and on the writer (`df.write.optimize(...)`).
+Note the API split: `DeltaTable.forName(conn, name).optimize(...)` is the **plain compaction /
+z-order** operation — *not* this sort rewrite. The sort rewrite lives on the table's DataFrame
+(`conn.table(name).optimize(...)`).
 
 The pipeline is: **profile the table → pick a sort key → `ORDER BY` → overwrite → measure.**
 The returned `savedPct` is the **real, measured** on-disk change — active-file `size_bytes`
