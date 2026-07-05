@@ -476,6 +476,14 @@ class TestDataFrameWriter:
         assert [r[0] for r in conn.sql("select * from (values (1),(3),(2)) t(n)")
                 .orderBy("n", ascending=False).collect()] == [3, 2, 1]
 
+    def test_sort_no_args_auto_key(self, conn):
+        # Bare sort() profiles the DataFrame and orders by the auto-picked run-length-friendly key
+        # (no Spark equivalent — Spark's sort() with no columns errors). One low-card dimension is
+        # the unambiguous key: the result is grouped ASC, stays writable, and keeps every row.
+        df = conn.sql("select (i%5) as g from range(500) t(i)").sort()
+        assert isinstance(df, duckrun.session.DataFrame) and hasattr(df, "write")
+        assert [r[0] for r in df.collect()] == sorted(i % 5 for i in range(500))
+
     def test_sort_then_partition_write(self, conn):
         # sort() returns a writable DataFrame that composes with partitionBy: delta-rs does the
         # partitioning, sort only sets row order. Round-trips all rows across partitions.

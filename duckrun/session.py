@@ -1015,6 +1015,29 @@ class DuckSession:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
         return self.createDataFrame(rows, schema)
 
+    def _auto_sort_cols(self, relation) -> List[str]:
+        """Run the sort-key recommender over an arbitrary relation (no Delta table behind it, so no
+        partitions and no log stats) and return the recommended ORDER BY columns, or ``[]`` if nothing
+        pays off. Backs the no-arg ``DataFrame.sort()``. Profiles a bounded reservoir sample, not the
+        whole relation."""
+        cols = list(relation.columns)
+        types = {n: str(t) for n, t in zip(relation.columns, relation.types)}
+        if not cols:
+            return []
+        view, src = "_rle_relation_src", "_rle_src"
+        relation.create_view(view, replace=True)
+        try:
+            self.con.execute(
+                f"CREATE OR REPLACE TEMP TABLE {src} AS "
+                f"SELECT * FROM {view} USING SAMPLE {_RLE_SAMPLE_ROWS} ROWS")
+            rows, _ = sortkey.recommend_sort_key(
+                self.con, "df", "sort()", src, cols, types, [], sample_rows=_RLE_SAMPLE_ROWS)
+        finally:
+            self.con.execute(f"DROP TABLE IF EXISTS {src}")
+            self.con.execute(f"DROP VIEW IF EXISTS {view}")
+        # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
+        return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+
     def _enumerate_remote(self, base: str, exts) -> List[tuple]:
         """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
         relative_path)`` pairs honouring the extension filter. Shared by ``list_files``/``download``."""
@@ -1215,16 +1238,20 @@ class DataFrame:
         if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
             cols = tuple(cols[0])
         if not cols:
-            raise ValueError("sort/orderBy requires at least one column.")
-        names = [str(c) for c in cols]
-        if ascending is None:
+            names = self.session._auto_sort_cols(self.relation)
+            if not names:
+                return self  # profiler found no key worth sorting by — leave order untouched
             dirs = ["ASC"] * len(names)
-        elif isinstance(ascending, (list, tuple)):
-            if len(ascending) != len(names):
-                raise ValueError("ascending list length must match the number of sort columns.")
-            dirs = ["ASC" if a else "DESC" for a in ascending]
         else:
-            dirs = ["ASC" if ascending else "DESC"] * len(names)
+            names = [str(c) for c in cols]
+            if ascending is None:
+                dirs = ["ASC"] * len(names)
+            elif isinstance(ascending, (list, tuple)):
+                if len(ascending) != len(names):
+                    raise ValueError("ascending list length must match the number of sort columns.")
+                dirs = ["ASC" if a else "DESC" for a in ascending]
+            else:
+                dirs = ["ASC" if ascending else "DESC"] * len(names)
         order_expr = ", ".join(f"{_qid(n)} {d}" for n, d in zip(names, dirs))
         return DataFrame(self.relation.order(order_expr), self.session)
 
