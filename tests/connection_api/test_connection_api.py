@@ -475,16 +475,9 @@ class TestDataFrameWriter:
             conn.sql("select 1 id, 77 val").write.option("replaceWhere", "id = 1") \
                 .mode("append").saveAsTable("rw2")
 
-    def test_insertInto(self, conn):
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("ii")
-        conn.sql("select 2 a").write.insertInto("ii")               # append into existing
-        assert sorted(r[0] for r in conn.table("ii").collect()) == [1, 2]
-        conn.sql("select 9 a").write.insertInto("ii", overwrite=True)  # replace all
-        assert conn.table("ii").collect() == [(9,)]
-
-    def test_insertInto_requires_existing(self, conn):
-        with pytest.raises(ValueError):
-            conn.sql("select 1 a").write.insertInto("nope")
+    def test_insertInto_removed(self, conn):
+        # insertInto is gone — the append/overwrite it did is mode("append"|"overwrite").saveAsTable.
+        assert not hasattr(conn.sql("select 1 a").write, "insertInto")
 
     def test_partitionBy(self, conn):
         conn.sql("select * from (values (1,'eu'),(2,'us')) t(id, region)") \

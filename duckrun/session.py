@@ -62,7 +62,7 @@ _MULTI_MSG = (
 # millisecond local-temp-table scans.
 _READ_ONLY_MSG = (
     "catalog '{catalog}' is read-only — cannot {op}. duckrun opens read-only by default; enable "
-    "Delta writes (saveAsTable / insertInto / save / merge / insert / update / delete / replaceWhere) "
+    "Delta writes (saveAsTable / save / merge / insert / update / delete / replaceWhere) "
     "with connect(read_only=False) for the primary, or conn.attach(path, name='{catalog}', "
     "read_only=False) for an attached catalog."
 )
@@ -1615,23 +1615,6 @@ class DataFrameWriter:
         session._use(session._current_catalog, session._current_database)
         return table
 
-    def insertInto(self, name: str, overwrite: bool = False) -> str:
-        """``df.write.insertInto(name)`` — append into an **existing** Delta table by catalog name
-        (Spark's insertInto verb). Like Spark, the target must already exist — this errors instead
-        of creating it (use :meth:`saveAsTable` to create). ``overwrite=True`` replaces all rows.
-        Columns are matched as delta-rs appends them (by name); the configured ``mode()`` is ignored
-        in favour of the insert/overwrite semantics."""
-        session = self._df.session
-        catalog, schema, table = session._resolve(name)
-        path = session._table_path(schema, table, catalog)
-        if not engine.table_exists(path, session._catalog_storage_options(catalog)):
-            raise ValueError(
-                f"insertInto target '{catalog}.{schema}.{table}' does not exist; create it first with "
-                f"df.write.saveAsTable('{name}')."
-            )
-        self._mode = "overwrite" if overwrite else "append"
-        return self.saveAsTable(name)
-
 
 # Spark's catalog.getTable / getDatabase return Table / Database objects; we mirror their fields with
 # a plain namedtuple rather than inventing classes. duckrun tables are always managed Delta tables
@@ -1807,7 +1790,7 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
         storage_options: forwarded to delta-rs (and used to mint DuckDB secrets). For OneLake you
             can omit it inside a Fabric notebook — a token is acquired automatically.
         schema: restrict to a single schema. Omit to discover every schema folder.
-        read_only: **default True** — the session refuses every Delta write (saveAsTable / insertInto
+        read_only: **default True** — the session refuses every Delta write (saveAsTable
             / save / merge / insert / update / delete / replaceWhere) with a ``PermissionError``, so
             an accidental write can't mutate a shared lakehouse. Pass ``read_only=False`` to enable
             writes. Reads and native DuckDB scratch (``CREATE TEMP``/``CREATE VIEW``) are unaffected.

@@ -10,6 +10,8 @@ All notable changes to this project will be documented in this file.
   accepted (use `append_if_unchanged`). No back-compat shim.
 - **`createDataFrame(samplingRatio=, verifySchema=)`** — both were parity-only no-ops and are removed
   from the signature; passing them now raises `TypeError`.
+- **`DataFrameWriter.insertInto`** — removed. It was `df.write.mode("append").saveAsTable(name)` (or
+  `mode("overwrite")` to replace all rows); use that directly. No shim.
 
 ## [0.3.36] - 2026-07-05
 

@@ -109,7 +109,7 @@ below are the action/output verbs, plus a passthrough to the underlying relation
 | `write.partitionBy(*cols)` | `write.partitionBy(*cols)` | ✅ | |
 | `write.save(path)` | `write.save(path)` | ✅ | Write Delta by **path**. |
 | `write.saveAsTable(name)` | `write.saveAsTable(name)` | ✅ | Write Delta by **catalog name**. |
-| `write.insertInto(name)` | `write.insertInto(name)` | ✅ | Appends to an **existing** table (errors if missing); `overwrite=True` replaces all rows. |
+| `write.insertInto(name)` | — | 🚫 | Removed — use `write.mode("append").saveAsTable(name)` (or `mode("overwrite")` to replace). |
 | `write.bucketBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 | `write.sortBy` | — | 🚫 | Delta doesn't bucket; partitioning is `partitionBy`. |
 
