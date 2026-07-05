@@ -87,6 +87,7 @@ jobs:
           python -m pytest \
             tests/adapter \
             tests/connection_api/test_connection_api.py \
+            tests/connection_api/test_public_api.py \
             tests/correctness/test_correctness.py \
             -q -p no:cacheprovider
 
@@ -280,6 +281,9 @@ jobs:
 
       - name: Gate — every connection-API method must pass
         run: python tests/tools/connection_summary.py connection.xml --check
+
+      - name: Gate — no public API removed (surface must match the committed baseline)
+        run: python tests/tools/public_api.py --check
 
   concurrency-correctness:
     name: concurrency correctness

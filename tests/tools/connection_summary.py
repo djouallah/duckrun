@@ -15,34 +15,22 @@ vouches the contract works.
 The connection-API analogue of tests/tools/conformance_summary.py.
 """
 import inspect
+import os
 import sys
 import xml.etree.ElementTree as ET
 from collections import Counter
 
-import duckrun
-from duckrun import session as _S, delta_table as _D
+# The API surface (which classes, which excluded members) is defined once in public_api.py — the same
+# definition the removal gate checks — so the card and the gate can never disagree about what's public.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from public_api import SURFACES, EXCLUDE   # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-# ── The API surface, in display order. Introspected from the classes themselves. ──────────────────
-# (surface label, class, extra public members introspection misses because they're instance
-# attributes set in __init__ rather than class-level methods/properties).
-SURFACES = [
-    ("DuckSession", _S.DuckSession, ["catalog"]),   # self.catalog = Catalog(self)
-    ("Catalog", _S.Catalog, []),
-    ("DataFrame", _S.DataFrame, []),
-    ("DataFrameReader", _S.DataFrameReader, []),
-    ("DataFrameWriter", _S.DataFrameWriter, []),
-    ("DeltaTable", _D.DeltaTable, []),
-    ("DeltaMergeBuilder", _D.DeltaMergeBuilder, []),
-]
 MODULE_FUNCS = [("connect", "DuckSession")]   # duckrun.connect(...) -> a DuckSession
-
-# Public members that exist but aren't part of the advertised contract (internal plumbing accessors).
-EXCLUDE = {("DuckSession", "root_path"), ("DuckSession", "storage_options")}
 
 # Which established API each method mirrors, so a reader can tell a real DataFrame/Delta method from a
 # duckrun-specific convenience. Default per surface; per-method overrides for the handful of exceptions.
