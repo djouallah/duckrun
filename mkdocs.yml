@@ -125,12 +125,12 @@ nav:
       - TPC-H benchmark: tpch.md
   - Advanced:
       - Connection API: connection-api.md
-      - Parquet layout: parquet-layout.md
-      - Automatic sort: automatic-sort.md
       - Spark / Delta coverage: spark-delta-parity.md
       - How it works:
           - Overview: overview.md
           - Design document: design_document.md
+          - Parquet layout: parquet-layout.md
+          - Automatic sort: automatic-sort.md
           - Snapshot isolation: snapshot-isolation.md
           - Snapshot pin walkthrough: snapshot-pin.md
       - Conformance: conformance.md

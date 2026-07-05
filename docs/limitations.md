@@ -11,10 +11,12 @@ by deliberate caution. Most come with a "do this instead." Deeper detail lives i
 
 ## Microsoft Fabric / OneLake
 
-- **Address OneLake by GUID, not friendly names.** Use the workspace GUID + lakehouse GUID; friendly
-  names currently hit an upstream OneLake read bug. See [dbt adapter → OneLake: use GUID paths](dbt-adapter.md).
 - **A Fabric Warehouse is read-only.** Attach it with `read_only=True` (it's a write-locked lakehouse);
   duckrun reads/joins it but does not write to a Warehouse. See the [Connection API](connection-api.md).
+- **delta-rs `> 1.5.0` breaks bulk delete on OneLake.** Since 1.5.1 the batch-delete path drops the
+  workspace/artifact ids (*"Either WorkspaceId or ArtifactId are missing in the request"*), so
+  `vacuum` and other multi-file deletes fail against OneLake. This is a major reason duckrun pins
+  `deltalake == 1.5.0`. See [delta-rs #4401](https://github.com/delta-io/delta-rs/issues/4401).
 
 ## SQL DML (`conn.sql`)
 
@@ -51,6 +53,14 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
 - **`DROP TABLE` is a soft tombstone, not a physical delete.** `conn.sql("drop table x")` unregisters
   the table and writes a tombstone marker but **does not reclaim the data files** (a deliberate
   precaution — you purge them when you're sure). Address dropped tables by name, not by path.
+
+## Parquet layout
+
+- **Can't force exactly one row group per file.** Direct Lake prefers one file = one row group, but
+  the Parquet writer picks row-group boundaries from its own size/row thresholds — there's no "one
+  group then new file" knob. Aligning `target_file_size` and `row_group_size` (256 MB against a 6M-row
+  group) *usually* yields one group per wide-fact file, but narrow or odd-width tables can still emit
+  two or three. See [Parquet layout](parquet-layout.md).
 
 ## Memory
 

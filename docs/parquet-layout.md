@@ -31,13 +31,3 @@ they're that ideal minus whatever headroom merge needs. merge itself takes the c
 further and opts out entirely — it writes with none of these properties, so an incremental merge
 stays lean and never rewrites fat files or materializes giant dictionaries to touch a few rows; the
 threshold-gated compaction folds those loose files back into this layout on a later pass.
-
-## The one thing I can't fix: one row group per file
-
-The biggest limitation is that I can't force **exactly one row group per file**. Direct Lake is
-happiest when a file is a single clean segment — one file, one row group — but the Parquet writer
-picks row-group boundaries from its own row-count and size thresholds, and there is no knob that
-says "emit one row group, then start a new file." The best you can do is line up `target_file_size`
-and `row_group_size` so they *usually* coincide (a 256 MB file target against a 6M-row group tends
-to yield one group per file for a wide fact). On a narrow table, or one with unusual row widths, a
-file can still come out with two or three row groups — and nothing in the writer will stop it.
