@@ -11,8 +11,6 @@ by deliberate caution. Most come with a "do this instead." Deeper detail lives i
 
 ## Microsoft Fabric / OneLake
 
-- **A Fabric Warehouse is read-only.** Attach it with `read_only=True` (it's a write-locked lakehouse);
-  duckrun reads/joins it but does not write to a Warehouse. See the [Connection API](connection-api.md).
 - **delta-rs `> 1.5.0` breaks bulk delete on OneLake.** Since 1.5.1 the batch-delete path drops the
   workspace/artifact ids (*"Either WorkspaceId or ArtifactId are missing in the request"*), so
   `vacuum` and other multi-file deletes fail against OneLake. This is a major reason duckrun pins
