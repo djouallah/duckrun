@@ -230,8 +230,8 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌────────────────────────────┐
-│ ✅ 105 passed   ❌ 0 failed  │
-│ 105 methods · 100% passing │
+│ ✅ 106 passed   ❌ 0 failed  │
+│ 106 methods · 100% passing │
 └────────────────────────────┘
 ```
 
@@ -248,7 +248,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `sort`, `orderBy_alias_and_desc`, `sort_then_partition_write`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 13/13 ✅ |
 | `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `table_optimize_auto_keys`, `table_optimize_user_keys`, `table_optimize_where_scopes_partitions`, `table_optimize_rejects_query_frame`, `table_optimize_rewrite_refuses_on_concurrent_commit`, `table_optimize_maintain_noop`, `table_optimize_maintain_compacts_small_files`, `table_optimize_analyze`, `get_rle_scan_count_is_constant`, `vacuum`, `restoreToVersion` | 20/20 ✅ |
 
-### duckrun-specific helpers — 27/27 ✅
+### duckrun-specific helpers — 28/28 ✅
 
 > Conveniences with no DataFrame-API equivalent (session plumbing + two shortcuts).
 
@@ -266,6 +266,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `list_files` | `DuckSession` | ✅ |
 | `get_stats` | `DuckSession` | ✅ |
 | `get_stats_detailed` | `DuckSession` | ✅ |
+| `get_stats_glob` | `DuckSession` | ✅ |
 | `__getattr__` | `DataFrame` | ✅ |
 | `SELECT (passthrough)` | `sql()` | ✅ |
 | `version-pinned read` | `sql()` | ✅ |
