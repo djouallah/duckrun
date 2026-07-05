@@ -66,7 +66,7 @@ conn.sql("""
     WHEN NOT MATCHED THEN INSERT *
 """)
 
-conn.stop()
+conn.close()
 ```
 
 **Multiple catalogs** — attach more lakehouses and read/join across them by three-part name. In

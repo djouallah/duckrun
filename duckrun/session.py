@@ -1122,17 +1122,23 @@ class DuckSession:
     def read(self) -> "DataFrameReader":
         return DataFrameReader(self)
 
-    def stop(self):
-        """Close the underlying DuckDB connection (Spark's ``SparkSession.stop()``). The session is
-        unusable afterwards — registered views and the minted secret go with the connection."""
+    def close(self):
+        """Close the underlying DuckDB connection. The session is unusable afterwards — registered
+        views and the minted secret go with the connection."""
         self.con.close()
+
+    # Transition alias for the pre-SQL-only name; hidden from the advertised surface (see
+    # public_api.EXCLUDE) and removed with the rest of the DataFrame veneer.
+    def stop(self):
+        """Deprecated alias for :meth:`close`."""
+        self.close()
 
     def __enter__(self) -> "DuckSession":
         return self
 
     def __exit__(self, exc_type, exc, tb):
         """Close the connection on ``with`` exit — ``with duckrun.connect(...) as conn:``."""
-        self.stop()
+        self.close()
         return False
 
     @property

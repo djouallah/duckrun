@@ -3,6 +3,7 @@
 #     python tests/tools/public_api.py --write
 # A diff here means a public API was added or removed — a removal is a breaking change.
 DuckSession.attach(path, name=None, storage_options=None, schema=None, read_only=None)
+DuckSession.close()
 DuckSession.convert_to_delta(identifier, partition_schema=None)
 DuckSession.copy(local_folder, remote_folder, file_extensions=None, overwrite=False)
 DuckSession.download(remote_folder='', local_folder='./downloaded_files', file_extensions=None, overwrite=False)
@@ -10,7 +11,6 @@ DuckSession.get_stats(source=None, detailed=False)
 DuckSession.list_files(remote_folder='', file_extensions=None)
 DuckSession.refresh(quiet=False, catalog=None)
 DuckSession.sql(query)
-DuckSession.stop()
 duckrun.DataFrame (class)
 duckrun.DeltaTable (class)
 duckrun.DuckSession (class)

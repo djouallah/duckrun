@@ -44,6 +44,7 @@ EXCLUDE = {
     ("DuckSession", "root_path"), ("DuckSession", "storage_options"),
     ("DuckSession", "table"), ("DuckSession", "read"),
     ("DuckSession", "createDataFrame"), ("DuckSession", "catalog"),
+    ("DuckSession", "stop"),   # transition alias for close() — not advertised
 }
 
 BASELINE = os.path.join(os.path.dirname(__file__), os.pardir,

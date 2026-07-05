@@ -12,6 +12,7 @@
 | --- | --- | --- |
 | `duckrun` | `connect` | `path, storage_options=None, schema=None, read_only=True, name=None` |
 | `DuckSession` | `attach` | `path, name=None, storage_options=None, schema=None, read_only=None` |
+| `DuckSession` | `close` | *(none)* |
 | `DuckSession` | `convert_to_delta` | `identifier, partition_schema=None` |
 | `DuckSession` | `copy` | `local_folder, remote_folder, file_extensions=None, overwrite=False` |
 | `DuckSession` | `download` | `remote_folder='', local_folder='./downloaded_files', file_extensions=None, overwrite=False` |
@@ -19,6 +20,5 @@
 | `DuckSession` | `list_files` | `remote_folder='', file_extensions=None` |
 | `DuckSession` | `refresh` | `quiet=False, catalog=None` |
 | `DuckSession` | `sql` | `query` |
-| `DuckSession` | `stop` | *(none)* |
 
 <!-- CONNECTION_API:END -->
