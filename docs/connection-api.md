@@ -176,10 +176,8 @@ and partition are orthogonal: partitioning decides the folder layout, sorting de
 
 ### Table maintenance { #optimize }
 
-Maintenance operates on a **table**, not the session. There are two `optimize` methods.
-
-**`conn.table(name).optimize(...)`** — the maintenance ladder. The bare call is safe; you opt into
-the heavier operations by argument:
+Maintenance operates on a **table**, not the session, via `conn.table(name).optimize(...)` — the
+maintenance ladder. The bare call is safe; you opt into the heavier operations by argument:
 
 ```python
 # Safe button — compact small files + vacuum, NEVER rewrites row data. Only partitions carrying
@@ -208,15 +206,8 @@ key is picked automatically by profiling the table — a heuristic, not an optim
 optimal choice is an NP-hard problem — see [Automatic sort](automatic-sort.md). Every write (this
 one included) lands in [the parquet layout](parquet-layout.md).
 
-**`DeltaTable.forName(conn, name).optimize()`** — the plain delta-rs `OPTIMIZE` (bin-packing
-compaction):
-
-```python
-DeltaTable.forName(conn, "sales").optimize()   # bin-packing compaction
-```
-
-There is no z-order (bit-interleaving destroys the run-length runs a columnar reader relies on; use a
-lexicographic key via `conn.table(name).optimize(...)` instead).
+There is no z-order — bit-interleaving destroys the run-length runs a columnar reader relies on, so
+cluster with a lexicographic key (`conn.table(name).optimize("region", "order_date")`) instead.
 
 Names resolve like everywhere else — bare = current schema, `schema.table` or
 `catalog.schema.table` to be explicit.
