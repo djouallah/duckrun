@@ -356,9 +356,9 @@ def test_overwrite_replaces_rows(root):
     assert _read(root, "ov") == [(9, "z")]
 
 
-def test_safeappend_creates_then_appends(root):
-    _rw(root, "sa", "select * from (values (1,'a')) t(id, name)", mode="safeappend")
-    _rw(root, "sa", "select * from (values (2,'b')) t(id, name)", mode="safeappend")
+def test_append_if_unchanged_creates_then_appends(root):
+    _rw(root, "sa", "select * from (values (1,'a')) t(id, name)", mode="append_if_unchanged")
+    _rw(root, "sa", "select * from (values (2,'b')) t(id, name)", mode="append_if_unchanged")
     assert _read(root, "sa") == [(1, "a"), (2, "b")]
 
 
