@@ -1,9 +1,8 @@
 # Automatic sort
 
 `conn.table(name).optimize(rewrite=True)` picks the sort key **for you**. You don't pass a column
-list — it profiles the table as it stands (the cardinality, skew, null-density and functional
-dependencies it reads from the Delta-log statistics plus a sample of the rows), chooses a short
-key from that, and rewrites every file physically ordered by it.
+list — it profiles the table (each column's cardinality, skew, null-density, and functional
+dependencies), chooses a short key from that, and rewrites every file physically ordered by it.
 
 ```python
 conn.table("sales").optimize(rewrite=True)            # auto: profile, pick the key, rewrite
@@ -72,9 +71,9 @@ you throw at it. Three things stack up:
   size is to actually sort and write the whole table that way and measure it. One evaluation is a
   full-table rewrite.
 - **Superexponential candidates × a full rewrite each = hours to days.** An exact optimizer would
-  materialize an astronomical number of layouts just to compare them. For a table of any real size
-  that is not "slow," it is *never finishes*. And what's at stake is a few percent of disk. Nobody
-  is going to spend a compute-week to shave 4% off a Parquet folder.
+  write out an astronomical number of layouts just to compare them. For a table of any real size
+  that is not "slow" — it *never finishes*. And what's at stake is a few percent of disk. Nobody is
+  going to spend a compute-week to shave 4% off a Parquet folder.
 
 This is the same shape as other well-known hard clustering/ordering problems: minimizing total runs
 across multiple columns by reordering rows generalizes problems that are provably NP-hard, so a
@@ -83,28 +82,32 @@ harder" — it's **don't try to be optimal.**
 
 ## How the automatic picker chooses instead
 
-`rewrite=True` gives up on optimal and uses a cheap, greedy heuristic that runs in one profiling
-pass over a sample. It's a stack of rules of thumb, each of which is *usually* right:
+`rewrite=True` gives up on optimal and uses a cheap, greedy heuristic — a stack of rules of thumb,
+each of which is *usually* right:
 
-- **Ascending cardinality.** Add columns coarse-to-fine — the classic rule that tends to maximize
-  total run length. This also respects natural hierarchies (a coarse `date` leads the finer `time`
-  nested within it).
-- **Partition columns lead but take no key slot** — Delta strips them from the data files, so they
-  carry no compression weight; leading with them just keeps ~one partition writer open at a time.
+- **A date leads.** One temporal column is given the first key slot ahead of everything else, because
+  leading a fact table by its date preserves natural time-clustering and lines up with how these
+  tables are queried and refreshed. Only the **coarsest** eligible date gets this — the lowest-
+  cardinality one — and a **near-unique** timestamp (so fine it's almost a row id) is *not* allowed
+  to lead: it would swallow the whole key and cluster nothing, leaving the real dimensions unsorted.
+- **Then ascending cardinality.** The remaining columns are added coarse-to-fine — the classic rule
+  that tends to maximize total run length and respects natural hierarchies.
+- **Partition columns go outermost, but take no key slot** — Delta strips them from the data files,
+  so they carry no compression weight; ordering by them first just keeps ~one writer open at a time.
 - **Skip functionally-dependent columns.** If adding a column doesn't grow the current prefix's
   distinct-count (`distinct(X) == distinct(X, c) ⇒ X → c`), the prefix already clusters it for free
   — `year`/`month` behind `date` earn no slot.
-- **Stop at the grain.** Once the prefix uniquely identifies rows, every group is size 1, there are
-  no runs left to make, and further columns can only cluster *worse*. Cap the key at 4 columns.
+- **Stop at the grain.** Once the prefix nearly identifies rows, every group is size 1, there are no
+  runs left to make, and further columns can only cluster *worse*. The key stops there, capped at 4.
 - **Drop what can't help.** Measures (`DECIMAL`/`FLOAT`/`DOUBLE` you aggregate, never filter on) and
-  mostly-null columns are excluded; unique/near-unique columns (`ndv ≥ 0.9·N`) are written **PLAIN**
-  because a dictionary just re-stores the whole column plus an index.
+  mostly-null columns are never candidates; unique/near-unique columns are written **PLAIN** because
+  a dictionary just re-stores the whole column plus an index.
 
-The result is a short, sensible key computed in seconds instead of a provably-optimal key computed
-never. Because it's a heuristic, it is **not guaranteed to shrink anything** — a near-uniform table
-or one already organized by a unique key has no runs to make, and the rewrite falls back to a plain
-compaction. That's also why the `savedPct` you get back is **measured from the Delta log** after the
-rewrite, not predicted: the picker optimizes a model of the size; only the disk knows the truth.
+The result is a short, sensible key. Because it's a heuristic, it is **not guaranteed to shrink
+anything** — a near-uniform table or one already organized by a unique key has no runs to make, and
+the rewrite falls back to a plain compaction. That's also why the `savedPct` you get back is
+**measured from the Delta log** after the rewrite, not predicted: the picker optimizes a model of the
+size; only the disk knows the truth.
 
 ## Pick your columns yourself
 
