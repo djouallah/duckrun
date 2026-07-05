@@ -288,7 +288,7 @@ class TestIncrAppendNoKey(_IncrBase):
 # ---------------------------------------------------------------------------
 # 6. append_if_unchanged (CAS append)
 # ---------------------------------------------------------------------------
-_SAFEAPPEND_MODEL = """
+_APPEND_IF_UNCHANGED_MODEL = """
 {{ config(materialized='incremental', incremental_strategy='append_if_unchanged') }}
 select id, region, ts, amount
 from {{ ref('stg_events') }}
@@ -298,8 +298,8 @@ where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }}
 """
 
 
-class TestIncrSafeAppend(_IncrBase):
-    model_files = {"fct_events.sql": _SAFEAPPEND_MODEL, "schema.yml": _MERGE_SCHEMA}
+class TestIncrAppendIfUnchanged(_IncrBase):
+    model_files = {"fct_events.sql": _APPEND_IF_UNCHANGED_MODEL, "schema.yml": _MERGE_SCHEMA}
     expected_initial = _INIT_IRA
     expected_final = _FINAL_APPEND
 
