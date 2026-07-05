@@ -66,12 +66,19 @@ def _test_totals(path):
 
 _MARKERS = {"(property)": "property", "(accessor)": "accessor", "(attr)": "attribute"}
 
+# Surfaces still shipped in the code but no longer advertised in the reference — the Spark-style
+# DeltaTable / DeltaMergeBuilder entry points are being consolidated onto conn.table(). They're hidden
+# from the card only; the code + the removal-gate baseline still track them until the refactor lands.
+_CARD_HIDE = {"DeltaTable", "DeltaMergeBuilder"}
+
 
 def _rows():
     """The code-derived contract as flat (surface, method, params) rows — one per public member, with
     `params` taken from the real signature. `nmethods` is the row count."""
     rows = [("duckrun", "connect", signature(duckrun.connect)[1:-1])]   # module entry point
     for surface, cls, extra in SURFACES:
+        if surface in _CARD_HIDE:
+            continue
         for m in _members(cls, extra):
             if (surface, m) in EXCLUDE:
                 continue

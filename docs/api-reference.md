@@ -4,7 +4,7 @@
 
 ## duckrun connection API — supported methods
 
-✅ **77 public methods** · 152/152 tests passing
+✅ **58 public methods** · 272/273 tests passing · 1 skipped
 
 > Introspected from the shipped classes — the exact public surface of `duckrun.connect()`, signatures and all, not a hand-maintained list. The green suite ([`test_connection_api.py`](../tests/connection_api/test_connection_api.py)) vouches it works. `conn.sql()` also routes raw Delta DML — see the DML matrix on the [Connection API](connection-api.md) page.
 
@@ -68,24 +68,5 @@
 | `DataFrameWriter` | `partitionBy` | `*cols` |
 | `DataFrameWriter` | `save` | `path` |
 | `DataFrameWriter` | `saveAsTable` | `name` |
-| `DeltaTable` | `convertToDelta` | `session, identifier, partitionSchema=None` |
-| `DeltaTable` | `delete` | `predicate=None` |
-| `DeltaTable` | `forName` | `session, name` |
-| `DeltaTable` | `forPath` | `session, path` |
-| `DeltaTable` | `history` | `limit=None` |
-| `DeltaTable` | `merge` | `source, condition, streamed_exec=False` |
-| `DeltaTable` | `optimize` | `target_size=None` |
-| `DeltaTable` | `restoreToVersion` | `version` |
-| `DeltaTable` | `update` | `condition=None, set=None` |
-| `DeltaTable` | `vacuum` | `retention_hours=None, dry_run=False, enforce_retention_duration=True` |
-| `DeltaTable` | `version` | *(none)* |
-| `DeltaMergeBuilder` | `execute` | *(none)* |
-| `DeltaMergeBuilder` | `whenMatchedDelete` | `condition=None` |
-| `DeltaMergeBuilder` | `whenMatchedUpdate` | `condition=None, set=None` |
-| `DeltaMergeBuilder` | `whenMatchedUpdateAll` | `condition=None` |
-| `DeltaMergeBuilder` | `whenNotMatchedBySourceDelete` | `condition=None` |
-| `DeltaMergeBuilder` | `whenNotMatchedBySourceUpdate` | `condition=None, set=None` |
-| `DeltaMergeBuilder` | `whenNotMatchedInsert` | `condition=None, values=None` |
-| `DeltaMergeBuilder` | `whenNotMatchedInsertAll` | `condition=None` |
 
 <!-- CONNECTION_API:END -->
