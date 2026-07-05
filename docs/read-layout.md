@@ -2,7 +2,7 @@
 
 Every duckrun **write** lands in **one** Parquet writer configuration — `saveAsTable`, `insertInto`,
 `save`, the `_if_unchanged` fenced modes, `replaceWhere`, the threshold-gated post-write compaction,
-and the [sort rewrite](experimental-sort.md) all use it. It is tuned so a columnar reader (Microsoft
+and the [automatic sort](automatic-sort.md) all use it. It is tuned so a columnar reader (Microsoft
 Fabric **Direct Lake**) can transcode the files fast on a cold load, not for maximum compression
 ratio. `MERGE` is the sole exception — see [below](#the-one-exception-merge). delta-rs (the arrow-rs
 Parquet writer) does the writing; DuckDB only streams Arrow into it.

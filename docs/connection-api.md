@@ -205,10 +205,10 @@ conn.table("sales").optimize(analyze=True)
 
 The bare button never touches row data; only `rewrite=True` / an explicit key / `where` do. Both
 rewrite paths are snapshot-fenced (full table → `overwrite_if_unchanged`, scoped → `replaceWhere`),
-so a concurrent write fails the rewrite loudly rather than being clobbered. The sort rewrite is
-experimental and best-effort — a heuristic, not an optimizer — see
-[Experimental: sort rewrite](experimental-sort.md). Every write (this one included) lands in
-[the read layout](read-layout.md).
+so a concurrent write fails the rewrite loudly rather than being clobbered. With `rewrite=True` the
+key is picked automatically by profiling the table — a heuristic, not an optimizer, because the
+optimal choice is an NP-hard problem — see [Automatic sort](automatic-sort.md). Every write (this
+one included) lands in [the read layout](read-layout.md).
 
 **`DeltaTable.forName(conn, name).optimize(...)`** — the plain delta-rs `OPTIMIZE`:
 
