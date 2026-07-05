@@ -199,12 +199,12 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 
 ```
 ┌────────────────────────────┐
-│ ✅ 101 passed   ❌ 0 failed  │
-│ 101 methods · 100% passing │
+│ ✅ 103 passed   ❌ 0 failed  │
+│ 103 methods · 100% passing │
 └────────────────────────────┘
 ```
 
-### DataFrame API — 74/74 ✅
+### DataFrame API — 76/76 ✅
 
 > Methods that mirror the established DataFrame / Delta `DeltaTable` API 1:1.
 
@@ -215,7 +215,7 @@ the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from 
 | `DataFrame` | `collect`, `count`, `columns`, `show`, `toPandas`, `toArrow`, `first`, `head`, `take`, `isEmpty`, `schema`, `printSchema` | 12/12 ✅ |
 | `DataFrameReader` | `format/load`, `table`, `parquet`, `csv`, `json`, `schema_csv_ddl`, `schema_ddl_with_comma_type`, `schema_json_struct`, `schema_rejected_for_delta`, `versionAsOf`, `timestampAsOf_rejected` | 11/11 ✅ |
 | `DataFrameWriter` | `saveAsTable`, `mode`, `option`, `insertInto`, `insertInto_requires_existing`, `partitionBy`, `sort`, `orderBy_alias_and_desc`, `sort_then_partition_write`, `format`, `save_by_path`, `save_modes`, `save_mode_error_when_exists` | 13/13 ✅ |
-| `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `table_optimize_auto_keys`, `table_optimize_user_keys`, `table_optimize_where_scopes_partitions`, `table_optimize_rejects_query_frame`, `get_rle_scan_count_is_constant`, `vacuum`, `restoreToVersion` | 16/16 ✅ |
+| `DeltaTable` | `forName`, `forPath`, `convertToDelta`, `merge`, `version`, `history`, `delete`, `update`, `optimize`, `table_optimize_auto_keys`, `table_optimize_user_keys`, `table_optimize_where_scopes_partitions`, `table_optimize_rejects_query_frame`, `table_optimize_maintain_noop`, `table_optimize_maintain_compacts_small_files`, `get_rle_scan_count_is_constant`, `vacuum`, `restoreToVersion` | 18/18 ✅ |
 
 ### duckrun-specific helpers — 27/27 ✅
 
