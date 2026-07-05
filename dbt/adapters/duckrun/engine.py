@@ -673,17 +673,17 @@ def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]]
     """Active-file list (absolute paths) + total size + VORDER flag for a Delta table — the Delta-log
     half of ``get_stats`` (the parquet footers are read separately by the caller). ``file_uris()``
     gives the live files (tombstoned ones excluded) as DuckDB-readable paths (bare local paths /
-    ``abfss://`` URIs); size + VORDER come from the same ``add_actions`` replacement-scan as
-    :func:`delta_stats` (no pyarrow)."""
+    ``abfss://`` URIs); size comes from the ``add_actions`` replacement-scan as :func:`delta_stats`
+    (no pyarrow). VORDER is read from the table metadata property (see below)."""
     dt = _delta_table(path, storage_options)
     files = list(dt.file_uris())
     add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
     size = int(cur.sql("select coalesce(sum(size_bytes), 0)::bigint from add_actions").fetchone()[0])
-    # VORDER is a Fabric write tag; flatten=True surfaces it as a column named like "tags.VORDER".
-    vcols = [d[0] for d in cur.sql("select * from add_actions limit 0").description]
-    vcol = next((c for c in vcols if "vorder" in c.lower()), None)
-    vorder = bool(vcol) and cur.sql(
-        f'select count(*) from add_actions where "{vcol}" is not null').fetchone()[0] > 0
+    # The Fabric writer records VORDER both as a per-file `add.tags` entry AND as the table property
+    # `delta.parquet.vorder.enabled`. delta-rs `get_add_actions` does NOT surface per-file tags, so
+    # read the property off the reconstructed metadata (survives checkpointing).
+    config = dt.metadata().configuration or {}
+    vorder = str(config.get("delta.parquet.vorder.enabled", "")).strip().lower() == "true"
     return files, size, vorder
 
 

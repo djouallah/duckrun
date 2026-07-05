@@ -183,6 +183,26 @@ class TestSession:
         with pytest.raises(ValueError):  # a pattern that matches nothing is a reported miss
             conn.get_stats("nope_*")
 
+    def test_get_stats_vorder_flag(self, conn):
+        # The Fabric write flag is the table property delta.parquet.vorder.enabled; get_stats reads it
+        # off the reconstructed Delta metadata (delta-rs does not surface the per-file add.tags).
+        import json, glob
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("plain_t")
+        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("vo_t")
+        # stamp the property into vo_t's log the way Spark/Fabric does (delta-rs refuses to write it).
+        for lf in glob.glob(str(Path(conn.root_path) / "**" / "vo_t" / "_delta_log" / "*.json"),
+                            recursive=True):
+            out = []
+            for ln in Path(lf).read_text().splitlines():
+                o = json.loads(ln)
+                if "metaData" in o:
+                    o["metaData"].setdefault("configuration", {})["delta.parquet.vorder.enabled"] = "true"
+                out.append(json.dumps(o))
+            Path(lf).write_text("\n".join(out) + "\n")
+        vorder_of = lambda n: dict(zip(conn.get_stats(n).columns, conn.get_stats(n).collect()[0]))["vorder"]
+        assert vorder_of("plain_t") is False
+        assert vorder_of("vo_t") is True
+
 
 class TestCatalog:
     def test_listTables(self, conn):
