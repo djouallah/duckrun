@@ -92,7 +92,7 @@ preserves the fast, high-concurrency append path. Each has a fenced compare-and-
 | `mode("append")` | `mode("append_if_unchanged")` | yes (any movement) |
 | `mode("overwrite")` | `mode("overwrite_if_unchanged")` | yes (any movement) |
 
-`safeappend` is a **deprecated alias** for `append_if_unchanged` (the dbt strategy accepts both).
+
 
 **Lazy reads.** DuckDB relations are lazy: `conn.table("x")` / `conn.sql(...)` read nothing — the
 relation runs only when `.write` does. So the read, the dedup, and the commit all happen inside the
@@ -122,7 +122,7 @@ The one real difference is **where the read version comes from**:
 
 In short: Spark/Delta fence the **commit instant** and leave the read-to-write gap to `MERGE` or
 job-level retry. duckrun makes the **read version** the thing you fence to — captured at the handle
-or at `vB` — and adds the lighter `safeappend` for the watermark case Spark has no built-in for.
+or at `vB` — and adds the lighter `append_if_unchanged` for the watermark case Spark has no built-in for.
 
 ## vs an RDBMS, and what duckrun does *not* provide
 

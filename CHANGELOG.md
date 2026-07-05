@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Removed
+- **`safeappend`** — the deprecated alias is gone, on both surfaces. `df.write.mode("safeappend")`
+  raises (use `mode("append_if_unchanged")`), and `incremental_strategy='safeappend'` is no longer
+  accepted (use `append_if_unchanged`). No back-compat shim.
+
 ## [0.3.36] - 2026-07-05
 
 ### Changed

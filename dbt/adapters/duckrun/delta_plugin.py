@@ -162,7 +162,7 @@ class Plugin(BasePlugin):
         # limit), clamping DuckDB's host-physical-RAM default that OOM-kills us on containers. Also
         # undoes any tightening a previous merge left on the shared connection; the merge branch
         # below re-tightens to its 0.3 share. So the write clamp applies to overwrite/append/
-        # safeappend/microbatch, and the 0.3/0.6 split applies to merge ONLY.
+        # append_if_unchanged/microbatch, and the 0.3/0.6 split applies to merge ONLY.
         engine.set_write_memory_limit(cur, self._baseline_memory_limit)
         name = self._relation_name(target_config.relation)
         # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
@@ -241,8 +241,9 @@ class Plugin(BasePlugin):
             # `CREATE OR REPLACE TABLE` does on every other warehouse. Without it, delta_rs's strict
             # overwrite keeps the OLD schema/protocol and so can't change a column's type or write a
             # column needing a new writer feature the old table lacks (e.g. retyping to ::timestamp /
-            # timestampNtz). This is scoped to the full-rebuild replace ONLY — NOT append, safeappend,
-            # merge, or microbatch, which must keep their strict, schema-stable writes. A fresh create
+            # timestampNtz). This is scoped to the full-rebuild replace ONLY — NOT append,
+            # append_if_unchanged, merge, or microbatch, which must keep their strict, schema-stable
+            # writes. A fresh create
             # (not exists) doesn't need it. A user's explicit merge_schema still wins.
             overwrite_schema = exists and not merge_schema
             with engine.mem_profile("overwrite", con=cur):
@@ -347,8 +348,8 @@ class Plugin(BasePlugin):
                     storage_options=storage_options,
                     cur=cur,
                 )
-        elif strategy in ("append_if_unchanged", "safeappend"):
-            # Optimistic append (``safeappend`` is the deprecated alias): commit only if the table
+        elif strategy == "append_if_unchanged":
+            # Optimistic append: commit only if the table
             # version has not moved since the model *started* (read_version, captured before it read
             # {{ this }}), else fail so dbt errors and the orchestrator re-runs. Pinning to the start
             # version — not HEAD at write time — is what closes the read→write gap: a writer that

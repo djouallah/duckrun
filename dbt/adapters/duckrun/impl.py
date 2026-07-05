@@ -97,7 +97,7 @@ class DuckrunAdapter(DuckDBAdapter):
     @available
     def delta_version(self, location):
         """Current Delta version at ``location``, or None if the table does not exist. Captured
-        at the *start* of a model build (before it reads ``{{ this }}``) so a ``safeappend`` can
+        at the *start* of a model build (before it reads ``{{ this }}``) so a ``append_if_unchanged`` can
         pin to it: if any writer commits during the run, the append fails instead of landing a
         duplicate."""
         from . import engine
@@ -106,9 +106,9 @@ class DuckrunAdapter(DuckDBAdapter):
         try:
             return engine._delta_table(location, so).version()
         except TableNotFoundError:
-            # Genuinely-missing table -> None (first run overwrites; safeappend has no pin yet).
+            # Genuinely-missing table -> None (first run overwrites; append_if_unchanged has no pin yet).
             # A real fault (transient storage error, bad token) must RE-RAISE: swallowing it here
-            # would silently degrade safeappend's start-of-build pin to HEAD-at-write, reopening
+            # would silently degrade append_if_unchanged's start-of-build pin to HEAD-at-write, reopening
             # the read->write race the pin exists to close.
             return None
 

@@ -432,9 +432,14 @@ class TestDataFrameWriter:
         conn.sql("select 2 a").write.mode("append").saveAsTable("w")
         assert conn.table("w").count() == 2
 
-    def test_mode_safeappend(self, conn):
-        conn.sql("select 1 a").write.mode("safeappend").saveAsTable("w")  # missing → create
-        conn.sql("select 2 a").write.mode("safeappend").saveAsTable("w")  # unchanged → append
+    def test_mode_safeappend_removed(self, conn):
+        # 'safeappend' was renamed to 'append_if_unchanged'; the alias is gone (no back-compat).
+        with pytest.raises(ValueError, match="renamed"):
+            conn.sql("select 1 a").write.mode("safeappend").saveAsTable("w")
+
+    def test_mode_append_if_unchanged(self, conn):
+        conn.sql("select 1 a").write.mode("append_if_unchanged").saveAsTable("w")  # missing → create
+        conn.sql("select 2 a").write.mode("append_if_unchanged").saveAsTable("w")  # unchanged → append
         assert conn.table("w").count() == 2
 
     def test_mode_ignore(self, conn):
@@ -1179,9 +1184,9 @@ def test_append_if_unchanged_creates_then_appends(wh):
     # Unchanged table → optimistic append commits and grows the table.
     conn.sql("select 2 id, 'b' v").write.mode("append_if_unchanged").saveAsTable("sa")
     assert sorted(conn.table("sa").collect()) == [(1, "a"), (2, "b")]
-    # "safeappend" stays as a deprecated alias for append_if_unchanged.
-    conn.sql("select 3 id, 'c' v").write.mode("safeappend").saveAsTable("sa")
-    assert conn.table("sa").count() == 3
+    # "safeappend" was renamed to append_if_unchanged — the old name is gone (no back-compat alias).
+    with pytest.raises(ValueError, match="renamed"):
+        conn.sql("select 3 id, 'c' v").write.mode("safeappend").saveAsTable("sa")
 
 
 def test_append_if_unchanged_refuses_on_concurrent_commit(wh, monkeypatch):

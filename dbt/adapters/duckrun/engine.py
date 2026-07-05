@@ -415,7 +415,7 @@ def mem_profile(label: str, con=None, interval: float = 0.1):
 _DUCKDB_MEM_FRACTION = 0.3   # DuckDB's memory_limit (see set_merge_memory_limit)
 _MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size
 
-# Write path (overwrite/append/safeappend/microbatch): DuckDB runs alone — no competing delta_rs
+# Write path (overwrite/append/append_if_unchanged/microbatch): DuckDB runs alone — no competing delta_rs
 # merge pool — so it gets the bulk of the cap, not a 0.3 share. But it must still be BOUNDED to the
 # effective limit, because DuckDB's own default memory_limit is 80% of *physical* RAM, and on a
 # container (Fabric/k8s) physical RAM is the whole node, not our slice — so the default
@@ -554,7 +554,7 @@ def restore_memory_limit(con, baseline: Optional[str]) -> None:
 
 
 def set_write_memory_limit(con, baseline: Optional[str]) -> None:
-    """Write-path (overwrite/append/safeappend/microbatch) ``memory_limit``: the connection
+    """Write-path (overwrite/append/append_if_unchanged/microbatch) ``memory_limit``: the connection
     ``baseline``, clamped DOWN to ``_WRITE_MEM_FRACTION`` of the effective limit. The write path
     has no competing delta_rs pool, so DuckDB gets the bulk — but still bounded, because DuckDB's
     own default is 80% of *physical* RAM, which on a container is the whole node, not our slice, and

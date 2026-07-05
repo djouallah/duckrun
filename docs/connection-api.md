@@ -9,7 +9,7 @@ interactive/notebook use (local, S3, GCS, ADLS, OneLake):
   delta_rs (works local AND on OneLake) — see the [DML matrix](#raw-sql-dml-through-connsql) below.
 - a `DataFrame` with a DataFrame-style `.write…saveAsTable()` — modes `overwrite` / `append` /
   `append_if_unchanged` / `overwrite_if_unchanged` / `ignore` (the `_if_unchanged` modes are the
-  fenced, fail-loud siblings; `safeappend` is the deprecated alias for `append_if_unchanged`), plus
+  fenced, fail-loud siblings), plus
   `option("replaceWhere", …)` for an atomic slice overwrite — plus `conn.read` and `conn.catalog`.
 - a `DeltaTable` handle (`DeltaTable.forName(conn, name)`) mirroring the `DeltaTable` API:
   `.merge(...)`, `.delete()`, `.update()`, `.version()`, `.history()`.
@@ -28,7 +28,7 @@ see [Coverage vs the Spark / Delta API](spark-delta-parity.md).
 
 `merge` is **snapshot-pinned by default** — single-snapshot MERGE, with no extra arguments:
 the target version is captured and the commit validates against it, so a concurrent writer fails the
-commit loudly instead of silently interleaving. `mode("append_if_unchanged")` (alias: `safeappend`)
+commit loudly instead of silently interleaving. `mode("append_if_unchanged")`
 and `mode("overwrite_if_unchanged")` apply the same fail-loud compare-and-swap to a plain append /
 full overwrite: they commit only if the table is unchanged since the version read, else raise
 `CommitFailedError`. The full model and a cross-engine comparison are in

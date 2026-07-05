@@ -289,7 +289,7 @@ class TestIncrAppendNoKey(_IncrBase):
 # 6. safeappend (CAS append)
 # ---------------------------------------------------------------------------
 _SAFEAPPEND_MODEL = """
-{{ config(materialized='incremental', incremental_strategy='safeappend') }}
+{{ config(materialized='incremental', incremental_strategy='append_if_unchanged') }}
 select id, region, ts, amount
 from {{ ref('stg_events') }}
 {% if is_incremental() %}

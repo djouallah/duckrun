@@ -1435,14 +1435,10 @@ def _csv_opt(value) -> str:
 class DataFrameWriter:
     """``DataFrameWriter`` over delta-rs (the adapter's :func:`engine.write_delta`).
 
-    Beyond the standard modes it adds ``"safeappend"`` — the same optimistic, fail-loud append as the
-    dbt adapter's incremental strategy: it commits only if the table version has not moved since
-    the call (compare-and-swap), else raises ``CommitFailedError``. Non-standard, but identical
-    behaviour to ``safeappend`` in dbt."""
+    ``append_if_unchanged`` / ``overwrite_if_unchanged`` are the fenced (compare-and-swap) siblings of
+    the unfenced ``append`` / ``overwrite`` modes: they commit only if the table version has not moved
+    since the call, else raise ``CommitFailedError``."""
 
-    # append_if_unchanged / overwrite_if_unchanged are the fenced (compare-and-swap) siblings of the
-    # unfenced Spark modes append / overwrite. "safeappend" is the deprecated alias for
-    # append_if_unchanged (normalized in mode()).
     _MODES = {"overwrite", "append", "append_if_unchanged", "overwrite_if_unchanged",
               "ignore", "error", "errorifexists"}
 
@@ -1464,7 +1460,7 @@ class DataFrameWriter:
     def mode(self, mode: str) -> "DataFrameWriter":
         m = mode.lower()
         if m == "safeappend":
-            m = "append_if_unchanged"  # deprecated alias — kept so existing notebooks don't break
+            raise ValueError("mode 'safeappend' was renamed — use mode('append_if_unchanged')")
         if m not in self._MODES:
             raise ValueError(f"mode must be one of {sorted(self._MODES)}, got '{mode}'.")
         self._mode = m
@@ -1534,13 +1530,13 @@ class DataFrameWriter:
             if exists and not delta_dml.is_dropped(session.con, path, so):
                 raise ValueError(
                     f"{descr} already exists (mode='error'). "
-                    f"Use mode('overwrite'), mode('append'), mode('safeappend'), or mode('ignore')."
+                    f"Use mode('overwrite'), mode('append'), mode('append_if_unchanged'), or mode('ignore')."
                 )
             replacing_tombstone = exists
             mode = "overwrite"
 
         if mode == "append_if_unchanged":
-            # Optimistic append (the dbt append_if_unchanged/safeappend strategy): pin to the version
+            # Optimistic append (the dbt append_if_unchanged strategy): pin to the version
             # now and CAS the commit, so a writer that lands between this read and the commit fails
             # the append (fail loud) instead of duplicating. On a missing table there is nothing to
             # fence against, so create it via a plain append (matches dbt's first-run create).

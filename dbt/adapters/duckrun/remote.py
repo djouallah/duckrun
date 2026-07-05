@@ -184,7 +184,7 @@ def list_files(dir_url: str, storage_options) -> List[str]:
     :func:`list_delta_tables`. Returns ``[]`` if the directory doesn't exist yet (HTTP 404) or
     there's no token; raises if the store is unreachable (wrong tenant / item not found). Follows
     ``x-ms-continuation`` so a directory with more files than one DFS page is fully enumerated —
-    a truncated list here would silently drop files from a download / the safeappend ingest."""
+    a truncated list here would silently drop files from a download / the append_if_unchanged ingest."""
     token = bearer_token(storage_options)
     if not token:
         return []

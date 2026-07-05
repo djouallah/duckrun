@@ -158,11 +158,11 @@ The first run (or `--full-refresh`, or a missing table) overwrites. Later runs a
 | `merge` (default with `unique_key`) | upsert — update matched, insert new       | `unique_key` |
 | `insert`                           | insert only new keys (idempotent append)  | `unique_key` |
 | `append` (default without `unique_key`) | blind append                          | —            |
-| `append_if_unchanged` (alias `safeappend`) | append, but only if the table is unchanged since the model read it (else fail) — cheap, no dedup scan | — |
+| `append_if_unchanged` | append, but only if the table is unchanged since the model read it (else fail) — cheap, no dedup scan | — |
 
 ### `append_if_unchanged`
 
-(Formerly `safeappend`, which is kept as a deprecated alias — both strategy names work.)
+(Formerly available under an older name, since removed.)
 
 A cheap append for the common "load only what's new" pattern — when your model SQL **already
 guarantees no duplicates** and you don't want to pay for a merge.
@@ -179,14 +179,14 @@ select * from read_csv(getvariable('new_files'))
 
 **Why, reason 1 — performance.** `merge` / `insert` scan the target and join on the key to find what's
 new — expensive on a large table. If the SQL above already excludes rows that are present, that work
-is redundant. `safeappend` is a plain append: **no target data scan, no key join, and DuckDB keeps
+is redundant. `append_if_unchanged` is a plain append: **no target data scan, no key join, and DuckDB keeps
 its full memory budget** (the merge memory split is never applied — same as `append` / `overwrite`).
 The only thing it reads from the target is one Delta log entry to get the version.
 
 **Why, reason 2 — a concurrency guard a blind `append` doesn't have.** Because the dedup is done in
 SQL against `{{ this }}`, a plain `append` is unsafe under concurrency: if another writer commits
 between your `not in (... from {{ this }})` read and your write, the file it added isn't excluded and
-you get a duplicate. `safeappend` closes that gap — it commits **only if the table version is
+you get a duplicate. `append_if_unchanged` closes that gap — it commits **only if the table version is
 unchanged since the model started** (captured *before* it reads `{{ this }}`); if anything committed
 in between, it fails with `CommitFailedError` so the run re-runs against the new state. No duplicate
 slips in.
@@ -198,17 +198,17 @@ like `merge` or auto-rebase like `append`), but the mechanism is optimistic, not
 Re-running is safe and idempotent: the SQL dedup simply excludes whatever the previous attempt already
 loaded.
 
-First run (or `--full-refresh`, or a missing table) overwrites to create the table; `safeappend`
+First run (or `--full-refresh`, or a missing table) overwrites to create the table; `append_if_unchanged`
 applies on later runs. A real example is the AEMO
 [`fct_scada`](../integration_tests/aemo/models/marts/fct_scada.sql) model — the project's largest
-table, which loads only not-yet-seen files and so uses `safeappend` instead of an expensive merge.
+table, which loads only not-yet-seen files and so uses `append_if_unchanged` instead of an expensive merge.
 
 ### Config options (`table` / `incremental` / `delta`)
 
 | option                  | description                                                                 |
 |-------------------------|-----------------------------------------------------------------------------|
 | `location`              | Delta path. Defaults to `<root_path>/<schema>/<id>`.                        |
-| `incremental_strategy`  | `merge` \| `insert` \| `append` \| `append_if_unchanged` (alias `safeappend`) (incremental only). |
+| `incremental_strategy`  | `merge` \| `insert` \| `append` \| `append_if_unchanged` (incremental only). |
 | `unique_key`            | column(s) to merge on.                                                       |
 | `merge_update_columns`  | merge: update only these columns on match (others untouched).               |
 | `merge_exclude_columns` | merge: update all columns **except** these on match.                        |
@@ -290,7 +290,7 @@ be "fixed" away:
   delta_rs write path isn't thread-safe (parallel writes to a table in the *same* process collide). It
   is **not** a limit on concurrent writers. Multiple independent writers — separate dbt runs,
   notebooks, jobs, whatever — writing the same tables at the same time is fully supported and safe:
-  every write uses optimistic concurrency (snapshot-pinned MERGE, `safeappend` compare-and-swap,
+  every write uses optimistic concurrency (snapshot-pinned MERGE, `append_if_unchanged` compare-and-swap,
   fail-loud on a conflicting commit). So you can absolutely run many writers in parallel; you just
   can't multi-thread the models *inside a single* dbt invocation.
 - **Two engines share one machine's memory.** DuckDB executes the SQL and delta_rs materializes the
