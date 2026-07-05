@@ -176,20 +176,49 @@ Partitioning itself is `df.write.partitionBy(*cols)` — delta-rs writes Hive-st
 folders and strips the column from the data files (it's re-materialized from the path on read). Sort
 and partition are orthogonal: partitioning decides the folder layout, sorting decides row order.
 
-### `optimize` — compaction and z-order
+### Table maintenance { #optimize }
 
-Optimize operates on a **table**, not the session:
+Maintenance operates on a **table**, not the session. There are two `optimize` methods.
+
+**`conn.table(name).optimize(...)`** — the maintenance ladder. The bare call is safe; you opt into
+the heavier operations by argument:
+
+```python
+# Safe button — compact small files + vacuum, NEVER rewrites row data. Only partitions carrying
+# real small-file debt are bin-packed (a byte trigger). Commits dataChange=false, safe under
+# concurrent writers, idempotent — schedule it.
+conn.table("sales").optimize()
+# → {'operation': 'compact', 'filesRemoved': 41, 'filesAdded': 3,
+#    'partitionsTouched': ['date=2026-07-04'], 'filesVacuumed': 12, 'advice': '…'}
+# nothing to do → {'operation': 'noop', 'reason': 'no small-file debt', 'filesVacuumed': 0}
+
+# Sort rewrite — profile → ORDER BY → rewrite in the read layout. Commits dataChange=true.
+conn.table("sales").optimize(rewrite=True)             # auto-profiled sort key
+conn.table("sales").optimize("region", "order_date")  # explicit key
+conn.table("sales").optimize("order_date", where="year = 2026")   # scoped to matching partitions
+# → {'operation': 'sortRewrite', 'sortedBy': [...], 'sizeBytesBefore': …, 'sizeBytesAfter': …,
+#    'savedPct': 55.3, 'warning': 'commits as dataChange=true — CDF/streaming consumers see a change'}
+
+# Advisory — the sort-key recommendation as a DataFrame + small-file debt, commits nothing.
+conn.table("sales").optimize(analyze=True)
+```
+
+The bare button never touches row data; only `rewrite=True` / an explicit key / `where` do. Both
+rewrite paths are snapshot-fenced (full table → `overwrite_if_unchanged`, scoped → `replaceWhere`),
+so a concurrent write fails the rewrite loudly rather than being clobbered. The sort rewrite is
+experimental and best-effort — a heuristic, not an optimizer — see
+[Experimental: sort rewrite](experimental-sort.md). Every write (this one included) lands in
+[the read layout](read-layout.md).
+
+**`DeltaTable.forName(conn, name).optimize(...)`** — the plain delta-rs `OPTIMIZE`:
 
 ```python
 DeltaTable.forName(conn, "sales").optimize()                       # bin-packing compaction
 DeltaTable.forName(conn, "sales").optimize(zorder_by=["a", "b"])   # z-order (file pruning)
 ```
 
-Both are the delta-rs `OPTIMIZE` operations. The name resolves like everywhere else — bare =
-current schema, `schema.table` or `catalog.schema.table` to be explicit. The table's DataFrame
-carries a separate, richer `conn.table("sales").optimize(...)` — a safe compact-and-vacuum button,
-an opt-in sort rewrite, and an advisory — documented in
-[Experimental: optimize](experimental-optimize.md).
+Names resolve like everywhere else — bare = current schema, `schema.table` or
+`catalog.schema.table` to be explicit.
 
 The card below — every public method with a ✅ — is regenerated on every push by
 the `connection-card` job in [`cores.yml`](../.github/workflows/cores.yml) from the `Test*` classes of
