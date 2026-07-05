@@ -2141,6 +2141,21 @@ def test_get_rle_hidden_date_plus_lowcard_dims(conn):
     assert sum(recs[c]["data_type"] == "DATE" for c in key) == 1       # ONE date, not both crowding out dims
 
 
+def test_get_rle_hidden_near_unique_timestamp_not_lead(conn):
+    # Regression (found on real NYC-taxi data, not synthetic): when the only temporal is a ~unique
+    # microsecond timestamp (tpep_pickup_datetime is ndv ~= 0.7*n), it must NOT be promoted to lead —
+    # doing so grain-stops the very first pick and leaves an EMPTY key ("no key pays off"). The low-card
+    # dimensions are the real key; the too-fine timestamp stays out (it can't form runs).
+    conn.sql("select (timestamp '2024-01-01' + (i * interval '1 second')) as ts, "
+             "(i % 2) as flag, (i % 5) as kind, (i % 3) as vendor "
+             "from range(40000) t(i)").write.mode("overwrite").saveAsTable("nutime")
+    df = conn._get_rle("nutime")
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    assert any(r["in_sort_key"] for r in recs.values())   # NOT empty — the bug produced an empty key
+    assert not recs["ts"]["in_sort_key"]                  # ~unique timestamp is too fine to be the key
+    assert recs["flag"]["in_sort_key"]                    # the low-card dimensions form the key instead
+
+
 def test_get_rle_hidden_partition_leads(conn, capsys):
     # R8: partition columns lead the printed ORDER BY (write-locality) but take no compression slot.
     conn.sql("select (i % 4) as region, (i % 3) as cat, (i % 3) * 7 as catlike "

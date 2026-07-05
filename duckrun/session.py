@@ -1110,8 +1110,11 @@ class DuckSession:
         # natural clustering and incremental framing. Only the single coarsest date gets the tier-0 thumb
         # (the lowest-ndv temporal, ties by schema order); the OTHER dates fall back to plain ascending
         # cardinality, so the low-card dimensions queries actually filter on aren't stranded behind them.
+        # A temporal too fine to survive the grain stop (a raw microsecond timestamp is ~unique — real
+        # NYC-taxi tpep_pickup_datetime is ndv≈0.7·n) is NOT lead-eligible: promoting it would grain-stop
+        # the very first pick and leave an EMPTY key, when the low-card dimensions are the real key.
         temporals = [c for c in cols if _elig(c) and _is_temporal(types[c])
-                     and not (n and ndv[c] >= 0.9 * n)]
+                     and not (n and ndv[c] >= grain_frac * n)]
         lead_temporal = min(temporals, key=lambda c: (ndv[c], cols.index(c))) if temporals else None
         candidates = sorted(
             (c for c in cols if _elig(c)),
