@@ -8,6 +8,8 @@ All notable changes to this project will be documented in this file.
 - **`safeappend`** — the deprecated alias is gone, on both surfaces. `df.write.mode("safeappend")`
   raises (use `mode("append_if_unchanged")`), and `incremental_strategy='safeappend'` is no longer
   accepted (use `append_if_unchanged`). No back-compat shim.
+- **`createDataFrame(samplingRatio=, verifySchema=)`** — both were parity-only no-ops and are removed
+  from the signature; passing them now raises `TypeError`.
 
 ## [0.3.36] - 2026-07-05
 

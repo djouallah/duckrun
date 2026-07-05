@@ -679,8 +679,7 @@ class DuckSession:
             self.con.sql(f"SELECT * FROM {_qid(catalog)}.{_qid(schema)}.{_qid(table)}"), self,
             source_table=name)
 
-    def createDataFrame(self, data, schema=None, samplingRatio=None,
-                        verifySchema: bool = True) -> "DataFrame":
+    def createDataFrame(self, data, schema=None) -> "DataFrame":
         """Create a :class:`DataFrame` from in-memory data — the ``createDataFrame`` API.
 
         ``data`` is a list of tuples/lists (a list of scalars is treated as a single column), a
@@ -689,9 +688,6 @@ class DuckSession:
         list of column names, or a DDL string (``"id int, name string"``; ``:`` between name and
         type is also accepted). The data is materialised as a relation on duckrun's own DuckDB
         connection — write it to Delta with ``df.write.saveAsTable(...)``.
-
-        ``samplingRatio`` is accepted for signature parity and ignored; ``verifySchema`` is
-        best-effort — DuckDB casts/validates when the relation is built.
         """
         names, types = _parse_schema(schema)
 

@@ -1451,6 +1451,12 @@ def test_createDataFrame_ddl_colon_spelling(conn):
     assert _cdf_types(df) == ["INTEGER", "VARCHAR"]
 
 
+def test_createDataFrame_rejects_parity_params(conn):
+    # samplingRatio / verifySchema were parity-only no-ops; removed entirely → natural TypeError.
+    with pytest.raises(TypeError):
+        conn.createDataFrame([(1, "a")], "id int, name string", samplingRatio=0.5)
+
+
 def test_createDataFrame_ddl_decimal_with_comma_survives(conn):
     df = conn.createDataFrame([(1, "1.50")], "id long, amount decimal(10,2)")
     assert _cdf_types(df) == ["BIGINT", "DECIMAL(10,2)"]
