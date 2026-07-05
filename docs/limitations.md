@@ -41,6 +41,13 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
 - **Only `not null` is enforced.** `check` / `primary_key` / `foreign_key` constraints are declared
   but not checked — they can't be enforced against a `delta_scan` view.
 
+## DuckDB catalog
+
+- **No external-table abstraction, so Delta tables are views.** DuckDB's catalog has only native
+  tables (own DuckDB storage) and views — no PostgreSQL-style foreign table whose bytes live
+  elsewhere but still accepts writes. Since delta-rs owns the data, duckrun registers each Delta
+  table as a `CREATE VIEW` over `delta_scan(...)` and routes writes to delta-rs at the cursor.
+
 ## Materializations
 
 - **No persistent views.** The Delta spec doesn't define a view, so there's nothing durable to write.
