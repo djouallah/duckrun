@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.1]
+
+Robustness fixes and a cleanup; the frozen 0.4.0 surface is unchanged.
+
+### Fixed
+- **Quoted-dot names resolve consistently.** All name-splitting sites now route through one
+  quote-aware splitter, so a dot inside a quoted identifier (`"a.b"`, one legal name) is never
+  mistaken for a schema/catalog separator.
+- **Malformed `CREATE TABLE` fails loud instead of writing garbage.** A mis-spelled layout clause
+  (e.g. `SORT BY AUTO` — it's `SORTED BY`) used to leak into the table name and silently create a
+  spaces-in-name Delta table (which later broke `get_stats` on abfss). The target is now validated
+  before any write.
+- **Case-fold collisions in a store fail loud on discovery.** When two tables (or schemas) differ
+  only by case — e.g. an external engine wrote both `Foo` and `foo` on a case-sensitive store —
+  DuckDB's catalog can expose only one; `connect()` now raises a clear error naming both instead of
+  silently hiding one.
+
+### Changed
+- **`CREATE TABLE` rejects whitespace in a schema or table name** (even quoted): spaces become
+  `%20` in the Delta path and trip abfss globbing, and match no valid OneLake table name anyway. A
+  space in an attached-catalog *alias* (not a directory) is still allowed.
+
+### Internal
+- Removed the dead `createDataFrame` helper machinery; the sort-key recommender relation is now
+  built directly (output columns and types unchanged).
+
 ## [0.4.0]
 
 0.4.0 marks the SQL-only surface (`connect()` / `conn.sql()` and the SQL verbs) stable and
