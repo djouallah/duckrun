@@ -49,7 +49,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import duckrun
-from dbt.adapters.duckrun import engine
 
 # The scenario prints box-drawing chars and ✅/❌; force utf-8 so a Windows cp1252 console doesn't
 # crash when watching the demo.
@@ -331,8 +330,8 @@ def run_taxi_demo(conn, schema):
             SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
             FROM trips_raw USING SAMPLE {SAMPLE_ROWS} ROWS
         """)
-        v_landed = engine.table_version(conn._table_path(schema, "trips"),
-                                        conn.storage_options)   # the snapshot we'll time-travel back to
+        _det = conn.sql("DESCRIBE DETAIL trips")                 # the snapshot we'll time-travel back to
+        v_landed = dict(zip(_det.columns, _det.fetchone()))["version"]
         n_trips = q("SELECT count(*) FROM trips")
         bad = q("SELECT count(*) FROM trips WHERE fare <= 0")
         results.append(_row("Land trips sample", 0, n_trips, SAMPLE_ROWS, n_trips == SAMPLE_ROWS, bad == 0,
@@ -359,8 +358,11 @@ def run_taxi_demo(conn, schema):
     with _step(5, "Catalog: the Delta tables this demo landed — with their real storage locations") as say:
         tbls = sorted(r[0] for r in conn.sql(
             f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'").fetchall())
-        _table([(t, _trim_loc(conn._table_path(schema, t))) for t in tbls], ["table", "location (real Delta dir)"],
-               f"  tables in '{schema}'")
+        locs = []
+        for t in tbls:                                          # DESCRIBE DETAIL → each table's location
+            d = conn.sql(f'DESCRIBE DETAIL {schema}."{t}"')
+            locs.append((t, _trim_loc(dict(zip(d.columns, d.fetchone()))["location"])))
+        _table(locs, ["table", "location (real Delta dir)"], f"  tables in '{schema}'")
         say(f"{len(tbls)} Delta tables — each a real directory with a _delta_log at the location shown")
 
     # 6 ── raw-DML INSERT (append a late-arriving batch) ──────────────────────────────────────────
@@ -457,9 +459,11 @@ def run_taxi_demo(conn, schema):
         still = q("SELECT count(*) FROM trips WHERE payment = 'Cash'")
         results.append(_row("DELETE Cash trips", before, after, before - cash, after == before - cash, still == 0,
                             time.perf_counter() - t0))
-        path = conn._table_path(schema, "trips").replace("\\", "/")
-        _emit('  <pre class="py"># SQL time travel — read the snapshot we landed at, by version, via delta_scan:\n'
-              f"conn.sql(\"SELECT count(*) FROM delta_scan('<trips path>', version => {v_landed})\").fetchone()[0]</pre>")
+        _dd = conn.sql("DESCRIBE DETAIL trips")                  # the table's location, straight from SQL
+        path = dict(zip(_dd.columns, _dd.fetchone()))["location"].replace("\\", "/")
+        _emit('  <pre class="py"># SQL time travel — location from DESCRIBE DETAIL, then delta_scan by version:\n'
+              'loc = conn.sql("DESCRIBE DETAIL trips").fetchone()[3]   # the location column\n'
+              f"conn.sql(\"SELECT count(*) FROM delta_scan('&lt;loc&gt;', version =&gt; {v_landed})\").fetchone()[0]</pre>")
         at_landed = conn.sql(
             f"SELECT count(*) FROM delta_scan('{path}', version => {v_landed})").fetchone()[0]
         how = f"delta_scan(version => {v_landed})"
@@ -570,14 +574,16 @@ def run_taxi_demo(conn, schema):
     # 16 ── attach a second lakehouse as a named catalog ────────────────────────────────────────────
     with _step(16, "conn.attach(path, name='scratch'): bring a second lakehouse in as a catalog") as say:
         scratch_path = tempfile.mkdtemp(prefix="duckrun_scratch_")
-        primary = conn._current_catalog
+        primary = conn.sql("SELECT current_database()").fetchone()[0]
         _emit('  <pre class="py"># a second lakehouse root becomes a named catalog (could be another\n'
               '# OneLake lakehouse, an S3 bucket, … — here a local scratch dir):\n'
               'conn.attach(scratch_path, name="scratch")\n'
-              'list(conn._catalogs)     # [primary, "scratch"]\n'
-              'conn._current_catalog    # still the primary — attach does NOT switch</pre>')
+              'conn.sql("SELECT database_name FROM duckdb_databases()")   # [primary, "scratch", …]\n'
+              'conn.sql("SELECT current_database()")   # still the primary — attach does NOT switch</pre>')
         conn.attach(scratch_path, name="scratch")
-        _table([(c, "primary (current)" if c == primary else "attached") for c in conn._catalogs],
+        cats = [r[0] for r in conn.sql("SELECT database_name FROM duckdb_databases() "
+                                       "WHERE database_name NOT IN ('system', 'temp', 'memory')").fetchall()]
+        _table([(c, "primary (current)" if c == primary else "attached") for c in cats],
                ["catalog", "role"], "  attached catalogs (each is its own lakehouse root)")
         say(f"attached '{_trim_loc(scratch_path)}' as catalog 'scratch'; current catalog is still '{primary}'")
 
@@ -590,14 +596,15 @@ def run_taxi_demo(conn, schema):
               '         "SELECT borough, round(sum(revenue) * 1.1, 0) AS target_rev "\n'
               '         "FROM mart_zone_revenue GROUP BY borough")\n'
               '# its physical location is under the scratch root:\n'
-              'conn._table_path("dbo", "borough_targets", catalog="scratch")</pre>')
+              'conn.sql("DESCRIBE DETAIL scratch.dbo.borough_targets")   # the location column</pre>')
         _sql(conn, """
             CREATE OR REPLACE TABLE scratch.dbo.borough_targets AS
             SELECT borough, round(sum(revenue) * 1.1, 0) AS target_rev
             FROM mart_zone_revenue GROUP BY borough
         """)
         n_tgt = q("SELECT count(*) FROM scratch.dbo.borough_targets")
-        landed = conn._table_path("dbo", "borough_targets", catalog="scratch").replace("\\", "/")
+        _ld = conn.sql("DESCRIBE DETAIL scratch.dbo.borough_targets")
+        landed = dict(zip(_ld.columns, _ld.fetchone()))["location"].replace("\\", "/")
         in_scratch = scratch_path.replace("\\", "/") in landed
         results.append(_row("Cross-catalog write (scratch)", 0, n_tgt, n_tgt, n_tgt > 0, in_scratch,
                             time.perf_counter() - t0))
@@ -628,11 +635,11 @@ def run_taxi_demo(conn, schema):
               '# fail-loud rails (both raise — no state change):\n'
               'conn.attach(scratch_path, name="dup")              # one URL ↔ one name\n'
               'conn.sql("INSERT INTO scratch.dbo.borough_targets VALUES (\'Z\', 0)")  # cross-catalog raw DML</pre>')
-        primary_db = conn._current_database                      # restore the primary's schema after
-        conn._use("scratch", "dbo")                              # USE is the single switch (reads + writes)
+        primary_db = conn.sql("SELECT current_schema()").fetchone()[0]   # restore the primary's schema after
+        conn.sql("USE scratch.dbo")                              # USE is the single switch (reads + writes)
         unq = q("SELECT count(*) FROM borough_targets")           # resolves in scratch.dbo now
-        switched = conn._current_catalog
-        conn._use(primary, primary_db)
+        switched = conn.sql("SELECT current_database()").fetchone()[0]
+        conn.sql(f'USE "{primary}"."{primary_db}"')
         guards = []
         try:
             conn.attach(scratch_path, name="dup")                # same URL → refused

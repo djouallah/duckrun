@@ -216,9 +216,11 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
             'conn.attach(local_path,     name="local")   # a plain local folder, writable')
         conn.attach(warehouse_path, name="warehouse", schema=REMOTE_SCHEMA, read_only=True)
         conn.attach(local_path, name="local")
-        rows = [(c, "primary" if c == lakehouse else ("read-only" if conn._catalogs[c].read_only else "writable"),
-                 _kind(conn._catalogs[c].root_path)) for c in conn._catalogs]
-        _table(rows, ["catalog", "mode", "storage"], "  attached catalogs")
+        # the demo attached these itself, so it knows their names / modes / roots — no introspection.
+        catalogs = [(lakehouse, "primary (writable)", _kind(conn.root_path)),
+                    ("warehouse", "read-only", _kind(warehouse_path)),
+                    ("local", "writable", _kind(local_path))]
+        _table(catalogs, ["catalog", "mode", "storage"], "  attached catalogs")
         say(f"three catalogs bound to one session; '{lakehouse}' is writable, 'warehouse' is read-only")
 
     # 2 ── THE KEY VISUAL: list every table across all catalogs as catalog.schema.table ─────────────
@@ -228,7 +230,7 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
             '            FROM information_schema.tables\n'
             "            WHERE table_schema NOT IN ('information_schema','pg_catalog','main')\n"
             '            ORDER BY 1, 2, 3""")')
-        rows = conn._connection.execute(
+        rows = conn.sql(
             "SELECT table_catalog, table_schema, table_name FROM information_schema.tables "
             "WHERE table_schema NOT IN ('information_schema','pg_catalog','main') "
             "ORDER BY table_catalog, table_schema, table_name"
@@ -236,7 +238,7 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
         _table([(cat, f"{cat}.{sch}.{tbl}") for cat, sch, tbl in rows] or [("—", "(none yet)")],
                ["catalog", "fully-qualified name (catalog.schema.table)"],
                "  every table the session can see, three-part named")
-        say(f"{len(rows)} tables across {len(conn._catalogs)} catalogs — the warehouse and "
+        say(f"{len(rows)} tables across {len(catalogs)} catalogs — the warehouse and "
             f"lakehouse expose the SAME mart tables; only the warehouse is read-only")
 
     # 3 ── the three ways to name the same table: 3-part → 2-part → 1-part ──────────────────────────
@@ -320,7 +322,8 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
             LEFT JOIN local.dbo.fuel_factors lf ON lower(lf.fuel) = lower(d.FuelSourceDescriptor)
             GROUP BY d.State
         """)
-        landed = conn._table_path(schema, "mart_generation_by_state").replace("\\", "/")
+        det = conn.sql(f"DESCRIBE DETAIL {schema}.mart_generation_by_state")   # location straight from SQL
+        landed = dict(zip(det.columns, det.fetchone()))["location"].replace("\\", "/")
         _table([(s, f"{mw:,.0f}", f"{p:,.2f}", f"{co2:,.0f}") for s, mw, p, co2 in conn.sql(
                     f"SELECT State, total_mw, avg_price, est_tonnes_co2 FROM {schema}.mart_generation_by_state "
                     "ORDER BY total_mw DESC").fetchall()],
