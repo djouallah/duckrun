@@ -40,12 +40,35 @@ conn.sql("CREATE OR REPLACE TABLE orders_copy AS SELECT * FROM orders")
 conn.sql("SELECT * FROM orders_copy").show()
 ```
 
+## It's just DuckDB SQL (plus three Delta bits)
+
+Everything you run through `conn.sql()` is **standard DuckDB SQL, parsed and executed by DuckDB** —
+reads, CTEs, `SHOW`/`DESCRIBE`, `CREATE TEMP`/`CREATE VIEW` scratch, all of it. There is no second SQL
+dialect and no DataFrame API to learn; `conn.sql()` hands back DuckDB's own relation.
+
+duckrun layers exactly two things on top:
+
+1. **Write DML runs against Delta, not a DuckDB table.** `CREATE TABLE … AS`, `INSERT`, `UPDATE`,
+   `DELETE`, `MERGE`, `ALTER TABLE … ADD COLUMN`, and `DROP TABLE` are written in ordinary DuckDB SQL
+   syntax, but duckrun routes them to delta-rs so they land on the Delta table (local or OneLake) with
+   snapshot fencing — see the [DML matrix](#raw-sql-dml-through-connsql).
+2. **Three Delta-specific extensions** DuckDB has no syntax for. These are the *only* places duckrun's
+   SQL isn't vanilla DuckDB:
+
+   | Extension | What it is |
+   |---|---|
+   | `CREATE TABLE … SORTED BY AUTO AS …` | duckrun profiles the data and picks the clustering key. (`SORTED BY (cols)` and `PARTITIONED BY (cols)` without `AUTO` are DuckDB's *own* CTAS syntax — not extensions.) |
+   | `VACUUM <table>` | DuckDB's `VACUUM` verb, repurposed to compact + vacuum the Delta table (plain DuckDB `VACUUM` is a stats no-op). |
+   | `INSERT INTO <t> REPLACE WHERE <pred> SELECT …` | delta_rs `replaceWhere` — an atomic slice overwrite (the Databricks spelling). |
+
+Everything else is portable DuckDB SQL — the same query runs on plain DuckDB.
+
 ## In-memory data — `conn.register`
 
 Register a local pandas / polars / pyarrow object (or a DuckDB relation) under a name, then read it
-in SQL — no wrapper, no import of a duckrun type. This is the `createDataFrame` replacement.
-Registration is explicit because DuckDB's replacement scan only sees the immediate calling frame
-(the `conn.sql` method), not yours, so a bare `conn.sql("FROM df")` can't find a caller-local `df`.
+in SQL — no wrapper, no import of a duckrun type. Registration is explicit because DuckDB's
+replacement scan only sees the immediate calling frame (the `conn.sql` method), not yours, so a bare
+`conn.sql("FROM df")` can't find a caller-local `df`.
 
 ```python
 import pandas as pd

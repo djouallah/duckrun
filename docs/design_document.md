@@ -6,16 +6,14 @@
 
 - give **dbt** Delta Lake support, writing through **delta_rs** — a pragmatic workaround,
   since DuckDB's native Delta writer appears tied to a Unity Catalog;
-- offer a **deliberately small DataFrame API** (shaped like the Spark / Delta `DeltaTable`
-  surface) to read and write Delta;
-- offer **SQL DML** (`conn.sql(...)`) to read and write Delta.
+- offer **SQL DML** (`conn.sql(...)`) to read and write Delta from a notebook — the same engine
+  the dbt adapter uses, exposed as a small, SQL-first connection API.
 
-**Anti-goal** — duckrun is *not* reimplementing Spark:
+**Anti-goal** — duckrun is *not* an engine and *not* a DataFrame library:
 
-- no extensive Spark DataFrame API (no fluent `select` / `filter` / `withColumn` transform
-  builder) and no Spark SQL engine;
-- transforms are written in **SQL**; the surface above is only the parity layer that makes
-  notebook code read familiarly. duckrun stays glue — it does not grow into an engine.
+- no fluent transform builder (`select` / `filter` / `withColumn`) and no second SQL engine;
+- transforms are written in **DuckDB SQL**; duckrun stays glue over DuckDB + delta_rs — it does
+  not grow into an engine.
 
 
 

@@ -32,127 +32,111 @@ Only the table being **written** is fenced. A table you merely read as an input 
 didn't modify it, so there is no lost update to prevent. `read_version` is **required** on every
 fenced path; a brand-new table's first write is a plain create (`write_delta`), never fenced.
 
-**Where the references sit.** SQL Server SNAPSHOT is the *behavioral* reference; Spark + Delta is the
-*API and OCC* reference. duckrun copies both surfaces, then — *on the read-modify-write paths only* —
-tightens the conflict window to the version you **read**, deliberately rejecting some races that
-Spark's commit-instant OCC would accept, so that no decision is ever committed on stale data. The
-fast, Spark-identical unfenced paths (plain `append`/`overwrite`) stay available; the extra strictness
-applies only when you opt in (a `DeltaTable` handle, a fenced writer mode, or the dbt path).
+**Where the references sit.** SQL Server SNAPSHOT is the *behavioral* reference; **Spark + Delta is the
+concurrency-model reference** — delta-rs is the Rust port of Delta's commit protocol, so the same OCC
+semantics carry over (append is non-conflicting; delete/update/merge are conflict-checked). duckrun
+copies that model, then — on the read-modify-write paths only — tightens the conflict window to the
+version you **read**, deliberately rejecting some races that Spark's commit-instant OCC would accept, so
+that no decision is committed on stale data. The fast, unfenced paths (a plain append/overwrite of new
+data) stay identical to Spark's; the extra strictness applies only where a read feeds the write.
 
 ## How it's enforced: two mechanisms
 
-Both pin with `DeltaTable.load_as_version(read_version)`. They differ in *how strict* the rejection
-is, and that difference is forced by the operation:
+Both pin with `load_as_version(read_version)`. They differ in *how strict* the rejection is, and that
+difference is forced by the operation:
 
 | Operation | Mechanism | Fails when… |
 |---|---|---|
-| `merge`, `delete`, `update` | native OCC (`load_as_version` + the op) | a **conflicting** commit landed since `V` (same rows/files) |
-| `append_if_unchanged`, `overwrite_if_unchanged`, `replaceWhere` | strict version CAS (`load_as_version` + `max_commit_retries=0`) | **any** commit landed since `V` |
+| `MERGE`, `DELETE`, `UPDATE` | native OCC (`load_as_version` + the op) | a **conflicting** commit landed since `V` (same rows/files) |
+| self-referential append, `REPLACE WHERE`, sort-rewrite overwrite | strict version CAS (`load_as_version` + `max_commit_retries=0`) | **any** commit landed since `V` |
 
-Why the asymmetry: delete/update/merge have a real read-set, so delta-rs detects genuine conflicts
-and rebases non-conflicting commits. An append/overwrite reads *nothing* from the target, so
-`load_as_version` alone is inert (no read-set to validate, delta-rs would just rebase onto HEAD) —
-`max_commit_retries=0` is the only thing that makes it fail-loud. So a `delete` tolerates an
-unrelated concurrent append, while a fenced append fails on *any* movement. This is also exactly how
-SQL Server SNAPSHOT behaves: abort on a write-write **conflict**, not on every concurrent commit.
+Why the asymmetry: delete/update/merge have a real read-set, so delta-rs detects genuine conflicts and
+rebases non-conflicting commits. An append/overwrite reads *nothing* from the target, so
+`load_as_version` alone is inert (delta-rs would just rebase onto HEAD) — `max_commit_retries=0` is the
+only thing that makes it fail-loud. So a `DELETE` tolerates an unrelated concurrent append, while a
+fenced write fails on *any* movement. This is exactly how SQL Server SNAPSHOT behaves.
 
-## The `DeltaTable` handle is the snapshot scope
+## What's fenced, through `conn.sql`
 
-For the connection API the handle is the poor-man's `BEGIN TRAN`:
+Every write is one SQL statement, and duckrun fences it **automatically** — there is no handle to
+manage and no mode to pick:
 
-```python
-dt = DeltaTable.forName(conn, "orders")   # captures version V here
-# ... time passes, another writer may commit ...
-dt.delete("status = 'cancelled'")          # pinned to V; fails loud if orders moved since V
-```
+| Statement | Fenced? |
+|---|---|
+| `MERGE INTO t …`, `DELETE FROM t …`, `UPDATE t …` | **yes** — the target version is captured and the commit validates against it (conflict-checked OCC) |
+| `INSERT INTO t SELECT … FROM t` (read-modify-append on the **same** table) | **yes** — detected by name and committed compare-and-swap (any movement fails it) |
+| `INSERT INTO t REPLACE WHERE <pred> …` (replaceWhere) | **yes** — single atomic commit, version CAS |
+| `CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t` (re-cluster) | **yes** — the overwrite is pinned to the version read |
+| `INSERT INTO t VALUES …` / `INSERT INTO t SELECT … FROM other` (append of new data) | **no** — additive, last-writer-safe; nothing to lose |
+| `CREATE OR REPLACE TABLE t AS …` (full rebuild) | **no** — last-writer-wins by design |
 
-- `conn.table(name)` / `DeltaTable.forName` capture the version **once**, when the handle is taken.
-- `merge` / `delete` / `update` through that handle all pin to that captured `V`.
-- After a *successful* mutation the handle **re-snapshots** to the new HEAD, so a second mutation on
-  the same handle only fails on a *foreign* write, never on its own previous write.
-
-`append`/`overwrite` are unfenced by design (below) and are not part of the handle.
+A single `MERGE`/`DELETE`/`UPDATE` is self-contained: it reads and writes `t` in one statement, so its
+own read version is the fence. A self-referential `INSERT … SELECT … FROM t` (e.g. a
+`max(ts) FROM t` watermark) is recognised by name and fenced the same way. Only a plain append of
+genuinely new data, or a full rebuild, is unfenced — correct, because neither can lose a concurrent
+writer's change.
 
 ## The dbt path
 
-The dbt incremental materialization does this automatically every run: it captures the target
-version `vB` before the model runs, pins the model's `{{ this }}` read to it
-(`delta_scan('…', version => vB)` — the reason for the duckdb 1.5.4 floor), and pins the merge
-commit to `vB`. Read and write agree on one snapshot. Version-by-version proof through a real
-`dbt run` is in **[snapshot-pin.md](snapshot-pin.md)**.
+The dbt incremental materialization does this every run: it captures the target version `vB` before
+the model runs, pins the model's `{{ this }}` read to it (`delta_scan('…', version => vB)` — the
+reason for the duckdb 1.5.4 floor), and pins the merge/overwrite commit to `vB`. Read and write agree
+on one snapshot. Version-by-version proof through a real `dbt run` is in
+**[snapshot-pin.md](snapshot-pin.md)**.
 
-## Fenced vs unfenced writer modes
+## Lazy reads
 
-`mode("append")` and `mode("overwrite")` are **unfenced by design**, matching Spark's `SaveMode`:
-append never fails on a concurrent write; overwrite is last-writer-wins. Keeping them unfenced
-preserves the fast, high-concurrency append path. Each has a fenced compare-and-swap sibling:
-
-| Unfenced (Spark `SaveMode`) | Fenced sibling | Fails if the table moved since the read version |
-|---|---|---|
-| `mode("append")` | `mode("append_if_unchanged")` | yes (any movement) |
-| `mode("overwrite")` | `mode("overwrite_if_unchanged")` | yes (any movement) |
-
-
-
-**Lazy reads.** DuckDB relations are lazy: `conn.table("x")` / `conn.sql(...)` read nothing — the
-relation runs only when `.write` does. So the read, the dedup, and the commit all happen inside the
-one write call, and the fenced modes capture `read_version` at **write time**; the CAS fences that
-whole window. duckrun cannot pin an append's *read* to a version (delta-rs has no such API) and
-doesn't need to — the guarantee lives entirely in the commit. The only time read and write sit at
-genuinely different versions is when you **materialize** and act later; that is what the handle is
-for (it carries `V` explicitly).
+DuckDB relations are lazy (exactly like Spark DataFrames): a `conn.sql(...)` read runs nothing until a
+write consumes it. So for a self-referential write, the read, the compute, and the commit all happen
+inside one statement, and the CAS fences that whole window. The only time read and write sit at
+genuinely different versions is when you **materialize** a result (`.df()` / `.arrow()`) and write it
+back in a *separate* statement — then you are back to the read-modify-write problem, and you should
+express it as a single `MERGE` / `REPLACE WHERE` so the fence applies.
 
 ## vs Spark + Delta
 
-duckrun deliberately mirrors the Delta-on-Spark surface — `DeltaTable.forName`,
-`.merge(...).whenMatched*/whenNotMatched*`, `delete`, `update`, `SaveMode` append/overwrite,
-`replaceWhere` — and runs on the same OCC model (delta-rs is the Rust port of Delta's commit
-protocol), so semantics carry over: append is non-conflicting, delete/update/merge are
-conflict-checked, `SaveMode.Append`/`Overwrite` are unfenced.
+duckrun runs on the **same OCC model** as Spark + Delta — delta-rs is Delta's commit protocol in Rust —
+so the semantics carry over: an append is non-conflicting, `DELETE`/`UPDATE`/`MERGE` are
+conflict-checked, and a full overwrite is last-writer-wins.
 
 The one real difference is **where the read version comes from**:
 
 | | Spark + Delta | duckrun |
 |---|---|---|
-| `DeltaTable.merge/delete/update` | reads HEAD at execution; OCC checks only the commit instant | pinned to the version captured at handle construction (`vB`), so a read-modify-write **split across statements** is fenced |
-| Fenced append (watermark insert) | no built-in; you write a `MERGE` | `append_if_unchanged` — a lighter version CAS |
-| `replaceWhere` | overwrite option | single atomic commit + version CAS (`replace_where`) |
-| `SaveMode.Append` / `Overwrite` | unfenced | unfenced (identical) |
-| Multi-table transaction | ❌ | ❌ |
+| `MERGE` / `DELETE` / `UPDATE` | reads HEAD at execution; OCC checks the commit instant | pinned to the version read, so a read-modify-write is fenced to *that* version |
+| read-modify-append (watermark) | you write a `MERGE` | a self-referential `INSERT … SELECT … FROM t` is auto-fenced (version CAS) |
+| replaceWhere | overwrite option | a single atomic `INSERT … REPLACE WHERE` commit + version CAS |
+| append / overwrite of new data | unfenced | unfenced (identical) |
+| multi-table transaction | ❌ | ❌ |
 
 In short: Spark/Delta fence the **commit instant** and leave the read-to-write gap to `MERGE` or
-job-level retry. duckrun makes the **read version** the thing you fence to — captured at the handle
-or at `vB` — and adds the lighter `append_if_unchanged` for the watermark case Spark has no built-in for.
+job-level retry; duckrun makes the **read version** the thing you fence to, and recognises a
+self-referential append so the watermark case is fenced without you having to write a `MERGE`.
 
 ## vs an RDBMS, and what duckrun does *not* provide
 
 | System | Mechanism | Scope | Multi-table txn |
 |---|---|---|---|
-| **duckrun** | OCC on the Delta version log; explicit handle / per-op pin | single table | ❌ |
+| **duckrun** | OCC on the Delta version log; per-statement pin | single table | ❌ |
 | **delta-rs / Spark + Delta** | OCC on the `_delta_log` | single table | ❌ |
 | **SQL Server** | transactions + isolation levels (lock or MVCC) | multi-statement, multi-table | ✅ |
 | **Postgres** | MVCC; `SERIALIZABLE` (SSI) | multi-statement, multi-table | ✅ |
 
 An RDBMS gets all of this "for free" because it **owns its storage and runs a transaction manager** —
-`BEGIN TRAN … COMMIT` under `SNAPSHOT` spans statements and tables. duckrun owns none of that; it is
-a library over a shared lakehouse. So the **handle is the stand-in for `BEGIN TRAN`**, deliberately
-single-table. What a lakehouse can't honestly provide, and duckrun therefore doesn't:
+`BEGIN TRAN … COMMIT` under `SNAPSHOT` spans statements and tables. duckrun owns none of that; it is a
+library over a shared lakehouse. So each statement's read version *is* its transaction scope,
+deliberately single-table. What a lakehouse can't honestly provide, and duckrun therefore doesn't:
 
 - **Multi-table transactions** — Delta commits one table at a time.
 - **Pessimistic locking / blocking** — lakehouses are optimistic-only; writers fail-and-retry, never block.
-- **Isolation across a _materialized_ read** — DuckDB relations are lazy (exactly like Spark
-  DataFrames), so a `conn.sql` read that feeds a fenced `.write` is pinned at **write** time even when
-  the read and the write are separate calls — read and commit land on one snapshot, and the CAS fences
-  the window. The gap opens only if you **materialize** (`.toPandas()` / `collect()`) and write the
-  result back later, so the read and the write genuinely sit at different versions. That is what the
-  `DeltaTable` handle is for — it carries the read version explicitly. Spark + Delta behaves
-  identically: a lazy DataFrame read→write is fenced at the commit; a collected-then-written result is
-  not, and you reach for a `MERGE` or an explicit version check.
+- **Isolation across a _materialized_ read** — a result you collect and write back in a later
+  statement sits at a different version than you read; express the read-modify-write as a single
+  `MERGE` / `REPLACE WHERE` statement so the fence applies.
 
 ## Further reading
 
 - **[Snapshot pin — version by version](snapshot-pin.md)** — the dbt MERGE pin proved through a real
   `dbt run` (silent data loss vs a loud, safe failure).
 - **[How far Python alone can take you on Delta](https://datamonkeysite.com/2026/05/24/how-far-python-alone-can-take-you-on-delta/)**
-  — the manual, pure-Python version of this pattern (`vB = DeltaTable(path).version()`, pin the read
-  and the merge to `vB`, catch `CommitFailedError`, retry). duckrun automates exactly this.
+  — the manual, pure-Python version of this pattern (read the version, pin the read and the merge to
+  it, catch `CommitFailedError`, retry). duckrun automates exactly this.
