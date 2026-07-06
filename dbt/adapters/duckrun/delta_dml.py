@@ -566,6 +566,46 @@ def _split_relation(rel: str) -> Tuple[Optional[str], Optional[str]]:
     return schema, identifier
 
 
+_BARE_IDENT = re.compile(r"[A-Za-z_][\w$]*", re.A)
+
+
+def _is_clean_relation(rel: str) -> bool:
+    """True if ``rel`` is a well-formed 1/2/3-part name: dot-separated parts, each a double-quoted
+    span or a bare identifier. Rejects a rel that carries STRAY TOKENS after the name — which is what
+    an unrecognised layout clause leaves behind (e.g. ``t SORT BY AUTO`` — a mis-spelled ``SORTED BY``
+    that would otherwise be silently baked into the table name, creating a spaces-in-name Delta table).
+    A name that genuinely contains spaces must be quoted (``"my table"``)."""
+    s = rel.strip()
+    n, i = len(s), 0
+    while True:
+        if i < n and s[i] == '"':                       # quoted part — opaque, may hold spaces/dots
+            j = i + 1
+            while j < n:
+                if s[j] == '"':
+                    if j + 1 < n and s[j + 1] == '"':   # "" — an escaped quote inside the name
+                        j += 2
+                        continue
+                    break
+                j += 1
+            else:
+                return False                            # unterminated quote
+            i = j + 1
+        else:                                           # bare identifier
+            mo = _BARE_IDENT.match(s, i)
+            if not mo:
+                return False
+            i = mo.end()
+        while i < n and s[i].isspace():                 # whitespace is allowed only around the dots
+            i += 1
+        if i >= n:
+            return True
+        if s[i] != ".":
+            return False                                # a stray token after the part → malformed
+        i += 1
+        while i < n and s[i].isspace():
+            i += 1
+
+
 def _lead_alias(text: str) -> Optional[str]:
     """The optional ``[AS] <alias>`` on a MERGE target (the text between the table and USING)."""
     s = re.sub(r"(?i)^as\s+", "", text.strip())
@@ -904,6 +944,11 @@ class _DeltaDML:
     # -- create table <rel> as <query>: always materialize as a duckrun Delta table ------------
     def _create_as(self, m) -> bool:
         rel, sort_cols, partition_cols = _split_create_layout(m.group("rel").strip())
+        if not _is_clean_relation(rel):
+            raise ValueError(
+                f"CREATE TABLE target {rel!r} has stray tokens after the table name. The layout "
+                f"clauses are SORTED BY (cols) | SORTED BY AUTO | PARTITIONED BY (cols) — check the "
+                f"spelling (it's SORTED BY, not SORT BY); quote the name if it truly has spaces.")
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
@@ -961,6 +1006,10 @@ class _DeltaDML:
         if self.default_schema is None:
             return False
         rel = m.group("rel").strip()
+        if not _is_clean_relation(rel):
+            raise ValueError(
+                f"CREATE TABLE target {rel!r} has stray tokens after the table name; quote the name "
+                f"if it truly has spaces.")
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False

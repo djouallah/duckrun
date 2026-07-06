@@ -761,6 +761,30 @@ def test_dotted_name_sites_are_quote_aware():
     assert dml_target_catalog('insert into cat.sch."a.b" select 1') == "cat"
 
 
+def test_malformed_create_layout_fails_loud_and_writes_nothing(tmp_path):
+    # Regression: a mis-spelled layout clause (SORT BY AUTO — the correct spelling is SORTED BY) is
+    # NOT peeled off the CREATE target, so it used to leak into the table name and SILENTLY create a
+    # spaces-in-name Delta table (data committed, then the view step failed — a partial write). That
+    # garbage table later broke get_stats on abfss. It must now fail loud BEFORE any write and leave
+    # nothing behind; a genuinely quoted name with spaces still works.
+    from dbt.adapters.duckrun.delta_dml import _is_clean_relation
+    assert _is_clean_relation("c.s.t") and _is_clean_relation('"my table"')
+    assert not _is_clean_relation("t SORT BY AUTO")
+
+    wh = str(tmp_path / "wh")
+    conn = duckrun.connect(wh, schema="dbo", read_only=False)
+    for stmt in ["CREATE OR REPLACE TABLE dbo.fct SORT BY AUTO AS SELECT 1 AS a",  # CTAS
+                 "CREATE OR REPLACE TABLE dbo.fct SORT BY AUTO (a int)"]:          # empty coldefs
+        with pytest.raises(ValueError, match="stray tokens"):
+            conn.sql(stmt)
+    dbo = tmp_path / "wh" / "dbo"
+    assert not (dbo / "fct SORT BY AUTO").exists()   # the malformed write left no directory
+    # the correct clause and a legitimately-quoted spaced name both still write
+    conn.sql("CREATE OR REPLACE TABLE dbo.good SORTED BY AUTO AS SELECT 1 AS a")
+    conn.sql('CREATE OR REPLACE TABLE dbo."my report" AS SELECT 1 AS a')
+    assert sorted(p.name for p in dbo.iterdir()) == ["good", "my report"]
+
+
 def test_partial_insert_null_fills_and_keeps_type(tmp_path):
     # INSERT with a column list shorter than the table null-fills the rest — and the omitted column
     # keeps its declared type (no drift to a nullable string).
