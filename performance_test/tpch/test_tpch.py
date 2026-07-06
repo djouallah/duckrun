@@ -8,10 +8,11 @@ Ported from the Fabric/OneLake multi-engine notebook. Differences:
     branches are gone; there is nothing to compare against locally.
   * Local storage — data and results live under a local folder, no abfss/OneLake.
   * Ingestion lands the generated parquet as Delta through the duckrun **write** path
-    (``conn.read.parquet(...).write.saveAsTable``), so the benchmark exercises the writer (the
-    read-layout profile) AND the DuckDB read side of the 22 queries — a real-world write+read test,
-    not a zero-copy ``convert_to_deltalake`` that only writes the ``_delta_log``.
-  * Results are saved with the duckrun DataFrame API (createDataFrame + saveAsTable),
+    (``conn.sql("CREATE OR REPLACE TABLE … AS SELECT * FROM read_parquet(…)")``), so the benchmark
+    exercises the writer (the read-layout profile) AND the DuckDB read side of the 22 queries — a
+    real-world write+read test, not a zero-copy ``convert_to_deltalake`` that only writes the
+    ``_delta_log``.
+  * Results are saved as a Delta table via plain SQL (CREATE TABLE + INSERT),
     not pandas write_deltalake.
 
 The end-to-end flow is :func:`run_tpch_benchmark`, parameterized by scale factor. ``test_tpch_local``
@@ -752,7 +753,8 @@ def _execute_queries(conn, sql_script):
 def _generate_tables(conn, sf, schema):
     """Generate TPCH parquet with tpchgen-cli (one ``--parts`` subdirectory per table) into a scratch
     dir, then land each table as Delta through the duckrun **write** path
-    (``conn.read.parquet(...).write.saveAsTable``). This deliberately exercises the writer — the
+    (``conn.sql("CREATE OR REPLACE TABLE … AS SELECT * FROM read_parquet(…)")``). This deliberately
+    exercises the writer — the
     read-layout profile (SNAPPY, 6M row groups, 8MB dictionaries, 128MB files) — AND the DuckDB reads of
     the 22 queries, rather than a zero-copy ``convertToDelta`` that only writes the ``_delta_log``.
     One-time — skipped when the tables already exist.
@@ -800,7 +802,7 @@ def _generate_tables(conn, sf, schema):
 
 def run_tpch_benchmark(sf=1, base_path=None, timings_out=None):
     """Generate (once) TPCH SF=``sf`` locally as Delta, run the 22 queries through ``conn.sql``, and
-    save the timings with the duckrun DataFrame API (createDataFrame + saveAsTable — no pandas).
+    save the timings as a Delta table via plain SQL (CREATE TABLE + INSERT — no pandas).
     Returns the list of ``{'query', 'dur'}`` query timings.
 
     If ``timings_out`` (a dict) is passed, it is filled with the full run — ``ingestion`` (the
