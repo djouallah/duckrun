@@ -92,6 +92,9 @@ _CLASSIFY = [
     ("alter table t add column x int", "delta"),
     ("drop table t", "delta"),
     ("drop table if exists t", "delta"),
+    ("vacuum t", "delta"),                                   # DuckDB verb → Delta compact + vacuum
+    ("VACUUM ANALYZE t", "delta"),
+    ("vacuum", "passthrough"),                              # bare VACUUM (no operand) → native no-op
     # reject — single-statement forms delta-rs cannot express
     ("update t set x = s.x from s where t.id = s.id", "reject"),
     ("delete from t using s where t.id = s.id", "reject"),
@@ -188,3 +191,35 @@ def test_routed_merge_is_fenced(w, monkeypatch):
     w.sql("MERGE INTO tgt USING src ON target.id = source.id "
           "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
     assert "read_version" in seen and seen["read_version"] is not None
+
+
+# ───────────────────────────────────────────────────────── VACUUM: compact + vacuum via a DuckDB verb
+
+def test_vacuum_compacts_small_files(w):
+    """`VACUUM <table>` repurposes DuckDB's VACUUM verb for Delta maintenance — it compacts the small
+    files that many appends leave behind (and vacuums tombstones) via the same engine.optimize the auto-
+    maintenance uses. Active file count drops; no rows are lost."""
+    w.sql("CREATE OR REPLACE TABLE m AS SELECT 1 AS id")
+    for i in range(2, 8):
+        w.sql(f"INSERT INTO m VALUES ({i})")
+
+    def nfiles():
+        return len(engine._delta_table(w._table_path("dbo", "m"), None).file_uris())
+
+    before = nfiles()
+    assert before >= 6                                     # one file per append, uncompacted
+    status = w.sql("VACUUM m")
+    assert status.fetchone()[0] == "ok"                    # native status relation, like other DML
+    assert nfiles() < before                               # compacted into fewer files
+    assert w.sql("select count(*) from m").fetchone()[0] == 7   # every row preserved
+
+
+def test_vacuum_refused_on_read_only(tmp_path):
+    """VACUUM writes (compacted files + tombstone GC), so a read-only session refuses it loudly rather
+    than silently mutating the store."""
+    wdir = str(tmp_path / "wh")
+    w = duckrun.connect(wdir, schema="dbo", read_only=False)
+    w.sql("CREATE OR REPLACE TABLE r AS SELECT 1 AS id")
+    ro = duckrun.connect(wdir, schema="dbo")               # read_only is the default
+    with pytest.raises(PermissionError):
+        ro.sql("VACUUM r")

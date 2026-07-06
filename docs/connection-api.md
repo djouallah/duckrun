@@ -159,7 +159,10 @@ conn.sql("CREATE OR REPLACE TABLE sales SORTED BY AUTO AS SELECT * FROM stg_sale
 duckrun extension. A plain `… AS SELECT … ORDER BY …` also clusters the write. See
 [Automatic sort](automatic-sort.md) and [the parquet layout](parquet-layout.md).
 
-> **Gaps (for now):** in-place `optimize`/compaction, `replaceWhere` (atomic slice overwrite), and
-> explicit history/restore/version have no SQL surface yet. Compaction + vacuum still run
-> automatically after every write, and `conn.get_stats(table)` inspects the physical layout; time
-> travel is `delta_scan('…', version => N)`.
+`VACUUM <table>` — DuckDB's `VACUUM` verb, repurposed for Delta maintenance: it compacts the table's
+small files and vacuums files tombstoned past the retention window (compaction also runs automatically
+after every write; this is the manual button). Read-only sessions refuse it.
+
+> **Gaps (for now):** `replaceWhere` (atomic slice overwrite) and explicit history/restore/version
+> have no SQL surface yet. `conn.get_stats(table)` inspects the physical layout; time travel is
+> `delta_scan('…', version => N)`.

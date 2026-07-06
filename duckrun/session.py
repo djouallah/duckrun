@@ -28,6 +28,7 @@ from ._runtime import check_runtime_versions
 # TEMP/TEMPORARY TABLE and CREATE VIEW are DuckDB-local scratch by design and pass through.
 _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
+_VACUUM_WRITE_RE = re.compile(r"^vacuum\s+(?:analyze\s+)?[\"\w]", re.IGNORECASE)
 _DML_TARGET_RE = re.compile(
     r"^(?:insert\s+into|delete\s+from|update)\s+(?P<rel>\"?[\w.]+\"?)", re.IGNORECASE)
 _CREATE_TEMP_RE = re.compile(r"^create\s+(or\s+replace\s+)?(temp|temporary)\b", re.IGNORECASE)
@@ -118,6 +119,13 @@ def _is_delta_write(query: str) -> bool:
     if _WRITE_KEYWORD_RE.match(s):
         return True
     return bool(_CREATE_TABLE_RE.match(s)) and not _CREATE_TEMP_RE.match(s)
+
+
+def _is_vacuum(query: str) -> bool:
+    """True if ``query`` is a ``VACUUM <table>`` — duckrun repurposes DuckDB's VACUUM verb to compact
+    and vacuum a Delta table, which WRITES (compacted files + tombstone GC) and so must be caught by
+    the read-only gate. A bare ``VACUUM`` / ``VACUUM ANALYZE`` (no operand) is a DuckDB no-op, not gated."""
+    return bool(_VACUUM_WRITE_RE.match(_strip_leading(query)))
 
 
 # ---- createDataFrame helpers --------------------------------------------------------------
@@ -641,6 +649,11 @@ class DuckSession:
         the files), and ``merge into … using … on … when …`` (delta_rs upsert). After a DML
         statement the catalog is refreshed.
 
+        ``vacuum <table>`` repurposes DuckDB's VACUUM verb for Delta maintenance: it compacts the
+        table's small files (delta_rs ``optimize.compact``, dataChange=false) and vacuums files
+        tombstoned past the retention window. (Compaction also runs automatically after writes; this
+        is the manual button.)
+
         A SQL ``merge`` must reference the literal ``target`` and ``source`` aliases in the ``ON``
         condition and ``WHEN`` clauses (``merge into t using s on target.id = source.id when matched
         then update set * when not matched then insert *``) — duckrun renames the merge relations to
@@ -661,8 +674,9 @@ class DuckSession:
         write_cat = target_cat if target_cat is not None else self._current_catalog
         # The read-only gate is the *target* catalog's — a read-only attached store fails loud even
         # when the current catalog is writable. _WRITE_KEYWORD_RE covers insert/update/delete/merge.
-        if self._catalogs[write_cat].read_only and _is_delta_write(query):
-            raise PermissionError(_READ_ONLY_MSG.format(op="run write DML", catalog=write_cat))
+        if self._catalogs[write_cat].read_only and (_is_delta_write(query) or _is_vacuum(query)):
+            op = "vacuum (compact) a table" if _is_vacuum(query) else "run write DML"
+            raise PermissionError(_READ_ONLY_MSG.format(op=op, catalog=write_cat))
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)

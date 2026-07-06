@@ -188,6 +188,14 @@ _ALTER_TAIL = re.compile(r"\b(?:default|not\s+null|null)\b", re.I)
 _DROP = re.compile(
     r"\s*drop\s+table\s+(?:if\s+exists\s+)?(?P<rel>[^\s;]+)\s*;?\s*", re.I | re.S
 )
+# `vacuum [analyze] <table>` — DuckDB's native VACUUM verb, repurposed for Delta maintenance: compact
+# small files (dataChange=false) then vacuum files tombstoned past retention. Only a form WITH a table
+# operand matches; a bare `vacuum` / `vacuum analyze` (no target) falls through to DuckDB (a no-op
+# there), and the `vacuum <table>(col)` stats form doesn't match (trailing paren) so it stays native.
+_VACUUM = re.compile(
+    r"\s*vacuum\s+(?:analyze\s+)?"
+    r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)\s*;?\s*", re.I | re.S
+)
 # `merge into <target> [[as] alias] using <source> ... on ... when ...`. The regex only captures the
 # target relation (a dotted/quoted identifier) and hands the remainder (`rest`) to _merge, which uses
 # _find_top_level/_find_all_top_level to split USING/ON/WHEN at paren-depth 0 — so those keywords
@@ -409,6 +417,7 @@ _C_FROM = re.compile(r"\bfrom\b", re.I)
 _C_USING = re.compile(r"\busing\b", re.I)
 _C_DELTA_HEAD = re.compile(
     r"\s*(?:insert\s+into|update|delete\s+from|merge\s+into|alter\s+table|drop\s+table)\b", re.I)
+_C_VACUUM = re.compile(r"\s*vacuum\s+(?:analyze\s+)?(?:\"|\w)", re.I)  # vacuum <table> → maintenance
 
 
 def classify(sql: str) -> str:
@@ -439,6 +448,8 @@ def classify(sql: str) -> str:
     if _C_CREATE_TABLE.match(inner):            # CREATE [OR REPLACE] TABLE … → Delta-backed
         return "delta"
     if _C_DELTA_HEAD.match(inner):             # insert/update/delete/merge/alter/drop → delta_rs
+        return "delta"
+    if _C_VACUUM.match(inner):                  # vacuum <table> → delta maintenance (compact + vacuum)
         return "delta"
     return "passthrough"                        # select, create view, show, describe, set, pragma, …
 
@@ -815,6 +826,9 @@ class _DeltaDML:
         m = _fullmatch(_DROP, sql)
         if m:
             return self._drop(m)
+        m = _fullmatch(_VACUUM, sql)
+        if m:
+            return self._vacuum(m)
         return False
 
     # -- create table <rel> as <query>: always materialize as a duckrun Delta table ------------
@@ -1232,6 +1246,20 @@ class _DeltaDML:
         self.cursor.execute(f"drop view if exists {rel}")
         return True
 
+    def _vacuum(self, m) -> bool:
+        """`vacuum <table>`: Delta maintenance via DuckDB's native VACUUM verb — compact small files
+        (delta_rs ``optimize.compact``, committed dataChange=false so it's concurrency-safe) then
+        vacuum files tombstoned past the retention window. No snapshot fence is needed: compaction
+        doesn't change data and vacuum only removes already-dead files. Returns False (pass through to
+        DuckDB) if <table> isn't a duckrun-managed Delta table, so a native DuckDB VACUUM still works."""
+        rel = m.group("rel").strip()
+        schema, identifier, loc = self._resolve(rel)
+        if not loc or not self._exists(loc):
+            return False
+        engine.optimize(loc, storage_options=self.so)
+        engine.vacuum(loc, storage_options=self.so)
+        return True
+
 
 def _split_top_level(sql: str) -> List[str]:
     """Split a (comment-stripped) SQL script into its top-level statements — a ``;`` that is outside
@@ -1276,7 +1304,8 @@ def _handle_one(cursor, root_path, storage_options, sql: str, default_schema) ->
     form against a duckrun-managed relation. True if applied to Delta; False to pass through."""
     with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
     head = body[:7].lower()                        # cheap pre-filter: only the candidate DML verbs
-    if not head.startswith(("delete", "update", "insert", "create", "alter", "drop", "merge")):
+    if not head.startswith(("delete", "update", "insert", "create", "alter", "drop", "merge",
+                            "vacuum")):
         return False
     dml = _DeltaDML(cursor, root_path, storage_options, default_schema)
     dml._with_clause = with_clause
