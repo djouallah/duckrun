@@ -800,32 +800,34 @@ def _fs_case_sensitive() -> bool:
 
 @pytest.mark.skipif(not _fs_case_sensitive(),
                     reason="needs a case-sensitive filesystem (Linux CI); Windows/macOS fold Foo/foo on disk")
-@pytest.mark.xfail(reason="case split-brain — known/parked gap: DuckDB's catalog folds Foo == foo, so "
-                          "two on-disk case-variant Delta tables cannot both be exposed; one silently "
-                          "shadows the other.", strict=False)
+@pytest.mark.xfail(reason="case split-brain — known/parked gap: an external engine (Spark/Fabric) can "
+                          "write two case-variant Delta tables; DuckDB's catalog folds Foo == foo, so "
+                          "discovery can only expose one and silently shadows the other.", strict=False)
 def test_case_variant_tables_split_brain(tmp_path):
-    """DEMONSTRATES the parked 'case split-brain' gap — reproducible ONLY on a case-sensitive
-    filesystem, which is exactly why it can't be seen on Windows (there ``Foo/`` and ``foo/`` ARE the
-    same directory, so the scenario never arises).
+    """DEMONSTRATES the parked 'case split-brain' gap, in the scenario that actually matters: two
+    case-variant Delta tables that an EXTERNAL engine (Spark/Fabric) already wrote to the lakehouse —
+    duckrun has no control over that and only discovers what is on disk. Written here straight to disk
+    with write_deltalake to mimic that, NOT through duckrun's write path.
 
-    On Linux ``.../dbo/Foo`` and ``.../dbo/foo`` are two DIFFERENT directories, so duckrun happily
-    writes two Delta tables that differ only by case. But DuckDB's catalog is case-INSENSITIVE (it
-    folds ``Foo == foo`` even when the name is quoted), so on a fresh connect only ONE of the two
-    ``delta_scan`` views survives — the other table's rows sit on disk unreachable through SQL.
+    Reproducible ONLY on a case-sensitive filesystem — which is exactly why it can't be seen on
+    Windows (there ``Foo/`` and ``foo/`` ARE the same directory, so the two tables can't coexist).
 
-    This asserts the DESIRED behaviour (both tables' rows retrievable), so it xfails today and pins
-    the gap; a fix — fold-on-write so the two coalesce into one path, or fail-loud on the second
-    create — flips it to pass. Runs on Linux CI (where it xfails), skipped on a case-folding FS.
+    On Linux ``.../dbo/Foo`` and ``.../dbo/foo`` are two DIFFERENT directories holding two real
+    tables. But DuckDB's catalog is case-INSENSITIVE (it folds ``Foo == foo`` even when quoted), so on
+    connect only ONE of the two ``delta_scan`` views survives — the other table's rows sit on disk
+    unreachable through SQL. Because the tables come from OUTSIDE, a write-side fix (fold/refuse on
+    duckrun's own CREATE) can't help; only DISCOVERY can — fail loud on the collision, or disambiguate
+    the views. This asserts the desired behaviour (both readable), so it xfails today and pins the gap.
     """
-    con = duckrun.connect(str(tmp_path), schema="dbo", read_only=False)
-    con.sql("CREATE OR REPLACE TABLE dbo.Foo AS SELECT 1 AS n")
-    con.sql("CREATE OR REPLACE TABLE dbo.foo AS SELECT 2 AS n")
-    # two genuinely distinct tables now exist on disk (case-sensitive FS)
+    import pyarrow as pa
+    # mimic Spark/Fabric: two case-variant Delta tables written straight to the store, not via duckrun
+    deltalake.write_deltalake(str(tmp_path / "dbo" / "Foo"), pa.table({"n": [1]}))
+    deltalake.write_deltalake(str(tmp_path / "dbo" / "foo"), pa.table({"n": [2]}))
     assert (tmp_path / "dbo" / "Foo").is_dir() and (tmp_path / "dbo" / "foo").is_dir()
-    # a fresh session rediscovers from disk — both case-variants should be independently queryable
-    con2 = duckrun.connect(str(tmp_path), schema="dbo")
-    reachable = {con2.sql('SELECT n FROM dbo."Foo"').fetchone()[0],
-                 con2.sql('SELECT n FROM dbo."foo"').fetchone()[0]}
+    # duckrun discovers the lakehouse — both externally-created tables should be independently queryable
+    con = duckrun.connect(str(tmp_path), schema="dbo")
+    reachable = {con.sql('SELECT n FROM dbo."Foo"').fetchone()[0],
+                 con.sql('SELECT n FROM dbo."foo"').fetchone()[0]}
     assert reachable == {1, 2}   # today: {1} or {2} — one table shadows the other (the split-brain)
 
 
