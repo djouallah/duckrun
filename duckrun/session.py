@@ -658,6 +658,11 @@ class DuckSession:
         tombstoned past the retention window. (Compaction also runs automatically after writes; this
         is the manual button.)
 
+        ``insert into <t> replace where <pred> select …`` (delta_rs ``replaceWhere``, the Databricks
+        spelling): atomically overwrite ONLY the rows matching ``<pred>`` with the SELECT's rows, in a
+        single fenced commit (pinned to the version read — a concurrent write fails it loud). ``<pred>``
+        is a CAST-free expression over the target's columns; partition columns are preserved.
+
         A SQL ``merge`` must reference the literal ``target`` and ``source`` aliases in the ``ON``
         condition and ``WHEN`` clauses (``merge into t using s on target.id = source.id when matched
         then update set * when not matched then insert *``) — duckrun renames the merge relations to

@@ -95,6 +95,7 @@ _CLASSIFY = [
     ("vacuum t", "delta"),                                   # DuckDB verb → Delta compact + vacuum
     ("VACUUM ANALYZE t", "delta"),
     ("vacuum", "passthrough"),                              # bare VACUUM (no operand) → native no-op
+    ("insert into t replace where region = 'eu' select 1 id, 'eu' region", "delta"),  # replaceWhere
     # reject — single-statement forms delta-rs cannot express
     ("update t set x = s.x from s where t.id = s.id", "reject"),
     ("delete from t using s where t.id = s.id", "reject"),
@@ -231,6 +232,39 @@ def test_vacuum_compacts_small_files(w):
     assert status.fetchone()[0] == "ok"                    # native status relation, like other DML
     assert nfiles() < before                               # compacted into fewer files
     assert w.sql("select count(*) from m").fetchone()[0] == 7   # every row preserved
+
+
+# ───────────────────────────────────────────── INSERT … REPLACE WHERE: atomic slice overwrite
+
+def test_insert_replace_where_overwrites_only_the_slice(w):
+    """INSERT INTO t REPLACE WHERE <pred> SELECT … atomically replaces only the matching slice; rows
+    outside the predicate are untouched (delta_rs replaceWhere, one commit)."""
+    w.sql("CREATE OR REPLACE TABLE s PARTITIONED BY (region) AS "
+          "SELECT * FROM (VALUES (1,'eu'),(2,'eu'),(3,'us')) t(id, region)")
+    w.sql("INSERT INTO s REPLACE WHERE region = 'eu' "
+          "SELECT * FROM (VALUES (9,'eu'),(8,'eu')) t(id, region)")
+    counts = dict(w.sql("select region, count(*) from s group by region").fetchall())
+    assert counts == {"eu": 2, "us": 1}                    # eu slice replaced (2 new), us untouched
+    assert sorted(r[0] for r in w.sql("select id from s where region='eu'").fetchall()) == [8, 9]
+    assert w.sql("select id from s where region='us'").fetchone()[0] == 3
+
+
+def test_routed_replace_where_is_fenced(w, monkeypatch):
+    """A routed REPLACE WHERE reaches delta-rs through engine.replace_where WITH a read_version and the
+    parsed predicate — so it's a fenced (CAS) read-modify-write, not a blind-HEAD overwrite."""
+    w.sql("CREATE OR REPLACE TABLE rw AS SELECT * FROM (VALUES (1,'a'),(2,'b')) v(id, name)")
+    seen = {}
+    real = engine.replace_where
+
+    def spy(path, data, predicate, **kw):
+        seen.update(kw)
+        seen["predicate"] = predicate
+        return real(path, data, predicate, **kw)
+
+    monkeypatch.setattr(engine, "replace_where", spy)
+    w.sql("INSERT INTO rw REPLACE WHERE id = 1 SELECT * FROM (VALUES (1,'A')) v(id, name)")
+    assert seen.get("read_version") is not None
+    assert seen["predicate"].strip() == "id = 1"           # predicate split off the body cleanly
 
 
 def test_vacuum_refused_on_read_only(tmp_path):

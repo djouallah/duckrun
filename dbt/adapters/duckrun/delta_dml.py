@@ -160,6 +160,16 @@ _INSERT_VALUES = re.compile(
 # VALUES/SELECT keyword is the first one at depth 0.
 _VALUES_KW = re.compile(r"\bvalues\b", re.I)
 _SELECT_KW = re.compile(r"\bselect\b", re.I)
+# `insert into <t> replace where <pred> <select|values|with …>` — delta_rs replaceWhere: atomically
+# overwrite ONLY the rows matching <pred> with the body, as one fenced commit (Databricks'
+# `INSERT INTO … REPLACE WHERE`). Capture the target and the whole tail; _insert_replace_where splits
+# <pred> from the body at the first TOP-LEVEL query keyword, so a keyword inside a string literal or a
+# subquery in the predicate can't be mistaken for the boundary (same scanners as MERGE).
+_INSERT_REPLACE = re.compile(
+    r"\s*insert\s+into\s+(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)\s+"
+    r"replace\s+where\b(?P<rest>.+)", re.I | re.S,
+)
+_REPLACE_BODY_KW = re.compile(r"\b(?:select|values|with)\b", re.I)
 _DELETE = re.compile(
     r"\s*delete\s+from\s+(?P<rel>.+?)(?:\s+where\s+(?P<where>.+))?\s*;?\s*", re.I | re.S
 )
@@ -799,6 +809,9 @@ class _DeltaDML:
         m = _fullmatch(_CREATE_COLDEFS, sql)
         if m and "__duckrun" not in m.group("rel"):
             return self._create_coldefs(m)
+        m = _fullmatch(_INSERT_REPLACE, sql)
+        if m and "__duckrun" not in m.group("rel"):
+            return self._insert_replace_where(m)
         if _INSERT_INTO_RE.match(sql):
             # Classify VALUES vs SELECT structurally, THEN apply the matching regex — see _insert_kind.
             kind = _insert_kind(sql)
@@ -1258,6 +1271,40 @@ class _DeltaDML:
             return False
         engine.optimize(loc, storage_options=self.so)
         engine.vacuum(loc, storage_options=self.so)
+        return True
+
+    def _insert_replace_where(self, m) -> bool:
+        """`insert into <t> replace where <pred> <select|values>`: delta_rs replaceWhere — atomically
+        overwrite ONLY the rows matching <pred> with the body's rows, as ONE fenced commit (no torn
+        delete-then-append window). Pinned to the version read (CAS, ``max_commit_retries=0``): a
+        concurrent commit since then fails it loud. <pred> is a CAST-free expression over the target's
+        columns (delta_rs/datafusion). Partition columns are preserved. Returns False (pass through) if
+        <t> isn't a live Delta table."""
+        rel = m.group("rel").strip()
+        schema, identifier, loc = self._resolve(rel)
+        if not loc or not self._exists(loc):
+            return False
+        rest = m.group("rest")
+        # Split predicate | body at the first TOP-LEVEL select/values/with — a keyword inside a string
+        # literal, or a subquery in the predicate, sits at depth>0 and can't be the boundary.
+        bi = _find_top_level(rest, _REPLACE_BODY_KW)
+        if bi < 0:
+            raise ValueError("INSERT … REPLACE WHERE requires a SELECT/VALUES body")
+        predicate = rest[:bi].strip()
+        body = rest[bi:].strip()
+        if not predicate:
+            raise ValueError("INSERT … REPLACE WHERE requires a <predicate> before the body")
+        data = self.cursor.sql(body)
+        try:
+            pcols = list(engine._delta_table(loc, self.so).metadata().partition_columns or [])
+        except Exception:
+            pcols = []
+        engine.replace_where(
+            loc, data, predicate,
+            read_version=engine.table_version(loc, self.so),
+            partition_by=(pcols or None),
+            storage_options=self.so, cur=self.cursor)
+        self._refresh_view(rel, schema, loc)
         return True
 
 

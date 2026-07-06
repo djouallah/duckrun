@@ -163,6 +163,10 @@ duckrun extension. A plain `… AS SELECT … ORDER BY …` also clusters the wr
 small files and vacuums files tombstoned past the retention window (compaction also runs automatically
 after every write; this is the manual button). Read-only sessions refuse it.
 
-> **Gaps (for now):** `replaceWhere` (atomic slice overwrite) and explicit history/restore/version
-> have no SQL surface yet. `conn.get_stats(table)` inspects the physical layout; time travel is
-> `delta_scan('…', version => N)`.
+`INSERT INTO <t> REPLACE WHERE <pred> SELECT …` — delta_rs `replaceWhere` (the Databricks spelling):
+atomically overwrite **only** the rows matching `<pred>` with the SELECT's rows, in a single fenced
+commit (pinned to the version read — a concurrent write fails it loud; no torn delete-then-append
+window). `<pred>` is a CAST-free expression over the target's columns; partition columns are preserved.
+
+> **Gaps (for now):** explicit history/restore/version have no SQL surface. `conn.get_stats(table)`
+> inspects the physical layout; time travel is `delta_scan('…', version => N)`.
