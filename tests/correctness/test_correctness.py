@@ -32,7 +32,6 @@ from deltalake import DeltaTable
 from deltalake.exceptions import CommitFailedError
 
 import duckrun
-from duckrun import DeltaTable as DuckrunDeltaTable
 from dbt.adapters.duckrun import engine
 
 
@@ -133,9 +132,13 @@ def root(tmp_path):
 
 
 def _rw(root, name, select_sql, mode="overwrite"):
-    """Write ``select_sql`` into ``dbo.<name>`` through the connection API (the real write path)."""
-    duckrun.connect(root, schema="dbo", read_only=False) \
-        .sql(select_sql).write.mode(mode).saveAsTable(name)
+    """Write ``select_sql`` into ``dbo.<name>`` via SQL (the real write path): overwrite is
+    CREATE OR REPLACE TABLE, append is INSERT INTO — both route through delta_dml → delta-rs."""
+    conn = duckrun.connect(root, schema="dbo", read_only=False)
+    if mode == "append":
+        conn.sql(f"insert into {name} {select_sql}")
+    else:
+        conn.sql(f"create or replace table {name} as {select_sql}")
 
 
 def _read(root, name):
@@ -251,8 +254,7 @@ def test_wide_realistic_10_rows(root):
 def _seed_items(root):
     """``dbo.items(id, name)`` = (1,a),(2,b),(3,c) on a writable connection; returns the connection."""
     conn = duckrun.connect(root, schema="dbo", read_only=False)
-    conn.sql("select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)") \
-        .write.mode("overwrite").saveAsTable("items")
+    conn.sql("create or replace table items as select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)")
     return conn
 
 
@@ -331,7 +333,7 @@ def test_dml_drop_table_tombstones(root):
 def test_dml_lossy_numeric_narrowing_rejected(root):
     """INSERT that would silently change a numeric value on cast (3.9 → 4) must raise, not truncate."""
     conn = duckrun.connect(root, schema="dbo", read_only=False)
-    conn.sql("select (1)::INTEGER as v").write.mode("overwrite").saveAsTable("nums")
+    conn.sql("create or replace table nums as select (1)::INTEGER as v")
     with pytest.raises(Exception):  # noqa: B017 — pin: lossy narrowing is refused at the guard.
         conn.sql("insert into nums select 3.9")
     assert _read(root, "nums") == [(1,)]   # unchanged — the rejected insert left no partial write
@@ -356,70 +358,73 @@ def test_overwrite_replaces_rows(root):
     assert _read(root, "ov") == [(9, "z")]
 
 
-def test_append_if_unchanged_creates_then_appends(root):
-    _rw(root, "sa", "select * from (values (1,'a')) t(id, name)", mode="append_if_unchanged")
-    _rw(root, "sa", "select * from (values (2,'b')) t(id, name)", mode="append_if_unchanged")
-    assert _read(root, "sa") == [(1, "a"), (2, "b")]
+def test_self_referential_insert_is_auto_fenced(root, monkeypatch):
+    """`insert into a select … from a` reads and appends the SAME table, so the append is
+    snapshot-fenced AUTOMATICALLY (the append_if_unchanged behavior, no verb): a concurrent commit
+    landing between the read and the append makes it fail loud instead of appending stale-derived
+    rows. Same read→foreign-commit→write race as the delete/update fence test above."""
+    conn = _seed_items(root)                        # dbo.items = (1,a),(2,b),(3,c) at vB
+    path = _path(root, "items")
+    vB = engine.table_version(path)
+    DeltaTable(path).delete(predicate="id = 3")     # foreign commit -> vB+1
+    monkeypatch.setattr(engine, "table_version", lambda *a, **k: vB)  # source reads target, pinned stale
+    with pytest.raises(CommitFailedError):
+        conn.sql("insert into items select * from items")
+
+
+def test_plain_append_is_not_fenced(root, monkeypatch):
+    """A plain append (new data, no self-reference) is NOT fenced — it references nothing of the
+    target, so a moved HEAD does not block it (last-writer-wins / additive, by design)."""
+    conn = _seed_items(root)
+    path = _path(root, "items")
+    vB = engine.table_version(path)
+    DeltaTable(path).delete(predicate="id = 3")     # foreign commit -> vB+1
+    monkeypatch.setattr(engine, "table_version", lambda *a, **k: vB)  # would be stale IF it fenced
+    conn.sql("insert into items values (9, 'z')")   # unfenced → commits despite the moved HEAD
+    assert (9, "z") in _read(root, "items")
 
 
 MERGE_CASES = [
-    ("insert_only", [(1, 10), (2, 10)], [(2, 99), (3, 99)],
-     lambda b: b.whenNotMatchedInsertAll(),
-     [(1, 10), (2, 10), (3, 99)]),
-    ("update_and_insert", [(1, 10), (2, 10)], [(2, 99), (3, 99)],
-     lambda b: b.whenMatchedUpdateAll().whenNotMatchedInsertAll(),
-     [(1, 10), (2, 99), (3, 99)]),
+    ("insert_only", "(1,10),(2,10)", "(2,99),(3,99)",
+     "WHEN NOT MATCHED THEN INSERT *", [(1, 10), (2, 10), (3, 99)]),
+    ("update_and_insert", "(1,10),(2,10)", "(2,99),(3,99)",
+     "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *", [(1, 10), (2, 99), (3, 99)]),
 ]
 
 
-@pytest.mark.parametrize("case_id,seed,src,build,expected", MERGE_CASES, ids=[c[0] for c in MERGE_CASES])
-def test_merge_strategies(root, case_id, seed, src, build, expected):
+@pytest.mark.parametrize("case_id,seed,src,when_clauses,expected", MERGE_CASES, ids=[c[0] for c in MERGE_CASES])
+def test_merge_strategies(root, case_id, seed, src, when_clauses, expected):
     conn = duckrun.connect(root, schema="dbo", read_only=False)
-    seed_vals = ",".join(f"({i},{v})" for i, v in seed)
-    conn.sql(f"select * from (values {seed_vals}) t(id, val)").write.mode("overwrite").saveAsTable("m")
-    src_vals = ",".join(f"({i},{v})" for i, v in src)
-    source = conn.sql(f"select * from (values {src_vals}) t(id, val)")
-    build(DuckrunDeltaTable.forName(conn, "dbo.m").merge(source, "target.id = source.id")).execute()
+    conn.sql(f"create or replace table m as select * from (values {seed}) t(id, val)")
+    conn.sql(f"MERGE INTO m USING (values {src}) s(id, val) ON target.id = source.id {when_clauses}")
     assert _read(root, "m") == sorted(expected, key=_k)
 
 
 def test_merge_idempotent_remerge(root):
     """Re-merging the same source must not duplicate or mutate rows (idempotency)."""
     conn = duckrun.connect(root, schema="dbo", read_only=False)
-    conn.sql("select * from (values (1,10),(2,10)) t(id, val)").write.mode("overwrite").saveAsTable("mi")
+    conn.sql("create or replace table mi as select * from (values (1,10),(2,10)) t(id, val)")
     for _ in range(2):
-        src = conn.sql("select * from (values (2,99),(3,99)) t(id, val)")
-        DuckrunDeltaTable.forName(conn, "dbo.mi").merge(src, "target.id = source.id") \
-            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+        conn.sql("MERGE INTO mi USING (values (2,99),(3,99)) s(id, val) ON target.id = source.id "
+                 "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
     assert _read(root, "mi") == [(1, 10), (2, 99), (3, 99)]
 
 
 # ── 4. Schema evolution — add column, type-changing overwrite, and incompatible append must fail loudly.
-def test_overwrite_schema_option_changes_column_type(root):
-    """overwrite + option('overwriteSchema') replaces the schema wholesale — int column → string."""
+def test_overwrite_replaces_schema(root):
+    """CREATE OR REPLACE TABLE replaces the schema wholesale — int column → string. (Plain overwrite
+    that casts-to-the-existing-schema was a DataFrame-writer mode with no SQL surface; CTAS always
+    replaces the schema.)"""
     _rw(root, "evo", "select 1 as v")
-    duckrun.connect(root, schema="dbo", read_only=False) \
-        .sql("select 'now a string' as v") \
-        .write.mode("overwrite").option("overwriteSchema", True).saveAsTable("evo")
+    _rw(root, "evo", "select 'now a string' as v")   # create or replace → schema replaced
     assert _read(root, "evo") == [("now a string",)]
 
 
-def test_overwrite_without_schema_option_casts_to_existing_type(root):
-    """Plain overwrite keeps the existing schema and casts — an incompatible type change fails loudly
-    (it does NOT silently drop the schema). This pins the casting boundary: overwriting an INT column
-    with a non-castable string is refused, leaving the table untouched."""
-    _rw(root, "evo2", "select 1 as v")
-    conn = duckrun.connect(root, schema="dbo", read_only=False)
-    with pytest.raises(Exception):  # noqa: B017 — pin: cast failure, not a silent schema swap.
-        conn.sql("select 'not an int' as v").write.mode("overwrite").saveAsTable("evo2")
-    assert _read(root, "evo2") == [(1,)]
-
-
 def test_incompatible_append_fails_loudly(root):
-    """Appending a relation whose schema can't reconcile with the table must raise, not silently drop
-    or coerce columns. (A column-count / name mismatch is the canonical incompatible append.)"""
+    """Appending a value that can't reconcile with the target column type must raise, not silently
+    coerce — a non-numeric string into the INTEGER ``id`` column is refused at the cast."""
     _rw(root, "inc", "select 1 as id, 'a' as name")
     conn = duckrun.connect(root, schema="dbo", read_only=False)
     with pytest.raises(Exception):  # noqa: B017 — pin: incompatible append is refused.
-        conn.sql("select 1 as id, 'a' as name, 999 as extra").write.mode("append").saveAsTable("inc")
+        conn.sql("insert into inc select 'not a number' as id, 'a' as name")
     assert _read(root, "inc") == [(1, "a")]   # table untouched by the rejected append

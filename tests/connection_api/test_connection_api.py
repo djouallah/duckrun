@@ -1,24 +1,23 @@
-"""The duckrun.connect() test suite — one file, three complementary views of the same API.
+"""The duckrun.connect() SQL-only test suite.
 
-1. **Per-method capability matrix** (the ``Test*`` classes) — one discrete test per public
-   method/option, grouped by surface (Session / Catalog / DataFrame / DataFrameReader /
-   DataFrameWriter / DeltaTable / SqlDml). The ``connection-card`` workflow renders *just these
-   classes* (``tests/tools/connection_summary.py``) into the README method scorecard, so each method
-   shows a ✅/❌. Granularity is the point — one concept per test.
+``conn.sql()`` returns DuckDB's native ``DuckDBPyRelation``; every write is SQL (CREATE TABLE AS /
+INSERT / UPDATE / DELETE / MERGE, routed to delta_rs). The suite has three parts:
 
-2. **Local-filesystem contract & plumbing** (``test_*`` functions on the ``wh`` fixture) — discovery,
-   catalog introspection, save-MODE contracts (error/ignore/append_if_unchanged), the connect() error
-   formatting, reader round-trips, and the merge-builder contracts. Behaviour, not data equality.
-   Storage-neutrality (s3/gcs/abfss) shares this exact code path — only the secret/discovery backend
-   differs — so the local run is representative.
+1. **Session plumbing** (``TestSession``) — connect / sql / register / attach / copy / download /
+   list_files / get_stats / convert_to_delta / close, plus ``TestSqlDml`` (the raw-DML matrix:
+   create-as / insert / update / delete / alter-add / drop-tombstone / merge with every clause and
+   the adversarial parsing cases).
 
-3. **Write-correctness matrix** (``test_sql_equals_dataframe`` + the Tier-2/3/4 functions) — does *our
-   glue* land the right Delta data? The load-bearing oracle is **cross-API equivalence**: the same
-   logical write expressed via the SQL API and the DataFrame API must land byte-identical Delta data, so
-   a bug in either path shows up as a mismatch with almost no hand-maintained expected values. Every
-   assertion reads back through a **fresh** ``duckrun.connect`` — which only sees real Delta on disk
-   (discovery globs ``_delta_log``), subsuming the old ``is_deltatable`` boundary check.
+2. **Local-filesystem contract & plumbing** (``test_*`` on the ``wh`` fixture) — discovery, catalog
+   introspection, read-only gate, multi-catalog attach/routing, and the connect() error formatting.
+   Storage-neutrality (s3/gcs/abfss) shares this exact code path, so the local run is representative.
 
+3. **Write-correctness matrix** (``test_sql_write_lands_expected`` + siblings) — does *our glue* land
+   the right Delta data? Each case applies a logical write via SQL and reads it back through a
+   **fresh** ``duckrun.connect`` (real Delta on disk), asserting the golden expected multiset.
+
+Write-options with no DuckDB-SQL surface (optimize / partitionBy / replaceWhere / append_if_unchanged)
+are left as gaps for now; the engine capabilities stay covered by tests/adapter and tests/correctness.
 All local, network-free, serial (duckrun's write path is single-writer). No DAT, no external engine.
 """
 import os
@@ -64,10 +63,9 @@ needs_version_param = pytest.mark.skipif(
 def conn(tmp_path):
     """A connected local-fs session with a seed table `src` (dbo) and a second schema `other`."""
     c = duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False)
-    c.sql("select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)") \
-        .write.mode("overwrite").saveAsTable("src")
-    c.sql("select 7 as n").write.mode("overwrite").saveAsTable("other.thing")
-    return c  # saveAsTable surfaces tables itself — no manual refresh needed
+    c.sql("CREATE OR REPLACE TABLE src AS select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)")
+    c.sql("CREATE OR REPLACE TABLE other.thing AS select 7 as n")
+    return c  # CREATE TABLE AS surfaces the table itself — no manual refresh needed
 
 
 class TestSession:
@@ -97,10 +95,10 @@ class TestSession:
     def test_connection(self, conn):
         assert conn._connection.execute("select 1").fetchone()[0] == 1
 
-    def test_stop(self, conn):
-        conn.stop()  # closes the DuckDB connection (Spark's SparkSession.stop())
+    def test_close(self, conn):
+        conn.close()  # closes the DuckDB connection
         with pytest.raises(Exception):
-            conn.sql("select 1").collect()  # connection is closed -> unusable
+            conn.sql("select 1").fetchall()  # connection is closed -> unusable
 
     def test_table_path(self, conn):
         assert conn._table_path("dbo", "src").endswith("dbo/src")
@@ -108,8 +106,8 @@ class TestSession:
     def test_attach(self, conn, tmp_path):
         # attach a second lakehouse as a named catalog; cross-catalog read resolves catalog.schema.table.
         other = duckrun.connect(str(tmp_path / "wh2"), schema="dbo", read_only=False)
-        other.sql("select 99 as n").write.mode("overwrite").saveAsTable("only_there")
-        other.stop()
+        other.sql("CREATE OR REPLACE TABLE only_there AS select 99 as n")
+        other.close()
         assert conn.attach(str(tmp_path / "wh2"), name="sales") is conn  # chains
         assert "sales" in conn.catalog.listCatalogs()
         assert conn.sql("select n from sales.dbo.only_there").fetchone()[0] == 99
@@ -160,12 +158,12 @@ class TestSession:
 
     def test_get_stats(self, conn):
         st = conn.get_stats("src")
-        d = dict(zip(st.columns, st.collect()[0]))
+        d = dict(zip(st.columns, st.fetchall()[0]))
         assert d["table"] == "src" and d["total_rows"] == 3 and d["num_files"] >= 1
         assert d["num_row_groups"] >= 1 and d["compression"]  # a real parquet footer was read
         # source=None → every table in the current schema (dbo has src)
         allrows = conn.get_stats()
-        assert "src" in {r[allrows.columns.index("table")] for r in allrows.collect()}
+        assert "src" in {r[allrows.columns.index("table")] for r in allrows.fetchall()}
 
     def test_get_stats_detailed(self, conn):
         st = conn.get_stats("src", detailed=True)  # one row per parquet row group
@@ -173,10 +171,10 @@ class TestSession:
 
     def test_get_stats_glob(self, conn):
         # wildcard patterns match table names across schemas in the current catalog.
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("fct_a")
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("fct_b")
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("dim_x")
-        names = lambda st: {r[st.columns.index("table")] for r in st.collect()}
+        conn.sql("CREATE OR REPLACE TABLE fct_a AS select 1 a")
+        conn.sql("CREATE OR REPLACE TABLE fct_b AS select 1 a")
+        conn.sql("CREATE OR REPLACE TABLE dim_x AS select 1 a")
+        names = lambda st: {r[st.columns.index("table")] for r in st.fetchall()}
         assert names(conn.get_stats("fct_*")) == {"fct_a", "fct_b"}       # bare pattern
         assert names(conn.get_stats("dbo.fct_*")) == {"fct_a", "fct_b"}   # schema.table pattern
         assert names(conn.get_stats("*")) >= {"fct_a", "fct_b", "dim_x", "src"}
@@ -187,8 +185,8 @@ class TestSession:
         # The Fabric write flag is the table property delta.parquet.vorder.enabled; get_stats reads it
         # off the reconstructed Delta metadata (delta-rs does not surface the per-file add.tags).
         import json, glob
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("plain_t")
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("vo_t")
+        conn.sql("CREATE OR REPLACE TABLE plain_t AS select 1 a")
+        conn.sql("CREATE OR REPLACE TABLE vo_t AS select 1 a")
         # stamp the property into vo_t's log the way Spark/Fabric does (delta-rs refuses to write it).
         for lf in glob.glob(str(Path(conn.root_path) / "**" / "vo_t" / "_delta_log" / "*.json"),
                             recursive=True):
@@ -199,7 +197,7 @@ class TestSession:
                     o["metaData"].setdefault("configuration", {})["delta.parquet.vorder.enabled"] = "true"
                 out.append(json.dumps(o))
             Path(lf).write_text("\n".join(out) + "\n")
-        vorder_of = lambda n: dict(zip(conn.get_stats(n).columns, conn.get_stats(n).collect()[0]))["vorder"]
+        vorder_of = lambda n: dict(zip(conn.get_stats(n).columns, conn.get_stats(n).fetchall()[0]))["vorder"]
         assert vorder_of("plain_t") is False
         assert vorder_of("vo_t") is True
 
@@ -209,754 +207,6 @@ class TestSession:
         assert conn.convert_to_delta(f"parquet.`{path}`") == path
         conn.refresh()
         assert conn.table("sconv").fetchall() == [(1, "a")]
-
-
-class TestCatalog:
-    def test_listTables(self, conn):
-        assert "src" in conn.catalog.listTables()
-
-    def test_listDatabases(self, conn):
-        assert {"dbo", "other"} <= set(conn.catalog.listDatabases())
-
-    def test_currentDatabase(self, conn):
-        assert conn.catalog.currentDatabase() == "dbo"
-
-    def test_setCurrentDatabase(self, conn):
-        conn.catalog.setCurrentDatabase("other")
-        assert conn.catalog.currentDatabase() == "other"
-        assert conn.sql("select n from thing").fetchone()[0] == 7  # resolves via search_path
-
-    def test_tableExists(self, conn):
-        assert conn.catalog.tableExists("src") is True
-        assert conn.catalog.tableExists("nope") is False
-        assert conn.catalog.tableExists("other.thing") is True  # qualified name
-
-    def test_tableExists_is_fresh(self, conn):
-        # safety: a table written out-of-band (no manual refresh) must still be found —
-        # tableExists refreshes internally.
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("fresh")
-        assert conn.catalog.tableExists("fresh") is True
-
-    def test_drop_parity_across_surfaces(self, conn):
-        # A dropped (tombstoned) table is ABSENT on every surface — one existence oracle.
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("gone")
-        conn.sql("drop table gone")
-        assert conn.catalog.tableExists("gone") is False            # (b) catalog surface
-        conn.sql("select 3 a").write.mode("error").saveAsTable("gone")  # (a) writer error → recreate
-        assert conn.table("gone").collect() == [(3,)]               # readable with the new data
-        # ignore over a tombstone WRITES (the table is absent, so it isn't a no-op)
-        conn.sql("drop table gone")
-        conn.sql("select 5 a").write.mode("ignore").saveAsTable("gone")
-        assert conn.table("gone").collect() == [(5,)]
-
-    def test_reader_table_absent_after_drop(self, conn):
-        # (c) reader surface: conn.table on a dropped table does not read stale rows.
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("rdrop")
-        conn.sql("drop table rdrop")
-        assert conn.catalog.tableExists("rdrop") is False
-        with pytest.raises(Exception):
-            conn.table("rdrop").collect()
-
-    def test_databaseExists(self, conn):
-        assert conn.catalog.databaseExists("dbo") is True
-        assert conn.catalog.databaseExists("ghost") is False
-
-    def test_listColumns(self, conn):
-        assert conn.catalog.listColumns("src") == ["id", "name"]
-
-    def test_refreshTable(self, conn):
-        # a table materialized out-of-band isn't visible until refreshed; refreshTable surfaces
-        # just that one (the per-table peer of conn.refresh()).
-        path = _stage_parquet(conn, "dbo/rt")
-        DeltaTable.convertToDelta(conn, f"parquet.`{path}`")  # writes _delta_log, registers no view
-        conn.catalog.refreshTable("rt")
-        assert conn.sql("select * from rt").fetchall() == [(1, "a")]
-
-    def test_createTable_ddl(self, conn):
-        df = conn.catalog.createTable("ct", "id int, name string")
-        assert df.count() == 0 and df.columns == ["id", "name"]
-        assert conn.catalog.tableExists("ct")          # managed Delta, queryable immediately
-        conn.sql("insert into ct values (1, 'x')")
-        assert conn.table("ct").collect() == [(1, "x")]
-
-    def test_createTable_from_struct(self, conn):
-        # schema can be a StructType lifted from another frame
-        conn.catalog.createTable("ct2", conn.sql("select 1::bigint k, 2.0::double v").schema)
-        assert conn.catalog.getTable("ct2").tableType == "MANAGED"
-        assert conn.sql("select * from ct2").schema.simpleString() == "struct<k:BIGINT,v:DOUBLE>"
-
-    def test_createTable_bad_schema(self, conn):
-        with pytest.raises(ValueError):
-            conn.catalog.createTable("ct3", 123)
-
-    def test_getTable(self, conn):
-        t = conn.catalog.getTable("src")
-        assert (t.name, t.database, t.catalog) == ("src", "dbo", "wh")
-        assert t.tableType == "MANAGED" and t.isTemporary is False
-        assert conn.catalog.getTable("other.thing").database == "other"  # qualified name
-        with pytest.raises(ValueError):
-            conn.catalog.getTable("nope")
-
-    def test_getDatabase(self, conn):
-        d = conn.catalog.getDatabase("dbo")
-        assert (d.name, d.catalog) == ("dbo", "wh")
-        assert d.locationUri.endswith("/dbo")
-        with pytest.raises(ValueError):
-            conn.catalog.getDatabase("ghost")
-
-    def test_dropTempView(self, conn):
-        conn.sql("select * from src").createOrReplaceTempView("tv")
-        assert conn.sql("select count(*) from tv").fetchone()[0] == 3
-        assert conn.catalog.dropTempView("tv") is True   # existed → dropped
-        assert conn.catalog.dropTempView("tv") is False  # already gone → no-op
-
-    def test_listCatalogs(self, conn):
-        # single-catalog session: the primary, named from the lakehouse folder ("wh") — no name= given.
-        assert conn.catalog.listCatalogs() == ["wh"]
-
-    def test_currentCatalog(self, conn):
-        assert conn.catalog.currentCatalog() == "wh"
-
-    def test_setCurrentCatalog(self, conn):
-        conn.catalog.setCurrentCatalog("wh")  # the only catalog; no-op switch must hold
-        assert conn.catalog.currentCatalog() == "wh"
-        with pytest.raises(ValueError):
-            conn.catalog.setCurrentCatalog("ghost")  # unknown catalog → fail loud
-
-
-class TestDataFrame:
-    def test_collect(self, conn):
-        assert len(conn.sql("select * from src").collect()) == 3
-
-    def test_count(self, conn):
-        assert conn.sql("select * from src").count() == 3
-
-    def test_columns(self, conn):
-        assert conn.sql("select id, name from src").columns == ["id", "name"]
-
-    def test_show(self, conn):
-        conn.sql("select * from src").show()  # smoke: must not raise
-
-    def test_toPandas(self, conn):
-        # toPandas() == relation.df() (DataFrame-API parity). DuckDB .df() materializes a pandas
-        # DataFrame, so pandas+numpy are required — provided by the [test] extra.
-        assert list(conn.sql("select name from src order by id").toPandas()["name"]) == ["a", "b", "c"]
-
-    def test_toArrow(self, conn):
-        # toArrow() returns a streaming pyarrow.RecordBatchReader (not a materialized Table).
-        import pyarrow as pa
-        reader = conn.sql("select name from src order by id").toArrow()
-        assert isinstance(reader, pa.RecordBatchReader)
-        assert reader.read_all().column("name").to_pylist() == ["a", "b", "c"]
-
-    def test_first(self, conn):
-        assert conn.sql("select id from src order by id").first() == (1,)
-        assert conn.sql("select id from src where id > 99").first() is None
-
-    def test_head(self, conn):
-        assert conn.sql("select id from src order by id").head() == (1,)
-        assert conn.sql("select id from src order by id").head(2) == [(1,), (2,)]
-
-    def test_take(self, conn):
-        assert conn.sql("select id from src order by id").take(2) == [(1,), (2,)]
-
-    def test_isEmpty(self, conn):
-        assert conn.sql("select * from src").isEmpty() is False
-        assert conn.sql("select * from src where id > 99").isEmpty() is True
-
-    def test_schema(self, conn):
-        s = conn.sql("select id, name from src").schema
-        assert s.names == ["id", "name"]
-        assert (s.fields[0].name, s.fields[0].nullable) == ("id", True)
-        assert s.simpleString().startswith("struct<id:")
-
-    def test_printSchema(self, conn, capsys):
-        conn.sql("select id from src").printSchema()
-        out = capsys.readouterr().out
-        assert out.startswith("root\n")
-        assert "|-- id:" in out and "(nullable = true)" in out
-
-    def test_relation_passthrough(self, conn):
-        # unknown attrs fall through to the DuckDB relation (e.g. .fetchall())
-        assert conn.sql("select 1").fetchall() == [(1,)]
-
-
-class TestDataFrameReader:
-    def test_format_load_delta(self, conn):
-        assert conn.read.format("delta").load(conn._table_path("dbo", "src")).count() == 3
-
-    def test_table(self, conn):
-        assert conn.read.table("src").count() == 3
-
-    def test_parquet(self, conn, tmp_path):
-        p = tmp_path / "s.parquet"
-        conn._connection.execute(f"copy (select 1 a, 2 b) to '{p.as_posix()}' (format parquet)")
-        assert conn.read.parquet(p.as_posix()).count() == 1
-
-    def test_csv(self, conn, tmp_path):
-        p = tmp_path / "s.csv"
-        p.write_text("x,y\n1,2\n3,4\n")
-        assert conn.read.option("header", True).csv(p.as_posix()).count() == 2
-
-    def test_json(self, conn, tmp_path):
-        p = tmp_path / "s.json"
-        p.write_text('{"a": 1, "b": 2}\n{"a": 3, "b": 4}\n')
-        assert conn.read.json(p.as_posix()).count() == 2
-
-    def test_schema_csv_ddl(self, conn, tmp_path):
-        # explicit schema names + types the columns and skips the header (Spark override).
-        p = tmp_path / "s.csv"
-        p.write_text("a,b\n1,2\n3,4\n")
-        df = conn.read.schema("x int, y bigint").option("header", True).csv(p.as_posix())
-        assert df.schema.simpleString() == "struct<x:INTEGER,y:BIGINT>"
-        assert df.collect() == [(1, 2), (3, 4)]
-
-    def test_schema_ddl_with_comma_type(self, conn, tmp_path):
-        # DECIMAL(10,2) would break naive comma-splitting; DuckDB parses it for us.
-        p = tmp_path / "d.csv"
-        p.write_text("1,2.50\n")
-        df = conn.read.schema("id int, price decimal(10,2)").csv(p.as_posix())
-        assert df.schema.simpleString() == "struct<id:INTEGER,price:DECIMAL(10,2)>"
-
-    def test_schema_json_struct(self, conn, tmp_path):
-        # schema may be a StructType lifted from another frame
-        st = conn.sql("select 1::int as id, 2.5::double as amt").schema
-        p = tmp_path / "s.json"
-        p.write_text('{"id": 7, "amt": 1.5}\n')
-        assert conn.read.schema(st).json(p.as_posix()).collect() == [(7, 1.5)]
-
-    def test_schema_rejected_for_delta(self, conn):
-        with pytest.raises(ValueError):
-            conn.read.schema("x int").format("delta").load(conn._table_path("dbo", "src"))
-
-    @needs_version_param
-    def test_versionAsOf(self, conn):
-        # spark.read.format("delta").option("versionAsOf", N).load(path) — time travel.
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("tt")   # v0
-        conn.sql("select 2 a").write.mode("append").saveAsTable("tt")      # v1
-        path = conn._table_path("dbo", "tt")
-        assert conn.read.format("delta").option("versionAsOf", 0).load(path).count() == 1
-        assert conn.read.format("delta").option("versionAsOf", 1).load(path).count() == 2
-
-    def test_timestampAsOf_rejected(self, conn):
-        with pytest.raises(ValueError):
-            conn.read.format("delta").option("timestampAsOf", "2024-01-01") \
-                .load(conn._table_path("dbo", "src"))
-
-
-class TestDataFrameWriter:
-    def test_saveAsTable(self, conn):
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
-        assert conn.table("w").count() == 1  # queryable immediately, no refresh
-
-    def test_mode_overwrite(self, conn):
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
-        conn.sql("select 2 a").write.mode("overwrite").saveAsTable("w")
-        assert conn.table("w").count() == 1
-
-    def test_mode_append(self, conn):
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
-        conn.sql("select 2 a").write.mode("append").saveAsTable("w")
-        assert conn.table("w").count() == 2
-
-    def test_mode_safeappend_removed(self, conn):
-        # 'safeappend' was renamed to 'append_if_unchanged'; the alias is gone (no back-compat).
-        with pytest.raises(ValueError, match="renamed"):
-            conn.sql("select 1 a").write.mode("safeappend").saveAsTable("w")
-
-    def test_mode_append_if_unchanged(self, conn):
-        conn.sql("select 1 a").write.mode("append_if_unchanged").saveAsTable("w")  # missing → create
-        conn.sql("select 2 a").write.mode("append_if_unchanged").saveAsTable("w")  # unchanged → append
-        assert conn.table("w").count() == 2
-
-    def test_mode_ignore(self, conn):
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
-        conn.sql("select 2 a").write.mode("ignore").saveAsTable("w")
-        assert conn.table("w").count() == 1  # no-op when it exists
-
-    def test_mode_error(self, conn):
-        with pytest.raises(ValueError):
-            conn.sql("select 1 a").write.saveAsTable("src")  # default error, src exists
-
-    def test_option_mergeSchema(self, conn):
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("w")
-        conn.sql("select 2 a, 3 b").write.mode("append").option("mergeSchema", "true").saveAsTable("w")
-        assert "b" in conn.sql("select * from w").columns
-
-    def test_option_overwriteSchema(self, conn):
-        conn.sql("select 1 a, 2 b").write.mode("overwrite").saveAsTable("w")
-        conn.sql("select 1 a").write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("w")
-        assert conn.sql("select * from w").columns == ["a"]
-
-    def test_option_replaceWhere(self, conn):
-        # df.write.option("replaceWhere", pred).mode("overwrite") — atomic slice swap.
-        conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
-            .write.mode("overwrite").saveAsTable("rw")
-        conn.sql("select * from (values (1,77),(2,77)) t(id, val)") \
-            .write.option("replaceWhere", "id < 3").mode("overwrite").saveAsTable("rw")
-        assert dict(conn.sql("select id, val from rw").collect()) == {1: 77, 2: 77, 3: 10}
-
-    def test_option_replaceWhere_requires_overwrite(self, conn):
-        conn.sql("select 1 id, 10 val").write.mode("overwrite").saveAsTable("rw2")
-        with pytest.raises(ValueError):
-            conn.sql("select 1 id, 77 val").write.option("replaceWhere", "id = 1") \
-                .mode("append").saveAsTable("rw2")
-
-    def test_insertInto_removed(self, conn):
-        # insertInto is gone — the append/overwrite it did is mode("append"|"overwrite").saveAsTable.
-        assert not hasattr(conn.sql("select 1 a").write, "insertInto")
-
-    def test_partitionBy(self, conn):
-        conn.sql("select * from (values (1,'eu'),(2,'us')) t(id, region)") \
-            .write.mode("overwrite").partitionBy("region").saveAsTable("w")
-        assert conn.table("w").count() == 2
-
-    def test_sort(self, conn):
-        df = conn.sql("select * from (values (3),(1),(2)) t(n)").sort("n")
-        assert isinstance(df, duckrun.session.DataFrame) and hasattr(df, "write")
-        assert [r[0] for r in df.collect()] == [1, 2, 3]
-
-    def test_orderBy_alias_and_desc(self, conn):
-        # orderBy is Spark's alias of sort; ascending=False sorts descending.
-        assert [r[0] for r in conn.sql("select * from (values (1),(3),(2)) t(n)")
-                .orderBy("n", ascending=False).collect()] == [3, 2, 1]
-
-    def test_sort_no_args_auto_key(self, conn):
-        # Bare sort() profiles the DataFrame and orders by the auto-picked run-length-friendly key
-        # (no Spark equivalent — Spark's sort() with no columns errors). One low-card dimension is
-        # the unambiguous key: the result is grouped ASC, stays writable, and keeps every row.
-        df = conn.sql("select (i%5) as g from range(500) t(i)").sort()
-        assert isinstance(df, duckrun.session.DataFrame) and hasattr(df, "write")
-        assert [r[0] for r in df.collect()] == sorted(i % 5 for i in range(500))
-
-    def test_sort_then_partition_write(self, conn):
-        # sort() returns a writable DataFrame that composes with partitionBy: delta-rs does the
-        # partitioning, sort only sets row order. Round-trips all rows across partitions.
-        conn.sql("select (i % 2) as region, (9 - i % 5) as k from range(40) t(i)") \
-            .sort("region", "k").write.mode("overwrite").partitionBy("region").saveAsTable("sp")
-        assert conn.table("sp").count() == 40
-        assert sorted(r[0] for r in conn.sql("select distinct region from sp").collect()) == [0, 1]
-
-    def test_format(self, conn):
-        with pytest.raises(ValueError):
-            conn.sql("select 1 a").write.format("parquet").saveAsTable("w")  # only delta
-
-    def test_save_by_path(self, conn, tmp_path):
-        p = (tmp_path / "by_path").as_posix()
-        conn.sql("select 1 a").write.mode("overwrite").save(p)  # no catalog name
-        assert conn.read.format("delta").load(p).count() == 1  # read back BY PATH, not as a table
-
-    def test_save_modes(self, conn, tmp_path):
-        p = (tmp_path / "modes").as_posix()
-        conn.sql("select 1 a").write.mode("overwrite").save(p)
-        conn.sql("select 2 a").write.mode("append").save(p)
-        assert conn.read.format("delta").load(p).count() == 2
-
-    def test_save_mode_error_when_exists(self, conn, tmp_path):
-        p = (tmp_path / "err").as_posix()
-        conn.sql("select 1 a").write.mode("overwrite").save(p)
-        with pytest.raises(ValueError):
-            conn.sql("select 2 a").write.save(p)  # default error, path exists
-
-
-class TestDeltaTable:
-    def _seed(self, conn):
-        conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
-            .write.mode("overwrite").saveAsTable("m")
-
-    def test_forName(self, conn):
-        self._seed(conn)
-        assert DeltaTable.forName(conn, "dbo.m").path.endswith("dbo/m")
-
-    def test_convertToDelta(self, conn):
-        path = _stage_parquet(conn, "dbo/conv")            # out-of-band parquet under the catalog root
-        DeltaTable.convertToDelta(conn, f"parquet.`{path}`")  # zero-copy: writes a _delta_log over it
-        conn.refresh()
-        assert conn.table("conv").fetchall() == [(1, "a")]
-
-    def test_merge_upsert(self, conn):
-        self._seed(conn)
-        src = conn.sql("select * from (values (2,99),(4,99)) t(id, val)")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-        assert conn.table("m").count() == 4
-        assert conn.sql("select val from m where id = 2").fetchone()[0] == 99
-
-    def test_merge_update_columns(self, conn):
-        self._seed(conn)
-        src = conn.sql("select 1 id, 555 val")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenMatchedUpdate(set={"val": "source.val"}).whenNotMatchedInsertAll().execute()
-        assert conn.sql("select val from m where id = 1").fetchone()[0] == 555
-
-    def test_merge_rejects_duplicate_source_keys(self, conn):
-        # Parity with the dbt merge strategy: a keyed upsert whose SOURCE has two rows for one key
-        # must FAIL LOUD (delta_rs would otherwise silently produce duplicate target rows), exactly
-        # like the dbt incremental merge. Both land in engine.merge_delta_clauses -> same behaviour.
-        self._seed(conn)
-        src = conn.sql("select * from (values (2,99),(2,98)) t(id, val)")  # duplicate id=2
-        with pytest.raises(Exception, match="(?i)unique|duplicate"):
-            DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-                .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-        # and the table is untouched (the guard runs before any write)
-        assert conn.table("m").count() == 3
-        assert conn.sql("select val from m where id = 2").fetchone()[0] == 10
-
-    def test_merge_insert_only(self, conn):
-        self._seed(conn)
-        src = conn.sql("select * from (values (2,99),(5,99)) t(id, val)")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenNotMatchedInsertAll().execute()
-        assert conn.table("m").count() == 4  # only id=5 added
-        assert conn.sql("select val from m where id = 2").fetchone()[0] == 10  # untouched
-
-    def test_merge_update_only(self, conn):
-        # update-only merge (matched update, no insert) is supported — matched rows change, none added.
-        self._seed(conn)
-        src = conn.sql("select * from (values (1,99),(5,99)) t(id, val)")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenMatchedUpdateAll().execute()
-        assert conn.sql("select val from m where id = 1").fetchone()[0] == 99  # updated
-        assert conn.table("m").count() == 3                                    # id=5 NOT inserted
-
-    def test_merge_matched_delete(self, conn):
-        # WHEN MATCHED THEN DELETE — matched rows removed (CDC-style).
-        self._seed(conn)
-        src = conn.sql("select * from (values (2,0),(3,0)) t(id, val)")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenMatchedDelete().execute()
-        assert sorted(r[0] for r in conn.table("m").collect()) == [1]
-
-    def test_merge_update_and_delete(self, conn):
-        # two WHEN MATCHED clauses in one merge: delete flagged rows, update the rest.
-        self._seed(conn)
-        src = conn.sql("select * from (values (1,99,false),(2,99,true)) t(id, val, gone)")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenMatchedDelete("source.gone").whenMatchedUpdate(set={"val": "source.val"}).execute()
-        rows = dict(conn.sql("select id, val from m").collect())
-        assert 2 not in rows           # deleted (gone = true)
-        assert rows[1] == 99           # updated
-        assert rows[3] == 10           # untouched
-
-    def test_merge_insert_values(self, conn):
-        # whenNotMatchedInsert with explicit value expressions.
-        self._seed(conn)
-        src = conn.sql("select * from (values (9,'5')) t(id, val)")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenNotMatchedInsert(values={"id": "source.id", "val": "cast(source.val as int) * 10"}) \
-            .execute()
-        assert conn.sql("select val from m where id = 9").fetchone()[0] == 50
-
-    def test_merge_by_source_update(self, conn):
-        # whenNotMatchedBySourceUpdate — touch rows the source doesn't carry.
-        self._seed(conn)
-        src = conn.sql("select * from (values (1,99)) t(id, val)")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenMatchedUpdateAll().whenNotMatchedBySourceUpdate(set={"val": "-1"}).execute()
-        rows = dict(conn.sql("select id, val from m").collect())
-        assert rows[1] == 99    # matched → updated from source
-        assert rows[2] == -1    # not in source → set to -1
-        assert rows[3] == -1
-
-    def test_version(self, conn):
-        self._seed(conn)  # one overwrite → version 0
-        assert DeltaTable.forName(conn, "dbo.m").version() == 0
-
-    def test_history(self, conn):
-        self._seed(conn)  # v0
-        conn.sql("select 9 id, 9 val").write.mode("append").saveAsTable("m")  # v1
-        hist = DeltaTable.forName(conn, "dbo.m").history()
-        assert [h["version"] for h in hist] == [1, 0]          # newest-first
-        assert DeltaTable.forName(conn, "dbo.m").history(1)[0]["version"] == 1   # limit
-
-    def test_delete(self, conn):
-        self._seed(conn)
-        DeltaTable.forName(conn, "dbo.m").delete("id = 2")
-        assert sorted(r[0] for r in conn.table("m").collect()) == [1, 3]
-
-    def test_update(self, conn):
-        self._seed(conn)
-        DeltaTable.forName(conn, "dbo.m").update(condition="id = 1", set={"val": "val + 1"})
-        assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
-
-    def test_optimize(self, conn):
-        # DeltaTable.forName(name).optimize() is a plain delta-rs bin-packing compaction (no z-order —
-        # that's removed). Write two commits → two files, then compact; data unchanged, metrics back.
-        self._seed(conn)
-        conn.sql("select 4 id, 10 val").write.mode("append").saveAsTable("m")
-        metrics = DeltaTable.forName(conn, "dbo.m").optimize()
-        assert metrics["numFilesAdded"] >= 1
-        assert conn.table("m").count() == 4
-        # z-order is gone: the parameter no longer exists.
-        with pytest.raises(TypeError):
-            DeltaTable.forName(conn, "dbo.m").optimize(zorder_by=["id"])
-
-    def test_table_optimize_auto_keys(self, conn):
-        # conn.table(name).optimize(rewrite=True) — the experimental sort rewrite: profiles the table
-        # (_get_rle), picks the sort key automatically, and rewrites every file physically ordered by
-        # it. Data is preserved and the active file comes out clustered by the key.
-        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
-            .write.mode("overwrite").saveAsTable("to_auto")
-        m = conn.table("dbo.to_auto").optimize(rewrite=True)
-        assert m["operation"] == "sortRewrite" and "region" in m["sortedBy"]
-        assert "dataChange=true" in m["warning"]  # full rewrite is a dataChange commit
-        # reports REAL measured on-disk bytes (Delta-log size_bytes), never an estimate
-        assert m["sizeBytesBefore"] > 0 and m["sizeBytesAfter"] > 0
-        assert m["savedPct"] == round(100.0 * (m["sizeBytesBefore"] - m["sizeBytesAfter"]) / m["sizeBytesBefore"], 1)
-        assert conn.table("to_auto").count() == 20000
-        # active file is clustered: reading it in file order, region is non-decreasing.
-        f = engine._delta_table(conn.root_path + "/dbo/to_auto", None).file_uris()[0].replace("file://", "")
-        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
-        assert regs == sorted(regs)
-
-    def test_table_optimize_user_keys(self, conn):
-        # conn.table(name).optimize("region") — full rewrite sorted by exactly the given columns, no
-        # profiler. The active file comes out ordered by region regardless of what the profiler'd pick.
-        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
-            .write.mode("overwrite").saveAsTable("to_keys")
-        m = conn.table("dbo.to_keys").optimize("region")
-        assert m["sortedBy"] == ["region"]
-        assert conn.table("to_keys").count() == 20000
-        f = engine._delta_table(conn.root_path + "/dbo/to_keys", None).file_uris()[0].replace("file://", "")
-        regs = [r[0] for r in conn.sql("select region from parquet_scan('%s')" % f).fetchall()]
-        assert regs == sorted(regs)
-
-    def test_table_optimize_where_scopes_partitions(self, conn):
-        # conn.table(name).optimize(where=...) rewrites ONLY the matching partition; the untouched
-        # partitions keep their data and total count is preserved.
-        conn.sql("select (i % 3) as region, i as id from range(300) t(i)") \
-            .write.mode("overwrite").partitionBy("region").saveAsTable("to_where")
-        v_before = engine.table_version(conn.root_path + "/dbo/to_where", None)
-        m = conn.table("dbo.to_where").optimize("id", where="region = 1")
-        assert m["operation"] == "sortRewrite"
-        # a replaceWhere commit landed (new version) and every row survived across all partitions
-        assert engine.table_version(conn.root_path + "/dbo/to_where", None) > v_before
-        assert conn.table("to_where").count() == 300
-        assert sorted(r[0] for r in conn.sql("select distinct region from to_where").collect()) == [0, 1, 2]
-        # the rewritten partition is sorted by id; other partitions still hold their rows
-        assert conn.sql("select count(*) from to_where where region = 0").fetchone()[0] == 100
-
-    def test_table_optimize_rejects_query_frame(self, conn):
-        # optimize() is only meaningful on a real table handle; a derived/query DataFrame refuses.
-        with pytest.raises(ValueError):
-            conn.sql("select 1 x").optimize()
-
-    def test_optimize_refuses_on_sorted_frame(self, conn):
-        # A sorted frame keeps its table lineage but is NOT pristine: optimize() refuses (sorting a
-        # frame does not choose the rewrite key) and points at conn.table(name).optimize.
-        conn.sql("select (i%5) g, i id from range(500) t(i)").write.mode("overwrite").saveAsTable("srt")
-        with pytest.raises(ValueError, match="sorted frame is refused"):
-            conn.table("srt").sort("g").optimize()
-
-    def test_self_overwrite_guard(self, conn):
-        # conn.table("t").sort(...).write.mode("overwrite").saveAsTable("t") is an unfenced self-rewrite
-        # — refused (the lineage survived the sort). Resolved-name compare: 3-part addressing of the
-        # SAME table is still refused; a DIFFERENT table is fine.
-        conn.sql("select (i%5) g, i id from range(500) t(i)").write.mode("overwrite").saveAsTable("selfw")
-        with pytest.raises(ValueError, match="unfenced rewrite"):
-            conn.table("selfw").sort("g").write.mode("overwrite").saveAsTable("selfw")
-        with pytest.raises(ValueError, match="unfenced rewrite"):
-            conn.table("selfw").sort("g").write.mode("overwrite").saveAsTable("wh.dbo.selfw")  # 3-part, same table
-        conn.table("selfw").sort("g").write.mode("overwrite").saveAsTable("selfw2")            # other table: ok
-        assert conn.table("selfw2").count() == 500
-
-    def test_sort_no_args_on_table_uses_log_stats(self, conn, monkeypatch):
-        # No-arg sort() on a conn.table frame profiles the SOURCE TABLE via _get_rle (Delta-log row
-        # width), not a schema-only estimate over the bare relation, then writes to a NEW table.
-        conn.sql("select (i%5) g, i id from range(500) t(i)").write.mode("overwrite").saveAsTable("logsrc")
-        seen, orig = [], conn.__class__._get_rle
-        monkeypatch.setattr(conn.__class__, "_get_rle",
-                            lambda self, name, **kw: (seen.append(name), orig(self, name, **kw))[1])
-        conn.table("logsrc").sort().write.mode("overwrite").saveAsTable("logdst")
-        assert "logsrc" in seen  # profiled the source table through the log-stats profiler
-        assert conn.table("logdst").count() == 500
-
-    def test_bare_table_optimize_still_works(self, conn):
-        # Sanity: a pristine conn.table(name).optimize() (the safe button) is unaffected by the guard.
-        conn.sql("select i id from range(100) t(i)").write.mode("overwrite").saveAsTable("bare")
-        assert conn.table("bare").optimize()["operation"] in ("noop", "compact")
-
-    def test_table_optimize_rewrite_refuses_on_concurrent_commit(self, conn, monkeypatch):
-        # The full-table sort rewrite is snapshot-fenced (overwrite_if_unchanged): the handle pins the
-        # version it read, so a foreign commit landing before the rewrite makes it fail loud instead of
-        # clobbering the concurrent write — the whole-table path is no longer the one unfenced hole.
-        conn.sql("select (i % 5) as region, i as id from range(2000) t(i)") \
-            .write.mode("overwrite").saveAsTable("to_race")
-        path = conn._table_path("dbo", "to_race")
-        stale = engine.table_version(path, conn.storage_options)
-        engine.write_delta(path, duckdb.connect().sql("select 1 region, 99999 id"), mode="append")
-        monkeypatch.setattr(engine, "table_version", lambda *a, **k: stale)  # handle reads the stale version
-        with pytest.raises(CommitFailedError):
-            conn.table("dbo.to_race").optimize("region")
-
-    def test_table_optimize_maintain_noop(self, conn):
-        # Bare conn.table(name).optimize() is the safe button: compaction policy + vacuum, never a
-        # rewrite. A single-file table has no small-file debt, so it's a noop; vacuum finds nothing
-        # to reclaim (every file is inside the retention window). Idempotent.
-        conn.sql("select i as id from range(1000) t(i)").write.mode("overwrite").saveAsTable("mt_clean")
-        m = conn.table("dbo.mt_clean").optimize()
-        assert m == {"operation": "noop", "reason": "no small-file debt", "filesVacuumed": 0}
-        assert conn.table("mt_clean").count() == 1000
-        assert conn.table("dbo.mt_clean").optimize()["operation"] == "noop"  # idempotent
-
-    def test_table_optimize_maintain_compacts_small_files(self, conn, monkeypatch):
-        # Below-target files accumulated by many small appends ARE compacted by the manual safe button
-        # once the byte trigger fires (>= 8 files AND >= 2x target bytes). Shrink the target so a
-        # handful of small commits trips it. Compaction commits dataChange=false and preserves rows.
-        monkeypatch.setattr(engine, "_TARGET_FILE_SIZE", 64 * 1024)  # 64 KB: small = <32 KB, fire >=128 KB
-        # Isolate the manual button: the automatic post-write maintenance now shares this exact byte
-        # trigger, so under the shrunk target it would compact these appends itself before the button
-        # is pressed. No-op it during setup so the debt survives for the button to clear (with the real
-        # 256 MB target, a few small appends never reach the trigger, so real debt accumulates the same).
-        monkeypatch.setattr(engine, "_maintain", lambda *a, **k: None)
-        conn.sql("select i as id, repeat('x', 200) as pad from range(5000) t(i)") \
-            .write.mode("overwrite").saveAsTable("mt_debt")
-        for b in range(10):
-            conn.sql(f"select i as id, repeat('x', 200) as pad from range({b}*5000, {b}*5000+5000) t(i)") \
-                .write.mode("append").saveAsTable("mt_debt")
-        m = conn.table("dbo.mt_debt").optimize()
-        assert m["operation"] == "compact"
-        assert m["filesRemoved"] >= 8 and m["filesAdded"] >= 1
-        assert conn.table("mt_debt").count() == 55000
-        assert "analyze=True" in m["advice"]  # nudge toward the advisory, no projected magnitude
-
-    def test_table_optimize_analyze(self, conn):
-        # optimize(analyze=True) is advisory-only: returns the sort-key recommendation as a DataFrame
-        # (the _get_rle profiler promoted to public) and commits nothing — the table version is unmoved.
-        conn.sql("select (i * 7 % 5) as region, (i % 1000) * 1.5 as amount, i as id from range(20000) t(i)") \
-            .write.mode("overwrite").saveAsTable("an")
-        v0 = engine.table_version(conn.root_path + "/dbo/an", None)
-        df = conn.table("dbo.an").optimize(analyze=True)
-        recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
-        assert set(recs) == {"region", "amount", "id"}          # a row per column
-        assert recs["region"]["in_sort_key"]                    # the low-card dimension is recommended
-        assert engine.table_version(conn.root_path + "/dbo/an", None) == v0  # zero commits
-        # advisory is exclusive — it can't be combined with a rewrite
-        with pytest.raises(ValueError):
-            conn.table("dbo.an").optimize("region", analyze=True)
-
-    def test_get_rle_scan_count_is_constant(self, conn):
-        # Regression: the auto profiler must NOT re-scan the (possibly remote) table once per column.
-        # Those O(columns) full-table reads are what made optimize take 20 min on a 142M-row OneLake
-        # table. _get_rle now materializes ONE reservoir sample and profiles that, so the number of
-        # delta_scan reads it issues is a small constant independent of table width.
-        class _Spy:   # session.con is a plain attribute; _get_rle reads it via self.con
-            def __init__(self, real, log):
-                self._real, self._log = real, log
-
-            def __getattr__(self, name):
-                attr = getattr(self._real, name)
-                if name in ("sql", "execute") and callable(attr):
-                    def wrapped(q, *a, **k):
-                        if "delta_scan(" in str(q):
-                            self._log.append(str(q))
-                        return attr(q, *a, **k)
-                    return wrapped
-                return attr
-
-        def _is_profiling(q):
-            # Ignore catalog view-registration reads (CREATE VIEW … + its backing SELECT *) — those are
-            # catalog-state churn, not per-column profiling. What we're guarding is the profiling reads:
-            # the DESCRIBE and the single sample materialize (CREATE … TEMP TABLE _rle_src AS …). A
-            # regression that re-scanned per column would show as extra aggregate reads kept here.
-            s = q.strip().lower()
-            return not (s.startswith("create or replace view") or s.startswith("select * from delta_scan"))
-
-        def _scan_count(name, ncols):
-            proj = ", ".join(f"(i % {j + 2}) as c{j}" for j in range(ncols))
-            conn.sql(f"select {proj}, i as id from range(3000) t(i)") \
-                .write.mode("overwrite").saveAsTable(name)
-            seen, real = [], conn.con
-            conn.con = _Spy(real, seen)   # _get_rle uses no add_actions replacement scan, so proxy is safe
-            try:
-                conn._get_rle(f"dbo.{name}")
-            finally:
-                conn.con = real
-            return [q for q in seen if _is_profiling(q)]
-
-        narrow = _scan_count("rle_narrow", 4)
-        wide = _scan_count("rle_wide", 16)
-        # DESCRIBE + one sample materialize, independent of column count — NOT one scan per column.
-        assert len(narrow) == len(wide) == 2
-
-    def test_vacuum(self, conn):
-        # dry_run lists removable files without deleting; never errors on a healthy table.
-        self._seed(conn)
-        assert isinstance(DeltaTable.forName(conn, "dbo.m").vacuum(dry_run=True), list)
-
-    def test_restoreToVersion(self, conn):
-        self._seed(conn)                                                    # v0: ids 1,2,3
-        conn.sql("select 9 id, 9 val").write.mode("append").saveAsTable("m")  # v1: + id 9
-        assert conn.table("m").count() == 4
-        DeltaTable.forName(conn, "dbo.m").restoreToVersion(0)
-        assert sorted(r[0] for r in conn.table("m").collect()) == [1, 2, 3]
-
-    def test_merge_by_source_delete(self, conn):
-        # full sync: source carries ids {2,4}; matched updates, unmatched-by-source (1,3) deleted.
-        self._seed(conn)
-        src = conn.sql("select * from (values (2,99),(4,99)) t(id, val)")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenMatchedUpdateAll().whenNotMatchedInsertAll().whenNotMatchedBySourceDelete().execute()
-        assert dict(conn.sql("select id, val from m").collect()) == {2: 99, 4: 99}
-
-    def test_merge_is_pinned_by_default(self, conn):
-        # merge pins the target snapshot automatically — the caller passes nothing extra.
-        self._seed(conn)
-        src = conn.sql("select 1 id, 11 val")
-        DeltaTable.forName(conn, "dbo.m").merge(src, "target.id = source.id") \
-            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-        assert conn.sql("select val from m where id = 1").fetchone()[0] == 11
-
-
-class TestTableParity:
-    """conn.table(name) carries the same DML/maintenance verbs as DeltaTable.forName(conn, name) —
-    the additive parity path. Same engine, same snapshot fence; only the entry point differs."""
-    def _seed(self, conn):
-        conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
-            .write.mode("overwrite").saveAsTable("m")
-
-    def test_table_merge(self, conn):
-        # the headline shape: conn.table(name).merge(...).whenMatchedUpdateAll()...execute()
-        self._seed(conn)
-        src = conn.sql("select * from (values (2,99),(4,99)) t(id, val)")
-        conn.table("m").merge(src, "target.id = source.id") \
-            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-        assert dict(conn.sql("select id, val from m").collect()) == {1: 10, 2: 99, 3: 10, 4: 99}
-
-    def test_table_delete_update(self, conn):
-        self._seed(conn)
-        conn.table("m").delete("id = 2")
-        conn.table("m").update(condition="id = 1", set={"val": "val + 5"})
-        assert dict(conn.sql("select id, val from m").collect()) == {1: 15, 3: 10}
-
-    def test_table_version_history_restore(self, conn):
-        self._seed(conn)                                                     # v0
-        conn.sql("select 9 id, 9 val").write.mode("append").saveAsTable("m")  # v1
-        assert conn.table("m").version() == 1
-        assert [h["version"] for h in conn.table("m").history()] == [1, 0]
-        conn.table("m").restoreToVersion(0)
-        assert sorted(r[0] for r in conn.table("m").collect()) == [1, 2, 3]
-
-    def test_table_vacuum(self, conn):
-        self._seed(conn)
-        assert isinstance(conn.table("m").vacuum(dry_run=True), list)
-
-    def test_table_dml_matches_deltatable(self, conn):
-        # cross-entry equivalence: the two surfaces land byte-identical results from the same merge.
-        self._seed(conn)
-        conn.sql("select * from (values (1,10),(2,10),(3,10)) t(id, val)") \
-            .write.mode("overwrite").saveAsTable("m2")
-        src = lambda: conn.sql("select * from (values (2,99),(5,99)) t(id, val)")
-        conn.table("m").merge(src(), "target.id = source.id") \
-            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-        DeltaTable.forName(conn, "dbo.m2").merge(src(), "target.id = source.id") \
-            .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-        assert sorted(conn.table("m").collect()) == sorted(conn.table("m2").collect())
-
-    def test_table_dml_needs_a_table(self, conn):
-        # a derived/query frame has no backing table — the verbs refuse rather than mis-resolve.
-        with pytest.raises(ValueError, match="table operation"):
-            conn.sql("select 1 id").delete("id = 1")
 
 
 class TestSqlDml:
@@ -971,8 +221,8 @@ class TestSqlDml:
     @needs_version_param
     def test_version_pinned_read(self, conn):
         # write v0 then v1, then read v0 back via the passthrough — time travel for free.
-        conn.sql("select 1 a").write.mode("overwrite").saveAsTable("tt")  # v0
-        conn.sql("select 2 a").write.mode("overwrite").saveAsTable("tt")  # v1
+        conn.sql("CREATE OR REPLACE TABLE tt AS select 1 a")  # v0
+        conn.sql("CREATE OR REPLACE TABLE tt AS select 2 a")  # v1
         path = conn._table_path("dbo", "tt")
         assert conn.sql(f"select a from delta_scan('{path}', version => 0)").fetchone()[0] == 1
 
@@ -1013,14 +263,14 @@ class TestSqlDml:
     def test_sql_update_subquery_predicate(self, conn):
         # UPDATE with a subquery predicate: delta_rs's update() would panic, so duckrun evaluates it
         # in DuckDB and commits a fenced overwrite (review #9). Rows matching the subquery update.
-        conn.sql("select * from (values (1),(3)) t(k)").write.mode("overwrite").saveAsTable("keys")
+        conn.sql("CREATE OR REPLACE TABLE keys AS select * from (values (1),(3)) t(k)")
         conn.sql("update src set name = 'Q' where id in (select k from keys)")
         got = {r[0]: r[1] for r in conn.sql("select id, name from src").fetchall()}
         assert got == {1: "Q", 2: "b", 3: "Q"}
 
     def test_sql_delete_subquery_predicate(self, conn):
         # DELETE with a subquery predicate takes the same DuckDB-evaluated fenced fallback (#8).
-        conn.sql("select * from (values (2)) t(k)").write.mode("overwrite").saveAsTable("dk")
+        conn.sql("CREATE OR REPLACE TABLE dk AS select * from (values (2)) t(k)")
         conn.sql("delete from src where id in (select k from dk)")
         assert {r[0] for r in conn.sql("select id from src").fetchall()} == {1, 3}
 
@@ -1067,7 +317,7 @@ class TestSqlDml:
                  "ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT * "
                  "WHEN NOT MATCHED BY SOURCE THEN DELETE")
-        assert dict(conn.sql("select id, name from src").collect()) == {2: "B", 3: "C"}
+        assert dict(conn.sql("select id, name from src").fetchall()) == {2: "B", 3: "C"}
 
     def test_sql_merge_subquery_source(self, conn):
         conn.sql("MERGE INTO src USING (select 9 as id, 'z' as name) AS source "
@@ -1138,7 +388,7 @@ class TestSqlDml:
         # WHEN MATCHED THEN DELETE — matched rows removed (full delta-rs surface).
         conn.sql("MERGE INTO src USING (values (2,'x'),(3,'x')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED THEN DELETE")
-        assert sorted(r[0] for r in conn.table("src").collect()) == [1]
+        assert sorted(r[0] for r in conn.table("src").fetchall()) == [1]
 
     def test_sql_merge_matched_delete_and_update(self, conn):
         # two WHEN MATCHED clauses, applied in order: delete flagged rows, update the rest.
@@ -1146,7 +396,7 @@ class TestSqlDml:
                  "ON target.id = source.id "
                  "WHEN MATCHED AND source.gone THEN DELETE "
                  "WHEN MATCHED THEN UPDATE SET name = source.name")
-        rows = dict(conn.sql("select id, name from src").collect())
+        rows = dict(conn.sql("select id, name from src").fetchall())
         assert 2 not in rows          # deleted (gone = true)
         assert rows[1] == "A"         # updated
         assert rows[3] == "c"         # untouched (not in source)
@@ -1179,7 +429,7 @@ class TestSqlDml:
         conn.sql("MERGE INTO src USING (values (1,'A')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET * "
                  "WHEN NOT MATCHED BY SOURCE THEN UPDATE SET name = 'gone'")
-        rows = dict(conn.sql("select id, name from src").collect())
+        rows = dict(conn.sql("select id, name from src").fetchall())
         assert rows[1] == "A"          # matched → updated from source
         assert rows[2] == "gone"       # not in source → updated
         assert rows[3] == "gone"
@@ -1263,192 +513,52 @@ def test_discover_all_schemas(wh):
 
 
 def test_write_modes_round_trip(wh):
+    # The SQL write modes with a DuckDB home: overwrite (CREATE OR REPLACE), append (INSERT),
+    # ignore (CREATE TABLE IF NOT EXISTS → no-op when the table exists).
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
 
-    conn.sql("select 1 as id, 'x' as v").write.mode("overwrite").saveAsTable("t3")
+    conn.sql("CREATE OR REPLACE TABLE t3 AS select 1 as id, 'x' as v")
     assert conn.sql("select count(*) from t3").fetchone()[0] == 1
 
-    conn.sql("select 2 as id, 'y' as v").write.mode("append").saveAsTable("t3")
-    assert conn.table("t3").count() == 2
+    conn.sql("insert into t3 select 2 as id, 'y' as v")
+    assert conn.sql("select count(*) from t3").fetchone()[0] == 2
 
-    # the default mode is 'error' → refuse to clobber an existing table.
-    with pytest.raises(ValueError):
-        conn.sql("select 3 as id, 'z' as v").write.saveAsTable("t3")
-
-    # 'ignore' is a no-op when the table exists.
-    conn.sql("select 99 as id, 'q' as v").write.mode("ignore").saveAsTable("t3")
-    assert conn.table("t3").count() == 2
+    conn.sql("create table if not exists t3 as select 99 as id, 'q' as v")  # no-op, table exists
+    assert conn.sql("select count(*) from t3").fetchone()[0] == 2
 
 
-def test_append_if_unchanged_creates_then_appends(wh):
+def test_writes_persist_to_delta(wh):
+    # CTAS/INSERT and conn.sql() UPDATE/DELETE land as real Delta, visible to a brand-new
+    # connection (not DuckDB-native tables in this session).
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    # First run on a missing table: nothing to fence against → create via append.
-    conn.sql("select 1 id, 'a' v").write.mode("append_if_unchanged").saveAsTable("sa")
-    assert conn.table("sa").count() == 1
-    # Unchanged table → optimistic append commits and grows the table.
-    conn.sql("select 2 id, 'b' v").write.mode("append_if_unchanged").saveAsTable("sa")
-    assert sorted(conn.table("sa").collect()) == [(1, "a"), (2, "b")]
-    # "safeappend" was renamed to append_if_unchanged — the old name is gone (no back-compat alias).
-    with pytest.raises(ValueError, match="renamed"):
-        conn.sql("select 3 id, 'c' v").write.mode("safeappend").saveAsTable("sa")
-
-
-def test_append_if_unchanged_refuses_on_concurrent_commit(wh, monkeypatch):
-    # append_if_unchanged pins to the version it read; if a writer lands before the commit, it must
-    # fail loud (CommitFailedError) instead of duplicating — identical to the dbt strategy.
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("sc")
-    path = conn._table_path("dbo", "sc")
-    stale = engine.table_version(path, conn.storage_options)  # the version "as read"
-
-    # A concurrent writer commits, moving HEAD past the version append_if_unchanged will pin to.
-    engine.write_delta(path, duckdb.connect().sql("select 99 id, 'x' v"), mode="append")
-    monkeypatch.setattr(engine, "table_version", lambda *a, **k: stale)
-
-    with pytest.raises(CommitFailedError):
-        conn.sql("select 2 id, 'b' v").write.mode("append_if_unchanged").saveAsTable("sc")
-
-
-def test_overwrite_if_unchanged_commits_when_unchanged_and_creates(wh):
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    conn.sql("select * from (values (1,'a'),(2,'b')) t(id,v)").write.mode("overwrite").saveAsTable("ou")
-    # unchanged → fenced full overwrite replaces all rows
-    conn.sql("select 5 id, 'z' v").write.mode("overwrite_if_unchanged").saveAsTable("ou")
-    assert conn.table("ou").collect() == [(5, "z")]
-    # missing table → nothing to fence → create via plain overwrite
-    conn.sql("select 7 id, 'q' v").write.mode("overwrite_if_unchanged").saveAsTable("ou_new")
-    assert conn.table("ou_new").collect() == [(7, "q")]
-
-
-def test_overwrite_if_unchanged_refuses_on_concurrent_commit(wh, monkeypatch):
-    # overwrite_if_unchanged pins to the version it read; a foreign commit makes it fail loud
-    # instead of clobbering the concurrent change — the overwrite sibling of append_if_unchanged.
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("oc")
-    path = conn._table_path("dbo", "oc")
-    stale = engine.table_version(path, conn.storage_options)
-
-    engine.write_delta(path, duckdb.connect().sql("select 99 id, 'x' v"), mode="append")
-    monkeypatch.setattr(engine, "table_version", lambda *a, **k: stale)
-
-    with pytest.raises(CommitFailedError):
-        conn.sql("select 2 id, 'b' v").write.mode("overwrite_if_unchanged").saveAsTable("oc")
-
-
-def test_handle_pinned_mutations_refuse_after_foreign_write(wh):
-    # The DeltaTable handle pins the version captured when it was taken (forName). A CONFLICTING
-    # write that lands on the table AFTER the handle was taken makes delete/update/merge through
-    # that handle fail loud (CommitFailedError) — poor-man's SNAPSHOT isolation, same as merge
-    # (delta-rs native OCC over (V, HEAD]: a conflict aborts).
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-
-    def handle_then_foreign_write():
-        conn.sql("select * from (values (1,'a'),(2,'b')) t(id,name)") \
-            .write.mode("overwrite").saveAsTable("h")
-        dt = DeltaTable.forName(conn, "h")                                   # pinned at V
-        # a conflicting write (full overwrite) lands after the handle was taken -> V+1
-        conn.sql("select 9 as id, 'z' as name").write.mode("overwrite").saveAsTable("h")
-        return dt
-
-    with pytest.raises(CommitFailedError):
-        handle_then_foreign_write().delete("id = 1")
-    with pytest.raises(CommitFailedError):
-        handle_then_foreign_write().update(condition="id = 1", set={"name": "'X'"})
-    with pytest.raises(CommitFailedError):
-        handle_then_foreign_write().merge(conn.sql("select 1 as id, 'M' as name"),
-                                          "target.id = source.id").whenMatchedUpdateAll().execute()
-
-
-def test_overwrite_append_stay_unsafe(wh):
-    # overwrite/append are NOT fenced (Spark SaveMode parity): a write landing on the table does
-    # not make a later overwrite/append fail — last-writer-wins / additive, by design.
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("us")
-    pending = conn.sql("select 2 id, 'b' v")
-    conn.sql("select 9 id, 'z' v").write.mode("append").saveAsTable("us")   # a write lands
-    pending.write.mode("append").saveAsTable("us")                          # unfenced -> commits
-    conn.sql("select 5 id, 'q' v").write.mode("overwrite").saveAsTable("us")  # unfenced -> commits
-    assert conn.table("us").collect() == [(5, "q")]                         # overwrite replaced all
-
-
-def test_dataframe_writes_persist_to_delta(wh):
-    # create/append via saveAsTable and mutate via the DeltaTable handle must land as real Delta,
-    # visible to a brand-new connection (not DuckDB-native tables in this session). conn.sql() is
-    # read-only for Delta writes — these go through the DataFrame API.
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    conn.sql("select 1 id, 'A' grp").write.mode("overwrite").saveAsTable("evt")
-    conn.sql("select 2 id, 'B' grp").write.mode("append").saveAsTable("evt")
-    conn.sql("select 3 id, 'C' grp").write.mode("append").saveAsTable("evt")
-    evt = DeltaTable.forName(conn, "evt")
-    evt.update(condition="id = 1", set={"grp": "'Z'"})
-    evt.delete("id = 2")
-    assert sorted(conn.sql("select * from evt").collect()) == [(1, "Z"), (3, "C")]
+    conn.sql("CREATE OR REPLACE TABLE evt AS select 1 id, 'A' grp")
+    conn.sql("insert into evt select 2 id, 'B' grp")
+    conn.sql("insert into evt select 3 id, 'C' grp")
+    conn.sql("update evt set grp = 'Z' where id = 1")
+    conn.sql("delete from evt where id = 2")
+    assert sorted(conn.sql("select * from evt").fetchall()) == [(1, "Z"), (3, "C")]
 
     # real persistence: a fresh connection reads it off the store
     fresh = duckrun.connect(wh, schema="dbo")
-    assert sorted(fresh.table("evt").collect()) == [(1, "Z"), (3, "C")]
+    assert sorted(fresh.sql("select * from evt").fetchall()) == [(1, "Z"), (3, "C")]
 
 
 def test_read_only_is_default_and_blocks_writes(wh):
-    # connect() is read-only by default: every Delta-write entry point raises PermissionError,
-    # reads and native scratch still work. read_only=False opts back in.
+    # connect() is read-only by default: every Delta-write raises PermissionError, reads and native
+    # scratch still work. read_only=False opts back in.
     ro = duckrun.connect(wh, schema="dbo")
     assert ro.sql("select count(*) from t1").fetchone()[0] == 2          # reads fine
     ro.sql("create temp table scratch as select 1 x")                    # native scratch fine
     with pytest.raises(PermissionError):
-        ro.sql("select 1 id").write.mode("overwrite").saveAsTable("nope")  # writer blocked
+        ro.sql("create or replace table nope as select 1 id")             # CTAS blocked
     with pytest.raises(PermissionError):
         ro.sql("insert into t1 values (3, 'c')")                          # write-DML blocked
     with pytest.raises(PermissionError):
-        DeltaTable.forName(ro, "t1").delete("id = 1")                      # DeltaTable mutator blocked
+        ro.sql("delete from t1 where id = 1")                             # delete blocked
 
     rw = duckrun.connect(wh, schema="dbo", read_only=False)
-    rw.sql("select 9 id, 'z' v").write.mode("overwrite").saveAsTable("ok")  # opt-in writes
-    assert rw.table("ok").count() == 1
-
-
-def test_read_api(wh):
-    conn = duckrun.connect(wh, schema="dbo")
-    t1_path = conn._table_path("dbo", "t1")
-    assert conn.read.format("delta").load(t1_path).count() == 2
-    assert conn.read.format("delta").load(t1_path).count() == 2
-
-
-def test_merge_insert_only(wh):
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    conn.sql("select * from (values (1,10),(2,10)) t(id, val)") \
-        .write.mode("overwrite").saveAsTable("io")
-
-    src = conn.sql("select * from (values (2,99),(3,99)) t(id, val)")
-    DeltaTable.forName(conn, "dbo.io").merge(src, "target.id = source.id") \
-        .whenNotMatchedInsertAll().execute()
-
-    assert conn.table("io").count() == 3                                    # only id=3 added
-    assert conn.sql("select val from io where id = 2").fetchone()[0] == 10  # existing untouched
-
-
-def test_update_only_merge(wh):
-    # update-only merge (matched update, no insert) is supported — only existing rows change.
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    src = conn.sql("select * from (values (1,'A'),(9,'z')) t(id, name)")
-    DeltaTable.forName(conn, "dbo.t1").merge(src, "target.id = source.id") \
-        .whenMatchedUpdateAll().execute()
-    assert conn.sql("select name from t1 where id = 1").fetchone()[0] == "A"  # updated
-    assert conn.sql("select count(*) from t1").fetchone()[0] == 2             # id=9 NOT inserted
-
-
-def test_toPandas(wh):
-    # .toPandas()/.df() are the only pandas-touching bits of the API (DuckDB materializes to a
-    # pandas DataFrame, like the DataFrame API's toPandas). pandas is in the [test] extra so this runs for real.
-    conn = duckrun.connect(wh, schema="dbo")
-    pdf = conn.sql("select name from t1 order by id").toPandas()
-    assert list(pdf["name"]) == ["a", "b"]
-
-
-def test_dataframe_show(wh):
-    # .show() is the print alias over the DuckDB relation: prints to stdout, returns None.
-    conn = duckrun.connect(wh, schema="dbo")
-    assert conn.sql("select * from t1 order by id").show() is None
+    rw.sql("create or replace table ok as select 9 id, 'z' v")            # opt-in writes
+    assert rw.sql("select count(*) from ok").fetchone()[0] == 1
 
 
 def test_raw_connection_escape_hatch(wh):
@@ -1469,29 +579,16 @@ def test_refresh_picks_up_external_writes(wh):
     assert conn.table("t3").count() == 1
 
 
-def test_reader_parquet_csv_and_table(wh, tmp_path):
+def test_read_files_via_sql(wh, tmp_path):
+    # Reading parquet/csv is native DuckDB — no reader wrapper needed.
     conn = duckrun.connect(wh, schema="dbo")
     pq = str(tmp_path / "t1.parquet")
     csv = str(tmp_path / "t1.csv")
     conn._connection.execute(f"COPY (select * from t1) TO '{pq}' (FORMAT parquet)")
     conn._connection.execute(f"COPY (select * from t1) TO '{csv}' (FORMAT csv, HEADER)")
 
-    assert conn.read.parquet(pq).count() == 2
-    # csv read with an explicit option (header) routed through DataFrameReader.option.
-    assert conn.read.format("csv").option("header", True).load(csv).count() == 2
-    assert conn.read.csv(csv).count() == 2
-    # read.table is the by-name shortcut (same as conn.table).
-    assert conn.read.table("t1").count() == 2
-
-
-def test_writer_format(wh):
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    # .format('delta') is accepted (the only supported writer format)…
-    conn.sql("select 1 id").write.format("delta").mode("overwrite").saveAsTable("wf")
-    assert conn.table("wf").count() == 1
-    # …anything else is rejected up front.
-    with pytest.raises(ValueError):
-        conn.sql("select 1 id").write.format("parquet")
+    assert conn.sql(f"select count(*) from read_parquet('{pq}')").fetchone()[0] == 2
+    assert conn.sql(f"select count(*) from read_csv_auto('{csv}')").fetchone()[0] == 2
 
 
 def test_catalog_database_and_column_introspection(wh):
@@ -1511,16 +608,6 @@ def test_catalog_database_and_column_introspection(wh):
     assert conn.sql("select n from orders").fetchone()[0] == 7   # unqualified resolves to sales
 
 
-def test_delta_table_version(wh):
-    conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    conn.sql("select 1 id, 'a' v").write.mode("overwrite").saveAsTable("ver")
-    # version() reads the same through the DeltaTable handle and the conn.table() parity path
-    assert DeltaTable.forName(conn, "dbo.ver").version() == conn.table("ver").version() == 0
-
-    conn.sql("select 2 id, 'b' v").write.mode("append").saveAsTable("ver")
-    assert conn.table("ver").version() == 1   # a new commit bumps the version
-
-
 # ── createDataFrame: every input/schema form ──────────────────────────────────────────────────────
 # The scorecard (TestSession.test_createDataFrame) has the one-liner; these are the edge cases, merged
 # in from the former test_create_dataframe.py so CI (which runs THIS file by path) actually runs them.
@@ -1531,7 +618,7 @@ def _cdf_types(df):
 def test_createDataFrame_tuples_no_schema_autonames(conn):
     df = conn.createDataFrame([(1, "a"), (2, "b")])
     assert df.columns == ["_1", "_2"]
-    assert df.collect() == [(1, "a"), (2, "b")]
+    assert df.fetchall() == [(1, "a"), (2, "b")]
 
 
 def test_createDataFrame_tuples_with_names(conn):
@@ -1561,13 +648,13 @@ def test_createDataFrame_rejects_parity_params(conn):
 def test_createDataFrame_ddl_decimal_with_comma_survives(conn):
     df = conn.createDataFrame([(1, "1.50")], "id long, amount decimal(10,2)")
     assert _cdf_types(df) == ["BIGINT", "DECIMAL(10,2)"]
-    assert df.collect() == [(1, pytest.approx(1.50))]
+    assert df.fetchall() == [(1, pytest.approx(1.50))]
 
 
 def test_createDataFrame_list_of_scalars_single_column(conn):
     df = conn.createDataFrame([1, 2, 3], "value int")
     assert df.columns == ["value"]
-    assert [r[0] for r in df.collect()] == [1, 2, 3]
+    assert [r[0] for r in df.fetchall()] == [1, 2, 3]
 
 
 def test_createDataFrame_ragged_rows_error(conn):
@@ -1703,10 +790,8 @@ def _seed(wh):
     """Seed a fresh warehouse at ``wh`` with the canonical tables and return the connection:
     ``items(id, name)`` = (1,a),(2,b),(3,c) and ``wide(id, name, qty)`` = (1,a,10)."""
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    conn.sql("select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)") \
-        .write.mode("overwrite").saveAsTable("items")
-    conn.sql("select * from (values (1,'a',10)) t(id, name, qty)") \
-        .write.mode("overwrite").saveAsTable("wide")
+    conn.sql("CREATE OR REPLACE TABLE items AS select * from (values (1,'a'),(2,'b'),(3,'c')) t(id, name)")
+    conn.sql("CREATE OR REPLACE TABLE wide AS select * from (values (1,'a',10)) t(id, name, qty)")
     return conn
 
 
@@ -1726,61 +811,47 @@ def _dtypes(wh, name):
     return {c: str(t) for c, t in zip(rel.columns, rel.types)}
 
 
-# Tier 1 — cross-API equivalence (the core oracle). Each pair expresses the SAME logical write via
-# the SQL API and the DataFrame API against the same seed; `expected` (in items column order) anchors it.
+# Write-correctness — each case applies a logical write through the SQL surface against the seed;
+# `expected` (in items column order) is the oracle, read back through a FRESH connection (real Delta
+# on disk). Covers overwrite / append (select, values, reordered col list, CTE) / update / delete /
+# upsert (delete literals + insert, delta-rs DELETE takes literals not IN (SELECT)).
 EQUIV = [
     dict(id="overwrite", table="items",
          sql=["create or replace table items as select * from (values (9,'z'),(8,'y')) t(id, name)"],
-         dataframe=lambda c: c.sql("select * from (values (9,'z'),(8,'y')) t(id, name)")
-                          .write.mode("overwrite").saveAsTable("items"),
          expected=[(9, "z"), (8, "y")]),
     dict(id="append_select", table="items",
          sql=["insert into items select * from (values (4,'d')) t(id, name)"],
-         dataframe=lambda c: c.sql("select * from (values (4,'d')) t(id, name)")
-                          .write.mode("append").saveAsTable("items"),
          expected=[(1, "a"), (2, "b"), (3, "c"), (4, "d")]),
     dict(id="append_values", table="items",
          sql=["insert into items values (5, 'e')"],
-         dataframe=lambda c: c.sql("select 5 id, 'e' as name").write.mode("append").saveAsTable("items"),
          expected=[(1, "a"), (2, "b"), (3, "c"), (5, "e")]),
     dict(id="append_collist_reordered", table="items",
-         # SQL maps by name from a reordered column list; the DataFrame API appends an in-order df — both land id=4,name='d'.
+         # a reordered column list maps by name: 'd' → name, 4 → id.
          sql=["insert into items (name, id) select 'd', 4"],
-         dataframe=lambda c: c.sql("select 4 id, 'd' as name").write.mode("append").saveAsTable("items"),
          expected=[(1, "a"), (2, "b"), (3, "c"), (4, "d")]),
     dict(id="with_prefixed_insert", table="items",
          sql=["with s as (select 8 id, 'h' as name) insert into items select * from s"],
-         dataframe=lambda c: c.sql("select 8 id, 'h' as name").write.mode("append").saveAsTable("items"),
          expected=[(1, "a"), (2, "b"), (3, "c"), (8, "h")]),
     dict(id="update_predicate", table="items",
          sql=["update items set name = 'Z' where id = 1"],
-         dataframe=lambda c: DeltaTable.forName(c, "items").update(condition="id = 1", set={"name": "'Z'"}),
          expected=[(1, "Z"), (2, "b"), (3, "c")]),
     dict(id="delete_predicate", table="items",
          sql=["delete from items where id = 2"],
-         dataframe=lambda c: DeltaTable.forName(c, "items").delete("id = 2"),
          expected=[(1, "a"), (3, "c")]),
     dict(id="upsert", table="items",
-         # SQL upsert = delete literal keys + insert (delta-rs DELETE takes literals, not IN (SELECT)).
          sql=["delete from items where id = 2 or id = 4", "insert into items values (2, 'B'), (4, 'D')"],
-         dataframe=lambda c: DeltaTable.forName(c, "items")
-             .merge(c.sql("select * from (values (2,'B'),(4,'D')) t(id, name)"), "target.id = source.id")
-             .whenMatchedUpdateAll().whenNotMatchedInsertAll().execute(),
          expected=[(1, "a"), (2, "B"), (3, "c"), (4, "D")]),
 ]
 
 
 @pytest.mark.parametrize("case", EQUIV, ids=[c["id"] for c in EQUIV])
-def test_sql_equals_dataframe(tmp_path, case):
-    a, b = str(tmp_path / "A"), str(tmp_path / "B")
-    ca = _seed(a)
+def test_sql_write_lands_expected(tmp_path, case):
+    wh = str(tmp_path / "A")
+    c = _seed(wh)
     for stmt in case["sql"]:
-        ca.sql(stmt)
-    case["dataframe"](_seed(b))
-
-    dump_a, dump_b = _dump(a, case["table"]), _dump(b, case["table"])
-    assert dump_a == dump_b, f"SQL≠DataFrame for {case['id']}: {dump_a} vs {dump_b}"
-    assert dump_a[1] == sorted(case["expected"], key=_k)   # anchor: agreeing-but-wrong can't pass
+        c.sql(stmt)
+    cols, rows = _dump(wh, case["table"])
+    assert rows == sorted(case["expected"], key=_k)
 
 
 # Tier 1b — SQL-routing forms with no DataFrame-API equivalent; the assertion is the persisted data.
@@ -1855,55 +926,9 @@ def test_insert_allows_widening_numeric(tmp_path):
     # An int literal into a BIGINT column is a lossless widening — not flagged.
     wh = str(tmp_path / "wh")
     c = duckrun.connect(wh, schema="dbo", read_only=False)
-    c.sql("select cast(1 as bigint) as id").write.mode("overwrite").saveAsTable("big")
+    c.sql("CREATE OR REPLACE TABLE big AS select cast(1 as bigint) as id")
     c.sql("insert into big values (2)")
     assert _dump(wh, "big")[1] == sorted([(1,), (2,)], key=_k)
-
-
-# Tier 2 — single-API ops; inline golden expected, read back via a fresh connection.
-def test_replace_where_dataframe_only(tmp_path):
-    wh = str(tmp_path / "wh")
-    c = _seed(wh)
-    c.sql("select * from (values (1,'eu'),(2,'us'),(3,'eu')) t(id, region)") \
-        .write.mode("overwrite").saveAsTable("rw")
-    c.sql("select 9 id, 'eu' region").write.option("replaceWhere", "region = 'eu'") \
-        .mode("overwrite").saveAsTable("rw")
-    assert _dump(wh, "rw")[1] == sorted([(2, "us"), (9, "eu")], key=_k)
-
-
-def test_merge_sync_delete_dataframe_only(tmp_path):
-    wh = str(tmp_path / "wh")
-    c = _seed(wh)
-    c.sql("select * from (values (1,10,'a'),(2,10,'b'),(3,10,'c')) t(id, val, note)") \
-        .write.mode("overwrite").saveAsTable("sync")
-    src = c.sql("select * from (values (2,99,'X'),(4,99,'Y')) t(id, val, note)")
-    DeltaTable.forName(c, "sync").merge(src, "target.id = source.id") \
-        .whenMatchedUpdate(set={"val": "source.val"}) \
-        .whenNotMatchedInsertAll().whenNotMatchedBySourceDelete().execute()
-    # id=2 val-only update (note 'b' kept), id=4 inserted, ids 1 & 3 deleted (absent from source).
-    assert _dump(wh, "sync")[1] == sorted([(2, 99, "b"), (4, 99, "Y")], key=_k)
-
-
-def test_partition_and_merge_schema_dataframe_only(tmp_path):
-    wh = str(tmp_path / "wh")
-    c = _seed(wh)
-    c.sql("select 1 id, 'eu' region").write.mode("overwrite").partitionBy("region").saveAsTable("p")
-    c.sql("select 2 id, 'us' region, true flag") \
-        .write.mode("append").option("mergeSchema", "true").partitionBy("region").saveAsTable("p")
-    assert "flag" in _dump(wh, "p")[0]
-    assert _select(wh, "select id, region, flag from p") == \
-        sorted([(1, "eu", None), (2, "us", True)], key=_k)
-
-
-def test_overwrite_schema_dataframe_only(tmp_path):
-    wh = str(tmp_path / "wh")
-    c = _seed(wh)
-    c.sql("select 1 id, 'x' a, 'y' b").write.mode("overwrite").saveAsTable("os")
-    assert _dump(wh, "os")[0] == ["id", "a", "b"]
-    with pytest.raises(Exception):   # plain overwrite can't silently drop columns
-        c.sql("select 2 id").write.mode("overwrite").saveAsTable("os")
-    c.sql("select 2 id").write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("os")
-    assert _dump(wh, "os") == (["id"], [(2,)])
 
 
 def test_alter_add_column_sql_only(tmp_path):
@@ -2025,8 +1050,8 @@ def test_multi_catalog_set_current(tmp_path):
 
 def test_multi_catalog_write_lands_in_right_root(tmp_path):
     conn = _two_lakehouses(tmp_path)
-    # a cross-catalog DataFrame write must land under the ATTACHED root (lhB), not the primary (lhA).
-    conn.sql("select 1 as id, 'z' as v").write.mode("overwrite").saveAsTable("other.dbo.created")
+    # a cross-catalog write must land under the ATTACHED root (lhB), not the primary (lhA).
+    conn.sql("CREATE OR REPLACE TABLE other.dbo.created AS select 1 as id, 'z' as v")
     assert deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhB" / "dbo" / "created"))
     assert not deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhA" / "dbo" / "created"))
     assert conn.sql("select v from other.dbo.created").fetchone()[0] == "z"
@@ -2133,33 +1158,31 @@ def test_attach_read_only_catalog_fences_writes(tmp_path):
 
     # the read-only catalog still reads (cross-catalog) ...
     assert conn.sql("select label from ref.dbo.lookup").fetchone()[0] == "one"
-    # ... but every write entry point into it fails loud, even though the session is writable.
+    # ... but a write into it fails loud, even though the session is writable — the fence is on the
+    # TARGET catalog's read-only flag, not the current one.
     with pytest.raises(PermissionError):
-        conn.sql("select 2 as id, 'two' as label").write.mode("append").saveAsTable("ref.dbo.lookup")
-    with pytest.raises(PermissionError):
-        DeltaTable.forName(conn, "ref.dbo.lookup").delete("id = 1")
-    # cross-catalog raw DML fences off the TARGET catalog's read-only flag, not the current one.
+        conn.sql("create or replace table ref.dbo.created as select 2 as id")
     with pytest.raises(PermissionError):
         conn.sql("insert into ref.dbo.lookup values (2, 'two')")
     # writes to the writable primary still work.
-    conn.sql("select 2 as id").write.mode("append").saveAsTable("t1")
+    conn.sql("insert into t1 select 2 as id")
     assert conn.sql("select count(*) from t1").fetchone()[0] == 2
 
 
-def test_stop_closes_connection(tmp_path):
+def test_close_closes_connection(tmp_path):
     conn = _two_lakehouses(tmp_path)
-    conn.stop()
+    conn.close()
     with pytest.raises(Exception):
-        conn.sql("select 1").collect()  # underlying DuckDB connection is closed
+        conn.sql("select 1").fetchall()  # underlying DuckDB connection is closed
 
 
 def test_context_manager_closes_connection(tmp_path):
     # `with duckrun.connect(...) as conn:` closes the connection on exit.
     with duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False) as conn:
-        conn.sql("select 1 as x").write.mode("overwrite").saveAsTable("t")
-        assert conn.sql("select count(*) from t").collect()[0][0] == 1
+        conn.sql("CREATE OR REPLACE TABLE t AS select 1 as x")
+        assert conn.sql("select count(*) from t").fetchall()[0][0] == 1
     with pytest.raises(Exception):
-        conn.sql("select 1").collect()  # closed on `with` exit
+        conn.sql("select 1").fetchall()  # closed on `with` exit
 
 
 def test_primary_secret_mint_failure_raises_and_closes_connection(tmp_path, monkeypatch):
@@ -2208,8 +1231,8 @@ def test_weird_attached_catalog_names(tmp_path, tmp_path_factory, weird):
     qn = '"' + weird.replace('"', '""') + '"'   # the caller quotes the weird name in their own SQL
     # cross-catalog read through the quoted 3-part name
     assert conn.sql(f"select n from {qn}.dbo.t2").fetchone()[0] == 9
-    # cross-catalog write via the DataFrame API (catalog resolved from the quoted 3-part name)
-    conn.sql("select 7 as v").write.mode("overwrite").saveAsTable(f"{qn}.dbo.created")
+    # cross-catalog write (catalog resolved from the quoted 3-part name)
+    conn.sql(f"CREATE OR REPLACE TABLE {qn}.dbo.created AS select 7 as v")
     assert conn.sql(f"select v from {qn}.dbo.created").fetchone()[0] == 7
     # switch to it and introspect under the weird name
     conn.catalog.setCurrentCatalog(weird)
@@ -2235,13 +1258,13 @@ def test_get_rle_hidden(conn):
     # Byte model on a fact-shaped table: a constant (ndv 1) sorts nothing; a low-card dimension enters
     # the key; its FD-derived twin does NOT (sorting the dimension already clusters it for free — a key
     # slot on it is meaningless, R5); a unique column can't be compressed by sorting. `_get_rle` is private.
-    conn.sql("select 1 as const, (i%4) as region, (i%4)*10 as rderived, i as uid "
-             "from range(1000) t(i)").write.mode("overwrite").saveAsTable("facttbl")
+    conn.sql("CREATE OR REPLACE TABLE facttbl AS select 1 as const, (i%4) as region, (i%4)*10 as rderived, i as uid "
+             "from range(1000) t(i)")
     df = conn._get_rle("facttbl")
     assert df.columns == ["table", "in_sort_key", "sort_position", "column", "data_type", "encoding",
                           "ndv", "skew_pct", "current_runs", "is_unique", "est_kb_current",
                           "est_kb_sorted", "saved_pct"]
-    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.fetchall())}
     assert not recs["const"]["in_sort_key"]        # ndv 1 → nothing to sort
     assert recs["region"]["in_sort_key"]           # low-card dimension compresses
     assert not recs["rderived"]["in_sort_key"]     # FD on region → already clustered, not a key slot
@@ -2258,11 +1281,11 @@ def test_get_rle_hidden_near_fd_dropped(conn):
     # NEAR (not exact) functional dependency. The old exact-equality test kept such a column (distinct
     # grew, if only by one), wasting a scarce key slot; the HLL threshold (fd_band) now drops it — it
     # clusters for free under `a`. `a` is the one independent dimension. No exact COUNT(DISTINCT) runs.
-    conn.sql("select (i % 100) as a, "
+    conn.sql("CREATE OR REPLACE TABLE nearfd AS select (i % 100) as a, "
              "case when (i % 1000) = 7 then 999 else (i % 100) end as b "
-             "from range(40000) t(i)").write.mode("overwrite").saveAsTable("nearfd")
+             "from range(40000) t(i)")
     df = conn._get_rle("nearfd")
-    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.fetchall())}
     assert recs["a"]["in_sort_key"] and recs["a"]["sort_position"] == 1   # the independent dimension
     assert not recs["b"]["in_sort_key"]                                   # 99%-determined by a → no slot
 
@@ -2271,10 +1294,9 @@ def test_get_rle_hidden_key_organized(conn):
     # A (near-)unique key with no compressible structure ⇒ key-organized (a dimension, or a table at
     # its grain): recommend ORDER BY the key itself, not a marginal compression sort. The unique key
     # is never told to "cut cardinality".
-    conn.sql("select i as pk, i * 2 as a, i * 3 as b from range(500) t(i)") \
-        .write.mode("overwrite").saveAsTable("dimtbl")
+    conn.sql("CREATE OR REPLACE TABLE dimtbl AS select i as pk, i * 2 as a, i * 3 as b from range(500) t(i)")
     df = conn._get_rle("dimtbl")
-    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.fetchall())}
     assert recs["pk"]["in_sort_key"] and recs["pk"]["sort_position"] == 1
     assert not recs["a"]["in_sort_key"] and not recs["b"]["in_sort_key"]
 
@@ -2290,10 +1312,10 @@ def test_get_rle_hidden_date_leads(conn):
     # R6: a moderate-NDV date/temporal column leads the key even though a lower-cardinality flag
     # exists (ndv 30 date ahead of the ndv-3 flag) — natural clustering wins the lead slot.
     # i%31 and i%3 are coprime → flag is independent of the date (not a functional dependency of it).
-    conn.sql("select (date '2024-01-01' + (i % 31)::int) as d, (i % 3) as flag, i as uid "
-             "from range(3000) t(i)").write.mode("overwrite").saveAsTable("dateleads")
+    conn.sql("CREATE OR REPLACE TABLE dateleads AS select (date '2024-01-01' + (i % 31)::int) as d, (i % 3) as flag, i as uid "
+             "from range(3000) t(i)")
     df = conn._get_rle("dateleads")
-    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.fetchall())}
     assert recs["d"]["in_sort_key"] and recs["d"]["sort_position"] == 1     # date leads despite higher ndv
     assert recs["flag"]["in_sort_key"] and recs["flag"]["sort_position"] == 2
     assert not recs["uid"]["in_sort_key"]                                    # near-unique → out
@@ -2306,12 +1328,12 @@ def test_get_rle_hidden_date_plus_lowcard_dims(conn):
     # fix the temporal thumb promoted every date, and the byte-gain gate starved the low-card dims, so the
     # key collapsed to a single date. Periods 53/7/11/59 are pairwise coprime → all four are independent
     # (no column is a functional dependency of another).
-    conn.sql("select (date '2024-01-01' + (i % 53)::int) as d1, "
+    conn.sql("CREATE OR REPLACE TABLE factdims AS select (date '2024-01-01' + (i % 53)::int) as d1, "
              "(date '2024-01-01' + (i % 59)::int) as d2, "
              "(i % 7) as status, (i % 11) as flag, i as id "
-             "from range(60000) t(i)").write.mode("overwrite").saveAsTable("factdims")
+             "from range(60000) t(i)")
     df = conn._get_rle("factdims")
-    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.fetchall())}
     key = sorted((c for c, r in recs.items() if r["in_sort_key"]), key=lambda c: recs[c]["sort_position"])
     assert recs[key[0]]["data_type"] == "DATE"                          # a date leads
     assert recs["status"]["in_sort_key"] and recs["flag"]["in_sort_key"]  # low-card dims make the key
@@ -2324,26 +1346,14 @@ def test_get_rle_hidden_near_unique_timestamp_not_lead(conn):
     # microsecond timestamp (tpep_pickup_datetime is ndv ~= 0.7*n), it must NOT be promoted to lead —
     # doing so grain-stops the very first pick and leaves an EMPTY key ("no key pays off"). The low-card
     # dimensions are the real key; the too-fine timestamp stays out (it can't form runs).
-    conn.sql("select (timestamp '2024-01-01' + (i * interval '1 second')) as ts, "
+    conn.sql("CREATE OR REPLACE TABLE nutime AS select (timestamp '2024-01-01' + (i * interval '1 second')) as ts, "
              "(i % 2) as flag, (i % 5) as kind, (i % 3) as vendor "
-             "from range(40000) t(i)").write.mode("overwrite").saveAsTable("nutime")
+             "from range(40000) t(i)")
     df = conn._get_rle("nutime")
-    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.fetchall())}
     assert any(r["in_sort_key"] for r in recs.values())   # NOT empty — the bug produced an empty key
     assert not recs["ts"]["in_sort_key"]                  # ~unique timestamp is too fine to be the key
     assert recs["flag"]["in_sort_key"]                    # the low-card dimensions form the key instead
-
-
-def test_get_rle_hidden_partition_leads(conn, capsys):
-    # R8: partition columns lead the printed ORDER BY (write-locality) but take no compression slot.
-    conn.sql("select (i % 4) as region, (i % 3) as cat, (i % 3) * 7 as catlike "
-             "from range(60000) t(i)").write.mode("overwrite").partitionBy("region").saveAsTable("parttbl")
-    df = conn._get_rle("parttbl")
-    out = capsys.readouterr().out
-    assert "ORDER BY region," in out                    # partition col leads the ORDER BY
-    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
-    assert not recs["region"]["in_sort_key"]            # ...but holds no compression-key slot
-    assert recs["cat"]["in_sort_key"]                   # the real low-card dimension is the key
 
 
 def test_get_rle_hidden_null_heavy_excluded(conn, capsys):
@@ -2351,12 +1361,12 @@ def test_get_rle_hidden_null_heavy_excluded(conn, capsys):
     # values → by its ndv (3) it would otherwise out-rank and lead ahead of `region` (ndv 4); but its
     # nulls already collapse to one run under any order, so a key slot on it clusters little and crowds
     # out the real dimension. The null share is read from the Delta LOG (get_add_actions), not the sample.
-    conn.sql("select (i % 4) as region, "
+    conn.sql("CREATE OR REPLACE TABLE nullheavy AS select (i % 4) as region, "
              "case when (i % 10) < 7 then null else (i % 3) end as sparse, i as uid "
-             "from range(20000) t(i)").write.mode("overwrite").saveAsTable("nullheavy")
+             "from range(20000) t(i)")
     df = conn._get_rle("nullheavy")
     out = capsys.readouterr().out
-    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.collect())}
+    recs = {r["column"]: r for r in (dict(zip(df.columns, row)) for row in df.fetchall())}
     assert recs["region"]["in_sort_key"] and recs["region"]["sort_position"] == 1   # real dimension keys
     assert not recs["sparse"]["in_sort_key"]                     # 70% null → excluded from candidacy
     assert "null-heavy" in out and "sparse" in out               # and the exclusion is reported
@@ -2370,117 +1380,20 @@ def test_writer_keeps_dictionary_encoding(conn):
     # dropped writer_properties — the real regression; genuine high-NDV columns are excluded upstream.
     import glob
     import os
-    conn.sql("select (i % 8) as lowcard, ('v' || (i % 5)) as lowstr from range(50000) t(i)") \
-        .write.mode("overwrite").saveAsTable("dicttbl")
+    conn.sql("CREATE OR REPLACE TABLE dicttbl AS select (i % 8) as lowcard, ('v' || (i % 5)) as lowstr from range(50000) t(i)")
     files = [f.replace(os.sep, "/")
              for f in glob.glob(os.path.join(conn.root_path, "dbo", "dicttbl", "**", "*.parquet"),
                                 recursive=True)]
     assert files, "no parquet files written"
     md = {r[0]: (r[1], r[2]) for r in conn.sql(
         f"select path_in_schema, encodings, dictionary_page_offset "
-        f"from parquet_metadata({files!r})").collect()}
+        f"from parquet_metadata({files!r})").fetchall()}
     for col in ("lowcard", "lowstr"):
         encodings, dict_off = md[col]
         assert dict_off is not None, f"{col} lost its dictionary page (PLAIN fallback)"
         assert "RLE_DICTIONARY" in encodings, f"{col} not dictionary-encoded: {encodings}"
 
 
-# ════════════════════════════════════════════════════════════════════════════════════════════════
-# optimize() end-to-end — INGEST raw data from a file, land it through every optimize combination,
-# and assert the one invariant that matters: OPTIMIZE CHANGES THE LAYOUT, NEVER THE DATA. Each variant
-# must hold the exact same row multiset as the raw baseline, and the optimized layout must be physically
-# clustered by its sort key. Codec is SNAPPY throughout — the one read-layout profile every file write
-# uses. All local-fs, network-free.
-# ════════════════════════════════════════════════════════════════════════════════════════════════
-
-# A realistic sales fact with no unique column (max ndv 5000 << 60000 rows), so the profiler picks the
-# low-cardinality dimensions by ascending cardinality — region (5) leads, then category (23), day (90) —
-# and treats `amount` as a measure (never a sort key). Deterministic: derived from range(), no RNG.
-_SALES_SQL = """
-    select (i % 5)                             as region,
-           (i % 23)                            as category,
-           (i % 90)                            as day,
-           (i % 5000)                          as customer_id,
-           ((i % 997) + 1) * 1.25              as amount,
-           (i % 7) + 1                         as qty
-    from range(60000) t(i)
-"""
-_SALES_COLS = "region, category, day, customer_id, amount, qty"
-
-
-@pytest.fixture
-def raw_sales(tmp_path):
-    """A writable local warehouse plus a STAGED RAW PARQUET (the 'raw data' we ingest). Returns
-    ``(conn, parquet_path, expected_rows)`` — expected_rows is the raw row multiset in ``_SALES_COLS``
-    order, the oracle every optimized write must reproduce exactly."""
-    conn = duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False)
-    praw = (tmp_path / "raw_sales.parquet").as_posix()
-    conn._connection.execute(f"COPY ({_SALES_SQL}) TO '{praw}' (FORMAT PARQUET)")
-    expected = sorted(
-        conn.sql(f"select {_SALES_COLS} from parquet_scan('{praw}')").fetchall(), key=_k)
-    return conn, praw, expected
-
-
-def _rows(conn, name):
-    """The table's row multiset projected in a stable column order (partition-layout-independent)."""
-    return sorted(conn.sql(f"select {_SALES_COLS} from {name}").fetchall(), key=_k)
-
-
-def _codecs(conn, name):
-    """The set of parquet codecs across the table's active files (e.g. {'SNAPPY'} or {'ZSTD'})."""
-    return set(conn.get_stats(name).df()["compression"].tolist())
-
-
-def _active_files(conn, name):
-    return [f.replace("file://", "")
-            for f in engine._delta_table(conn.root_path + f"/dbo/{name}", None).file_uris()]
-
-
-def _clustered_by(conn, name, col):
-    """True iff EVERY active file is internally non-decreasing on ``col`` (the sort-key signature)."""
-    for f in _active_files(conn, name):
-        vals = [r[0] for r in conn.sql(f"select {col} from parquet_scan('{f}')").fetchall()]
-        if vals != sorted(vals):
-            return False
-    return True
-
-
-def test_optimize_e2e_write_raw_then_table_optimize(raw_sales):
-    # The other entry point: land raw, THEN rewrite in place via conn.table(name).optimize(). Auto and
-    # explicit keys both preserve the data; the codec is SNAPPY (the one read-layout profile).
-    conn, praw, expected = raw_sales
-    conn.read.format("parquet").load(praw).write.mode("overwrite").saveAsTable("t1")
-    assert _codecs(conn, "t1") == {"SNAPPY"}
-
-    m = conn.table("t1").optimize(rewrite=True)           # auto-key rewrite
-    assert m["operation"] == "sortRewrite" and m["sortedBy"]
-    assert _rows(conn, "t1") == expected
-    assert _codecs(conn, "t1") == {"SNAPPY"}
-    assert _clustered_by(conn, "t1", m["sortedBy"][0])    # clustered by whatever the profiler led with
-
-    # Re-optimizing with an explicit key re-clusters the same data (idempotent on rows).
-    conn.table("t1").optimize("category")
-    assert _rows(conn, "t1") == expected
-    assert _clustered_by(conn, "t1", "category")
-
-
-def test_optimize_e2e_where_scopes_one_partition(raw_sales):
-    # Partition by region, then optimize(where="region = 2") — a scoped rewrite. Only region 2's files
-    # move; all rows across all partitions survive, and region 2 comes out clustered by customer_id.
-    conn, praw, expected = raw_sales
-    conn.read.format("parquet").load(praw) \
-        .write.partitionBy("region").mode("overwrite").saveAsTable("p1")
-    v0 = engine.table_version(conn.root_path + "/dbo/p1", None)
-
-    m = conn.table("p1").optimize("customer_id", where="region = 2")
-    assert m["operation"] == "sortRewrite"
-    assert engine.table_version(conn.root_path + "/dbo/p1", None) > v0     # a replaceWhere commit landed
-    assert _rows(conn, "p1") == expected                                   # nothing lost, nothing dup'd
-    # per-region counts are unchanged (the scope didn't touch other partitions' data)
-    counts = dict(conn.sql("select region, count(*) from p1 group by region").collect())
-    assert counts == {r: 12000 for r in range(5)}
-    # the rewritten partition's file is now sorted by the requested key
-    f2 = [f for f in _active_files(conn, "p1") if "region=2" in f.replace(os.sep, "/")]
-    assert f2, "region=2 partition file not found"
-    vals = [r[0] for r in conn.sql(f"select customer_id from parquet_scan('{f2[0]}')").fetchall()]
-    assert vals == sorted(vals)
+# NOTE: optimize / partitionBy / append_if_unchanged (fenced modes) have no DuckDB-SQL surface and are
+# left as gaps for now — their notebook tests were removed here; the engine capabilities remain covered
+# by tests/adapter and tests/correctness.

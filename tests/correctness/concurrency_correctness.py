@@ -166,14 +166,14 @@ def mutate_display(rows):
 # ------------------------------------------ E. connection-API append_if_unchanged (self-reference)
 
 def conn_append_if_unchanged_run(mode: str, concurrent: bool) -> dict:
-    """Same guarantee as B, but driven end-to-end through the **connection API** — and where the
-    source query reads the SAME table it writes to (``select … from t`` → ``saveAsTable('t')``).
-    ``mode`` is 'append' (no guard) or 'append_if_unchanged' (CAS). The real race: the writer captures the
-    version it read (vB), a foreign writer then commits, and append_if_unchanged's CAS must refuse the commit
-    (HEAD moved past vB) while a plain append silently lands on the new HEAD."""
+    """Section E: the connection-API self-reference **auto-fence**. A write whose source reads the
+    SAME table it writes (``insert into t select … from t``) is snapshot-fenced automatically — no
+    verb — so a foreign commit since the read makes it REFUSE (``CommitFailedError``); a plain append
+    of new data (``insert into t values …``) is unfenced and lands on the new HEAD. ``mode`` maps
+    'append_if_unchanged' → the self-referential (fenced) write, 'append' → the plain (unfenced) one."""
     root = tempfile.mkdtemp()
     conn = duckrun.connect(root, schema="dbo", read_only=False)
-    conn.sql("select 0 as id").write.mode("overwrite").saveAsTable("t")    # v0
+    conn.sql("create or replace table t as select 0 as id")               # v0
     path = conn._table_path("dbo", "t")
     so = conn.storage_options
     cap = {"mode": mode, "concurrent": concurrent}
@@ -183,16 +183,16 @@ def conn_append_if_unchanged_run(mode: str, concurrent: bool) -> dict:
         engine.write_delta(path, _batch([7]), "append")                  # foreign writer -> v1
     cap["head_ver"] = DeltaTable(path).version()
 
-    # Source reads the SAME table t, then appends back into it (self-reference).
-    src = conn.sql("select id + 100 as id from t")
-
+    # 'append_if_unchanged' → self-reference (reads t, appends to t → auto-fenced); 'append' → a
+    # plain append of new data (references nothing of t → unfenced).
+    stmt = ("insert into t select id + 100 as id from t"
+            if mode == "append_if_unchanged" else "insert into t values (100)")
     real_tv = engine.table_version
     if mode == "append_if_unchanged" and concurrent:
-        # append_if_unchanged fences to the version the writer read (vB); a foreign commit since then must
-        # make the CAS refuse. Force the captured version to vB to model "read vB, then it moved".
+        # model "read vB, then a foreign commit moved HEAD past it": force the version capture to vB.
         engine.table_version = lambda *a, **k: read_ver
     try:
-        src.write.mode(mode).saveAsTable("t")
+        conn.sql(stmt)
         cap["outcome"], cap["final"] = "committed", _ids(path)
     except CommitFailedError:
         cap["outcome"], cap["final"] = "refused", _ids(path)
@@ -245,8 +245,8 @@ def render_console(sa_disp, mut_disp, conn_disp, safe):
         ["mode", "concurrent write", "read", "head", "result"],
         [[x["mode"], x["concurrent"], x["read"], x["head"], x["res_txt"]] for x in conn_disp])
     verdict = ("CONCURRENCY-CORRECT: append_if_unchanged refuses a moved table, plain append has no guard;\n"
-               "  DELETE/UPDATE fail on a conflicting commit; conn-API append_if_unchanged refuses a moved\n"
-               "  table even when reading the same table it writes. (MERGE pinning: test_correctness.)"
+               "  DELETE/UPDATE fail on a conflicting commit; a conn-API self-referential insert refuses a\n"
+               "  moved table (auto-fenced), plain append doesn't. (MERGE pinning: test_correctness.)"
                if safe else
                "INVARIANT VIOLATED — a case behaved unexpectedly (see tables). Investigate.")
     return ("\n  duckrun — concurrency correctness\n\n"
@@ -254,7 +254,7 @@ def render_console(sa_disp, mut_disp, conn_disp, safe):
             + b + "\n\n"
             "  D) DELETE / UPDATE — do they fail on a conflicting concurrent commit (like merge)?\n"
             + d + "\n\n"
-            "  E) connection-API append_if_unchanged — self-reference (read t, write t) refuses a moved table\n"
+            "  E) connection-API self-reference auto-fence — read t, write t refuses a moved table\n"
             + e + "\n\n  " + verdict + "\n")
 
 
@@ -285,17 +285,18 @@ def render_markdown(sa_disp, mut_disp, conn_disp, safe):
           "`CommitFailedError` when a foreign commit changed the same rows after the snapshot was "
           "opened. No `max_commit_retries` hack: the conflict detection is native (the hack was only "
           "needed for non-conflicting appends in `append_if_unchanged`). Uncontended, they just commit.", "",
-          "### E) connection-API append_if_unchanged — *self-reference (read `t`, write `t`)*", "",
-          "| mode | concurrent write | read | head | result |",
+          "### E) connection-API self-reference auto-fence — *read `t`, write `t`*", "",
+          "| write | concurrent write | read | head | result |",
           "|:---:|:---:|:---:|:---:|:---|"]
     for d in conn_disp:
         cc = "**yes**" if d["concurrent"] == "yes" else "no"
-        L.append(f"| `{d['mode']}` | {cc} | {d['read']} | {d['head']} | {d['res_md']} |")
+        label = "self-ref" if d["mode"] == "append_if_unchanged" else "plain append"
+        L.append(f"| `{label}` | {cc} | {d['read']} | {d['head']} | {d['res_md']} |")
     L += ["",
-          "> Driven end-to-end through the connection API — `conn.sql(\"select … from t\")"
-          ".write.mode(m).saveAsTable(\"t\")` — where the source reads the **same table it writes**. "
-          "`append_if_unchanged` still **refuses** (`CommitFailedError`) when a foreign commit moved the table "
-          "since the writer read it, while a plain `append` silently lands on the new HEAD.", "",
+          "> Driven end-to-end through the connection API. A `conn.sql(\"insert into t select … from t\")` "
+          "whose source reads the **same table it writes** is snapshot-fenced automatically (no verb): it "
+          "**refuses** (`CommitFailedError`) when a foreign commit moved the table since the read, while a "
+          "plain `insert into t values …` (new data) is unfenced and lands on the new HEAD.", "",
           ("> ✅ **Concurrency-correct.**" if safe
            else "> ❌ **Invariant violated** — see tables above.")]
     return "\n".join(L) + "\n"

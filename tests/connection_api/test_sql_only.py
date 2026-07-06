@@ -14,6 +14,7 @@ Some of these are RED until Phase 1 lands (native return, ``conn.register``, ``d
 that is the point — the spec leads the implementation. The spy tests (engine path / fencing) are
 GREEN today and guard the shared-seam invariant during the refactor.
 """
+import duckdb
 import pytest
 
 import duckrun
@@ -28,12 +29,19 @@ def w(tmp_path):
     return duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False)
 
 
-# NOTE: the native-relation return contract (`type(conn.sql(...)) is duckdb.DuckDBPyRelation`) lands
-# with the migration commit that flips the return type and rewrites the wrapper-API tests — it can't
-# be green until then, so it is added there rather than committed RED to main.
+# ─────────────────────────────────────────────────────────────────── native relation return
+
+def test_sql_returns_native_duckdb_relation(w):
+    """conn.sql() hands back DuckDB's own relation, unwrapped — exact type, not isinstance-of-ours."""
+    rel = w.sql("select 1 as x")
+    assert type(rel) is duckdb.DuckDBPyRelation
+    # the native surface users rely on is all present (maintained upstream by DuckDB)
+    for m in ("show", "df", "arrow", "pl", "fetchall", "fetchone", "filter", "aggregate"):
+        assert hasattr(rel, m), m
+    assert rel.fetchall() == [(1,)]
 
 
-# ─────────────────────────────────────────────────────────── conn.register (createDataFrame → 1a)
+# ─────────────────────────────────────────────────────────── conn.register (createDataFrame)
 
 def test_register_makes_local_object_queryable(w):
     """The createDataFrame replacement: register a local object under a name, then FROM it in SQL.

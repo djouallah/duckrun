@@ -419,6 +419,35 @@ def classify(sql: str) -> str:
     return "passthrough"                        # select, create view, show, describe, set, pragma, …
 
 
+def _blank_string_literals(s: str) -> str:
+    """Blank ``'…'`` and ``$tag$…$tag$`` string literals (replace their runs with spaces), leaving
+    ``"…"`` quoted IDENTIFIERS intact — so a table name matcher can't be fooled by a literal that
+    contains the name, but still sees a quoted-identifier reference to it. Length-preserving."""
+    out, quote, i, n = [], None, 0, len(s)
+    while i < n:
+        ch = s[i]
+        if quote:
+            out.append(" ")
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "'":
+            quote = ch
+            out.append(" ")
+        elif ch == "$":
+            de = _dollar_quote_end(s, i)
+            if de is not None:
+                out.append(" " * (de - i))
+                i = de
+                continue
+            out.append(ch)
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _fullmatch(pattern, sql):
     return pattern.fullmatch(sql.strip())
 
@@ -997,7 +1026,31 @@ class _DeltaDML:
             for col, typ in zip(target_cols, target_types)
         ]
         data = self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
-        engine.write_delta(loc, data, "append", storage_options=self.so, cur=self.cursor)
+        # Read-then-append to the SAME table (`insert into a select … from a`) is fenced to the
+        # version read — the automatic append_if_unchanged — so a concurrent commit fails loud
+        # instead of appending stale-derived rows. A plain append of new data (a VALUES list, or a
+        # SELECT over other tables) references nothing of the target and stays unfenced.
+        read_version = (engine.table_version(loc, self.so)
+                        if self._reads_target(derived, loc) else None)
+        engine.write_delta(loc, data, "append", storage_options=self.so, cur=self.cursor,
+                           read_version=read_version)
+
+    def _reads_target(self, derived: str, loc: str) -> bool:
+        """True if the append's source query references the target table (a read-modify-append on one
+        relation), so the append must be snapshot-fenced. A VALUES list or a SELECT over other tables
+        references nothing of the target and stays a plain, unfenced append.
+
+        Detection is by name: the target is reached through a ``delta_scan`` VIEW, which DuckDB's
+        ``get_table_names`` doesn't report, and a path compare is unreliable (8.3 short names, abfss
+        URLs). The target's bare name appears in EVERY real reference — bare, ``schema.t`` or
+        ``cat.schema.t`` all contain it — so a word-boundary match on the comment/literal-stripped
+        source never MISSES a self-reference; it can only over-fence the rare ``… AS <name>`` alias,
+        which is the safe direction (an unnecessary fence fails loud, it never silently loses a write)."""
+        target = loc.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1]
+        body = _blank_string_literals(_strip_comments(derived))
+        if re.search('"' + re.escape(target) + '"', body):            # exact quoted identifier
+            return True
+        return re.search(r"\b" + re.escape(target) + r"\b", body, re.IGNORECASE) is not None
 
     def _reject_lossy_numeric_narrowing(self, inner: str, provided, ttype) -> None:
         """Fail loud when a supplied numeric value would be SILENTLY changed by the cast onto its

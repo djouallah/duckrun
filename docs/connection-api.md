@@ -24,10 +24,12 @@ scratch are always allowed.
 
 For the exact list of supported methods, see the [API reference](api-reference.md).
 
-`MERGE` is **snapshot-pinned by default** — single-snapshot MERGE, no extra arguments: the target
-version is captured and the commit validates against it, so a concurrent writer fails the commit
-loudly (`CommitFailedError`) instead of silently interleaving. The full model and a cross-engine
-comparison are in [Snapshot isolation](snapshot-isolation.md).
+`MERGE`, `UPDATE`, and `DELETE` are **snapshot-pinned by default** — the target version is captured
+and the commit validates against it, so a concurrent writer fails the commit loudly
+(`CommitFailedError`) instead of silently interleaving. A **read-modify-append on the same table**
+(`INSERT INTO a SELECT … FROM a`) is fenced the same way automatically; a plain append of new data
+(a `VALUES` list, or a `SELECT` over *other* tables) is unfenced (last-writer-wins / additive). The
+full model and a cross-engine comparison are in [Snapshot isolation](snapshot-isolation.md).
 
 ```python
 import duckrun

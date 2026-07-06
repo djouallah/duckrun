@@ -626,8 +626,10 @@ class DuckSession:
 
     # ---- DataFrame-style surface --------------------------------------------------------------
 
-    def sql(self, query: str) -> "DataFrame":
-        """Run a query and return a :class:`DataFrame`.
+    def sql(self, query: str) -> duckdb.DuckDBPyRelation:
+        """Run a query and return DuckDB's native ``DuckDBPyRelation`` — unwrapped, with all of its
+        own methods (``.show()``, ``.df()``, ``.arrow()``, ``.pl()``, ``.fetchall()``, ``.filter()``,
+        …), maintained upstream by DuckDB.
 
         Reads pass straight through to DuckDB over the ``delta_scan`` views (time-travel works for
         free — ``conn.sql("from delta_scan('path', version => 0)")``).
@@ -642,8 +644,10 @@ class DuckSession:
         A SQL ``merge`` must reference the literal ``target`` and ``source`` aliases in the ``ON``
         condition and ``WHEN`` clauses (``merge into t using s on target.id = source.id when matched
         then update set * when not matched then insert *``) — duckrun renames the merge relations to
-        those names. It mirrors the DataFrame ``DeltaTable.forName(conn, name).merge(...)`` builder.
-        ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
+        those names. ``CREATE TEMP/VIEW`` and other DuckDB-local scratch DDL pass through to DuckDB.
+
+        A DML statement returns a one-row ``status`` relation (there is no result set to hand back);
+        the write has already been applied to Delta.
         """
         # Raw DML routes through delta_rs against ONE root. A 3-part target names which catalog that
         # is (``_dml_target_catalog`` → its name); an unqualified/2-part target is the current catalog.
@@ -666,10 +670,10 @@ class DuckSession:
         if delta_dml.handle(self.con, entry.root_path, entry.storage_options, query,
                             default_schema=self._current_database):
             self.refresh(quiet=True, catalog=write_cat)
-            return DataFrame(self.con.sql("SELECT 'ok' AS status"), self)
+            return self.con.sql("SELECT 'ok' AS status")
         if _is_delta_write(query):
             raise ValueError(_delta_write_message(query))
-        return DataFrame(self.con.sql(query), self)
+        return self.con.sql(query)
 
     def register(self, name: str, obj) -> None:
         """Register an in-memory object (pandas / polars / pyarrow / a DuckDB relation) as ``name`` so
