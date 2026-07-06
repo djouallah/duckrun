@@ -581,15 +581,15 @@ _BARE_IDENT = re.compile(r"[A-Za-z_][\w$]*", re.A)
 
 
 def _is_clean_relation(rel: str) -> bool:
-    """True if ``rel`` is a well-formed 1/2/3-part name: dot-separated parts, each a double-quoted
-    span or a bare identifier. Rejects a rel that carries STRAY TOKENS after the name — which is what
-    an unrecognised layout clause leaves behind (e.g. ``t SORT BY AUTO`` — a mis-spelled ``SORTED BY``
-    that would otherwise be silently baked into the table name, creating a spaces-in-name Delta table).
-    A name that genuinely contains spaces must be quoted (``"my table"``)."""
+    """True if ``rel`` is a structurally well-formed 1/2/3-part name: dot-separated parts, each a
+    double-quoted span (a dot inside quotes is part of the name) or a bare identifier. Rejects a rel
+    that carries STRAY TOKENS after the name — what an unrecognised layout clause leaves behind (e.g.
+    ``t SORT BY AUTO``, a mis-spelled ``SORTED BY``, which would otherwise be baked into the name).
+    (The whitespace-in-name policy is separate — see :func:`_create_target_error`.)"""
     s = rel.strip()
     n, i = len(s), 0
     while True:
-        if i < n and s[i] == '"':                       # quoted part — opaque, may hold spaces/dots
+        if i < n and s[i] == '"':                       # quoted part (a dot inside is part of the name)
             j = i + 1
             while j < n:
                 if s[j] == '"':
@@ -615,6 +615,21 @@ def _is_clean_relation(rel: str) -> bool:
         i += 1
         while i < n and s[i].isspace():
             i += 1
+
+
+def _create_target_error(rel: str) -> Optional[str]:
+    """Validate a CREATE TABLE target; return an error message, or None if OK. Rejects (a) stray
+    tokens (an unrecognised layout clause left in the name) and (b) whitespace in the SCHEMA or TABLE
+    part — those become directories on the store and a space in a Delta path trips abfss globbing
+    (``%20``). Whitespace in the CATALOG part (a DuckDB attach alias, not a directory) is allowed."""
+    if not _is_clean_relation(rel):
+        return (f"invalid CREATE TABLE target {rel!r}: a table name can't contain stray tokens. The "
+                f"layout clauses are SORTED BY (cols) | SORTED BY AUTO | PARTITIONED BY (cols) — check "
+                f"the spelling (it's SORTED BY, not SORT BY).")
+    schema, identifier = _split_relation(rel)
+    if any(p and any(c.isspace() for c in p) for p in (schema, identifier)):
+        return f"invalid CREATE TABLE target {rel!r}: schema and table names can't contain spaces."
+    return None
 
 
 def _lead_alias(text: str) -> Optional[str]:
@@ -957,11 +972,9 @@ class _DeltaDML:
     # -- create table <rel> as <query>: always materialize as a duckrun Delta table ------------
     def _create_as(self, m) -> bool:
         rel, sort_cols, partition_cols = _split_create_layout(m.group("rel").strip())
-        if not _is_clean_relation(rel):
-            raise ValueError(
-                f"CREATE TABLE target {rel!r} has stray tokens after the table name. The layout "
-                f"clauses are SORTED BY (cols) | SORTED BY AUTO | PARTITIONED BY (cols) — check the "
-                f"spelling (it's SORTED BY, not SORT BY); quote the name if it truly has spaces.")
+        err = _create_target_error(rel)
+        if err:
+            raise ValueError(err)
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
@@ -1019,10 +1032,9 @@ class _DeltaDML:
         if self.default_schema is None:
             return False
         rel = m.group("rel").strip()
-        if not _is_clean_relation(rel):
-            raise ValueError(
-                f"CREATE TABLE target {rel!r} has stray tokens after the table name; quote the name "
-                f"if it truly has spaces.")
+        err = _create_target_error(rel)
+        if err:
+            raise ValueError(err)
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False

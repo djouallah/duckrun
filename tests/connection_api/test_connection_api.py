@@ -766,23 +766,30 @@ def test_malformed_create_layout_fails_loud_and_writes_nothing(tmp_path):
     # NOT peeled off the CREATE target, so it used to leak into the table name and SILENTLY create a
     # spaces-in-name Delta table (data committed, then the view step failed — a partial write). That
     # garbage table later broke get_stats on abfss. It must now fail loud BEFORE any write and leave
-    # nothing behind; a genuinely quoted name with spaces still works.
-    from dbt.adapters.duckrun.delta_dml import _is_clean_relation
-    assert _is_clean_relation("c.s.t") and _is_clean_relation('"my table"')
-    assert not _is_clean_relation("t SORT BY AUTO")
+    # nothing behind. A name with spaces is refused even when quoted (spaces in the path trip abfss
+    # globbing); a quoted name WITHOUT spaces (e.g. a dotted "a.b") still works.
+    from dbt.adapters.duckrun.delta_dml import _is_clean_relation, _create_target_error
+    assert _is_clean_relation("c.s.t") and _is_clean_relation('"a.b"')
+    assert not _is_clean_relation("t SORT BY AUTO")             # stray tokens (structural)
+    assert _create_target_error("dbo.t") is None
+    assert _create_target_error('dbo."my report"') is not None  # space in the table name
+    assert _create_target_error('"my schema".t') is not None    # space in the schema name
+    assert _create_target_error('"my lake".dbo.t') is None      # space only in the CATALOG alias → OK
 
     wh = str(tmp_path / "wh")
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
-    for stmt in ["CREATE OR REPLACE TABLE dbo.fct SORT BY AUTO AS SELECT 1 AS a",  # CTAS
-                 "CREATE OR REPLACE TABLE dbo.fct SORT BY AUTO (a int)"]:          # empty coldefs
-        with pytest.raises(ValueError, match="stray tokens"):
+    for stmt in ["CREATE OR REPLACE TABLE dbo.fct SORT BY AUTO AS SELECT 1 AS a",  # stray tokens, CTAS
+                 "CREATE OR REPLACE TABLE dbo.fct SORT BY AUTO (a int)",           # stray tokens, coldefs
+                 'CREATE OR REPLACE TABLE dbo."my report" AS SELECT 1 AS a',       # space in name, CTAS
+                 'CREATE OR REPLACE TABLE dbo."my report" (a int)']:               # space in name, coldefs
+        with pytest.raises(ValueError, match="can't contain"):
             conn.sql(stmt)
     dbo = tmp_path / "wh" / "dbo"
-    assert not (dbo / "fct SORT BY AUTO").exists()   # the malformed write left no directory
-    # the correct clause and a legitimately-quoted spaced name both still write
+    assert not dbo.exists() or list(dbo.iterdir()) == []   # nothing written for any rejected statement
+    # the correct clause and a quoted dotted name (no spaces) both still write
     conn.sql("CREATE OR REPLACE TABLE dbo.good SORTED BY AUTO AS SELECT 1 AS a")
-    conn.sql('CREATE OR REPLACE TABLE dbo."my report" AS SELECT 1 AS a')
-    assert sorted(p.name for p in dbo.iterdir()) == ["good", "my report"]
+    conn.sql('CREATE OR REPLACE TABLE dbo."a.b" AS SELECT 1 AS a')
+    assert sorted(p.name for p in dbo.iterdir()) == ["a.b", "good"]
 
 
 def _fs_case_sensitive() -> bool:
