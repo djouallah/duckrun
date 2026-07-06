@@ -177,7 +177,7 @@ shares (`engine.set_merge_memory_limit` / `_default_merge_spill_size`):
 - the remaining **~10%** is slack for Python, Arrow buffers, and page cache.
 
 Past its share each consumer **spills to disk** rather than OOM-killing the container. The
-write path (overwrite/append/append_if_unchanged/microbatch) has no competing delta_rs pool, so DuckDB
+write path (overwrite/append/microbatch) has no competing delta_rs pool, so DuckDB
 gets the bulk — clamped to `_WRITE_MEM_FRACTION` (**0.7**) of the effective limit
 (`engine.set_write_memory_limit`).
 

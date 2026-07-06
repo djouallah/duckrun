@@ -4,7 +4,7 @@ The `merge-spill` job in [`local_stress_tests.yml`](../.github/workflows/local_s
 fact table (the release gate runs scale factor **10**, ~60M rows) and runs several merge
 shapes against it — mixed upsert, insert-only, update-only, idempotent re-merge, and the full
 delta-rs clause set (CDC delete+update+insert, by-source delete, expression update) — plus a
-plain `append`, `append_if_unchanged`, and `overwrite` of the same batch for comparison, all through the
+plain `append` and `overwrite` of the same batch for comparison, all through the
 **connection API** (`duckrun.connect()` + `conn.sql(...)` — no dbt), on a single machine with
 duckrun's shipping memory defaults (per-merge DuckDB `memory_limit` + delta_rs `max_spill_size`
 + target pruning). It runs on a standard **GitHub-hosted runner (~16 GB RAM)** — no beefy
@@ -16,7 +16,7 @@ every release; the latest scorecard is rendered live below.
 
 ## 🔀 Incremental MERGE test — duckrun on Delta Lake (via the connection API)
 
-**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table **through the connection API** — a chain of `conn.sql(...)` MERGEs (the delta_rs spill cap + the per-merge DuckDB memory pin) — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same shape compares against a plain `append` / `append_if_unchanged` / `overwrite` (which never scan the target).
+**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table **through the connection API** — a chain of `conn.sql(...)` MERGEs (the delta_rs spill cap + the per-merge DuckDB memory pin) — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same shape compares against a plain `append` / `overwrite` (which never scan the target).
 
 ### Setup (the inputs)
 | | |
@@ -36,7 +36,7 @@ every release; the latest scorecard is rendered live below.
 6. **Full sync (by-source delete):** matched rows UPDATEd, keys a ~50% (inline-subquery) source no longer carries DELETEd via `WHEN NOT MATCHED BY SOURCE` — the heaviest shape (whole-target anti-join).
 7. **Expression update:** a 100%-match UPDATE whose SET is an arbitrary expression + `CASE` over the source, not a plain column copy.
 8. **Append (no merge):** the batch appended — no target scan/join (far cheaper).
-9. **append_if_unchanged (no merge):** same cheap append, version-guarded against concurrent writers.
+9. **Append #2 (plain, no merge):** a second cheap append of new keys — no target scan/join.
 10. **Overwrite (no merge):** the table replaced by the batch — also no target scan/join.
 
 _Operations 5–7 exercise delta-rs's full MERGE clause set and run on the LOCAL stress gate only; the OneLake path-smoke job skips them._
@@ -52,7 +52,7 @@ _Operations 5–7 exercise delta-rs's full MERGE clause set and run on the LOCAL
 | Full sync (update + by-source delete) | 15.0M | 15.0M | 0.0M | 30.1M | 15.0M | 15.0M | ✅ | ✅ | 11,563 MB | 23.7s |
 | Expression update (set expressions + CASE) | 1.5M | 1.5M | 0.0M | 30.1M | 30.1M | 30.1M | ✅ | ✅ | 9,072 MB | 70.7s |
 | Append (no merge) | 3.2M | 0.0M | 3.2M | 63.1M | 66.3M | 66.3M | ✅ | ✅ | 8,910 MB | 14.3s |
-| append_if_unchanged (no merge) | 3.3M | 0.0M | 3.3M | 66.3M | 69.6M | 69.6M | ✅ | ✅ | 9,716 MB | 15.4s |
+| Append #2 (plain, no merge) | 3.3M | 0.0M | 3.3M | 66.3M | 69.6M | 69.6M | ✅ | ✅ | 9,716 MB | 15.4s |
 | Overwrite (no merge) | 3.5M | 0.0M | 3.5M | 69.6M | 3.5M | 3.5M | ✅ | ✅ | 7,815 MB | 10.9s |
 
 **Result: ✅ all operations correct.** The chain tail reached **69,584,515 rows**, peak memory **11,563 MB** — duckrun stayed within the runner's RAM and every update/insert landed through the connection API.

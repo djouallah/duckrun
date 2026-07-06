@@ -1,19 +1,26 @@
 # Automatic sort
 
-`conn.table(name).optimize(rewrite=True)` picks the sort key **for you**. You don't pass a column
-list — it profiles the table (each column's cardinality, skew, null-density, and functional
-dependencies), chooses a short key from that, and rewrites every file physically ordered by it.
+`CREATE OR REPLACE TABLE <t> SORTED BY AUTO AS SELECT * FROM <t>` picks the sort key **for you**. You
+don't pass a column list — duckrun profiles the table (each column's cardinality, skew, null-density,
+and functional dependencies), chooses a short key from that, and rewrites every file physically ordered
+by it.
 
-```python
-conn.table("sales").optimize(rewrite=True)            # auto: profile, pick the key, rewrite
-conn.table("sales").optimize("region", "order_date")  # or say the key yourself
-conn.table("sales").optimize(analyze=True)            # just show me what you'd pick, don't write
+```sql
+-- auto: profile the table, pick the key, rewrite clustered by it
+CREATE OR REPLACE TABLE sales SORTED BY AUTO AS SELECT * FROM sales;
+
+-- or name the key yourself (plain DuckDB CTAS syntax — no AUTO)
+CREATE OR REPLACE TABLE sales SORTED BY (region, order_date) AS SELECT * FROM sales;
+
+-- just compact small files, no re-sort
+VACUUM sales;
 ```
 
-Both forms do the same physical thing — one global `ORDER BY` streamed back out as new Delta files
-in [the parquet layout](parquet-layout.md). The only difference is **who chooses the columns**. The rest
-of this page is about why letting the machine choose is a genuinely hard problem — and why that
-matters when you decide whether to trust it.
+Both `SORTED BY` forms do the same physical thing — one global `ORDER BY` streamed back out as new
+Delta files in [the parquet layout](parquet-layout.md). The only difference is **who chooses the
+columns**: `AUTO` profiles and picks, `(cols)` takes your list. `VACUUM` is the no-sort sibling — it
+just bin-packs small files. The rest of this page is about why letting the machine choose is a
+genuinely hard problem — and why that matters when you decide whether to trust it.
 
 ## It's just a global `ORDER BY`
 
@@ -115,7 +122,7 @@ plus a few duckrun-specific rules (lead with a date, stop at the grain, drop mea
 
 ## How the automatic picker chooses instead
 
-`rewrite=True` gives up on optimal and uses a cheap, greedy heuristic — a stack of rules of thumb,
+`SORTED BY AUTO` gives up on optimal and uses a cheap, greedy heuristic — a stack of rules of thumb,
 each of which is *usually* right:
 
 - **A date leads.** One temporal column is given the first key slot ahead of everything else, because
@@ -138,9 +145,9 @@ each of which is *usually* right:
 
 The result is a short, sensible key. Because it's a heuristic, it is **not guaranteed to shrink
 anything** — a near-uniform table or one already organized by a unique key has no runs to make, and
-the rewrite falls back to a plain compaction. That's also why the `savedPct` you get back is
-**measured from the Delta log** after the rewrite, not predicted: the picker optimizes a model of the
-size; only the disk knows the truth.
+`SORTED BY AUTO` falls back to a plain compaction (the same thing `VACUUM` does). The picker only
+optimizes a *model* of the size, so compare `conn.get_stats("sales")` before and after to see the real
+change on disk — only the disk knows the truth.
 
 ## Pick your columns yourself
 
