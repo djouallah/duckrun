@@ -291,4 +291,5 @@ def test_onelake_friendly_name_connect_error_is_clean():
         assert "duckdb-delta#307" in msg, "the GUID workaround hint must be present"
         assert "log segment" in msg or "IO Error" in msg, "the real engine error must be preserved"
         return
-    print(f"\nfriendly-name connect succeeded — discovered: {conn.catalog.listTables()}", flush=True)
+    tables = [r[0] for r in conn.sql("SHOW TABLES").fetchall()]
+    print(f"\nfriendly-name connect succeeded — discovered: {tables}", flush=True)

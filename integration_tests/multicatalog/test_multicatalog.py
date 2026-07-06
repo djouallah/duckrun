@@ -48,14 +48,14 @@ def test_multicatalog_local_derisk(tmp_path):
     assert deltalake.DeltaTable.is_deltatable(f"{lakehouse}/{SCHEMA}/mart_generation_by_state")
     assert deltalake.DeltaTable.is_deltatable(f"{local}/dbo/fuel_factors")
     out = {s: (mw, co2) for s, mw, co2 in conn.sql(
-        f"SELECT State, total_mw, est_tonnes_co2 FROM {SCHEMA}.mart_generation_by_state").collect()}
+        f"SELECT State, total_mw, est_tonnes_co2 FROM {SCHEMA}.mart_generation_by_state").fetchall()}
     assert set(out) == {"New South Wales", "Victoria", "Queensland"}      # 3 states, joined via dim
     assert out["New South Wales"] == (500, 450.0)   # 500 MW black coal × 900 kg/MWh = 450 t
     assert out["Victoria"][1] == 0.0                # wind → zero-carbon (local factor)
     # the warehouse stayed read-only: the fence write left no 'nope' table behind.
-    conn.catalog.setCurrentCatalog("warehouse")
-    assert "nope" not in conn.catalog.listTables("mart")
-    conn.stop()
+    conn.sql("USE warehouse.mart")
+    assert "nope" not in [r[0] for r in conn.sql("SHOW TABLES").fetchall()]
+    conn.close()
 
 
 def test_multicatalog_demo_writes_html(tmp_path, monkeypatch):

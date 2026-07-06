@@ -57,7 +57,7 @@ def _readback(root, table):
         rows = con.sql(f"select * from {table}").fetchall()
         return cols, rows
     finally:
-        con.stop()
+        con.close()
 
 
 def main():

@@ -760,7 +760,7 @@ def _generate_tables(conn, sf, schema):
     Returns the per-table ingestion timings ``[{'table', 'rows', 'dur'}, …]`` (the write cost; the row
     count is a cheap parquet-metadata read), or ``[]`` when the tables already exist and nothing was
     written."""
-    if conn.catalog.tableExists("supplier"):
+    if conn.sql("SELECT count(*) FROM information_schema.tables WHERE table_name = 'supplier'").fetchone()[0]:
         print("Data already exists")
         return []
     gen_root = os.path.join(tempfile.gettempdir(), f"tpch_gen_sf{sf}")
@@ -779,9 +779,10 @@ def _generate_tables(conn, sf, schema):
     ingestion = []
     for tbl in TPCH_TABLES:
         src = f"{gen_root}/{tbl}/*.parquet"
-        rows = conn.read.parquet(src).count()                   # cheap: parquet footer metadata
+        srclit = src.replace("'", "''")
+        rows = conn.sql(f"SELECT count(*) FROM read_parquet('{srclit}')").fetchone()[0]  # parquet footer
         ts = time.time()
-        conn.read.parquet(src).write.mode("overwrite").saveAsTable(f"{schema}.{tbl}")
+        conn.sql(f"CREATE OR REPLACE TABLE {schema}.{tbl} AS SELECT * FROM read_parquet('{srclit}')")
         dur = time.time() - ts
         ingestion.append({"table": tbl, "rows": rows, "dur": dur})
         print(f"  {tbl}: {rows:,} rows write→Delta in {dur:.2f}s")
@@ -813,18 +814,22 @@ def run_tpch_benchmark(sf=1, base_path=None, timings_out=None):
     setup_time = time.time() - start
 
     ingestion = _generate_tables(conn, sf, schema)
-    conn.catalog.setCurrentDatabase(schema)  # resolve the queries' unqualified table names
+    # connect(schema=schema) already made `schema` the current database, so the queries' unqualified
+    # table names resolve; a plain `USE` keeps it current after the ingestion refresh.
+    cat = conn.sql("SELECT current_database()").fetchone()[0]
+    conn.sql(f'USE "{cat}"."{schema}"')
 
     results = _execute_queries(conn, _tpch_sql(sf))
     results[0]["dur"] += setup_time  # fold attach cost into Q1, as the original did
 
-    # Save results with the duckrun DataFrame API (no pandas).
+    # Save the timings as a Delta table via plain SQL (no pandas, no DataFrame API).
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cores = os.cpu_count()
-    rows = [(r["query"], r["dur"], "duckrun", now, sf, cores, "tpch") for r in results]
-    conn.createDataFrame(
-        rows, "query int, dur double, engine string, time string, sf int, cpu int, test string"
-    ).write.mode("append").saveAsTable("result")
+    conn.sql("CREATE TABLE IF NOT EXISTS result "
+             "(query INT, dur DOUBLE, engine VARCHAR, time VARCHAR, sf INT, cpu INT, test VARCHAR)")
+    vals = ", ".join(f"({r['query']}, {r['dur']}, 'duckrun', '{now}', {sf}, {cores}, 'tpch')"
+                     for r in results)
+    conn.sql(f"INSERT INTO result VALUES {vals}")
 
     if timings_out is not None:
         timings_out["ingestion"] = ingestion

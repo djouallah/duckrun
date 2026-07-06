@@ -327,7 +327,7 @@ def test_dml_drop_table_tombstones(root):
     """DROP hides the table from discovery (tombstone marker), so a fresh connect can't see it."""
     _seed_items(root).sql("drop table items")
     fresh = duckrun.connect(root, schema="dbo")
-    assert "items" not in fresh._cat_tables()
+    assert "items" not in [r[0] for r in fresh.sql("SHOW TABLES").fetchall()]
 
 
 def test_dml_lossy_numeric_narrowing_rejected(root):
