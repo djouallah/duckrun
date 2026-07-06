@@ -156,6 +156,25 @@ def test_create_sorted_by_auto(w):
     assert w.sql("select count(*) from a").fetchone()[0] == 20000
 
 
+def test_sorted_by_auto_single_table_profiles_exactly(w, monkeypatch):
+    """SORTED BY AUTO over a bare `SELECT * FROM <delta table>` (re-cluster this table) profiles the
+    table EXACTLY from the Delta log; a filtered/projected body samples the result relation instead."""
+    w.sql("CREATE OR REPLACE TABLE t AS SELECT (i%5) region, i id FROM range(100) t(i)")
+    calls = []
+    monkeypatch.setattr(type(w), "_auto_sort_cols_from_table",
+                        lambda self, name, **k: calls.append(("exact", name)) or [])
+    monkeypatch.setattr(type(w), "_auto_sort_cols",
+                        lambda self, rel, **k: calls.append(("sample", None)) or [])
+    w.sql("CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t")
+    assert calls == [("exact", "t")]                             # single bare Delta table → exact
+    calls.clear()
+    w.sql("CREATE OR REPLACE TABLE t2 SORTED BY AUTO AS SELECT * FROM t WHERE id > 10")
+    assert calls == [("sample", None)]                           # filtered body → sampler
+    calls.clear()
+    w.sql("CREATE OR REPLACE TABLE t3 SORTED BY AUTO AS SELECT region, id FROM t")
+    assert calls == [("sample", None)]                           # projection (no `*`) → sampler
+
+
 # ─────────────────────────────────────────────────────── shared engine seam + fencing (GREEN)
 
 def test_ctas_goes_through_engine_write_delta(w, monkeypatch):

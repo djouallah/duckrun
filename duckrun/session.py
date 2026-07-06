@@ -29,6 +29,10 @@ from ._runtime import check_runtime_versions
 _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
 _VACUUM_WRITE_RE = re.compile(r"^vacuum\s+(?:analyze\s+)?[\"\w]", re.IGNORECASE)
+# A bare `SELECT * FROM <table>` — nothing else (no WHERE/JOIN/LIMIT/projection). Its output is that
+# table verbatim, so SORTED BY AUTO can profile it EXACTLY from the Delta log instead of sampling.
+_SELECT_STAR_FROM = re.compile(
+    r"\s*select\s+\*\s+from\s+(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)\s*", re.IGNORECASE)
 _DML_TARGET_RE = re.compile(
     r"^(?:insert\s+into|delete\s+from|update)\s+(?P<rel>\"?[\w.]+\"?)", re.IGNORECASE)
 _CREATE_TEMP_RE = re.compile(r"^create\s+(or\s+replace\s+)?(temp|temporary)\b", re.IGNORECASE)
@@ -695,7 +699,13 @@ class DuckSession:
         ``SORTED BY (cols)`` by profiling the query's result with the sort-key recommender, so the
         router only ever handles explicit layout clauses. If nothing pays off, the clause is dropped.
         ``SORTED BY (cols)`` / ``PARTITIONED BY (cols)`` (native DuckDB syntax) and every non-CREATE
-        statement pass straight through untouched."""
+        statement pass straight through untouched.
+
+        When the body is a bare ``SELECT * FROM <one delta table>`` (the re-cluster-this-table case),
+        the key is profiled EXACTLY from that table's Delta log — real row width, per-column null
+        stats, and uniqueness (a unique key is left PLAIN and picked as the ORDER BY key) — which a
+        sampled relation profile can't assert. Any filter / projection / join / non-Delta source falls
+        back to sampling the result relation, whose distribution isn't a table's on-disk layout."""
         stripped = delta_dml._strip_comments(delta_dml._strip_leading(query)).rstrip().rstrip(";").rstrip()
         m = delta_dml._CREATE_AS.fullmatch(stripped)
         if not m:
@@ -703,9 +713,27 @@ class DuckSession:
         _rel, sort, _part = delta_dml._split_create_layout(m.group("rel").strip())
         if sort != "AUTO":
             return query
-        cols = self._auto_sort_cols(self.con.sql(m.group("body")))
+        body = m.group("body")
+        src = self._auto_sort_single_table(body)
+        cols = (self._auto_sort_cols_from_table(src) if src is not None
+                else self._auto_sort_cols(self.con.sql(body)))
         replacement = ("SORTED BY (" + ", ".join(_qid(c) for c in cols) + ")") if cols else ""
         return delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1)
+
+    def _auto_sort_single_table(self, body: str) -> Optional[str]:
+        """If ``body`` is a bare ``SELECT * FROM <table>`` over a single duckrun-managed Delta table,
+        return that table name so SORTED BY AUTO profiles it exactly from the Delta log; else None (a
+        general query — sample its result relation, whose output distribution is unknown)."""
+        m = _SELECT_STAR_FROM.fullmatch(body.strip())
+        if not m:
+            return None
+        name = m.group("rel")
+        try:
+            if self.catalog.tableExists(name):
+                return name
+        except Exception:
+            pass
+        return None
 
     def register(self, name: str, obj) -> None:
         """Register an in-memory object (pandas / polars / pyarrow / a DuckDB relation) as ``name`` so
