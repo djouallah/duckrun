@@ -67,7 +67,7 @@ def test_multicatalog_demo_writes_html(tmp_path, monkeypatch):
     _seed(warehouse + "/mart/fct_summary", "SELECT DATE '2024-01-01' AS date, 'D1' AS DUID, 10.0 AS mw, 50.0 AS price")
     conn = duckrun.connect(lakehouse, schema=demo.REMOTE_SCHEMA, read_only=False, name="lakehouse")
     demo.run_multicatalog_demo(conn, warehouse, local, SCHEMA)
-    conn.stop()
+    conn.close()
     body = page.read_text(encoding="utf-8")
     assert "catalog.schema.table" in body          # the key three-part naming visual
     assert "warehouse.mart.fct_summary" in body     # cross-catalog reference shown

@@ -49,7 +49,7 @@
 # OneLake tokens are acquired automatically (Fabric notebook / env / az login):
 conn.attach(warehouse_path, name=&quot;warehouse&quot;, schema=&quot;mart&quot;, read_only=True)
 conn.attach(local_path,     name=&quot;local&quot;)   # a plain local folder, writable</pre>
-  <p class="tcap">conn.catalog.listCatalogs()</p>
+  <p class="tcap">the three attached catalogs</p>
   <table class="data"><thead><tr><th>catalog</th><th>mode</th><th>storage</th></tr></thead><tbody><tr><td>lakehouse</td><td>primary</td><td>OneLake (abfss)</td></tr><tr><td>warehouse</td><td>read-only</td><td>OneLake (abfss)</td></tr><tr><td>local</td><td>writable</td><td>local</td></tr></tbody></table>
   <p class="note">three catalogs bound to one session; &#x27;lakehouse&#x27; is writable, &#x27;warehouse&#x27; is read-only</p>
 </section>
@@ -70,10 +70,10 @@ conn.sql(&quot;&quot;&quot;SELECT table_catalog, table_schema, table_name
   <h3><span class="n">3</span> the three ways to name a table: catalog.schema.table → schema.table → table</h3>
   <pre class="py"># 3-part — fully qualified, works from anywhere (cross-catalog):
 conn.sql(&quot;SELECT * FROM warehouse.mart.fct_summary LIMIT 5&quot;)
-# 2-part — schema.table, in the current catalog:
-conn.catalog.setCurrentCatalog(&quot;warehouse&quot;); conn.sql(&quot;SELECT * FROM mart.fct_summary LIMIT 5&quot;)
-# 1-part — bare table, in the current catalog + database:
-conn.catalog.setCurrentDatabase(&quot;mart&quot;);      conn.sql(&quot;SELECT * FROM fct_summary LIMIT 5&quot;)</pre>
+# 2-part — schema.table, after USE selects the current catalog:
+conn.sql(&quot;USE warehouse&quot;);      conn.sql(&quot;SELECT * FROM mart.fct_summary LIMIT 5&quot;)
+# 1-part — bare table, after USE selects catalog + schema:
+conn.sql(&quot;USE warehouse.mart&quot;); conn.sql(&quot;SELECT * FROM fct_summary LIMIT 5&quot;)</pre>
   <p class="tcap">the same warehouse table, three naming conventions — identical on a bounded probe</p>
   <table class="data"><thead><tr><th>naming</th><th>reference</th><th>rows (100k sample probe)</th></tr></thead><tbody><tr><td>3-part</td><td>warehouse.mart.fct_summary</td><td>100,000</td></tr><tr><td>2-part</td><td>mart.fct_summary (current catalog)</td><td>100,000</td></tr><tr><td>1-part</td><td>fct_summary (current catalog + db)</td><td>100,000</td></tr></tbody></table>
   <p class="note">all three names resolve to the same table (probed on a 100k-row sample, not the full fact)</p>

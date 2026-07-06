@@ -150,10 +150,10 @@ jobs:
         with:
           name: docs-aemo
           path: integration_tests/aemo/target/static_index.html
-      - name: conn.table('fct_summary').optimize() — sort rewrite (dogfood on real data)
-        # Non-blocking: run the fluent auto-key sort-rewrite on the real summary table over OneLake and
-        # print the chosen sort order to the log. Last step on purpose — it's a rewrite the next dbt
-        # build supersedes, and it must not gate the integration on a new feature.
+      - name: SORTED BY AUTO sort rewrite on fct_summary (dogfood on real data)
+        # Non-blocking: run the SQL-only auto-key sort rewrite on the real summary table over OneLake
+        # and print the before/after layout. Last step on purpose — it's a rewrite the next dbt build
+        # supersedes, and it must not gate the integration on a new feature.
         continue-on-error: true
         run: |
           python - <<'PY'
@@ -162,12 +162,20 @@ jobs:
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema="mart", read_only=False)
-          result = conn.table("fct_summary").optimize()
-          print("=== conn.table('fct_summary').optimize() result ===")
-          print("sort order:", result.get("sortedBy", result))
-          b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
+
+          def detail(t):
+              rel = conn.sql(f"DESCRIBE DETAIL {t}")
+              return dict(zip(rel.columns, rel.fetchone()))
+
+          before = detail("fct_summary")
+          # Auto-key sort rewrite, SQL-only: profile the key from the Delta log, re-cluster in one commit.
+          conn.sql("CREATE OR REPLACE TABLE fct_summary SORTED BY AUTO AS SELECT * FROM fct_summary")
+          after = detail("fct_summary")
+          print("=== CREATE TABLE fct_summary SORTED BY AUTO — auto-sort rewrite ===")
+          print(f"numFiles: {before['numFiles']} -> {after['numFiles']}  (version {before['version']} -> {after['version']})")
+          b, a = before["sizeInBytes"], after["sizeInBytes"]
           if b:
-              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB ({result.get('savedPct')}% smaller)")
+              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB")
           PY
 
   merge_spill:
@@ -269,11 +277,11 @@ jobs:
         with:
           name: docs-coffee
           path: integration_tests/coffee/target/static_index.html
-      - name: conn.table('fact_sales').optimize() — sort rewrite (dogfood)
+      - name: SORTED BY AUTO sort rewrite on fact_sales (dogfood)
         # Non-blocking dogfood on the partitioned coffee fact: connect writable to the dbt build's
-        # schema, run the fluent auto-key sort rewrite, print the chosen sort order + the REAL on-disk
-        # size reduction. fact_sales is partitioned by region (R8) and has season<-order_date (R5), so
-        # it exercises both partition-leading order and the profiler.
+        # schema, run the SQL-only auto-key sort rewrite, print the before/after layout. fact_sales is
+        # partitioned by region (R8) and has season<-order_date (R5), so it exercises both
+        # partition-leading order and the profiler.
         continue-on-error: true
         env:
           DBT_SCHEMA: duckrun_dbt_it
@@ -284,12 +292,20 @@ jobs:
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema=os.environ["DBT_SCHEMA"], read_only=False)
-          result = conn.table("fact_sales").optimize()
-          print("=== conn.table('fact_sales').optimize() result ===")
-          print("sort order:", result.get("sortedBy", result))
-          b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
+
+          def detail(t):
+              rel = conn.sql(f"DESCRIBE DETAIL {t}")
+              return dict(zip(rel.columns, rel.fetchone()))
+
+          before = detail("fact_sales")
+          # Auto-key sort rewrite, SQL-only: profile the key from the Delta log, re-cluster in one commit.
+          conn.sql("CREATE OR REPLACE TABLE fact_sales SORTED BY AUTO AS SELECT * FROM fact_sales")
+          after = detail("fact_sales")
+          print("=== CREATE TABLE fact_sales SORTED BY AUTO — auto-sort rewrite ===")
+          print(f"numFiles: {before['numFiles']} -> {after['numFiles']}  (version {before['version']} -> {after['version']})")
+          b, a = before["sizeInBytes"], after["sizeInBytes"]
           if b:
-              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB ({result.get('savedPct')}% smaller)")
+              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB")
           PY
       - name: Run the coffee-shop scenario against OneLake (connection-API smoke)
         env:
@@ -351,9 +367,9 @@ jobs:
           DUCKRUN_TAXI_PAGE: taxi_run.html   # the demo writes its full SQL+results HTML report here
         run: python integration_tests/taxi/demo_taxi.py
 
-      - name: conn.table('trips').optimize() — sort rewrite (dogfood)
-        # Non-blocking dogfood of the fluent auto-key sort rewrite on the demo fact table: connect
-        # writable, run conn.table('trips').optimize(), and print the chosen sort order to the CI log.
+      - name: SORTED BY AUTO sort rewrite on trips (dogfood)
+        # Non-blocking dogfood of the SQL-only auto-key sort rewrite on the demo fact table: connect
+        # writable, run CREATE TABLE trips SORTED BY AUTO, and print the before/after layout to the CI log.
         continue-on-error: true
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
@@ -365,12 +381,20 @@ jobs:
               os.environ["WAREHOUSE_PATH"],
               storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema=os.environ["DUCKRUN_TAXI_SCHEMA"], read_only=False)
-          result = conn.table("trips").optimize()
-          print("=== conn.table('trips').optimize() result ===")
-          print("sort order:", result.get("sortedBy", result))
-          b, a = result.get("sizeBytesBefore"), result.get("sizeBytesAfter")
+
+          def detail(t):
+              rel = conn.sql(f"DESCRIBE DETAIL {t}")
+              return dict(zip(rel.columns, rel.fetchone()))
+
+          before = detail("trips")
+          # Auto-key sort rewrite, SQL-only: profile the key from the Delta log, re-cluster in one commit.
+          conn.sql("CREATE OR REPLACE TABLE trips SORTED BY AUTO AS SELECT * FROM trips")
+          after = detail("trips")
+          print("=== CREATE TABLE trips SORTED BY AUTO — auto-sort rewrite ===")
+          print(f"numFiles: {before['numFiles']} -> {after['numFiles']}  (version {before['version']} -> {after['version']})")
+          b, a = before["sizeInBytes"], after["sizeInBytes"]
           if b:
-              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB ({result.get('savedPct')}% smaller)")
+              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB")
           PY
 
       - name: Upload this run's HTML report for deploy-docs to publish as taxi.html

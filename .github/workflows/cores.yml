@@ -403,7 +403,7 @@ jobs:
 
   tpch-smoke:
     # A fast SF=1 smoke of the connection-API TPCH benchmark (duckrun.connect): generate →
-    # read.parquet → saveAsTable → 22-query run. Pure per-change GUARD — the card script exits
+    # CREATE TABLE AS read_parquet → 22-query run. Pure per-change GUARD — the card script exits
     # non-zero if the read/write surface or the 22-query run breaks. The PUBLISHED scorecard is the
     # heavy SF=100 run in local_stress_tests.yml (manual, big-disk runner); this job never commits
     # the card. Fully offline bar tpchgen-cli.

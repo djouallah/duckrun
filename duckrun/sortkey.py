@@ -378,8 +378,8 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                      f"{', '.join(partition_cols)})")
     # Deliberately NO projected-size line: this only profiles, it doesn't rewrite, so any "sorted
     # size" would be a model estimate — and an estimate that reads like a measurement is worse than
-    # none. The real before/after bytes are printed by conn.table(name).optimize(), which actually
-    # rewrites and measures via the Delta log (get_stats).
+    # none. The real before/after bytes come from actually rewriting the table
+    # (CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t) and measuring via the Delta log.
     if note:
         lines.append(f"  ({note})")
     if dict_bound:

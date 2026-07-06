@@ -1328,8 +1328,9 @@ def optimize(
 ) -> Dict:
     """Compact small files into larger ones (delta_rs ``optimize.compact``) and return the operation
     metrics. Reuses the one ``_writer_properties()`` read layout. A lexicographic ``ORDER BY`` at
-    write time (``conn.table(name).optimize(...)``) is what a columnar reader wants; there is no
-    z-order path — bit-interleaving destroys the run-length runs the in-memory reader relies on."""
+    write time (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a columnar
+    reader wants; there is no z-order path — bit-interleaving destroys the run-length runs the
+    in-memory reader relies on."""
     dt = _delta_table(path, storage_options)
     return dt.optimize.compact(target_size=target_size, writer_properties=_writer_properties())
 
