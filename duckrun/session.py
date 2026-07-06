@@ -186,6 +186,34 @@ def _qlit(text: str) -> str:
     return str(text).replace("'", "''")
 
 
+def _case_collision(names):
+    """The first ``(earlier, later)`` pair of ``names`` that are equal ignoring case but differ in
+    spelling — a case-fold collision DuckDB's case-INSENSITIVE catalog would silently merge (so one
+    table shadows the other) — else ``None``. Used to fail discovery loud when a store holds two
+    tables (or schemas) that differ only by case, e.g. an external engine wrote both ``Foo`` and
+    ``foo`` as separate directories on a case-sensitive filesystem."""
+    seen = {}
+    for n in names:
+        prior = seen.get(n.lower())
+        if prior is not None and prior != n:
+            return prior, n
+        seen.setdefault(n.lower(), n)
+    return None
+
+
+def _case_clash_msg(catalog, schema, clash) -> str:
+    """The fail-loud message for a case-fold collision found during discovery."""
+    a, b = clash
+    where = (f"schema '{schema}' of catalog '{catalog}'" if schema is not None
+             else f"catalog '{catalog}'")
+    kind = "tables" if schema is not None else "schemas"
+    return (
+        f"duckrun: {where} has two {kind} that differ only by case — '{a}' and '{b}'. DuckDB's "
+        f"catalog is case-insensitive, so it can expose only one and the other would be silently "
+        f"hidden. They are separate directories on the store (written by another engine); rename or "
+        f"remove one so the name is unambiguous.")
+
+
 def _norm_exts(file_extensions: Optional[List[str]]) -> Optional[set]:
     """Normalise a file-extension filter to a lowercase set with leading dots (``csv`` → ``.csv``),
     or ``None`` for no filter."""
@@ -472,18 +500,31 @@ class DuckSession:
         else:
             mapping = {s: self._list_tables(root, s, so) for s in self._list_schemas(root, so)}
 
+        # Fail loud when the store holds two schemas/tables that differ ONLY by case: DuckDB's catalog
+        # folds them to one name, so exposing both is impossible and one would silently shadow the
+        # other. This happens on a case-sensitive store (Linux / OneLake) when an external engine
+        # (Spark/Fabric) wrote both — duckrun can't fix it, but it must not hide it.
+        clash = _case_collision(list(mapping))
+        if clash:
+            raise RuntimeError(_case_clash_msg(name, None, clash))
+
         registered = []
         for schema, tables in mapping.items():
             if not tables:
                 continue
             self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(name)}.{_qid(schema)}")
+            live = []
             for table in tables:
                 # Hide drop-tombstones (a `drop table` overwrites the table to a one-column marker;
                 # no data is deleted, the files persist, but the table must not surface).
                 if delta_dml.is_dropped(self.con, f"{root}/{schema}/{table}", so):
                     continue
                 if self._register_view(name, schema, table):
+                    live.append(table)
                     registered.append(f"{schema}.{table}")
+            clash = _case_collision(live)
+            if clash:
+                raise RuntimeError(_case_clash_msg(name, schema, clash))
 
         if not quiet:
             lh = root.rstrip("/").rsplit("/", 1)[-1]

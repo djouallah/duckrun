@@ -798,37 +798,34 @@ def _fs_case_sensitive() -> bool:
     return sensitive
 
 
+def test_case_collision_detector():
+    """The pure fold-collision detector behind fail-loud discovery (runs everywhere)."""
+    assert session_mod._case_collision(["a", "b", "c"]) is None
+    assert session_mod._case_collision(["Foo", "bar", "foo"]) == ("Foo", "foo")
+    assert session_mod._case_collision(["t", "T"]) == ("t", "T")
+    assert session_mod._case_collision([]) is None
+    assert session_mod._case_collision(["dbo", "DBO"]) == ("dbo", "DBO")
+
+
 @pytest.mark.skipif(not _fs_case_sensitive(),
                     reason="needs a case-sensitive filesystem (Linux CI); Windows/macOS fold Foo/foo on disk")
-@pytest.mark.xfail(reason="case split-brain — known/parked gap: an external engine (Spark/Fabric) can "
-                          "write two case-variant Delta tables; DuckDB's catalog folds Foo == foo, so "
-                          "discovery can only expose one and silently shadows the other.", strict=False)
-def test_case_variant_tables_split_brain(tmp_path):
-    """DEMONSTRATES the parked 'case split-brain' gap, in the scenario that actually matters: two
-    case-variant Delta tables that an EXTERNAL engine (Spark/Fabric) already wrote to the lakehouse —
-    duckrun has no control over that and only discovers what is on disk. Written here straight to disk
-    with write_deltalake to mimic that, NOT through duckrun's write path.
+def test_case_variant_tables_fail_loud_on_discovery(tmp_path):
+    """The 'case split-brain' fix, in the scenario that actually matters: two case-variant Delta tables
+    that an EXTERNAL engine (Spark/Fabric) already wrote to the lakehouse — duckrun only discovers what
+    is on disk. Written here straight to disk with write_deltalake to mimic that, NOT via duckrun.
 
-    Reproducible ONLY on a case-sensitive filesystem — which is exactly why it can't be seen on
-    Windows (there ``Foo/`` and ``foo/`` ARE the same directory, so the two tables can't coexist).
-
-    On Linux ``.../dbo/Foo`` and ``.../dbo/foo`` are two DIFFERENT directories holding two real
-    tables. But DuckDB's catalog is case-INSENSITIVE (it folds ``Foo == foo`` even when quoted), so on
-    connect only ONE of the two ``delta_scan`` views survives — the other table's rows sit on disk
-    unreachable through SQL. Because the tables come from OUTSIDE, a write-side fix (fold/refuse on
-    duckrun's own CREATE) can't help; only DISCOVERY can — fail loud on the collision, or disambiguate
-    the views. This asserts the desired behaviour (both readable), so it xfails today and pins the gap.
+    Reproducible ONLY on a case-sensitive filesystem — which is why it can't be seen on Windows (there
+    ``Foo/`` and ``foo/`` ARE the same directory, so the two tables can't coexist). On Linux they are
+    two real tables, but DuckDB's catalog folds ``Foo == foo`` and could expose only one, silently
+    hiding the other. duckrun can't fix the store, so discovery FAILS LOUD instead of shadowing.
     """
     import pyarrow as pa
     # mimic Spark/Fabric: two case-variant Delta tables written straight to the store, not via duckrun
     deltalake.write_deltalake(str(tmp_path / "dbo" / "Foo"), pa.table({"n": [1]}))
     deltalake.write_deltalake(str(tmp_path / "dbo" / "foo"), pa.table({"n": [2]}))
     assert (tmp_path / "dbo" / "Foo").is_dir() and (tmp_path / "dbo" / "foo").is_dir()
-    # duckrun discovers the lakehouse — both externally-created tables should be independently queryable
-    con = duckrun.connect(str(tmp_path), schema="dbo")
-    reachable = {con.sql('SELECT n FROM dbo."Foo"').fetchone()[0],
-                 con.sql('SELECT n FROM dbo."foo"').fetchone()[0]}
-    assert reachable == {1, 2}   # today: {1} or {2} — one table shadows the other (the split-brain)
+    with pytest.raises(RuntimeError, match="differ only by case"):
+        duckrun.connect(str(tmp_path), schema="dbo")
 
 
 def test_partial_insert_null_fills_and_keeps_type(tmp_path):
