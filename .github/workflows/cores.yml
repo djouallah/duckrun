@@ -81,13 +81,14 @@ jobs:
         run: pip install -e ".[test]"
 
       - name: Adapter unit tests + connection-API offline tests
-        # The whole connection-API suite (per-method matrix + local-fs contract + the cross-API
-        # write-correctness matrix) lives in one file now; run it ALL on every change.
+        # Run the WHOLE tests/connection_api directory — the per-method matrix + local-fs contract +
+        # cross-API write-correctness matrix (test_connection_api.py), the public-surface lock
+        # (test_public_api.py), AND the SQL-only router / fail-loud regression suite
+        # (test_sql_only.py) — so a new file in that dir can't silently escape the release gate.
         run: |
           python -m pytest \
             tests/adapter \
-            tests/connection_api/test_connection_api.py \
-            tests/connection_api/test_public_api.py \
+            tests/connection_api \
             tests/correctness/test_correctness.py \
             -q -p no:cacheprovider
 
