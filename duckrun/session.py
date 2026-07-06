@@ -30,6 +30,8 @@ from ._runtime import check_runtime_versions
 _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
 _VACUUM_WRITE_RE = re.compile(r"^vacuum\s+(?:analyze\s+)?[\"\w]", re.IGNORECASE)
+# `describe detail <t>` / `describe history <t>` — Delta introspection (plain `describe <t>` is DuckDB's).
+_DESCRIBE_EXT_RE = re.compile(r"^describe\s+(?P<kind>detail|history)\s+(?P<rel>.+?)\s*;?\s*$", re.IGNORECASE)
 # A bare `SELECT * FROM <table>` — nothing else (no WHERE/JOIN/LIMIT/projection). Its output is that
 # table verbatim, so SORTED BY AUTO can profile it EXACTLY from the Delta log instead of sampling.
 _SELECT_STAR_FROM = re.compile(
@@ -706,7 +708,19 @@ class DuckSession:
 
         A DML statement returns a one-row ``status`` relation (there is no result set to hand back);
         the write has already been applied to Delta.
+
+        ``describe detail <table>`` and ``describe history <table>`` (the Databricks Delta
+        introspection verbs) return the table's ``location`` / ``numFiles`` / ``sizeInBytes`` /
+        ``version`` and its commit history — read from the Delta log. (Plain ``describe <table>``
+        passes through to DuckDB for column info.)
         """
+        # DESCRIBE DETAIL / DESCRIBE HISTORY — the Delta introspection verbs. DuckDB has plain
+        # DESCRIBE (columns) but rejects these, so answer them from the Delta log as a native relation.
+        mdesc = _DESCRIBE_EXT_RE.match(_strip_leading(query))
+        if mdesc:
+            rel = mdesc.group("rel").strip()
+            return (self._describe_detail(rel) if mdesc.group("kind").lower() == "detail"
+                    else self._describe_history(rel))
         # Raw DML routes through delta_rs against ONE root. A 3-part target names which catalog that
         # is (``_dml_target_catalog`` → its name); an unqualified/2-part target is the current catalog.
         # Reads (SELECT) are unaffected — DuckDB resolves every attached catalog natively.
@@ -997,6 +1011,49 @@ class DuckSession:
         if not parts:
             raise ValueError(f"get_stats: no files to describe for source={source!r}.")
         return self.con.sql(" UNION ALL ".join(parts))
+
+    def _describe_detail(self, name: str) -> "duckdb.DuckDBPyRelation":
+        """``describe detail <table>`` — the Delta table's ``format`` / ``id`` / ``name`` /
+        ``location`` (its storage path) / ``partitionColumns`` / ``numFiles`` / ``sizeInBytes`` /
+        ``version``, read from the Delta log. One row, as a native relation."""
+        cat, sch, tbl = self._resolve(name)
+        entry = self._catalogs[cat]
+        path = f"{entry.root_path}/{sch}/{tbl}"
+        dt = engine._delta_table(path, entry.storage_options)
+        md = dt.metadata()
+        files, size_bytes, _ = engine.delta_file_summary(self.con, path, entry.storage_options)
+        parts = list(md.partition_columns or [])
+        part_lit = "[" + ", ".join(f"'{_qlit(p)}'" for p in parts) + "]"
+        return self.con.sql(
+            f"SELECT 'delta' AS format, '{_qlit(str(md.id))}' AS id, '{_qlit(f'{sch}.{tbl}')}' AS name, "
+            f"'{_qlit(path)}' AS location, {part_lit} AS \"partitionColumns\", "
+            f"{len(files)} AS \"numFiles\", {int(size_bytes)} AS \"sizeInBytes\", "
+            f"{int(dt.version())} AS version")
+
+    def _describe_history(self, name: str) -> "duckdb.DuckDBPyRelation":
+        """``describe history <table>`` — one row per Delta commit (``version``, ``timestamp``,
+        ``operation``, ``operationMetrics``), newest first, read from the Delta log."""
+        cat, sch, tbl = self._resolve(name)
+        entry = self._catalogs[cat]
+        path = f"{entry.root_path}/{sch}/{tbl}"
+        dt = engine._delta_table(path, entry.storage_options)
+        rows = []
+        for h in dt.history():
+            ver = h.get("version")
+            ts = h.get("timestamp")
+            op = _qlit(str(h.get("operation", "")))
+            metrics = _qlit(str(h.get("operationMetrics", "") or ""))
+            ver_expr = str(int(ver)) if ver is not None else "NULL"
+            ts_expr = f"epoch_ms({int(ts)})" if ts is not None else "NULL::timestamp"
+            rows.append(f"({ver_expr}, {ts_expr}, '{op}', '{metrics}')")
+        if not rows:
+            return self.con.sql(
+                "SELECT NULL::bigint AS version, NULL::timestamp AS timestamp, "
+                "NULL::varchar AS operation, NULL::varchar AS \"operationMetrics\" WHERE 1=0")
+        body = ", ".join(rows)
+        return self.con.sql(
+            f'SELECT * FROM (VALUES {body}) AS h(version, timestamp, operation, "operationMetrics") '
+            f"ORDER BY version DESC")
 
 
     def _resolve_stats_targets(self, source: Optional[str]) -> List[tuple]:

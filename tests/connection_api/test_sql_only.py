@@ -316,6 +316,37 @@ def test_alter_rename_column(w):
     assert w.sql("select * from r").fetchall() == [(1, 2)]
 
 
+# ─────────────────────────────────────── DESCRIBE DETAIL / DESCRIBE HISTORY (Delta introspection)
+
+def test_describe_detail(w):
+    """DESCRIBE DETAIL <t> (Databricks verb) returns the table's location/partitionColumns/numFiles/
+    version from the Delta log — the public way to get a table's storage path (plain DESCRIBE stays
+    DuckDB's column view)."""
+    w.sql("CREATE OR REPLACE TABLE t PARTITIONED BY (r) AS SELECT (i % 2) r, i id FROM range(20) t(i)")
+    d = w.sql("DESCRIBE DETAIL t")
+    assert d.columns == ["format", "id", "name", "location", "partitionColumns",
+                         "numFiles", "sizeInBytes", "version"]
+    row = dict(zip(d.columns, d.fetchone()))
+    assert row["format"] == "delta"
+    assert row["location"].replace("\\", "/").endswith("dbo/t")
+    assert row["partitionColumns"] == ["r"] and row["numFiles"] >= 1 and row["version"] == 0
+    # plain DESCRIBE still passes through to DuckDB (column info)
+    assert set(r[0] for r in w.sql("DESCRIBE t").fetchall()) == {"r", "id"}
+
+
+def test_describe_history_and_time_travel(w):
+    """DESCRIBE HISTORY <t> returns one row per commit (newest first) — retiring the version/history
+    gap — and the location from DESCRIBE DETAIL powers pure-SQL time travel."""
+    w.sql("CREATE OR REPLACE TABLE h AS SELECT 1 AS id")
+    w.sql("INSERT INTO h SELECT 2 AS id")
+    hist = w.sql("DESCRIBE HISTORY h")
+    assert hist.columns == ["version", "timestamp", "operation", "operationMetrics"]
+    assert [r[0] for r in hist.fetchall()] == [1, 0]        # newest first
+    d = w.sql("DESCRIBE DETAIL h")
+    loc = dict(zip(d.columns, d.fetchone()))["location"]
+    assert w.sql(f"SELECT count(*) FROM delta_scan('{loc}', version => 0)").fetchone()[0] == 1
+
+
 def test_vacuum_refused_on_read_only(tmp_path):
     """VACUUM writes (compacted files + tombstone GC), so a read-only session refuses it loudly rather
     than silently mutating the store."""

@@ -61,8 +61,13 @@ duckrun layers exactly two things on top:
    | `VACUUM <table>` | DuckDB's `VACUUM` verb, repurposed to compact + vacuum the Delta table (plain DuckDB `VACUUM` is a stats no-op). |
    | `INSERT INTO <t> REPLACE WHERE <pred> SELECT …` | delta_rs `replaceWhere` — an atomic slice overwrite (the Databricks spelling). |
    | `INSERT WITH SCHEMA EVOLUTION INTO <t> SELECT …` | append that widens the table with the source's new columns (existing rows → NULL), instead of dropping them — delta_rs `schema_mode='merge'` (the Databricks spelling). |
+   | `DESCRIBE DETAIL <table>` | the table's `location` (storage path), `partitionColumns`, `numFiles`, `sizeInBytes`, `version` — read from the Delta log (the Databricks verb; plain `DESCRIBE <table>` stays DuckDB's column view). |
+   | `DESCRIBE HISTORY <table>` | one row per Delta commit (`version`, `timestamp`, `operation`, `operationMetrics`), newest first. |
 
 Everything else is portable DuckDB SQL — the same query runs on plain DuckDB.
+
+**Time travel** is `delta_scan('<location>', version => N)` — get `<location>` from `DESCRIBE DETAIL`,
+and the versions from `DESCRIBE HISTORY`.
 
 ## In-memory data — `conn.register`
 
@@ -192,5 +197,7 @@ atomically overwrite **only** the rows matching `<pred>` with the SELECT's rows,
 commit (pinned to the version read — a concurrent write fails it loud; no torn delete-then-append
 window). `<pred>` is a CAST-free expression over the target's columns; partition columns are preserved.
 
-> **Gaps (for now):** explicit history/restore/version have no SQL surface. `conn.get_stats(table)`
-> inspects the physical layout; time travel is `delta_scan('…', version => N)`.
+> **Gaps (for now):** `RESTORE` (roll a table back to an earlier version) has no SQL surface yet —
+> though `CREATE OR REPLACE TABLE t AS SELECT * FROM delta_scan('<location>', version => N)` does it as
+> a new overwrite. History/version/location are covered by `DESCRIBE HISTORY` / `DESCRIBE DETAIL`;
+> `conn.get_stats(table)` inspects the physical layout.
