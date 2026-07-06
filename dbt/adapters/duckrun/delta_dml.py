@@ -1040,6 +1040,17 @@ class _DeltaDML:
         for assign in _split_top_level_commas(set_clause):
             col, _, expr = assign.partition("=")
             updates[col.strip().strip('"')] = expr.strip()
+        # Validate SET targets against the real schema BEFORE routing to delta_rs: dt.update() silently
+        # accepts an unknown column, writing a no-op commit that changes nothing (a typo'd column name
+        # would advance the log while doing nothing). Fail loud with no commit, like a bad SELECT column.
+        loc_sql = loc.replace("'", "''")
+        target_cols = list(self.cursor.sql(f"select * from delta_scan('{loc_sql}') limit 0").columns)
+        by_lower = {c.lower() for c in target_cols}
+        unknown = [c for c in updates if c.lower() not in by_lower]
+        if unknown:
+            raise ValueError(
+                f"UPDATE on {loc!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
+            )
         if where and _PREDICATE_SUBQUERY.search(where):
             # delta_rs's update(predicate) hits the same datafusion "not implemented" panic on a
             # subquery predicate as delete() does (`… where id in (select … from other)`). DuckDB CAN
