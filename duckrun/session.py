@@ -696,7 +696,7 @@ class DuckSession:
         tombstoned past the retention window. (Compaction also runs automatically after writes; this
         is the manual button.)
 
-        ``insert into <t> replace where <pred> select …`` (delta_rs ``replaceWhere``, the Databricks
+        ``insert into <t> replace where <pred> select …`` (delta_rs ``replaceWhere``, the Spark/Delta
         spelling): atomically overwrite ONLY the rows matching ``<pred>`` with the SELECT's rows, in a
         single fenced commit (pinned to the version read — a concurrent write fails it loud). ``<pred>``
         is a CAST-free expression over the target's columns; partition columns are preserved.
@@ -709,7 +709,7 @@ class DuckSession:
         A DML statement returns a one-row ``status`` relation (there is no result set to hand back);
         the write has already been applied to Delta.
 
-        ``describe detail <table>`` and ``describe history <table>`` (the Databricks Delta
+        ``describe detail <table>`` and ``describe history <table>`` (the Spark/Delta
         introspection verbs) return the table's ``location`` / ``numFiles`` / ``sizeInBytes`` /
         ``version`` and its commit history — read from the Delta log. (Plain ``describe <table>``
         passes through to DuckDB for column info.)

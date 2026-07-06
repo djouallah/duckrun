@@ -161,7 +161,7 @@ _INSERT_VALUES = re.compile(
 _VALUES_KW = re.compile(r"\bvalues\b", re.I)
 _SELECT_KW = re.compile(r"\bselect\b", re.I)
 # `insert into <t> replace where <pred> <select|values|with …>` — delta_rs replaceWhere: atomically
-# overwrite ONLY the rows matching <pred> with the body, as one fenced commit (Databricks'
+# overwrite ONLY the rows matching <pred> with the body, as one fenced commit (the Spark/Delta
 # `INSERT INTO … REPLACE WHERE`). Capture the target and the whole tail; _insert_replace_where splits
 # <pred> from the body at the first TOP-LEVEL query keyword, so a keyword inside a string literal or a
 # subquery in the predicate can't be mistaken for the boundary (same scanners as MERGE).
@@ -170,7 +170,7 @@ _INSERT_REPLACE = re.compile(
     r"replace\s+where\b(?P<rest>.+)", re.I | re.S,
 )
 _REPLACE_BODY_KW = re.compile(r"\b(?:select|values|with)\b", re.I)
-# `insert with schema evolution into <t> <select|values>` (Databricks spelling) — append with delta_rs
+# `insert with schema evolution into <t> <select|values>` (Spark/Delta spelling) — append with delta_rs
 # schema_mode='merge', so columns the source has and the table lacks are ADDED (existing rows → NULL),
 # instead of the plain append's project-to-target (which drops unknown columns).
 _INSERT_SCHEMA_EVOLUTION = re.compile(
@@ -1226,7 +1226,7 @@ class _DeltaDML:
                                       storage_options=self.so)
 
     def _insert_schema_evolution(self, m, rel, schema, loc) -> None:
-        """`insert with schema evolution into <t> <select|values>` (Databricks spelling): append with
+        """`insert with schema evolution into <t> <select|values>` (Spark/Delta spelling): append with
         delta_rs ``schema_mode='merge'`` — columns the source has that the table lacks are ADDED
         (existing rows get NULL), matched by name, instead of the plain append's project-to-target
         (which silently drops unknown columns). Auto-fenced when the body reads the target."""

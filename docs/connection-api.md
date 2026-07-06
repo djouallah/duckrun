@@ -59,9 +59,9 @@ duckrun layers exactly two things on top:
    |---|---|
    | `CREATE TABLE … SORTED BY AUTO AS …` | duckrun profiles the data and picks the clustering key. (`SORTED BY (cols)` and `PARTITIONED BY (cols)` without `AUTO` are DuckDB's *own* CTAS syntax — not extensions.) |
    | `VACUUM <table>` | DuckDB's `VACUUM` verb, repurposed to compact + vacuum the Delta table (plain DuckDB `VACUUM` is a stats no-op). |
-   | `INSERT INTO <t> REPLACE WHERE <pred> SELECT …` | delta_rs `replaceWhere` — an atomic slice overwrite (the Databricks spelling). |
-   | `INSERT WITH SCHEMA EVOLUTION INTO <t> SELECT …` | append that widens the table with the source's new columns (existing rows → NULL), instead of dropping them — delta_rs `schema_mode='merge'` (the Databricks spelling). |
-   | `DESCRIBE DETAIL <table>` | the table's `location` (storage path), `partitionColumns`, `numFiles`, `sizeInBytes`, `version` — read from the Delta log (the Databricks verb; plain `DESCRIBE <table>` stays DuckDB's column view). |
+   | `INSERT INTO <t> REPLACE WHERE <pred> SELECT …` | delta_rs `replaceWhere` — an atomic slice overwrite (the Spark/Delta spelling). |
+   | `INSERT WITH SCHEMA EVOLUTION INTO <t> SELECT …` | append that widens the table with the source's new columns (existing rows → NULL), instead of dropping them — delta_rs `schema_mode='merge'` (the Spark/Delta spelling). |
+   | `DESCRIBE DETAIL <table>` | the table's `location` (storage path), `partitionColumns`, `numFiles`, `sizeInBytes`, `version` — read from the Delta log (the Spark/Delta verb; plain `DESCRIBE <table>` stays DuckDB's column view). |
    | `DESCRIBE HISTORY <table>` | one row per Delta commit (`version`, `timestamp`, `operation`, `operationMetrics`), newest first. |
 
 Everything else is portable DuckDB SQL — the same query runs on plain DuckDB.
@@ -192,7 +192,7 @@ duckrun extension. A plain `… AS SELECT … ORDER BY …` also clusters the wr
 small files and vacuums files tombstoned past the retention window (compaction also runs automatically
 after every write; this is the manual button). Read-only sessions refuse it.
 
-`INSERT INTO <t> REPLACE WHERE <pred> SELECT …` — delta_rs `replaceWhere` (the Databricks spelling):
+`INSERT INTO <t> REPLACE WHERE <pred> SELECT …` — delta_rs `replaceWhere` (the Spark/Delta spelling):
 atomically overwrite **only** the rows matching `<pred>` with the SELECT's rows, in a single fenced
 commit (pinned to the version read — a concurrent write fails it loud; no torn delete-then-append
 window). `<pred>` is a CAST-free expression over the target's columns; partition columns are preserved.

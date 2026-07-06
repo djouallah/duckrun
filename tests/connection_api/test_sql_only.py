@@ -292,7 +292,7 @@ def test_use_switches_write_routing(tmp_path):
 # ───────────────────────────────────────── schema evolution: INSERT … / DROP / RENAME COLUMN
 
 def test_insert_with_schema_evolution_adds_columns(w):
-    """INSERT WITH SCHEMA EVOLUTION INTO t … (Databricks spelling) widens the table with the source's
+    """INSERT WITH SCHEMA EVOLUTION INTO t … (Spark/Delta spelling) widens the table with the source's
     new columns (existing rows get NULL); a plain INSERT of an unknown column drops it instead."""
     w.sql("CREATE OR REPLACE TABLE t AS SELECT 1 AS id, 'a' AS name")
     w.sql("INSERT WITH SCHEMA EVOLUTION INTO t SELECT 2 AS id, 'b' AS name, 99 AS extra")
@@ -319,7 +319,7 @@ def test_alter_rename_column(w):
 # ─────────────────────────────────────── DESCRIBE DETAIL / DESCRIBE HISTORY (Delta introspection)
 
 def test_describe_detail(w):
-    """DESCRIBE DETAIL <t> (Databricks verb) returns the table's location/partitionColumns/numFiles/
+    """DESCRIBE DETAIL <t> (Spark/Delta verb) returns the table's location/partitionColumns/numFiles/
     version from the Delta log — the public way to get a table's storage path (plain DESCRIBE stays
     DuckDB's column view)."""
     w.sql("CREATE OR REPLACE TABLE t PARTITIONED BY (r) AS SELECT (i % 2) r, i id FROM range(20) t(i)")
