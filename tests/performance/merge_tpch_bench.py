@@ -16,7 +16,8 @@ RAM:
     -> full_sync           (matched UPDATE + WHEN NOT MATCHED BY SOURCE DELETE)                [local]
     -> expr_update         (100%-match UPDATE via arbitrary SET expressions + CASE)            [local]
     -> append_only         (~5% sample appended -- no target scan/join)
-    -> append_if_unchanged_only     (~5% sample via append_if_unchanged -- version-guarded append)
+    -> append_if_unchanged_only     (~5% sample appended -- plain INSERT; the version-guard verb was
+                                     removed, a read-modify-append on the same table is auto-fenced)
     -> overwrite_all       (~5% sample, table overwrite -- replaces the whole table)
 
 Each op's SQL lives in ``performance_test/merge_spill/sql/<op>.sql`` (plain DuckDB, no Jinja):
@@ -229,20 +230,20 @@ class Bench:
             for stmt in statements:
                 self.conn.sql(stmt)
             if model == "append_if_unchanged_only":
-                # No raw-SQL append_if_unchanged form — append the batch via the DataFrame write API (same
-                # engine path, with the version-guard fence).
-                self.conn.sql("SELECT * FROM _batch").write.mode("append_if_unchanged") \
-                    .saveAsTable(self.t("append_if_unchanged_only"))
+                # The append_if_unchanged VERB is gone; _batch is new data (not a read of the target),
+                # so this is a plain, unfenced append. (A read-modify-append on the same table would be
+                # auto-fenced — see delta_dml._reads_target.)
+                self.conn.sql(f"INSERT INTO {self.t('append_if_unchanged_only')} SELECT * FROM _batch")
             if model == "full_sync":
-                # No raw-SQL way to set streamed_exec, and a by-source MERGE must STREAM its big ~50%
-                # source (collecting it whole builds a non-spillable hash → OOM), so apply it via the
-                # DataFrame builder with streamed_exec=True. _src is built by sql/full_sync.sql above.
-                src = self.conn.sql("SELECT * FROM _src")
-                duckrun.DeltaTable.forName(self.conn, self.t("full_sync")).merge(
-                    src,
-                    "target.l_orderkey = source.l_orderkey AND target.l_linenumber = source.l_linenumber",
-                    streamed_exec=True,
-                ).whenMatchedUpdateAll().whenNotMatchedBySourceDelete().execute()
+                # A by-source MERGE (WHEN NOT MATCHED BY SOURCE) auto-streams its big ~50% source in the
+                # router (collecting it whole builds a non-spillable hash → OOM). _src is built by
+                # sql/full_sync.sql above.
+                self.conn.sql(
+                    f"MERGE INTO {self.t('full_sync')} USING _src "
+                    "ON target.l_orderkey = source.l_orderkey "
+                    "AND target.l_linenumber = source.l_linenumber "
+                    "WHEN MATCHED THEN UPDATE SET * "
+                    "WHEN NOT MATCHED BY SOURCE THEN DELETE")
         self.peak_mb = sampler.peak
         return time.time() - t
 
@@ -427,7 +428,7 @@ def run(args):
         b.seed("full_sync");       results.append(b.full_sync("full_sync"))
         b.seed("expr_update");     results.append(b.expr_update("expr_update"))
     b.seed("append_only");         results.append(b.appendish("append_only", "Append"))
-    b.seed("append_if_unchanged_only");     results.append(b.appendish("append_if_unchanged_only", "append_if_unchanged"))
+    b.seed("append_if_unchanged_only");     results.append(b.appendish("append_if_unchanged_only", "Append #2 (plain)"))
     results.append(b.overwrite("overwrite_all", "append_if_unchanged_only"))
 
     ok = True
@@ -491,7 +492,8 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
     L.append("7. **Expression update:** a 100%-match UPDATE whose SET is an arbitrary expression + `CASE` "
              "over the source, not a plain column copy.")
     L.append("8. **Append (no merge):** the batch appended — no target scan/join (far cheaper).")
-    L.append("9. **append_if_unchanged (no merge):** same cheap append, version-guarded against concurrent writers.")
+    L.append("9. **Append #2 (no merge):** a second plain append of new data (the version-guard verb was "
+             "removed; a read-modify-append on the SAME table is auto-fenced instead).")
     L.append("10. **Overwrite (no merge):** the table replaced by the batch — also no target scan/join.")
     L.append("")
     L.append("_Operations 5–7 exercise delta-rs's full MERGE clause set and run on the LOCAL stress gate "

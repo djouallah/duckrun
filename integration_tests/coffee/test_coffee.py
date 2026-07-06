@@ -32,7 +32,6 @@ from contextlib import contextmanager
 import pytest
 
 import duckrun
-from duckrun import DeltaTable
 
 # The scenario (and session.refresh) print Unicode; force utf-8 so a Windows cp1252 console doesn't
 # crash on it when watching the run with `pytest -s`.
@@ -66,39 +65,41 @@ ONELAKE_SCHEMA = os.environ.get("DUCKRUN_IT_SCHEMA", "duckrun_conn_it")
 
 
 def run_coffee_scenario(conn, schema, n_rows):
-    """Exercise the full connection-API surface against ``conn`` with an ``n_rows`` fact table."""
+    """Exercise the SQL-only connection API against ``conn`` with an ``n_rows`` fact table."""
     q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731 — scalar helper
 
     print(f"\n=== coffee-shop scenario | schema='{schema}' | {n_rows:,} fact rows "
           f"| warehouse={getattr(conn, 'root_path', '?')} ===", flush=True)
 
-    # ── ingest dimensions: DataFrameReader.csv → Delta ───────────────────────────────────────────
+    # ── ingest dimensions: read_csv_auto → Delta via CREATE TABLE AS ─────────────────────────────
     with _step(1, "ingest dimensions: read vendored Dim_Locations / Dim_Products CSVs → Delta") as say:
-        conn.read.csv(DATA + "/Dim_Locations.csv").write.mode("overwrite").saveAsTable("dim_locations")
-        conn.read.csv(DATA + "/Dim_Products.csv").write.mode("overwrite").saveAsTable("dim_products")
-        assert conn.table("dim_locations").count() == 1000
-        assert conn.table("dim_products").count() == 26   # SCD2 rows (product_id repeats)
+        conn.sql(f"CREATE OR REPLACE TABLE dim_locations AS SELECT * FROM read_csv_auto('{DATA}/Dim_Locations.csv')")
+        conn.sql(f"CREATE OR REPLACE TABLE dim_products AS SELECT * FROM read_csv_auto('{DATA}/Dim_Products.csv')")
+        assert q("select count(*) from dim_locations") == 1000
+        assert q("select count(*) from dim_products") == 26   # SCD2 rows (product_id repeats)
         say("dim_locations=1,000 rows, dim_products=26 SCD2 rows")
 
     # ── dedup the SCD2 product dim to a current, unique-key 'products' table ──────────────────────
     with _step(2, "dedup SCD2 dim_products → current, unique-key 'products' "
                   "(row_number() over product_id, keep latest to_date)") as say:
         conn.sql("""
+            CREATE OR REPLACE TABLE products AS
             select product_id, name, category, subcategory, standard_cost, standard_price
             from (
                 select *, row_number() over (partition by product_id order by to_date desc) as rn
                 from dim_products
             ) where rn = 1
-        """).write.mode("overwrite").saveAsTable("products")
-        n_products = conn.table("products").count()
+        """)
+        n_products = q("select count(*) from products")
         assert n_products == q("select count(distinct product_id) from dim_products")
         say(f"{n_products} unique products (down from 26 SCD2 rows)")
 
-    # ── generate an n_rows coffee-shop fact table → Delta, partitioned by region ─────────────────
+    # ── generate an n_rows coffee-shop fact table → Delta, PARTITIONED BY region ──────────────────
     # Dense-index products & locations and sample by index so every order line joins exactly once.
     with _step(3, f"generate {n_rows:,} fact rows (random product/location/qty/discount/date), "
-                  "join to dims 1:1, write partitioned by region") as say:
+                  "join to dims 1:1, write PARTITIONED BY (region)") as say:
         conn.sql(f"""
+            CREATE OR REPLACE TABLE fact_sales PARTITIONED BY (region) AS
             with prods as (select *, row_number() over (order by product_id) as prn from products),
                  locs  as (select location_id, region,
                                   row_number() over (order by record_id) as lrn from dim_locations),
@@ -122,96 +123,97 @@ def run_coffee_scenario(conn, schema, n_rows):
             from raw r
             join prods p on p.prn = r.prn
             join locs  l on l.lrn = r.lrn
-        """).write.mode("overwrite").partitionBy("region").saveAsTable("fact_sales")
-        assert conn.table("fact_sales").count() == n_rows   # 1:1 joins → no rows dropped
+        """)
+        assert q("select count(*) from fact_sales") == n_rows   # 1:1 joins → no rows dropped
         regions = q("select count(distinct region) from fact_sales")
         say(f"fact_sales={n_rows:,} rows across {regions} region partitions (1:1 joins, no rows dropped)")
 
-    # ── catalog (Catalog) ──────────────────────────────────────────────────────────────────
-    with _step(4, "Catalog: currentDatabase / listDatabases / listTables / SHOW TABLES") as say:
-        assert conn.catalog.currentDatabase() == schema
-        assert schema in conn.catalog.listDatabases()
-        assert {"products", "fact_sales", "dim_locations"} <= set(conn.catalog.listTables())
-        assert {"products", "fact_sales"} <= {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
-        say(f"tables in '{schema}': {sorted(conn.catalog.listTables())}")
+    # ── catalog: SHOW TABLES / information_schema ────────────────────────────────────────────────
+    with _step(4, "catalog: SHOW TABLES and information_schema over the discovered Delta tables") as say:
+        shown = {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
+        assert {"products", "fact_sales", "dim_locations"} <= shown
+        cols = {r[0] for r in conn.sql(
+            "select column_name from information_schema.columns where table_name = 'products'").fetchall()}
+        assert {"product_id", "standard_price"} <= cols
+        say(f"tables: {sorted(shown)}")
 
     # ── analytics → a mart Delta table; revenue reconciles exactly (1:1 join to unique products) ──
     with _step(5, "analytics: revenue by category x season -> mart_revenue (joins fact to products)") as say:
         conn.sql("""
+            CREATE OR REPLACE TABLE mart_revenue AS
             select p.category, f.season, count(*) as order_lines, round(sum(f.sales_amount), 2) as revenue
             from fact_sales f join products p on p.product_id = f.product_id
             group by 1, 2
-        """).write.mode("overwrite").saveAsTable("mart_revenue")
+        """)
         cells = q("select count(*) from mart_revenue")
         revenue = q("select sum(revenue) from mart_revenue")
         assert cells >= 4   # (category x season) cells
         assert abs(revenue - q("select sum(sales_amount) from fact_sales")) < 1.0   # tiny rounding only
         say(f"{cells} (category x season) cells, total revenue=${revenue:,.2f} (reconciles to fact_sales)")
 
-        # DataFrame aliases: .collect() (→ fetchall), .columns, and .toPandas() (→ relation.df()).
+        # conn.sql() returns DuckDB's native relation — .fetchall() / .columns / .df() all work.
         top = conn.sql("select product_name, sum(sales_amount) rev from fact_sales group by 1 order by rev desc limit 3")
-        assert len(top.collect()) == 3
+        rows = top.fetchall()
+        assert len(rows) == 3
         assert top.columns == ["product_name", "rev"]
-        assert list(top.toPandas().columns) == ["product_name", "rev"]
-        say(f"top product by revenue: {top.collect()[0][0]} (${top.collect()[0][1]:,.2f})")
+        assert list(top.df().columns) == ["product_name", "rev"]
+        say(f"top product by revenue: {rows[0][0]} (${rows[0][1]:,.2f})")
 
-    # ── write modes: append / ignore / default 'error' ─────────────────────────────────────
-    with _step(6, "write modes: append (+1 row), ignore (no-op), default 'error' (refuses clobber)") as say:
-        conn.sql("select * from fact_sales limit 1").write.mode("append").saveAsTable("fact_sales")
-        assert conn.table("fact_sales").count() == n_rows + 1
-        conn.sql("select * from fact_sales limit 0").write.mode("ignore").saveAsTable("fact_sales")
-        assert conn.table("fact_sales").count() == n_rows + 1      # ignore = no-op when it exists
+    # ── write modes in SQL: append / ignore / default-error ──────────────────────────────────────
+    with _step(6, "write modes: INSERT (+1 row), CREATE IF NOT EXISTS (no-op), CREATE over live (error)") as say:
+        conn.sql("insert into fact_sales select * from fact_sales limit 1")  # self-ref append (auto-fenced)
+        assert q("select count(*) from fact_sales") == n_rows + 1
+        conn.sql("create table if not exists fact_sales as select * from fact_sales limit 0")  # no-op
+        assert q("select count(*) from fact_sales") == n_rows + 1
         with pytest.raises(ValueError):
-            conn.sql("select 1 x").write.saveAsTable("products")   # default 'error' refuses clobber
-        say(f"append -> {n_rows + 1:,} rows; ignore -> still {n_rows + 1:,}; error mode raised as expected")
+            conn.sql("create table products as select 1 x")   # plain CREATE over a live table refuses
+        say(f"append -> {n_rows + 1:,} rows; if-not-exists -> still {n_rows + 1:,}; create-over-live raised")
 
-    # ── schema evolution: overwriteSchema resets, then mergeSchema widens (re-runnable) ──────────
-    with _step(7, "schema evolution: overwriteSchema resets columns, then mergeSchema widens") as say:
-        conn.sql("select 1 id, 'A' grp") \
-            .write.mode("overwrite").option("overwriteSchema", "true").saveAsTable("evt")
+    # ── schema evolution: CREATE OR REPLACE resets the schema wholesale ──────────────────────────
+    with _step(7, "schema evolution: CREATE OR REPLACE resets columns (int col → string)") as say:
+        conn.sql("create or replace table evt as select 1 id, 'A' grp")
         assert conn.sql("select * from evt").columns == ["id", "grp"]
-        conn.sql("select 2 id, 'B' grp, true as flagged") \
-            .write.mode("append").option("mergeSchema", "true").saveAsTable("evt")
-        assert "flagged" in conn.sql("select * from evt").columns
-        say("evt columns after mergeSchema append: " + str(conn.sql("select * from evt").columns))
+        conn.sql("create or replace table evt as select 'x' id, 'B' grp, true as flagged")
+        assert conn.sql("select * from evt").columns == ["id", "grp", "flagged"]
+        say("evt columns after CREATE OR REPLACE: " + str(conn.sql("select * from evt").columns))
 
-    # ── read API straight off the store by path ──────────────────────────────────────────────────
-    with _step(8, "read API by path: conn.read.format('delta').load(path)") as say:
-        assert conn.read.format("delta").load(conn._table_path(schema, "products")).count() == n_products
-        assert conn.read.format("delta").load(conn._table_path(schema, "fact_sales")).count() == n_rows + 1
+    # ── read straight off the store by path (delta_scan) ─────────────────────────────────────────
+    with _step(8, "read by path: SELECT … FROM delta_scan('…/table')") as say:
+        pp = conn._table_path(schema, "products").replace("'", "''")
+        fp = conn._table_path(schema, "fact_sales").replace("'", "''")
+        assert q(f"select count(*) from delta_scan('{pp}')") == n_products
+        assert q(f"select count(*) from delta_scan('{fp}')") == n_rows + 1
         say(f"read products={n_products}, fact_sales={n_rows + 1:,} straight off the store")
 
-    # ── MERGE / upsert: a price-list update (DeltaTable.merge → engine.merge_delta) on 'products' ─
-    with _step(9, "MERGE upsert on products: update price for id=1, insert new id=99 "
-                  "(whenMatchedUpdate + whenNotMatchedInsertAll)") as say:
+    # ── MERGE / upsert on 'products': update price for id=1, insert new id=99 ─────────────────────
+    with _step(9, "MERGE upsert on products: UPDATE price for id=1, INSERT new id=99") as say:
         old_price = q("select standard_price from products where product_id = 1")
-        new_prices = conn.sql("""
-            select * from (values
+        conn.sql("""
+            MERGE INTO products USING (values
                 (1,  'Latte',             'Hot',  'Coffee',   2.0, 5.25),
                 (99, 'Pumpkin Cold Brew', 'Cold', 'Seasonal', 2.5, 6.50)
-            ) t(product_id, name, category, subcategory, standard_cost, standard_price)
+            ) s(product_id, name, category, subcategory, standard_cost, standard_price)
+            ON target.product_id = source.product_id
+            WHEN MATCHED THEN UPDATE SET standard_price = source.standard_price
+            WHEN NOT MATCHED THEN INSERT *
         """)
-        DeltaTable.forName(conn, f"{schema}.products").merge(new_prices, "target.product_id = source.product_id") \
-            .whenMatchedUpdate(set={"standard_price": "source.standard_price"}) \
-            .whenNotMatchedInsertAll().execute()
         assert q("select standard_price from products where product_id = 1") == 5.25  # matched updated
         assert q("select name from products where product_id = 99") == "Pumpkin Cold Brew"  # inserted
-        assert conn.table("products").count() == n_products + 1
+        assert q("select count(*) from products") == n_products + 1
         assert old_price != 5.25  # sanity: the merge actually changed the price
         say(f"id=1 price {old_price} -> 5.25 (updated), id=99 inserted; products now {n_products + 1}")
 
     # insert-only: existing rows untouched, only the new key lands
-    with _step(10, "MERGE insert-only on products: whenNotMatchedInsertAll — only new id=200 lands, "
-                   "existing rows untouched") as say:
-        src = conn.sql("""
-            select * from (values
+    with _step(10, "MERGE insert-only on products: WHEN NOT MATCHED THEN INSERT — only id=200 lands") as say:
+        conn.sql("""
+            MERGE INTO products USING (values
                 (1,   'IGNORED',          'Hot',  'Coffee',   0.0, 0.0),
                 (200, 'Nitro Cold Brew',  'Cold', 'Seasonal', 2.5, 6.0)
-            ) t(product_id, name, category, subcategory, standard_cost, standard_price)
+            ) s(product_id, name, category, subcategory, standard_cost, standard_price)
+            ON target.product_id = source.product_id
+            WHEN NOT MATCHED THEN INSERT *
         """)
-        DeltaTable.forName(conn, f"{schema}.products").merge(src, "target.product_id = source.product_id") \
-            .whenNotMatchedInsertAll().execute()
-        assert conn.table("products").count() == n_products + 2            # only product_id=200 added
+        assert q("select count(*) from products") == n_products + 2            # only product_id=200 added
         assert q("select standard_price from products where product_id = 1") == 5.25  # untouched
         assert q("select name from products where product_id = 1") == "Latte"
         say(f"id=200 inserted; id=1 untouched (still Latte @ 5.25); products now {n_products + 2}")

@@ -666,6 +666,7 @@ class DuckSession:
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)
+        query = self._resolve_auto_sort(query)
         entry = self._catalogs[write_cat]
         if delta_dml.handle(self.con, entry.root_path, entry.storage_options, query,
                             default_schema=self._current_database):
@@ -674,6 +675,23 @@ class DuckSession:
         if _is_delta_write(query):
             raise ValueError(_delta_write_message(query))
         return self.con.sql(query)
+
+    def _resolve_auto_sort(self, query: str) -> str:
+        """Resolve ``CREATE TABLE … SORTED BY AUTO AS <query>`` (a duckrun extension) into an explicit
+        ``SORTED BY (cols)`` by profiling the query's result with the sort-key recommender, so the
+        router only ever handles explicit layout clauses. If nothing pays off, the clause is dropped.
+        ``SORTED BY (cols)`` / ``PARTITIONED BY (cols)`` (native DuckDB syntax) and every non-CREATE
+        statement pass straight through untouched."""
+        stripped = delta_dml._strip_comments(delta_dml._strip_leading(query)).rstrip().rstrip(";").rstrip()
+        m = delta_dml._CREATE_AS.fullmatch(stripped)
+        if not m:
+            return query
+        _rel, sort, _part = delta_dml._split_create_layout(m.group("rel").strip())
+        if sort != "AUTO":
+            return query
+        cols = self._auto_sort_cols(self.con.sql(m.group("body")))
+        replacement = ("SORTED BY (" + ", ".join(_qid(c) for c in cols) + ")") if cols else ""
+        return delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1)
 
     def register(self, name: str, obj) -> None:
         """Register an in-memory object (pandas / polars / pyarrow / a DuckDB relation) as ``name`` so

@@ -117,6 +117,30 @@ _CREATE_COLDEFS = re.compile(
     r"(?P<rel>.+?)\s*\((?P<defs>.+)\)\s*;?\s*",
     re.I | re.S,
 )
+# Optional table-layout clauses on CREATE TABLE … AS, between the name and AS: DuckDB's own
+# `SORTED BY (cols)` / `PARTITIONED BY (cols)` syntax (its parser accepts both), plus `SORTED BY AUTO`
+# (a duckrun extension — the session profiles and substitutes explicit columns before this router runs,
+# so the router only ever sees the explicit forms). `[^()]*` — a column list has no nested parens.
+_SORTED_BY_RE = re.compile(r"\bsorted\s+by\s+(?:(auto)\b|\(([^()]*)\))", re.I)
+_PARTITIONED_BY_RE = re.compile(r"\bpartitioned\s+by\s+\(([^()]*)\)", re.I)
+
+
+def _split_create_layout(rel: str):
+    """Peel optional ``SORTED BY (cols)|SORTED BY AUTO`` and ``PARTITIONED BY (cols)`` clauses off a
+    CREATE TABLE target. Returns ``(bare_rel, sort, partition)`` — ``sort`` is a column list, the
+    string ``'AUTO'``, or None; ``partition`` is a column list or None."""
+    sort = partition = None
+    ms = _SORTED_BY_RE.search(rel)
+    if ms:
+        sort = "AUTO" if ms.group(1) else [c.strip().strip('"') for c in ms.group(2).split(",") if c.strip()]
+        rel = rel[:ms.start()] + rel[ms.end():]
+    mp = _PARTITIONED_BY_RE.search(rel)
+    if mp:
+        partition = [c.strip().strip('"') for c in mp.group(1).split(",") if c.strip()]
+        rel = rel[:mp.start()] + rel[mp.end():]
+    return rel.strip(), sort, partition
+
+
 _INSERT_INTO_RE = re.compile(r"\s*insert\s+into\b", re.I)
 _INSERT_SELECT = re.compile(
     r"\s*insert\s+into\s+(?P<rel>.+?)\s*(?:\((?P<cols>[^)]*)\))?\s+(?P<body>select\b.*)",
@@ -795,7 +819,7 @@ class _DeltaDML:
 
     # -- create table <rel> as <query>: always materialize as a duckrun Delta table ------------
     def _create_as(self, m) -> bool:
-        rel = m.group("rel").strip()
+        rel, sort_cols, partition_cols = _split_create_layout(m.group("rel").strip())
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
@@ -828,10 +852,19 @@ class _DeltaDML:
                 f"table {schema}.{identifier} already exists — "
                 f"use CREATE OR REPLACE TABLE to replace it"
             )
-        data = self.cursor.sql(m.group("body"))
+        body = m.group("body")
+        if sort_cols == "AUTO":  # the connection API substitutes explicit columns before we get here
+            raise ValueError(
+                "CREATE TABLE … SORTED BY AUTO is a connection-API feature (it profiles the query to "
+                "pick the sort key); give an explicit SORTED BY (cols) on this path.")
+        if sort_cols:  # cluster the write: DuckDB ORDER BY the query, then materialize
+            order = ", ".join('"' + c + '"' for c in sort_cols)
+            body = f"SELECT * FROM ({body}) ORDER BY {order}"
+        data = self.cursor.sql(body)
         # overwrite_schema so this replaces a prior table (or a drop-tombstone) wholesale — a live
         # table is recreated with the real schema, clearing any tombstone marker.
-        engine.write_delta(loc, data, "overwrite", overwrite_schema=True, storage_options=self.so)
+        engine.write_delta(loc, data, "overwrite", overwrite_schema=True,
+                           partition_by=partition_cols or None, storage_options=self.so)
         self._refresh_view(rel, schema, loc)
         return True
 
@@ -1161,6 +1194,10 @@ class _DeltaDML:
         # a subquery with a column-renaming alias (`(values …) t(id, name)`) all work — delta_rs
         # renames the relation to `source` regardless of the SQL alias.
         source = self.cursor.sql(f"select * from {source_part.strip()}")
+        # A WHEN NOT MATCHED BY SOURCE merge (full-sync) anti-joins the WHOLE target, so collecting the
+        # source whole to compute target-pruning stats builds a non-spillable hash → OOM on a large
+        # source. Stream it instead — the raw-SQL equivalent of the builder's streamed_exec=True.
+        by_source = any(c.get("clause") == "not_matched_by_source" for c in clauses)
         engine.merge_delta_clauses(
             loc,
             source,
@@ -1169,6 +1206,7 @@ class _DeltaDML:
             # Pin the target to the version we read now (single statement) — same as the builder's
             # .merge(), which captures the version at call time.
             read_version=engine.table_version(loc, self.so),
+            streamed_exec=by_source,
             storage_options=self.so,
             cur=self.cursor,
         )

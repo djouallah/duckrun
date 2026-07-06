@@ -14,6 +14,8 @@ Some of these are RED until Phase 1 lands (native return, ``conn.register``, ``d
 that is the point — the spec leads the implementation. The spy tests (engine path / fencing) are
 GREEN today and guard the shared-seam invariant during the refactor.
 """
+import os
+
 import duckdb
 import pytest
 
@@ -77,6 +79,9 @@ _CLASSIFY = [
     ("create table t as select 1", "delta"),
     ("CREATE OR REPLACE TABLE t AS SELECT 1", "delta"),
     ("create table if not exists t as select 1", "delta"),
+    ("create table t sorted by (id) as select 1 id", "delta"),          # DuckDB layout clause
+    ("create table t partitioned by (region) as select 1 id, 'x' region", "delta"),
+    ("create or replace table t sorted by auto as select 1 id", "delta"),  # duckrun extension
     ("insert into t select 1", "delta"),
     ("insert into t values (1)", "delta"),
     ("update t set x = 1 where id = 2", "delta"),
@@ -103,6 +108,49 @@ def test_multi_statement_dml_is_rejected_by_session():
     front (session policy), not partially executed."""
     assert session_mod._unsupported_dml("insert into t values (1); delete from t") is not None
     assert session_mod._unsupported_dml("select 1; select 2") is None  # non-DML batch is not our concern
+
+
+# ─────────────────────────────────────────────── CREATE TABLE layout: SORTED BY / PARTITIONED BY
+
+def _first_file(w, name):
+    return engine._delta_table(w._table_path("dbo", name), None).file_uris()[0].replace("file://", "")
+
+
+def test_create_sorted_by_explicit(w):
+    """CREATE TABLE … SORTED BY (cols) AS … (native DuckDB syntax) clusters the write by the key."""
+    w.sql("CREATE OR REPLACE TABLE s SORTED BY (id) AS SELECT * FROM (VALUES (3),(1),(2)) t(id)")
+    assert [r[0] for r in w.sql(f"select id from parquet_scan('{_first_file(w, 's')}')").fetchall()] == [1, 2, 3]
+
+
+def test_create_partitioned_by(w):
+    """CREATE TABLE … PARTITIONED BY (cols) AS … (native DuckDB syntax) writes Hive-partitioned Delta."""
+    import glob
+    w.sql("CREATE OR REPLACE TABLE p PARTITIONED BY (region) AS "
+          "SELECT * FROM (VALUES (1,'eu'),(2,'us'),(3,'eu')) t(id, region)")
+    dirs = {os.path.basename(os.path.dirname(f))
+            for f in glob.glob(os.path.join(w._table_path("dbo", "p"), "**", "*.parquet"), recursive=True)}
+    assert dirs == {"region=eu", "region=us"}
+    assert w.sql("select count(*) from p").fetchone()[0] == 3
+
+
+def test_create_sorted_and_partitioned(w):
+    """SORTED BY and PARTITIONED BY compose on one CREATE TABLE."""
+    import glob
+    w.sql("CREATE OR REPLACE TABLE sp SORTED BY (id) PARTITIONED BY (region) AS "
+          "SELECT (i % 2) region, (9 - i % 5) id FROM range(40) t(i)")
+    dirs = {os.path.basename(os.path.dirname(f))
+            for f in glob.glob(os.path.join(w._table_path("dbo", "sp"), "**", "*.parquet"), recursive=True)}
+    assert dirs == {"region=0", "region=1"}
+    assert w.sql("select count(*) from sp").fetchone()[0] == 40
+
+
+def test_create_sorted_by_auto(w):
+    """CREATE TABLE … SORTED BY AUTO AS … (duckrun extension) profiles the query and clusters by the
+    auto-picked low-cardinality key; all rows preserved."""
+    w.sql("CREATE OR REPLACE TABLE a SORTED BY AUTO AS SELECT (i%5) as region, i as id FROM range(20000) t(i)")
+    regs = [r[0] for r in w.sql(f"select region from parquet_scan('{_first_file(w, 'a')}')").fetchall()]
+    assert regs == sorted(regs)                                   # clustered by the auto-picked key
+    assert w.sql("select count(*) from a").fetchone()[0] == 20000
 
 
 # ─────────────────────────────────────────────────────── shared engine seam + fencing (GREEN)

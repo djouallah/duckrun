@@ -132,20 +132,34 @@ Leading `--` / `/* … */` comments are fine. The exact behaviour is pinned, sta
 in [`tests/connection_api/test_connection_api.py`](../tests/connection_api/test_connection_api.py)
 (the `TestSqlDml` class).
 
-## Table layout — sort, partition, maintenance
+## Table layout — sort & partition on write
 
-<!-- PLACEHOLDER: the SQL-only maintenance surface (optimize / vacuum / history / restore / version /
-stats) is being reworked as part of the DataFrame-API removal and will be documented here. Sorting a
-write is `CREATE TABLE t AS SELECT … ORDER BY …`; there is no z-order (bit-interleaving destroys the
-run-length runs a columnar reader relies on — cluster with a lexicographic key instead). See
-[Automatic sort](automatic-sort.md) and [the parquet layout](parquet-layout.md). -->
-
-Sorting a write clusters equal values together, which is what makes run-length and dictionary
-encoding pay off — smaller files and faster column scans. Do it in SQL:
+Clustering equal values together on write is what makes run-length and dictionary encoding pay off —
+smaller files, faster column scans. duckrun reads DuckDB's own `CREATE TABLE … SORTED BY (…)` and
+`PARTITIONED BY (…)` layout clauses and applies them to the Delta write:
 
 ```python
-conn.sql("CREATE OR REPLACE TABLE sales AS SELECT * FROM stg_sales ORDER BY region, order_date")
+# cluster the write by a lexicographic key (no z-order — bit-interleaving destroys the run-length
+# runs a columnar reader relies on; use a lexicographic key instead)
+conn.sql("CREATE OR REPLACE TABLE sales SORTED BY (region, order_date) AS SELECT * FROM stg_sales")
+
+# Hive-partitioned Delta (delta-rs writes col=value/ folders, strips the column from the data files)
+conn.sql("CREATE OR REPLACE TABLE sales PARTITIONED BY (region) AS SELECT * FROM stg_sales")
+
+# both compose — partition columns should lead the sort so delta-rs keeps ~one partition writer open
+conn.sql("CREATE OR REPLACE TABLE sales SORTED BY (region, order_date) PARTITIONED BY (region) "
+         "AS SELECT * FROM stg_sales")
+
+# SORTED BY AUTO — duckrun profiles the query and picks a run-length-friendly key for you (a
+# heuristic, not an optimizer; the optimal choice is NP-hard). See Automatic sort.
+conn.sql("CREATE OR REPLACE TABLE sales SORTED BY AUTO AS SELECT * FROM stg_sales")
 ```
 
-The remaining maintenance operations (compaction, vacuum, history, restore, version, stats) are being
-reworked onto a SQL-native surface and will be documented here when that lands.
+`SORTED BY (cols)` and `PARTITIONED BY (cols)` are DuckDB's native syntax; `SORTED BY AUTO` is a
+duckrun extension. A plain `… AS SELECT … ORDER BY …` also clusters the write. See
+[Automatic sort](automatic-sort.md) and [the parquet layout](parquet-layout.md).
+
+> **Gaps (for now):** in-place `optimize`/compaction, `replaceWhere` (atomic slice overwrite), and
+> explicit history/restore/version have no SQL surface yet. Compaction + vacuum still run
+> automatically after every write, and `conn.get_stats(table)` inspects the physical layout; time
+> travel is `delta_scan('…', version => N)`.

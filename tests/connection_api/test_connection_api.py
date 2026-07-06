@@ -16,8 +16,10 @@ INSERT / UPDATE / DELETE / MERGE, routed to delta_rs). The suite has three parts
    the right Delta data? Each case applies a logical write via SQL and reads it back through a
    **fresh** ``duckrun.connect`` (real Delta on disk), asserting the golden expected multiset.
 
-Write-options with no DuckDB-SQL surface (optimize / partitionBy / replaceWhere / append_if_unchanged)
-are left as gaps for now; the engine capabilities stay covered by tests/adapter and tests/correctness.
+Sort / partition on write use DuckDB's `CREATE TABLE … SORTED BY (…) PARTITIONED BY (…) AS …`
+(`SORTED BY AUTO` is a duckrun extension) — see `test_sql_only.py`. Write-options still without a SQL
+surface (optimize / replaceWhere / the append_if_unchanged verb) are gaps; the engine capabilities
+stay covered by tests/adapter and tests/correctness.
 All local, network-free, serial (duckrun's write path is single-writer). No DAT, no external engine.
 """
 import os
@@ -1394,6 +1396,7 @@ def test_writer_keeps_dictionary_encoding(conn):
         assert "RLE_DICTIONARY" in encodings, f"{col} not dictionary-encoded: {encodings}"
 
 
-# NOTE: optimize / partitionBy / append_if_unchanged (fenced modes) have no DuckDB-SQL surface and are
-# left as gaps for now — their notebook tests were removed here; the engine capabilities remain covered
-# by tests/adapter and tests/correctness.
+# NOTE: sort / partition on write are covered by test_sql_only.py (CREATE TABLE … SORTED BY /
+# PARTITIONED BY / SORTED BY AUTO). optimize / replaceWhere / the append_if_unchanged verb still have
+# no DuckDB-SQL surface and are gaps for now — their engine capabilities remain covered by
+# tests/adapter and tests/correctness.
