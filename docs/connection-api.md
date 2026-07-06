@@ -63,6 +63,7 @@ duckrun layers exactly two things on top:
    | `INSERT WITH SCHEMA EVOLUTION INTO <t> SELECT …` | append that widens the table with the source's new columns (existing rows → NULL), instead of dropping them — delta_rs `schema_mode='merge'` (the Spark/Delta spelling). |
    | `DESCRIBE DETAIL <table>` | the table's `location` (storage path), `partitionColumns`, `numFiles`, `sizeInBytes`, `version` — read from the Delta log (the Spark/Delta verb; plain `DESCRIBE <table>` stays DuckDB's column view). |
    | `DESCRIBE HISTORY <table>` | one row per Delta commit (`version`, `timestamp`, `operation`, `operationMetrics`), newest first. |
+   | `RESTORE TABLE <t> TO VERSION AS OF <n>` / `TO TIMESTAMP AS OF '…'` | roll the table back to an earlier version/timestamp — delta_rs `restore` (a new commit on top of history, so it's itself revertible). |
 
 Everything else is portable DuckDB SQL — the same query runs on plain DuckDB.
 
@@ -197,7 +198,6 @@ atomically overwrite **only** the rows matching `<pred>` with the SELECT's rows,
 commit (pinned to the version read — a concurrent write fails it loud; no torn delete-then-append
 window). `<pred>` is a CAST-free expression over the target's columns; partition columns are preserved.
 
-> **Gaps (for now):** `RESTORE` (roll a table back to an earlier version) has no SQL surface yet —
-> though `CREATE OR REPLACE TABLE t AS SELECT * FROM delta_scan('<location>', version => N)` does it as
-> a new overwrite. History/version/location are covered by `DESCRIBE HISTORY` / `DESCRIBE DETAIL`;
-> `conn.get_stats(table)` inspects the physical layout.
+> **Gaps (for now):** changing a column's *type* has no SQL surface (delta-rs is add-only for schema
+> evolution; `ADD` / `DROP` / `RENAME COLUMN` work, a type change does not). Everything else —
+> history, version, location, restore, time travel — is covered above.

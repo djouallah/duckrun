@@ -1352,14 +1352,15 @@ def compaction_debt(cur, path: str, *, dt: Optional[DeltaTable] = None,
 
 def restore_to_version(
     path: str,
-    version: int,
+    target,
     *,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Restore the table to an earlier Delta ``version`` (delta_rs ``DeltaTable.restore``). This is a
-    new commit on top of history — it does not rewrite the log — so it is itself revertible."""
+    """Restore the table to an earlier state — ``target`` is a Delta ``version`` (int) or a
+    ``datetime`` timestamp (delta_rs ``DeltaTable.restore``). This is a new commit on top of history
+    — it does not rewrite the log — so it is itself revertible."""
     dt = _delta_table(path, storage_options)
-    dt.restore(version)
+    dt.restore(target)
 
 
 def merge_delta(

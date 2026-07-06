@@ -30,6 +30,7 @@ from ._runtime import check_runtime_versions
 _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
 _VACUUM_WRITE_RE = re.compile(r"^vacuum\s+(?:analyze\s+)?[\"\w]", re.IGNORECASE)
+_RESTORE_RE = re.compile(r"^restore\s+table\b", re.IGNORECASE)   # RESTORE writes a new commit
 # `describe detail <t>` / `describe history <t>` — Delta introspection (plain `describe <t>` is DuckDB's).
 _DESCRIBE_EXT_RE = re.compile(r"^describe\s+(?P<kind>detail|history)\s+(?P<rel>.+?)\s*;?\s*$", re.IGNORECASE)
 # A bare `SELECT * FROM <table>` — nothing else (no WHERE/JOIN/LIMIT/projection). Its output is that
@@ -133,6 +134,12 @@ def _is_vacuum(query: str) -> bool:
     and vacuum a Delta table, which WRITES (compacted files + tombstone GC) and so must be caught by
     the read-only gate. A bare ``VACUUM`` / ``VACUUM ANALYZE`` (no operand) is a DuckDB no-op, not gated."""
     return bool(_VACUUM_WRITE_RE.match(_strip_leading(query)))
+
+
+def _is_restore(query: str) -> bool:
+    """True if ``query`` is ``RESTORE TABLE …`` — it commits a new (restored) version, so the read-only
+    gate must catch it."""
+    return bool(_RESTORE_RE.match(_strip_leading(query)))
 
 
 # ---- createDataFrame helpers --------------------------------------------------------------
@@ -712,7 +719,9 @@ class DuckSession:
         ``describe detail <table>`` and ``describe history <table>`` (the Spark/Delta
         introspection verbs) return the table's ``location`` / ``numFiles`` / ``sizeInBytes`` /
         ``version`` and its commit history — read from the Delta log. (Plain ``describe <table>``
-        passes through to DuckDB for column info.)
+        passes through to DuckDB for column info.) ``restore table <t> to version as of <n>`` (or
+        ``to timestamp as of '…'``) rolls the table back — a new commit on top of history, itself
+        revertible.
         """
         # DESCRIBE DETAIL / DESCRIBE HISTORY — the Delta introspection verbs. DuckDB has plain
         # DESCRIBE (columns) but rejects these, so answer them from the Delta log as a native relation.
@@ -733,7 +742,7 @@ class DuckSession:
         # The current catalog is DuckDB's own current_database() (the _current_catalog property), so a
         # bare `USE cat.schema` steers write routing exactly as it steers reads — no parallel state.
         write_cat = target_cat if target_cat is not None else self._current_catalog
-        is_write = _is_delta_write(query) or _is_vacuum(query)
+        is_write = _is_delta_write(query) or _is_vacuum(query) or _is_restore(query)
         entry = self._catalogs.get(write_cat)
         # A write whose current/target catalog isn't duckrun-managed (e.g. after `USE memory`, or a
         # DuckDB-native catalog) has no Delta root to land in — fail loud instead of KeyError.

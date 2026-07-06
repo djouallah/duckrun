@@ -93,6 +93,7 @@ _CLASSIFY = [
     ("alter table t drop column x", "delta"),
     ("alter table t rename column a to b", "delta"),
     ("insert with schema evolution into t select 1 id, 2 extra", "delta"),
+    ("restore table t to version as of 3", "delta"),
     ("drop table t", "delta"),
     ("drop table if exists t", "delta"),
     ("vacuum t", "delta"),                                   # DuckDB verb → Delta compact + vacuum
@@ -345,6 +346,28 @@ def test_describe_history_and_time_travel(w):
     d = w.sql("DESCRIBE DETAIL h")
     loc = dict(zip(d.columns, d.fetchone()))["location"]
     assert w.sql(f"SELECT count(*) FROM delta_scan('{loc}', version => 0)").fetchone()[0] == 1
+
+
+def test_restore_to_version(w):
+    """RESTORE TABLE t TO VERSION AS OF n (Spark/Delta verb) rolls the table back via delta_rs restore
+    — a new commit on top of history, so the restore is itself revertible."""
+    w.sql("CREATE OR REPLACE TABLE t AS SELECT 1 AS id")   # v0
+    w.sql("INSERT INTO t SELECT 2 AS id")                   # v1
+    assert sorted(r[0] for r in w.sql("select id from t").fetchall()) == [1, 2]
+    w.sql("RESTORE TABLE t TO VERSION AS OF 0")
+    assert [r[0] for r in w.sql("select id from t").fetchall()] == [1]
+    assert [r[0] for r in w.sql("DESCRIBE HISTORY t").fetchall()] == [2, 1, 0]   # restore = new commit
+
+
+def test_restore_refused_on_read_only(tmp_path):
+    """RESTORE commits a new version, so a read-only session refuses it."""
+    wdir = str(tmp_path / "wh")
+    w = duckrun.connect(wdir, schema="dbo", read_only=False)
+    w.sql("CREATE OR REPLACE TABLE t AS SELECT 1 AS id")
+    w.sql("INSERT INTO t SELECT 2 AS id")
+    ro = duckrun.connect(wdir, schema="dbo")
+    with pytest.raises(PermissionError):
+        ro.sql("RESTORE TABLE t TO VERSION AS OF 0")
 
 
 def test_vacuum_refused_on_read_only(tmp_path):

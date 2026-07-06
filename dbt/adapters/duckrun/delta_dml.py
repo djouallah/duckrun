@@ -67,6 +67,7 @@ Supported / unsupported (what reaches delta_rs):
                                                              error; the dbt path never emits them.
 """
 import re
+from datetime import datetime
 from typing import List, Optional, Tuple
 
 from dbt.adapters.events.logging import AdapterLogger
@@ -224,6 +225,13 @@ _DROP = re.compile(
 _VACUUM = re.compile(
     r"\s*vacuum\s+(?:analyze\s+)?"
     r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)\s*;?\s*", re.I | re.S
+)
+# `restore table <t> to version as of <n>` / `to timestamp as of '<ts>'` — the Spark/Delta RESTORE
+# verb, rolled to delta_rs ``DeltaTable.restore`` (a new commit on top of history, itself revertible).
+_RESTORE = re.compile(
+    r"\s*restore\s+table\s+(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)\s+to\s+"
+    r"(?:version\s+as\s+of\s+(?P<version>\d+)|timestamp\s+as\s+of\s+'(?P<ts>[^']+)')\s*;?\s*",
+    re.I | re.S,
 )
 # `merge into <target> [[as] alias] using <source> ... on ... when ...`. The regex only captures the
 # target relation (a dotted/quoted identifier) and hands the remainder (`rest`) to _merge, which uses
@@ -446,7 +454,7 @@ _C_FROM = re.compile(r"\bfrom\b", re.I)
 _C_USING = re.compile(r"\busing\b", re.I)
 _C_DELTA_HEAD = re.compile(
     r"\s*(?:insert\s+into|insert\s+with\s+schema\s+evolution|update|delete\s+from|"
-    r"merge\s+into|alter\s+table|drop\s+table)\b", re.I)
+    r"merge\s+into|alter\s+table|drop\s+table|restore\s+table)\b", re.I)
 _C_VACUUM = re.compile(r"\s*vacuum\s+(?:analyze\s+)?(?:\"|\w)", re.I)  # vacuum <table> → maintenance
 
 
@@ -871,6 +879,9 @@ class _DeltaDML:
         m = _fullmatch(_VACUUM, sql)
         if m:
             return self._vacuum(m)
+        m = _fullmatch(_RESTORE, sql)
+        if m:
+            return self._restore(m)
         return False
 
     # -- create table <rel> as <query>: always materialize as a duckrun Delta table ------------
@@ -1337,6 +1348,21 @@ class _DeltaDML:
         engine.vacuum(loc, storage_options=self.so)
         return True
 
+    def _restore(self, m) -> bool:
+        """`restore table <t> to version as of <n>` / `to timestamp as of '<ts>'` (the Spark/Delta
+        verb): roll the table back via delta_rs ``DeltaTable.restore`` — a NEW commit on top of
+        history, so the restore is itself revertible. Returns False (pass through) if <t> isn't a
+        duckrun-managed Delta table."""
+        rel = m.group("rel").strip()
+        schema, identifier, loc = self._resolve(rel)
+        if not loc or not self._exists(loc):
+            return False
+        target = (int(m.group("version")) if m.group("version") is not None
+                  else datetime.fromisoformat(m.group("ts")))
+        engine.restore_to_version(loc, target, storage_options=self.so)
+        self._refresh_view(rel, schema, loc)
+        return True
+
     def _insert_replace_where(self, m) -> bool:
         """`insert into <t> replace where <pred> <select|values>`: delta_rs replaceWhere — atomically
         overwrite ONLY the rows matching <pred> with the body's rows, as ONE fenced commit (no torn
@@ -1416,7 +1442,7 @@ def _handle_one(cursor, root_path, storage_options, sql: str, default_schema) ->
     with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
     head = body[:7].lower()                        # cheap pre-filter: only the candidate DML verbs
     if not head.startswith(("delete", "update", "insert", "create", "alter", "drop", "merge",
-                            "vacuum")):
+                            "vacuum", "restore")):
         return False
     dml = _DeltaDML(cursor, root_path, storage_options, default_schema)
     dml._with_clause = with_clause
