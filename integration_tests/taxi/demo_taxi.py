@@ -629,12 +629,10 @@ def run_taxi_demo(conn, schema):
               'conn.attach(scratch_path, name="dup")              # one URL ↔ one name\n'
               'conn.sql("INSERT INTO scratch.dbo.borough_targets VALUES (\'Z\', 0)")  # cross-catalog raw DML</pre>')
         primary_db = conn._current_database                      # restore the primary's schema after
-        conn._use("scratch", "dbo")
-        conn._current_catalog, conn._current_database = "scratch", "dbo"
+        conn._use("scratch", "dbo")                              # USE is the single switch (reads + writes)
         unq = q("SELECT count(*) FROM borough_targets")           # resolves in scratch.dbo now
         switched = conn._current_catalog
         conn._use(primary, primary_db)
-        conn._current_catalog, conn._current_database = primary, primary_db
         guards = []
         try:
             conn.attach(scratch_path, name="dup")                # same URL → refused

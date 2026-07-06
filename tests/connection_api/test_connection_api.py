@@ -892,11 +892,11 @@ def test_multi_catalog_cross_query(tmp_path):
 
 
 def _set_current_catalog(conn, name):
-    """Switch the current catalog and pick its default database (dbo when present, else the first)."""
-    conn._current_catalog = name
+    """Switch the current catalog and pick its default database (dbo when present, else the first).
+    USE is the single switch — duckrun derives 'current' from DuckDB's current_database()."""
+    conn._use(name, None)                          # make it current so _cat_databases sees its schemas
     dbs = conn._cat_databases()
-    conn._current_database = "dbo" if "dbo" in dbs else (dbs[0] if dbs else "dbo")
-    conn._use(conn._current_catalog, conn._current_database)
+    conn._use(name, "dbo" if "dbo" in dbs else (dbs[0] if dbs else "dbo"))
 
 
 def test_multi_catalog_set_current(tmp_path):

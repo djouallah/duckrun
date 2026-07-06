@@ -30,7 +30,6 @@ from ._runtime import check_runtime_versions
 _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
 _VACUUM_WRITE_RE = re.compile(r"^vacuum\s+(?:analyze\s+)?[\"\w]", re.IGNORECASE)
-_USE_RE = re.compile(r"^use\b", re.IGNORECASE)   # USE <catalog>[.<schema>] — resync current after
 # A bare `SELECT * FROM <table>` — nothing else (no WHERE/JOIN/LIMIT/projection). Its output is that
 # table verbatim, so SORTED BY AUTO can profile it EXACTLY from the Delta log instead of sampling.
 _SELECT_STAR_FROM = re.compile(
@@ -384,12 +383,11 @@ class DuckSession:
         self.con = duckdb.connect()
         engine.configure_duckdb_session(self.con)
 
-        # The catalog registry: name -> _CatEntry. The primary (from connect) is the first entry;
-        # attach() adds more. root_path / storage_options stay readable as properties that return the
-        # *current* catalog's values, so existing single-catalog callers keep working unchanged.
+        # The catalog registry: name -> _CatEntry (root / creds / read-only). "Which catalog & schema
+        # is current" is NOT tracked here — DuckDB owns it (current_database() / current_schema(),
+        # surfaced by the _current_catalog / _current_database properties), so a user's `USE` steers
+        # reads AND write-routing with no parallel state to drift.
         self._catalogs: Dict[str, _CatEntry] = {}
-        self._current_catalog: Optional[str] = None
-        self._current_database: Optional[str] = None
 
         root, schema_filter = _split_root_schema(path, schema)
         # Catalog is first-class, so single- and multi-catalog sessions share one code path
@@ -416,6 +414,17 @@ class DuckSession:
     def storage_options(self) -> Optional[Dict[str, str]]:
         """The current catalog's storage_options (back-compat for single-catalog callers)."""
         return self._catalogs[self._current_catalog].storage_options
+
+    @property
+    def _current_catalog(self) -> str:
+        """The current catalog — DuckDB's own ``current_database()``. Single source of truth: a bare
+        ``conn.sql("USE …")`` moves it, so reads and write-routing never disagree."""
+        return self.con.execute("SELECT current_database()").fetchone()[0]
+
+    @property
+    def _current_database(self) -> str:
+        """The current schema — DuckDB's own ``current_schema()``."""
+        return self.con.execute("SELECT current_schema()").fetchone()[0]
 
     def _attach_catalog(self, name: str, root: str, storage_options, schema_filter,
                         primary: bool = False, quiet: bool = True, read_only=None):
@@ -450,9 +459,15 @@ class DuckSession:
 
         self.con.execute(f"ATTACH ':memory:' AS {_qid(name)}")
         self._catalogs[name] = _CatEntry(name, root, so, schema_filter, ro)
+        schemas = self._refresh_catalog(name, quiet=quiet)
         if primary:
-            self._current_catalog = name
-        self._refresh_catalog(name, quiet=quiet)
+            # Make the primary the current catalog (+ a sensible default schema) via DuckDB's own USE —
+            # the ONE place "current" is set; every reader derives it back from current_database().
+            # Ensure the default schema exists first (an empty catalog has none yet) so USE can't fail
+            # and silently leave the DuckDB default ('memory') current.
+            default_db = "dbo" if "dbo" in schemas else (schemas[0] if schemas else "dbo")
+            self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(name)}.{_qid(default_db)}")
+            self._use(name, default_db)
 
     def attach(self, path: str, name: Optional[str] = None,
                storage_options: Optional[Dict[str, str]] = None,
@@ -550,17 +565,11 @@ class DuckSession:
                 if self._register_view(name, schema, table):
                     registered.append(f"{schema}.{table}")
 
-        schemas = list(mapping.keys())
-        if name == self._current_catalog and self._current_database is None:
-            self._current_database = "dbo" if "dbo" in schemas else (schemas[0] if schemas else "dbo")
-        if name == self._current_catalog:
-            self._use(self._current_catalog, self._current_database)
-
         if not quiet:
             lh = root.rstrip("/").rsplit("/", 1)[-1]
             print(f"Connected to {lh} (catalog '{name}') — discovered {len(registered)} table(s)"
                   + (": " + ", ".join(registered) if registered else ""))
-        return registered
+        return list(mapping.keys())
 
     def _register_view(self, catalog: str, schema: str, table: str) -> bool:
         """Register a discovered table as a ``delta_scan`` view. Returns True if registered, False if
@@ -706,39 +715,33 @@ class DuckSession:
                 f"unknown catalog '{target_cat}'; attached catalogs: {list(self._catalogs)}. "
                 f"Attach it with conn.attach(path, name='{target_cat}')."
             )
+        # The current catalog is DuckDB's own current_database() (the _current_catalog property), so a
+        # bare `USE cat.schema` steers write routing exactly as it steers reads — no parallel state.
         write_cat = target_cat if target_cat is not None else self._current_catalog
+        is_write = _is_delta_write(query) or _is_vacuum(query)
+        entry = self._catalogs.get(write_cat)
+        # A write whose current/target catalog isn't duckrun-managed (e.g. after `USE memory`, or a
+        # DuckDB-native catalog) has no Delta root to land in — fail loud instead of KeyError.
+        if is_write and entry is None:
+            raise ValueError(
+                f"catalog '{write_cat}' is not a duckrun-managed catalog; USE one of "
+                f"{list(self._catalogs)}, or qualify the write with catalog.schema.table.")
         # The read-only gate is the *target* catalog's — a read-only attached store fails loud even
         # when the current catalog is writable. _WRITE_KEYWORD_RE covers insert/update/delete/merge.
-        if self._catalogs[write_cat].read_only and (_is_delta_write(query) or _is_vacuum(query)):
+        if entry is not None and entry.read_only and is_write:
             op = "vacuum (compact) a table" if _is_vacuum(query) else "run write DML"
             raise PermissionError(_READ_ONLY_MSG.format(op=op, catalog=write_cat))
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)
         query = self._resolve_auto_sort(query)
-        entry = self._catalogs[write_cat]
-        if delta_dml.handle(self.con, entry.root_path, entry.storage_options, query,
-                            default_schema=self._current_database):
+        if entry is not None and delta_dml.handle(self.con, entry.root_path, entry.storage_options,
+                                                  query, default_schema=self._current_database):
             self.refresh(quiet=True, catalog=write_cat)
             return self.con.sql("SELECT 'ok' AS status")
         if _is_delta_write(query):
             raise ValueError(_delta_write_message(query))
-        result = self.con.sql(query)
-        # `USE <catalog>[.<schema>]` is native DuckDB — it moves DuckDB's current catalog/schema (for
-        # reads) but not duckrun's write-routing state. Resync the two from DuckDB's own
-        # current_database()/current_schema() so one USE switches reads AND writes consistently.
-        if _USE_RE.match(_strip_leading(query)):
-            self._sync_current_from_duckdb()
-        return result
-
-    def _sync_current_from_duckdb(self) -> None:
-        """Adopt DuckDB's current catalog/schema (``current_database()`` / ``current_schema()``) as
-        duckrun's write-routing current — so a user's ``conn.sql("USE …")`` steers unqualified/2-part
-        writes to the same place it steers reads. Only adopts a catalog duckrun actually manages."""
-        cat = self.con.sql("SELECT current_database()").fetchone()[0]
-        if cat in self._catalogs:
-            self._current_catalog = cat
-            self._current_database = self.con.sql("SELECT current_schema()").fetchone()[0]
+        return self.con.sql(query)
 
     def _resolve_auto_sort(self, query: str) -> str:
         """Resolve ``CREATE TABLE … SORTED BY AUTO AS <query>`` (a duckrun extension) into an explicit
