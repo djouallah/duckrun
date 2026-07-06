@@ -210,8 +210,8 @@ def test_docs_generate_reports_delta_stats(tmp_path):
 # the SAME concurrent `update id=1 -> 999` mid-run — to lock in which are FENCED (a foreign commit
 # makes the run fail loud, no lost update) and which are UNFENCED BY DESIGN (the run succeeds):
 #
-#   merge / insert / delete+insert / append_if_unchanged / microbatch  -> fenced   (read-modify-write)
-#   append (plain) / table (full overwrite)                   -> unfenced (append only adds;
+#   merge / insert / delete+insert / append-reading-{{this}} / microbatch -> fenced (read-modify-write)
+#   append (plain, no self-ref) / table (full overwrite)      -> unfenced (append only adds;
 #                                                                a full rebuild is last-writer-wins)
 #
 # microbatch is fenced but not separately raced here: it is the ONE fenced strategy that structurally
@@ -223,9 +223,10 @@ def test_docs_generate_reports_delta_stats(tmp_path):
 
 
 def test_append_if_unchanged_is_fenced(tmp_path):
-    """append_if_unchanged commits compare-and-swap against vB (append_if_unchanged, max_commit_retries=0): a
-    writer that lands during the run makes the append REFUSE rather than append onto a drifted HEAD.
-    The run fails loud and the batch (id=11) never lands."""
+    """An `append` model that READS {{ this }} auto-fences: the append commits compare-and-swap against
+    vB (engine.append_if_unchanged, max_commit_retries=0), so a writer that lands during the run makes
+    the append REFUSE rather than append onto a drifted HEAD. The run fails loud and id=11 never lands.
+    (patch target is the engine primitive, still named append_if_unchanged behind the automatic fence.)"""
     res, rows = _race(tmp_path, "events_append_if_unchanged", ["append_if_unchanged"])
     assert not res.success                          # CAS refused — the run failed loud
     assert rows == {**_seed_rows(), 1: 999}         # writer's 999 stands; id=11 never appended

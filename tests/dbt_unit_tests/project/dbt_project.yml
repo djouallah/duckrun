@@ -18,8 +18,8 @@ models:
   dbt_unit_tests:
     +materialized: table
     # The incremental/ marts exercise every duckrun incremental strategy (merge / insert /
-    # delete+insert / append / append_if_unchanged / microbatch) through a real two-run dbt build -- see
-    # the harness for the per-strategy row-content assertions.
+    # delete+insert / append / microbatch) through a real two-run dbt build -- see the harness for
+    # the per-strategy row-content assertions. (An `append` that reads {{ this }} auto-fences.)
     incremental:
       +materialized: incremental
 

@@ -7,7 +7,9 @@
 
 -- Plain append is UNFENCED by design: it rebases onto HEAD and only ADDS rows, so a concurrent
 -- writer's change is never clobbered (both coexist). The race test proves the run still succeeds and
--- nothing is lost — the deliberate contrast with the fenced strategies (merge/delete+insert/append_if_unchanged).
+-- nothing is lost — the deliberate contrast with the fenced paths (merge, delete+insert, and a
+-- self-referential append; see events_append_if_unchanged.sql). NOTE: do not write the Jinja
+-- self-ref token in this comment — dbt renders it even in comments and reads_self would fence it.
 
 {% if is_incremental() %}
 

@@ -23,8 +23,8 @@ Because a unit test sandboxes a model's SELECT and not its write strategy, the s
 instead distinguished by a REAL two-run ``dbt run`` here (``test_incremental_strategy_two_runs`` /
 ``test_incremental_microbatch_two_batches``): an initial load then an incremental load, with the
 resulting Delta read back through duckrun and asserted row-by-row so merge (updates), insert
-(insert-only), delete+insert (replace), append/append_if_unchanged (append-only) and microbatch (per-day
-batch) each show their defining behaviour. The exhaustive strategy x key-shape x type x fixture-
+(insert-only), delete+insert (replace), append (append-only; auto-fenced when it reads ``{{ this }}``)
+and microbatch (per-day batch) each show their defining behaviour. The exhaustive strategy x key-shape x type x fixture-
 format matrix lives in tests/conformance/test_unit_testing_incremental.py; this file is the
 realistic-project, row-content counterpart.
 """
@@ -132,7 +132,6 @@ _STRATEGY_EXPECTED = {
     "delete_insert": {1: 111.0, 2: 222.0, 3: 333.0, 4: 400.0, 5: 500.0, 6: 600.0},  # batch keys replaced
     "insert":        {1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0, 5: 500.0, 6: 600.0},  # insert-only: 1-3 kept
     "append":        {1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0, 5: 500.0, 6: 600.0},  # only new keys appended
-    "append_if_unchanged": {1: 100.0, 2: 200.0, 3: 300.0, 4: 400.0, 5: 500.0, 6: 600.0},  # optimistic append (CAS)
 }
 
 

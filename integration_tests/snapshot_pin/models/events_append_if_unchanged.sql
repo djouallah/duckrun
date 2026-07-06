@@ -1,13 +1,15 @@
 {{
   config(
     materialized = 'incremental',
-    incremental_strategy = 'append_if_unchanged',
+    incremental_strategy = 'append',
   )
 }}
 
--- append_if_unchanged is a FENCED strategy: the append is committed compare-and-swap (max_commit_retries=0)
--- against vB, so a concurrent writer that commits during the run makes the append refuse rather than
--- land a (possibly duplicate) row on a drifted HEAD. The race test proves that through a real run.
+-- A plain `append` that READS {{ this }} auto-fences: because the model self-references its own target
+-- (the `not in (select id from {{ this }})` below), the append is committed compare-and-swap
+-- (max_commit_retries=0) against vB, so a concurrent writer that commits during the run makes the
+-- append refuse rather than land a (possibly duplicate) row on a drifted HEAD. There is no strategy to
+-- pick — the fence is automatic on the self-reference. The race test proves that through a real run.
 
 {% if is_incremental() %}
 
