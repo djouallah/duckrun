@@ -16,7 +16,7 @@ every release; the latest scorecard is rendered live below.
 
 ## 🔀 Incremental MERGE test — duckrun on Delta Lake (via the connection API)
 
-**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table **through the connection API** — a chain of `conn.sql(...)` MERGEs (the delta_rs spill cap + the per-merge DuckDB memory pin) — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same shape compares against a plain `append` / `overwrite` (which never scan the target).
+**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table **through the connection API** — a chain of `conn.sql(...)` MERGEs (the delta_rs spill cap + the per-merge DuckDB memory pin) — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same shape compares against a plain `append` / `append_if_unchanged` / `overwrite` (which never scan the target).
 
 ### Setup (the inputs)
 | | |
@@ -24,8 +24,8 @@ every release; the latest scorecard is rendered live below.
 | Engine | duckrun &middot; DuckDB 1.5.4 &middot; delta_rs 1.5.0 |
 | Target fact table | TPCH `lineitem`, scale factor **10.0** → **59,986,052 rows** |
 | Primary key (merge on) | `(l_orderkey, l_linenumber)` |
-| Effective memory | 15117 MB (runner RAM, no artificial limit) |
-| Merge spill cap | 9070 MB — delta_rs `max_spill_size` |
+| Effective memory | 15077 MB (runner RAM, no artificial limit) |
+| Merge spill cap | 9046 MB — delta_rs `max_spill_size` |
 
 ### The operations (a chain — each builds on the previous)
 1. **Mixed upsert (~1% sample):** ~80% existing keys → UPDATE, ~20% key-shifted → INSERT.
@@ -36,7 +36,7 @@ every release; the latest scorecard is rendered live below.
 6. **Full sync (by-source delete):** matched rows UPDATEd, keys a ~50% (inline-subquery) source no longer carries DELETEd via `WHEN NOT MATCHED BY SOURCE` — the heaviest shape (whole-target anti-join).
 7. **Expression update:** a 100%-match UPDATE whose SET is an arbitrary expression + `CASE` over the source, not a plain column copy.
 8. **Append (no merge):** the batch appended — no target scan/join (far cheaper).
-9. **Append #2 (plain, no merge):** a second cheap append of new keys — no target scan/join.
+9. **Append #2 (no merge):** a second plain append of new data (the version-guard verb was removed; a read-modify-append on the SAME table is auto-fenced instead).
 10. **Overwrite (no merge):** the table replaced by the batch — also no target scan/join.
 
 _Operations 5–7 exercise delta-rs's full MERGE clause set and run on the LOCAL stress gate only; the OneLake path-smoke job skips them._
@@ -44,17 +44,17 @@ _Operations 5–7 exercise delta-rs's full MERGE clause set and run on the LOCAL
 ### Results (row counts in millions; peak RSS is the process's, per op)
 | Operation | Increment | Updates | Inserts | Before | After | Expected | Count ✓ | Values ✓ | Peak RSS | Time |
 |---|---:|---:|---:|---:|---:|---:|:---:|:---:|---:|---:|
-| Mixed upsert | 0.6M | 0.5M | 0.1M | 60.0M | 60.1M | 60.1M | ✅ | ✅ | 5,774 MB | 109.6s |
-| Insert-only (future shipdate) | 3.0M | 0.0M | 3.0M | 60.1M | 63.1M | 63.1M | ✅ | ✅ | 4,796 MB | 13.7s |
-| Update-only (100% match) | 3.2M | 3.2M | 0.0M | 63.1M | 63.1M | 63.1M | ✅ | ✅ | 7,210 MB | 109.0s |
-| Idempotent re-merge | 0.0M | 0.0M | 0.0M | 63.1M | 63.1M | 63.1M | ✅ | ✅ | 8,386 MB | 119.1s |
-| CDC merge (delete+update+insert) | 1.8M | 0.9M | 0.6M | 30.1M | 30.4M | 30.4M | ✅ | ✅ | 6,562 MB | 64.4s |
-| Full sync (update + by-source delete) | 15.0M | 15.0M | 0.0M | 30.1M | 15.0M | 15.0M | ✅ | ✅ | 11,563 MB | 23.7s |
-| Expression update (set expressions + CASE) | 1.5M | 1.5M | 0.0M | 30.1M | 30.1M | 30.1M | ✅ | ✅ | 9,072 MB | 70.7s |
-| Append (no merge) | 3.2M | 0.0M | 3.2M | 63.1M | 66.3M | 66.3M | ✅ | ✅ | 8,910 MB | 14.3s |
-| Append #2 (plain, no merge) | 3.3M | 0.0M | 3.3M | 66.3M | 69.6M | 69.6M | ✅ | ✅ | 9,716 MB | 15.4s |
-| Overwrite (no merge) | 3.5M | 0.0M | 3.5M | 69.6M | 3.5M | 3.5M | ✅ | ✅ | 7,815 MB | 10.9s |
+| Mixed upsert | 0.6M | 0.5M | 0.1M | 60.0M | 60.1M | 60.1M | ✅ | ✅ | 6,006 MB | 86.5s |
+| Insert-only (future shipdate) | 3.0M | 0.0M | 3.0M | 60.1M | 63.1M | 63.1M | ✅ | ✅ | 4,328 MB | 13.2s |
+| Update-only (100% match) | 3.2M | 3.2M | 0.0M | 63.1M | 63.1M | 63.1M | ✅ | ✅ | 6,527 MB | 115.2s |
+| Idempotent re-merge | 0.0M | 0.0M | 0.0M | 63.1M | 63.1M | 63.1M | ✅ | ✅ | 7,863 MB | 123.6s |
+| CDC merge (delete+update+insert) | 1.8M | 0.9M | 0.6M | 30.1M | 30.4M | 30.4M | ✅ | ✅ | 6,259 MB | 79.9s |
+| Full sync (update + by-source delete) | 15.0M | 15.0M | 0.0M | 30.0M | 15.0M | 15.0M | ✅ | ✅ | 11,943 MB | 22.7s |
+| Expression update (set expressions + CASE) | 1.5M | 1.5M | 0.0M | 30.1M | 30.1M | 30.1M | ✅ | ✅ | 9,290 MB | 62.7s |
+| Append (no merge) | 3.2M | 0.0M | 3.2M | 63.1M | 66.3M | 66.3M | ✅ | ✅ | 8,950 MB | 14.0s |
+| Append #2 (plain) (no merge) | 3.3M | 0.0M | 3.3M | 66.3M | 69.6M | 69.6M | ✅ | ✅ | 9,431 MB | 14.8s |
+| Overwrite (no merge) | 3.5M | 0.0M | 3.5M | 69.6M | 3.5M | 3.5M | ✅ | ✅ | 7,514 MB | 10.9s |
 
-**Result: ✅ all operations correct.** The chain tail reached **69,584,515 rows**, peak memory **11,563 MB** — duckrun stayed within the runner's RAM and every update/insert landed through the connection API.
+**Result: ✅ all operations correct.** The chain tail reached **69,575,633 rows**, peak memory **11,943 MB** — duckrun stayed within the runner's RAM and every update/insert landed through the connection API.
 
 <!-- MERGE:END -->
