@@ -235,18 +235,18 @@ def session(tmp_path):
 
 
 def test_optimize_analyze_prints_order_by(session, capsys):
-    session.sql("select (i % 4) as region, (i % 5) as cat from range(4000) t(i)") \
-        .write.mode("overwrite").saveAsTable("an")
-    session.table("an").optimize(analyze=True)
+    session.sql("CREATE OR REPLACE TABLE an AS "
+                "select (i % 4) as region, (i % 5) as cat from range(4000) t(i)")
+    session._get_rle("an")                       # the sort-key profiler prints the advisory
     assert "ORDER BY" in capsys.readouterr().out
 
 
 def test_optimize_analyze_seed_is_deterministic(session, capsys):
     # Seeded advisory over a table is reproducible run-to-run (small table → exact, but the seed
     # path must at least run and stay stable).
-    session.sql("select (i % 50) a, (i % 7) b, i c from range(4000) t(i)") \
-        .write.mode("overwrite").saveAsTable("seeded")
-    r1 = [tuple(row) for row in session.table("seeded").optimize(analyze=True, seed=7).collect()]
+    session.sql("CREATE OR REPLACE TABLE seeded AS "
+                "select (i % 50) a, (i % 7) b, i c from range(4000) t(i)")
+    r1 = [tuple(row) for row in session._get_rle("seeded", seed=7).fetchall()]
     capsys.readouterr()
-    r2 = [tuple(row) for row in session.table("seeded").optimize(analyze=True, seed=7).collect()]
+    r2 = [tuple(row) for row in session._get_rle("seeded", seed=7).fetchall()]
     assert r1 == r2

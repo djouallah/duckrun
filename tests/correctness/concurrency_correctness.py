@@ -24,11 +24,11 @@ D. DELETE / UPDATE snapshot safety. A connection-API delete()/update() is a genu
    Delta op, so delta-rs OCC fails it (CommitFailedError) when a foreign commit changed the same
    rows after its snapshot opened — native conflict detection, no max_commit_retries hack.
 
-E. Connection-API append_if_unchanged (self-reference). The same B guarantee, but driven end-to-end through
-   the connection API — `conn.sql("select … from t").write.mode("append_if_unchanged").saveAsTable("t")` —
-   where the source reads the SAME table it writes to. A plain `append` silently lands on the new
-   HEAD; `append_if_unchanged` REFUSES (CommitFailedError) when a foreign commit moved the table since the
-   writer read it.
+E. Connection-API self-referential append. The same B guarantee, but driven end-to-end through the
+   connection API — `conn.sql("INSERT INTO t SELECT … FROM t")` — where the source reads the SAME
+   table it writes to, so duckrun auto-fences it. A plain append of new data silently lands on the new
+   HEAD; the self-referential append REFUSES (CommitFailedError) when a foreign commit moved the table
+   since the writer read it.
 """
 import os
 import sys
@@ -102,8 +102,8 @@ def append_if_unchanged_display(rows):
 # -------------------------------------------------------------- D. DELETE / UPDATE snapshot safety
 
 def mutate_run(op: str, concurrent: bool) -> dict:
-    """A connection-API ``DeltaTable.forName(conn, t).delete(…)/.update(…)`` (engine.delete_rows /
-    update_rows) is pinned to the version the handle read (``load_as_version``) and committed under
+    """A connection-API ``conn.sql("DELETE FROM t …" / "UPDATE t …")`` (engine.delete_rows /
+    update_rows) is pinned to the version the statement read (``load_as_version``) and committed under
     delta-rs native OCC over ``(read_version, HEAD]`` — exactly like MERGE — so a CONFLICTING
     foreign commit landing after that snapshot makes it fail with CommitFailedError. (Here the
     foreign writer updates the same row, a genuine conflict.) With no concurrent writer it

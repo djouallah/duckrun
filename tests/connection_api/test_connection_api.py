@@ -32,7 +32,6 @@ from deltalake.exceptions import CommitFailedError
 
 import duckrun
 import duckrun.session as session_mod
-from duckrun import DeltaTable
 from duckrun.delta_table import _parse_parquet_identifier
 from dbt.adapters.duckrun import engine
 from dbt.adapters.duckrun.delta_dml import TOMBSTONE_COLUMN
@@ -77,20 +76,6 @@ class TestSession:
     def test_sql(self, conn):
         assert conn.sql("select count(*) from src").fetchone()[0] == 3
 
-    def test_table(self, conn):
-        assert conn.table("src").count() == 3
-
-    def test_createDataFrame(self, conn):
-        df = conn.createDataFrame([(1, "a"), (2, "b")], "id int, name string")
-        assert df.columns == ["id", "name"]
-        assert df.count() == 2
-
-    def test_read_property(self, conn):
-        assert conn.read is not None
-
-    def test_catalog_property(self, conn):
-        assert conn.catalog is not None
-
     def test_refresh(self, conn):
         assert conn.refresh() is conn
 
@@ -111,7 +96,7 @@ class TestSession:
         other.sql("CREATE OR REPLACE TABLE only_there AS select 99 as n")
         other.close()
         assert conn.attach(str(tmp_path / "wh2"), name="sales") is conn  # chains
-        assert "sales" in conn.catalog.listCatalogs()
+        assert "sales" in conn._catalogs
         assert conn.sql("select n from sales.dbo.only_there").fetchone()[0] == 99
 
     def test_show_tables(self, conn):
@@ -169,7 +154,7 @@ class TestSession:
 
     def test_get_stats_detailed(self, conn):
         st = conn.get_stats("src", detailed=True)  # one row per parquet row group
-        assert st.count() >= 1 and "table" in st.columns
+        assert len(st.fetchall()) >= 1 and "table" in st.columns
 
     def test_get_stats_glob(self, conn):
         # wildcard patterns match table names across schemas in the current catalog.
@@ -208,7 +193,7 @@ class TestSession:
         path = _stage_parquet(conn, "dbo/sconv")
         assert conn.convert_to_delta(f"parquet.`{path}`") == path
         conn.refresh()
-        assert conn.table("sconv").fetchall() == [(1, "a")]
+        assert conn.sql("select * from sconv").fetchall() == [(1, "a")]
 
 
 class TestSqlDml:
@@ -230,15 +215,15 @@ class TestSqlDml:
 
     def test_sql_create_table_as(self, conn):
         conn.sql("create table cta as select * from (values (1),(2)) t(x)")
-        assert conn.table("cta").count() == 2
+        assert conn.sql("select count(*) from cta").fetchone()[0] == 2
 
     def test_sql_insert_select(self, conn):
         conn.sql("insert into src select * from (values (9,'z')) t(id, name)")
-        assert conn.table("src").count() == 4
+        assert conn.sql("select count(*) from src").fetchone()[0] == 4
 
     def test_sql_insert_values(self, conn):
         conn.sql("insert into src values (9, 'z')")
-        assert conn.table("src").count() == 4
+        assert conn.sql("select count(*) from src").fetchone()[0] == 4
         assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
     def test_sql_insert_values_named_subset(self, conn):
@@ -253,7 +238,7 @@ class TestSqlDml:
 
     def test_sql_delete(self, conn):
         conn.sql("delete from src where id = 1")
-        assert conn.table("src").count() == 2
+        assert conn.sql("select count(*) from src").fetchone()[0] == 2
 
     def test_sql_update_where_inside_set_literal(self, conn):
         # A literal containing the word `where` in the SET list must not mis-split the statement
@@ -292,13 +277,13 @@ class TestSqlDml:
     def test_sql_drop_tombstone(self, conn):
         # drop is a tombstone (no data deleted); the table leaves the catalog.
         conn.sql("drop table src")
-        assert "src" not in conn.catalog.listTables()
+        assert "src" not in conn._cat_tables()
 
     def test_sql_merge_upsert(self, conn):
         conn.sql("MERGE INTO src USING (values (2,'B'),(9,'z')) t(id, name) "
                  "ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
-        assert conn.table("src").count() == 4
+        assert conn.sql("select count(*) from src").fetchone()[0] == 4
         assert conn.sql("select name from src where id = 2").fetchone()[0] == "B"
         assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
@@ -310,7 +295,7 @@ class TestSqlDml:
     def test_sql_merge_insert_only(self, conn):
         conn.sql("MERGE INTO src USING (values (2,'B'),(5,'e')) t(id, name) "
                  "ON target.id = source.id WHEN NOT MATCHED THEN INSERT *")
-        assert conn.table("src").count() == 4                                   # only id=5 added
+        assert conn.sql("select count(*) from src").fetchone()[0] == 4          # only id=5 added
         assert conn.sql("select name from src where id = 2").fetchone()[0] == "b"  # untouched
 
     def test_sql_merge_by_source_delete(self, conn):
@@ -390,7 +375,7 @@ class TestSqlDml:
         # WHEN MATCHED THEN DELETE — matched rows removed (full delta-rs surface).
         conn.sql("MERGE INTO src USING (values (2,'x'),(3,'x')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED THEN DELETE")
-        assert sorted(r[0] for r in conn.table("src").fetchall()) == [1]
+        assert sorted(r[0] for r in conn.sql("select * from src").fetchall()) == [1]
 
     def test_sql_merge_matched_delete_and_update(self, conn):
         # two WHEN MATCHED clauses, applied in order: delete flagged rows, update the rest.
@@ -441,7 +426,7 @@ class TestSqlDml:
         conn.sql("MERGE INTO src USING (values (1,'A'),(9,'z')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET *")
         assert conn.sql("select name from src where id = 1").fetchone()[0] == "A"  # updated
-        assert conn.table("src").count() == 3                                      # id=9 NOT inserted
+        assert conn.sql("select count(*) from src").fetchone()[0] == 3             # id=9 NOT inserted
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -498,8 +483,8 @@ def test_onelake_guid_hint():
 
 def test_discovery_and_catalog(wh):
     conn = duckrun.connect(wh, schema="dbo")
-    assert set(conn.catalog.listTables()) == {"t1", "t2"}
-    assert conn.catalog.currentDatabase() == "dbo"
+    assert set(conn._cat_tables()) == {"t1", "t2"}
+    assert conn._current_database == "dbo"
     # SHOW TABLES works for free (native DuckDB over the registered views).
     shown = {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
     assert {"t1", "t2"} <= shown
@@ -510,7 +495,7 @@ def test_discover_all_schemas(wh):
     # Add a second schema folder, then connect with no schema → discover everything.
     _write_table(wh + "/sales/orders", "select 7 as n")
     conn = duckrun.connect(wh)
-    assert set(conn.catalog.listDatabases()) == {"dbo", "sales"}
+    assert set(conn._cat_databases()) == {"dbo", "sales"}
     assert conn.sql("select n from sales.orders").fetchone()[0] == 7
 
 
@@ -574,11 +559,11 @@ def test_raw_connection_escape_hatch(wh):
 def test_refresh_picks_up_external_writes(wh):
     # A table created on the store after connect is invisible until refresh() re-discovers it.
     conn = duckrun.connect(wh, schema="dbo")
-    assert "t3" not in conn.catalog.listTables()
+    assert "t3" not in conn._cat_tables()
     _write_table(wh + "/dbo/t3", "select 1 as id")
     conn.refresh(quiet=True)
-    assert "t3" in conn.catalog.listTables()
-    assert conn.table("t3").count() == 1
+    assert "t3" in conn._cat_tables()
+    assert conn.sql("select count(*) from t3").fetchone()[0] == 1
 
 
 def test_read_files_via_sql(wh, tmp_path):
@@ -593,142 +578,8 @@ def test_read_files_via_sql(wh, tmp_path):
     assert conn.sql(f"select count(*) from read_csv_auto('{csv}')").fetchone()[0] == 2
 
 
-def test_catalog_database_and_column_introspection(wh):
-    # A second schema folder so setCurrentDatabase / databaseExists have something to switch to.
-    _write_table(wh + "/sales/orders", "select 7 as n, 'x' as label")
-    conn = duckrun.connect(wh)  # no schema → discover every schema
-
-    assert conn.catalog.databaseExists("sales") is True
-    assert conn.catalog.databaseExists("nope") is False
-    assert conn.catalog.tableExists("dbo.t1") is True
-    assert conn.catalog.tableExists("nope") is False
-    assert conn.catalog.listColumns("dbo.t1") == ["id", "name"]
-
-    conn.catalog.setCurrentDatabase("sales")
-    assert conn.catalog.currentDatabase() == "sales"
-    assert conn.catalog.tableExists("orders") is True            # resolved in the current db
-    assert conn.sql("select n from orders").fetchone()[0] == 7   # unqualified resolves to sales
-
-
-# ── createDataFrame: every input/schema form ──────────────────────────────────────────────────────
-# The scorecard (TestSession.test_createDataFrame) has the one-liner; these are the edge cases, merged
-# in from the former test_create_dataframe.py so CI (which runs THIS file by path) actually runs them.
-def _cdf_types(df):
-    return [str(t) for t in df.relation.types]
-
-
-def test_createDataFrame_tuples_no_schema_autonames(conn):
-    df = conn.createDataFrame([(1, "a"), (2, "b")])
-    assert df.columns == ["_1", "_2"]
-    assert df.fetchall() == [(1, "a"), (2, "b")]
-
-
-def test_createDataFrame_tuples_with_names(conn):
-    df = conn.createDataFrame([(1, "a"), (2, "b")], ["id", "name"])
-    assert df.columns == ["id", "name"]
-    assert df.count() == 2
-
-
-def test_createDataFrame_ddl_casts_types(conn):
-    df = conn.createDataFrame([(1, "a")], "id int, name string")
-    assert df.columns == ["id", "name"]
-    assert _cdf_types(df) == ["INTEGER", "VARCHAR"]
-
-
-def test_createDataFrame_ddl_colon_spelling(conn):
-    df = conn.createDataFrame([(1, "a")], "id: int, name: string")
-    assert df.columns == ["id", "name"]
-    assert _cdf_types(df) == ["INTEGER", "VARCHAR"]
-
-
-def test_createDataFrame_rejects_parity_params(conn):
-    # samplingRatio / verifySchema were parity-only no-ops; removed entirely → natural TypeError.
-    with pytest.raises(TypeError):
-        conn.createDataFrame([(1, "a")], "id int, name string", samplingRatio=0.5)
-
-
-def test_createDataFrame_ddl_decimal_with_comma_survives(conn):
-    df = conn.createDataFrame([(1, "1.50")], "id long, amount decimal(10,2)")
-    assert _cdf_types(df) == ["BIGINT", "DECIMAL(10,2)"]
-    assert df.fetchall() == [(1, pytest.approx(1.50))]
-
-
-def test_createDataFrame_list_of_scalars_single_column(conn):
-    df = conn.createDataFrame([1, 2, 3], "value int")
-    assert df.columns == ["value"]
-    assert [r[0] for r in df.fetchall()] == [1, 2, 3]
-
-
-def test_createDataFrame_ragged_rows_error(conn):
-    with pytest.raises(ValueError, match="same number of columns"):
-        conn.createDataFrame([(1, "a"), (2,)])
-
-
-def test_createDataFrame_pandas(conn):
-    pd = pytest.importorskip("pandas")
-    df = conn.createDataFrame(pd.DataFrame({"id": [1, 2], "name": ["a", "b"]}))
-    assert df.columns == ["id", "name"]
-    assert df.count() == 2
-
-
-def test_createDataFrame_pandas_with_schema_rename(conn):
-    pd = pytest.importorskip("pandas")
-    df = conn.createDataFrame(pd.DataFrame({"x": [1], "y": ["a"]}), ["id", "name"])
-    assert df.columns == ["id", "name"]
-
-
-def test_createDataFrame_pyarrow_table(conn):
-    pa = pytest.importorskip("pyarrow")
-    df = conn.createDataFrame(pa.table({"id": [1, 2], "name": ["a", "b"]}))
-    assert df.columns == ["id", "name"]
-    assert df.count() == 2
-
-
-def test_createDataFrame_empty_with_ddl(conn):
-    df = conn.createDataFrame([], "id int, name string")
-    assert df.columns == ["id", "name"]
-    assert _cdf_types(df) == ["INTEGER", "VARCHAR"]
-    assert df.count() == 0
-
-
-def test_createDataFrame_empty_without_schema_errors(conn):
-    with pytest.raises(ValueError, match="empty dataset"):
-        conn.createDataFrame([])
-
-
-def test_createDataFrame_name_count_mismatch_errors(conn):
-    with pytest.raises(ValueError, match="columns"):
-        conn.createDataFrame([(1, "a")], ["only_one"])
-
-
-def test_createDataFrame_bad_schema_type_errors(conn):
-    with pytest.raises(TypeError, match="schema must be"):
-        conn.createDataFrame([(1,)], schema=123)
-
-
-def test_createDataFrame_column_name_with_embedded_quote(conn):
-    # Regression: _project_rename must escape identifiers via _qid. A column name containing a
-    # double-quote previously built broken SQL (`"_1" AS "id"x"`); now it round-trips.
-    df = conn.createDataFrame([(1, "a"), (2, "b")], ['id"x', "name"])
-    assert df.columns == ['id"x', "name"]
-    assert df.count() == 2
-
-
-def test_createDataFrame_round_trip_to_delta(conn):
-    conn.createDataFrame([(1, "a"), (2, "b")], "id int, name string") \
-        .write.mode("overwrite").saveAsTable("seeded")
-    fresh = duckrun.connect(conn.root_path, schema="dbo", read_only=True)
-    assert fresh.table("seeded").relation.order("id").fetchall() == [(1, "a"), (2, "b")]
-
-
-def test_createDataFrame_no_experimental_spark_import():
-    src = Path(session_mod.__file__).read_text(encoding="utf-8")
-    assert "experimental.spark" not in src
-
-
-# ── convertToDelta: zero-copy parquet→Delta in place (delta-spark DeltaTable.convertToDelta) ─────────
-# The scorecard (TestDeltaTable.test_convertToDelta) has the one-liner; these are the identifier /
-# zero-copy / guard cases, merged in from the former test_convert_to_delta.py.
+# ── convert_to_delta: zero-copy parquet→Delta in place (session-level convert) ───────────────────────
+# The identifier / zero-copy / guard cases, merged in from the former test_convert_to_delta.py.
 def _stage_parquet(conn, rel_dir, sql="select 1 AS id, 'a' AS nm"):
     """Stage a parquet file at <root>/<rel_dir>/data.parquet via the raw DuckDB connection
     (out-of-band — a native parquet write, not a Delta write, so the read-only gate lets it through)."""
@@ -754,14 +605,14 @@ def test_convertToDelta_parse_identifier_rejects_empty():
 
 def test_convertToDelta_bare_path_round_trip(conn):
     path = _stage_parquet(conn, "dbo/bare")
-    DeltaTable.convertToDelta(conn, path)            # a bare path works, not just parquet.`…`
+    conn.convert_to_delta(path)                      # a bare path works, not just parquet.`…`
     conn.refresh()
-    assert conn.table("bare").count() == 1
+    assert conn.sql("select count(*) from bare").fetchone()[0] == 1
 
 
 def test_convertToDelta_is_zero_copy(conn):
     path = _stage_parquet(conn, "dbo/zc")
-    DeltaTable.convertToDelta(conn, path)
+    conn.convert_to_delta(path)
     assert os.path.exists(path + "/data.parquet")    # original parquet survives
     assert os.path.isdir(path + "/_delta_log")       # only a _delta_log was added
 
@@ -770,14 +621,14 @@ def test_convertToDelta_read_only_raises(tmp_path):
     ro = duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=True)
     path = _stage_parquet(ro, "dbo/blocked")
     with pytest.raises(PermissionError):
-        DeltaTable.convertToDelta(ro, path)
+        ro.convert_to_delta(path)
 
 
 def test_convertToDelta_already_delta_raises(conn):
     path = _stage_parquet(conn, "dbo/twice")
-    DeltaTable.convertToDelta(conn, path)
+    conn.convert_to_delta(path)
     with pytest.raises(Exception):                   # delta-rs mode='error' on an already-converted dir
-        DeltaTable.convertToDelta(conn, path)
+        conn.convert_to_delta(path)
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -960,12 +811,12 @@ def test_drop_tombstones_without_deleting_data(tmp_path):
     c = _seed(wh)
     path = c._table_path("dbo", "items")
     c.sql("drop table items")
-    assert "items" not in c.catalog.listTables()
+    assert "items" not in c._cat_tables()
     with pytest.raises(Exception):
-        c.table("items")
+        c.sql("select * from items").fetchall()
     assert deltalake.DeltaTable.is_deltatable(path)                               # NOT deleted
     assert [f.name for f in deltalake.DeltaTable(path).schema().fields] == [TOMBSTONE_COLUMN]
-    assert "items" not in duckrun.connect(wh, schema="dbo").catalog.listTables()  # fresh conn hides it
+    assert "items" not in duckrun.connect(wh, schema="dbo")._cat_tables()  # fresh conn hides it
     c.sql("create table items as select * from (values (10,'x')) t(id, name)")
     assert _dump(wh, "items") == (["id", "name"], [(10, "x")])
 
@@ -981,7 +832,7 @@ def test_native_passthrough_not_delta(tmp_path, stmt, name):
     c.sql(stmt)
     assert c.sql(f"select count(*) from {name}").fetchone()[0] is not None   # queryable now
     assert not deltalake.DeltaTable.is_deltatable(c._table_path("dbo", name))  # but not Delta
-    assert name not in duckrun.connect(wh, schema="dbo").catalog.listTables()  # and not persisted
+    assert name not in duckrun.connect(wh, schema="dbo")._cat_tables()  # and not persisted
 
 
 # Tier 4 — rejection contract: conn.sql() refuses what it can't route to delta_rs.
@@ -1030,8 +881,8 @@ def _two_lakehouses(tmp_path):
 
 def test_multi_catalog_cross_query(tmp_path):
     conn = _two_lakehouses(tmp_path)
-    assert conn.catalog.listCatalogs() == ["lhA", "other"]   # primary derives its folder name "lhA"
-    assert conn.catalog.currentCatalog() == "lhA"
+    assert list(conn._catalogs) == ["lhA", "other"]   # primary derives its folder name "lhA"
+    assert conn._current_catalog == "lhA"
     # cross-catalog read resolves catalog.schema.table across the two lakehouse roots.
     assert conn.sql("select n from other.dbo.t2").fetchone()[0] == 7
     assert conn.sql("select label from other.sales.s").fetchone()[0] == "x"
@@ -1040,14 +891,22 @@ def test_multi_catalog_cross_query(tmp_path):
     assert conn.sql("select count(*) from t1").fetchone()[0] == 2  # via USE lhA.dbo
 
 
+def _set_current_catalog(conn, name):
+    """Switch the current catalog and pick its default database (dbo when present, else the first)."""
+    conn._current_catalog = name
+    dbs = conn._cat_databases()
+    conn._current_database = "dbo" if "dbo" in dbs else (dbs[0] if dbs else "dbo")
+    conn._use(conn._current_catalog, conn._current_database)
+
+
 def test_multi_catalog_set_current(tmp_path):
     conn = _two_lakehouses(tmp_path)
-    conn.catalog.setCurrentCatalog("other")
-    assert conn.catalog.currentCatalog() == "other"
-    assert conn.catalog.currentDatabase() == "dbo"          # picks dbo when present
+    _set_current_catalog(conn, "other")
+    assert conn._current_catalog == "other"
+    assert conn._current_database == "dbo"                  # picks dbo when present
     assert conn.sql("select n from t2").fetchone()[0] == 7   # unqualified now resolves in 'other'
-    assert set(conn.catalog.listDatabases()) == {"dbo", "sales"}  # other's schemas, not lhA's
-    assert conn.catalog.listTables() == ["t2"]              # current catalog (other) + db (dbo)
+    assert set(conn._cat_databases()) == {"dbo", "sales"}   # other's schemas, not lhA's
+    assert conn._cat_tables() == ["t2"]                     # current catalog (other) + db (dbo)
 
 
 def test_multi_catalog_write_lands_in_right_root(tmp_path):
@@ -1057,9 +916,9 @@ def test_multi_catalog_write_lands_in_right_root(tmp_path):
     assert deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhB" / "dbo" / "created"))
     assert not deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhA" / "dbo" / "created"))
     assert conn.sql("select v from other.dbo.created").fetchone()[0] == "z"
-    # and the DeltaTable handle resolves the attached catalog's path + storage_options.
-    dt = DeltaTable.forName(conn, "other.dbo.created")
-    assert dt.path.replace("\\", "/").endswith("lhB/dbo/created")
+    # and the resolved path lands under the attached catalog's root.
+    path = conn._table_path("dbo", "created", catalog="other")
+    assert path.replace("\\", "/").endswith("lhB/dbo/created")
 
 
 def test_multi_catalog_bijective_guards(tmp_path):
@@ -1079,15 +938,15 @@ def test_primary_name_derive_explicit_and_fallback(tmp_path):
     # No name= → derive from the path's last segment (the folder name).
     a = str(tmp_path / "wh")
     _write_table(a + "/dbo/t", "select 1 as id")
-    assert duckrun.connect(a).catalog.currentCatalog() == "wh"
+    assert duckrun.connect(a)._current_catalog == "wh"
     # Explicit name= wins.
-    assert duckrun.connect(a, name="picked").catalog.currentCatalog() == "picked"
+    assert duckrun.connect(a, name="picked")._current_catalog == "picked"
     # Nothing derivable (a GUID-shaped segment → _derive_catalog_name returns None) → "data" fallback,
     # which is non-reserved so it's usable bare in 3-part SQL.
     g = str(tmp_path / "11111111-1111-1111-1111-111111111111")
     _write_table(g + "/dbo/t", "select 1 as id")
     conn = duckrun.connect(g)
-    assert conn.catalog.currentCatalog() == "data"
+    assert conn._current_catalog == "data"
     assert conn.sql("select count(*) from data.dbo.t").fetchone()[0] == 1   # bare, no quoting needed
 
 
@@ -1102,7 +961,7 @@ def test_name_url_bijection_with_derived_names(tmp_path, tmp_path_factory):
     with pytest.raises(ValueError, match="already attached|another name"):
         conn.attach(b)                                 # derived name "wh" clashes with the primary
     conn.attach(b, name="wh2")                         # an explicit name resolves it
-    assert set(conn.catalog.listCatalogs()) == {"wh", "wh2"}
+    assert set(conn._catalogs) == {"wh", "wh2"}
     assert conn.sql("select id from wh2.dbo.t").fetchone()[0] == 2
 
 
@@ -1114,9 +973,9 @@ def test_attach_schema_filter_skips_discovery(tmp_path):
     _write_table(b + "/skipme/hidden", "select 1 as id")
     conn = duckrun.connect(a, read_only=False)
     conn.attach(b, name="other", schema="dbo")
-    conn.catalog.setCurrentCatalog("other")
-    assert conn.catalog.listDatabases() == ["dbo"]          # skipme not discovered
-    assert conn.catalog.listTables() == ["keep"]
+    _set_current_catalog(conn, "other")
+    assert conn._cat_databases() == ["dbo"]                 # skipme not discovered
+    assert conn._cat_tables() == ["keep"]
 
 
 def test_cross_catalog_raw_dml_routes_to_target_root(tmp_path):
@@ -1229,7 +1088,7 @@ def test_weird_attached_catalog_names(tmp_path, tmp_path_factory, weird):
     _write_table(b + "/dbo/t2", "select 9 as n")
     conn = duckrun.connect(a, read_only=False)
     conn.attach(b, name=weird)
-    assert weird in conn.catalog.listCatalogs()
+    assert weird in conn._catalogs
     qn = '"' + weird.replace('"', '""') + '"'   # the caller quotes the weird name in their own SQL
     # cross-catalog read through the quoted 3-part name
     assert conn.sql(f"select n from {qn}.dbo.t2").fetchone()[0] == 9
@@ -1237,9 +1096,9 @@ def test_weird_attached_catalog_names(tmp_path, tmp_path_factory, weird):
     conn.sql(f"CREATE OR REPLACE TABLE {qn}.dbo.created AS select 7 as v")
     assert conn.sql(f"select v from {qn}.dbo.created").fetchone()[0] == 7
     # switch to it and introspect under the weird name
-    conn.catalog.setCurrentCatalog(weird)
-    assert conn.catalog.currentCatalog() == weird
-    assert {"t2", "created"} <= set(conn.catalog.listTables("dbo"))
+    _set_current_catalog(conn, weird)
+    assert conn._current_catalog == weird
+    assert {"t2", "created"} <= set(conn._cat_tables("dbo"))
 
 
 @pytest.mark.parametrize("weird", ["select", "my lake", "café", "default"])
@@ -1249,7 +1108,7 @@ def test_weird_primary_catalog_name(tmp_path, weird):
     a = str(tmp_path / "wh")
     _write_table(a + "/dbo/t", "select 5 as id")
     conn = duckrun.connect(a, name=weird, read_only=False)
-    assert conn.catalog.currentCatalog() == weird
+    assert conn._current_catalog == weird
     assert conn.sql("select id from t").fetchone()[0] == 5            # bare, current catalog
     qn = '"' + weird.replace('"', '""') + '"'
     assert conn.sql(f"select id from {qn}.dbo.t").fetchone()[0] == 5  # explicit 3-part, quoted

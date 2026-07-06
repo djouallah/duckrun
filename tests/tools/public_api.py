@@ -28,23 +28,17 @@ try:
 except Exception:
     pass
 
-# The reachable public API surface. The SQL-only refactor amputates the DataFrame veneer: the notebook
-# surface is now ~just DuckSession + SQL. The wrapper classes (Catalog / DataFrame / DataFrameReader /
-# DataFrameWriter / DeltaTable / DeltaMergeBuilder) and the DuckSession members that hand them out
-# (table / read / createDataFrame / catalog) still exist in the code during the strangler transition,
-# but are no longer advertised — dropped from SURFACES / added to EXCLUDE so the reference card and the
-# removal gate track only the target surface. They're physically deleted in the final phase.
+# The reachable public API surface. The SQL-only refactor amputated the DataFrame veneer: the notebook
+# surface is just DuckSession + SQL. The wrapper classes (Catalog / DataFrame / DataFrameReader /
+# DataFrameWriter / DeltaTable / DeltaMergeBuilder) and the members that handed them out (table / read /
+# createDataFrame / catalog / stop) were physically deleted — so only DuckSession's SQL surface remains.
 SURFACES = [
     ("DuckSession", _S.DuckSession, []),
 ]
 
-# Public members that exist but aren't part of the advertised contract: internal plumbing accessors,
-# plus the DataFrame-veneer entry points being removed by the SQL-only refactor (still in code, hidden).
+# Public members that exist but aren't part of the advertised contract: internal plumbing accessors.
 EXCLUDE = {
     ("DuckSession", "root_path"), ("DuckSession", "storage_options"),
-    ("DuckSession", "table"), ("DuckSession", "read"),
-    ("DuckSession", "createDataFrame"), ("DuckSession", "catalog"),
-    ("DuckSession", "stop"),   # transition alias for close() — not advertised
 }
 
 BASELINE = os.path.join(os.path.dirname(__file__), os.pardir,

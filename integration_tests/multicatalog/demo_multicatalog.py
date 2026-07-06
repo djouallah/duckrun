@@ -36,7 +36,6 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import duckrun
-from duckrun import DeltaTable
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -200,7 +199,7 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
     dirs (de-risk) or live OneLake (the demo)."""
     _DOC.clear()
     q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731
-    lakehouse = conn.catalog.currentCatalog()
+    lakehouse = conn._current_catalog
 
     print(f"\n=== duckrun multi-catalog | lakehouse={_trim_loc(conn.root_path)} | "
           f"warehouse(ro)={_trim_loc(warehouse_path)} | local={_trim_loc(local_path)} ===", flush=True)
@@ -218,8 +217,8 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
         conn.attach(warehouse_path, name="warehouse", schema=REMOTE_SCHEMA, read_only=True)
         conn.attach(local_path, name="local")
         rows = [(c, "primary" if c == lakehouse else ("read-only" if conn._catalogs[c].read_only else "writable"),
-                 _kind(conn._catalogs[c].root_path)) for c in conn.catalog.listCatalogs()]
-        _table(rows, ["catalog", "mode", "storage"], "  conn.catalog.listCatalogs()")
+                 _kind(conn._catalogs[c].root_path)) for c in conn._catalogs]
+        _table(rows, ["catalog", "mode", "storage"], "  attached catalogs")
         say(f"three catalogs bound to one session; '{lakehouse}' is writable, 'warehouse' is read-only")
 
     # 2 ── THE KEY VISUAL: list every table across all catalogs as catalog.schema.table ─────────────
@@ -237,7 +236,7 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
         _table([(cat, f"{cat}.{sch}.{tbl}") for cat, sch, tbl in rows] or [("—", "(none yet)")],
                ["catalog", "fully-qualified name (catalog.schema.table)"],
                "  every table the session can see, three-part named")
-        say(f"{len(rows)} tables across {len(conn.catalog.listCatalogs())} catalogs — the warehouse and "
+        say(f"{len(rows)} tables across {len(conn._catalogs)} catalogs — the warehouse and "
             f"lakehouse expose the SAME mart tables; only the warehouse is read-only")
 
     # 3 ── the three ways to name the same table: 3-part → 2-part → 1-part ──────────────────────────
@@ -247,16 +246,16 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
         probe = "SELECT count(*) FROM (SELECT 1 FROM {ref} LIMIT 100000)"
         _py('# 3-part — fully qualified, works from anywhere (cross-catalog):\n'
             'conn.sql("SELECT * FROM warehouse.mart.fct_summary LIMIT 5")\n'
-            '# 2-part — schema.table, in the current catalog:\n'
-            'conn.catalog.setCurrentCatalog("warehouse"); conn.sql("SELECT * FROM mart.fct_summary LIMIT 5")\n'
-            '# 1-part — bare table, in the current catalog + database:\n'
-            'conn.catalog.setCurrentDatabase("mart");      conn.sql("SELECT * FROM fct_summary LIMIT 5")')
+            '# 2-part — schema.table, after USE selects the current catalog:\n'
+            'conn.sql("USE warehouse"); conn.sql("SELECT * FROM mart.fct_summary LIMIT 5")\n'
+            '# 1-part — bare table, after USE selects catalog + schema:\n'
+            'conn.sql("USE warehouse.mart"); conn.sql("SELECT * FROM fct_summary LIMIT 5")')
         n3 = q(probe.format(ref="warehouse.mart.fct_summary"))
-        conn.catalog.setCurrentCatalog("warehouse")
+        conn.sql("USE warehouse")                          # DuckDB current catalog → warehouse
         n2 = q(probe.format(ref="mart.fct_summary"))
-        conn.catalog.setCurrentDatabase("mart")
+        conn.sql("USE warehouse.mart")                     # current catalog + schema → warehouse.mart
         n1 = q(probe.format(ref="fct_summary"))
-        conn.catalog.setCurrentCatalog(lakehouse)  # back to the writable lakehouse
+        conn.sql(f"USE {_q(lakehouse)}.{_q(REMOTE_SCHEMA)}")   # back to the writable lakehouse
         _table([("3-part", "warehouse.mart.fct_summary", f"{n3:,}"),
                 ("2-part", "mart.fct_summary (current catalog)", f"{n2:,}"),
                 ("1-part", "fct_summary (current catalog + db)", f"{n1:,}")],
@@ -266,10 +265,10 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
 
     # 4 ── the warehouse is read-only; the lakehouse is writable ────────────────────────────────────
     with _step(4, "a Warehouse is locked to writes — the read-only fence refuses a write into it") as say:
-        _py('conn.sql("SELECT 1 AS x").write.mode("overwrite").saveAsTable("warehouse.mart.nope")\n'
+        _py('conn.sql("CREATE OR REPLACE TABLE warehouse.mart.nope AS SELECT 1 AS x")\n'
             '#  -> PermissionError: catalog \'warehouse\' is read-only')
         try:
-            conn.sql("SELECT 1 AS x").write.mode("overwrite").saveAsTable("warehouse.mart.nope")
+            conn.sql("CREATE OR REPLACE TABLE warehouse.mart.nope AS SELECT 1 AS x")
             outcome = "WROTE ❌ (UNSAFE)"
         except PermissionError:
             outcome = "refused ✅"
@@ -284,10 +283,10 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
     # 5 ── seed the LOCAL catalog with the carbon-factor lookup ─────────────────────────────────────
     with _step(5, "write a carbon-factor lookup into the LOCAL catalog (local.dbo.fuel_factors)") as say:
         values = ", ".join(f"('{f}', {c})" for f, c in _FUEL_FACTORS)
-        _py('lookup = conn.sql("SELECT * FROM (VALUES …) t(fuel, co2_kg_per_mwh)")\n'
-            'lookup.write.mode("overwrite").saveAsTable("local.dbo.fuel_factors")')
-        conn.sql(f"SELECT * FROM (VALUES {values}) t(fuel, co2_kg_per_mwh)") \
-            .write.mode("overwrite").saveAsTable("local.dbo.fuel_factors")
+        _py('conn.sql("""CREATE OR REPLACE TABLE local.dbo.fuel_factors AS\n'
+            '            SELECT * FROM (VALUES …) t(fuel, co2_kg_per_mwh)""")')
+        conn.sql(f"CREATE OR REPLACE TABLE local.dbo.fuel_factors AS "
+                 f"SELECT * FROM (VALUES {values}) t(fuel, co2_kg_per_mwh)")
         say(f"{len(_FUEL_FACTORS)} fuel factors written to the local catalog")
 
     # 6 ── JOIN warehouse facts ⋈ lakehouse dim ⋈ local lookup, write the mart BACK to the lakehouse ─
@@ -295,7 +294,7 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
         # Read a bounded SAMPLE of the facts (LIMIT) — DuckDB early-terminates the delta_scan, so the
         # demo never downloads the full 100M+-row fact table.
         _py('# facts: WAREHOUSE (read-only) · DUID dim: LAKEHOUSE · carbon factor: LOCAL\n'
-            'mart = conn.sql(f"""\n'
+            f'conn.sql(f"""CREATE OR REPLACE TABLE {schema}.mart_generation_by_state AS\n'
             '    WITH facts AS (   -- a bounded sample, not the whole 100M+-row fact\n'
             f'        SELECT DUID, mw, price FROM warehouse.mart.fct_summary LIMIT {SAMPLE_ROWS}\n'
             '    )\n'
@@ -306,9 +305,9 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
             '    FROM facts f\n'
             '    JOIN mart.dim_duid d                ON d.DUID = f.DUID\n'
             '    LEFT JOIN local.dbo.fuel_factors lf ON lower(lf.fuel) = lower(d.FuelSourceDescriptor)\n'
-            '    GROUP BY d.State""")\n'
-            f'mart.write.mode("overwrite").saveAsTable("{schema}.mart_generation_by_state")')
-        mart = conn.sql(f"""
+            '    GROUP BY d.State""")')
+        conn.sql(f"""
+            CREATE OR REPLACE TABLE {schema}.mart_generation_by_state AS
             WITH facts AS (
                 SELECT DUID, mw, price FROM warehouse.mart.fct_summary LIMIT {SAMPLE_ROWS}
             )
@@ -321,11 +320,10 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
             LEFT JOIN local.dbo.fuel_factors lf ON lower(lf.fuel) = lower(d.FuelSourceDescriptor)
             GROUP BY d.State
         """)
-        mart.write.mode("overwrite").saveAsTable(f"{schema}.mart_generation_by_state")
-        landed = DeltaTable.forName(conn, f"{schema}.mart_generation_by_state").path.replace("\\", "/")
+        landed = conn._table_path(schema, "mart_generation_by_state").replace("\\", "/")
         _table([(s, f"{mw:,.0f}", f"{p:,.2f}", f"{co2:,.0f}") for s, mw, p, co2 in conn.sql(
                     f"SELECT State, total_mw, avg_price, est_tonnes_co2 FROM {schema}.mart_generation_by_state "
-                    "ORDER BY total_mw DESC").collect()],
+                    "ORDER BY total_mw DESC").fetchall()],
                ["state", "total MW", "avg price $", "est t CO₂"],
                f"  {schema}.mart_generation_by_state — warehouse ⋈ lakehouse ⋈ local ({SAMPLE_ROWS:,}-row fact sample)")
         say(f"mart written back to the lakehouse ({_trim_loc(landed)}) — joined a {SAMPLE_ROWS:,}-row "

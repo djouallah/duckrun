@@ -1,19 +1,19 @@
-"""duckrun — a storage-neutral, DataFrame-style connection over a Delta lakehouse.
+"""duckrun — a storage-neutral, SQL-first connection over a Delta lakehouse.
 
     import duckrun
     conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")
     conn.sql("SHOW TABLES").show()
     # connect() is read-only by default; pass read_only=False to enable writes:
     w = duckrun.connect("abfss://…/Tables/dbo", read_only=False)
-    w.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
+    w.sql("CREATE OR REPLACE TABLE orders_copy AS SELECT * FROM orders")
 
+`conn.sql()` returns DuckDB's native relation; writes are ordinary SQL DML routed to delta-rs.
 Works the same against a local path, ``s3://``, ``gs://``, ``az://``, or OneLake ``abfss://``.
 This is the interactive/notebook API; the dbt adapter lives under ``dbt.adapters.duckrun``.
 """
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
-from .session import connect, DuckSession, DataFrame
-from .delta_table import DeltaTable
+from .session import connect, DuckSession
 
 try:
     # Single source of truth: the installed distribution's version (built from pyproject.toml).
@@ -23,4 +23,4 @@ try:
 except PackageNotFoundError:  # running from a source tree that was never installed
     __version__ = "0+unknown"
 
-__all__ = ["connect", "DuckSession", "DataFrame", "DeltaTable", "__version__"]
+__all__ = ["connect", "DuckSession", "__version__"]

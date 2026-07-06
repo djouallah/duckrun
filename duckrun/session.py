@@ -1,9 +1,10 @@
-"""A DataFrame-style, storage-neutral connection over a Delta lakehouse.
+"""A storage-neutral, SQL-first connection over a Delta lakehouse.
 
 ``duckrun.connect(path)`` opens a DuckDB connection, discovers the Delta tables under the store,
-registers each as a ``delta_scan`` view, and hands back a :class:`DuckSession` whose surface
-offers ``.sql()``, ``.table()``, ``.read``, ``.catalog``, and a
-``DataFrame`` with a ``.write…saveAsTable()``.
+registers each as a ``delta_scan`` view, and hands back a :class:`DuckSession`. The surface is SQL:
+``conn.sql(query)`` returns DuckDB's native relation for reads and routes write DML
+(``CREATE TABLE … AS`` / ``INSERT`` / ``UPDATE`` / ``DELETE`` / ``MERGE`` / ``VACUUM`` /
+``REPLACE WHERE``) to delta-rs.
 
 It is storage-neutral — local path, ``s3://``, ``gs://``, ``az://``, OneLake ``abfss://`` — because
 every storage concern (token → secret, table discovery, the Delta write path) is delegated to the
@@ -21,8 +22,8 @@ from . import auth, sortkey
 from ._runtime import check_runtime_versions
 
 
-# Statements that would WRITE to a table — rejected by the read-only conn.sql() with a pointer to
-# the DataFrame write API. INSERT/UPDATE/DELETE/MERGE against a read-only delta_scan view error in
+# Statements that would WRITE to a table — rejected by a read-only conn.sql().
+# INSERT/UPDATE/DELETE/MERGE against a read-only delta_scan view error in
 # DuckDB anyway; CREATE [OR REPLACE] TABLE … is the dangerous one — it silently makes an ephemeral
 # DuckDB-local table that never reaches Delta — so it must be caught BEFORE executing. CREATE
 # TEMP/TEMPORARY TABLE and CREATE VIEW are DuckDB-local scratch by design and pass through.
@@ -233,8 +234,7 @@ def _delta_write_message(query: str) -> str:
     """The error for a raw-SQL write conn.sql() can't route to delta_rs. For an INSERT/UPDATE/DELETE
     whose target isn't a discovered Delta table — the common cause being a typo or a table written
     out-of-band before refresh() — name the table and give form-appropriate guidance, instead of the
-    generic 'use the DataFrame write API' redirect (which misdirects: for UPDATE/DELETE the problem is the
-    missing table, not the API)."""
+    generic redirect (which misdirects: for UPDATE/DELETE the problem is the missing table)."""
     s = _strip_leading(query)
     m = _DML_TARGET_RE.match(s)
     if m:
@@ -248,13 +248,12 @@ def _delta_write_message(query: str) -> str:
             )
         return (  # insert into a table that doesn't exist yet
             f"conn.sql(): no Delta table '{rel}' to insert into. Create it first with "
-            f"df.write.saveAsTable('{rel}'), then insert."
+            f"CREATE TABLE {rel} AS SELECT …, then insert."
         )
     return (  # a CREATE … AS that didn't resolve, or any other unrouted Delta write
-        "conn.sql() can't write a Delta table from raw SQL here. "
-        "Use the DataFrame write API: df.write.saveAsTable(...) to create/append, "
-        "df.write.option('replaceWhere', …) to overwrite a slice, or "
-        "DeltaTable.forName(conn, name).merge(...)/.delete()/.update()."
+        "conn.sql() can't write a Delta table from this SQL. Use CREATE TABLE … AS SELECT to create "
+        "or overwrite, INSERT / UPDATE / DELETE / MERGE against a discovered table, "
+        "INSERT INTO t REPLACE WHERE <pred> … to overwrite a slice, or VACUUM t to compact."
     )
 
 
@@ -390,7 +389,6 @@ class DuckSession:
         self._catalogs: Dict[str, _CatEntry] = {}
         self._current_catalog: Optional[str] = None
         self._current_database: Optional[str] = None
-        self.catalog = Catalog(self)
 
         root, schema_filter = _split_root_schema(path, schema)
         # Catalog is first-class, so single- and multi-catalog sessions share one code path
@@ -629,14 +627,41 @@ class DuckSession:
 
     def _require_writable(self, op: str, catalog: Optional[str] = None):
         """Raise unless the target catalog (default: the current one) is writable. Guards every
-        Delta-write entry point (the DataFrame write API, the DeltaTable mutators, and raw write-DML
-        in sql()). ``read_only`` is per-catalog, so a read-only attached store fails loud here even
-        when the session/primary is writable."""
+        Delta-write entry point (raw write-DML in sql()). ``read_only`` is per-catalog, so a read-only
+        attached store fails loud here even when the session/primary is writable."""
         cat = catalog if catalog is not None else self._current_catalog
         if self._catalogs[cat].read_only:
             raise PermissionError(_READ_ONLY_MSG.format(op=op, catalog=cat))
 
-    # ---- DataFrame-style surface --------------------------------------------------------------
+    # ---- catalog introspection (internal; SQL users use SHOW TABLES / information_schema) -------
+
+    _SKIP_SCHEMAS = {"information_schema", "pg_catalog", "main"}
+
+    def _cat_databases(self) -> List[str]:
+        """Schemas in the current catalog (the discovered Delta schema folders), minus DuckDB internals."""
+        rows = self.con.execute(
+            "SELECT schema_name FROM information_schema.schemata "
+            "WHERE catalog_name = ? ORDER BY schema_name", [self._current_catalog]).fetchall()
+        return [r[0] for r in rows if r[0] not in self._SKIP_SCHEMAS]
+
+    def _cat_tables(self, dbName: Optional[str] = None) -> List[str]:
+        """Tables (registered delta_scan views) in ``dbName`` (default: the current database)."""
+        schema = dbName or self._current_database
+        rows = self.con.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_catalog = ? AND table_schema = ? ORDER BY table_name",
+            [self._current_catalog, schema]).fetchall()
+        return [r[0] for r in rows]
+
+    def _cat_table_exists(self, tableName: str) -> bool:
+        """True iff ``tableName`` is a LIVE Delta table (read from the store; a drop-tombstone is False)."""
+        catalog, schema, table = self._resolve(tableName)
+        return self._live_table_exists(self._table_path(schema, table, catalog),
+                                       self._catalog_storage_options(catalog))
+
+    def _cat_database_exists(self, dbName: str) -> bool:
+        self.refresh(quiet=True)  # re-discover schema folders first
+        return dbName in self._cat_databases()
 
     def sql(self, query: str) -> duckdb.DuckDBPyRelation:
         """Run a query and return DuckDB's native ``DuckDBPyRelation`` — unwrapped, with all of its
@@ -734,7 +759,7 @@ class DuckSession:
             return None
         name = m.group("rel")
         try:
-            if self.catalog.tableExists(name):
+            if self._cat_table_exists(name):
                 return name
         except Exception:
             pass
@@ -758,24 +783,12 @@ class DuckSession:
         gone. One oracle, no per-surface duplication."""
         return engine.table_exists(path, so) and not delta_dml.is_dropped(self.con, path, so)
 
-    def table(self, name: str) -> "DataFrame":
-        catalog, schema, table = self._resolve(name)
-        # source_table + pristine: this frame IS the Delta table unchanged, so .optimize() can rewrite
-        # it and the writer can catch a self-overwrite. .sort() keeps source_table but clears pristine.
-        return DataFrame(
-            self.con.sql(f"SELECT * FROM {_qid(catalog)}.{_qid(schema)}.{_qid(table)}"), self,
-            source_table=name, pristine=True)
-
-    def createDataFrame(self, data, schema=None) -> "DataFrame":
-        """Create a :class:`DataFrame` from in-memory data — the ``createDataFrame`` API.
-
-        ``data`` is a list of tuples/lists (a list of scalars is treated as a single column), a
-        pandas ``DataFrame``, or a pyarrow ``Table`` / ``RecordBatchReader``. ``schema`` is
-        ``None`` (names inferred — ``_1, _2, …`` for tuples, the frame's own names otherwise), a
-        list of column names, or a DDL string (``"id int, name string"``; ``:`` between name and
-        type is also accepted). The data is materialised as a relation on duckrun's own DuckDB
-        connection — write it to Delta with ``df.write.saveAsTable(...)``.
-        """
+    def _relation_from(self, data, schema=None) -> "duckdb.DuckDBPyRelation":
+        """Materialise in-memory ``data`` as a native DuckDB relation on the session connection.
+        ``data`` is a list of tuples/lists (a list of scalars → a single column), a pandas
+        ``DataFrame``, or a pyarrow ``Table`` / ``RecordBatchReader``; ``schema`` is ``None``, a list
+        of column names, or a DDL string. Internal helper behind ``_get_rle`` (users register objects
+        with :meth:`register`)."""
         names, types = _parse_schema(schema)
 
         pdf = _as_pandas(data)
@@ -789,11 +802,9 @@ class DuckSession:
                 rows = [(v,) for v in rows]  # list of scalars → a single column
             if not rows:
                 if not types:
-                    raise ValueError(
-                        "cannot infer schema from an empty dataset — pass a DDL schema, e.g. "
-                        "createDataFrame([], 'id int, name string')")
+                    raise ValueError("cannot infer schema from an empty dataset — pass a DDL schema")
                 cols = ", ".join(f'CAST(NULL AS {t}) AS "{n}"' for n, t in zip(names, types))
-                return DataFrame(self.con.sql(f"SELECT {cols} WHERE 1=0"), self)
+                return self.con.sql(f"SELECT {cols} WHERE 1=0")
             ncols = len(rows[0])
             if any(len(r) != ncols for r in rows):
                 raise ValueError("all rows must have the same number of columns")
@@ -807,7 +818,7 @@ class DuckSession:
             rel = _project_rename(rel, names)
         if types is not None:
             rel = _project_cast(rel, types)
-        return DataFrame(rel, self)
+        return rel
 
     # ---- file transfer (OneLake Files / any store) -----------------------------------------
 
@@ -912,7 +923,7 @@ class DuckSession:
         session op: the table doesn't exist yet, there's nothing to fence. ``identifier`` is the
         delta-spark form ``"parquet.`<path>`"`` (a bare ``<path>`` is also accepted); ``partition_schema``
         is a pyarrow ``Schema`` of the Hive-partition columns for a partitioned dir, or ``None``. Returns
-        the converted path; ``conn.refresh()`` (or ``conn.catalog.refreshTable(name)``) then surfaces it
+        the converted path; ``conn.refresh()`` then surfaces it
         as a discoverable table when it sits under a catalog root. Storage-neutral (local / s3 / gs / az /
         OneLake) — uses the session's already-minted credentials."""
         from .delta_table import _parse_parquet_identifier
@@ -921,10 +932,10 @@ class DuckSession:
         engine.convert_to_delta(path, self.storage_options, partition_by=partition_schema)
         return path
 
-    def get_stats(self, source: Optional[str] = None, detailed: bool = False) -> "DataFrame":
+    def get_stats(self, source: Optional[str] = None, detailed: bool = False) -> "duckdb.DuckDBPyRelation":
         """Delta table statistics — the "why is my table slow / full of small files" view. Returns a
-        :class:`DataFrame`, one row per table (``detailed=False``) or one row per parquet **row group**
-        (``detailed=True``, the raw ``parquet_metadata`` columns).
+        native DuckDB relation, one row per table (``detailed=False``) or one row per parquet **row
+        group** (``detailed=True``, the raw ``parquet_metadata`` columns).
 
         ``source``: ``None`` → every table in the current schema; a table name (1/2/3-part) → that
         table; a schema name → every table in it; a wildcard pattern (``fct_*``, ``mart.fct_*``) →
@@ -965,7 +976,7 @@ class DuckSession:
                     f"FROM parquet_file_metadata({lit}) fm")
         if not parts:
             raise ValueError(f"get_stats: no files to describe for source={source!r}.")
-        return DataFrame(self.con.sql(" UNION ALL ".join(parts)), self)
+        return self.con.sql(" UNION ALL ".join(parts))
 
 
     def _resolve_stats_targets(self, source: Optional[str]) -> List[tuple]:
@@ -975,13 +986,13 @@ class DuckSession:
         table in the current catalog."""
         if source is None:
             db = self._current_database
-            return [(self._current_catalog, db, t) for t in self.catalog.listTables(db)]
+            return [(self._current_catalog, db, t) for t in self._cat_tables(db)]
         if any(ch in source for ch in "*?["):
             return self._glob_stats_targets(source)
-        if self.catalog.tableExists(source):
+        if self._cat_table_exists(source):
             return [self._resolve(source)]
-        if "." not in source and self.catalog.databaseExists(source):
-            return [(self._current_catalog, source, t) for t in self.catalog.listTables(source)]
+        if "." not in source and self._cat_database_exists(source):
+            return [(self._current_catalog, source, t) for t in self._cat_tables(source)]
         raise ValueError(
             f"get_stats: '{source}' is neither a known table nor a schema in catalog "
             f"'{self._current_catalog}'.")
@@ -1008,10 +1019,10 @@ class DuckSession:
             return []
         sp, tp = schema_pat.lower(), table_pat.lower()
         out = []
-        for sch in self.catalog.listDatabases():
+        for sch in self._cat_databases():
             if not fnmatch.fnmatchcase(sch.lower(), sp):
                 continue
-            for tbl in self.catalog.listTables(sch):
+            for tbl in self._cat_tables(sch):
                 if fnmatch.fnmatchcase(tbl.lower(), tp):
                     out.append((cat, sch, tbl))
         return out
@@ -1019,7 +1030,7 @@ class DuckSession:
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
                  key_sort_below_pct: float = 10.0, null_excl: float = 0.5,
                  fd_band: float = 0.12, grain_frac: float = 0.5,
-                 seed: Optional[int] = None) -> "DataFrame":
+                 seed: Optional[int] = None) -> "duckdb.DuckDBPyRelation":
         """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a short Delta **sort
         key** that minimises a table's estimated **in-memory columnar** footprint, and
         return a per-column :class:`DataFrame`. Recommendation-only — it never rewrites the table.
@@ -1065,8 +1076,8 @@ class DuckSession:
         a schema name / ``None`` raises."""
         if not isinstance(table, str) or not table.strip():
             raise ValueError("_get_rle is single-table; pass one table name.")
-        if not self.catalog.tableExists(table):
-            if "." not in table and self.catalog.databaseExists(table):
+        if not self._cat_table_exists(table):
+            if "." not in table and self._cat_database_exists(table):
                 raise ValueError(f"_get_rle is single-table; '{table}' is a schema — pass one table.")
             raise ValueError(f"_get_rle: table '{table}' not found.")
         cat, sch, tbl = self._resolve(table)
@@ -1129,7 +1140,7 @@ class DuckSession:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
         for line in lines:   # the module is pure; the caller prints the advisory
             print(line)
-        return self.createDataFrame(rows, schema)
+        return self._relation_from(rows, schema)
 
     def _auto_sort_cols(self, relation, seed: Optional[int] = None) -> List[str]:
         """Run the sort-key recommender over an arbitrary relation (no Delta table behind it, so no
@@ -1171,7 +1182,7 @@ class DuckSession:
         byte budget) rather than a schema-only estimate — the same profiler the sort rewrite uses.
         Returns the recommended ORDER BY columns, or ``[]`` if nothing pays off."""
         prof = self._get_rle(source_table, seed=seed)
-        recs = [dict(zip(prof.columns, row)) for row in prof.collect()]
+        recs = [dict(zip(prof.columns, row)) for row in prof.fetchall()]
         return [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
                                             key=lambda x: x["sort_position"])]
 
@@ -1198,20 +1209,10 @@ class DuckSession:
             return remote.file_exists(path, self.storage_options)
         return bool(self.con.execute(f"SELECT 1 FROM glob('{_qlit(path)}') LIMIT 1").fetchall())
 
-    @property
-    def read(self) -> "DataFrameReader":
-        return DataFrameReader(self)
-
     def close(self):
         """Close the underlying DuckDB connection. The session is unusable afterwards — registered
         views and the minted secret go with the connection."""
         self.con.close()
-
-    # Transition alias for the pre-SQL-only name; hidden from the advertised surface (see
-    # public_api.EXCLUDE) and removed with the rest of the DataFrame veneer.
-    def stop(self):
-        """Deprecated alias for :meth:`close`."""
-        self.close()
 
     def __enter__(self) -> "DuckSession":
         return self
@@ -1225,751 +1226,6 @@ class DuckSession:
     def _connection(self):
         """The underlying DuckDB connection (internal escape hatch)."""
         return self.con
-
-
-class StructField:
-    """One column of a :class:`StructType`. Mirrors Spark's ``StructField`` surface (``name``,
-    ``dataType``, ``nullable``); ``dataType`` is the **DuckDB** type as a string — duckrun is
-    DuckDB-native and doesn't remap to Spark type objects (same stance as ``df.dtypes``)."""
-
-    def __init__(self, name: str, dataType: str, nullable: bool = True):
-        self.name = name
-        self.dataType = dataType
-        self.nullable = nullable
-
-    def simpleString(self) -> str:
-        return f"{self.name}:{self.dataType}"
-
-    def __repr__(self) -> str:
-        return f"StructField('{self.name}', '{self.dataType}', {self.nullable})"
-
-
-class StructType:
-    """A :class:`DataFrame`'s schema — a list of :class:`StructField`, built from the DuckDB
-    relation's columns and types. Mirrors Spark's ``StructType`` surface (``fields``, ``names``,
-    iteration, ``simpleString()``)."""
-
-    def __init__(self, fields: List[StructField]):
-        self.fields = list(fields)
-
-    @property
-    def names(self) -> List[str]:
-        return [f.name for f in self.fields]
-
-    def __iter__(self):
-        return iter(self.fields)
-
-    def __len__(self) -> int:
-        return len(self.fields)
-
-    def simpleString(self) -> str:
-        return f"struct<{','.join(f.simpleString() for f in self.fields)}>"
-
-    def treeString(self) -> str:
-        lines = ["root"]
-        for f in self.fields:
-            lines.append(f" |-- {f.name}: {f.dataType} (nullable = {str(f.nullable).lower()})")
-        return "\n".join(lines) + "\n"
-
-    def __repr__(self) -> str:
-        return f"StructType([{', '.join(repr(f) for f in self.fields)}])"
-
-
-class DataFrame:
-    """Wraps a DuckDB relation; exposes a DataFrame-style ``.write`` plus a few DataFrame aliases.
-
-    Anything not defined here falls through to the underlying DuckDB relation, so ``.df()``,
-    ``.arrow()``, ``.fetchall()``, ``.fetchnumpy()`` etc. all keep working.
-    """
-
-    def __init__(self, relation, session: DuckSession, source_table: Optional[str] = None,
-                 pristine: bool = False):
-        self.relation = relation
-        self.session = session
-        # Lineage back to a catalog table, in two fields:
-        #  _source_table: the Delta table this frame reads from — set by conn.table(name) and PRESERVED
-        #    through a projection like .sort() (a sorted frame still reads table X). None for a
-        #    createDataFrame / reader / conn.sql() frame with no single source. The self-overwrite guard
-        #    and the no-arg sort() profiler key off this.
-        #  _pristine: True only while the relation IS the table unchanged (straight conn.table(name));
-        #    .sort() clears it (the rows are reordered/projected). .optimize() requires BOTH — a rewrite
-        #    key is chosen by profiling the table, not implied by a frame's current order.
-        self._source_table = source_table
-        self._pristine = pristine and source_table is not None
-
-    @property
-    def write(self) -> "DataFrameWriter":
-        return DataFrameWriter(self)
-
-    def optimize(self, *keys: str, rewrite: bool = False, where: Optional[str] = None,
-                 analyze: bool = False, seed: Optional[int] = None):
-        """Maintain this table. Only available on ``conn.table(name)`` — a derived/query DataFrame has
-        no Delta table to touch.
-
-        **The safe button** — ``optimize()`` (no arguments) compacts small files and vacuums; it
-        **never rewrites data**. It applies a byte trigger (bin-pack only partitions carrying real
-        small-file debt), commits ``dataChange=false``, and is idempotent — a clean table is a
-        ``noop``. Safe to run on a schedule and safe under concurrent writers.
-
-        **The deliberate rewrite** — pass a key, ``rewrite=True``, or ``where`` to sort-rewrite the
-        table physically ordered for compression / read pruning (returns the REAL measured on-disk
-        ``sizeBytesBefore`` / ``sizeBytesAfter`` / ``savedPct``). This is a full rewrite that commits
-        ``dataChange=true``, so run it occasionally, not on every load:
-
-        - ``optimize(rewrite=True)`` — full rewrite; the sort key is auto-picked by profiling.
-        - ``optimize("region", "status")`` — full rewrite sorted by exactly those columns.
-        - ``optimize("region", where="year = 2026")`` — rewrite ONLY the partitions matching the
-          predicate (a CAST-free delta_rs SQL expression), as one atomic snapshot-fenced commit.
-
-        **Advisory** — ``optimize(analyze=True)`` returns the sort-key recommendation as a DataFrame
-        (the profiler promoted to public) and prints the small-file debt, and commits nothing.
-
-        ``seed`` makes the profiling sample reproducible (the auto-key paths — ``analyze=True`` and
-        the auto-picked ``rewrite=True``); two runs with the same seed pick the same key.
-
-        Partition columns always lead the physical order and are preserved."""
-        if self._source_table is None:
-            raise ValueError(
-                "optimize() is only available on conn.table(name); a derived/query DataFrame has no "
-                "Delta table to optimize.")
-        if not self._pristine:
-            raise ValueError(
-                f"optimize() on a sorted frame is refused — sorting a frame does not choose the "
-                f"rewrite key. Use conn.table('{self._source_table}').optimize('<col>', ...) to "
-                f"rewrite in place, or write the sorted frame to a new table.")
-        from .delta_table import DeltaTable
-        dt = DeltaTable.forName(self.session, self._source_table)
-        if analyze:
-            if keys or where or rewrite:
-                raise ValueError(
-                    "optimize(analyze=True) is advisory-only and commits nothing — drop the "
-                    "keys / rewrite / where.")
-            return dt._analyze(seed=seed)
-        if keys or where or rewrite:
-            return dt._sort_rewrite(keys=list(keys) or None, where=where, seed=seed)
-        return dt._maintain()
-
-    # ---- Table DML / maintenance on conn.table(name) --------------------------------------------
-    # conn.table(name) gains the same verbs as DeltaTable.forName(conn, name): the handle is the
-    # backing Delta table, so each op resolves + snapshot-fences through the one DeltaTable
-    # construction. Only a conn.table(name) frame has a backing table (a derived/query frame does not).
-    def _table_handle(self):
-        if self._source_table is None:
-            raise ValueError(
-                "this is a table operation — call it on conn.table(name); a derived/query DataFrame "
-                "has no Delta table to mutate.")
-        from .delta_table import DeltaTable
-        return DeltaTable.forName(self.session, self._source_table)
-
-    def merge(self, source, condition: str, streamed_exec: bool = False):
-        """Upsert ``source`` into this table on ``condition``, returning the snapshot-pinned merge
-        builder — ``conn.table(name).merge(...)`` mirrors ``DeltaTable.forName(conn, name).merge(...)``."""
-        return self._table_handle().merge(source, condition, streamed_exec=streamed_exec)
-
-    def delete(self, predicate: Optional[str] = None) -> None:
-        """Delete rows matching ``predicate`` (or all rows when None) — like ``DeltaTable.delete``."""
-        self._table_handle().delete(predicate)
-
-    def update(self, condition: Optional[str] = None, set: Optional[Dict[str, str]] = None) -> None:
-        """Set ``{column: expression}`` for rows matching ``condition`` — like ``DeltaTable.update``."""
-        self._table_handle().update(condition=condition, set=set)
-
-    def vacuum(self, retention_hours: Optional[int] = None, dry_run: bool = False,
-               enforce_retention_duration: bool = True) -> List[str]:
-        """Delete unreferenced files older than the retention window — like ``DeltaTable.vacuum``."""
-        return self._table_handle().vacuum(retention_hours=retention_hours, dry_run=dry_run,
-                                           enforce_retention_duration=enforce_retention_duration)
-
-    def history(self, limit: Optional[int] = None) -> List[Dict]:
-        """Delta commit history, newest first — like ``DeltaTable.history``."""
-        return self._table_handle().history(limit)
-
-    def version(self) -> int:
-        """The current Delta version of this table — like ``DeltaTable.version``."""
-        return self._table_handle().version()
-
-    def restoreToVersion(self, version: int) -> None:
-        """Restore this table to an earlier Delta ``version`` — like ``DeltaTable.restoreToVersion``."""
-        self._table_handle().restoreToVersion(version)
-
-    # DataFrame aliases over the DuckDB relation.
-    def show(self, *a, **k):
-        return self.relation.show(*a, **k)
-
-    def toPandas(self):
-        return self.relation.df()
-
-    def toArrow(self):
-        """Spark's ``DataFrame.toArrow()`` by name — but **streaming, not materialized**. Spark
-        returns a fully-collected ``pyarrow.Table``; duckrun returns a lazy
-        ``pyarrow.RecordBatchReader`` (DuckDB's ``to_arrow_reader()``), so large results are pulled
-        one batch at a time instead of loaded whole into memory."""
-        return self.relation.to_arrow_reader()
-
-    def collect(self):
-        return self.relation.fetchall()
-
-    def count(self) -> int:
-        return self.relation.aggregate("count(*)").fetchone()[0]
-
-    def first(self):
-        """First row as a tuple, or ``None`` if empty (Spark's ``DataFrame.first()``)."""
-        return self.relation.limit(1).fetchone()
-
-    def head(self, n=None):
-        """``head()`` → the first row (or ``None``); ``head(n)`` → a list of the first ``n`` rows
-        (Spark's ``DataFrame.head([n])``)."""
-        if n is None:
-            return self.relation.limit(1).fetchone()
-        return self.relation.limit(n).fetchall()
-
-    def take(self, n: int):
-        """The first ``n`` rows as a list (Spark's ``DataFrame.take(n)``)."""
-        return self.relation.limit(n).fetchall()
-
-    def isEmpty(self) -> bool:
-        """``True`` if the DataFrame has no rows (Spark's ``DataFrame.isEmpty()``)."""
-        return self.relation.limit(1).fetchone() is None
-
-    def sort(self, *cols, ascending=None, seed: Optional[int] = None) -> "DataFrame":
-        """A new DataFrame globally sorted by ``cols`` (Spark's ``DataFrame.sort``; ``orderBy`` is its
-        alias). ``cols`` are column names (or a single list of them); ``ascending`` is a bool or a
-        list of bools matching ``cols`` (default all ascending). This is a native DuckDB ``ORDER BY``,
-        so writing the result lands physically sorted Delta files — nothing sort-specific in the write
-        path. Without this, ``df.sort(...)`` fell through to the bare DuckDB relation and lost ``.write``.
-
-        The no-arg ``df.sort()`` auto-picks a run-length-friendly key by profiling; ``seed`` makes
-        that profiling sample reproducible."""
-        if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
-            cols = tuple(cols[0])
-        if not cols:
-            # No-arg auto-key: profile the SOURCE TABLE via its Delta log (real row width, exact when
-            # the table fits the byte budget) when this frame carries one; otherwise a schema-only
-            # estimate over the bare relation. Needs source_table only — a sorted frame still profiles
-            # its table.
-            names = (self.session._auto_sort_cols_from_table(self._source_table, seed=seed)
-                     if self._source_table is not None
-                     else self.session._auto_sort_cols(self.relation, seed=seed))
-            if not names:
-                return self  # profiler found no key worth sorting by — leave order untouched
-            dirs = ["ASC"] * len(names)
-        else:
-            names = [str(c) for c in cols]
-            if ascending is None:
-                dirs = ["ASC"] * len(names)
-            elif isinstance(ascending, (list, tuple)):
-                if len(ascending) != len(names):
-                    raise ValueError("ascending list length must match the number of sort columns.")
-                dirs = ["ASC" if a else "DESC" for a in ascending]
-            else:
-                dirs = ["ASC" if ascending else "DESC"] * len(names)
-        order_expr = ", ".join(f"{_qid(n)} {d}" for n, d in zip(names, dirs))
-        # Keep the lineage (source_table) so a self-overwrite is caught, but drop pristine — the rows
-        # are reordered now, so .optimize() must refuse (it profiles the table, not this order).
-        return DataFrame(self.relation.order(order_expr), self.session,
-                         source_table=self._source_table, pristine=False)
-
-    orderBy = sort  # Spark: orderBy is an alias of sort
-
-    @property
-    def schema(self) -> StructType:
-        """The schema as a :class:`StructType` of :class:`StructField` (Spark's ``DataFrame.schema``).
-        Types are the DuckDB types (as in ``df.dtypes``); the relation doesn't carry nullability, so
-        every field reports ``nullable=True`` — Spark's own default for an inferred schema."""
-        rel = self.relation
-        return StructType([StructField(n, str(t)) for n, t in zip(rel.columns, rel.types)])
-
-    def printSchema(self) -> None:
-        """Print the schema as a tree (Spark's ``DataFrame.printSchema``)."""
-        print(self.schema.treeString(), end="")
-
-    def createOrReplaceTempView(self, name: str) -> "DataFrame":
-        """Register this DataFrame as a session-scoped view named ``name``, so it can be queried by
-        name via ``conn.sql("select * from name")`` (the ``createOrReplaceTempView`` API).
-
-        This is the path-read counterpart to ``saveAsTable``: ``conn.read.format("delta").load(path)`` returns a
-        DataFrame but registers nothing, so this is how a by-path read becomes queryable by name. The
-        view is **native DuckDB and ephemeral** — it is not a Delta table, is not written to storage,
-        and does not appear in ``conn.catalog``; use ``saveAsTable`` to persist as Delta. Returns
-        ``self`` so it chains."""
-        self.relation.create_view(name, replace=True)
-        return self
-
-    def __getattr__(self, name):
-        # Only reached for attributes not found on DataFrame itself.
-        return getattr(self.relation, name)
-
-
-class DataFrameReader:
-    """``DataFrameReader``: read a path/table into a :class:`DataFrame` without it having to
-    be a pre-registered view. Storage-neutral via the session's already-minted secret."""
-
-    def __init__(self, session: DuckSession):
-        self.session = session
-        self._format = "delta"
-        self._options: Dict[str, str] = {}
-        self._schema = None
-
-    def format(self, fmt: str) -> "DataFrameReader":
-        self._format = fmt.lower()
-        return self
-
-    def option(self, key: str, value) -> "DataFrameReader":
-        self._options[key] = value
-        return self
-
-    def schema(self, schema) -> "DataFrameReader":
-        """Supply an explicit read schema (Spark's ``read.schema``) — a DDL string
-        (``"id int, name string"``) or a :class:`StructType`. Applies to ``csv`` / ``json``, where
-        it both **names and types** the columns and turns off type sniffing (and skips the header
-        row), matching Spark's override. ``delta`` / ``parquet`` carry their own schema, so setting
-        one for them is rejected rather than silently ignored."""
-        self._schema = schema
-        return self
-
-    def _columns_arg(self) -> str:
-        """Render the stored schema as a DuckDB ``columns={'n': 'TYPE', …}`` argument. A StructType
-        maps field→type directly; a DDL string is parsed robustly by letting DuckDB build a throwaway
-        temp table and reading back its column names and types (handles ``DECIMAL(10,2)``, nested
-        types, etc. that naive comma-splitting would break)."""
-        s = self._schema
-        if isinstance(s, StructType):
-            pairs = [(f.name, f.dataType) for f in s.fields]
-        elif isinstance(s, str):
-            con = self.session.con
-            tmp = "__duckrun_schema_probe"
-            con.execute(f'create or replace temp table "{tmp}" ({s})')
-            try:
-                rel = con.sql(f'select * from "{tmp}" limit 0')
-                pairs = list(zip(rel.columns, [str(t) for t in rel.types]))
-            finally:
-                con.execute(f'drop table if exists "{tmp}"')
-        else:
-            raise ValueError("read.schema(...) must be a DDL string or a StructType.")
-        cols = ", ".join(f"'{_qlit(n)}': '{_qlit(t)}'" for n, t in pairs)
-        return f"columns={{{cols}}}"
-
-    def load(self, path: str) -> DataFrame:
-        fmt = self._format
-        if self._schema is not None and fmt in ("delta", "parquet"):
-            raise ValueError(
-                f"read.schema(...) applies to csv/json only; {fmt} carries its own schema."
-            )
-        if fmt == "delta":
-            # Time travel mirrors spark.read.option("versionAsOf", N): pin the read to that Delta
-            # version via duckdb-delta's `version =>` parameter. timestampAsOf has no delta_scan
-            # equivalent in this build, so reject it rather than silently ignoring it.
-            if "timestampAsOf" in self._options:
-                raise ValueError(
-                    "read.option('timestampAsOf', …) is not supported — duckdb-delta time-travels "
-                    "by version only. Use option('versionAsOf', N)."
-                )
-            version = self._options.get("versionAsOf")
-            if version is not None:
-                try:
-                    version = int(version)
-                except (TypeError, ValueError):
-                    raise ValueError(f"versionAsOf must be an integer Delta version, got {version!r}.")
-                scan = f"delta_scan('{_qlit(path)}', version => {version})"
-            else:
-                scan = f"delta_scan('{_qlit(path)}')"
-        elif fmt == "parquet":
-            scan = f"read_parquet('{_qlit(path)}')"
-        elif fmt == "json":
-            if self._schema is not None:
-                scan = f"read_json('{_qlit(path)}', {self._columns_arg()})"
-            else:
-                scan = f"read_json_auto('{_qlit(path)}')"
-        elif fmt == "csv":
-            opts = "".join(f", {k}={_csv_opt(v)}" for k, v in self._options.items())
-            if self._schema is not None:
-                scan = f"read_csv('{_qlit(path)}', {self._columns_arg()}{opts})"
-            else:
-                scan = f"read_csv_auto('{_qlit(path)}'{opts})"
-        else:
-            raise ValueError(f"Unsupported read format '{fmt}'. Use 'delta', 'parquet', 'json', or 'csv'.")
-        return DataFrame(self.session.con.sql(f"SELECT * FROM {scan}"), self.session)
-
-    def parquet(self, path: str) -> DataFrame:
-        return self.format("parquet").load(path)
-
-    def json(self, path: str) -> DataFrame:
-        return self.format("json").load(path)
-
-    def csv(self, path: str) -> DataFrame:
-        return self.format("csv").load(path)
-
-    def table(self, name: str) -> DataFrame:
-        return self.session.table(name)
-
-
-def _csv_opt(value) -> str:
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    if isinstance(value, (int, float)):
-        return str(value)
-    return "'" + _qlit(str(value)) + "'"
-
-
-class DataFrameWriter:
-    """``DataFrameWriter`` over delta-rs (the adapter's :func:`engine.write_delta`).
-
-    ``append_if_unchanged`` / ``overwrite_if_unchanged`` are the fenced (compare-and-swap) siblings of
-    the unfenced ``append`` / ``overwrite`` modes: they commit only if the table version has not moved
-    since the call, else raise ``CommitFailedError``."""
-
-    _MODES = {"overwrite", "append", "append_if_unchanged", "overwrite_if_unchanged",
-              "ignore", "error", "errorifexists"}
-
-    def __init__(self, df: DataFrame):
-        self._df = df
-        self._format = "delta"
-        self._mode = "error"  # the default SaveMode
-        self._merge_schema = False
-        self._overwrite_schema = False
-        self._partition_by: Optional[List[str]] = None
-        self._replace_where: Optional[str] = None
-
-    def format(self, fmt: str) -> "DataFrameWriter":
-        if fmt.lower() != "delta":
-            raise ValueError(f"Only 'delta' is supported, got '{fmt}'.")
-        self._format = "delta"
-        return self
-
-    def mode(self, mode: str) -> "DataFrameWriter":
-        m = mode.lower()
-        if m == "safeappend":
-            raise ValueError("mode 'safeappend' was renamed — use mode('append_if_unchanged')")
-        if m not in self._MODES:
-            raise ValueError(f"mode must be one of {sorted(self._MODES)}, got '{mode}'.")
-        self._mode = m
-        return self
-
-    def option(self, key: str, value) -> "DataFrameWriter":
-        if key == "replaceWhere":
-            # Atomically replace the rows matching this predicate with the written data, in a single
-            # Delta commit (the delta-spark replaceWhere / INSERT OVERWRITE form). Requires
-            # mode('overwrite'); snapshot-fenced at write time so a concurrent writer fails loudly.
-            self._replace_where = str(value)
-            return self
-        truthy = str(value).lower() in ("true", "1")
-        if key == "mergeSchema":
-            self._merge_schema = truthy
-        elif key == "overwriteSchema":
-            self._overwrite_schema = truthy
-        else:
-            raise ValueError(
-                "Unsupported write option '{}'. Supported: 'mergeSchema', 'overwriteSchema', "
-                "'replaceWhere'.".format(key)
-            )
-        return self
-
-    def partitionBy(self, *cols) -> "DataFrameWriter":
-        if len(cols) == 1 and isinstance(cols[0], (list, tuple)):
-            cols = tuple(cols[0])
-        self._partition_by = list(cols)
-        return self
-
-    def _write(self, path: str, descr: str, so=None, catalog=None, target=None) -> None:
-        """Apply the configured mode to the Delta table at ``path`` (storage-neutral). ``descr``
-        names the target in the mode='error' message. ``so`` / ``catalog`` are the target catalog's
-        storage_options / name (default to the current catalog's). ``target`` is the resolved
-        ``(catalog, schema, table)`` for saveAsTable — used to refuse a self-overwrite; save(path)
-        has no catalog name and passes None. Shared by saveAsTable and save."""
-        session = self._df.session
-        session._require_writable("write a Delta table", catalog)
-        # Self-overwrite guard: a full overwrite of a table with a frame READ FROM that same table
-        # (compare resolved names, not strings) is an unfenced read-modify-write — the classic
-        # conn.table("t").sort(...).write.mode("overwrite").saveAsTable("t"). Only overwrite modes
-        # clobber the whole table; append / *_if_unchanged / replaceWhere don't. optimize() is the
-        # fenced, measured way to rewrite in place.
-        if (target is not None and self._df._source_table is not None
-                and self._replace_where is None
-                and self._mode in ("overwrite", "overwrite_if_unchanged")
-                and session._resolve(self._df._source_table) == target):
-            raise ValueError(
-                "overwriting a table with a sort/projection of itself is an unfenced rewrite — use "
-                f"conn.table('{self._df._source_table}').optimize(...) which is snapshot-fenced and "
-                "measured.")
-        if so is None:
-            so = session.storage_options
-
-        if self._replace_where is not None:
-            # df.write.option("replaceWhere", pred).mode("overwrite").save()/saveAsTable() — a single
-            # Delta commit that swaps only the matching partition/rows. Snapshot-fenced: pin the
-            # version now and CAS the commit, so a concurrent writer fails loudly.
-            if self._mode != "overwrite":
-                raise ValueError(
-                    "option('replaceWhere', …) requires mode('overwrite'), got mode('%s')." % self._mode
-                )
-            engine.replace_where(
-                path,
-                self._df.relation,
-                self._replace_where,
-                read_version=engine.table_version(path, so),
-                partition_by=self._partition_by,
-                storage_options=so,
-                cur=session.con,
-            )
-            return
-
-        mode = self._mode
-        replacing_tombstone = False
-        if mode in ("error", "errorifexists", "ignore"):
-            # A drop-tombstone (a `drop table` marker, data not yet purged) is ABSENT on every surface —
-            # `create table` / mode('error') recreate it, mode('ignore') writes it. Only a LIVE table
-            # blocks error / no-ops ignore. One oracle (_live_table_exists) so all surfaces agree.
-            # Recreating over a tombstone forces overwrite_schema (its marker column differs).
-            live = session._live_table_exists(path, so)
-            if live:
-                if mode == "ignore":
-                    return  # a live table → ignore is a no-op
-                raise ValueError(
-                    f"{descr} already exists (mode='error'). "
-                    f"Use mode('overwrite'), mode('append'), mode('append_if_unchanged'), or mode('ignore')."
-                )
-            replacing_tombstone = engine.table_exists(path, so)  # exists but not live → a tombstone
-            mode = "overwrite"
-
-        if mode == "append_if_unchanged":
-            # Optimistic append (the dbt append_if_unchanged strategy): pin to the version
-            # now and CAS the commit, so a writer that lands between this read and the commit fails
-            # the append (fail loud) instead of duplicating. On a missing table there is nothing to
-            # fence against, so create it via a plain append (matches dbt's first-run create).
-            if engine.table_exists(path, so):
-                engine.append_if_unchanged(
-                    path,
-                    self._df.relation,
-                    read_version=engine.table_version(path, so),
-                    partition_by=self._partition_by,
-                    merge_schema=self._merge_schema,
-                    storage_options=so,
-                    cur=session.con,
-                )
-            else:
-                engine.write_delta(
-                    path,
-                    self._df.relation,
-                    mode="append",
-                    partition_by=self._partition_by,
-                    merge_schema=self._merge_schema,
-                    storage_options=so,
-                    cur=session.con,
-                )
-        elif mode == "overwrite_if_unchanged":
-            # Optimistic FULL overwrite (the overwrite sibling of append_if_unchanged): pin + CAS so
-            # a concurrent write fails the overwrite instead of being clobbered. A missing table has
-            # nothing to fence — create it via a plain overwrite.
-            if engine.table_exists(path, so):
-                engine.overwrite_if_unchanged(
-                    path,
-                    self._df.relation,
-                    read_version=engine.table_version(path, so),
-                    partition_by=self._partition_by,
-                    overwrite_schema=self._overwrite_schema,
-                    storage_options=so,
-                )
-            else:
-                engine.write_delta(
-                    path,
-                    self._df.relation,
-                    mode="overwrite",
-                    partition_by=self._partition_by,
-                    overwrite_schema=self._overwrite_schema,
-                    storage_options=so,
-                    cur=session.con,
-                )
-        else:
-            engine.write_delta(
-                path,
-                self._df.relation,
-                mode=mode,
-                partition_by=self._partition_by,
-                merge_schema=self._merge_schema,
-                overwrite_schema=self._overwrite_schema or replacing_tombstone,
-                storage_options=so,
-                cur=session.con,
-            )
-
-    def save(self, path: str) -> str:
-        """``df.write.save(path)`` — write to a Delta table by PATH, not catalog name.
-
-        Storage-neutral (local / s3:// / gs:// / az:// / abfss://). Unlike :meth:`saveAsTable`,
-        the result is addressed only by ``path`` — there is no schema.table name to register a
-        view for — so it is read back with ``conn.read.format("delta").load(path)`` / ``delta_scan('<path>')``,
-        not as an unqualified table. Returns ``path``."""
-        self._write(path, f"delta table at '{path}'")
-        return path
-
-    def saveAsTable(self, name: str) -> str:
-        session = self._df.session
-        catalog, schema, table = session._resolve(name)
-        path = session._table_path(schema, table, catalog)
-        self._write(path, f"table '{catalog}.{schema}.{table}'",
-                    session._catalog_storage_options(catalog), catalog,
-                    target=(catalog, schema, table))
-        # Surface the (new or grown) table immediately — no manual refresh() needed.
-        session.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(catalog)}.{_qid(schema)}")
-        session._register_view(catalog, schema, table)
-        # Re-apply USE: on a previously-empty warehouse the schema didn't exist at connect, so the
-        # USE silently no-op'd; now that it exists, unqualified names must resolve.
-        session._use(session._current_catalog, session._current_database)
-        return table
-
-
-# Spark's catalog.getTable / getDatabase return Table / Database objects; we mirror their fields with
-# a plain namedtuple rather than inventing classes. duckrun tables are always managed Delta tables
-# materialized under the catalog root, never temporary.
-Table = namedtuple("Table", ["name", "catalog", "database", "description", "tableType", "isTemporary"])
-Database = namedtuple("Database", ["name", "catalog", "description", "locationUri"])
-
-
-class Catalog:
-    """A small ``Catalog`` over the discovered schemas/views."""
-
-    def __init__(self, session: DuckSession):
-        self.session = session
-
-    _SKIP_SCHEMAS = {"information_schema", "pg_catalog", "main"}
-
-    def listDatabases(self) -> List[str]:
-        rows = self.session.con.execute(
-            "SELECT schema_name FROM information_schema.schemata "
-            "WHERE catalog_name = ? ORDER BY schema_name",
-            [self.session._current_catalog],
-        ).fetchall()
-        return [r[0] for r in rows if r[0] not in self._SKIP_SCHEMAS]
-
-    def listTables(self, dbName: Optional[str] = None) -> List[str]:
-        schema = dbName or self.session._current_database
-        rows = self.session.con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_catalog = ? AND table_schema = ? ORDER BY table_name",
-            [self.session._current_catalog, schema],
-        ).fetchall()
-        return [r[0] for r in rows]
-
-    def currentDatabase(self) -> str:
-        return self.session._current_database
-
-    def setCurrentDatabase(self, dbName: str):
-        self.session._current_database = dbName
-        self.session._use(self.session._current_catalog, dbName)
-
-    def tableExists(self, tableName: str, dbName: Optional[str] = None) -> bool:
-        # One existence oracle (_live_table_exists), read from the store, so a drop-tombstone reports
-        # False here exactly as it does to the writer and discovery — no surface disagreement.
-        catalog, schema, table = self.session._resolve(tableName)
-        if dbName is not None:
-            schema = dbName
-        path = self.session._table_path(schema, table, catalog)
-        return self.session._live_table_exists(path, self.session._catalog_storage_options(catalog))
-
-    def getTable(self, tableName: str, dbName: Optional[str] = None) -> Table:
-        """Return a :class:`Table` record for ``tableName`` (Spark's ``catalog.getTable``), or raise
-        ``ValueError`` if it doesn't exist — the peer of :meth:`tableExists` / :meth:`listTables`.
-        duckrun tables are always managed Delta tables, never temporary."""
-        catalog, schema, table = self.session._resolve(tableName)
-        if dbName is not None:
-            schema = dbName
-        if not self.tableExists(tableName, dbName):
-            raise ValueError(f"table '{tableName}' not found in '{catalog}.{schema}'.")
-        return Table(name=table, catalog=catalog, database=schema, description=None,
-                     tableType="MANAGED", isTemporary=False)
-
-    def createTable(self, tableName: str, schema) -> "DataFrame":
-        """Create an empty managed Delta table and return it as a :class:`DataFrame` (Spark's
-        ``catalog.createTable``). ``schema`` is a DDL string (``"id int, name string"``) or a
-        :class:`StructType` (e.g. from another frame's ``df.schema``). Routes through the same
-        Delta-backed ``CREATE TABLE`` the SQL path uses, so the table is queryable immediately.
-
-        Note: unlike Spark there's no ``path`` / ``source`` argument — duckrun tables are always
-        managed Delta under the catalog root; read foreign data by path with ``conn.read…load()``."""
-        if isinstance(schema, StructType):
-            ddl = ", ".join(f'"{f.name}" {f.dataType}' for f in schema.fields)
-        elif isinstance(schema, str):
-            ddl = schema
-        else:
-            raise ValueError("createTable: schema must be a DDL string or a StructType.")
-        self.session.sql(f"CREATE TABLE {tableName} ({ddl})")
-        return self.session.table(tableName)
-
-    def getDatabase(self, dbName: str) -> Database:
-        """Return a :class:`Database` record for ``dbName`` (Spark's ``catalog.getDatabase``), or
-        raise ``ValueError`` if it doesn't exist — the peer of :meth:`databaseExists` /
-        :meth:`listDatabases`. ``locationUri`` is the schema folder under the catalog root."""
-        catalog = self.session._current_catalog
-        if not self.databaseExists(dbName):
-            raise ValueError(f"database '{dbName}' not found in catalog '{catalog}'.")
-        location = f"{self.session._catalogs[catalog].root_path}/{dbName}"
-        return Database(name=dbName, catalog=catalog, description=None, locationUri=location)
-
-    def refreshTable(self, tableName: str) -> None:
-        """Rebuild the cached view for a single table from the current on-store Delta snapshot
-        (Spark's ``catalog.refreshTable``). The per-table peer of ``conn.refresh()``, which
-        rediscovers the whole store; use this after an out-of-band write to one table."""
-        catalog, schema, table = self.session._resolve(tableName)
-        self.session._register_view(catalog, schema, table)
-
-    def databaseExists(self, dbName: str) -> bool:
-        self.session.refresh(quiet=True)  # safe: re-discover schema folders first
-        return dbName in self.listDatabases()
-
-    def listColumns(self, tableName: str, dbName: Optional[str] = None) -> List[str]:
-        self.session.refresh(quiet=True)
-        catalog, schema, table = self.session._resolve(tableName)
-        if dbName is not None:
-            schema = dbName
-        rows = self.session.con.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_catalog = ? AND table_schema = ? AND table_name = ? ORDER BY ordinal_position",
-            [catalog, schema, table],
-        ).fetchall()
-        return [r[0] for r in rows]
-
-    def dropTempView(self, viewName: str) -> bool:
-        """Drop a view registered by :meth:`DataFrame.createOrReplaceTempView` (the inverse). Returns
-        ``True`` if the view existed and was dropped, ``False`` if there was nothing to drop — like
-        Spark's ``catalog.dropTempView``. These views are native, ephemeral DuckDB views, not Delta
-        tables, so this never touches storage."""
-        con = self.session.con
-        existed = con.execute(
-            "SELECT 1 FROM information_schema.tables WHERE table_name = ? AND table_type = 'VIEW'",
-            [viewName],
-        ).fetchone() is not None
-        con.execute(f'DROP VIEW IF EXISTS "{viewName}"')
-        return existed
-
-    # ---- multi-catalog (each attached lakehouse root is a catalog) -------------------------
-
-    def listCatalogs(self) -> List[str]:
-        """The attached catalogs (the primary from ``connect`` plus any ``conn.attach``ed roots)."""
-        return list(self.session._catalogs.keys())
-
-    def currentCatalog(self) -> str:
-        return self.session._current_catalog
-
-    def setCurrentCatalog(self, catalogName: str):
-        """Make ``catalogName`` the current catalog, so unqualified / 2-part names resolve in it. The
-        current database becomes that catalog's ``dbo`` (or its first schema)."""
-        sess = self.session
-        if catalogName not in sess._catalogs:
-            raise ValueError(
-                f"unknown catalog '{catalogName}'; attached catalogs: {list(sess._catalogs)}."
-            )
-        sess._current_catalog = catalogName
-        schema_filter = sess._catalogs[catalogName].schema_filter
-        if schema_filter is not None:
-            sess._current_database = schema_filter  # the catalog was attached pinned to one schema
-        else:
-            rows = sess.con.execute(
-                "SELECT schema_name FROM information_schema.schemata "
-                "WHERE catalog_name = ? ORDER BY schema_name",
-                [catalogName],
-            ).fetchall()
-            schemas = [r[0] for r in rows if r[0] not in self._SKIP_SCHEMAS]
-            sess._current_database = "dbo" if "dbo" in schemas else (schemas[0] if schemas else "dbo")
-        sess._use(catalogName, sess._current_database)
 
 
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
