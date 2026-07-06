@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.3.38"
+version = "0.4.0"
 description = "A dbt adapter that runs SQL in DuckDB and materializes to Delta Lake (delta_rs)."
 readme = "README.md"
 license = {text = "MIT"}

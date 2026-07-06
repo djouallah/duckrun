@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0]
+
+0.4.0 marks the SQL-only surface (`connect()` / `conn.sql()` and the SQL verbs) stable and
+frozen. Planned implementation cleanups — parser unification, dead-code removal, case-fold on
+discovery — land afterward as internal changes without touching this surface.
+
 ### Changed
 - **A dropped table is absent on every surface.** A `drop table` tombstone now reports nonexistent
   consistently through one oracle (`_live_table_exists`, reusing the `is_dropped` predicate discovery
