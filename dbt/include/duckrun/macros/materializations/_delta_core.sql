@@ -72,6 +72,15 @@
        it exists, but the Delta table can't be opened at store time → a transient storage error,
        NOT a real absence) and refuse to overwrite an incremental dataset. --#}
   {%- set dbt_believes_exists = _delta_state['exists'] -%}
+
+  {#-- Does the model read `{{ this }}` (a read-modify-append on itself, e.g. an incremental append
+       whose watermark is `max(ts) from {{ this }}`)? The compiled `model_sql` contains the rendered
+       `{{ this }}` when it does. If so, the `append` strategy is fenced to `vB` (the version read):
+       a concurrent commit since the build started fails it loudly instead of appending a duplicate —
+       the automatic append_if_unchanged behavior, no strategy to pick. A plain append of new data
+       (no `{{ this }}` read) stays unfenced. A missed match degrades to a plain append (the old
+       behavior), so detection erring low is safe. --#}
+  {%- set reads_self = dbt_believes_exists and language != 'python' and model_sql and (this | string) in model_sql -%}
   {#-- Pin the self-reference view to the captured `vB` (delta_scan version => N, requires the
        duckdb-delta version param). This makes the model's `is_incremental()` read of `{{ this }}`
        resolve at EXACTLY the version the write commit will validate OCC against — one snapshot for
@@ -144,6 +153,7 @@
       'incremental': is_incremental,
       'incremental_strategy': config.get('incremental_strategy'),
       'read_version': read_version,
+      'reads_self': reads_self,
       'dbt_believes_exists': dbt_believes_exists,
       'not_null_columns': not_null_columns,
       'full_refresh': should_full_refresh(),

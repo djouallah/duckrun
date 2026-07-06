@@ -12,9 +12,11 @@
       batch (duplicates preserved) — a fenced full-table overwrite (CAS to vB); requires unique_key.
       Differs from merge: merge updates matched rows and rejects a duplicate-key source, whereas
       delete+insert replaces whole rows and TOLERATES duplicate keys.
-    - append (default when no unique_key): blind append
-    - append_if_unchanged: optimistic append — commit only if the table version has not moved
-      since the write began, else fail (no dedup; that's the model SQL's job)
+    - append (default when no unique_key): appends the batch. A model that reads {{ this }} (a
+      read-modify-append on itself, e.g. a `max(ts) from {{ this }}` watermark) is fenced to the
+      version it read automatically — a concurrent commit during the build fails it loudly instead of
+      appending a duplicate; a plain append of new data is unfenced. (No dedup; that's the model SQL's
+      job.)
     - microbatch: delete+insert the model's event_time window per dbt-driven batch
 #}
 {% materialization incremental, adapter='duckrun', supported_languages=['sql', 'python'] %}

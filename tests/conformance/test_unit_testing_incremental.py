@@ -27,7 +27,7 @@ with a new value at a later timestamp, plus a brand-new key):
 
 That final assertion is what distinguishes the strategies — merge UPDATES the
 re-emitted key, insert KEEPS the old value, delete+insert REPLACES it, and
-append/append_if_unchanged leave a SECOND copy. Without reading the rows back these were
+append leaves a SECOND copy. Without reading the rows back these were
 mere "does it crash" smoke tests; now wrong output fails the suite.
 
 Matrix axes: incremental_strategy × is_incremental(true/false) × key shape
@@ -283,25 +283,6 @@ class TestIncrAppendNoKey(_IncrBase):
     model_files = {"fct_events.sql": _APPEND_MODEL, "schema.yml": _MERGE_SCHEMA}
     expected_initial = _INIT_IRA
     expected_final = _FINAL_APPEND       # blind append: a SECOND copy of id 1 (no dedup)
-
-
-# ---------------------------------------------------------------------------
-# 6. append_if_unchanged (CAS append)
-# ---------------------------------------------------------------------------
-_APPEND_IF_UNCHANGED_MODEL = """
-{{ config(materialized='incremental', incremental_strategy='append_if_unchanged') }}
-select id, region, ts, amount
-from {{ ref('stg_events') }}
-{% if is_incremental() %}
-where ts > (select coalesce(max(ts), cast('1900-01-01' as date)) from {{ this }})
-{% endif %}
-"""
-
-
-class TestIncrAppendIfUnchanged(_IncrBase):
-    model_files = {"fct_events.sql": _APPEND_IF_UNCHANGED_MODEL, "schema.yml": _MERGE_SCHEMA}
-    expected_initial = _INIT_IRA
-    expected_final = _FINAL_APPEND
 
 
 # ---------------------------------------------------------------------------

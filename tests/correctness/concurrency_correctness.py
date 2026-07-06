@@ -12,11 +12,13 @@ Three guarantees are checked here. (MERGE single-snapshot pinning — read_versi
 `load_as_version`, OCC over `(vB, HEAD]` — is proved separately in `test_correctness.py`;
 merge now ALWAYS pins, there is no unpinned path to demo.)
 
-B. append_if_unchanged (pin intended). The `append_if_unchanged` incremental strategy appends only if the table
-   version has not moved since it was read — a compare-and-swap via delta-rs max_commit_retries=0.
-   A plain `append` has no such guard: it silently lands on whatever the latest version is.
-   append_if_unchanged instead REFUSES (CommitFailedError) when a concurrent write slipped in, so the
-   caller re-runs against the new HEAD. Dedup is NOT its job — that's the model SQL's.
+B. Fenced append (the engine CAS). `engine.append_if_unchanged` appends only if the table version has
+   not moved since it was read — a compare-and-swap via delta-rs max_commit_retries=0. This is the
+   primitive behind the automatic self-reference fence: a dbt `append` model that reads `{{ this }}`
+   (and a `conn.sql` `insert into a select … from a`) route through it. A plain append of new data has
+   no such guard — it silently lands on whatever the latest version is. The fenced append instead
+   REFUSES (CommitFailedError) when a concurrent write slipped in, so the caller re-runs against the
+   new HEAD. Dedup is NOT its job — that's the SQL's.
 
 D. DELETE / UPDATE snapshot safety. A connection-API delete()/update() is a genuinely conflicting
    Delta op, so delta-rs OCC fails it (CommitFailedError) when a foreign commit changed the same
