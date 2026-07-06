@@ -332,7 +332,8 @@ def test_use_switches_write_routing(tmp_path):
 
 def test_insert_with_schema_evolution_adds_columns(w):
     """INSERT WITH SCHEMA EVOLUTION INTO t … (Spark/Delta spelling) widens the table with the source's
-    new columns (existing rows get NULL); a plain INSERT of an unknown column drops it instead."""
+    new columns (existing rows get NULL); a plain INSERT with an extra column is rejected loud instead
+    (see test_insert_select_extra_columns_fails_loud)."""
     w.sql("CREATE OR REPLACE TABLE t AS SELECT 1 AS id, 'a' AS name")
     w.sql("INSERT WITH SCHEMA EVOLUTION INTO t SELECT 2 AS id, 'b' AS name, 99 AS extra")
     assert w.sql("select * from t").columns == ["id", "name", "extra"]
@@ -417,3 +418,70 @@ def test_vacuum_refused_on_read_only(tmp_path):
     ro = duckrun.connect(wdir, schema="dbo")               # read_only is the default
     with pytest.raises(PermissionError):
         ro.sql("VACUUM r")
+
+
+# ─────────────────────── fail-loud + hostile-identifier guards (external black-box suite regressions)
+# Each pins a real defect the external suite surfaced; they exist so CI catches a re-break, since that
+# suite isn't run here. Every "no write happened" claim is checked against the log, not just the raise.
+
+def test_update_unknown_set_column_fails_loud_no_commit(w):
+    """UPDATE SET on a column that doesn't exist must raise BEFORE any commit — delta_rs's update()
+    silently accepts an unknown column and writes a no-op commit that still advances the log."""
+    w.sql("CREATE OR REPLACE TABLE t AS SELECT 1 AS id, 'x' AS s")
+    before = [r[0] for r in w.sql("DESCRIBE HISTORY t").fetchall()]
+    with pytest.raises(Exception):
+        w.sql("UPDATE t SET nope = 1")
+    assert [r[0] for r in w.sql("DESCRIBE HISTORY t").fetchall()] == before   # no new commit
+    assert w.sql("select s from t").fetchone()[0] == "x"                      # data untouched
+
+
+def test_update_scalar_subquery_in_set_does_not_panic(w):
+    """UPDATE t SET c = (SELECT …) — exactly the rewrite the UPDATE…FROM rejection recommends — is
+    evaluated via the DuckDB fallback, never handed to delta_rs's datafusion 'not implemented' panic."""
+    w.sql("CREATE OR REPLACE TABLE t AS SELECT range AS id, 0 AS g FROM range(4)")
+    w.sql("CREATE OR REPLACE TABLE ref AS SELECT 7 AS id")
+    w.sql("UPDATE t SET g = (SELECT max(id) FROM ref) WHERE id = 1")
+    got = dict(w.sql("select id, g from t").fetchall())
+    assert got[1] == 7 and got[0] == 0 and got[2] == 0        # only the matched row changed
+
+
+def test_quoted_identifier_with_dot_is_one_table(w):
+    """CREATE TABLE "a.b" is ONE table named a.b (a legal quoted identifier) — the relation splitter is
+    quote-aware, so the inner dot is part of the name, not a schema/table separator."""
+    w.sql('CREATE OR REPLACE TABLE "a.b" AS SELECT 1 AS id')
+    assert os.path.isdir(w._table_path("dbo", "a.b"))         # landed at <root>/dbo/a.b …
+    assert not os.path.isdir(w._table_path("a", "b"))         # … NOT dot-split into schema a / table b
+    assert w.sql('SELECT id FROM "a.b"').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("evil", ['"../escape"', '"x/../../pwned"', '".."'])
+def test_path_traversal_table_name_is_rejected(w, evil):
+    """A quoted identifier carrying a path separator or a `..` component must fail loud and create
+    nothing above the lakehouse root — a quoted name is otherwise opaque to the splitter."""
+    w.sql("CREATE OR REPLACE TABLE seed AS SELECT 1 AS id")   # materialize the root dir to watch it
+    before = set(os.listdir(w.root_path))
+    with pytest.raises(Exception):
+        w.sql(f"CREATE TABLE {evil} AS SELECT 1 AS id")
+    assert set(os.listdir(w.root_path)) == before             # nothing written outside <root>/dbo
+
+
+def test_insert_select_extra_columns_fails_loud(w):
+    """INSERT INTO t SELECT with MORE columns than the target must raise — a wider SELECT would
+    otherwise be silently truncated by the positional projection (data loss); no commit is written."""
+    w.sql("CREATE OR REPLACE TABLE t AS SELECT 1 AS a, 'x' AS b")
+    before = [r[0] for r in w.sql("DESCRIBE HISTORY t").fetchall()]
+    with pytest.raises(Exception):
+        w.sql("INSERT INTO t SELECT 1, 'y', 99")              # 3 cols into a 2-col table
+    assert [r[0] for r in w.sql("DESCRIBE HISTORY t").fetchall()] == before
+    assert w.sql("select count(*) from t").fetchone()[0] == 1
+
+
+def test_delta_write_inside_explicit_transaction_is_rejected(w):
+    """A Delta write auto-commits (delta_rs), so it can't join an open explicit transaction — the
+    session rejects it rather than let a following ROLLBACK report success while the row persisted."""
+    w.sql("CREATE OR REPLACE TABLE t AS SELECT 1 AS id")
+    w.sql("BEGIN")
+    with pytest.raises(Exception):
+        w.sql("INSERT INTO t VALUES (2)")
+    w.sql("ROLLBACK")
+    assert [r[0] for r in w.sql("select id from t").fetchall()] == [1]   # the write never landed
