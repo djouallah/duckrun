@@ -554,6 +554,17 @@ def _split_dotted(name: str) -> List[str]:
     return [p.strip().strip('"') for p in parts]
 
 
+def _reject_unsafe_name(part: str, kind: str) -> None:
+    """Reject an identifier that would escape or break the ``<root>/<schema>/<table>`` physical
+    layout — a path separator or a ``.``/``..`` traversal component. Necessary because a quoted
+    identifier is otherwise opaque to the splitter and can smuggle ``/`` or ``..`` straight into the
+    path (``CREATE TABLE "../escape"`` → a write above the lakehouse root)."""
+    if "/" in part or "\\" in part or part in (".", ".."):
+        raise ValueError(
+            f"illegal {kind} name {part!r}: a schema/table name may not contain a path separator "
+            f"or be a '.'/'..' path component")
+
+
 def _split_relation(rel: str) -> Tuple[Optional[str], Optional[str]]:
     """`"db"."schema"."tbl"` / `schema.tbl` / `tbl` / `"a.b"` -> (schema, identifier), quotes stripped.
     Quote-aware: a dot inside a quoted identifier (`"a.b"`) is part of the name, not a separator, so
@@ -863,6 +874,8 @@ class _DeltaDML:
         schema = schema or self.default_schema
         if not schema or not identifier:
             return None, None, None
+        _reject_unsafe_name(schema, "schema")
+        _reject_unsafe_name(identifier, "table")
         return schema, identifier, self._loc(schema, identifier)
 
     def _exists(self, loc: str) -> bool:
@@ -1200,6 +1213,17 @@ class _DeltaDML:
         else:  # explicit column list → canonicalize to the target's casing
             provided = [by_lower.get(c.lower(), c) for c in provided]
         provided_set = set(provided)
+
+        # Arity must match the columns being bound: a SELECT/VALUES source wider than the target (or
+        # than the explicit column list) would otherwise be SILENTLY TRUNCATED by the `v(<names>)`
+        # alias below (DuckDB drops surplus source columns) — data loss. The VALUES path already errors
+        # on too-few names; this makes the SELECT path (and the too-many case) equally loud.
+        src_width = len(self.cursor.sql(f"select * from {derived} limit 0").columns)
+        if src_width != len(provided):
+            raise ValueError(
+                f"INSERT source provides {src_width} column(s) but {len(provided)} are being written "
+                f"({', '.join(provided)}); the column counts must match — surplus or missing source "
+                f"columns are never silently dropped or NULL-filled on this path")
 
         quoted = ", ".join('"' + c + '"' for c in provided)
         inner = f"{derived} v({quoted})"

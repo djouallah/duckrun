@@ -40,6 +40,9 @@ _SELECT_STAR_FROM = re.compile(
 _DML_TARGET_RE = re.compile(
     r"^(?:insert\s+into|delete\s+from|update)\s+(?P<rel>\"?[\w.]+\"?)", re.IGNORECASE)
 _CREATE_TEMP_RE = re.compile(r"^create\s+(or\s+replace\s+)?(temp|temporary)\b", re.IGNORECASE)
+# Explicit transaction-control verbs. DuckDB owns the native transaction, but Delta writes auto-commit
+# via delta_rs and can't join it — so we track whether one is open and reject Delta DML inside it.
+_TXN_VERB_RE = re.compile(r"^(begin|start|commit|rollback|end|abort)\b", re.IGNORECASE)
 
 # DML forms that genuinely can't be expressed through delta_rs (delta_dml.handle never applies them):
 # rejected up front with a form-specific pointer rather than letting DuckDB raise a cryptic error on
@@ -59,6 +62,11 @@ _DELETE_USING_MSG = (
 )
 _MULTI_MSG = (
     "conn.sql() runs one statement at a time — split the batch into separate conn.sql() calls."
+)
+_TXN_WRITE_MSG = (
+    "Delta writes auto-commit (delta_rs) and cannot run inside an explicit transaction — a ROLLBACK "
+    "would report success while the write persisted. Commit or roll back the open transaction first, "
+    "then run the write; or run the write outside BEGIN … COMMIT."
 )
 
 # _get_rle profiles a reservoir SAMPLE of the table, not the whole thing: key selection only needs to
@@ -388,6 +396,7 @@ class DuckSession:
                  schema: Optional[str], read_only: bool = True,
                  name: Optional[str] = None):
         self.read_only = read_only
+        self._in_explicit_txn = False  # an explicit BEGIN … is open on self.con (Delta writes can't join it)
 
         self.con = duckdb.connect()
         engine.configure_duckdb_session(self.con)
@@ -730,6 +739,13 @@ class DuckSession:
             rel = mdesc.group("rel").strip()
             return (self._describe_detail(rel) if mdesc.group("kind").lower() == "detail"
                     else self._describe_history(rel))
+        # Explicit transaction control passes through to DuckDB; we only track whether one is open so a
+        # Delta write inside it can fail loud below (delta_rs auto-commits — it can't be rolled back).
+        mtxn = _TXN_VERB_RE.match(_strip_leading(query))
+        if mtxn:
+            result = self.con.sql(query)
+            self._in_explicit_txn = mtxn.group(1).lower() in ("begin", "start")
+            return result
         # Raw DML routes through delta_rs against ONE root. A 3-part target names which catalog that
         # is (``_dml_target_catalog`` → its name); an unqualified/2-part target is the current catalog.
         # Reads (SELECT) are unaffected — DuckDB resolves every attached catalog natively.
@@ -743,6 +759,10 @@ class DuckSession:
         # bare `USE cat.schema` steers write routing exactly as it steers reads — no parallel state.
         write_cat = target_cat if target_cat is not None else self._current_catalog
         is_write = _is_delta_write(query) or _is_vacuum(query) or _is_restore(query)
+        # A Delta write auto-commits via delta_rs, so it can't participate in an open explicit
+        # transaction — reject it loud rather than let a later ROLLBACK silently fail to undo it.
+        if is_write and self._in_explicit_txn:
+            raise ValueError(_TXN_WRITE_MSG)
         entry = self._catalogs.get(write_cat)
         # A write whose current/target catalog isn't duckrun-managed (e.g. after `USE memory`, or a
         # DuckDB-native catalog) has no Delta root to land in — fail loud instead of KeyError.
