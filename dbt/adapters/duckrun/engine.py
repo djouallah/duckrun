@@ -1021,11 +1021,19 @@ def write_delta(
         # target version and this write fails loudly instead of silently landing on top of it. Keeping
         # the actual write_deltalake here — not in the fenced wrappers — makes this the single seam a
         # streamed mid-write race is observable at.
+        #
+        # Record the pinned version in commitInfo so the fence is OBSERVABLE: a fenced append (the
+        # self-reading `insert into t select … from t`, or safeappend) carries duckrun.readVersion,
+        # which a blind last-writer-wins append does not — so a concurrent writer / external reader
+        # can tell a read-modify-append from a plain append in the log.
         dt = _delta_table(path, storage_options)
         dt.load_as_version(read_version)
         args["table_or_uri"] = dt
         args.pop("storage_options", None)
-        args["commit_properties"] = CommitProperties(max_commit_retries=0)
+        args["commit_properties"] = CommitProperties(
+            max_commit_retries=0,
+            custom_metadata={"duckrun.readVersion": str(read_version)},
+        )
         try:
             write_deltalake(**args)
         except CommitFailedError as e:
@@ -1245,7 +1253,7 @@ def delete_rows(
         raise ValueError(
             "delete_rows requires read_version (the version the caller read). A delete is a "
             "read-modify-write and must be pinned to its snapshot — pass the version you read "
-            "(e.g. DeltaTable.forName(conn, name) captures it)."
+            "(engine.table_version(path, storage_options) captures the current HEAD)."
         )
     dt = _delta_table(path, storage_options)
     dt.load_as_version(read_version)
@@ -1278,7 +1286,7 @@ def update_rows(
         raise ValueError(
             "update_rows requires read_version (the version the caller read). An update is a "
             "read-modify-write and must be pinned to its snapshot — pass the version you read "
-            "(e.g. DeltaTable.forName(conn, name) captures it)."
+            "(engine.table_version(path, storage_options) captures the current HEAD)."
         )
     dt = _delta_table(path, storage_options)
     dt.load_as_version(read_version)
@@ -1561,7 +1569,7 @@ def merge_delta_clauses(
     ``target``/``source`` aliases.
 
     This is the shared core for every merge path: ``merge_delta`` (dbt incremental — builds a fixed
-    clause list), the raw-SQL MERGE handler, and the DataFrame ``DeltaTable.merge`` builder. The
+    clause list) and the ``conn.sql`` / raw-SQL ``MERGE INTO`` handler. The
     spill cap, target pruning, the REQUIRED ``read_version`` snapshot pin (OCC over (vB, HEAD]), and
     the post-merge maintenance are identical for every clause shape, so the single-snapshot and
     concurrency-safety guarantees hold for all of them. See ``merge_delta`` for the parameter
@@ -1593,7 +1601,7 @@ def merge_delta_clauses(
     )
 
     # A merge always has an existing target (a brand-new table is created, never merged into), so
-    # the caller (the dbt materialization / DeltaTable.merge) always pins the version it read.
+    # the caller (the dbt materialization / conn.sql MERGE INTO) always pins the version it read.
     # read_version=None would silently merge against HEAD and reopen the read->write gap — refuse it.
     if read_version is None:
         raise ValueError(
@@ -1603,8 +1611,8 @@ def merge_delta_clauses(
     if not clauses:
         raise ValueError("merge has no clauses")
 
-    # Cardinality guard — applied to EVERY merge path (the dbt materialization, raw-SQL MERGE, and the
-    # DataFrame DeltaTable.merge all land here), so a keyed upsert behaves identically across them. A
+    # Cardinality guard — applied to EVERY merge path (the dbt materialization and the conn.sql
+    # MERGE INTO handler all land here), so a keyed upsert behaves identically across them. A
     # keyed merge/insert cannot resolve two source rows for one target row: Spark/Snowflake/BigQuery
     # raise, but delta_rs silently produces duplicate rows. So when the merge has an update/insert
     # clause keyed on an equality predicate, require the source to be unique on that key. Skipped when

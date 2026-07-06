@@ -51,12 +51,11 @@ _strip_leading = delta_dml._strip_leading  # shared comment/whitespace stripper
 
 _UPDATE_FROM_MSG = (
     "conn.sql() can't run UPDATE … FROM via delta_rs. Rewrite the SET values as correlated "
-    "subqueries, or use DeltaTable.forName(conn, name).update(...)/.merge(...)."
+    "subqueries, or express the join as MERGE INTO … USING …."
 )
 _DELETE_USING_MSG = (
     "conn.sql() can't run DELETE … USING via delta_rs. Rewrite the predicate as a correlated "
-    "subquery (DELETE … WHERE … IN (SELECT …)), or use "
-    "DeltaTable.forName(conn, name).delete(...)/.merge(...)."
+    "subquery (DELETE … WHERE … IN (SELECT …)), or express the join as MERGE INTO … USING …."
 )
 _MULTI_MSG = (
     "conn.sql() runs one statement at a time — split the batch into separate conn.sql() calls."
@@ -71,7 +70,7 @@ _MULTI_MSG = (
 # millisecond local-temp-table scans.
 _READ_ONLY_MSG = (
     "catalog '{catalog}' is read-only — cannot {op}. duckrun opens read-only by default; enable "
-    "Delta writes (saveAsTable / save / merge / insert / update / delete / replaceWhere) "
+    "Delta writes (INSERT / UPDATE / DELETE / MERGE / REPLACE WHERE / CREATE / DROP / VACUUM) "
     "with connect(read_only=False) for the primary, or conn.attach(path, name='{catalog}', "
     "read_only=False) for an attached catalog."
 )
@@ -142,9 +141,10 @@ def _is_restore(query: str) -> bool:
     return bool(_RESTORE_RE.match(_strip_leading(query)))
 
 
-# ---- createDataFrame helpers --------------------------------------------------------------
-# PySpark DDL type spellings → DuckDB types. Anything not listed (INTEGER, DECIMAL(10,2), …) is
-# already a DuckDB type and passes through untouched.
+# ---- register() schema helpers --------------------------------------------------------------
+# DDL type spellings → DuckDB types (for the optional schema arg of register/_relation_from).
+# Anything not listed (INTEGER, DECIMAL(10,2), …) is already a DuckDB type and passes through
+# untouched.
 _SPARK_TO_DUCKDB_TYPE = {
     "int": "INTEGER", "integer": "INTEGER",
     "long": "BIGINT", "bigint": "BIGINT",
@@ -812,9 +812,9 @@ class DuckSession:
         """Register an in-memory object (pandas / polars / pyarrow / a DuckDB relation) as ``name`` so
         SQL can read it: ``conn.register("df", df); conn.sql("SELECT * FROM df")``.
 
-        This is the ``createDataFrame`` replacement. A bare ``conn.sql("FROM df")`` can't find a
-        caller-local ``df`` — DuckDB's replacement scan only inspects the immediate calling frame,
-        which is this method, not the user's — so registration is explicit. Forwards to DuckDB's
+        Registration is explicit because a bare ``conn.sql("FROM df")`` can't find a caller-local
+        ``df`` — DuckDB's replacement scan only inspects the immediate calling frame, which is this
+        method, not the user's. Forwards to DuckDB's
         native ``register``; it's an in-memory view (no Delta write), so a read-only session allows it.
         Persist it with the normal write path: ``conn.sql("CREATE TABLE t AS SELECT * FROM df")``."""
         self.con.register(name, obj)
@@ -822,7 +822,7 @@ class DuckSession:
     def _live_table_exists(self, path: str, so=None) -> bool:
         """True iff a LIVE Delta table exists at ``path``. A drop-tombstone counts as NONEXISTENT — the
         same ``is_dropped`` predicate discovery and the raw-DML router use — so every existence check
-        (the writer's error/ignore mode, ``catalog.tableExists``, the reader) agrees a dropped table is
+        (the writer's error/ignore mode and the reader) agrees a dropped table is
         gone. One oracle, no per-surface duplication."""
         return engine.table_exists(path, so) and not delta_dml.is_dropped(self.con, path, so)
 
@@ -1317,7 +1317,7 @@ class DuckSession:
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
             schema: Optional[str] = None,
             read_only: bool = True, name: Optional[str] = None) -> DuckSession:
-    """Open a storage-neutral, DataFrame-style session over a Delta lakehouse.
+    """Open a storage-neutral, SQL-only session over a Delta lakehouse.
 
     The session binds to this one lakehouse root as the primary catalog. Catalog is first-class:
     tables are addressed ``catalog.schema.table`` (``schema.table`` / ``table`` resolve in the current
@@ -1330,8 +1330,8 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
         storage_options: forwarded to delta-rs (and used to mint DuckDB secrets). For OneLake you
             can omit it inside a Fabric notebook — a token is acquired automatically.
         schema: restrict to a single schema. Omit to discover every schema folder.
-        read_only: **default True** — the session refuses every Delta write (saveAsTable
-            / save / merge / insert / update / delete / replaceWhere) with a ``PermissionError``, so
+        read_only: **default True** — the session refuses every Delta write (INSERT / UPDATE
+            / DELETE / MERGE / REPLACE WHERE / CREATE / DROP / VACUUM) with a ``PermissionError``, so
             an accidental write can't mutate a shared lakehouse. Pass ``read_only=False`` to enable
             writes. Reads and native DuckDB scratch (``CREATE TEMP``/``CREATE VIEW``) are unaffected.
         name: the primary catalog's name. When omitted it's derived from the URL (the OneLake
@@ -1343,7 +1343,7 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
         >>> conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/sales.Lakehouse/Tables")
         >>> conn.sql("SHOW TABLES").show()                          # primary catalog 'sales'
         >>> w = duckrun.connect("…/Tables/dbo", read_only=False)   # opt in to write
-        >>> w.sql("select * from orders").write.mode("overwrite").saveAsTable("orders_copy")
+        >>> w.sql("CREATE OR REPLACE TABLE orders_copy AS SELECT * FROM orders")
         >>> lh = duckrun.connect("…/<guid>/Tables", name="lakehouse")   # name a GUID-path catalog
     """
     check_runtime_versions()  # fail loud if Fabric's stale duckdb/deltalake are still loaded

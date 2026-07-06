@@ -97,6 +97,36 @@ def test_replace_where_cas_refuses_on_foreign_commit():
         engine.replace_where(path, _tbl([(1, 77)]), "id < 3", read_version=vB)
 
 
+# --------------------------------------------------------------- fenced (self-reading) append
+
+def test_pinned_append_refuses_on_foreign_commit():
+    """A self-reading append (`insert into t select … from t`) fences to the version it read: at the
+    seam, write_delta(mode="append", read_version=vB) fails loud if the table moved since vB — the
+    SAME CAS the merge/replaceWhere paths use, so a concurrent commit can't silently append rows
+    derived from a stale snapshot."""
+    path = str(Path(tempfile.mkdtemp()) / "t")
+    _seed(path)
+    vB = engine.table_version(path)
+    DeltaTable(path).update(predicate="id = 1", updates={"value": "999"})  # foreign -> v1
+    with pytest.raises(CommitFailedError):
+        engine.write_delta(path, _tbl([(4, 77)]), "append", read_version=vB)
+
+
+def test_fenced_append_is_observable_blind_append_is_not():
+    """A fenced append records duckrun.readVersion in commitInfo so it's distinguishable in the log
+    from a blind (last-writer-wins) append, which carries no such marker."""
+    fenced = str(Path(tempfile.mkdtemp()) / "t")
+    _seed(fenced)
+    engine.write_delta(fenced, _tbl([(4, 77)]), "append",
+                       read_version=engine.table_version(fenced))  # pinned at v0
+    assert any(h.get("duckrun.readVersion") == "0" for h in DeltaTable(fenced).history())
+
+    blind = str(Path(tempfile.mkdtemp()) / "t")
+    _seed(blind)
+    engine.write_delta(blind, _tbl([(4, 77)]), "append")          # no read_version
+    assert not any("duckrun.readVersion" in h for h in DeltaTable(blind).history())
+
+
 # --------------------------------------------------------------- maintenance never pinned
 
 def test_maintain_takes_no_version_parameter():

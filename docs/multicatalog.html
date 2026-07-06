@@ -81,7 +81,7 @@ conn.catalog.setCurrentDatabase(&quot;mart&quot;);      conn.sql(&quot;SELECT * 
 
 <section>
   <h3><span class="n">4</span> a Warehouse is locked to writes — the read-only fence refuses a write into it</h3>
-  <pre class="py">conn.sql(&quot;SELECT 1 AS x&quot;).write.mode(&quot;overwrite&quot;).saveAsTable(&quot;warehouse.mart.nope&quot;)
+  <pre class="py">conn.sql(&quot;CREATE OR REPLACE TABLE warehouse.mart.nope AS SELECT 1 AS x&quot;)
 #  -&gt; PermissionError: catalog &#x27;warehouse&#x27; is read-only</pre>
   <p class="tcap">the same write, two catalogs</p>
   <table class="data"><thead><tr><th>catalog</th><th>mode</th><th>write attempt</th></tr></thead><tbody><tr><td>warehouse</td><td>read-only</td><td>refused ✅</td></tr><tr><td>lakehouse</td><td>writable</td><td>allowed ✅</td></tr></tbody></table>
@@ -93,15 +93,15 @@ conn.catalog.setCurrentDatabase(&quot;mart&quot;);      conn.sql(&quot;SELECT * 
 
 <section>
   <h3><span class="n">5</span> write a carbon-factor lookup into the LOCAL catalog (local.dbo.fuel_factors)</h3>
-  <pre class="py">lookup = conn.sql(&quot;SELECT * FROM (VALUES …) t(fuel, co2_kg_per_mwh)&quot;)
-lookup.write.mode(&quot;overwrite&quot;).saveAsTable(&quot;local.dbo.fuel_factors&quot;)</pre>
+  <pre class="py">conn.sql(&quot;&quot;&quot;CREATE OR REPLACE TABLE local.dbo.fuel_factors AS
+    SELECT * FROM (VALUES …) t(fuel, co2_kg_per_mwh)&quot;&quot;&quot;)</pre>
   <p class="note">15 fuel factors written to the local catalog</p>
 </section>
 
 <section>
   <h3><span class="n">6</span> JOIN all three → write &#x27;multicatalog_demo.mart_generation_by_state&#x27; back to the lakehouse</h3>
   <pre class="py"># facts: WAREHOUSE (read-only) · DUID dim: LAKEHOUSE · carbon factor: LOCAL
-mart = conn.sql(f&quot;&quot;&quot;
+conn.sql(f&quot;&quot;&quot;CREATE OR REPLACE TABLE multicatalog_demo.mart_generation_by_state AS
     WITH facts AS (   -- a bounded sample, not the whole 100M+-row fact
         SELECT DUID, mw, price FROM warehouse.mart.fct_summary LIMIT 200000
     )
@@ -112,8 +112,7 @@ mart = conn.sql(f&quot;&quot;&quot;
     FROM facts f
     JOIN mart.dim_duid d                ON d.DUID = f.DUID
     LEFT JOIN local.dbo.fuel_factors lf ON lower(lf.fuel) = lower(d.FuelSourceDescriptor)
-    GROUP BY d.State&quot;&quot;&quot;)
-mart.write.mode(&quot;overwrite&quot;).saveAsTable(&quot;multicatalog_demo.mart_generation_by_state&quot;)</pre>
+    GROUP BY d.State&quot;&quot;&quot;)</pre>
   <p class="tcap">multicatalog_demo.mart_generation_by_state — warehouse ⋈ lakehouse ⋈ local (200,000-row fact sample)</p>
   <table class="data"><thead><tr><th>state</th><th>total MW</th><th>avg price $</th><th>est t CO₂</th></tr></thead><tbody><tr><td>Queensland</td><td>2,927,844</td><td>104.94</td><td>644,304</td></tr><tr><td>Victoria</td><td>2,253,936</td><td>98.41</td><td>433,265</td></tr><tr><td>New South Wales</td><td>2,071,641</td><td>98.83</td><td>451,617</td></tr><tr><td>South Australia</td><td>995,708</td><td>128.82</td><td>447,044</td></tr><tr><td>Tasmania</td><td>747,277</td><td>84.74</td><td>43,236</td></tr></tbody></table>
   <p class="note">mart written back to the lakehouse (abfss://…/Tables/multicatalog_demo/mart_generation_by_state) — joined a 200,000-row fact sample(warehouse) + dim(lakehouse) + factors(local)</p>

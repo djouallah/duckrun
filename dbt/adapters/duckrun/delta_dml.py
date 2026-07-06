@@ -1017,8 +1017,8 @@ class _DeltaDML:
             return
         # Route through engine.delete_rows pinned to the version read at statement start — the SAME
         # snapshot-fenced path (read_version → load_as_version, OCC over (vB, HEAD], post-op
-        # maintenance) as DeltaTable.forName(...).delete(). conn.sql and the DataFrame handle MUST
-        # behave identically; a raw delta-rs delete() at HEAD skipped the pin and the maintenance.
+        # maintenance) every duckrun mutation uses; a raw delta-rs delete() at HEAD would skip the
+        # pin and the maintenance.
         engine.delete_rows(
             loc, where,
             read_version=engine.table_version(loc, self.so),
@@ -1068,7 +1068,7 @@ class _DeltaDML:
             finally:
                 self.cursor.execute(f'drop table if exists "{tmp}"')
             return
-        # Same snapshot-fenced path as DeltaTable.forName(...).update() — SQL == DataFrame.
+        # Same snapshot-fenced path (read_version → OCC) every duckrun mutation uses.
         engine.update_rows(
             loc, updates, where,
             read_version=engine.table_version(loc, self.so),
@@ -1097,14 +1097,18 @@ class _DeltaDML:
     def _provided(cols: str) -> List[str]:
         return [c.strip().strip('"') for c in cols.split(",")]
 
-    def _append_projected(self, loc, provided, derived: str) -> None:
-        """Append a ``derived`` table (a ``(values …)`` tuple list or a ``(select …)`` subquery) to
-        the Delta table at ``loc``, projecting its columns onto the FULL target schema: supplied
+    def _project_onto_schema(self, loc, provided, derived: str):
+        """Project a ``derived`` table (a ``(values …)`` tuple list or a ``(select …)`` subquery)
+        onto the FULL target schema at ``loc`` and return the projected DuckDB relation: supplied
         columns come from ``derived`` (positional when ``provided`` is None), any unsupplied target
-        column is a typed NULL, and every projected column is cast to the target column's type so
-        the appended Arrow schema matches the table exactly (what a plain SQL INSERT does, and it
-        stops a literal wider than the column from forcing delta_rs to add a new writer feature on
-        append)."""
+        column is a typed NULL, and every projected column is cast to the target column's type so the
+        written Arrow schema matches the table exactly (what a plain SQL INSERT does, and it stops a
+        literal wider than the column from forcing delta_rs to add a new writer feature on write).
+
+        Shared by the plain append (INSERT … SELECT/VALUES) and the REPLACE WHERE body so both align
+        source shape to the table identically — same positional/by-name rule, same lossy-numeric
+        guard — instead of REPLACE WHERE matching delta_rs by name and rejecting positional columns
+        that INSERT accepts."""
         loc_sql = loc.replace("'", "''")
         template = self.cursor.sql(f"select * from delta_scan('{loc_sql}') limit 0")
         target_cols = list(template.columns)
@@ -1125,7 +1129,12 @@ class _DeltaDML:
             else f'cast(null as {typ}) as "{col}"'
             for col, typ in zip(target_cols, target_types)
         ]
-        data = self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
+        return self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
+
+    def _append_projected(self, loc, provided, derived: str) -> None:
+        """Append a ``derived`` table to the Delta table at ``loc``, projected onto its full schema
+        by :meth:`_project_onto_schema`."""
+        data = self._project_onto_schema(loc, provided, derived)
         # Read-then-append to the SAME table (`insert into a select … from a`) is fenced to the
         # version read — the automatic append_if_unchanged — so a concurrent commit fails loud
         # instead of appending stale-derived rows. A plain append of new data (a VALUES list, or a
@@ -1384,7 +1393,10 @@ class _DeltaDML:
         body = rest[bi:].strip()
         if not predicate:
             raise ValueError("INSERT … REPLACE WHERE requires a <predicate> before the body")
-        data = self.cursor.sql(body)
+        # Project the body onto the target schema (positional, like INSERT) BEFORE handing it to
+        # delta_rs replaceWhere — which otherwise matches by name and rejects positional columns
+        # (SELECT 501, 2, 'x') that a plain INSERT accepts. Same projection contract as the append.
+        data = self._project_onto_schema(loc, None, f"({body})")
         try:
             pcols = list(engine._delta_table(loc, self.so).metadata().partition_columns or [])
         except Exception:

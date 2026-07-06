@@ -271,6 +271,44 @@ def test_routed_replace_where_is_fenced(w, monkeypatch):
     assert seen["predicate"].strip() == "id = 1"           # predicate split off the body cleanly
 
 
+def test_replace_where_accepts_positional_columns_like_insert(w):
+    """REPLACE WHERE aligns a positional body onto the target schema exactly like plain INSERT — a
+    `SELECT 501, 2, 'x'` body (whose columns are named 501/2/x) must land, not raise delta_rs
+    SchemaMismatchError. Regression for the append/replace-where projection parity gap."""
+    w.sql("CREATE OR REPLACE TABLE p AS "
+          "SELECT * FROM (VALUES (1,1,'a'),(2,2,'b'),(3,3,'c')) t(id, grp, val)")
+    w.sql("INSERT INTO p SELECT 500, 1, 'x'")              # plain positional INSERT — the oracle
+    w.sql("INSERT INTO p REPLACE WHERE grp = 2 SELECT 501, 2, 'x'")   # same body shape, must succeed
+    rows = {(r[0], r[1], r[2]) for r in w.sql("select id, grp, val from p").fetchall()}
+    assert (501, 2, "x") in rows                            # the replaced grp=2 slice landed positionally
+    assert (500, 1, "x") in rows                            # the earlier positional insert survived
+    assert (2, 2, "b") not in rows                          # old grp=2 row fully replaced
+    assert (3, 3, "c") in rows                              # untouched slice intact
+
+
+def test_self_reading_append_is_fenced_blind_append_is_not(w, monkeypatch):
+    """`insert into t select … from t` fences to the version read (a read_version reaches write_delta,
+    so a concurrent commit fails it loud); a plain append over other tables / VALUES stays unfenced
+    (last-writer-wins). Proves the router derives the fence only for a read-modify-append."""
+    w.sql("CREATE OR REPLACE TABLE acc AS SELECT * FROM (VALUES (1,10),(2,20)) v(id, val)")
+    w.sql("CREATE OR REPLACE TABLE src AS SELECT * FROM (VALUES (3,30)) v(id, val)")
+    seen = []
+    real = engine.write_delta
+
+    def spy(path, data, mode, **kw):
+        seen.append((mode, kw.get("read_version")))
+        return real(path, data, mode, **kw)
+
+    monkeypatch.setattr(engine, "write_delta", spy)
+
+    w.sql("INSERT INTO acc SELECT * FROM acc WHERE id = 1")     # self-reading -> fenced
+    assert seen[-1][0] == "append" and seen[-1][1] is not None
+    w.sql("INSERT INTO acc SELECT * FROM src")                  # reads another table -> blind
+    assert seen[-1][0] == "append" and seen[-1][1] is None
+    w.sql("INSERT INTO acc VALUES (9, 90)")                     # VALUES -> blind
+    assert seen[-1][0] == "append" and seen[-1][1] is None
+
+
 def test_use_switches_write_routing(tmp_path):
     """conn.sql("USE <cat>.<schema>") is native DuckDB, but duckrun resyncs its write routing from
     current_database()/current_schema() so an unqualified write after USE lands in the catalog the USE
