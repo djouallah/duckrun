@@ -30,6 +30,7 @@ from ._runtime import check_runtime_versions
 _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
 _VACUUM_WRITE_RE = re.compile(r"^vacuum\s+(?:analyze\s+)?[\"\w]", re.IGNORECASE)
+_USE_RE = re.compile(r"^use\b", re.IGNORECASE)   # USE <catalog>[.<schema>] — resync current after
 # A bare `SELECT * FROM <table>` — nothing else (no WHERE/JOIN/LIMIT/projection). Its output is that
 # table verbatim, so SORTED BY AUTO can profile it EXACTLY from the Delta log instead of sampling.
 _SELECT_STAR_FROM = re.compile(
@@ -722,7 +723,22 @@ class DuckSession:
             return self.con.sql("SELECT 'ok' AS status")
         if _is_delta_write(query):
             raise ValueError(_delta_write_message(query))
-        return self.con.sql(query)
+        result = self.con.sql(query)
+        # `USE <catalog>[.<schema>]` is native DuckDB — it moves DuckDB's current catalog/schema (for
+        # reads) but not duckrun's write-routing state. Resync the two from DuckDB's own
+        # current_database()/current_schema() so one USE switches reads AND writes consistently.
+        if _USE_RE.match(_strip_leading(query)):
+            self._sync_current_from_duckdb()
+        return result
+
+    def _sync_current_from_duckdb(self) -> None:
+        """Adopt DuckDB's current catalog/schema (``current_database()`` / ``current_schema()``) as
+        duckrun's write-routing current — so a user's ``conn.sql("USE …")`` steers unqualified/2-part
+        writes to the same place it steers reads. Only adopts a catalog duckrun actually manages."""
+        cat = self.con.sql("SELECT current_database()").fetchone()[0]
+        if cat in self._catalogs:
+            self._current_catalog = cat
+            self._current_database = self.con.sql("SELECT current_schema()").fetchone()[0]
 
     def _resolve_auto_sort(self, query: str) -> str:
         """Resolve ``CREATE TABLE … SORTED BY AUTO AS <query>`` (a duckrun extension) into an explicit

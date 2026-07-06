@@ -267,6 +267,25 @@ def test_routed_replace_where_is_fenced(w, monkeypatch):
     assert seen["predicate"].strip() == "id = 1"           # predicate split off the body cleanly
 
 
+def test_use_switches_write_routing(tmp_path):
+    """conn.sql("USE <cat>.<schema>") is native DuckDB, but duckrun resyncs its write routing from
+    current_database()/current_schema() so an unqualified write after USE lands in the catalog the USE
+    selected — reads and writes agree on one current catalog."""
+    import glob
+    prim, sec = str(tmp_path / "prim"), str(tmp_path / "sec")
+    c = duckrun.connect(prim, schema="dbo", read_only=False)
+    c.sql("CREATE OR REPLACE TABLE seed AS SELECT 1 x")
+    c.attach(sec, name="sec")
+    c.sql("CREATE OR REPLACE TABLE sec.dbo.s0 AS SELECT 1 x")   # give sec a dbo schema to USE into
+    c.sql("USE sec.dbo")
+    assert c.sql("SELECT current_database()").fetchone()[0] == "sec"
+    assert c._current_catalog == "sec"                          # routing followed the USE, not just reads
+    c.sql("CREATE OR REPLACE TABLE t AS SELECT 42 x")           # unqualified write
+    assert glob.glob(os.path.join(sec, "**", "t"), recursive=True)      # landed in sec
+    assert not glob.glob(os.path.join(prim, "**", "t"), recursive=True)  # NOT the primary
+    c.close()
+
+
 def test_vacuum_refused_on_read_only(tmp_path):
     """VACUUM writes (compacted files + tombstone GC), so a read-only session refuses it loudly rather
     than silently mutating the store."""

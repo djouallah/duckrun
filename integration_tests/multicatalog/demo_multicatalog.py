@@ -199,7 +199,7 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
     dirs (de-risk) or live OneLake (the demo)."""
     _DOC.clear()
     q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731
-    lakehouse = conn._current_catalog
+    lakehouse = q("SELECT current_database()")   # the current catalog, straight from DuckDB
 
     print(f"\n=== duckrun multi-catalog | lakehouse={_trim_loc(conn.root_path)} | "
           f"warehouse(ro)={_trim_loc(warehouse_path)} | local={_trim_loc(local_path)} ===", flush=True)
