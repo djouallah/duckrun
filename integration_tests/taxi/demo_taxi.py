@@ -5,23 +5,21 @@ CSVs, no download step) — the NYC TLC **Yellow Taxi** Parquet + the taxi-zone 
 served by ``d37ci6vzurychx.cloudfront.net`` and read directly by DuckDB over https — then lands it
 into **Delta on OneLake** using nothing but SQL through ``conn.sql(...)``. Along the way it leans on
 DuckDB's fancy SQL (QUALIFY, PIVOT, ROLLUP, LIST/STRUCT, ASOF JOIN) and closes with a results
-scorecard. ``test_coffee.py`` already covers the DataFrame-style builder API on generated data; this is
-the SQL-first, real-data counterpart.
+scorecard. This is the SQL-first, real-data showcase: every write and every mutation is a
+``conn.sql(...)`` statement — no DataFrame builder, no by-path writes.
 
-The demo is split in four parts. **Part 1** is SQL-first: every step is raw SQL through ``conn.sql`` — including a real ``MERGE`` upsert.
-**Part 2** switches to the DataFrame API on the same connection — the ``DataFrameWriter`` writing Delta by
-**path** (``.mode("overwrite"/"append").save(path)``, read back with ``conn.read.format("delta").load(path)``), closing
-with a **concurrent MERGE clash** staged through the DataFrame ``DeltaTable.merge`` builder (the builder
-snapshot-pins at BUILD time, so two writers can be pinned to one snapshot before either commits — a raw
-``conn.sql`` MERGE pins-and-commits in one call) — the stale writer refused with ``CommitFailedError``,
-proving snapshot isolation. **Part 3** is **multi-catalog**: ``conn.attach`` brings a
-*second* lakehouse in as a named catalog (here a local scratch dir alongside the warehouse — they can be on
-different storage), then a single ``conn.sql`` JOINs a table in the primary catalog with one in the attached
-catalog, addressing them as ``catalog.schema.table``. **Part 4** shows the **full MERGE surface** — the complete
-delta-rs clause set (matched update/delete, not-matched insert, not-matched-by-source delete, CASE/arbitrary
-expressions, many clauses in order) applied in a single MERGE driven by a **fresh recompute over the fact**
-(a subquery — the real ETL shape, no hand-typed VALUES), BOTH through ``conn.sql`` and through the
-``DeltaTable.merge`` builder.
+The demo is split in four parts. **Part 1** lands the fact and marts: reads, ``CREATE TABLE AS``,
+``INSERT``, ``DELETE``, time travel — each a raw SQL statement through ``conn.sql`` landing real
+Delta via delta-rs, including a real ``MERGE`` upsert. **Part 2** stays in SQL for the full write &
+mutation surface on **named catalog tables** — ``CREATE OR REPLACE TABLE`` / ``INSERT`` /
+``INSERT … REPLACE WHERE`` (atomic slice swap) / ``UPDATE`` / ``DELETE``. **Part 3** is **multi-catalog**:
+``conn.attach`` brings a *second* lakehouse in as a named catalog (here a local scratch dir alongside
+the warehouse — they can be on different storage), then a single ``conn.sql`` JOINs a table in the
+primary catalog with one in the attached catalog, addressing them as ``catalog.schema.table``.
+**Part 4** shows the **full MERGE surface** — the complete delta-rs clause set (matched update/delete,
+not-matched insert, not-matched-by-source delete, CASE/arbitrary expressions, many clauses in order)
+applied in a single ``conn.sql`` MERGE driven by a **fresh recompute over the fact** (a subquery —
+the real ETL shape, no hand-typed VALUES).
 
 Heavy read+compute runs in-engine over the *full* month (millions of rows, local CPU); only a
 bounded **sample** plus compact marts are written over the network to OneLake, so the network is not
@@ -51,7 +49,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import duckrun
-from duckrun import DeltaTable
+from dbt.adapters.duckrun import engine
 
 # The scenario prints box-drawing chars and ✅/❌; force utf-8 so a Windows cp1252 console doesn't
 # crash when watching the demo.
@@ -83,7 +81,7 @@ def _emit(fragment):
 # ── narration + rendering helpers ────────────────────────────────────────────────────────────────
 def _part(label, blurb):
     """Open a top-level part of the demo (console banner + an <h2> divider in the HTML report).
-    Used to split the SQL-first steps from the DataFrame-API steps."""
+    Used to split the demo into its numbered parts."""
     print(f"\n══ {label} ══  {blurb}", flush=True)
     _emit(f'\n<h2 class="part">{html.escape(label)}</h2>\n  <p class="lede">{html.escape(blurb)}</p>')
 
@@ -243,17 +241,18 @@ def _page_html(scorecard, body, caption, ok):
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>duckrun — the connection API on Delta (SQL &amp; DataFrame)</title>
+  <title>duckrun — the connection API on Delta (SQL-first)</title>
   <style>{_PAGE_CSS}</style>
 </head>
 <body>
   <a class="back" href="index.html">← duckrun docs</a>
-  <h1>the connection API — SQL &amp; DataFrame<span class="tag">not a dbt project</span></h1>
-  <p class="lede">{html.escape(caption)}. Part 1 runs raw SQL through <code>conn.sql(...)</code>; Part 2 uses
-  the <code>DataFrameWriter</code>/<code>DeltaTable</code> API to write by path; Part 3 attaches a second
-  lakehouse with <code>conn.attach</code> and JOINs across catalogs; Part 4 exercises the full delta-rs
-  <code>MERGE</code> clause set in both SQL and DataFrame form — all against live NYC&nbsp;TLC data,
-  landing real Delta, top to bottom.</p>
+  <h1>the connection API — SQL-first on Delta<span class="tag">not a dbt project</span></h1>
+  <p class="lede">{html.escape(caption)}. Every write and mutation is raw SQL through <code>conn.sql(...)</code>.
+  Part 1 lands the fact and marts; Part 2 exercises the full write &amp; mutation surface on named catalog
+  tables (<code>CREATE OR REPLACE TABLE</code> / <code>INSERT</code> / <code>INSERT … REPLACE WHERE</code> /
+  <code>UPDATE</code> / <code>DELETE</code>); Part 3 attaches a second lakehouse with <code>conn.attach</code>
+  and JOINs across catalogs; Part 4 exercises the full delta-rs <code>MERGE</code> clause set — all against
+  live NYC&nbsp;TLC data, landing real Delta, top to bottom.</p>
   <h2 style="margin-bottom:0.2rem">Run scorecard — <span style="font-weight:400">{verdict}</span></h2>
   {scorecard}
   {body}
@@ -294,7 +293,7 @@ def run_taxi_demo(conn, schema):
         n_zones = q("SELECT count(*) FROM zones")
         nulls = q("SELECT count(*) FROM zones WHERE borough IS NULL")
         results.append(_row("Load zones (CSV→Delta)", 0, n_zones, n_zones, True, nulls == 0, time.perf_counter() - t0))
-        _table(conn.sql("SELECT zone_id, borough, zone FROM zones ORDER BY zone_id LIMIT 6").collect(),
+        _table(conn.sql("SELECT zone_id, borough, zone FROM zones ORDER BY zone_id LIMIT 6").fetchall(),
                ["zone_id", "borough", "zone"], "  zones (first 6 of a real 265-zone dimension)")
         say(f"{n_zones} zones loaded")
 
@@ -332,7 +331,8 @@ def run_taxi_demo(conn, schema):
             SELECT pickup_ts, zone_id, borough, zone, payment, fare, tip, distance, total, pickup_hour
             FROM trips_raw USING SAMPLE {SAMPLE_ROWS} ROWS
         """)
-        v_landed = DeltaTable.forName(conn, "trips").version()   # the snapshot we'll time-travel back to
+        v_landed = engine.table_version(conn._table_path(schema, "trips"),
+                                        conn.storage_options)   # the snapshot we'll time-travel back to
         n_trips = q("SELECT count(*) FROM trips")
         bad = q("SELECT count(*) FROM trips WHERE fare <= 0")
         results.append(_row("Land trips sample", 0, n_trips, SAMPLE_ROWS, n_trips == SAMPLE_ROWS, bad == 0,
@@ -351,13 +351,14 @@ def run_taxi_demo(conn, schema):
         results.append(_row("Write revenue mart", 0, n_mart, n_mart, True, n_mart > 0, time.perf_counter() - t0))
         _table([(b, z, f"{tr:,}", f"{rev:,.0f}") for b, z, tr, rev in conn.sql(
                     """SELECT borough, zone, trips, revenue FROM mart_zone_revenue
-                       ORDER BY revenue DESC LIMIT 8""").collect()],
+                       ORDER BY revenue DESC LIMIT 8""").fetchall()],
                ["borough", "zone", "trips", "revenue $"], "  top zones by revenue (mart_zone_revenue)")
         say(f"{n_mart} (borough, zone) rows written to Delta")
 
     # 5 ── catalog WITH each table's real Delta location ───────────────────────────────────────────
     with _step(5, "Catalog: the Delta tables this demo landed — with their real storage locations") as say:
-        tbls = sorted(conn.catalog.listTables())
+        tbls = sorted(r[0] for r in conn.sql(
+            f"SELECT table_name FROM information_schema.tables WHERE table_schema = '{schema}'").fetchall())
         _table([(t, _trim_loc(conn._table_path(schema, t))) for t in tbls], ["table", "location (real Delta dir)"],
                f"  tables in '{schema}'")
         say(f"{len(tbls)} Delta tables — each a real directory with a _delta_log at the location shown")
@@ -390,10 +391,9 @@ def run_taxi_demo(conn, schema):
         tgt_trips = q(f"SELECT trips FROM zone_stats WHERE zone_id = {target}")
         tgt_zone = q(f"SELECT zone FROM zone_stats WHERE zone_id = {target}").replace("'", "''")
         new_avg = round(old_avg + 5.0, 2)
-        # A real SQL MERGE: conn.sql routes it to delta-rs (same engine + snapshot pin as the
-        # DeltaTable.merge builder). Write it like standard SQL — pick your own aliases (here z/s);
-        # duckrun normalizes them internally. One statement does the upsert — the busiest zone is
-        # updated, zone 999 is inserted.
+        # A real SQL MERGE: conn.sql routes it to delta-rs (it pins-and-commits in one call). Write it
+        # like standard SQL — pick your own aliases (here z/s); duckrun normalizes them internally. One
+        # statement does the upsert — the busiest zone is updated, zone 999 is inserted.
         _sql(conn, f"""
             MERGE INTO zone_stats z USING (VALUES
                 ({target}, '{tgt_zone}', {tgt_trips}, {new_avg}),
@@ -458,156 +458,109 @@ def run_taxi_demo(conn, schema):
         results.append(_row("DELETE Cash trips", before, after, before - cash, after == before - cash, still == 0,
                             time.perf_counter() - t0))
         path = conn._table_path(schema, "trips").replace("\\", "/")
-        _emit('  <pre class="py"># canonical Spark time travel — read the snapshot we landed at, by version:\n'
-              f'conn.read.format("delta").option("versionAsOf", {v_landed}).load(path).count()</pre>')
-        at_landed = conn.read.format("delta").option("versionAsOf", v_landed).load(path).count()
-        how = f'read.option("versionAsOf", {v_landed})'
+        _emit('  <pre class="py"># SQL time travel — read the snapshot we landed at, by version, via delta_scan:\n'
+              f"conn.sql(\"SELECT count(*) FROM delta_scan('<trips path>', version => {v_landed})\").fetchone()[0]</pre>")
+        at_landed = conn.sql(
+            f"SELECT count(*) FROM delta_scan('{path}', version => {v_landed})").fetchone()[0]
+        how = f"delta_scan(version => {v_landed})"
         _table([(f"{before:,}", f"{cash:,}", f"{after:,}", f"{at_landed:,}")],
                ["before", "Cash deleted", "after (now)", "at landed ver"], "  time travel: current vs landed snapshot")
         say(f"deleted {cash:,} Cash trips ({before:,} → {after:,}); {how} still sees {at_landed:,}")
 
-    _part("Part 2 · the DataFrame & Delta API — write & mutate without SQL",
-          "Same connection, no SQL DML: the DataFrameWriter, the Spark write verbs "
-          "(save / insertInto / replaceWhere), and the DeltaTable builder (update / delete / merge). "
-          "Writes are addressed by storage PATH (local / s3:// / gs:// / abfss://) or by catalog NAME.")
+    _part("Part 2 · the full write & mutation surface — all SQL, on named catalog tables",
+          "Same connection, still pure conn.sql: CREATE OR REPLACE TABLE / INSERT / INSERT … REPLACE "
+          "WHERE (atomic slice swap) / UPDATE / DELETE. Writes are addressed by catalog NAME "
+          "(schema.table); the store underneath can be local / s3:// / gs:// / abfss://.")
 
-    # 10 ── DataFrame write by PATH: df.write.mode('overwrite').save(path) ─────────────────────────────
-    with _step(10, "DataFrame write by path: df.write.mode('overwrite').save(path) → a bare Delta dir "
-                  "(no catalog name)") as say:
+    # 10 ── write a named catalog table: CREATE OR REPLACE TABLE … AS ─────────────────────────────────
+    with _step(10, "SQL write by name: CREATE OR REPLACE TABLE borough_hourly AS … → a named Delta "
+                  "catalog table") as say:
         t0 = time.perf_counter()
-        by_path = conn._table_path(schema, "borough_hourly")     # any store works: local / s3:// / abfss://
-        _emit('  <pre class="py"># DataFrameWriter — addressed by a storage PATH, not a schema.table name:\n'
-              'df = conn.sql("SELECT borough, pickup_hour, count(*) AS trips "\n'
-              '              "FROM trips GROUP BY borough, pickup_hour")\n'
-              'df.write.format("delta").mode("overwrite").save(path)   # land Delta at the path\n'
-              '# a by-path read registers nothing — name it so conn.sql can query it BY NAME:\n'
-              'conn.read.format("delta").load(path).createOrReplaceTempView("borough_hourly_v")\n'
-              'conn.sql("SELECT * FROM borough_hourly_v ORDER BY trips DESC LIMIT 5")</pre>')
-        df = conn.sql("SELECT borough, pickup_hour, count(*) AS trips "
-                      "FROM trips GROUP BY borough, pickup_hour")
-        df.write.format("delta").mode("overwrite").save(by_path)
-        # createOrReplaceTempView: the by-path read is a DataFrame that registers nothing in the
-        # catalog, so register it as a session view to make it queryable by name (the path-read
-        # counterpart to saveAsTable). The view is native/ephemeral — not Delta, not in conn.catalog.
-        n_path = conn.read.format("delta").load(by_path).createOrReplaceTempView("borough_hourly_v").count()
-        results.append(_row("DataFrame save by path (overwrite)", 0, n_path, n_path, n_path > 0, n_path > 0,
+        _emit('  <pre class="py"># CREATE OR REPLACE TABLE — addressed by a schema.table NAME, lands real Delta:\n'
+              'conn.sql("CREATE OR REPLACE TABLE borough_hourly AS "\n'
+              '         "SELECT borough, pickup_hour, count(*) AS trips "\n'
+              '         "FROM trips GROUP BY borough, pickup_hour")\n'
+              '# it is a catalog table now — query it directly by name:\n'
+              'conn.sql("SELECT * FROM borough_hourly ORDER BY trips DESC LIMIT 5")</pre>')
+        _sql(conn, """
+            CREATE OR REPLACE TABLE borough_hourly AS
+            SELECT borough, pickup_hour, count(*) AS trips
+            FROM trips GROUP BY borough, pickup_hour
+        """)
+        n_named = q("SELECT count(*) FROM borough_hourly")
+        results.append(_row("CREATE OR REPLACE TABLE (overwrite)", 0, n_named, n_named, n_named > 0, n_named > 0,
                             time.perf_counter() - t0))
-        top = conn.sql("SELECT borough, pickup_hour, trips FROM borough_hourly_v "
-                       "ORDER BY trips DESC LIMIT 5").collect()
+        top = conn.sql("SELECT borough, pickup_hour, trips FROM borough_hourly "
+                       "ORDER BY trips DESC LIMIT 5").fetchall()
         _table([(b, h, f"{tr:,}") for b, h, tr in top], ["borough", "pickup_hour", "trips"],
-               "  read back by path — conn.read.format('delta').load(path).createOrReplaceTempView('borough_hourly_v')")
-        say(f"{n_path} (borough, hour) rows written to a bare Delta path, registered as a temp view, "
-            "and queried by name")
+               "  read back by name — conn.sql('SELECT * FROM borough_hourly ORDER BY trips DESC LIMIT 5')")
+        say(f"{n_named} (borough, hour) rows written as a named Delta catalog table and queried by name")
 
-    # 11 ── DataFrame append by PATH: df.write.mode('append').save(path) — grow the same dir ──────────
-    with _step(11, "DataFrame append by path: df.write.mode('append').save(path) — grow the same Delta dir") as say:
+    # 11 ── append to the same named table: INSERT INTO … SELECT ──────────────────────────────────────
+    with _step(11, "SQL append by name: INSERT INTO borough_hourly SELECT … — grow the same Delta table") as say:
         t0 = time.perf_counter()
-        before = conn.read.format("delta").load(by_path).count()
-        _emit('  <pre class="py">extra = conn.sql("SELECT \'EWR\' AS borough, 25 AS pickup_hour, 1 AS trips")\n'
-              'extra.write.format("delta").mode("append").save(path)   # append to the SAME path</pre>')
-        extra = conn.sql("SELECT 'EWR' AS borough, 25 AS pickup_hour, 1 AS trips")
-        extra.write.format("delta").mode("append").save(by_path)
-        after = conn.read.format("delta").load(by_path).count()
-        results.append(_row("DataFrame append by path", before, after, before + 1, after == before + 1,
+        before = q("SELECT count(*) FROM borough_hourly")
+        _emit('  <pre class="py">conn.sql("INSERT INTO borough_hourly "\n'
+              '         "SELECT \'EWR\' AS borough, 25 AS pickup_hour, 1 AS trips")</pre>')
+        _sql(conn, "INSERT INTO borough_hourly SELECT 'EWR' AS borough, 25 AS pickup_hour, 1 AS trips")
+        after = q("SELECT count(*) FROM borough_hourly")
+        results.append(_row("INSERT append by name", before, after, before + 1, after == before + 1,
                             after - before == 1, time.perf_counter() - t0))
-        say(f"{before:,} → {after:,} rows (appended by path)")
+        say(f"{before:,} → {after:,} rows (appended by name)")
 
-    # 12 ── DeltaTable mutate API: update(condition, set) + delete(predicate) ──────────────────────────
-    with _step(12, "DeltaTable mutate API: DeltaTable.forName(conn, 'zone_stats').update(...) + .delete(...)") as say:
+    # 12 ── mutate in place: UPDATE … + DELETE … ──────────────────────────────────────────────────────
+    with _step(12, "SQL mutate: UPDATE zone_stats SET … + DELETE FROM zone_stats WHERE …") as say:
         t0 = time.perf_counter()
         z = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")
         before = q("SELECT count(*) FROM zone_stats")
-        _emit('  <pre class="py">dt = DeltaTable.forName(conn, "zone_stats")\n'
-              f'dt.update(condition="zone_id = {z}", set={{"avg_fare": "42.0"}})   # set one row\n'
-              'dt.delete("zone_id = 999")                                  # drop the demo zone</pre>')
-        dt = DeltaTable.forName(conn, "zone_stats")
-        dt.update(condition=f"zone_id = {z}", set={"avg_fare": "42.0"})
-        dt.delete("zone_id = 999")
+        _emit('  <pre class="py">conn.sql(f"UPDATE zone_stats SET avg_fare = 42.0 WHERE zone_id = {z}")   # set one row\n'
+              'conn.sql("DELETE FROM zone_stats WHERE zone_id = 999")                  # drop the demo zone</pre>')
+        _sql(conn, f"UPDATE zone_stats SET avg_fare = 42.0 WHERE zone_id = {z}")
+        _sql(conn, "DELETE FROM zone_stats WHERE zone_id = 999")
         after = q("SELECT count(*) FROM zone_stats")
         upd_ok = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {z}") == 42.0
         del_ok = q("SELECT count(*) FROM zone_stats WHERE zone_id = 999") == 0
-        results.append(_row("DeltaTable update + delete", before, after, before - 1, after == before - 1,
+        results.append(_row("UPDATE + DELETE", before, after, before - 1, after == before - 1,
                             upd_ok and del_ok, time.perf_counter() - t0))
         say(f"zone {z} avg → 42.0 (update), zone 999 removed (delete); {before:,} → {after:,} rows")
 
-    # 13 ── df.write.insertInto(name): append into an EXISTING table by catalog name ────────────────────
-    with _step(13, "df.write.insertInto('zone_stats'): the Spark insertInto verb — append by name") as say:
+    # 13 ── INSERT INTO … SELECT: append a copy of an existing row by name ─────────────────────────────
+    with _step(13, "SQL append: INSERT INTO zone_stats SELECT * FROM zone_stats WHERE … — copy a row by name") as say:
         t0 = time.perf_counter()
         dup_id = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")
         before = q("SELECT count(*) FROM zone_stats")
         # source rows are SELECT *'d straight from the table, so the Delta schema matches exactly.
-        _emit('  <pre class="py"># Spark insertInto — append rows into an existing table by name:\n'
-              f'dup = conn.sql("SELECT * FROM zone_stats WHERE zone_id = {dup_id}")\n'
-              'dup.write.insertInto("zone_stats")   # errors if the table does not exist</pre>')
-        dup = conn.sql(f"SELECT * FROM zone_stats WHERE zone_id = {dup_id}")
-        dup.write.insertInto("zone_stats")
+        _emit('  <pre class="py"># INSERT INTO … SELECT — append rows into an existing table by name:\n'
+              f'conn.sql("INSERT INTO zone_stats SELECT * FROM zone_stats WHERE zone_id = {dup_id}")</pre>')
+        _sql(conn, f"INSERT INTO zone_stats SELECT * FROM zone_stats WHERE zone_id = {dup_id}")
         after = q("SELECT count(*) FROM zone_stats")
         ins_ok = q(f"SELECT count(*) FROM zone_stats WHERE zone_id = {dup_id}") == 2
-        results.append(_row("DataFrame insertInto (+1)", before, after, before + 1, after == before + 1,
+        results.append(_row("INSERT copy (+1)", before, after, before + 1, after == before + 1,
                             ins_ok, time.perf_counter() - t0))
         say(f"appended a copy of zone {dup_id} by name; {before:,} → {after:,} rows")
 
-    # 14 ── df.write.option('replaceWhere', …): atomic slice overwrite by name ─────────────────────────
-    with _step(14, "df.write.option('replaceWhere', pred).mode('overwrite').saveAsTable('zone_stats'): "
-                   "atomic slice swap") as say:
+    # 14 ── INSERT … REPLACE WHERE: atomic slice overwrite by name ─────────────────────────────────────
+    with _step(14, "SQL atomic slice swap: INSERT INTO zone_stats REPLACE WHERE <pred> SELECT …") as say:
         t0 = time.perf_counter()
         z = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")
         before = q("SELECT count(*) FROM zone_stats")
-        matched = q(f"SELECT count(*) FROM zone_stats WHERE zone_id = {z}")  # may be >1 after step 12
+        matched = q(f"SELECT count(*) FROM zone_stats WHERE zone_id = {z}")  # may be >1 after step 13
         # source = one row, same schema (one column overridden), atomically replacing the whole slice.
-        _emit('  <pre class="py">new = conn.sql(f"SELECT * REPLACE (55.5::DOUBLE AS avg_fare) "\n'
-              '               f"FROM zone_stats WHERE zone_id = {z} LIMIT 1")\n'
-              'new.write.option("replaceWhere", f"zone_id = {z}").mode("overwrite").saveAsTable("zone_stats")</pre>')
-        new = conn.sql(f"SELECT * REPLACE (55.5::DOUBLE AS avg_fare) FROM zone_stats WHERE zone_id = {z} LIMIT 1")
-        new.write.option("replaceWhere", f"zone_id = {z}").mode("overwrite").saveAsTable("zone_stats")
+        _emit('  <pre class="py">conn.sql(f"INSERT INTO zone_stats REPLACE WHERE zone_id = {z} "\n'
+              '         f"SELECT * REPLACE (55.5::DOUBLE AS avg_fare) "\n'
+              '         f"FROM zone_stats WHERE zone_id = {z} LIMIT 1")</pre>')
+        _sql(conn, f"""
+            INSERT INTO zone_stats REPLACE WHERE zone_id = {z}
+            SELECT * REPLACE (55.5::DOUBLE AS avg_fare) FROM zone_stats WHERE zone_id = {z} LIMIT 1
+        """)
         after = q("SELECT count(*) FROM zone_stats")
         expected = before - matched + 1   # the matched slice collapses to the single source row
         rw_ok = (q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {z}") == 55.5
                  and q(f"SELECT count(*) FROM zone_stats WHERE zone_id = {z}") == 1)
-        results.append(_row("DataFrame replaceWhere (slice swap)", before, after, expected, after == expected,
+        results.append(_row("REPLACE WHERE (slice swap)", before, after, expected, after == expected,
                             rw_ok, time.perf_counter() - t0))
         say(f"zone {z} slice ({matched} row(s)) replaced atomically by 1 row (avg → 55.5); "
             f"{before:,} → {after:,} rows")
-
-    # 15 ── concurrent MERGE clash — DataFrame builder API, snapshot isolation ────────────────────────
-    with _step(15, "concurrent MERGE clash (DataFrame DeltaTable.merge): two writers, one snapshot — "
-                   "the stale one is refused") as say:
-        from deltalake.exceptions import CommitFailedError
-        t0 = time.perf_counter()
-        busiest = q("SELECT zone_id FROM zone_stats ORDER BY trips DESC LIMIT 1")
-        old_avg = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {busiest}")
-        before = q("SELECT count(*) FROM zone_stats")
-        cond = "target.zone_id = source.zone_id"
-        # DataFrame builder on purpose (step 7 already showed a SQL MERGE): .merge() snapshot-pins at
-        # BUILD time, so we can stage TWO writers against the SAME version before either commits — a raw
-        # conn.sql MERGE pins-and-commits in one call, so it can't stage the clash. Exactly two concurrent writers.
-        _emit('  <pre class="py"># DataFrame builder API — staged so both writers pin the SAME version before committing:\n'
-              f'writer_A = DeltaTable.forName(conn, "zone_stats").merge(srcA, "{cond}") \\\n'
-              '    .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcA sets avg → 100.0\n'
-              f'writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, "{cond}") \\\n'
-              '    .whenMatchedUpdateAll().whenNotMatchedInsertAll()   # srcB sets avg → 200.0\n'
-              'writer_A.execute()   # wins, advances the table version\n'
-              'writer_B.execute()   # stale snapshot → CommitFailedError</pre>')
-        srcA = conn.sql(f"SELECT zone_id, zone, trips, 100.00::DOUBLE AS avg_fare FROM zone_stats WHERE zone_id = {busiest}")
-        srcB = conn.sql(f"SELECT zone_id, zone, trips, 200.00::DOUBLE AS avg_fare FROM zone_stats WHERE zone_id = {busiest}")
-        writer_A = DeltaTable.forName(conn, "zone_stats").merge(srcA, cond).whenMatchedUpdateAll().whenNotMatchedInsertAll()
-        writer_B = DeltaTable.forName(conn, "zone_stats").merge(srcB, cond).whenMatchedUpdateAll().whenNotMatchedInsertAll()
-        say(f"both writers built against zone {busiest} (avg {old_avg}) at the same snapshot")
-        writer_A.execute()  # writer A wins the race, advancing the table version
-        try:
-            writer_B.execute()  # writer B is now one version behind → OCC must refuse it
-            clashed, errline = False, ""
-        except CommitFailedError as e:
-            clashed, errline = True, str(e).splitlines()[0]
-        final_avg = q(f"SELECT avg_fare FROM zone_stats WHERE zone_id = {busiest}")
-        after = q("SELECT count(*) FROM zone_stats")
-        _table([("A — fresh snapshot", "100.0", "committed ✅"),
-                ("B — stale snapshot", "200.0", "refused ✅" if clashed else "committed ❌ (UNSAFE)")],
-               ["writer", "intended avg", "outcome"], "  two concurrent MERGEs against one snapshot")
-        results.append(_row("Concurrent MERGE clash", before, after, before, after == before,
-                            clashed and final_avg == 100.0, time.perf_counter() - t0))
-        say(f"snapshot isolation held: zone {busiest} avg = {final_avg} (writer A won); "
-            f"writer B refused — {errline.split(':')[-1].strip() or 'CommitFailedError'}")
 
     _part("Part 3 · multi-catalog — attach a second lakehouse and query across both",
           "conn.attach(path, name=…) brings a second lakehouse in as a named catalog, addressed as "
@@ -617,31 +570,34 @@ def run_taxi_demo(conn, schema):
     # 16 ── attach a second lakehouse as a named catalog ────────────────────────────────────────────
     with _step(16, "conn.attach(path, name='scratch'): bring a second lakehouse in as a catalog") as say:
         scratch_path = tempfile.mkdtemp(prefix="duckrun_scratch_")
-        primary = conn.catalog.currentCatalog()
+        primary = conn._current_catalog
         _emit('  <pre class="py"># a second lakehouse root becomes a named catalog (could be another\n'
               '# OneLake lakehouse, an S3 bucket, … — here a local scratch dir):\n'
               'conn.attach(scratch_path, name="scratch")\n'
-              'conn.catalog.listCatalogs()      # [primary, "scratch"]\n'
-              'conn.catalog.currentCatalog()    # still the primary — attach does NOT switch</pre>')
+              'list(conn._catalogs)     # [primary, "scratch"]\n'
+              'conn._current_catalog    # still the primary — attach does NOT switch</pre>')
         conn.attach(scratch_path, name="scratch")
-        _table([(c, "primary (current)" if c == primary else "attached") for c in conn.catalog.listCatalogs()],
+        _table([(c, "primary (current)" if c == primary else "attached") for c in conn._catalogs],
                ["catalog", "role"], "  attached catalogs (each is its own lakehouse root)")
         say(f"attached '{_trim_loc(scratch_path)}' as catalog 'scratch'; current catalog is still '{primary}'")
 
-    # 17 ── cross-catalog write: saveAsTable into the SCRATCH catalog by 3-part name ─────────────────
-    with _step(17, "cross-catalog write: df.write.saveAsTable('scratch.dbo.borough_targets') — lands "
-                   "under the SCRATCH root, not the primary") as say:
+    # 17 ── cross-catalog write: CREATE OR REPLACE TABLE into the SCRATCH catalog by 3-part name ──────
+    with _step(17, "cross-catalog write: CREATE OR REPLACE TABLE scratch.dbo.borough_targets AS … — "
+                   "lands under the SCRATCH root, not the primary") as say:
         t0 = time.perf_counter()
         _emit('  <pre class="py"># a 3-part name routes the write to THAT catalog\'s storage root:\n'
-              'targets = conn.sql("SELECT borough, round(sum(revenue) * 1.1, 0) AS target_rev "\n'
-              '                   "FROM mart_zone_revenue GROUP BY borough")\n'
-              'targets.write.mode("overwrite").saveAsTable("scratch.dbo.borough_targets")\n'
-              'DeltaTable.forName(conn, "scratch.dbo.borough_targets").path   # under the scratch root</pre>')
-        targets = conn.sql("SELECT borough, round(sum(revenue) * 1.1, 0) AS target_rev "
-                           "FROM mart_zone_revenue GROUP BY borough")
-        targets.write.mode("overwrite").saveAsTable("scratch.dbo.borough_targets")
+              'conn.sql("CREATE OR REPLACE TABLE scratch.dbo.borough_targets AS "\n'
+              '         "SELECT borough, round(sum(revenue) * 1.1, 0) AS target_rev "\n'
+              '         "FROM mart_zone_revenue GROUP BY borough")\n'
+              '# its physical location is under the scratch root:\n'
+              'conn._table_path("dbo", "borough_targets", catalog="scratch")</pre>')
+        _sql(conn, """
+            CREATE OR REPLACE TABLE scratch.dbo.borough_targets AS
+            SELECT borough, round(sum(revenue) * 1.1, 0) AS target_rev
+            FROM mart_zone_revenue GROUP BY borough
+        """)
         n_tgt = q("SELECT count(*) FROM scratch.dbo.borough_targets")
-        landed = DeltaTable.forName(conn, "scratch.dbo.borough_targets").path.replace("\\", "/")
+        landed = conn._table_path("dbo", "borough_targets", catalog="scratch").replace("\\", "/")
         in_scratch = scratch_path.replace("\\", "/") in landed
         results.append(_row("Cross-catalog write (scratch)", 0, n_tgt, n_tgt, n_tgt > 0, in_scratch,
                             time.perf_counter() - t0))
@@ -658,24 +614,27 @@ def run_taxi_demo(conn, schema):
             FROM mart_zone_revenue m
             JOIN scratch.dbo.borough_targets t ON t.borough = m.borough
             GROUP BY m.borough ORDER BY actual_rev DESC
-        """).collect()
+        """).fetchall()
         _table([(b, f"{a:,.0f}", f"{tg:,.0f}", f"{pct}%") for b, a, tg, pct in rows],
                ["borough", "actual $", "target $", "% of target"],
                "  actuals (primary catalog) joined to targets (scratch catalog) in a single query")
         say(f"one SQL statement joined {len(rows)} boroughs across two lakehouses on different storage")
 
     # 19 ── switch the current catalog, and the fail-loud safety rails ───────────────────────────────
-    with _step(19, "catalog.setCurrentCatalog('scratch'): unqualified names resolve there; then the guards") as say:
-        _emit('  <pre class="py">conn.catalog.setCurrentCatalog("scratch")\n'
+    with _step(19, "USE scratch: unqualified names resolve there; then the guards") as say:
+        _emit('  <pre class="py">conn.sql("USE scratch.dbo")\n'
               'conn.sql("SELECT count(*) FROM borough_targets")   # unqualified → scratch.dbo\n'
-              'conn.catalog.setCurrentCatalog(primary)            # back to the warehouse\n'
+              'conn.sql(f"USE {primary}")                         # back to the warehouse\n'
               '# fail-loud rails (both raise — no state change):\n'
               'conn.attach(scratch_path, name="dup")              # one URL ↔ one name\n'
               'conn.sql("INSERT INTO scratch.dbo.borough_targets VALUES (\'Z\', 0)")  # cross-catalog raw DML</pre>')
-        conn.catalog.setCurrentCatalog("scratch")
+        primary_db = conn._current_database                      # restore the primary's schema after
+        conn._use("scratch", "dbo")
+        conn._current_catalog, conn._current_database = "scratch", "dbo"
         unq = q("SELECT count(*) FROM borough_targets")           # resolves in scratch.dbo now
-        switched = conn.catalog.currentCatalog()
-        conn.catalog.setCurrentCatalog(primary)
+        switched = conn._current_catalog
+        conn._use(primary, primary_db)
+        conn._current_catalog, conn._current_database = primary, primary_db
         guards = []
         try:
             conn.attach(scratch_path, name="dup")                # same URL → refused
@@ -690,12 +649,11 @@ def run_taxi_demo(conn, schema):
         say(f"unqualified name resolved in '{switched}' ({unq} rows); switched back to '{primary}'; "
             f"{len(guards)} safety rails held")
 
-    _part("Part 4 · the full MERGE surface — a real recompute, applied in one MERGE (SQL & DataFrame)",
+    _part("Part 4 · the full MERGE surface — a real recompute, applied in one conn.sql MERGE",
           "duckrun's MERGE is the COMPLETE delta-rs TableMerger — matched UPDATE (arbitrary expressions, "
           "CASE) / matched DELETE / NOT MATCHED INSERT / NOT MATCHED BY SOURCE delete, any number of "
-          "clauses applied in order. Both steps drive ONE MERGE off a fresh recompute over the 'trips' "
-          "fact (a subquery — the real ETL shape, no hand-typed VALUES): one through conn.sql, one "
-          "through the DeltaTable.merge builder.")
+          "clauses applied in order. Both steps drive ONE conn.sql MERGE off a fresh recompute over the "
+          "'trips' fact (a subquery — the real ETL shape, no hand-typed VALUES).")
 
     # 20 ── SQL: refresh a dimension from the fact in ONE merge — recompute source, all clause kinds ──
     with _step(20, "SQL full-surface MERGE (real ETL): a fresh recompute over 'trips', applied to a "
@@ -759,15 +717,15 @@ def run_taxi_demo(conn, schema):
                             after == n_zones - retired, ok, time.perf_counter() - t0))
         _table([(t, f"{z:,}", f"{mn:,}", f"{mx:,}") for t, z, mn, mx in conn.sql(
                     """SELECT tier, count(*) AS zones, min(trips) AS mn, max(trips) AS mx
-                       FROM zone_scorecard GROUP BY tier ORDER BY tier""").collect()],
+                       FROM zone_scorecard GROUP BY tier ORDER BY tier""").fetchall()],
                ["tier", "zones", "min trips", "max trips"],
                "  zone_scorecard after the merge — tiers (re)assigned by CASE, low-volume zones retired, new zones onboarded")
         say(f"one MERGE off a recompute subquery: retired {retired}, refreshed {before - retired}, "
             f"onboarded {onboarded}; {before:,} → {after:,} rows, 0 drift")
 
-    # 21 ── DataFrame: full-sync a dimension from a recompute — refresh matched, purge departed keys ──
-    with _step(21, "DataFrame full-surface merge (real ETL): full-sync 'fare_watch' from a fresh "
-                   "recompute over 'trips' via the builder — whenMatchedUpdate(CASE) + whenNotMatchedBySourceDelete") as say:
+    # 21 ── SQL full-sync a dimension from a recompute — refresh matched, purge departed keys ─────────
+    with _step(21, "SQL full-surface MERGE (real ETL): full-sync 'fare_watch' from a fresh recompute "
+                   "over 'trips' — WHEN MATCHED UPDATE (CASE) + WHEN NOT MATCHED BY SOURCE THEN DELETE") as say:
         # the dimension carries two decommissioned zones (901, 902) that no longer appear in the fact —
         # a full sync must refresh the live zones AND purge the departed ones.
         _sql(conn, """
@@ -781,24 +739,21 @@ def run_taxi_demo(conn, schema):
         before = q("SELECT count(*) FROM fare_watch")
         n_zones = q("SELECT count(DISTINCT zone_id) FROM trips")
         hi = q("SELECT approx_quantile(avg_fare, 0.75) FROM (SELECT avg(fare) AS avg_fare FROM trips GROUP BY zone_id)")
-        # the merge SOURCE is a recompute over the fact (real ETL). The builder refreshes every matched
+        # the merge SOURCE is a recompute over the fact (real ETL). The MERGE refreshes every matched
         # zone — re-banding 'status' with a CASE expression — and DELETEs every target zone the source
         # no longer carries, so the two decommissioned zones are purged. No VALUES in the merge.
-        _emit('  <pre class="py"># builder full-sync: source is a recompute over the fact, not VALUES\n'
-              'src = conn.sql("SELECT zone_id, any_value(zone) AS zone, "\n'
-              '               "round(avg(fare),2)::DOUBLE AS avg_fare FROM trips GROUP BY zone_id")\n'
-              'DeltaTable.forName(conn, "fare_watch").merge(src, "target.zone_id = source.zone_id") \\\n'
-              '    .whenMatchedUpdate(set={"avg_fare": "source.avg_fare",\n'
-              '        "status": "case when source.avg_fare >= <p75> then \'premium\' else \'active\' end"}) \\\n'
-              '    .whenNotMatchedBySourceDelete() \\\n'
-              '    .execute()</pre>')
-        src = conn.sql("SELECT zone_id, any_value(zone) AS zone, round(avg(fare), 2)::DOUBLE AS avg_fare "
-                       "FROM trips GROUP BY zone_id")
-        DeltaTable.forName(conn, "fare_watch").merge(src, "target.zone_id = source.zone_id") \
-            .whenMatchedUpdate(set={"avg_fare": "source.avg_fare",
-                                    "status": f"case when source.avg_fare >= {hi} then 'premium' else 'active' end"}) \
-            .whenNotMatchedBySourceDelete() \
-            .execute()
+        _sql(conn, f"""
+            MERGE INTO fare_watch t
+            USING (
+                SELECT zone_id, any_value(zone) AS zone, round(avg(fare), 2)::DOUBLE AS avg_fare
+                FROM trips GROUP BY zone_id
+            ) s
+            ON t.zone_id = s.zone_id
+            WHEN MATCHED THEN UPDATE SET
+                avg_fare = s.avg_fare,
+                status   = CASE WHEN s.avg_fare >= {hi} THEN 'premium' ELSE 'active' END
+            WHEN NOT MATCHED BY SOURCE THEN DELETE
+        """)
         after = q("SELECT count(*) FROM fare_watch")
         purged = q("SELECT count(*) FROM fare_watch WHERE zone_id IN (901, 902)")
         drift = q("""
@@ -812,14 +767,14 @@ def run_taxi_demo(conn, schema):
             and drift == 0                         # matched UPDATE refreshed every zone from source
             and q("SELECT count(*) FROM fare_watch WHERE status = 'premium'") > 0   # CASE re-band applied
         )
-        results.append(_row("DataFrame merge (refresh+purge)", before, after, n_zones, after == n_zones, ok,
+        results.append(_row("SQL MERGE (refresh+purge)", before, after, n_zones, after == n_zones, ok,
                             time.perf_counter() - t0))
         _table([(s, f"{z:,}", f"{mn:,.2f}", f"{mx:,.2f}") for s, z, mn, mx in conn.sql(
                     """SELECT status, count(*) AS zones, min(avg_fare) AS mn, max(avg_fare) AS mx
-                       FROM fare_watch GROUP BY status ORDER BY status""").collect()],
+                       FROM fare_watch GROUP BY status ORDER BY status""").fetchall()],
                ["status", "zones", "min fare", "max fare"],
                "  fare_watch after the full-sync — every live zone refreshed & re-banded by CASE, decommissioned zones purged")
-        say(f"builder full-sync off a recompute: refreshed {n_zones} live zones (re-banded via CASE), "
+        say(f"MERGE full-sync off a recompute: refreshed {n_zones} live zones (re-banded via CASE), "
             f"purged {before - after} departed; {before:,} → {after:,} rows, 0 drift")
 
     _part("Part 5 · loose files — conn.copy() / conn.download() (non-Delta, storage-neutral)",
@@ -851,10 +806,10 @@ def run_taxi_demo(conn, schema):
         t0 = time.perf_counter()
         back = tempfile.mkdtemp(prefix="duckrun_files_dl_")
         _emit('  <pre class="py">conn.download("demo_files/…", local_dir, overwrite=True)  # OneLake → local\n'
-              'conn.read.csv(local_dir + "/zone_scorecard.csv").count()   # re-read what came back</pre>')
+              'conn.sql("SELECT count(*) FROM read_csv_auto(\'<local_dir>/zone_scorecard.csv\')").fetchone()[0]</pre>')
         conn.download(remote_dir, back, overwrite=True)
         csv_back = os.path.join(back, "zone_scorecard.csv").replace("\\", "/")
-        rows_back = conn.read.csv(csv_back).count()
+        rows_back = conn.sql(f"SELECT count(*) FROM read_csv_auto('{csv_back}')").fetchone()[0]
         rows_local = q("SELECT count(*) FROM zone_scorecard")
         results.append(_row("conn.download (Files round-trip)", rows_local, rows_back, rows_local,
                             rows_back == rows_local, rows_back == rows_local, time.perf_counter() - t0))
