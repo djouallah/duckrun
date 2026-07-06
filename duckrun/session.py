@@ -631,7 +631,7 @@ class DuckSession:
 
         3 parts → ``catalog.schema.table`` (the catalog must be attached); 2 parts → ``schema.table``
         in the current catalog; 1 part → table in the current catalog + database."""
-        parts = [p.strip().strip('"') for p in name.split(".")]
+        parts = delta_dml._split_dotted(name)  # quote-aware: a dot inside "a.b" stays one part
         if len(parts) >= 3:
             catalog, schema, table = parts[-3], parts[-2], parts[-1]
             if catalog not in self._catalogs:
@@ -1089,7 +1089,7 @@ class DuckSession:
         a missing leading segment defaults to ``*`` (schema) / the current catalog. Returns the matched
         ``(catalog, schema, table)`` targets (possibly empty — the caller reports the miss)."""
         import fnmatch
-        parts = source.split(".")
+        parts = delta_dml._split_dotted(source)  # quote-aware split (matches _resolve / the router)
         if len(parts) == 1:
             cat_pat, schema_pat, table_pat = self._current_catalog, "*", parts[0]
         elif len(parts) == 2:

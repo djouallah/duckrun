@@ -444,7 +444,7 @@ def dml_target_catalog(query: str) -> Optional[str]:
     m = _DML_REL.match(_strip_leading(body))
     if not m:
         return None
-    parts = [p.strip().strip('"') for p in m.group("rel").split(".")]
+    parts = _split_dotted(m.group("rel"))  # quote-aware: a dot inside "a.b" isn't a separator
     return parts[0] if len(parts) >= 3 else None
 
 
@@ -835,7 +835,7 @@ class _DeltaDML:
         # the current catalog, then the qualified view create fails on the missing schema (a partial
         # CTAS: data committed, view never registered). A 1/2-part rel stays unqualified in the current
         # catalog, preserving the dbt single-catalog path.
-        parts = [p.strip().strip('"') for p in rel.split(".")]
+        parts = _split_dotted(rel)  # quote-aware: a dot inside "a.b" isn't a separator
         if len(parts) >= 3:
             self.cursor.execute(f'create schema if not exists "{parts[-3]}"."{schema}"')
         else:

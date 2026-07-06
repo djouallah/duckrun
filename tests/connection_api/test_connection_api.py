@@ -746,6 +746,21 @@ def test_split_top_level_skips_dollar_quoted_bodies():
     assert len(_split_top_level("delete from t where id=1; insert into t values (1)")) == 2
 
 
+def test_dotted_name_sites_are_quote_aware():
+    # Regression: the name-splitting sites (session._resolve, session._glob_stats_targets,
+    # delta_dml.dml_target_catalog, delta_dml._refresh_view) all route through one quote-aware
+    # splitter, so a dot INSIDE a quoted identifier ("a.b", one legal name) is never mistaken for a
+    # schema/catalog separator. Previously these split on "." first and stripped quotes after.
+    from dbt.adapters.duckrun.delta_dml import _split_dotted, dml_target_catalog
+    assert _split_dotted('"a.b"') == ["a.b"]                    # one quoted identifier, not schema.table
+    assert _split_dotted("cat.sch.tbl") == ["cat", "sch", "tbl"]
+    assert _split_dotted('cat.sch."a.b"') == ["cat", "sch", "a.b"]
+    # dml_target_catalog only reports a catalog for a genuinely 3-part target
+    assert dml_target_catalog('insert into "a.b" select 1') is None       # 1 part → no catalog
+    assert dml_target_catalog("insert into cat.sch.tbl select 1") == "cat"
+    assert dml_target_catalog('insert into cat.sch."a.b" select 1') == "cat"
+
+
 def test_partial_insert_null_fills_and_keeps_type(tmp_path):
     # INSERT with a column list shorter than the table null-fills the rest — and the omitted column
     # keeps its declared type (no drift to a nullable string).
