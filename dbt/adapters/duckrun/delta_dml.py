@@ -539,9 +539,26 @@ def _insert_kind(sql: str) -> Optional[str]:
     return "select"
 
 
+def _split_dotted(name: str) -> List[str]:
+    """Split a qualified name on the dots that separate its parts, treating a double-quoted span as
+    opaque so a dot INSIDE quotes (`"a.b"`, one legal quoted identifier) does NOT split the name.
+    Quotes are then stripped per part (matching the historical `.strip('"')`)."""
+    parts, start, in_q = [], 0, False
+    for i, ch in enumerate(name):
+        if ch == '"':
+            in_q = not in_q
+        elif ch == "." and not in_q:
+            parts.append(name[start:i])
+            start = i + 1
+    parts.append(name[start:])
+    return [p.strip().strip('"') for p in parts]
+
+
 def _split_relation(rel: str) -> Tuple[Optional[str], Optional[str]]:
-    """`"db"."schema"."tbl"` / `schema.tbl` / `tbl` -> (schema, identifier), quotes stripped."""
-    parts = [p.strip().strip('"') for p in rel.strip().split(".")]
+    """`"db"."schema"."tbl"` / `schema.tbl` / `tbl` / `"a.b"` -> (schema, identifier), quotes stripped.
+    Quote-aware: a dot inside a quoted identifier (`"a.b"`) is part of the name, not a separator, so
+    `CREATE TABLE "a.b"` is one table named `a.b` rather than schema `a` / table `b`."""
+    parts = _split_dotted(rel.strip())
     if not parts or not parts[-1]:
         return None, None
     identifier = parts[-1]
@@ -1051,20 +1068,23 @@ class _DeltaDML:
             raise ValueError(
                 f"UPDATE on {loc!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
             )
-        if where and _PREDICATE_SUBQUERY.search(where):
-            # delta_rs's update(predicate) hits the same datafusion "not implemented" panic on a
-            # subquery predicate as delete() does (`… where id in (select … from other)`). DuckDB CAN
-            # evaluate it, so compute the updated rows there — `CASE WHEN (pred) THEN <expr> ELSE col
-            # END` per SET column via SELECT * REPLACE — and commit a fenced full overwrite, mirroring
-            # _delete's fallback. Fenced to vB so a concurrent commit fails loud, not clobbered.
+        if (where and _PREDICATE_SUBQUERY.search(where)) or \
+                any(_PREDICATE_SUBQUERY.search(e) for e in updates.values()):
+            # delta_rs's update() hits a datafusion "not implemented" panic (pyo3 PanicException) on a
+            # subquery in EITHER the predicate (`… where id in (select …)`) OR a SET expression
+            # (`set g = (select max(id) from ref)` — the very rewrite our UPDATE…FROM error recommends).
+            # DuckDB CAN evaluate both, so compute the updated rows there — `CASE WHEN (pred) THEN <expr>
+            # ELSE col END` per SET column via SELECT * REPLACE (no predicate → apply <expr> to every row)
+            # — and commit a fenced full overwrite, mirroring _delete's fallback. Fenced to vB so a
+            # concurrent commit fails loud, not clobbered.
             logger.debug(
-                f"duckrun: UPDATE predicate on {loc!r} references a subquery; delta_rs can't "
-                "evaluate it, falling back to a DuckDB-evaluated fenced full overwrite (slower)."
+                f"duckrun: UPDATE on {loc!r} references a subquery (predicate or SET expr); delta_rs "
+                "can't evaluate it, falling back to a DuckDB-evaluated fenced full overwrite (slower)."
             )
             vB = engine.table_version(loc, self.so)
-            loc_sql = loc.replace("'", "''")
             replaces = ", ".join(
-                f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"'
+                (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
+                 else f'({expr}) AS "{col}"')
                 for col, expr in updates.items()
             )
             tmp = f"__duckrun_upd_{abs(hash(loc)) & 0xFFFFFFFF}"
