@@ -90,6 +90,9 @@ _CLASSIFY = [
     ("/* c */\nMERGE INTO t a USING s b ON a.id = b.id WHEN MATCHED THEN DELETE", "delta"),
     ("with c as (select 1 id) insert into t select id from c", "delta"),  # CTE-wrapped DML
     ("alter table t add column x int", "delta"),
+    ("alter table t drop column x", "delta"),
+    ("alter table t rename column a to b", "delta"),
+    ("insert with schema evolution into t select 1 id, 2 extra", "delta"),
     ("drop table t", "delta"),
     ("drop table if exists t", "delta"),
     ("vacuum t", "delta"),                                   # DuckDB verb → Delta compact + vacuum
@@ -284,6 +287,33 @@ def test_use_switches_write_routing(tmp_path):
     assert glob.glob(os.path.join(sec, "**", "t"), recursive=True)      # landed in sec
     assert not glob.glob(os.path.join(prim, "**", "t"), recursive=True)  # NOT the primary
     c.close()
+
+
+# ───────────────────────────────────────── schema evolution: INSERT … / DROP / RENAME COLUMN
+
+def test_insert_with_schema_evolution_adds_columns(w):
+    """INSERT WITH SCHEMA EVOLUTION INTO t … (Databricks spelling) widens the table with the source's
+    new columns (existing rows get NULL); a plain INSERT of an unknown column drops it instead."""
+    w.sql("CREATE OR REPLACE TABLE t AS SELECT 1 AS id, 'a' AS name")
+    w.sql("INSERT WITH SCHEMA EVOLUTION INTO t SELECT 2 AS id, 'b' AS name, 99 AS extra")
+    assert w.sql("select * from t").columns == ["id", "name", "extra"]
+    assert w.sql("select id, name, extra from t order by id").fetchall() == [(1, "a", None), (2, "b", 99)]
+
+
+def test_alter_drop_column(w):
+    """ALTER TABLE t DROP COLUMN c — a fenced overwrite rewrite (delta_rs has no in-place drop)."""
+    w.sql("CREATE OR REPLACE TABLE d AS SELECT 1 AS a, 2 AS b, 3 AS cc")
+    w.sql("ALTER TABLE d DROP COLUMN b")
+    assert w.sql("select * from d").columns == ["a", "cc"]
+    assert w.sql("select * from d").fetchall() == [(1, 3)]
+
+
+def test_alter_rename_column(w):
+    """ALTER TABLE t RENAME COLUMN old TO new — a fenced overwrite rewrite, data preserved."""
+    w.sql("CREATE OR REPLACE TABLE r AS SELECT 1 AS a, 2 AS b")
+    w.sql("ALTER TABLE r RENAME COLUMN b TO bb")
+    assert w.sql("select * from r").columns == ["a", "bb"]
+    assert w.sql("select * from r").fetchall() == [(1, 2)]
 
 
 def test_vacuum_refused_on_read_only(tmp_path):

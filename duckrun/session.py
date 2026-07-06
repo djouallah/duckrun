@@ -683,10 +683,11 @@ class DuckSession:
 
         Delta **DML** is applied to the Delta table via delta_rs (works local AND on OneLake):
         ``create table … as select`` (overwrite), ``insert into … select``/``insert into … values``
-        (append), ``delete``/``update`` (delta_rs delete/update), ``alter table … add column``,
-        ``drop table`` (tombstone — marks the table dropped without deleting data; a human purges
-        the files), and ``merge into … using … on … when …`` (delta_rs upsert). After a DML
-        statement the catalog is refreshed.
+        (append), ``insert with schema evolution into …`` (append that widens the table with the
+        source's new columns), ``delete``/``update`` (delta_rs delete/update), ``alter table … add /
+        drop / rename column``, ``drop table`` (tombstone — marks the table dropped without deleting
+        data; a human purges the files), and ``merge into … using … on … when …`` (delta_rs upsert).
+        After a DML statement the catalog is refreshed.
 
         ``vacuum <table>`` repurposes DuckDB's VACUUM verb for Delta maintenance: it compacts the
         table's small files (delta_rs ``optimize.compact``, dataChange=false) and vacuums files

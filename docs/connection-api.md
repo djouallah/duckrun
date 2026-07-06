@@ -49,10 +49,10 @@ dialect and no DataFrame API to learn; `conn.sql()` hands back DuckDB's own rela
 duckrun layers exactly two things on top:
 
 1. **Write DML runs against Delta, not a DuckDB table.** `CREATE TABLE … AS`, `INSERT`, `UPDATE`,
-   `DELETE`, `MERGE`, `ALTER TABLE … ADD COLUMN`, and `DROP TABLE` are written in ordinary DuckDB SQL
-   syntax, but duckrun routes them to delta-rs so they land on the Delta table (local or OneLake) with
-   snapshot fencing — see the [DML matrix](#raw-sql-dml-through-connsql).
-2. **Three Delta-specific extensions** DuckDB has no syntax for. These are the *only* places duckrun's
+   `DELETE`, `MERGE`, `ALTER TABLE … ADD/DROP/RENAME COLUMN`, and `DROP TABLE` are written in ordinary
+   DuckDB SQL syntax, but duckrun routes them to delta-rs so they land on the Delta table (local or
+   OneLake) with snapshot fencing — see the [DML matrix](#raw-sql-dml-through-connsql).
+2. **A few Delta-specific extensions** DuckDB has no syntax for. These are the *only* places duckrun's
    SQL isn't vanilla DuckDB:
 
    | Extension | What it is |
@@ -60,6 +60,7 @@ duckrun layers exactly two things on top:
    | `CREATE TABLE … SORTED BY AUTO AS …` | duckrun profiles the data and picks the clustering key. (`SORTED BY (cols)` and `PARTITIONED BY (cols)` without `AUTO` are DuckDB's *own* CTAS syntax — not extensions.) |
    | `VACUUM <table>` | DuckDB's `VACUUM` verb, repurposed to compact + vacuum the Delta table (plain DuckDB `VACUUM` is a stats no-op). |
    | `INSERT INTO <t> REPLACE WHERE <pred> SELECT …` | delta_rs `replaceWhere` — an atomic slice overwrite (the Databricks spelling). |
+   | `INSERT WITH SCHEMA EVOLUTION INTO <t> SELECT …` | append that widens the table with the source's new columns (existing rows → NULL), instead of dropping them — delta_rs `schema_mode='merge'` (the Databricks spelling). |
 
 Everything else is portable DuckDB SQL — the same query runs on plain DuckDB.
 

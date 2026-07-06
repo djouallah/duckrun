@@ -170,6 +170,14 @@ _INSERT_REPLACE = re.compile(
     r"replace\s+where\b(?P<rest>.+)", re.I | re.S,
 )
 _REPLACE_BODY_KW = re.compile(r"\b(?:select|values|with)\b", re.I)
+# `insert with schema evolution into <t> <select|values>` (Databricks spelling) — append with delta_rs
+# schema_mode='merge', so columns the source has and the table lacks are ADDED (existing rows → NULL),
+# instead of the plain append's project-to-target (which drops unknown columns).
+_INSERT_SCHEMA_EVOLUTION = re.compile(
+    r"\s*insert\s+with\s+schema\s+evolution\s+into\s+"
+    r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)\s+(?P<body>(?:select|with|values)\b.+)",
+    re.I | re.S,
+)
 _DELETE = re.compile(
     r"\s*delete\s+from\s+(?P<rel>.+?)(?:\s+where\s+(?P<where>.+))?\s*;?\s*", re.I | re.S
 )
@@ -189,6 +197,17 @@ _UPDATE = re.compile(
 _TOP_WHERE = re.compile(r"\bwhere\b", re.I)
 _ALTER_ADD = re.compile(
     r"\s*alter\s+table\s+(?P<rel>.+?)\s+add\s+column\s+(?P<col>\S+)\s+(?P<def>.+?)\s*;?\s*",
+    re.I | re.S,
+)
+# `alter table <t> drop column [if exists] <c>` and `… rename column <old> to <new>`. delta_rs has no
+# in-place column drop/rename, so both are done as a fenced overwrite rewrite (DuckDB SELECT * EXCLUDE
+# / SELECT * RENAME) under overwrite_schema — same mechanism as ADD COLUMN.
+_ALTER_DROP = re.compile(
+    r"\s*alter\s+table\s+(?P<rel>.+?)\s+drop\s+column\s+(?:if\s+exists\s+)?(?P<col>[^\s;]+)\s*;?\s*",
+    re.I | re.S,
+)
+_ALTER_RENAME = re.compile(
+    r"\s*alter\s+table\s+(?P<rel>.+?)\s+rename\s+column\s+(?P<old>[^\s;]+)\s+to\s+(?P<new>[^\s;]+)\s*;?\s*",
     re.I | re.S,
 )
 # Trailing column-definition clauses (DEFAULT / NOT NULL / NULL), located structurally in _alter_add
@@ -426,7 +445,8 @@ _C_CREATE_TABLE = re.compile(r"\s*create\s+(?:or\s+replace\s+)?table\b", re.I)
 _C_FROM = re.compile(r"\bfrom\b", re.I)
 _C_USING = re.compile(r"\busing\b", re.I)
 _C_DELTA_HEAD = re.compile(
-    r"\s*(?:insert\s+into|update|delete\s+from|merge\s+into|alter\s+table|drop\s+table)\b", re.I)
+    r"\s*(?:insert\s+into|insert\s+with\s+schema\s+evolution|update|delete\s+from|"
+    r"merge\s+into|alter\s+table|drop\s+table)\b", re.I)
 _C_VACUUM = re.compile(r"\s*vacuum\s+(?:analyze\s+)?(?:\"|\w)", re.I)  # vacuum <table> → maintenance
 
 
@@ -812,6 +832,9 @@ class _DeltaDML:
         m = _fullmatch(_INSERT_REPLACE, sql)
         if m and "__duckrun" not in m.group("rel"):
             return self._insert_replace_where(m)
+        m = _fullmatch(_INSERT_SCHEMA_EVOLUTION, sql)
+        if m and "__duckrun" not in m.group("rel"):
+            return self._mutate(m, self._insert_schema_evolution)
         if _INSERT_INTO_RE.match(sql):
             # Classify VALUES vs SELECT structurally, THEN apply the matching regex — see _insert_kind.
             kind = _insert_kind(sql)
@@ -833,6 +856,12 @@ class _DeltaDML:
         m = _fullmatch(_ALTER_ADD, sql)
         if m:
             return self._mutate(m, self._alter_add)
+        m = _fullmatch(_ALTER_DROP, sql)
+        if m:
+            return self._mutate(m, self._alter_drop)
+        m = _fullmatch(_ALTER_RENAME, sql)
+        if m:
+            return self._mutate(m, self._alter_rename)
         m = _fullmatch(_MERGE, sql)
         if m:
             return self._mutate(m, self._merge)
@@ -1171,6 +1200,41 @@ class _DeltaDML:
         )
         engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
                                       storage_options=self.so)
+
+    def _alter_drop(self, m, rel, schema, loc) -> None:
+        """`alter table <t> drop column <c>`: delta_rs has no in-place column drop, so rewrite the
+        table WITHOUT the column (DuckDB ``SELECT * EXCLUDE``) under overwrite_schema, fenced to the
+        version read — the same mechanism as ADD COLUMN."""
+        col = m.group("col").strip().strip('"')
+        vB = engine.table_version(loc, self.so)
+        loc_sql = loc.replace("'", "''")
+        data = self.cursor.sql(
+            f'select * exclude ("{col}") from delta_scan(\'{loc_sql}\', version => {vB})')
+        engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
+                                      storage_options=self.so)
+
+    def _alter_rename(self, m, rel, schema, loc) -> None:
+        """`alter table <t> rename column <old> to <new>`: rewrite with the column renamed (DuckDB
+        ``SELECT * RENAME``) under overwrite_schema, fenced to the version read."""
+        old = m.group("old").strip().strip('"')
+        new = m.group("new").strip().strip('"')
+        vB = engine.table_version(loc, self.so)
+        loc_sql = loc.replace("'", "''")
+        data = self.cursor.sql(
+            f'select * rename ("{old}" as "{new}") from delta_scan(\'{loc_sql}\', version => {vB})')
+        engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
+                                      storage_options=self.so)
+
+    def _insert_schema_evolution(self, m, rel, schema, loc) -> None:
+        """`insert with schema evolution into <t> <select|values>` (Databricks spelling): append with
+        delta_rs ``schema_mode='merge'`` — columns the source has that the table lacks are ADDED
+        (existing rows get NULL), matched by name, instead of the plain append's project-to-target
+        (which silently drops unknown columns). Auto-fenced when the body reads the target."""
+        body = m.group("body")
+        data = self.cursor.sql(body)
+        read_version = engine.table_version(loc, self.so) if self._reads_target(body, loc) else None
+        engine.write_delta(loc, data, "append", merge_schema=True, read_version=read_version,
+                           storage_options=self.so, cur=self.cursor)
 
     # -- merge into <target> using <source> on <cond> when … : full delta_rs MERGE ---------------
     def _merge(self, m, rel, schema, loc) -> None:
