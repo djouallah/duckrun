@@ -785,6 +785,50 @@ def test_malformed_create_layout_fails_loud_and_writes_nothing(tmp_path):
     assert sorted(p.name for p in dbo.iterdir()) == ["good", "my report"]
 
 
+def _fs_case_sensitive() -> bool:
+    """True if the filesystem distinguishes ``A`` from ``a`` (Linux) — False on Windows/macOS, which
+    fold case on disk so two case-variant directories can't coexist."""
+    import tempfile
+    d = tempfile.mkdtemp()
+    probe = os.path.join(d, "CaseProbe")
+    open(probe, "w").close()
+    sensitive = not os.path.exists(os.path.join(d, "caseprobe"))
+    os.remove(probe)
+    os.rmdir(d)
+    return sensitive
+
+
+@pytest.mark.skipif(not _fs_case_sensitive(),
+                    reason="needs a case-sensitive filesystem (Linux CI); Windows/macOS fold Foo/foo on disk")
+@pytest.mark.xfail(reason="case split-brain — known/parked gap: DuckDB's catalog folds Foo == foo, so "
+                          "two on-disk case-variant Delta tables cannot both be exposed; one silently "
+                          "shadows the other.", strict=False)
+def test_case_variant_tables_split_brain(tmp_path):
+    """DEMONSTRATES the parked 'case split-brain' gap — reproducible ONLY on a case-sensitive
+    filesystem, which is exactly why it can't be seen on Windows (there ``Foo/`` and ``foo/`` ARE the
+    same directory, so the scenario never arises).
+
+    On Linux ``.../dbo/Foo`` and ``.../dbo/foo`` are two DIFFERENT directories, so duckrun happily
+    writes two Delta tables that differ only by case. But DuckDB's catalog is case-INSENSITIVE (it
+    folds ``Foo == foo`` even when the name is quoted), so on a fresh connect only ONE of the two
+    ``delta_scan`` views survives — the other table's rows sit on disk unreachable through SQL.
+
+    This asserts the DESIRED behaviour (both tables' rows retrievable), so it xfails today and pins
+    the gap; a fix — fold-on-write so the two coalesce into one path, or fail-loud on the second
+    create — flips it to pass. Runs on Linux CI (where it xfails), skipped on a case-folding FS.
+    """
+    con = duckrun.connect(str(tmp_path), schema="dbo", read_only=False)
+    con.sql("CREATE OR REPLACE TABLE dbo.Foo AS SELECT 1 AS n")
+    con.sql("CREATE OR REPLACE TABLE dbo.foo AS SELECT 2 AS n")
+    # two genuinely distinct tables now exist on disk (case-sensitive FS)
+    assert (tmp_path / "dbo" / "Foo").is_dir() and (tmp_path / "dbo" / "foo").is_dir()
+    # a fresh session rediscovers from disk — both case-variants should be independently queryable
+    con2 = duckrun.connect(str(tmp_path), schema="dbo")
+    reachable = {con2.sql('SELECT n FROM dbo."Foo"').fetchone()[0],
+                 con2.sql('SELECT n FROM dbo."foo"').fetchone()[0]}
+    assert reachable == {1, 2}   # today: {1} or {2} — one table shadows the other (the split-brain)
+
+
 def test_partial_insert_null_fills_and_keeps_type(tmp_path):
     # INSERT with a column list shorter than the table null-fills the rest — and the omitted column
     # keeps its declared type (no drift to a nullable string).
