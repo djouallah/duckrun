@@ -449,7 +449,7 @@ jobs:
           # retarget. One ONELAKE_TOKEN (above) authenticates all three (same storage resource).
           LH_SILVER_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           LH_BRONZE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
-          LH_GOLD_PATH: abfss://d5f25039-7f33-4668-b909-2c397b2626fb@onelake.dfs.fabric.microsoft.com/61bf56ea-a4d5-4895-a90e-a6daa6e02d04/Tables
+          LH_GOLD_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/4fb792e8-b2e6-431c-b2d3-36727410bea8/Tables
           DBT_SCHEMA: multicatalog_dbt_demo
           DUCKRUN_MULTICAT_DBT_PAGE: multicatalog_dbt_run.html
         run: python integration_tests/multicatalog/demo_multicatalog_dbt.py
