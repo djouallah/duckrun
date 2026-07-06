@@ -246,8 +246,8 @@ jobs:
       - name: Run the connection-API method matrix
         # The matrix is the per-method Test* classes in the merged suite; -k selects ONLY those so
         # the scorecard counts methods, not the write-correctness / contract functions in the same
-        # file (which run in the `adapter` job). Render even on failure (the gate is a later step).
-        continue-on-error: true
+        # file (which run in the `adapter` job). These are duckrun's own methods — they must ALL pass,
+        # so a failure here fails the job (the card still renders via the always() step below).
         run: |
           python -m pytest tests/connection_api/test_connection_api.py \
             -k "TestSession or TestCatalog or TestDataFrame or TestDataFrameReader or TestDataFrameWriter or TestDeltaTable or TestSqlDml" \

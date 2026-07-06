@@ -151,10 +151,8 @@ jobs:
           name: docs-aemo
           path: integration_tests/aemo/target/static_index.html
       - name: SORTED BY AUTO sort rewrite on fct_summary (dogfood on real data)
-        # Non-blocking: run the SQL-only auto-key sort rewrite on the real summary table over OneLake
-        # and print the before/after layout. Last step on purpose — it's a rewrite the next dbt build
-        # supersedes, and it must not gate the integration on a new feature.
-        continue-on-error: true
+        # Run the SQL-only auto-key sort rewrite on the real summary table over OneLake and print the
+        # before/after layout. Last step on purpose — a rewrite the next dbt build supersedes.
         run: |
           python - <<'PY'
           import os, duckrun
@@ -278,11 +276,10 @@ jobs:
           name: docs-coffee
           path: integration_tests/coffee/target/static_index.html
       - name: SORTED BY AUTO sort rewrite on fact_sales (dogfood)
-        # Non-blocking dogfood on the partitioned coffee fact: connect writable to the dbt build's
-        # schema, run the SQL-only auto-key sort rewrite, print the before/after layout. fact_sales is
-        # partitioned by region (R8) and has season<-order_date (R5), so it exercises both
-        # partition-leading order and the profiler.
-        continue-on-error: true
+        # Dogfood on the partitioned coffee fact: connect writable to the dbt build's schema, run the
+        # SQL-only auto-key sort rewrite, print the before/after layout. fact_sales is partitioned by
+        # region (R8) and has season<-order_date (R5), so it exercises both partition-leading order
+        # and the profiler.
         env:
           DBT_SCHEMA: duckrun_dbt_it
         run: |
@@ -360,7 +357,6 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: NYC taxi live demo (SQL-first connection-API showcase, OneLake)
-        continue-on-error: true
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
@@ -368,9 +364,8 @@ jobs:
         run: python integration_tests/taxi/demo_taxi.py
 
       - name: SORTED BY AUTO sort rewrite on trips (dogfood)
-        # Non-blocking dogfood of the SQL-only auto-key sort rewrite on the demo fact table: connect
-        # writable, run CREATE TABLE trips SORTED BY AUTO, and print the before/after layout to the CI log.
-        continue-on-error: true
+        # Dogfood of the SQL-only auto-key sort rewrite on the demo fact table: connect writable, run
+        # CREATE TABLE trips SORTED BY AUTO, and print the before/after layout to the CI log.
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
@@ -448,7 +443,6 @@ jobs:
           echo "AZURE_STORAGE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Multi-lakehouse dbt demo — LIVE OneLake (writes Bronze/Silver/Gold to THREE lakehouses)
-        continue-on-error: true
         env:
           # Three real OneLake Lakehouse roots — the dbt project writes one medallion layer to each,
           # into an isolated schema so nothing else in the lakehouse is touched. Swap the GUIDs to
@@ -467,7 +461,6 @@ jobs:
           path: multicatalog_dbt_run.html
           if-no-files-found: warn
       - name: Multi-catalog live demo (lakehouse + read-only warehouse + local scratch)
-        continue-on-error: true
         env:
           # writable aemo lakehouse (the shared sample lakehouse) + the read-only Fabric Warehouse.
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
