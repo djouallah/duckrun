@@ -187,7 +187,7 @@ conn.sql("CREATE OR REPLACE TABLE sales SORTED BY AUTO AS SELECT * FROM stg_sale
 
 `SORTED BY (cols)` and `PARTITIONED BY (cols)` are DuckDB's native syntax; `SORTED BY AUTO` is a
 duckrun extension. A plain `… AS SELECT … ORDER BY …` also clusters the write. See
-[Automatic sort](automatic-sort.md) and [the parquet layout](parquet-layout.md).
+[Automatic sorting](parquet-layout.md#automatic-sorting) and [the parquet layout](parquet-layout.md).
 
 `VACUUM <table>` — DuckDB's `VACUUM` verb, repurposed for Delta maintenance: it compacts the table's
 small files and vacuums files tombstoned past the retention window (compaction also runs automatically

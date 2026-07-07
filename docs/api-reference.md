@@ -37,7 +37,7 @@ DuckDB has no syntax for (Spark/Delta spellings). A read-only session refuses th
 
 | Extension | What it does | Writes? |
 |---|---|---|
-| `CREATE [OR REPLACE] TABLE <t> SORTED BY AUTO AS <query>` | duckrun profiles the query and picks a run-length-friendly clustering key for you (a heuristic, not an optimizer). Only the `AUTO` keyword is the extension — `SORTED BY (cols)` and `PARTITIONED BY (cols)` are DuckDB's own CTAS syntax. See [Automatic sort](automatic-sort.md). | ✅ |
+| `CREATE [OR REPLACE] TABLE <t> SORTED BY AUTO AS <query>` | duckrun profiles the query and picks a run-length-friendly clustering key for you (a heuristic, not an optimizer). Only the `AUTO` keyword is the extension — `SORTED BY (cols)` and `PARTITIONED BY (cols)` are DuckDB's own CTAS syntax. See [Automatic sorting](parquet-layout.md#automatic-sorting). | ✅ |
 | `INSERT INTO <t> REPLACE WHERE <pred> SELECT …` | delta_rs `replaceWhere` — atomically overwrite **only** the rows matching `<pred>` with the SELECT's rows, in one fenced commit (no torn delete-then-append window). `<pred>` is a CAST-free expression over the target's columns. | ✅ |
 | `INSERT WITH SCHEMA EVOLUTION INTO <t> SELECT …` | append that **widens** the table with the source's new columns (existing rows → `NULL`) instead of dropping them — delta_rs `schema_mode='merge'`. | ✅ |
 | `RESTORE TABLE <t> TO VERSION AS OF <n>` <br> `RESTORE TABLE <t> TO TIMESTAMP AS OF '…'` | delta_rs `restore` — roll the table back to an earlier version/timestamp. It's a new commit on top of history, so the restore is itself revertible. | ✅ |

@@ -131,7 +131,6 @@ nav:
           - Overview: overview.md
           - Design document: design_document.md
           - Parquet layout: parquet-layout.md
-          - Automatic sort: automatic-sort.md
           - Snapshot isolation: snapshot-isolation.md
           - Snapshot pin walkthrough: snapshot-pin.md
       - Conformance: conformance.md
