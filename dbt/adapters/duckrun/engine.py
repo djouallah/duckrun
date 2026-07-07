@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - older layouts
 # A Parquet row group maps 1:1 to a Direct Lake column segment, and Fabric wants segments
 # in the 8M–16M row band, uniform in size. 8M sits at the low end while bounding write-time memory — arrow-rs
 # buffers a full uncompressed row group per open writer, which is the real OOM lever on the hot path.
-_ROW_GROUP_SIZE = 1_048_576 * 8
+_ROW_GROUP_SIZE = 16_000_000
 # Dictionary page limit: 8 MB. This is the load-bearing knob for merge memory. A large limit (the old
 # 128 MB) keeps HIGH-cardinality columns dictionary-encoded instead of overflowing to PLAIN; a delta_rs
 # MERGE reading the table then materializes those giant per-column dictionaries — measured 25 GB RSS vs
