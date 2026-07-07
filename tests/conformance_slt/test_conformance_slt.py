@@ -62,6 +62,12 @@ EXPECTED_DEVIATIONS = {
         "SELECT count(*) FROM colorder",
         "INSERT INTO defaults_t VALUES (1, DEFAULT)",
         "SELECT created FROM defaults_t",
+        # case-collision gap: duckrun maps a table name to a DIRECTORY, so a case-variant WRITE
+        # (`INSERT INTO DEFAULTS_T` vs the `defaults_t` dir) resolves only on a case-INSENSITIVE
+        # filesystem — it fails on Linux/OneLake (the CI oracle) though it "passes" on Windows. The
+        # case-variant READ (`FROM Defaults_T`) resolves via DuckDB's case-insensitive view lookup but
+        # then returns a mismatched count, so it's red on every platform. See case-collision-table-names-gap.
+        "INSERT INTO DEFAULTS_T VALUES (4, 'upper ref')",
         "SELECT count(*) FROM Defaults_T",
         "FROM defaults_t SELECT count(*)",
         "FROM defaults_t",
