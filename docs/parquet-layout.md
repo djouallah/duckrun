@@ -4,13 +4,32 @@ Two things determine how a duckrun table sits on disk: the **physical file forma
 
 Before anything else, one caveat that applies to the entire page: **every value and every rule described here is a heuristic.** Compression is a function of your data's cardinality, skew, and correlation structure, and those differ from table to table and change over time within the same table. The settings below are defaults that worked well across the workloads duckrun was tuned against; they are starting points, not guarantees. Where a rule can fail, this page says so.
 
-- [Parquet layout](#parquet-layout-the-file-format) — the file-format settings and the reasoning behind each.
+- [Parquet layout](#parquet-layout-the-file-format) — what the layout optimizes for (transcoding), the file-format settings, and the reasoning behind each.
 - [Automatic sorting](#automatic-sorting) — `SORTED BY AUTO`: what it does and how it picks a key.
-- [Design goal: fast and cheap, not optimal](#design-goal-fast-and-cheap-not-optimal) — why the target is a good-enough sort found quickly, not the best sort found slowly.
+- [The design goal, stated precisely](#the-design-goal-stated-precisely) — the best outcome for Power BI within two hard limits: merge must survive, and the sort key must be the sharpest heuristic a single pass allows.
 
 ## Parquet layout (the file format)
 
-The configuration is a compromise between two consumers with opposite needs — a columnar reader that wants large structures, and an incremental merge that wants small ones. The table below is the full configuration; the [reasoning](#the-logic-behind-the-numbers) follows.
+The configuration is a compromise between two consumers with opposite needs — a columnar reader that wants large structures, and an incremental merge that wants small ones. Before the settings themselves, it is worth being explicit about what this layout is actually optimizing for, because it is not what most Parquet tuning guides assume.
+
+### What the layout optimizes for: transcoding
+
+Most Parquet advice targets **scan engines** — Spark, DuckDB, a warehouse — where the engine streams the file, decompresses it, and processes it row-group by row-group. That is not the primary consumer here. This layout is tuned for **Direct Lake**, and Direct Lake does not scan Parquet: it **transcodes** it.
+
+The distinction is between two formats that happen to describe the same data:
+
+- **The disk format (Parquet)** is built for storage and transport: compressed pages, dictionary and RLE encodings chosen per column, min/max statistics, immutable files on an object store. Its job is to be small and cheap to move.
+- **The engine's in-memory format (VertiPaq column segments)** is built for interactive query: columns held resident in memory in the engine's own encoding, sized and organized for vectorized scans over and over, thousands of times a day, with sub-second expectations.
+
+A scan engine bridges the two formats transiently, per query, and throws the result away. Direct Lake bridges them **once, on cold load**: it reads the Parquet, converts each row group into a resident column segment, remaps dictionaries where it can, and then serves every subsequent query from the in-memory form without touching the file again until the data changes. That one-time conversion — **transcoding** — is the operation this layout exists to make fast and faithful, and it explains settings that would look odd through a scan-engine lens:
+
+- **SNAPPY over ZSTD** — transcoding is decode-bound; a slightly larger file that decodes faster wins, because the size difference is paid once in storage while the decode cost is paid on every cold load.
+- **8M-row row groups** — a row group becomes a segment as-is, so row-group sizing *is* segment sizing; the 8–16M band is a property of the in-memory engine, not of Parquet.
+- **Dictionaries retained where sensible** — a Parquet dictionary can be remapped into the engine's dictionary rather than rebuilt from raw values, so keeping mid-cardinality columns dictionary-encoded makes the transcode a cheap remap instead of a full re-encode.
+
+The general point: the "right" Parquet layout depends on **which engine's in-memory format it will be turned into, and how often**. A layout tuned for one-shot scans, for a different segment size, or for a different memory model would legitimately choose different values. This is one more sense in which everything on this page is a heuristic tied to a specific consumer, not a universal recommendation.
+
+With that frame in place, the table below is the full configuration; the [reasoning](#the-logic-behind-the-numbers) follows.
 
 | Property | Value | Rationale |
 | --- | --- | --- |
@@ -28,7 +47,12 @@ Every value above is pulled in two opposite directions:
 - **Direct Lake wants it large.** One Parquet row group becomes one column segment, and a reader wants those segments large and few — big row groups, big files, dictionaries retained. Optimizing for the reader alone, every size would be pushed to its maximum.
 - **Merge wants it small.** arrow-rs buffers a whole uncompressed row group per open writer, and a large dictionary inflates the memory a merge needs just to *read* the table — a 128 MB dictionary limit made one merge materialize ~25 GB, and a 1 GB file forced whole-file copy-on-write. The merge spill tests act as the guardrail: they fail the moment a setting pushes merge past its memory budget.
 
-Each number is therefore set to the **largest value that still passes the merge spill tests** — large enough to serve Direct Lake well, small enough that merge remains stable. 8M-row groups, 256 MB files, an 8 MB dictionary cap, a 20k-row page cap: none of these is the theoretical ideal for read speed; each is that ideal minus the headroom merge requires. These specific values were validated against duckrun's test workloads — tables with very different width, cardinality, or update patterns may find their own sweet spot elsewhere.
+If those two consumers were equals, the values would sit in the middle. They are not equals, and this asymmetry decides which way the compromise leans:
+
+- **ETL compute is cheap and invisible.** Merge and compaction run in the background, on a schedule, with no one watching. If a merge takes four minutes instead of three, nothing happens — no user notices, no report stalls. Batch work tolerates being slow; the only hard constraint is that it must *finish* within its memory budget.
+- **BI compute is interactive and user-facing.** A Power BI report is a person clicking a slicer and waiting. Latency there is the product: a cold load that takes seconds instead of milliseconds is felt by every user of every report built on the table, on every visual interaction. Worse, interactive compute cannot be amortized or rescheduled — it happens exactly when the user acts, at whatever concurrency the users generate.
+
+So a second of latency is not worth the same on both sides. The layout therefore optimizes for the reader first and concedes to merge only what merge strictly *needs* — not what would make merge fastest, but what keeps it from failing. Each number is set to the **largest value that still passes the merge spill tests**: large enough to serve Direct Lake well, small enough that merge remains stable. 8M-row groups, 256 MB files, an 8 MB dictionary cap, a 20k-row page cap — none of these is the theoretical ideal for read speed; each is that ideal minus the headroom merge requires, and no more. These specific values were validated against duckrun's test workloads — tables with very different width, cardinality, or update patterns may find their own sweet spot elsewhere.
 
 Merge itself takes the compromise one step further and opts out entirely: it writes with none of these properties, so an incremental merge stays lean and never rewrites large files or materializes large dictionaries to touch a few rows. Threshold-gated compaction folds those loose files back into this layout on a later pass.
 
@@ -88,11 +112,16 @@ Note what this model implies: how much a sort can help is entirely a property of
 
 The result is a short, sensible key — usually. Because the picker is a heuristic operating on statistical sketches, **it is not guaranteed to shrink anything**. A near-uniform table has no runs to manufacture; a table already organized by a unique key has nothing left to cluster. In those cases `SORTED BY AUTO` degrades to a plain compaction (the same operation as `VACUUM`). The picker optimizes a *model* of the on-disk size, and the model can be wrong for your distribution — always compare `conn.get_stats("sales")` before and after to measure the real change. Only the disk knows the truth.
 
-## Design goal: fast and cheap, not optimal
+## The design goal, stated precisely
 
-Everything above follows from one design decision: **the goal is not to find the best possible sort — it is to find a good-enough one quickly and cheaply.** That may sound like settling, but it is forced by the structure of the problem.
+Everything above serves one objective: **produce the best possible layout for the interactive reader — Power BI — subject to two hard constraints.**
 
-### Why picking the best key is hard
+1. **The file layout must pass the merge spill tests.** The reader gets the largest segments, the fastest-decoding codec, and the most remappable dictionaries that merge can survive. The constraint is survival, not merge speed — merge is background compute and its comfort buys nothing.
+2. **The sort key must be selectable in a single cheap profiling pass.** Here the constraint is not chosen — it is imposed by mathematics. Finding the *provably* best key is intractable (the next section shows why), so the honest ambition is the strongest one available: **the cleverest column-selection heuristic that can be written** — one that profiles cardinality, skew, dependencies, and grain, and gets as close to the intractable optimum as a single pass allows.
+
+So the goal is not "good enough, found cheaply" as an end in itself. The goal is *maximal* on both axes; "heuristic" describes the ceiling the problem permits, not a lowered bar. What follows is why that ceiling exists.
+
+### Why the provably best key is out of reach
 
 Choosing the sort order that minimizes a table's size is not a tidy optimization with a clean answer. It is **combinatorially hard — NP-hard in general** — and remains hard regardless of available compute. Three factors compound:
 
@@ -100,7 +129,7 @@ Choosing the sort order that minimizes a table's size is not a tidy optimization
 - **A candidate cannot be scored without building it.** There is no closed form for "how many bytes will this ordering compress to." A column's encoded size depends on its **run structure**, which depends on the run structure of *every column ahead of it in the key* — columns interact through correlation and functional dependency (sorting by `date` silently clusters `month` and `year`; sorting by `city` partially clusters `country`). The only faithful way to score a candidate is to sort and write the entire table that way and measure the result. One evaluation is a full-table rewrite.
 - **Superexponential candidates × a full rewrite each.** An exact optimizer would write an astronomical number of layouts just to compare them. For a table of any realistic size this is not merely slow — it does not finish. And the prize is a few percent of disk; no one spends a compute-week to shave 4% off a Parquet folder.
 
-Minimizing total runs across multiple columns by reordering rows generalizes problems that are provably NP-hard, so a polynomial exact algorithm almost certainly does not exist. The sound engineering response is not "try harder" — it is **do not attempt optimality.**
+Minimizing total runs across multiple columns by reordering rows generalizes problems that are provably NP-hard, so a polynomial exact algorithm almost certainly does not exist. Exact optimality is therefore not on the menu at any budget — which is exactly why the effort goes into making the *heuristic* as sharp as possible instead.
 
 ### What the research says — and why its best ideas are too slow
 
@@ -113,11 +142,11 @@ Push the second point to its conclusion: if the column order is worth 40%, one w
 
 This is precisely why the more sophisticated ideas in this literature — Gray-code orderings, Hilbert-curve tuple orderings, nearest-neighbour (TSP-style) row chaining — are genuinely interesting but **impractical at warehouse scale**. They reason about *relationships between rows*, which requires pairwise distances: quadratic work, or a heavy approximation, over a table that may hold billions of rows. A nightly maintenance job gets **one pass**, not a week of graph search to recover a few more percent.
 
-Lemire's own practical recommendation is the one this implementation adopts: do not chase the optimum. Perform a single cheap lexicographic sort — `O(n log n)`, affordable every night — and spend the one real degree of freedom on the **column order**, arranging the key so the lowest-cardinality columns lead. That captures most of the ~9× for a small fraction of the cost. The [heuristic above](#how-the-automatic-picker-chooses) is that recommendation, plus a few duckrun-specific rules (lead with a date, stop at the grain, drop measures).
+Lemire's practical recommendation is the foundation this implementation builds on: perform a single cheap lexicographic sort — `O(n log n)`, affordable every night — and spend the one real degree of freedom on the **column order**, arranging the key so the lowest-cardinality columns lead. That captures most of the ~9× for a small fraction of the cost. The [picker above](#how-the-automatic-picker-chooses) takes that foundation and sharpens it with everything a profiling pass can learn — coarsest-date leadership, functional-dependency pruning, grain detection, measure exclusion — precisely because when the exact optimum is unreachable, the quality of the heuristic is where all the remaining win lives.
 
 ### Prefer your own key when you know the workload
 
-A final, deliberate note of humility. The automatic picker is intentionally simple, and there will be tables where it selects a worse key than the one you would choose — or even a worse layout than the table's natural arrival order. Sort-key selection is not an exact science: the outcome is determined by your data's cardinality, skew, and correlation structure, all of which the picker only *estimates* from sketches, and all of which can drift as the table grows.
+A final, deliberate note of humility. However sharp the heuristic, it is still a heuristic operating on estimates, and there will be tables where it selects a worse key than the one you would choose — occasionally even a worse layout than the table's natural arrival order. Sort-key selection is not an exact science: the outcome is determined by your data's cardinality, skew, and correlation structure, all of which the picker only *estimates* from sketches, and all of which can drift as the table grows.
 
 If you understand your table's grain and query patterns, `SORTED BY (cols)` with an explicit list will often beat `AUTO` — you have information about the workload that no single-pass profile can recover. Treat `AUTO` as a sensible default for tables you have not studied, verify its effect with `conn.get_stats()`, and override it wherever your own knowledge is better. Finding a provably good sort order in minimal time remains an open problem; a heuristic plus measurement is the practical state of the art.
 
