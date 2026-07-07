@@ -188,22 +188,25 @@ def bench_model(workspace, model, token, runs, want_cold):
                 rowcount = rows
             res = {"rows": rowcount, "all": times}
             if can_cold:
-                res["cold_min"] = times[0]                        # run1 = the real cold
-                res["hot_min"] = times[-1] if runs > 1 else times[0]  # last run = hot
+                res["cold_min"] = times[0]                        # run1 = the real cold first-touch
+                # Warm/hot = the AVERAGE of every run after the cold one (run2 warm + run3..N hot),
+                # so the reported number is a mean of the warmed-up state, not a single last sample.
+                warm_hot = times[1:] or [times[0]]
+                res["hot_avg"] = sum(warm_hot) / len(warm_hot)
             else:
-                res["hot_min"] = min(times)
+                res["hot_avg"] = sum(times) / len(times)  # no cold path: average all runs
             results[name] = res
-            # Show every run with its warm-up label.
+            # Show every run with its label: run1 cold, run2 warm, run3..N hot.
             print(f"  {name}  (rows={rowcount})")
             for i in range(runs):
                 if not can_cold:
                     label = "hot"
                 elif i == 0:
                     label = "cold  <- first touch"
-                elif i == runs - 1:
-                    label = "hot"
+                elif i == 1:
+                    label = "warm"
                 else:
-                    label = "warming"
+                    label = "hot"
                 print(f"      run{i + 1}  {times[i]:9.1f}ms  {label}")
     finally:
         conn.Close()
@@ -303,7 +306,7 @@ def main():
     workspace = os.environ["PBI_WORKSPACE"].strip()
     token = os.environ["PBI_TOKEN"].strip()
     adomd_dir = os.environ.get("ADOMD_DIR", ".")
-    runs = int(os.environ.get("BENCH_RUNS", "3"))
+    runs = int(os.environ.get("BENCH_RUNS", "4"))
     want_cold = (os.environ.get("BENCH_COLD", "true").strip().lower() != "false")
     gap = int(os.environ.get("BENCH_GAP_SECONDS", "300"))  # idle gap between models (>CU smoothing)
 
@@ -316,7 +319,7 @@ def main():
     _write_summary(
         f"# 🔍 XMLA benchmark — `{', '.join(others)}` vs `{base}`\n\n"
         f"Workspace `{workspace}` · one dehydrate then **{runs}** runs per query "
-        f"(run 1 = cold first-touch, run {runs} = hot) · same data (numbers identical) — "
+        f"(run 1 = cold first-touch; runs 2–{runs} averaged = warm/hot) · same data (numbers identical) — "
         f"only speed differs. Lower ms is better; "
         f"**base/model ratio > 1× means the compared model is faster**.\n")
 
@@ -341,8 +344,8 @@ def main():
         if base_cold and opt_cold:
             compare_table(f"{model} vs {base}  —  COLD (run 1, first touch after one dehydrate)",
                           base, model, base_res, opt_res, "cold_min")
-        compare_table(f"{model} vs {base}  —  HOT (run {runs}, fully warmed)",
-                      base, model, base_res, opt_res, "hot_min")
+        compare_table(f"{model} vs {base}  —  HOT (avg of runs 2–{runs}: 1 warm + {runs - 2} hot)",
+                      base, model, base_res, opt_res, "hot_avg")
 
 
 if __name__ == "__main__":

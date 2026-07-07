@@ -15,9 +15,9 @@ on:
         type: string
         default: main
       runs:
-        description: "repetitions per query per model (best/min is reported)"
+        description: "runs per query per model (run 1 = cold; runs 2+ averaged for the warm/hot number)"
         type: string
-        default: "3"
+        default: "4"
       cold:
         description: "measure cold by dehydrating (clearValues+full) before each query"
         type: boolean
