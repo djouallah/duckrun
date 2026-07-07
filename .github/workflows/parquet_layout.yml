@@ -1,0 +1,151 @@
+name: 🔍 parquet layout benchmark (Direct Lake vs V-Order)
+
+# MANUAL ONLY, non-gating (never called by publish.yml). Validates duckrun's parquet write
+# layout against a real Fabric V-Order layout of the SAME data, by running heavy DAX queries over
+# the XMLA endpoint (ADOMD.NET) against two Direct Lake semantic models and TIMING them — the
+# _optimized model (duckrun-clustered fact, current WriterProperties) vs the _vorder model (Fabric
+# Spark V-Order fact). Both derive from the same pristine base fct_summary, so numbers are identical;
+# only speed differs. Runs on windows-latest where ADOMD.NET loads cleanly. See
+# parquet_layout_tests/README.md.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "deploy_config.yml env whose workspace to query"
+        type: string
+        default: main
+      runs:
+        description: "repetitions per query per model (best/min is reported)"
+        type: string
+        default: "3"
+      cold:
+        description: "measure cold by dehydrating (clearValues+full) before each query"
+        type: boolean
+        default: true
+      gap_seconds:
+        description: "idle seconds between the base and vorder benchmarks (>5min CU smoothing => clean gap in the capacity chart)"
+        type: string
+        default: "300"
+      opt_sort:
+        description: "duckrun sort for the optimized copy ('auto' recommender, or cols like 'date, time')"
+        type: string
+        default: "auto"
+      rebuild:
+        description: "rebuild the optimized/vorder tables even if they already exist (else reuse)"
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  benchmark:
+    name: 🔍 Benchmark
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install deps (duckrun from THIS tree — tests the current WriterProperties)
+        run: |
+          pip install pythonnet pyyaml ms-fabric-cli
+          pip install -e .
+
+      - name: 🧩 Install ADOMD.NET client (NuGet)
+        shell: pwsh
+        run: |
+          # NetCore build so it loads under pythonnet's coreclr runtime. No -Version => latest stable.
+          nuget install Microsoft.AnalysisServices.AdomdClient.NetCore.retail.amd64 -OutputDirectory nuget -NonInteractive
+          "ADOMD_DIR=$PWD\nuget" >> $env:GITHUB_ENV
+
+      - name: 🔐 Azure federated login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: 🔑 Resolve lakehouse + mint tokens
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          # ws id from deploy_config; lakehouse id + workspace name from the Fabric/Power BI APIs.
+          $meta = python -c "import yaml, json; c = yaml.safe_load(open('parquet_layout_tests/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
+          $wsId = $meta.ws
+          $lhs = az rest --method get --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" | ConvertFrom-Json
+          $lhId = ($lhs.value | Where-Object { $_.displayName -eq $meta.lh }).id
+          if (-not $lhId) { throw "lakehouse '$($meta.lh)' not found in workspace $wsId" }
+          $grp = az rest --method get --resource "https://analysis.windows.net/powerbi/api" --url "https://api.powerbi.com/v1.0/myorg/groups?`$filter=id eq '$wsId'" | ConvertFrom-Json
+          $wsName = $grp.value[0].name
+          if (-not $wsName) { throw "workspace name not resolved for $wsId" }
+          # Mint ALL tokens now, while the OIDC client assertion is fresh (later steps outlive it).
+          $onelake = az account get-access-token --resource "https://storage.azure.com/" --query accessToken -o tsv
+          $fabric  = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
+          $pbi     = az account get-access-token --resource "https://analysis.windows.net/powerbi/api" --query accessToken -o tsv
+          echo "::add-mask::$onelake"; echo "::add-mask::$fabric"; echo "::add-mask::$pbi"
+          @(
+            "WS_ID=$wsId",
+            "LH_ID=$lhId",
+            "WS_NAME=$wsName",
+            "ONELAKE_TABLES_PATH=abfss://$wsId@onelake.dfs.fabric.microsoft.com/$lhId/Tables",
+            "ONELAKE_TOKEN=$onelake",
+            "FABRIC_TOKEN=$fabric",
+            "PBI_TOKEN=$pbi",
+            "PBI_WORKSPACE=$wsName"
+          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: ⚡ Build V-Order table on Fabric Spark (Livy) — from the pristine base summary
+        # Both derived tables (vorder here, optimized next) are built from the untouched base
+        # fct_summary and never mutate it, so the benchmark only ever assumes the base exists.
+        env:
+          PYTHONIOENCODING: utf-8
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+        run: python parquet_layout_tests/livy_vorder.py
+
+      - name: 🧭 Build optimized summary table (duckrun sorted, base untouched)
+        env:
+          PYTHONIOENCODING: utf-8
+          OPT_SORT: ${{ inputs.opt_sort }}
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+        run: python parquet_layout_tests/build_optimized.py
+
+      - name: 🚀 Deploy benchmark semantic models (optimized + vorder)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          fab config set encryption_fallback_enabled true
+          # Federated (OIDC) login for fab — deploys only parquet_layout_tests/*.SemanticModel.
+          $fed = (Invoke-RestMethod -Uri "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
+          fab auth login -t ${{ secrets.AZURE_TENANT_ID }} -u ${{ secrets.AZURE_CLIENT_ID }} --federated-token $fed
+          python parquet_layout_tests/deploy_vorder.py --env ${{ inputs.env }}
+
+      - name: 📊 Table stats (duckrun) — fct_summary_optimized vs fct_summary_vorder
+        continue-on-error: true   # nice-to-have; never block the benchmark
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python parquet_layout_tests/table_stats.py
+
+      - name: 📎 Upload detailed stats CSV
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: table-stats-detailed
+          path: stats_detailed.csv
+          if-no-files-found: warn
+
+      - name: 🔍 Benchmark both models over XMLA
+        env:
+          PYTHONNET_RUNTIME: coreclr
+          PYTHONIOENCODING: utf-8
+          BENCH_RUNS: ${{ inputs.runs }}
+          BENCH_COLD: ${{ inputs.cold }}
+          BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
+        run: python parquet_layout_tests/xmla_compare.py

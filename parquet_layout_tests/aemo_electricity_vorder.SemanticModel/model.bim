@@ -1,0 +1,276 @@
+{
+  "compatibilityLevel": 1604,
+  "model": {
+    "culture": "en-US",
+    "defaultPowerBIDataSourceVersion": "powerBI_V3",
+    "annotations": [
+      {
+        "name": "PBI_ProTooling",
+        "value": "[\"RemoteModeling\", \"DirectLakeOnOneLakeCreatedInDesktop\"]"
+      }
+    ],
+    "expressions": [
+      {
+        "name": "DirectLake",
+        "kind": "m",
+        "description": "Direct Lake connection to OneLake — reads Delta tables directly, no SQL endpoint",
+        "expression": [
+          "let",
+          "    Source = AzureStorage.DataLake(\"https://onelake.dfs.fabric.microsoft.com/e446a5e7-6666-42ad-a331-0bfef3187fbf/cf8bbf8a-5488-4020-ac8f-293727b447b1\", [HierarchicalNavigation=true])",
+          "in",
+          "    Source"
+        ],
+        "annotations": [
+          {
+            "name": "PBI_RemovedChildren",
+            "value": "[{\"sourceLineageTag\":\"[landing].[fct_scada]\"},{\"sourceLineageTag\":\"[landing].[fct_scada_today]\"},{\"sourceLineageTag\":\"[landing].[fct_price]\"},{\"sourceLineageTag\":\"[landing].[fct_price_today]\"},{\"sourceLineageTag\":\"[landing].[stg_csv_archive_log]\"}]"
+          }
+        ]
+      }
+    ],
+    "tables": [
+      {
+        "name": "dim_calendar",
+        "description": "Calendar dimension covering 2018-04-01 to 2026-12-31.\nUsed to filter and aggregate electricity market data by date, month, and year.",
+        "sourceLineageTag": "[aemo].[dim_calendar]",
+        "columns": [
+          {
+            "name": "date",
+            "dataType": "dateTime",
+            "description": "Calendar date (primary key). Grain: one row per day.",
+            "isKey": true,
+            "formatString": "yyyy-MM-dd",
+            "sourceColumn": "date",
+            "sourceLineageTag": "date",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "year",
+            "dataType": "int64",
+            "description": "Calendar year (e.g. 2024)",
+            "sourceColumn": "year",
+            "sourceLineageTag": "year",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "month",
+            "dataType": "int64",
+            "description": "Calendar month number (1-12)",
+            "sourceColumn": "month",
+            "sourceLineageTag": "month",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "dim_calendar",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "dim_calendar",
+              "expressionSource": "DirectLake",
+              "schemaName": "mart"
+            }
+          }
+        ]
+      },
+      {
+        "name": "dim_duid",
+        "description": "Generator unit reference dimension for the Australian National Electricity Market (NEM).\nEach row represents a unique Dispatchable Unit Identifier (DUID) — a power station or generation unit.\nIncludes fuel type, region, participant, and geographic coordinates.",
+        "sourceLineageTag": "[aemo].[dim_duid]",
+        "columns": [
+          {
+            "name": "DUID",
+            "dataType": "string",
+            "description": "Dispatchable Unit Identifier — unique code for each generator unit (primary key)",
+            "isKey": true,
+            "sourceColumn": "DUID",
+            "sourceLineageTag": "DUID",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Region",
+            "dataType": "string",
+            "description": "NEM region code (e.g. NSW1, QLD1, VIC1, SA1, TAS1, WA1)",
+            "sourceColumn": "Region",
+            "sourceLineageTag": "Region",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "State",
+            "dataType": "string",
+            "description": "Australian state name (e.g. New South Wales, Queensland)",
+            "sourceColumn": "State",
+            "sourceLineageTag": "State",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "FuelSourceDescriptor",
+            "dataType": "string",
+            "description": "Fuel source type (e.g. Black coal, Natural gas, Solar, Wind)",
+            "sourceColumn": "FuelSourceDescriptor",
+            "sourceLineageTag": "FuelSourceDescriptor",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Participant",
+            "dataType": "string",
+            "description": "Market participant company name",
+            "sourceColumn": "Participant",
+            "sourceLineageTag": "Participant",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "latitude",
+            "dataType": "double",
+            "description": "Geographic latitude of the generator unit",
+            "sourceColumn": "latitude",
+            "sourceLineageTag": "latitude",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "longitude",
+            "dataType": "double",
+            "description": "Geographic longitude of the generator unit",
+            "sourceColumn": "longitude",
+            "sourceLineageTag": "longitude",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "dim_duid",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "dim_duid",
+              "expressionSource": "DirectLake",
+              "schemaName": "mart"
+            }
+          }
+        ]
+      },
+      {
+        "name": "fct_summary",
+        "description": "Fact table combining SCADA dispatch and price data from the Australian NEM.\nGrain: one row per 5-minute dispatch interval per generator unit (DUID).\nCombines daily historical data with intraday updates.",
+        "sourceLineageTag": "[aemo].[fct_summary]",
+        "columns": [
+          {
+            "name": "date",
+            "dataType": "dateTime",
+            "description": "Dispatch date",
+            "formatString": "yyyy-MM-dd",
+            "sourceColumn": "date",
+            "sourceLineageTag": "date",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "time",
+            "dataType": "int64",
+            "description": "Time of day as HHMM integer (e.g. 1430 = 2:30 PM)",
+            "sourceColumn": "time",
+            "sourceLineageTag": "time",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "DUID",
+            "dataType": "string",
+            "description": "Generator unit identifier — foreign key to dim_duid",
+            "sourceColumn": "DUID",
+            "sourceLineageTag": "DUID",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "mw",
+            "dataType": "decimal",
+            "description": "Power output in megawatts (MW) for this 5-minute interval",
+            "formatString": "#,##0.00",
+            "sourceColumn": "mw",
+            "sourceLineageTag": "mw",
+            "summarizeBy": "sum"
+          },
+          {
+            "name": "price",
+            "dataType": "decimal",
+            "description": "Regional reference price in AUD per megawatt-hour ($/MWh)",
+            "formatString": "$#,##0.00",
+            "sourceColumn": "price",
+            "sourceLineageTag": "price",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "cutoff",
+            "dataType": "dateTime",
+            "description": "Timestamp of the latest data refresh cutoff",
+            "formatString": "yyyy-MM-dd HH:mm",
+            "sourceColumn": "cutoff",
+            "sourceLineageTag": "cutoff",
+            "summarizeBy": "none"
+          }
+        ],
+        "measures": [
+          {
+            "name": "Total MW",
+            "description": "Total megawatts across all selected generators and time periods",
+            "expression": "SUM(fct_summary[mw])",
+            "formatString": "#,##0"
+          },
+          {
+            "name": "Total MWh",
+            "description": "Total megawatt-hours. Divides MW by 12 because each row is a 5-minute interval (60/5 = 12).",
+            "expression": "SUM(fct_summary[mw]) / 12",
+            "formatString": "#,##0"
+          },
+          {
+            "name": "Avg Price",
+            "description": "Average electricity price in AUD per MWh across selected data",
+            "expression": "AVERAGE(fct_summary[price])",
+            "formatString": "$#,##0.00"
+          },
+          {
+            "name": "Generator Count",
+            "description": "Count of distinct generator units (DUIDs) in the current selection",
+            "expression": "DISTINCTCOUNT(fct_summary[DUID])",
+            "formatString": "#,##0"
+          },
+          {
+            "name": "Latest Update",
+            "description": "Most recent data refresh timestamp, ignoring all filters",
+            "expression": "CALCULATE(MAX(fct_summary[cutoff]), REMOVEFILTERS())",
+            "formatString": "yyyy-MM-dd HH:mm"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "fct_summary",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "fct_summary_vorder",
+              "expressionSource": "DirectLake",
+              "schemaName": "mart"
+            }
+          }
+        ]
+      }
+    ],
+    "relationships": [
+      {
+        "name": "fct_summary_to_dim_duid",
+        "fromTable": "fct_summary",
+        "fromColumn": "DUID",
+        "toTable": "dim_duid",
+        "toColumn": "DUID",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "fct_summary_to_dim_calendar",
+        "fromTable": "fct_summary",
+        "fromColumn": "date",
+        "toTable": "dim_calendar",
+        "toColumn": "date",
+        "relyOnReferentialIntegrity": true
+      }
+    ]
+  }
+}

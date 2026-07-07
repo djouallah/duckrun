@@ -1,0 +1,13 @@
+# Fabric workspace / lakehouse targets for the parquet-layout benchmark. Read by
+# deploy_vorder.py (--env) and the parquet_layout.yml workflow to resolve the workspace + lakehouse.
+# NOTE: `ws` / `lakehouse` are Fabric workspace/lakehouse GUIDs — identifiers, NOT secrets. Auth is
+# separate (OIDC: AZURE_CLIENT_ID / AZURE_TENANT_ID GitHub secrets). The federated identity must be
+# granted access to the workspace below for the benchmark to run.
+defaults:
+  lakehouse_name: "data"
+
+main:
+  ws: "91588e42-0f1c-4e56-bcaa-cbf015b8f312"
+
+production:
+  ws: "be079b0f-3416-4de2-9184-9c546bad223c"

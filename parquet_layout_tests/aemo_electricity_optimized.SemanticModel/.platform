@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "SemanticModel",
+    "displayName": "aemo_electricity_optimized"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "7c4e2a91-6b3d-4f82-a1e5-9d8c0b2f3a64"
+  }
+}
