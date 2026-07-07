@@ -1,4 +1,4 @@
-name: 🔍 parquet layout benchmark (Direct Lake vs V-Order)
+name: Direct Lake query benchmark — global sort vs V-Order
 
 # MANUAL ONLY, non-gating (never called by publish.yml). Validates duckrun's parquet write
 # layout against a real Fabric V-Order layout of the SAME data, by running heavy DAX queries over
