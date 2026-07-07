@@ -42,15 +42,18 @@ except ImportError:  # pragma: no cover - older layouts
 # in the 8M–16M row band, uniform in size. 8M sits at the low end while bounding write-time memory — arrow-rs
 # buffers a full uncompressed row group per open writer, which is the real OOM lever on the hot path.
 _ROW_GROUP_SIZE = 16_000_000
-# Dictionary page limit: 8 MB. This is the load-bearing knob for merge memory. A large limit (the old
-# 128 MB) keeps HIGH-cardinality columns dictionary-encoded instead of overflowing to PLAIN; a delta_rs
-# MERGE reading the table then materializes those giant per-column dictionaries — measured 25 GB RSS vs
-# ~4 GB on an 18M-row merge (OOM / disk-spill on a normal runner). 8 MB caps any one column's dictionary
-# so high-card / join-key columns (l_orderkey, l_comment) fall to PLAIN — cheap to merge and no loss for a
-# columnar reader (a near-unique dictionary is as big as the data) — while MID-cardinality columns
-# (≲1M distinct) still keep a real dictionary the reader can remap. 16 MB already doubled merge RSS to
-# ~8.7 GB, so 8 MB is the safe ceiling.
-_DICT_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
+# Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
+# overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
+# shrinks the written files and gives the columnar reader denser, more uniform segments — the read
+# layout this write path is tuned for. The cost is merge memory: a delta_rs MERGE reads the table and
+# materializes those per-column dictionaries, so a larger limit means a larger merge working set.
+# Measured on an 18M-row merge: the old 128 MB limit hit ~25 GB RSS, 8 MB ~4 GB, 16 MB ~8.7 GB — so
+# 32 MB is a deliberate step further up the merge-memory curve, bought for read-layout density. Truly
+# near-unique join keys (e.g. l_orderkey / l_comment) still overflow to PLAIN — their dictionary would
+# be as big as the data, so no loss. This is the knob most likely to regress the merge-spill stress
+# gate; parquet_layout_tests/ is the harness to confirm the read-side win against a real Direct Lake
+# reference before trusting it.
+_DICT_PAGE_SIZE_LIMIT = 32 * 1024 * 1024
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
