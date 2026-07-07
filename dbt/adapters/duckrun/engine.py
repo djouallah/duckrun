@@ -37,11 +37,11 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# Row group size: 6M rows, used by BOTH the normal write path and the experimental sort-rewrite.
+# Row group size: 8M rows, used by BOTH the normal write path and the experimental sort-rewrite.
 # A Parquet row group maps 1:1 to a Direct Lake column segment, and Fabric wants segments
-# in the 1M–16M row band, uniform in size. 6M sits mid-band while bounding write-time memory — arrow-rs
+# in the 8M–16M row band, uniform in size. 8M sits at the low end while bounding write-time memory — arrow-rs
 # buffers a full uncompressed row group per open writer, which is the real OOM lever on the hot path.
-_ROW_GROUP_SIZE = 1_048_576 * 6
+_ROW_GROUP_SIZE = 1_048_576 * 8
 # Dictionary page limit: 8 MB. This is the load-bearing knob for merge memory. A large limit (the old
 # 128 MB) keeps HIGH-cardinality columns dictionary-encoded instead of overflowing to PLAIN; a delta_rs
 # MERGE reading the table then materializes those giant per-column dictionaries — measured 25 GB RSS vs
@@ -55,13 +55,13 @@ _DICT_PAGE_SIZE_LIMIT = 8 * 1024 * 1024
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
 # Data page ROW-COUNT limit — the real page safeguard, set EXPLICITLY (delta-rs 1.5.0's default is far
-# higher than 20k, measured). Without it a highly compressible column buffers its whole 6M-row group as a
+# higher than 20k, measured). Without it a highly compressible column buffers its whole 8M-row group as a
 # single page: ~10x write memory, and giant pages that blow the merge's read-side spill cap → out of disk
 # (arrow-rs #5797 / #4973). 20k rows/page is arrow-rs's intended default; measured +0 MB write overhead.
 _DATA_PAGE_ROW_LIMIT = 20_000
 # Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a segment
-# cap: it lets more of a table reach the full 6M-row group before the file rolls (a wide fact like
-# lineitem needs ~256 MB to fit a 6M-row segment), giving larger, more uniform Direct Lake segments. It
+# cap: it lets more of a table reach the full 8M-row group before the file rolls (a wide fact like
+# lineitem needs ~256 MB to fit an 8M-row segment), giving larger, more uniform Direct Lake segments. It
 # is NOT a merge-memory lever — that was the dictionary page limit (see _DICT_PAGE_SIZE_LIMIT); with that
 # bounded, 128/256/512 MB all merge in ~16s at ~4.5-5.2 GB (measured), so file size is free to serve the
 # read layout. Still deliberately far below 1 GB, which forced the whole-file copy-on-write that blew up
@@ -72,7 +72,7 @@ _TARGET_FILE_SIZE = 256 * 1024 * 1024
 
 def _writer_properties(plain_cols=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, 6M-row row groups, an 8 MB dictionary page limit
+    # compaction, and the optimize sort-rewrite: SNAPPY, 8M-row row groups, an 8 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
     # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap, an EXPLICIT
     # 20k-row data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.

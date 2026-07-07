@@ -755,7 +755,7 @@ def _generate_tables(conn, sf, schema):
     dir, then land each table as Delta through the duckrun **write** path
     (``conn.sql("CREATE OR REPLACE TABLE … AS SELECT * FROM read_parquet(…)")``). This deliberately
     exercises the writer — the
-    read-layout profile (SNAPPY, 6M row groups, 8MB dictionaries, 128MB files) — AND the DuckDB reads of
+    read-layout profile (SNAPPY, 8M row groups, 8MB dictionaries, 128MB files) — AND the DuckDB reads of
     the 22 queries, rather than a zero-copy ``convertToDelta`` that only writes the ``_delta_log``.
     One-time — skipped when the tables already exist.
 
