@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.11]
+
+Robustness fixes to the SQL-write path, shaken out by a new black-box conformance suite.
+
 ### Fixed
 - **`INSERT … VALUES` casts each literal to its target column type.** A VALUES list whose columns
   don't share a common type on their own (e.g. `('inf'), (0.0)` — a string next to a decimal) now
