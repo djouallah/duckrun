@@ -92,6 +92,18 @@ jobs:
             tests/correctness/test_correctness.py \
             -q -p no:cacheprovider
 
+      - name: Conformance-SLT suite (black-box SQL router / Delta-semantics gate)
+        # A vendored, DuckDB-oracle-validated sqllogictest suite (tests/conformance_slt/) run against
+        # real duckrun with writes enabled. The wrapper asserts the oracle stays all-green AND that
+        # duckrun fails ONLY the pinned deliberate-deviation records (EXPECTED_DEVIATIONS) — a failure
+        # off that allowlist is a real regression. Single-version (3.11): its allowlist is derived from
+        # one Python; a second would spuriously trip it, same as the dbt conformance gate.
+        if: matrix.python-version == '3.11'
+        run: |
+          python -m pytest \
+            tests/conformance_slt/test_conformance_slt.py \
+            -q -p no:cacheprovider
+
       - name: Snapshot-pin dbt integration test (single-snapshot MERGE through a real dbt run)
         # Drives `dbt run` in-process against a local-fs warehouse and simulates a concurrent writer
         # to prove the read/write snapshot pin: a commit landing mid-run makes the run fail loudly

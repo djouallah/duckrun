@@ -1,0 +1,368 @@
+# ============================================================================
+# 04_queries.slt -- query engine correctness over stored tables
+# ============================================================================
+
+statement ok
+CREATE TABLE emp (id INTEGER, name VARCHAR, dept VARCHAR, salary DECIMAL(10,2), mgr INTEGER)
+
+statement ok
+INSERT INTO emp VALUES
+(1, 'alice', 'eng', 120000.00, NULL),
+(2, 'bob', 'eng', 95000.00, 1),
+(3, 'carol', 'sales', 80000.00, 1),
+(4, 'dave', 'sales', 80000.00, 3),
+(5, 'erin', 'hr', 70000.00, 1),
+(6, 'frank', 'eng', 95000.00, 2),
+(7, 'grace', NULL, 60000.00, 5)
+
+statement ok
+CREATE TABLE dept_info (dept VARCHAR, floor INTEGER)
+
+statement ok
+INSERT INTO dept_info VALUES ('eng', 3), ('sales', 2), ('legal', 9)
+
+# ---------------------------------------------------------------- aggregation
+
+query TIT
+SELECT dept, count(*), min(name) FROM emp GROUP BY dept ORDER BY dept NULLS FIRST
+----
+NULL
+1
+grace
+eng
+3
+alice
+hr
+1
+erin
+sales
+2
+carol
+
+query TI
+SELECT dept, count(*) FROM emp GROUP BY dept HAVING count(*) > 1 ORDER BY dept
+----
+eng
+3
+sales
+2
+
+query TII
+SELECT coalesce(dept, '(null)') AS d, grouping(dept) AS g, count(*) FROM emp GROUP BY ROLLUP(dept) ORDER BY g, d
+----
+(null)
+0
+1
+eng
+0
+3
+hr
+0
+1
+sales
+0
+2
+(null)
+1
+7
+
+query I
+SELECT count(DISTINCT salary) FROM emp
+----
+5
+
+query T
+SELECT string_agg(name, ',' ORDER BY name) FROM emp WHERE dept = 'eng'
+----
+alice,bob,frank
+
+# ---------------------------------------------------------------- window functions
+
+query TI
+SELECT name, rank() OVER (PARTITION BY dept ORDER BY salary DESC) FROM emp WHERE dept = 'eng' ORDER BY 2, 1
+----
+alice
+1
+bob
+2
+frank
+2
+
+query TI
+SELECT name, (salary - lag(salary, 1, salary) OVER (ORDER BY id))::INTEGER FROM emp ORDER BY id
+----
+alice
+0
+bob
+-25000
+carol
+-15000
+dave
+0
+erin
+-10000
+frank
+25000
+grace
+-35000
+
+query I
+SELECT sum(salary) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)::BIGINT FROM emp ORDER BY id
+----
+120000
+215000
+295000
+375000
+445000
+540000
+600000
+
+query T
+SELECT name FROM emp QUALIFY row_number() OVER (PARTITION BY dept ORDER BY salary DESC, id) = 1 ORDER BY name
+----
+alice
+carol
+erin
+grace
+
+query TI
+SELECT name, ntile(3) OVER (ORDER BY salary DESC, id) FROM emp ORDER BY salary DESC, id
+----
+alice
+1
+bob
+1
+frank
+1
+carol
+2
+dave
+2
+erin
+3
+grace
+3
+
+# ---------------------------------------------------------------- joins
+
+query TT
+SELECT e.name, coalesce(m.name, '(top)') FROM emp e LEFT JOIN emp m ON e.mgr = m.id ORDER BY e.id
+----
+alice
+(top)
+bob
+alice
+carol
+alice
+dave
+carol
+erin
+alice
+frank
+bob
+grace
+erin
+
+query TI
+SELECT d.dept, count(e.id) FROM dept_info d LEFT JOIN emp e ON d.dept = e.dept GROUP BY d.dept ORDER BY d.dept
+----
+eng
+3
+legal
+0
+sales
+2
+
+query I
+SELECT count(*) FROM emp e FULL OUTER JOIN dept_info d ON e.dept = d.dept
+----
+8
+
+query I
+SELECT count(*) FROM emp CROSS JOIN dept_info
+----
+21
+
+query TI
+SELECT d.dept, x.c FROM dept_info d, LATERAL (SELECT count(*) AS c FROM emp e WHERE e.dept = d.dept) x ORDER BY d.dept
+----
+eng
+3
+legal
+0
+sales
+2
+
+# ---------------------------------------------------------------- NULL semantics traps
+
+# NOT IN against a set containing NULL yields no rows -- classic
+query I
+SELECT count(*) FROM emp WHERE dept NOT IN (SELECT dept FROM emp)
+----
+0
+
+# NOT EXISTS does not have that trap
+query T
+SELECT name FROM emp e WHERE NOT EXISTS (SELECT 1 FROM dept_info d WHERE d.dept = e.dept) ORDER BY name
+----
+erin
+grace
+
+# NOT IN against a NULL-free set behaves normally
+query T
+SELECT name FROM emp WHERE dept NOT IN (SELECT dept FROM dept_info)
+----
+erin
+
+query I
+SELECT count(*) FROM emp WHERE dept = dept
+----
+6
+
+query I
+SELECT count(*) FROM emp WHERE dept IS NOT DISTINCT FROM NULL
+----
+1
+
+# ---------------------------------------------------------------- subqueries
+
+query T
+SELECT name FROM emp e WHERE salary > (SELECT avg(salary) FROM emp e2 WHERE e2.dept = e.dept) ORDER BY name
+----
+alice
+
+query TI
+SELECT name, (SELECT count(*) FROM emp r WHERE r.mgr = e.id) AS reports FROM emp e WHERE id <= 3 ORDER BY id
+----
+alice
+3
+bob
+1
+carol
+1
+
+query I
+SELECT count(*) FROM emp WHERE salary >= ALL (SELECT salary FROM emp WHERE dept = 'sales')
+----
+5
+
+query I
+SELECT count(*) FROM emp WHERE salary > ANY (SELECT salary FROM emp WHERE dept = 'eng')
+----
+1
+
+# ---------------------------------------------------------------- recursive CTEs
+
+query I
+WITH RECURSIVE fib(n, a, b) AS (
+    SELECT 1, 0::BIGINT, 1::BIGINT
+    UNION ALL
+    SELECT n + 1, b, a + b FROM fib WHERE n < 30
+)
+SELECT a FROM fib WHERE n = 30
+----
+514229
+
+query TI
+WITH RECURSIVE chain(id, name, depth) AS (
+    SELECT id, name, 0 FROM emp WHERE mgr IS NULL
+    UNION ALL
+    SELECT e.id, e.name, c.depth + 1 FROM emp e JOIN chain c ON e.mgr = c.id
+)
+SELECT name, depth FROM chain ORDER BY depth, name
+----
+alice
+0
+bob
+1
+carol
+1
+erin
+1
+dave
+2
+frank
+2
+grace
+2
+
+# ---------------------------------------------------------------- set operations
+
+query I
+SELECT count(*) FROM (SELECT dept FROM emp INTERSECT SELECT dept FROM dept_info)
+----
+2
+
+query T
+SELECT dept FROM dept_info EXCEPT SELECT dept FROM emp
+----
+legal
+
+query I
+SELECT count(*) FROM (SELECT id FROM emp UNION ALL SELECT id FROM emp)
+----
+14
+
+query I
+SELECT count(*) FROM (SELECT dept FROM emp UNION SELECT dept FROM dept_info)
+----
+5
+
+# ---------------------------------------------------------------- misc surface
+
+query TT
+SELECT DISTINCT ON (dept) dept, name FROM emp WHERE dept IS NOT NULL ORDER BY dept, salary DESC, id
+----
+eng
+alice
+hr
+erin
+sales
+carol
+
+query I
+SELECT count(*) FROM emp WHERE CASE WHEN dept = 'eng' THEN salary > 90000 ELSE salary < 90000 END
+----
+7
+
+query T
+SELECT name FROM emp ORDER BY salary DESC, name LIMIT 2 OFFSET 2
+----
+frank
+carol
+
+query I
+SELECT date_diff('day', DATE '2026-01-01', DATE '2026-07-07')
+----
+187
+
+query I
+SELECT sum(u) FROM (SELECT unnest([1, 2, 3, 4]) AS u)
+----
+10
+
+query T
+SELECT list_transform([1, 2, 3], x -> x * x)::VARCHAR
+----
+[1, 4, 9]
+
+query T
+SELECT [name FOR name IN ['a','b','c'] IF name <> 'b']::VARCHAR
+----
+[a, c]
+
+query R
+SELECT median(salary)::DOUBLE FROM emp
+----
+80000.000
+
+query I
+SELECT count(*) FILTER (WHERE salary BETWEEN 70000 AND 95000) FROM emp
+----
+5
+
+statement maybe
+PIVOT emp ON dept USING count(*)
+
+statement maybe
+SELECT * FROM emp USING SAMPLE 1

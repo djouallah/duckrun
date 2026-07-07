@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`INSERT … VALUES` casts each literal to its target column type.** A VALUES list whose columns
+  don't share a common type on their own (e.g. `('inf'), (0.0)` — a string next to a decimal) now
+  casts per-row to the destination type, the way a native `INSERT` does, instead of failing with
+  DuckDB's "Cannot combine types". The lossy-numeric-narrowing guard is unchanged.
+- **`INSERT INTO t WITH cte … SELECT …` is routed.** A CTE placed after the target — even one that
+  shadows the target's name — is no longer swallowed into the relation name.
+- **`INSERT INTO t BY NAME SELECT …`** aligns the source's columns to the target by name (omitted
+  target columns are written NULL).
+- **A predicate-less `UPDATE` updates every row over a many-file table.** delta-rs 1.5.0's
+  full-table `update()` silently updated only some rows of a multi-file table; a no-`WHERE` update
+  now goes through a fenced DuckDB-evaluated overwrite (correct, and equal work — it rewrites every
+  row anyway).
+- **`DROP TABLE <t>` on an already-dropped table raises** like SQL requires; only `DROP TABLE IF
+  EXISTS` is a silent no-op. (A drop tombstone is no longer read as "still exists".)
+
+### Internal
+- Vendored **`tests/conformance_slt/`** — a black-box, DuckDB-oracle-validated sqllogictest suite
+  (933 records) that exercises the SQL router and Delta storage semantics. A pytest wrapper gates it
+  on regressions: the oracle must stay all-green and duckrun may fail only a pinned allowlist of
+  deliberate deviations (the whitespace-in-name invariant, non-ASCII identifiers, and delta-rs engine
+  limits like `RETURNING` / column `DEFAULT`).
+
 ## [0.4.1]
 
 Robustness fixes and a cleanup; the frozen 0.4.0 surface is unchanged.

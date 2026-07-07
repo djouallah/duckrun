@@ -1,0 +1,229 @@
+# ============================================================================
+# 01_ddl.slt -- table lifecycle, CTAS, identifier abuse
+# ============================================================================
+
+statement ok
+CREATE TABLE t_basic (id INTEGER, name VARCHAR, amount DOUBLE)
+
+statement ok
+CREATE TABLE IF NOT EXISTS t_basic (id INTEGER)
+
+statement error
+CREATE TABLE t_basic (id INTEGER)
+
+statement ok
+CREATE OR REPLACE TABLE t_basic (id INTEGER, name VARCHAR)
+
+statement ok
+INSERT INTO t_basic VALUES (1, 'one'), (2, 'two')
+
+query I
+SELECT count(*) FROM t_basic
+----
+2
+
+statement ok
+DROP TABLE t_basic
+
+statement error
+SELECT * FROM t_basic
+
+statement ok
+DROP TABLE IF EXISTS t_basic
+
+statement error
+DROP TABLE t_basic
+
+# ---------------------------------------------------------------- CTAS
+
+statement ok
+CREATE TABLE ctas_src (i INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO ctas_src SELECT range, 'row_' || range FROM range(10)
+
+statement ok
+CREATE TABLE ctas_dst AS SELECT i * 2 AS dbl, s FROM ctas_src WHERE i < 5
+
+query II
+SELECT count(*), sum(dbl) FROM ctas_dst
+----
+5
+20
+
+statement ok
+CREATE TABLE ctas_sorted AS SELECT i FROM ctas_src ORDER BY i DESC
+
+query II
+SELECT min(i), max(i) FROM ctas_sorted
+----
+0
+9
+
+# CTAS from a query with a join and aggregation
+statement ok
+CREATE TABLE ctas_agg AS SELECT s.i % 3 AS bucket, count(*) AS c FROM ctas_src s JOIN ctas_dst d ON s.i * 2 = d.dbl GROUP BY 1
+
+query II
+SELECT bucket, c FROM ctas_agg ORDER BY bucket
+----
+0
+2
+1
+2
+2
+1
+
+# CREATE OR REPLACE via CTAS on an existing table
+statement ok
+CREATE OR REPLACE TABLE ctas_dst AS SELECT 42 AS answer
+
+query I
+SELECT answer FROM ctas_dst
+----
+42
+
+# ---------------------------------------------------------------- quoted / hostile identifiers
+
+statement ok
+CREATE TABLE "Order Details" ("Unit Price" DECIMAL(10,2), "from" VARCHAR, "select" INTEGER)
+
+statement ok
+INSERT INTO "Order Details" VALUES (9.99, 'x', 1), (0.01, 'y', 2)
+
+query TIT
+SELECT "from", "select", "Unit Price"::VARCHAR FROM "Order Details" ORDER BY "select"
+----
+x
+1
+9.99
+y
+2
+0.01
+
+statement ok
+CREATE TABLE "table" ("column" INTEGER)
+
+statement ok
+INSERT INTO "table" VALUES (42)
+
+query I
+SELECT "column" FROM "table"
+----
+42
+
+statement ok
+DROP TABLE "table"
+
+statement ok
+CREATE TABLE "group" ("order" INTEGER, "by" VARCHAR)
+
+statement ok
+INSERT INTO "group" VALUES (1, 'a'), (2, 'b')
+
+query I
+SELECT sum("order") FROM "group" GROUP BY 'const'
+----
+3
+
+statement ok
+CREATE TABLE numcol ("1" INTEGER, "2" INTEGER)
+
+statement ok
+INSERT INTO numcol VALUES (10, 20)
+
+query II
+SELECT "2", "1" FROM numcol
+----
+20
+10
+
+# unicode table and column names -- these become directory names on disk
+statement ok
+CREATE TABLE "販売データ" (id INTEGER)
+
+statement ok
+INSERT INTO "販売データ" VALUES (7)
+
+query I
+SELECT id FROM "販売データ"
+----
+7
+
+statement ok
+CREATE TABLE métriques ("温度" DOUBLE)
+
+statement ok
+INSERT INTO métriques VALUES (36.6)
+
+query R
+SELECT "温度" FROM métriques
+----
+36.600
+
+# emoji and filesystem-hostile characters: allowed to be unsupported, must not corrupt
+statement maybe
+CREATE TABLE "🦆_ducks" (id INTEGER)
+
+statement maybe
+CREATE TABLE "star*name" (id INTEGER)
+
+statement maybe
+CREATE TABLE "dot.dot.dot" (id INTEGER)
+
+# a very long column name
+statement ok
+CREATE TABLE t_long_col (abcdefghij0123456789_abcdefghij0123456789_abcdefghij0123456789 INTEGER)
+
+statement ok
+INSERT INTO t_long_col VALUES (1)
+
+query I
+SELECT abcdefghij0123456789_abcdefghij0123456789_abcdefghij0123456789 FROM t_long_col
+----
+1
+
+# ---------------------------------------------------------------- many tables
+
+loop i 0 20
+statement ok
+CREATE TABLE loop_t_${i} (v INTEGER)
+
+statement ok
+INSERT INTO loop_t_${i} VALUES (${i})
+
+query I
+SELECT v FROM loop_t_${i}
+----
+${i}
+endloop
+
+query I
+SELECT count(*) FROM loop_t_0
+----
+1
+
+loop i 0 20
+statement ok
+DROP TABLE loop_t_${i}
+endloop
+
+statement error
+SELECT * FROM loop_t_7
+
+# ---------------------------------------------------------------- optional DDL surface
+
+statement maybe
+CREATE TABLE part_ctas PARTITIONED BY (p) AS SELECT range % 3 AS p, range AS v FROM range(9)
+
+statement maybe
+ALTER TABLE ctas_src RENAME TO ctas_src_renamed
+
+statement maybe
+CREATE VIEW v_over AS SELECT 1 AS one
+
+statement maybe
+CREATE TEMP TABLE scratch (x INTEGER)
+
+statement maybe
+COMMENT ON TABLE numcol IS 'two numeric column names'

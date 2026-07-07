@@ -1,0 +1,175 @@
+# ============================================================================
+# 08_stress.slt -- volume, churn, and durability at scale
+# ============================================================================
+
+statement ok
+CREATE TABLE big (id BIGINT, grp INTEGER, payload VARCHAR)
+
+statement ok
+INSERT INTO big SELECT range, range % 97, 'payload_' || (range % 1000) FROM range(100000)
+
+query II
+SELECT count(*), sum(id) FROM big
+----
+100000
+4999950000
+
+query I
+SELECT count(DISTINCT grp) FROM big
+----
+97
+
+query I
+SELECT count(DISTINCT payload) FROM big
+----
+1000
+
+query II
+SELECT grp, count(*) FROM big GROUP BY grp ORDER BY count(*) DESC, grp LIMIT 1
+----
+0
+1031
+
+query I
+SELECT id FROM big ORDER BY id DESC LIMIT 3
+----
+99999
+99998
+99997
+
+query I
+SELECT count(*) FROM big b1 JOIN big b2 ON b1.id = b2.id + 1 WHERE b1.grp = 0
+----
+1030
+
+query I
+SELECT max(rn) FROM (SELECT row_number() OVER (PARTITION BY grp ORDER BY id) AS rn FROM big)
+----
+1031
+
+# ---------------------------------------------------------------- churn at volume
+
+statement ok
+DELETE FROM big WHERE id % 2 = 0
+
+query II
+SELECT count(*), min(id) FROM big
+----
+50000
+1
+
+statement ok
+UPDATE big SET grp = -1 WHERE id < 1000
+
+query I
+SELECT count(*) FROM big WHERE grp = -1
+----
+500
+
+reconnect
+
+query III
+SELECT count(*), count(*) FILTER (WHERE grp = -1), sum(id) FROM big
+----
+50000
+500
+2500000000
+
+# ---------------------------------------------------------------- join to dimension
+
+statement ok
+CREATE TABLE dim (grp INTEGER, name VARCHAR)
+
+statement ok
+INSERT INTO dim SELECT range, 'group_' || range FROM range(97)
+
+query I
+SELECT count(*) FROM big b JOIN dim d ON b.grp = d.grp
+----
+49500
+
+query I
+SELECT length(string_agg(payload, ',')) > 100000 FROM big
+----
+true
+
+# ---------------------------------------------------------------- 150 commits, one row each
+
+statement ok
+CREATE TABLE drip (i INTEGER)
+
+loop i 0 150
+statement ok
+INSERT INTO drip VALUES (${i})
+endloop
+
+query II
+SELECT count(*), sum(i) FROM drip
+----
+150
+11175
+
+reconnect
+
+query II
+SELECT count(*), sum(i) FROM drip
+----
+150
+11175
+
+# ---------------------------------------------------------------- mixed op churn loop
+# 40 iterations x (insert, update, conditional delete) = 120 commits
+
+statement ok
+CREATE TABLE churn (i INTEGER, v INTEGER)
+
+loop i 0 40
+statement ok
+INSERT INTO churn VALUES (${i}, ${i})
+
+statement ok
+UPDATE churn SET v = v + 1 WHERE i = ${i}
+
+statement ok
+DELETE FROM churn WHERE i = ${i} AND v % 2 = 0
+endloop
+
+query II
+SELECT count(*), sum(v) FROM churn
+----
+20
+400
+
+reconnect
+
+query II
+SELECT count(*), sum(v) FROM churn
+----
+20
+400
+
+# ---------------------------------------------------------------- rebuild from own data
+
+statement ok
+CREATE TABLE big2 AS SELECT id, grp, payload FROM big WHERE grp <> -1
+
+query I
+SELECT count(*) FROM big2
+----
+49500
+
+statement ok
+INSERT INTO big2 SELECT id + 1000000, grp, payload FROM big2 WHERE grp = 5
+
+query I
+SELECT count(*) FROM big2 WHERE id > 1000000
+----
+510
+
+reconnect
+
+query II
+SELECT count(*), count(DISTINCT grp) FROM big2
+----
+50010
+97

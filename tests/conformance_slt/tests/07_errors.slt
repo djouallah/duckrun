@@ -1,0 +1,164 @@
+# ============================================================================
+# 07_errors.slt -- failures must raise a clean exception, and a failed
+# statement must never leave partial data or wedge the connection.
+# ============================================================================
+
+statement error
+SELECT * FROM table_that_does_not_exist
+
+statement error
+SELECT * FROM missing_tbl_xyz
+----
+missing_tbl_xyz
+
+statement error
+SELEKT 1
+
+statement error
+SELECT 'unterminated
+
+statement error
+SELECT ((1 + 2)
+
+statement error
+INSERT INTO
+
+statement error
+CREATE TABLE
+
+statement ok
+CREATE TABLE err_t (i INTEGER, s VARCHAR)
+
+statement error
+INSERT INTO err_t VALUES (1)
+
+statement error
+INSERT INTO err_t VALUES (1, 'a', 2)
+
+statement error
+INSERT INTO err_t (i, nope) VALUES (1, 'a')
+
+statement error
+INSERT INTO err_t VALUES ('NaNaNa', 'x')
+
+statement error
+SELECT nonexistent_col FROM err_t
+
+statement error
+SELECT i FROM err_t GROUP BY s
+
+statement error
+UPDATE err_t SET nope = 1
+
+statement error
+DELETE FROM err_t WHERE undefined_col = 1
+
+statement error
+CREATE TABLE err_t (i INTEGER)
+
+statement error
+DROP TABLE ghost_table
+
+statement error
+ALTER TABLE ghost_table ADD COLUMN x INTEGER
+
+statement error
+ALTER TABLE err_t ADD COLUMN i VARCHAR
+
+# DuckDB semantics: integer // 0 is NULL, float / 0 is Infinity -- pin them
+query I
+SELECT CASE WHEN 1 // 0 IS NULL THEN 1 ELSE 0 END
+----
+1
+
+query R
+SELECT 1 / 0
+----
+Infinity
+
+statement error
+SELECT CAST('abc' AS INTEGER)
+
+query I
+SELECT CASE WHEN TRY_CAST('abc' AS INTEGER) IS NULL THEN 1 ELSE 0 END
+----
+1
+
+# ---------------------------------------------------------------- recovery
+# a failed write must not commit partial data and must not wedge the session
+
+statement ok
+INSERT INTO err_t VALUES (1, 'ok')
+
+statement error
+INSERT INTO err_t VALUES ('boom', 'bad')
+
+statement ok
+INSERT INTO err_t VALUES (2, 'still works after failure')
+
+query I
+SELECT count(*) FROM err_t
+----
+2
+
+# multi-row insert where a LATER row fails: nothing may be committed
+statement error
+INSERT INTO err_t VALUES (3, 'fine'), ('kaboom', 'bad'), (4, 'fine')
+
+query I
+SELECT count(*) FROM err_t
+----
+2
+
+reconnect
+
+query I
+SELECT count(*) FROM err_t
+----
+2
+
+# failed CTAS must not leave a phantom table behind
+statement error
+CREATE TABLE phantom AS SELECT CAST('abc' AS INTEGER) AS v
+
+statement error
+SELECT * FROM phantom
+
+statement ok
+CREATE TABLE phantom (v INTEGER)
+
+query I
+SELECT count(*) FROM phantom
+----
+0
+
+# failed UPDATE must not partially apply
+statement error
+UPDATE err_t SET i = CAST(s AS INTEGER)
+
+query II
+SELECT count(*), sum(i) FROM err_t
+----
+2
+3
+
+# failed DELETE (error inside the predicate) must not delete anything
+statement error
+DELETE FROM err_t WHERE i = CAST('oops' AS INTEGER)
+
+query I
+SELECT count(*) FROM err_t
+----
+2
+
+reconnect
+
+query II
+SELECT count(*), sum(i) FROM err_t
+----
+2
+3
+
+# error messages should not be swallowed into silent success
+statement error
+SELECT * FROM err_t WHERE

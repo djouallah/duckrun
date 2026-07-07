@@ -1,0 +1,337 @@
+# ============================================================================
+# 02_types.slt -- type boundaries, round-tripping through storage
+# ============================================================================
+
+# ---------------------------------------------------------------- integers
+
+statement ok
+CREATE TABLE t_int (t TINYINT, s SMALLINT, i INTEGER, b BIGINT)
+
+statement ok
+INSERT INTO t_int VALUES (-128, -32768, -2147483648, -9223372036854775808), (127, 32767, 2147483647, 9223372036854775807), (0, 0, 0, 0)
+
+query IIII
+SELECT t, s, i, b FROM t_int ORDER BY t
+----
+-128
+-32768
+-2147483648
+-9223372036854775808
+0
+0
+0
+0
+127
+32767
+2147483647
+9223372036854775807
+
+query II
+SELECT sum(i), sum(b) FROM t_int
+----
+-1
+-1
+
+statement error
+INSERT INTO t_int VALUES (128, 0, 0, 0)
+
+statement error
+INSERT INTO t_int VALUES (0, 0, 2147483648, 0)
+
+statement maybe
+CREATE TABLE t_huge AS SELECT 170141183460469231731687303715884105727::HUGEINT AS h
+
+statement maybe
+CREATE TABLE t_utiny (u UTINYINT)
+
+# ---------------------------------------------------------------- decimals
+
+statement ok
+CREATE TABLE t_dec (d38 DECIMAL(38,10), d4 DECIMAL(4,2))
+
+statement ok
+INSERT INTO t_dec VALUES (1234567890123456789012345678.0123456789, 99.99), (-0.0000000001, -99.99)
+
+query TT
+SELECT d38::VARCHAR, d4::VARCHAR FROM t_dec ORDER BY d4
+----
+-0.0000000001
+-99.99
+1234567890123456789012345678.0123456789
+99.99
+
+query T
+SELECT (0.1::DECIMAL(3,1) + 0.2::DECIMAL(3,1))::VARCHAR
+----
+0.3
+
+query T
+SELECT sum(d4)::VARCHAR FROM t_dec
+----
+0.00
+
+statement error
+INSERT INTO t_dec VALUES (0, 100.00)
+
+# ---------------------------------------------------------------- floats
+
+statement ok
+CREATE TABLE t_float (f DOUBLE)
+
+statement ok
+INSERT INTO t_float VALUES ('inf'), ('-inf'), ('nan'), (0.0), (-0.0), (1.5e308), (5e-324)
+
+query I
+SELECT count(*) FROM t_float WHERE isnan(f)
+----
+1
+
+query I
+SELECT count(*) FROM t_float WHERE isinf(f)
+----
+2
+
+query I
+SELECT count(*) FROM t_float WHERE f = 0.0
+----
+2
+
+query I
+SELECT count(*) FROM t_float WHERE isfinite(f) AND f > 1e307
+----
+1
+
+query I
+SELECT count(*) FROM t_float WHERE isfinite(f) AND f > 0 AND f < 1e-300
+----
+1
+
+# ---------------------------------------------------------------- temporal
+
+statement ok
+CREATE TABLE t_time (d DATE, ts TIMESTAMP)
+
+statement ok
+INSERT INTO t_time VALUES (DATE '1000-01-01', TIMESTAMP '1000-01-01 00:00:00'), (DATE '9999-12-31', TIMESTAMP '9999-12-31 23:59:59.999999'), (DATE '1970-01-01', TIMESTAMP '1970-01-01 00:00:00'), (DATE '1969-12-31', TIMESTAMP '1969-12-31 23:59:59.999999')
+
+statement error
+INSERT INTO t_time VALUES (DATE '2026-02-29', NULL)
+
+statement ok
+INSERT INTO t_time VALUES (DATE '2024-02-29', TIMESTAMP '2024-02-29 12:00:00.000001')
+
+query T
+SELECT ts::VARCHAR FROM t_time WHERE d = DATE '2024-02-29'
+----
+2024-02-29 12:00:00.000001
+
+query I
+SELECT count(*) FROM t_time WHERE d < DATE '1900-01-01'
+----
+1
+
+query I
+SELECT count(*) FROM t_time WHERE ts < TIMESTAMP '1970-01-01 00:00:00'
+----
+2
+
+query T
+SELECT max(d)::VARCHAR FROM t_time
+----
+9999-12-31
+
+query T
+SELECT min(ts)::VARCHAR FROM t_time
+----
+1000-01-01 00:00:00
+
+query I
+SELECT date_diff('microsecond', TIMESTAMP '2024-02-29 12:00:00', ts) FROM t_time WHERE d = DATE '2024-02-29'
+----
+1
+
+statement maybe
+CREATE TABLE t_timeonly (t TIME)
+
+statement maybe
+INSERT INTO t_timeonly VALUES (TIME '23:59:59.999999')
+
+statement maybe
+CREATE TABLE t_tstz (ts TIMESTAMPTZ)
+
+statement maybe
+CREATE TABLE t_interval AS SELECT INTERVAL 3 MONTH AS iv
+
+# ---------------------------------------------------------------- strings
+
+statement ok
+CREATE TABLE t_str (s VARCHAR)
+
+statement ok
+INSERT INTO t_str VALUES (''), (NULL), ('  leading and trailing  '), (e'tab\there'), (e'line1\nline2'), ('quote '' inside'), ('naïve café résumé'), ('日本語テキスト'), ('👨‍👩‍👧‍👦 family emoji'), ('mixed العربية and עברית')
+
+query I
+SELECT count(*) FROM t_str
+----
+10
+
+query I
+SELECT count(*) FROM t_str WHERE s IS NULL
+----
+1
+
+query I
+SELECT count(*) FROM t_str WHERE s = ''
+----
+1
+
+query T
+SELECT s FROM t_str WHERE s LIKE 'quote%'
+----
+quote ' inside
+
+query T
+SELECT s FROM t_str WHERE s LIKE 'line1%'
+----
+line1\nline2
+
+query T
+SELECT s FROM t_str WHERE s LIKE 'tab%'
+----
+tab\there
+
+query T
+SELECT s FROM t_str WHERE s LIKE '  leading%'
+----
+  leading and trailing  
+
+query I
+SELECT length(s) FROM t_str WHERE s LIKE 'naïve%'
+----
+17
+
+statement ok
+INSERT INTO t_str SELECT repeat('xyz', 10000)
+
+query I
+SELECT length(s) FROM t_str WHERE s LIKE 'xyz%'
+----
+30000
+
+# empty string and NULL must survive storage as distinct values
+query II
+SELECT count(*) FILTER (WHERE s = ''), count(*) FILTER (WHERE s IS NULL) FROM t_str
+----
+1
+1
+
+# ---------------------------------------------------------------- blob
+
+statement ok
+CREATE TABLE t_blob (b BLOB)
+
+statement ok
+INSERT INTO t_blob VALUES ('\xDE\xAD\xBE\xEF'::BLOB), (''::BLOB), (NULL)
+
+query T
+SELECT b FROM t_blob WHERE b IS NOT NULL AND octet_length(b) > 0
+----
+0xdeadbeef
+
+query I
+SELECT min(octet_length(b)) FROM t_blob
+----
+0
+
+# ---------------------------------------------------------------- nested types
+
+statement ok
+CREATE TABLE t_nested (l INTEGER[], st STRUCT(a INTEGER, b VARCHAR), ll VARCHAR[][])
+
+statement ok
+INSERT INTO t_nested VALUES ([1,2,3], {'a': 1, 'b': 'x'}, [['p','q'],[NULL]]), ([], NULL, NULL), (NULL, {'a': NULL, 'b': ''}, [[]])
+
+query I
+SELECT count(*) FROM t_nested
+----
+3
+
+query I
+SELECT sum(len(l)) FROM t_nested
+----
+3
+
+query T
+SELECT st.b FROM t_nested WHERE st.a = 1
+----
+x
+
+query I
+SELECT l[2] FROM t_nested WHERE len(l) = 3
+----
+2
+
+query T
+SELECT ll[1][1] FROM t_nested WHERE ll IS NOT NULL AND len(ll) = 2
+----
+p
+
+query I
+SELECT count(*) FROM t_nested WHERE st IS NULL
+----
+1
+
+query I
+SELECT count(*) FROM t_nested WHERE st.b = ''
+----
+1
+
+statement maybe
+CREATE TABLE t_map AS SELECT MAP {'k1': 1, 'k2': 2} AS m
+
+statement maybe
+CREATE TABLE t_uuid AS SELECT '5e740e6f-87a4-4d16-af5d-2c76fce53b3d'::UUID AS u
+
+statement maybe
+CREATE TABLE t_fixed_array (a INTEGER[3])
+
+statement maybe
+CREATE TABLE t_enum AS SELECT 'happy'::ENUM('sad','ok','happy') AS mood
+
+# ---------------------------------------------------------------- coercion
+
+statement ok
+CREATE TABLE t_coerce (i INTEGER)
+
+statement ok
+INSERT INTO t_coerce VALUES ('42')
+
+statement error
+INSERT INTO t_coerce VALUES ('not a number')
+
+statement error
+INSERT INTO t_coerce VALUES (9999999999)
+
+query I
+SELECT i FROM t_coerce
+----
+42
+
+# boolean round trip
+statement ok
+CREATE TABLE t_bool (b BOOLEAN)
+
+statement ok
+INSERT INTO t_bool VALUES (true), (false), (NULL)
+
+query T rowsort
+SELECT b FROM t_bool
+----
+NULL
+false
+true
+
+query I
+SELECT count(*) FROM t_bool WHERE b
+----
+1

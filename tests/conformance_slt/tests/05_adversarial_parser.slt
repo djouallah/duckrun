@@ -1,0 +1,394 @@
+# ============================================================================
+# 05_adversarial_parser.slt -- statements designed to confuse regex-based
+# SQL routing. Every statement here is plain valid SQL; the results must be
+# exactly correct no matter how the router classified the statement.
+#
+# The main traps:
+#   * keywords and table names inside string literals and comments
+#   * self-referencing inserts hidden behind nesting / CTEs
+#   * table names that are prefixes of other table names
+#   * identifiers that ARE keywords
+#   * whitespace, case, semicolons, dollar-quoting, FROM-first syntax
+# ============================================================================
+
+statement ok
+CREATE TABLE sales (id INTEGER, note VARCHAR)
+
+statement ok
+CREATE TABLE sale (id INTEGER)
+
+statement ok
+CREATE TABLE sales_backup (id INTEGER)
+
+# -- 1. string literal contains "INSERT INTO sales ... FROM sales" -----------
+
+statement ok
+INSERT INTO sales VALUES (1, 'INSERT INTO sales SELECT * FROM sales')
+
+query I
+SELECT count(*) FROM sales
+----
+1
+
+# -- 2. comments mention the target table ------------------------------------
+
+statement ok
+INSERT INTO sales /* not really FROM sales */ VALUES (2, 'two')
+
+statement ok
+INSERT INTO sales VALUES (3, 'three') -- SELECT * FROM sales
+
+statement ok
+-- leading line comment mentioning DELETE FROM sales
+INSERT INTO sales VALUES (4, 'four')
+
+statement ok
+/* UPDATE sales SET id = 0 */ INSERT INTO sales VALUES (5, 'five')
+
+query II
+SELECT count(*), sum(id) FROM sales
+----
+5
+15
+
+# -- 3. genuinely self-referencing insert hidden behind nesting --------------
+
+statement ok
+INSERT INTO sales SELECT id + 100, note FROM (SELECT * FROM (SELECT * FROM sales) a) b
+
+query II
+SELECT count(*), sum(id) FROM sales
+----
+10
+530
+
+# -- 4. CTE with the SAME NAME as the target shadows the base table ----------
+
+statement ok
+INSERT INTO sales WITH sales AS (SELECT 999 AS id, 'cte' AS note) SELECT * FROM sales
+
+query I
+SELECT count(*) FROM sales WHERE id = 999
+----
+1
+
+query I
+SELECT count(*) FROM sales
+----
+11
+
+# -- 5. prefix-named tables: writes must not leak between sale / sales -------
+
+statement ok
+INSERT INTO sale VALUES (7)
+
+statement ok
+INSERT INTO sales_backup SELECT id FROM sale
+
+query I
+SELECT count(*) FROM sale
+----
+1
+
+query I
+SELECT count(*) FROM sales_backup
+----
+1
+
+query I
+SELECT count(*) FROM sales
+----
+11
+
+# -- 6. eccentric case and whitespace ----------------------------------------
+
+statement ok
+iNsErT
+   InTo
+      sales
+VALUES (12, 'mixed case')
+
+statement ok
+	INSERT	INTO	sales	VALUES	(13,	'tabs everywhere')
+
+query I
+SELECT count(*) FROM sales WHERE id IN (12, 13)
+----
+2
+
+# -- 7. fake SQL, semicolons, quotes inside string literals -------------------
+
+statement ok
+INSERT INTO sales VALUES (14, 'a; DROP TABLE sales; --'), (15, 'it''s a ''quoted'' value'), (16, '"double" quotes and \ backslash')
+
+query T
+SELECT note FROM sales WHERE id = 14
+----
+a; DROP TABLE sales; --
+
+query T
+SELECT note FROM sales WHERE id = 15
+----
+it's a 'quoted' value
+
+query I
+SELECT count(*) FROM sales
+----
+16
+
+statement ok
+INSERT INTO sales VALUES (17, $$UPDATE sales SET note = 'gotcha' WHERE 1=1;--$$)
+
+query T
+SELECT note FROM sales WHERE id = 17
+----
+UPDATE sales SET note = 'gotcha' WHERE 1=1;--
+
+# -- 8. UPDATE / DELETE whose predicates contain keyword-laden strings --------
+
+statement ok
+UPDATE sales SET note = 'safe' WHERE note = 'a; DROP TABLE sales; --'
+
+query T
+SELECT note FROM sales WHERE id = 14
+----
+safe
+
+# note: the self-referencing insert copied this note to id 101 too,
+# so this DELETE must remove exactly two rows
+statement ok
+DELETE FROM sales WHERE note = 'INSERT INTO sales SELECT * FROM sales'
+
+query II
+SELECT count(*) FILTER (WHERE id = 1), count(*) FILTER (WHERE id = 101) FROM sales
+----
+0
+0
+
+query I
+SELECT count(*) FROM sales
+----
+15
+
+# -- 9. identifiers that ARE keywords ------------------------------------------
+
+statement ok
+CREATE TABLE "insert" ("from" INTEGER, "where" VARCHAR)
+
+statement ok
+INSERT INTO "insert" ("from", "where") VALUES (1, 'x')
+
+statement ok
+INSERT INTO "insert" SELECT "from" + 1, "where" FROM "insert"
+
+query II
+SELECT count(*), sum("from") FROM "insert"
+----
+2
+3
+
+statement ok
+UPDATE "insert" SET "where" = 'y' WHERE "from" = 2
+
+statement ok
+DELETE FROM "insert" WHERE "from" = 1
+
+query IT
+SELECT "from", "where" FROM "insert"
+----
+2
+y
+
+statement ok
+CREATE TABLE "select from where" (v INTEGER)
+
+statement ok
+INSERT INTO "select from where" VALUES (1)
+
+statement ok
+INSERT INTO "select from where" SELECT v + 1 FROM "select from where"
+
+query I rowsort
+SELECT v FROM "select from where"
+----
+1
+2
+
+# -- 10. column ordering, BY NAME, DEFAULT, RETURNING --------------------------
+
+statement ok
+CREATE TABLE colorder (a INTEGER, b INTEGER, c INTEGER)
+
+statement ok
+INSERT INTO colorder (c, a, b) VALUES (3, 1, 2)
+
+query III
+SELECT a, b, c FROM colorder
+----
+1
+2
+3
+
+statement ok
+INSERT INTO colorder BY NAME SELECT 30 AS c, 10 AS a, 20 AS b
+
+query III
+SELECT a, b, c FROM colorder WHERE a = 10
+----
+10
+20
+30
+
+statement ok
+INSERT INTO colorder VALUES (100, 100, 100);
+
+query I
+SELECT count(*) FROM colorder WHERE a = 100;
+----
+1
+
+query I
+INSERT INTO colorder VALUES (200, 0, 0) RETURNING a
+----
+200
+
+query I
+SELECT count(*) FROM colorder
+----
+4
+
+statement ok
+CREATE TABLE defaults_t (id INTEGER, created VARCHAR DEFAULT 'unknown')
+
+statement ok
+INSERT INTO defaults_t VALUES (1, DEFAULT)
+
+query T
+SELECT created FROM defaults_t
+----
+unknown
+
+statement ok
+INSERT INTO defaults_t VALUES (2, 'is this a ? parameter')
+
+query I
+SELECT count(*) FROM defaults_t WHERE created LIKE '%?%'
+----
+1
+
+# raw newline inside a string literal, mid-statement
+statement ok
+INSERT INTO defaults_t VALUES (3, 'line one
+line two')
+
+query T
+SELECT created FROM defaults_t WHERE id = 3
+----
+line one\nline two
+
+# case-insensitive resolution of the same table
+statement ok
+INSERT INTO DEFAULTS_T VALUES (4, 'upper ref')
+
+query I
+SELECT count(*) FROM Defaults_T
+----
+4
+
+# -- 11. FROM-first and bare-FROM syntax ---------------------------------------
+
+query I
+FROM defaults_t SELECT count(*)
+----
+4
+
+query IT rowsort
+FROM defaults_t
+----
+1
+unknown
+2
+is this a ? parameter
+3
+line one\nline two
+4
+upper ref
+
+# -- 12. CTE-prefixed DML -------------------------------------------------------
+
+statement ok
+CREATE TABLE cte_dml (id INTEGER)
+
+statement ok
+INSERT INTO cte_dml SELECT range FROM range(10)
+
+statement ok
+WITH victims AS (SELECT id FROM cte_dml WHERE id % 3 = 0)
+DELETE FROM cte_dml WHERE id IN (SELECT id FROM victims)
+
+query II
+SELECT count(*), sum(id) FROM cte_dml
+----
+6
+27
+
+statement ok
+WITH bump AS (SELECT 100 AS delta)
+UPDATE cte_dml SET id = id + (SELECT delta FROM bump) WHERE id = 1
+
+query I
+SELECT max(id) FROM cte_dml
+----
+101
+
+# -- 13. multi-statement in a single call (optional, must not corrupt) ---------
+
+statement ok
+CREATE TABLE multi_t (v INTEGER)
+
+statement maybe
+INSERT INTO multi_t VALUES (1); INSERT INTO multi_t VALUES (2)
+
+# whatever happened above, the table must still be usable
+statement ok
+INSERT INTO multi_t VALUES (99)
+
+query I
+SELECT count(*) FROM multi_t WHERE v = 99
+----
+1
+
+# -- 14. INSERT INTO ... FROM a table function, not a table --------------------
+
+statement ok
+CREATE TABLE fn_src (v BIGINT)
+
+statement ok
+INSERT INTO fn_src SELECT range FROM range(5)
+
+statement ok
+INSERT INTO fn_src SELECT v FROM fn_src WHERE v = (SELECT min(v) FROM fn_src)
+
+query II
+SELECT count(*), sum(v) FROM fn_src
+----
+6
+10
+
+# -- 15. a table literally named like a function call --------------------------
+
+statement ok
+CREATE TABLE "range" (v INTEGER)
+
+statement ok
+INSERT INTO "range" VALUES (777)
+
+query I
+SELECT v FROM "range"
+----
+777
+
+query I
+SELECT count(*) FROM range(3)
+----
+3

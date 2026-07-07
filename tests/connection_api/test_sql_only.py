@@ -340,6 +340,59 @@ def test_insert_with_schema_evolution_adds_columns(w):
     assert w.sql("select id, name, extra from t order by id").fetchall() == [(1, "a", None), (2, "b", 99)]
 
 
+# ─────────────────────────────── adversarial INSERT / UPDATE / DROP forms (conformance-SLT regressions)
+
+def test_insert_values_casts_mixed_literal_types_to_target(w):
+    """INSERT … VALUES whose literals share no common type (a VARCHAR 'inf' next to a DECIMAL 0.0) still
+    casts each row to the TARGET column type, the way a native INSERT does — instead of failing with
+    DuckDB's "Cannot combine types VARCHAR and DECIMAL" when the bare VALUES list is typed on its own."""
+    w.sql("CREATE OR REPLACE TABLE fl (f DOUBLE)")
+    w.sql("INSERT INTO fl VALUES ('inf'), ('-inf'), ('nan'), (0.0), (-0.0), (1.5)")
+    assert w.sql("select count(*) filter (where isinf(f)), count(*) filter (where isnan(f)), "
+                 "count(*) filter (where f = 0.0) from fl").fetchone() == (2, 1, 2)
+
+
+def test_insert_into_with_cte_after_target_shadowing_its_name(w):
+    """INSERT INTO t WITH cte AS (…) SELECT … — a CTE placed AFTER the target (even one that SHADOWS the
+    target's name) is routed, not swallowed into the relation: the CTE's row is appended."""
+    w.sql("CREATE OR REPLACE TABLE sales AS SELECT 1 AS id, 'a' AS note")
+    w.sql("INSERT INTO sales WITH sales AS (SELECT 999 AS id, 'cte' AS note) SELECT * FROM sales")
+    assert w.sql("select count(*), count(*) filter (where id = 999) from sales").fetchone() == (2, 1)
+
+
+def test_insert_by_name_aligns_source_columns_to_target(w):
+    """INSERT INTO t BY NAME SELECT … aligns the source's columns to the target BY NAME (not by
+    position); a target column the source omits is written NULL."""
+    w.sql("CREATE OR REPLACE TABLE colorder (a INTEGER, b INTEGER, c INTEGER)")
+    w.sql("INSERT INTO colorder BY NAME SELECT 30 AS c, 10 AS a, 20 AS b")
+    assert w.sql("select a, b, c from colorder").fetchall() == [(10, 20, 30)]
+    w.sql("INSERT INTO colorder BY NAME SELECT 7 AS b")          # a, c omitted → NULL
+    assert w.sql("select a, b, c from colorder where b = 7").fetchall() == [(None, 7, None)]
+
+
+def test_predicate_less_update_touches_every_row_over_many_files(w):
+    """UPDATE t SET c = <expr> with NO WHERE updates EVERY row even when the table is many small files.
+    delta_rs 1.5.0's predicate-less update() silently updates only some rows of a multi-file table (a
+    predicate referencing no column mis-prunes to a broken fast path), so duckrun routes a full-table
+    update through a DuckDB-evaluated fenced overwrite."""
+    w.sql("CREATE OR REPLACE TABLE batch (i INTEGER)")
+    for k in range(60):
+        w.sql(f"INSERT INTO batch VALUES ({k})")                 # 60 single-row commits → many files
+    w.sql("UPDATE batch SET i = i + 1")
+    assert w.sql("select count(*), sum(i), min(i), max(i) from batch").fetchone() == (60, 1830, 1, 60)
+
+
+def test_plain_drop_of_already_dropped_table_errors(w):
+    """DROP TABLE <t> a second time (after it's already dropped) raises like SQL requires; only DROP
+    TABLE IF EXISTS is a silent no-op. A dropped duckrun table leaves a tombstone at its path — the drop
+    must not read that as 'still exists' and succeed."""
+    w.sql("CREATE OR REPLACE TABLE gone (id INTEGER)")
+    w.sql("DROP TABLE gone")
+    w.sql("DROP TABLE IF EXISTS gone")                           # already gone → silent no-op
+    with pytest.raises(Exception):
+        w.sql("DROP TABLE gone")                                 # already gone, no IF EXISTS → error
+
+
 def test_alter_drop_column(w):
     """ALTER TABLE t DROP COLUMN c — a fenced overwrite rewrite (delta_rs has no in-place drop)."""
     w.sql("CREATE OR REPLACE TABLE d AS SELECT 1 AS a, 2 AS b, 3 AS cc")

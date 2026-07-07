@@ -1,0 +1,290 @@
+# ============================================================================
+# 06_delta_semantics.slt -- storage-format semantics: everything here must
+# survive closing the connection and reopening the same path. Reconnects are
+# placed after writes on purpose: a failed commit that "works" in-session but
+# is invisible after reopen is a storage bug.
+# ============================================================================
+
+statement ok
+CREATE TABLE durable (id INTEGER, s VARCHAR)
+
+statement ok
+INSERT INTO durable VALUES (1, 'before reconnect')
+
+reconnect
+
+query IT
+SELECT id, s FROM durable
+----
+1
+before reconnect
+
+statement ok
+INSERT INTO durable VALUES (2, 'after reconnect')
+
+reconnect
+
+query I
+SELECT count(*) FROM durable
+----
+2
+
+# ------------------------------------------------ checkpoint pressure
+# one commit per insert; reopen twice mid-stream (log replay + checkpoint read)
+
+statement ok
+CREATE TABLE chk (i INTEGER)
+
+loop i 0 12
+statement ok
+INSERT INTO chk VALUES (${i})
+endloop
+
+reconnect
+
+query II
+SELECT count(*), sum(i) FROM chk
+----
+12
+66
+
+loop i 12 25
+statement ok
+INSERT INTO chk VALUES (${i})
+endloop
+
+reconnect
+
+query II
+SELECT count(*), sum(i) FROM chk
+----
+25
+300
+
+# deletes and updates must survive reopen too
+
+statement ok
+DELETE FROM chk WHERE i >= 20
+
+statement ok
+UPDATE chk SET i = i * 10 WHERE i < 2
+
+reconnect
+
+query II
+SELECT count(*), sum(i) FROM chk
+----
+20
+199
+
+# ------------------------------------------------ replace / drop durability
+
+statement ok
+CREATE OR REPLACE TABLE durable (x DOUBLE)
+
+statement ok
+INSERT INTO durable VALUES (2.5)
+
+reconnect
+
+query R
+SELECT x FROM durable
+----
+2.500
+
+query I
+SELECT count(*) FROM durable
+----
+1
+
+statement ok
+DROP TABLE durable
+
+reconnect
+
+statement error
+SELECT * FROM durable
+
+statement ok
+CREATE TABLE durable (back INTEGER)
+
+statement ok
+INSERT INTO durable VALUES (1)
+
+reconnect
+
+query I
+SELECT back FROM durable
+----
+1
+
+# ------------------------------------------------ schema evolution
+
+statement ok
+CREATE TABLE evo (id INTEGER)
+
+statement ok
+INSERT INTO evo VALUES (1), (2)
+
+statement ok
+ALTER TABLE evo ADD COLUMN tag VARCHAR
+
+query IT
+SELECT id, tag FROM evo ORDER BY id
+----
+1
+NULL
+2
+NULL
+
+statement ok
+INSERT INTO evo VALUES (3, 'new')
+
+reconnect
+
+query IT
+SELECT id, tag FROM evo ORDER BY id
+----
+1
+NULL
+2
+NULL
+3
+new
+
+query I
+SELECT count(*) FROM evo WHERE tag IS NULL
+----
+2
+
+# rename / drop column need Delta column mapping -- optional, must not corrupt
+statement maybe
+ALTER TABLE evo RENAME COLUMN tag TO label
+
+statement maybe
+ALTER TABLE evo DROP COLUMN id
+
+# after whatever happened above, count must still be intact
+query I
+SELECT count(*) FROM evo
+----
+3
+
+# ------------------------------------------------ all-NULL columns and stats
+
+statement ok
+CREATE TABLE all_null (v INTEGER, w VARCHAR)
+
+statement ok
+INSERT INTO all_null SELECT NULL, NULL FROM range(100)
+
+reconnect
+
+query III
+SELECT count(*), count(v), count(w) FROM all_null
+----
+100
+0
+0
+
+query I
+SELECT count(*) FROM all_null WHERE v IS NULL
+----
+100
+
+query I
+SELECT count(*) FROM all_null WHERE v = 5
+----
+0
+
+# min/max pruning must not lose rows on long shared-prefix strings
+statement ok
+CREATE TABLE statstr (s VARCHAR)
+
+statement ok
+INSERT INTO statstr SELECT repeat('a', 100) || range::VARCHAR FROM range(50)
+
+reconnect
+
+query I
+SELECT count(*) FROM statstr WHERE s > repeat('a', 100) || '3'
+----
+26
+
+query I
+SELECT count(*) FROM statstr WHERE s = repeat('a', 100) || '49'
+----
+1
+
+# pruning on numeric boundaries after multiple files
+statement ok
+CREATE TABLE prune_n (v INTEGER)
+
+loop i 0 10
+statement ok
+INSERT INTO prune_n SELECT range + ${i} * 1000 FROM range(100)
+endloop
+
+reconnect
+
+query I
+SELECT count(*) FROM prune_n
+----
+1000
+
+query I
+SELECT count(*) FROM prune_n WHERE v BETWEEN 4050 AND 5049
+----
+100
+
+query I
+SELECT count(*) FROM prune_n WHERE v = 9099
+----
+1
+
+query I
+SELECT count(*) FROM prune_n WHERE v < 0
+----
+0
+
+# ------------------------------------------------ wide-ish schema round trip
+
+statement ok
+CREATE TABLE wide (c00 INTEGER, c01 INTEGER, c02 INTEGER, c03 INTEGER, c04 INTEGER, c05 INTEGER, c06 INTEGER, c07 INTEGER, c08 INTEGER, c09 INTEGER, c10 INTEGER, c11 INTEGER, c12 INTEGER, c13 INTEGER, c14 INTEGER, c15 INTEGER, c16 INTEGER, c17 INTEGER, c18 INTEGER, c19 INTEGER)
+
+statement ok
+INSERT INTO wide SELECT 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19
+
+reconnect
+
+query II
+SELECT c00 + c19, c10 * c11 FROM wide
+----
+19
+110
+
+# ------------------------------------------------ optional Delta surface
+
+statement maybe
+SELECT count(*) FROM chk AT (VERSION => 0)
+
+statement maybe
+OPTIMIZE chk
+
+statement maybe
+VACUUM chk
+
+# table must be fully intact after optional maintenance ops
+query II
+SELECT count(*), sum(i) FROM chk
+----
+20
+199
+
+reconnect
+
+query II
+SELECT count(*), sum(i) FROM chk
+----
+20
+199

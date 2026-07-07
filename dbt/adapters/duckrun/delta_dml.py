@@ -70,6 +70,8 @@ import re
 from datetime import datetime
 from typing import List, Optional, Tuple
 
+import duckdb
+
 from dbt.adapters.events.logging import AdapterLogger
 
 from . import engine
@@ -143,8 +145,16 @@ def _split_create_layout(rel: str):
 
 
 _INSERT_INTO_RE = re.compile(r"\s*insert\s+into\b", re.I)
+# `insert into <rel> [(cols)] [BY NAME] <SELECT | WITH … SELECT>`. rel is non-greedy so the optional
+# `BY NAME` (DuckDB's align-source-by-column-name) and a body-leading `WITH …` CTE (`insert into t
+# WITH c AS (…) SELECT … FROM c`, where the CTE may even SHADOW the target name) are peeled into their
+# own groups instead of being swallowed into rel — otherwise rel captures `colorder BY NAME` /
+# `sales WITH sales AS` and _resolve fails. The body starts at the first top-level SELECT-or-WITH.
 _INSERT_SELECT = re.compile(
-    r"\s*insert\s+into\s+(?P<rel>.+?)\s*(?:\((?P<cols>[^)]*)\))?\s+(?P<body>select\b.*)",
+    r"\s*insert\s+into\s+(?P<rel>.+?)"
+    r"(?:\s*\((?P<cols>[^)]*)\))?"
+    r"(?P<byname>\s+by\s+name)?"
+    r"\s+(?P<body>(?:with\b|select\b).*)",
     re.I | re.S,
 )
 _INSERT_VALUES = re.compile(
@@ -1142,14 +1152,19 @@ class _DeltaDML:
             raise ValueError(
                 f"UPDATE on {loc!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
             )
-        if (where and _PREDICATE_SUBQUERY.search(where)) or \
+        if where is None or (where and _PREDICATE_SUBQUERY.search(where)) or \
                 any(_PREDICATE_SUBQUERY.search(e) for e in updates.values()):
-            # delta_rs's update() hits a datafusion "not implemented" panic (pyo3 PanicException) on a
-            # subquery in EITHER the predicate (`… where id in (select …)`) OR a SET expression
-            # (`set g = (select max(id) from ref)` — the very rewrite our UPDATE…FROM error recommends).
-            # DuckDB CAN evaluate both, so compute the updated rows there — `CASE WHEN (pred) THEN <expr>
-            # ELSE col END` per SET column via SELECT * REPLACE (no predicate → apply <expr> to every row)
-            # — and commit a fenced full overwrite, mirroring _delete's fallback. Fenced to vB so a
+            # Route to a DuckDB-evaluated fenced overwrite (instead of delta_rs's dt.update) in two cases:
+            #  * a subquery in the predicate (`… where id in (select …)`) OR a SET expression (`set g =
+            #    (select max(id) from ref)`) — delta_rs's update() hits a datafusion "not implemented"
+            #    panic (pyo3 PanicException) on either; DuckDB can evaluate both.
+            #  * a predicate-less full-table UPDATE (`update t set i = i + 1`) — delta_rs 1.5.0 silently
+            #    updates only SOME rows of a multi-file table when the predicate references no column
+            #    (None / a constant both mis-prune to a broken fast path); a column-referencing predicate
+            #    is fine. A no-WHERE update rewrites every row anyway, so the full overwrite is equal work.
+            # Compute the updated rows there — `CASE WHEN (pred) THEN <expr> ELSE col END` per SET column
+            # via SELECT * REPLACE (no predicate → apply <expr> to every row) — and commit a fenced full
+            # overwrite, mirroring _delete's fallback. Fenced to vB so a
             # concurrent commit fails loud, not clobbered.
             logger.debug(
                 f"duckrun: UPDATE on {loc!r} references a subquery (predicate or SET expr); delta_rs "
@@ -1185,18 +1200,68 @@ class _DeltaDML:
         body = m.group("body")
         if self._with_clause:  # `WITH … INSERT INTO t SELECT …`: re-attach the CTE to the body
             body = f"{self._with_clause} {body}"
-        cols = m.group("cols")
+        if m.group("byname"):
+            # `INSERT INTO t BY NAME SELECT …`: align the source's OWN columns to the target by name
+            # (any target column the source doesn't name becomes NULL). Read the source column names
+            # and treat them as the written column list — _project_onto_schema already maps by name.
+            provided = list(self.cursor.sql(f"select * from ({body}) limit 0").columns)
+        else:
+            cols = m.group("cols")
+            provided = self._provided(cols) if cols else None
         # Always project onto the target schema — a column list maps by name, no list maps
         # positionally. Routing both through _append_projected gives one place for the intentional
         # type alignment AND the lossy-numeric-narrowing guard (so `insert … select 3.9` is caught too).
-        self._append_projected(loc, self._provided(cols) if cols else None, f"({body})")
+        self._append_projected(loc, provided, f"({body})")
 
     def _insert_values(self, m, rel, schema, loc) -> None:
         # `insert into <rel> [(<cols>)] values (...)`: the literals supply every target column when
         # no list is given, in order; otherwise the named columns.
         cols = m.group("cols")
         provided = self._provided(cols) if cols else None
-        self._append_projected(loc, provided, f"(values {m.group('body')})")
+        body = m.group("body")
+        derived = f"(values {body})"
+        # Can DuckDB self-type the VALUES columns? Probe on a THROWAWAY connection: the tuples are pure
+        # literals (no table refs), and a binder error would otherwise abort self.cursor's transaction.
+        try:
+            duckdb.connect().sql(f"select * from {derived} limit 0")
+        except duckdb.NotImplementedException:
+            # A column mixes literal types DuckDB won't self-combine across rows (e.g. 'inf' next to
+            # 0.0 → "Cannot combine types VARCHAR and DECIMAL") — exactly what a native INSERT resolves
+            # by casting each row to the TARGET column type. Replay the tuples through a target-typed
+            # temp so each literal casts per-row (native INSERT semantics), then append that relation.
+            # (The clean-typing fast path below keeps the lossy-numeric-narrowing guard intact.)
+            self._insert_values_via_typed_temp(loc, provided, body)
+            return
+        self._append_projected(loc, provided, derived)
+
+    def _insert_values_via_typed_temp(self, loc, provided, body: str) -> None:
+        """Append a VALUES list whose columns DuckDB can't self-type by first materializing it into a
+        temp table shaped like the target (the written columns, in the target's declared types). DuckDB's
+        own INSERT then casts each literal to its destination type per-row — the way a native INSERT does
+        — and the typed temp becomes the projected append source (unsupplied columns still NULL-fill)."""
+        loc_sql = loc.replace("'", "''")
+        template = self.cursor.sql(f"select * from delta_scan('{loc_sql}') limit 0")
+        by_lower = {c.lower(): (c, str(t)) for c, t in zip(template.columns, template.types)}
+        if provided is None:  # positional → every target column, in order
+            cols_types = list(zip(list(template.columns), [str(t) for t in template.types]))
+        else:
+            cols_types = []
+            for c in provided:
+                hit = by_lower.get(c.lower())
+                if hit is None:
+                    raise ValueError(
+                        f"INSERT into {loc!r} names unknown column {c!r}; columns are "
+                        f"{list(template.columns)}")
+                cols_types.append(hit)
+        coldefs = ", ".join(f'"{c}" {t}' for c, t in cols_types)
+        collist = ", ".join(f'"{c}"' for c, _ in cols_types)
+        tmp = f"__duckrun_vals_{abs(hash(loc)) & 0xFFFFFFFF}"
+        self.cursor.execute(f'create or replace temp table "{tmp}" ({coldefs})')
+        try:
+            self.cursor.execute(f'insert into "{tmp}" ({collist}) values {body}')
+            self._append_projected(loc, provided, f'"{tmp}"')
+        finally:
+            self.cursor.execute(f'drop table if exists "{tmp}"')
 
     @staticmethod
     def _provided(cols: str) -> List[str]:
@@ -1447,7 +1512,12 @@ class _DeltaDML:
         # isn't a duckrun-managed Delta table, fall through and let DuckDB drop the native table.
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
-        if not loc or not self._exists(loc):
+        if not loc or not self._exists(loc) or is_dropped(self.cursor, loc, self.so):
+            # Not a LIVE duckrun table (never existed, native, or already tombstoned) → pass through so
+            # DuckDB applies plain DROP / DROP IF EXISTS semantics: a plain `DROP TABLE <gone>` raises
+            # (the delta_scan view was already unregistered on the first drop), IF EXISTS is a no-op.
+            # Without this, a tombstoned table still has files at loc so a second plain DROP would
+            # wrongly succeed (re-tombstone) instead of erroring like SQL requires.
             return False
         # Fence the tombstone write to the version observed at drop time: a drop racing a live writer
         # should fail loud (the writer's commit lands first → CommitFailedError), not silently
