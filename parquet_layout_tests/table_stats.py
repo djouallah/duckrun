@@ -1,14 +1,15 @@
-"""duckrun get_stats for the summary tables — BOTH views:
-  1. per-TABLE summary  (get_stats('fct_summary*'))
-  2. per-ROW-GROUP detail (get_stats('fct_summary*', detailed=True)) — the raw parquet row-group
-     metadata, where the vorder vs optimized layout difference actually shows (how many rows / MB
-     sit in each parquet row group).
-Console tables + markdown sections in the GitHub Actions job summary.
+"""duckrun get_stats for the summary tables → run_report.json (tables.<t>.parquet)
+plus a stats_detailed.csv of the raw per-row-group parquet_metadata.
 
-Env in: ONELAKE_TABLES_PATH, ONELAKE_TOKEN (minted in the workflow).
+Env in: ONELAKE_TABLES_PATH, ONELAKE_TOKEN, RUN_REPORT.
 """
+import csv as _csv
 import os
 import sys
+from collections import defaultdict
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report  # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -16,64 +17,35 @@ try:
 except Exception:
     pass
 
-# Right-align these (numeric); everything else left-aligns.
-_NUM = {"total_rows", "num_files", "num_row_groups", "avg_row_group", "size_mb"}
-_FLOAT = {"avg_row_group", "size_mb"}
-
-
-def _fmt(col, v):
-    if v is None:
-        return ""
-    if col in _NUM:
-        try:
-            return f"{float(v):,.1f}" if col in _FLOAT else f"{int(v):,}"
-        except (TypeError, ValueError):
-            return str(v)
-    return str(v)
-
-
-def _markdown(title, note, cols, rows):
-    align = ["--:" if c in _NUM else ":--" for c in cols]
-    out = [title, "",
-           "| " + " | ".join(cols) + " |",
-           "| " + " | ".join(align) + " |"]
-    for r in rows:
-        out.append("| " + " | ".join(_fmt(c, v) for c, v in zip(cols, r)) + " |")
-    if note:
-        out += ["", note, ""]
-    return "\n".join(out)
-
-
-def _write_summary(md):
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if path:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(md + "\n")
-
 
 def main():
     import duckrun
     con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"] + "/mart",
                           storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})
 
-    # --- 1) Per-table summary (feeds the report card) ---
+    # --- per-table summary -> tables.<table>.parquet ---
     summ = con.get_stats("fct_summary*")
     print("\n=== Per-table summary — get_stats('fct_summary*') ===")
     try:
         summ.show(max_width=100000, max_col_width=1000)
     except TypeError:
         summ.show()
-    _write_summary(_markdown(
-        "## 📊 Table layout — duckrun `get_stats('fct_summary*')`",
-        "_`vorder` = Fabric V-Order flag; `avg_row_group` = rows per row group "
-        "(smaller ⇒ finer granularity, usually faster Direct Lake cold transcode)._",
-        summ.columns, summ.fetchall()))
+    scols = summ.columns
+    for row in summ.fetchall():
+        d = dict(zip(scols, row))
+        report.merge({"tables": {d["table"]: {"parquet": {
+            "rows": d.get("total_rows"),
+            "files": d.get("num_files"),
+            "row_groups": d.get("num_row_groups"),
+            "avg_row_group": d.get("avg_row_group"),
+            "size_mb": d.get("size_mb"),
+            "vorder": d.get("vorder"),
+            "compression": d.get("compression"),
+        }}}})
 
-    # --- 2) Full detail (detailed=True) — raw parquet_metadata -> CSV only (no report-card noise).
-    # Uploaded as the 'table-stats-detailed' artifact; download into Excel / pandas.
+    # --- per-row-group detail: CSV (raw) + row_group_detail into the report ---
     det = con.get_stats("fct_summary*", detailed=True)
     det_cols, det_rows = det.columns, det.fetchall()
-    import csv as _csv
     csv_path = os.environ.get("STATS_CSV", "stats_detailed.csv")
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
         w = _csv.writer(f)
@@ -81,6 +53,25 @@ def main():
         w.writerows(det_rows)
     print(f"\nwrote detailed stats CSV -> {os.path.abspath(csv_path)} "
           f"({len(det_rows)} rows × {len(det_cols)} cols)")
+
+    try:
+        i = {c: n for n, c in enumerate(det_cols)}
+        tc, fc, rgc = i["table"], i["file_name"], i["row_group_id"]
+        rc, sc = i["row_group_num_rows"], i["total_compressed_size"]
+        agg = {}
+        for r in det_rows:
+            key = (r[tc], r[fc], r[rgc])
+            a = agg.setdefault(key, {"rows": r[rc], "bytes": 0})
+            a["bytes"] += r[sc] or 0
+        detail = defaultdict(list)
+        for (t, fn, rg), a in agg.items():
+            detail[t].append({"file": fn, "rg": rg, "rows": a["rows"],
+                              "mb": round(a["bytes"] / 1e6, 1)})
+        for t, lst in detail.items():
+            lst.sort(key=lambda x: (str(x["file"]), x["rg"]))
+            report.merge({"tables": {t: {"parquet": {"row_group_detail": lst}}}})
+    except Exception as e:
+        print(f"(row_group_detail skipped: {str(e).splitlines()[0][:120]})")
 
 
 if __name__ == "__main__":

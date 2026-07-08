@@ -40,6 +40,9 @@ try:
 except Exception:
     pass
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report  # noqa: E402
+
 # Heavy queries: each forces a large scan of the ~140M-row fact but returns a SMALL result,
 # so we time the engine (scan/aggregate), not row transfer over the wire. Measures/columns
 # referenced all exist in model.bim (fct_summary, dim_duid, dim_calendar + the model measures).
@@ -228,12 +231,15 @@ def discover_models():
     return base, [n for n in names if n != base]
 
 
-def _write_summary(text):
-    """Append markdown to the GitHub Actions job summary (renders as a real table)."""
-    path = os.environ.get("GITHUB_STEP_SUMMARY")
-    if path:
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(text + "\n")
+def _write_timings(model, res):
+    out = {}
+    for name, r in res.items():
+        e = {"rows": r.get("rows"), "all_ms": r.get("all")}
+        if "cold_min" in r:
+            e["cold_ms"] = r["cold_min"]
+        e["hot_avg_ms"] = r.get("hot_avg")
+        out[name] = e
+    report.merge({"timings": {model: out}})
 
 
 def _render_console(title, headers, rows, aligns, sep_before_last=False):
@@ -290,18 +296,6 @@ def compare_table(title, base, model, base_res, opt_res, key):
                     disp, ("l", "r", "r", "r", "l"), sep_before_last=True)
     print(f"  → {headline}")
 
-    # ---- markdown for the job summary ----
-    emoji = {"opt": f"🟢 {mshort}", "base": "🔴 base", "tie": "⚪ tie"}
-    md = [f"### {title}", "",
-          f"| Query | {base} (ms) | {model} (ms) | base / {mshort} | Winner |",
-          "|:--|--:|--:|--:|:--|"]
-    for (n, b, o, s, w) in rows:
-        md.append(f"| `{n}` | {b:,.1f} | {o:,.1f} | {s:.2f}× | {emoji[w]} |")
-    md.append(f"| **TOTAL** | **{base_tot:,.1f}** | **{opt_tot:,.1f}** | "
-              f"**{overall:.2f}×** | **{emoji[total_w]}** |")
-    md += ["", f"**{headline}.**", ""]
-    _write_summary("\n".join(md))
-
 
 def main():
     workspace = os.environ["PBI_WORKSPACE"].strip()
@@ -317,16 +311,10 @@ def main():
     print(f"Base model: {base}")
     print(f"Compare   : {', '.join(others)}")
 
-    _write_summary(
-        f"# 🔍 XMLA benchmark — `{', '.join(others)}` vs `{base}`\n\n"
-        f"Workspace `{workspace}` · one dehydrate then **{runs}** runs per query "
-        f"(run 1 = cold first-touch; run 2 = warm; runs 3–{runs} averaged = hot) · same data (numbers identical) — "
-        f"only speed differs. Lower ms is better; "
-        f"**base/model ratio > 1× means the compared model is faster**.\n")
-
     base_res, base_cold = bench_model(workspace, base, token, runs, want_cold)
     if base_res is None:
         sys.exit(f"Base model {base!r} never became queryable — cannot benchmark.")
+    _write_timings(base, base_res)
 
     for model in others:
         if gap:
@@ -342,6 +330,7 @@ def main():
         if opt_res is None:
             print(f"  {model} never became queryable — skipping its comparison.", flush=True)
             continue
+        _write_timings(model, opt_res)
         if base_cold and opt_cold:
             compare_table(f"{model} vs {base}  —  COLD (run 1, first touch after one dehydrate)",
                           base, model, base_res, opt_res, "cold_min")

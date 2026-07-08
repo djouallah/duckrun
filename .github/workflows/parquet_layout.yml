@@ -58,6 +58,20 @@ jobs:
           pip install pythonnet pyyaml ms-fabric-cli
           pip install -e .
 
+      - name: 🧾 Init run report
+        shell: pwsh
+        env:
+          BENCH_ENV: ${{ inputs.env }}
+          BENCH_RUNS: ${{ inputs.runs }}
+          BENCH_COLD: ${{ inputs.cold }}
+          BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
+          OPT_SORT: ${{ inputs.opt_sort }}
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+        run: |
+          "RUN_REPORT=$PWD\run_report.json" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $env:RUN_REPORT = "$PWD\run_report.json"
+          python parquet_layout_tests/report.py init
+
       - name: 🧩 Install ADOMD.NET client (NuGet)
         shell: pwsh
         run: |
@@ -130,15 +144,6 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python parquet_layout_tests/table_stats.py
 
-      - name: 📎 Upload detailed stats CSV
-        if: always()
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: table-stats-detailed
-          path: stats_detailed.csv
-          if-no-files-found: warn
-
       - name: 🔍 Benchmark both models over XMLA
         env:
           PYTHONNET_RUNTIME: coreclr
@@ -147,3 +152,17 @@ jobs:
           BENCH_COLD: ${{ inputs.cold }}
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
         run: python parquet_layout_tests/xmla_compare.py
+
+      - name: 📝 Render report to job summary
+        if: always()
+        continue-on-error: true
+        run: python parquet_layout_tests/render_report.py
+
+      - name: 📎 Upload run report
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-report
+          path: run_report.json
+          if-no-files-found: warn
