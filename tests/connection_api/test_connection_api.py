@@ -1447,6 +1447,33 @@ def test_append_uses_delta_rs_defaults():
     assert "target_file_size" not in ap and "writer_properties" not in ap
 
 
+def test_compaction_adapts_row_groups(conn):
+    # Compaction rewrites the whole table into the read layout, sizing row groups from the live row
+    # count that's FREE in the Delta log — so a small fragmented table compacts to ~8 small groups, not
+    # one 16M group. Build fragmentation via many delta_rs-default appends, then compact.
+    from dbt.adapters.duckrun import engine
+    conn.sql("CREATE OR REPLACE TABLE compact_me AS select i as j from range(4000000) t(i)")
+    for k in range(1, 5):
+        conn.sql(f"INSERT INTO compact_me select i + {k} * 4000000 from range(4000000) t(i)")  # 20M total
+    loc = conn.root_path + "/dbo/compact_me"
+    engine.optimize(loc, storage_options=conn.storage_options, cur=conn._connection)
+    # optimize() doesn't vacuum, so tombstoned pre-compaction files linger on disk — count row groups
+    # over the LIVE files only (file_uris), not a raw glob.
+    live = engine._delta_table(loc, conn.storage_options).file_uris()
+    n = conn.sql(f"select count(*) from (select distinct file_name, row_group_id "
+                 f"from parquet_metadata({live!r}))").fetchone()[0]
+    assert 6 <= n <= 12, f"compaction did not adapt to the free row count: {n} row groups"
+
+
+def test_table_num_records_reads_the_log(conn):
+    # The free row count compaction sizes from: sum(num_records) over the Delta log, no data scan.
+    from dbt.adapters.duckrun import engine
+    conn.sql("CREATE OR REPLACE TABLE nrec AS select i from range(1234567) t(i)")
+    dt = engine._delta_table(conn.root_path + "/dbo/nrec", conn.storage_options)
+    assert engine.table_num_records(conn._connection, dt) == 1234567
+    assert engine.table_num_records(None, dt) is None  # no cursor -> unknown -> caller keeps 16M
+
+
 def test_rg_for_clamps():
     from dbt.adapters.duckrun import engine
     assert engine.rg_for(100) == engine._RG_MIN                       # tiny → floor

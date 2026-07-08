@@ -1542,7 +1542,7 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc or not self._exists(loc):
             return False
-        engine.optimize(loc, storage_options=self.so)
+        engine.optimize(loc, storage_options=self.so, cur=self.cursor)
         engine.vacuum(loc, storage_options=self.so)
         return True
 

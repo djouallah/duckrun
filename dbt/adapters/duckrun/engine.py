@@ -130,6 +130,21 @@ def rg_for(est):
     return max(_RG_MIN, min(_RG_MAX, -(-est // _RG_LANES)))   # ceil(est / _RG_LANES)
 
 
+def table_num_records(cur, dt):
+    """Total live rows of an EXISTING table from the Delta **log** (sum of per-file num_records) — free,
+    no data scan. This is the exact size compaction is about to rewrite, so compaction sizes its row
+    groups from it directly (no planner estimate needed). None if unavailable (no cursor, or a stat-less
+    log) so the caller keeps the 16M profile. 0 rows -> None (an empty table has nothing to size)."""
+    if cur is None:
+        return None
+    try:
+        add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
+        row = cur.sql("select coalesce(sum(num_records), 0)::bigint from add_actions").fetchone()
+    except Exception:
+        return None
+    return int(row[0]) if row and row[0] else None   # 0 / null stats -> unknown -> keep 16M
+
+
 def _writer_properties(plain_cols=None, row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
     # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a 32 MB dictionary page limit
@@ -993,9 +1008,10 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) 
 
     The compaction trigger matches the Tier-0 safe button exactly (compaction_debt: at least 8 files
     under half the target AND at least 2x the target in small bytes). compact() reuses the same
-    _writer_properties() read layout and _TARGET_FILE_SIZE every file write uses, so maintenance
-    (including the consolidation of files a lean MERGE left behind) keeps the uniform, one-row-group-
-    per-file layout Direct Lake wants.
+    _writer_properties() read layout and _TARGET_FILE_SIZE every file write uses — with the row-group
+    size adapted to the table's live row count (free from the log) so a small table compacts to
+    ~_RG_LANES groups, not one 16M group — so maintenance (including the consolidation of files a lean
+    MERGE left behind) keeps the uniform Direct Lake layout.
 
     The byte debt is measured with the DuckDB cursor ``cur`` (a replacement scan over the Delta log's
     add-actions); a caller with no cursor to lend — a bare engine write outside a session — simply
@@ -1007,8 +1023,14 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) 
     debt = compaction_debt(cur, path, dt=dt, storage_options=storage_options)
     policy = _policy()
 
+    # Adaptive row-group geometry: compaction rewrites the whole table into the read layout, and the
+    # table's live row count is free in the log — so a small table compacts to ~_RG_LANES small groups
+    # instead of one fat 16M group (big/unknown -> 16M). Same knob as the overwrite path.
+    _compact_rg = rg_for(table_num_records(cur, dt))
+
     def _compact():
-        dt.optimize.compact(target_size=_TARGET_FILE_SIZE, writer_properties=_writer_properties())
+        dt.optimize.compact(target_size=_TARGET_FILE_SIZE,
+                            writer_properties=_writer_properties(row_group_rows=_compact_rg))
 
     def _vacuum():  # past the retention-length gate only; a compaction just ran → compacted=True
         if policy.should_vacuum(compacted=True, last_vacuum_age_s=_last_vacuum_age_s(dt)):
@@ -1405,14 +1427,19 @@ def optimize(
     *,
     target_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
+    cur=None,
 ) -> Dict:
     """Compact small files into larger ones (delta_rs ``optimize.compact``) and return the operation
-    metrics. Reuses the one ``_writer_properties()`` read layout. A lexicographic ``ORDER BY`` at
-    write time (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a columnar
-    reader wants; there is no z-order path — bit-interleaving destroys the run-length runs the
-    in-memory reader relies on."""
+    metrics. Reuses the one ``_writer_properties()`` read layout, adapting the row-group size to the
+    table's live row count (free from the log via ``cur``) so a small table compacts to ~_RG_LANES
+    small groups rather than one 16M group. A lexicographic ``ORDER BY`` at write time
+    (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a columnar reader wants;
+    there is no z-order path — bit-interleaving destroys the run-length runs the in-memory reader
+    relies on."""
     dt = _delta_table(path, storage_options)
-    return dt.optimize.compact(target_size=target_size, writer_properties=_writer_properties())
+    rg = rg_for(table_num_records(cur, dt))
+    return dt.optimize.compact(target_size=target_size,
+                               writer_properties=_writer_properties(row_group_rows=rg))
 
 
 def compaction_debt(cur, path: str, *, dt: Optional[DeltaTable] = None,
