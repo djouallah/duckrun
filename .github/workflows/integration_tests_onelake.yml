@@ -43,6 +43,26 @@ on:
       - 'tests/performance/merge_tpch_bench.py'
       - '.github/workflows/integration_tests_onelake.yml'
   workflow_dispatch:
+    inputs:
+      project:
+        description: "Which project to run (aemo runs alone; 'all' runs every job)"
+        type: choice
+        default: aemo
+        options:
+          - all
+          - aemo
+          - merge_spill
+          - coffee
+          - taxi
+          - multicatalog
+      download_limit:
+        description: "aemo: files to download per source (default 10)"
+        type: string
+        default: "10"
+      process_limit:
+        description: "aemo: CSV files to fold into the marts (default 1000)"
+        type: string
+        default: "1000"
 
 # The project jobs use OIDC (id-token) for the Azure login. (Pages publishing lives in deploy-docs.yml.)
 permissions:
@@ -93,7 +113,7 @@ jobs:
     # and the standalone `dbt test` is the abfss:// read-path regression gate. Then static docs.
     # Serialize across branches: it writes a single shared OneLake lakehouse.
     needs: changes
-    if: ${{ needs.changes.outputs.aemo == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ needs.changes.outputs.aemo == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'aemo' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: aemo-onelake
@@ -106,8 +126,9 @@ jobs:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
       FILES_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Files
       DBT_SCHEMA: mart
-      download_limit: "10"
-      process_limit: "1000"
+      # On workflow_dispatch these come from the run inputs; on push they fall back to the defaults.
+      download_limit: ${{ inputs.download_limit || '10' }}
+      process_limit: ${{ inputs.process_limit || '1000' }}
       # The azure extension's default transport fails the OneLake TLS handshake on the runner
       # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
       AZURE_TRANSPORT_OPTION_TYPE: curl
@@ -181,7 +202,7 @@ jobs:
     # (the abfss:// merge write/read path via conn.sql). The heavy SF=10 memory-spill version is a
     # local release gate (local_stress_tests.yml), not this.
     needs: changes
-    if: ${{ needs.changes.outputs.merge_spill == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ needs.changes.outputs.merge_spill == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'merge_spill' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: merge-onelake
@@ -228,7 +249,7 @@ jobs:
     # the live OneLake tables — not a throwaway local build. Then the connection-API coffee scenario
     # (duckrun.connect) over OneLake, into an isolated schema.
     needs: changes
-    if: ${{ needs.changes.outputs.coffee == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ needs.changes.outputs.coffee == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'coffee' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: coffee-onelake
@@ -331,7 +352,7 @@ jobs:
     # schema so it never collides with the coffee tables in the shared lakehouse. Its own job so it
     # shows up as a visible node; non-fatal so a flaky live source can't redden the run.
     needs: changes
-    if: ${{ needs.changes.outputs.taxi == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ needs.changes.outputs.taxi == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'taxi' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: taxi-onelake
@@ -407,7 +428,7 @@ jobs:
     # writable OneLake lakehouse, a READ-ONLY Fabric Warehouse, and a local scratch dir as three
     # catalogs, JOINs across them, and writes a mart back to the lakehouse. Non-fatal like taxi.
     needs: changes
-    if: ${{ needs.changes.outputs.multicatalog == 'true' || github.event_name == 'workflow_dispatch' }}
+    if: ${{ needs.changes.outputs.multicatalog == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'multicatalog' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: multicatalog-onelake
