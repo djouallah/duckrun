@@ -13,7 +13,9 @@ BASE = (f"https://api.fabric.microsoft.com/v1/workspaces/{os.environ['WS_ID']}"
         f"/lakehouses/{os.environ['LH_ID']}/livyapi/versions/2023-12-01")
 FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 
-VARIANTS = {"vorder_base_sorted": "mart.fct_summary",
+# Both derive from the shared limited base so all layouts hold the SAME rows: sorted reads the
+# natural-order twin, notsorted reads the shuffled one.
+VARIANTS = {"vorder_base_sorted": "tests.summary_sorted",
             "vorder_base_notsorted": "tests.summary_unsorted"}
 # Human-readable sort provenance for the build metadata / summary layout matrix.
 SORTS = {"vorder_base_sorted": "source order (sorted base)",

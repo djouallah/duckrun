@@ -37,11 +37,12 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# Row group size: 6M rows (under evaluation — was 16M). Used by BOTH the normal write path and the
-# experimental sort-rewrite. A Parquet row group maps 1:1 to a Direct Lake column segment, and Fabric
-# wants segments in the 8M–16M row band, uniform in size; arrow-rs buffers a full uncompressed row group
-# per open writer, which is the real OOM lever on the hot path — so this is also the write-memory ceiling.
-_ROW_GROUP_SIZE = 6_000_000
+# Row group size: 16M rows, used by BOTH the normal write path and the experimental sort-rewrite.
+# A Parquet row group maps 1:1 to a Direct Lake column segment, and Fabric wants segments
+# in the 8M–16M row band, uniform in size. 16M sits at the top of that band (kept under 2^24, so one row
+# group still maps to one segment); arrow-rs buffers a full uncompressed row group per open writer, which
+# is the real OOM lever on the hot path — so 16M is also the write-memory ceiling.
+_ROW_GROUP_SIZE = 16_000_000
 # Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
 # overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
 # shrinks the written files and gives the columnar reader denser, more uniform segments — the read

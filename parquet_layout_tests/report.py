@@ -54,6 +54,7 @@ def _init():
             "runs": _int("BENCH_RUNS"),
             "cold": _bool("BENCH_COLD"),
             "cold_repeats": _int("COLD_REPEATS"),
+            "row_limit": _int("BENCH_ROW_LIMIT"),
             "gap_seconds": _int("BENCH_GAP_SECONDS"),
             "opt_sort": os.environ.get("OPT_SORT"),
             "rebuild": _bool("FORCE_REBUILD"),

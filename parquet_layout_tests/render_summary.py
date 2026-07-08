@@ -152,7 +152,7 @@ def s1_header(rep):
     w(f"- run `{run.get('run_id')}` · sha `{run.get('sha')}` · {run.get('date')}")
     w(f"- duckrun `{run.get('duckrun_version')}` · writer `{run.get('writer_profile')}`")
     w(f"- inputs: cold_repeats={inp.get('cold_repeats')} · runs={inp.get('runs')} · "
-      f"gap_seconds={inp.get('gap_seconds')}")
+      f"row_limit={inp.get('row_limit')} · gap_seconds={inp.get('gap_seconds')}")
     w()
     w(f"{len(rep.get('tables', {}))} layouts of the same {rows/1e6:,.1f}M-row table; DAX over XMLA "
       f"against Direct Lake; {inp.get('cold_repeats')} cold cycles (dehydrate→query) per query, "

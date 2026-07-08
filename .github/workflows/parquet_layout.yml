@@ -26,6 +26,10 @@ on:
         description: "cold dehydrate→query cycles per cold-tier query (median + spread reported)"
         type: string
         default: "3"
+      row_limit:
+        description: "row cap for the shared base all layouts derive from (default 142M ≈ full table; shrink to test small-table behaviour). Use with rebuild=true."
+        type: string
+        default: "142000000"
       gap_seconds:
         description: "idle seconds between the base and vorder benchmarks (>5min CU smoothing => clean gap in the capacity chart)"
         type: string
@@ -69,6 +73,7 @@ jobs:
           BENCH_RUNS: ${{ inputs.runs }}
           BENCH_COLD: ${{ inputs.cold }}
           COLD_REPEATS: ${{ inputs.cold_repeats }}
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
@@ -126,11 +131,12 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python parquet_layout_tests/check_tables.py
 
-      - name: 🧱 Build unsorted base (duckrun)
+      - name: 🧱 Build limited base — summary_unsorted + summary_sorted (duckrun)
         if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
         env:
           PYTHONIOENCODING: utf-8
           FORCE_REBUILD: ${{ inputs.rebuild }}
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python parquet_layout_tests/build_not_sorted.py
 
       - name: ⚡ Build Spark variant tables (Livy)

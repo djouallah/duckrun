@@ -36,8 +36,10 @@ if not force and _exists():
     status = "skipped"
 else:
     print(f"Building tests.fct_summary_optimized with '{clause}' ...", flush=True)
+    # Derive from the shared limited base (tests.summary_unsorted) so it holds the SAME rows as the
+    # V-Order variants; SORTED BY AUTO re-sorts them regardless of the base's shuffled order.
     con.sql(f"create or replace table tests.fct_summary_optimized {clause} "
-            "as select * from mart.fct_summary")
+            "as select * from tests.summary_unsorted")
     rows = con.sql("select count(*) from tests.fct_summary_optimized").fetchone()[0]
     print(f"done — tests.fct_summary_optimized built ({rows:,} rows)", flush=True)
     status = "rebuilt"
