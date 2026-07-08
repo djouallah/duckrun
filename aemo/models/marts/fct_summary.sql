@@ -33,7 +33,8 @@ SELECT
   sm.DUID,
   CAST(sm.mw AS DECIMAL(18, 4)) AS mw,
   CAST(sm.price AS DECIMAL(18, 4)) AS price,
-  cal.year
+  cal.year,
+  CAST((SELECT MAX(SETTLEMENTDATE) FROM {{ ref('fct_scada') }}) AS TIMESTAMP) AS cutoff
 FROM summary sm
 LEFT JOIN {{ source('aemo', 'dim_calendar') }} cal ON sm.date = cal.date
 ORDER BY sm.date
