@@ -102,13 +102,28 @@ def _walk_cardinality(plan):
     return None
 
 
-def estimated_rows(cur, data):
-    """Estimated result rows for a DuckDB relation (EXPLAIN, no execution). None on any failure.
+def _plan_has_limit(plan):
+    """True if the plan tree contains a LIMIT / STREAMING_LIMIT node. DuckDB's EXPLAIN annotates that
+    node with NOTHING (empty extra_info — no limit value, no reduced cardinality), so a limited query's
+    estimate falls through _walk_cardinality to the pre-limit SEQ_SCAN count. The node's mere presence
+    is our only signal that the estimate is untrustworthy and an exact count is needed."""
+    if "LIMIT" in (plan.get("name") or "").upper():
+        return True
+    return any(_plan_has_limit(c) for c in plan.get("children", []))
 
-    Registers the relation on its connection and reads the planner's Estimated Cardinality. This is the
-    single overwrite seam the SQL CTAS path and the dbt table path both flow through, so they size
-    identically. ``cur`` must be the connection that produced ``data``; ``None`` skips the estimate
-    (the write keeps the 16M profile)."""
+
+def estimated_rows(cur, data):
+    """Estimated result rows for a DuckDB relation. None on any failure.
+
+    Registers the relation on its connection and reads the planner's Estimated Cardinality (EXPLAIN,
+    no execution). This is the single overwrite seam the SQL CTAS path and the dbt table path both flow
+    through, so they size identically. ``cur`` must be the connection that produced ``data``; ``None``
+    skips the estimate (the write keeps the 16M profile).
+
+    A LIMIT is invisible to the estimate — DuckDB exposes neither its value nor a reduced cardinality,
+    so the walk would report the whole source and the row groups would be sized for the pre-limit count
+    (a ``… LIMIT 50M`` off a 140M table sizes as 140M). When the plan carries a limit we take an exact
+    ``count(*)`` instead; the limit short-circuits the scan, so it stays cheap."""
     if cur is None:
         return None
     name = "__duckrun_rg_est"
@@ -117,11 +132,14 @@ def estimated_rows(cur, data):
         try:
             raw = cur.execute(f"EXPLAIN (FORMAT JSON) SELECT * FROM {name}").fetchall()[0][1]
             plan = json.loads(raw)[0]
+            if _plan_has_limit(plan):
+                row = cur.execute(f"SELECT count(*) FROM {name}").fetchone()
+                return int(row[0]) if row and row[0] is not None else _walk_cardinality(plan)
+            return _walk_cardinality(plan)
         finally:
             cur.unregister(name)
     except Exception:
         return None
-    return _walk_cardinality(plan)
 
 
 def rg_for(est):

@@ -1379,6 +1379,17 @@ def test_ctas_sorted_result_adapts_row_groups(conn):
     assert 6 <= n <= 10, f"sorted CTAS collapsed/inflated to {n} row groups (zero-estimate not skipped?)"
 
 
+def test_ctas_limit_sizes_off_limited_count_not_source(conn):
+    # A LIMIT is invisible to the planner estimate (DuckDB annotates STREAMING_LIMIT with nothing, so
+    # the walk falls through to the full-source count). Sizing off the 200M source would keep the 16M
+    # profile (2 groups); the limited 20M result must adapt to ~8. Guards the limit-aware exact count.
+    conn.sql("CREATE OR REPLACE TABLE limited_ctas AS "
+             "select * from (select i as j from range(200000000) t(i) limit 20000000)")
+    assert conn.sql("select count(*) from limited_ctas").fetchone()[0] == 20000000
+    n = _row_groups(conn, "limited_ctas")
+    assert 7 <= n <= 9, f"expected ~8 row groups from the limited count, got {n}"
+
+
 def test_ctas_large_estimate_keeps_16m_profile(conn, monkeypatch):
     # A large estimate keeps today's 16M constant: 20M rows → ceil(20M/16M)=2 groups (byte-for-byte the
     # pre-change layout). Forced via the estimate so we don't have to write 128M rows in a test.
