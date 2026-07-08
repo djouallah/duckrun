@@ -82,6 +82,13 @@ integration_tests/*/target/
 integration_tests/*/dbt_packages/
 integration_tests/*/logs/
 integration_tests/*/package-lock.yml
+# aemo — promoted to a top-level project (its own workflow, .github/workflows/aemo.yml)
+aemo/.user.yml
+aemo/warehouse/
+aemo/target/
+aemo/dbt_packages/
+aemo/logs/
+aemo/package-lock.yml
 # multicatalog's dbt demo is one level deeper (integration_tests/multicatalog/dbt/)
 integration_tests/multicatalog/dbt/target/
 integration_tests/multicatalog/dbt/dbt_packages/

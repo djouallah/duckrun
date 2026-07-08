@@ -121,7 +121,7 @@ select ...
 Profiles, materializations, incremental strategies (incl. `append_if_unchanged`), sources, and
 automatic compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
 
-See it on real projects: [aemo](integration_tests/aemo) and [coffee](integration_tests/coffee) are
+See it on real projects: [aemo](aemo) and [coffee](integration_tests/coffee) are
 runnable starters, and [parity_tests/](parity_tests) runs real `type: duckdb` projects (jaffle_shop,
 sde, MRR, TechFlow, Tuva) unchanged on duckrun and diffs the output against dbt-duckdb.
 

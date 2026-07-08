@@ -25,7 +25,7 @@ on:
     # (the scorecards they commit to docs with [skip ci] — conformance / connection / snapshot-pin
     # from cores, the SF=100 TPC-H card from local_stress_tests — which would otherwise not reach the
     # site, since [skip ci] suppresses the docs-push trigger).
-    workflows: ["integration_tests_onelake", "cores", "local_stress_tests", "parity"]
+    workflows: ["integration_tests_onelake", "aemo", "cores", "local_stress_tests", "parity"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -93,6 +93,13 @@ jobs:
             gh run download "$PARITY_RUN_ID" --pattern 'docs-sde'         --dir docs-artifacts || true
             gh run download "$PARITY_RUN_ID" --pattern 'docs-mrr'         --dir docs-artifacts || true
             gh run download "$PARITY_RUN_ID" --pattern 'docs-techflow'    --dir docs-artifacts || true
+          fi
+          # aemo docs (its own workflow now, not integration_tests_onelake) — pull from its latest run.
+          AEMO_RUN_ID="$(gh run list --workflow=aemo.yml --branch=main \
+            --status=success --limit=1 --json databaseId --jq '.[0].databaseId' || true)"
+          if [ -n "${AEMO_RUN_ID:-}" ]; then
+            echo "Reusing aemo docs from run $AEMO_RUN_ID"
+            gh run download "$AEMO_RUN_ID" --pattern 'docs-aemo' --dir docs-artifacts || true
           fi
           # Overlay the per-project DAG catalogs and the live demo reports onto the built site.
           cp_art() { [ -f "$1" ] && cp "$1" "site/$2" && echo "  from artifact: $2"; }

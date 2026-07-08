@@ -1,0 +1,116 @@
+name: aemo
+
+# The AEMO project, built against live Microsoft Fabric OneLake (abfss://) — the build IS the
+# OneLake exercise, and the standalone `dbt test` is the abfss:// read-path regression gate. Then
+# static docs. Split out of integration_tests_onelake so it runs on its own, not behind the other
+# projects. Serialize across branches (and against the parquet-layout benchmark, which reads its
+# fct_summary): it writes a single shared OneLake lakehouse.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - 'aemo/**'
+      - '.github/workflows/aemo.yml'
+  pull_request:
+    paths:
+      - 'aemo/**'
+      - '.github/workflows/aemo.yml'
+  workflow_dispatch:
+    inputs:
+      download_limit:
+        description: "files to download per source (default 10)"
+        type: string
+        default: "10"
+      process_limit:
+        description: "CSV files to fold into the marts (default 1000)"
+        type: string
+        default: "1000"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aemo-onelake
+  cancel-in-progress: false
+
+jobs:
+  aemo:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: aemo
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/aemo
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+      FILES_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Files
+      DBT_SCHEMA: mart
+      download_limit: ${{ inputs.download_limit || '10' }}
+      process_limit: ${{ inputs.process_limit || '1000' }}
+      # The azure extension's default transport fails the OneLake TLS handshake on the runner
+      # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
+      AZURE_TRANSPORT_OPTION_TYPE: curl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
+        working-directory: ${{ github.workspace }}
+        run: pip install -e .
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        # Bearer tokens last ~1h, so mint one per run. OneLake takes Azure Storage AAD tokens.
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Generate external sources (calendar Delta table)
+        # dim_calendar is an external Delta table read via source('aemo','dim_calendar'), not a model.
+        run: python scripts/generate_calendar.py
+      - name: dbt build (OneLake — creates Delta tables over abfss://)
+        run: dbt build --target dev --exclude tag:heavy
+      - name: dbt test (fresh process — read-only delta_scan registration over abfss://)
+        # A standalone `dbt test` materializes nothing, so it only passes if the adapter re-registers
+        # every Delta table as a delta_scan view at run start — which on OneLake needs the Azure
+        # secret created at connection-open. The regression gate for "schema does not exist".
+        run: dbt test --target dev --exclude tag:heavy
+      - name: dbt docs generate (static, real catalog over abfss:// Delta tables)
+        run: dbt docs generate --static --target dev
+      - name: Verify the aemo catalog carries Delta table stats (issue #3)
+        run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json aemo
+      - name: Upload aemo docs
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-aemo
+          path: aemo/target/static_index.html
+      - name: SORTED BY AUTO sort rewrite on fct_summary (dogfood on real data)
+        # Run the SQL-only auto-key sort rewrite on the real summary table over OneLake and print the
+        # before/after layout. Last step on purpose — a rewrite the next dbt build supersedes.
+        run: |
+          python - <<'PY'
+          import os, duckrun
+          conn = duckrun.connect(
+              os.environ["WAREHOUSE_PATH"],
+              storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
+              schema="mart", read_only=False)
+
+          def detail(t):
+              rel = conn.sql(f"DESCRIBE DETAIL {t}")
+              return dict(zip(rel.columns, rel.fetchone()))
+
+          before = detail("fct_summary")
+          # Auto-key sort rewrite, SQL-only: profile the key from the Delta log, re-cluster in one commit.
+          conn.sql("CREATE OR REPLACE TABLE fct_summary SORTED BY AUTO AS SELECT * FROM fct_summary")
+          after = detail("fct_summary")
+          print("=== CREATE TABLE fct_summary SORTED BY AUTO — auto-sort rewrite ===")
+          print(f"numFiles: {before['numFiles']} -> {after['numFiles']}  (version {before['version']} -> {after['version']})")
+          b, a = before["sizeInBytes"], after["sizeInBytes"]
+          if b:
+              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB")
+          PY
