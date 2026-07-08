@@ -1,6 +1,11 @@
 import os
+import sys
+import time
 
 import duckrun
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report  # noqa: E402
 
 sort = (os.environ.get("OPT_SORT") or "auto").strip()
 clause = "sorted by auto" if sort.lower() == "auto" else f"sorted by ({sort})"
@@ -23,13 +28,20 @@ def _exists():
         return False
 
 
+_t0 = time.perf_counter()
 if not force and _exists():
     rows = con.sql("select count(*) from tests.fct_summary_optimized").fetchone()[0]
     print(f"tests.fct_summary_optimized already exists ({rows:,} rows) — skipping "
           "(rebuild=true to rebuild)", flush=True)
+    status = "skipped"
 else:
     print(f"Building tests.fct_summary_optimized with '{clause}' ...", flush=True)
     con.sql(f"create or replace table tests.fct_summary_optimized {clause} "
             "as select * from mart.fct_summary")
     rows = con.sql("select count(*) from tests.fct_summary_optimized").fetchone()[0]
     print(f"done — tests.fct_summary_optimized built ({rows:,} rows)", flush=True)
+    status = "rebuilt"
+
+report.merge({"tables": {"fct_summary_optimized": {"build": {
+    "engine": "duckdb", "sort": clause, "vorder": False,
+    "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})

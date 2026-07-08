@@ -5,6 +5,9 @@ import time
 import urllib.error
 import urllib.request
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report  # noqa: E402
+
 TOKEN = os.environ["FABRIC_TOKEN"]
 BASE = (f"https://api.fabric.microsoft.com/v1/workspaces/{os.environ['WS_ID']}"
         f"/lakehouses/{os.environ['LH_ID']}/livyapi/versions/2023-12-01")
@@ -12,6 +15,16 @@ FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 
 VARIANTS = {"vorder_base_sorted": "mart.fct_summary",
             "vorder_base_notsorted": "tests.summary_unsorted"}
+# Human-readable sort provenance for the build metadata / summary layout matrix.
+SORTS = {"vorder_base_sorted": "source order (sorted base)",
+         "vorder_base_notsorted": "shuffled source"}
+
+
+def _record_build(variant, seconds, status):
+    report.merge({"tables": {f"fct_summary_{variant}": {"build": {
+        "engine": "spark", "sort": SORTS[variant], "vorder": True,
+        "seconds": (round(seconds, 1) if seconds is not None else None),
+        "status": status}}}})
 
 
 def _spark_code(variant, source):
@@ -96,6 +109,7 @@ def main():
         out = f"tests.fct_summary_{v}"
         if not FORCE and _table_exists(out):
             print(f"{out} already exists — skipping (set rebuild=true to rebuild).", flush=True)
+            _record_build(v, None, "skipped")
             continue
         if not _table_exists(src):
             print(f"source {src} not found — skipping {v}.", flush=True)
@@ -113,7 +127,9 @@ def main():
                     {"error", "dead", "killed", "shutting_down"}, timeout=900, interval=15)
         for v, src in todo.items():
             print(f"Building tests.fct_summary_{v} (V-Order, source {src})...", flush=True)
+            t0 = time.perf_counter()
             _run_statement(sid, _spark_code(v, src))
+            _record_build(v, time.perf_counter() - t0, "rebuilt")
     finally:
         print(f"Deleting session {sid}...", flush=True)
         try:

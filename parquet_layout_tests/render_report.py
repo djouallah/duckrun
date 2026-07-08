@@ -22,6 +22,10 @@ _PARQUET_COLS = ["table", "rows", "files", "row_groups", "avg_row_group",
 _PROBE_COLS = ["mw", "price", "duid", "date", "time"]     # probe_<col> minus probe_rowcount
 _FILTER_COLS = ["date", "time", "DUID"]                   # clustering candidates
 _RG_BIG = 1 << 24                                          # 16,777,216 rows — Direct Lake segment cap
+# hot_only ladder query -> the fact column(s) its predicate prunes on (year/month filter via
+# dim_calendar reaches the fact `date`; DUID filter is direct).
+_LADDER_COLS = {"sel_1yr": ["date"], "sel_1mo": ["date"],
+                "sel_1duid": ["DUID"], "sel_1duid_1mo": ["DUID", "date"]}
 
 
 def _write(md):
@@ -53,12 +57,30 @@ def _short(model):
 
 # ---------------------------------------------------------------------------- derived analysis
 
+def _bounds(chunk):
+    """(min, max) for a column-chunk. DuckDB puts current stats in stats_min_value/stats_max_value
+    (string columns like DUID have ONLY these — stats_min/stats_max are null); fall back to the
+    legacy stats_min/stats_max for anything that only has those."""
+    lo = chunk.get("stats_min_value")
+    if lo is None:
+        lo = chunk.get("stats_min")
+    hi = chunk.get("stats_max_value")
+    if hi is None:
+        hi = chunk.get("stats_max")
+    return lo, hi
+
+
 def _coerce_intervals(chunks, col):
     """[(min, max)] for column `col` across its column-chunks, coerced to a comparable type
-    (float if every bound parses as a number, else str)."""
-    raw = [(c.get("stats_min"), c.get("stats_max")) for c in chunks
-           if c.get("path_in_schema") == col and c.get("stats_min") is not None
-           and c.get("stats_max") is not None]
+    (float if every bound parses as a number, else str — strings compare lexicographically)."""
+    raw = []
+    for c in chunks:
+        if c.get("path_in_schema") != col:
+            continue
+        lo, hi = _bounds(c)
+        if lo is None or hi is None:
+            continue
+        raw.append((lo, hi))
     if not raw:
         return []
     flat = [v for pair in raw for v in pair]
@@ -94,12 +116,42 @@ def _tie(b, m, b_spread_pct, m_spread_pct):
     return "model" if m < b else ("base" if m > b else "tie")
 
 
+def _agg_verdict(base_t, model_t, key, spread_key):
+    """Aggregate base-vs-model verdict for one metric, tie rule applied per query. If no query
+    separates the two outside its spread, the verdict is 'no measurable difference' — that is a
+    finding, not a win."""
+    bt = mt = 0.0
+    per = []
+    for q, mv in model_t.items():
+        bv = base_t.get(q, {})
+        b, x = bv.get(key), mv.get(key)
+        if b is None or x is None:
+            continue
+        per.append(_tie(b, x, bv.get(spread_key) if spread_key else None,
+                        mv.get(spread_key) if spread_key else None))
+        bt += b
+        mt += x
+    if not per:
+        return None
+    wins, losses, ties = per.count("model"), per.count("base"), per.count("tie")
+    ratio = (bt / mt) if mt else float("inf")
+    if wins == 0 and losses == 0:
+        verdict, text = "tie", "no measurable difference (all deltas within spread)"
+    else:
+        verdict = "model" if mt < bt else "base"
+        fac = ratio if ratio >= 1 else (1 / ratio if ratio else 0)
+        text = f"{verdict} {fac:.2f}× faster overall (W/L/T {wins}/{losses}/{ties})"
+    return {"base_total_ms": round(bt, 1), "model_total_ms": round(mt, 1),
+            "ratio": round(ratio, 3), "wins": wins, "losses": losses, "ties": ties,
+            "verdict": verdict, "text": text}
+
+
 def compute_analysis(rep):
     timings = rep.get("timings", {})
     tables = rep.get("tables", {})
     models = list(timings)
-    analysis = {"cold_column_cost": {}, "cold_vs_geometry": {},
-                "size_attribution": {}, "clustering_scores": {}, "verdicts": []}
+    analysis = {"cold_column_cost": {}, "cold_vs_geometry": {}, "size_attribution": {},
+                "clustering_scores": {}, "skipping": {}, "verdicts": []}
 
     # cold_column_cost: probe_<col>.cold_median - probe_rowcount.cold_median (marginal transcode).
     for m in models:
@@ -136,39 +188,50 @@ def compute_analysis(rep):
         if by_col:
             analysis["size_attribution"][m] = {k: by_col[k] for k in sorted(by_col)}
 
-    # clustering_scores: overlap metric per (table, filter column).
+    # clustering_scores: overlap metric per (table, filter column). Uses stats_min_value/
+    # stats_max_value so string columns (DUID) are compared, not silently scored 0.0.
     for m in models:
         chunks = tables.get(_table(m), {}).get("parquet", {}).get("column_chunks") or []
         if not chunks:
             continue
-        analysis["clustering_scores"][_table(m)] = {
-            col: _overlap_score(_coerce_intervals(chunks, col)) for col in _FILTER_COLS
-        }
+        scores = {col: _overlap_score(_coerce_intervals(chunks, col)) for col in _FILTER_COLS}
+        analysis["clustering_scores"][_table(m)] = scores
+        # Sanity: 0.0 over >1 row group with stats is almost always the string-compare failure mode.
+        for col, s in scores.items():
+            n = sum(1 for c in chunks
+                    if c.get("path_in_schema") == col and _bounds(c)[0] is not None)
+            if s == 0.0 and n > 1:
+                print(f"WARN clustering {_table(m)}.{col} = 0.0 over {n} row groups with stats — "
+                      "verify the min/max comparison (string columns need stats_*_value)",
+                      flush=True)
 
-    # verdicts: one-liners, base vs each challenger, tie rule applied.
+    # skipping: pair each ladder query's first_touch_ms with the clustering of its filtered
+    # column(s) — this is the data-skipping evidence.
+    for q, cols in _LADDER_COLS.items():
+        entry = {"filter_cols": cols, "models": {}}
+        present = False
+        for m in models:
+            ft = timings[m].get(q, {}).get("first_touch_ms")
+            if ft is not None:
+                present = True
+            sc = analysis["clustering_scores"].get(_table(m), {})
+            entry["models"][m] = {"first_touch_ms": ft,
+                                  "clustering": {c: sc.get(c) for c in cols}}
+        if present:
+            analysis["skipping"][q] = entry
+
+    # verdicts: structured, base vs each challenger, medians + tie rule (never a mean).
     base = next((x for x in models if x.endswith("_optimized")), min(models, key=len) if models else None)
     if base:
         for m in models:
             if m == base:
                 continue
-            for label, key, sk in (("COLD", "cold_median_ms", "cold_spread_pct"),
-                                    ("HOT", "hot_avg_ms", None)):
-                bt = mt = 0.0
-                for q, mv in timings[m].items():
-                    bv = timings[base].get(q, {})
-                    b, x = bv.get(key), mv.get(key)
-                    if b is not None and x is not None:
-                        bt += b
-                        mt += x
-                if not (bt or mt):
-                    continue
-                w = _tie(bt, mt, None, None)
-                fac = (bt / mt) if mt else float("inf")
-                fac = fac if fac >= 1 else (1 / fac if fac else 0)
-                who = {"base": _short(base), "model": _short(m), "tie": "tie"}[w]
-                analysis["verdicts"].append(
-                    f"{label}: {_short(m)} vs {_short(base)} — "
-                    + ("statistical tie" if w == "tie" else f"{who} {fac:.2f}× faster overall"))
+            for metric, key, sk in (("COLD", "cold_median_ms", "cold_spread_pct"),
+                                    ("HOT", "hot_median_ms", "hot_spread_pct")):
+                agg = _agg_verdict(timings[base], timings[m], key, sk)
+                if agg:
+                    agg.update({"metric": metric, "base": _short(base), "model": _short(m)})
+                    analysis["verdicts"].append(agg)
     return analysis
 
 
@@ -233,7 +296,8 @@ def _cold_cost_table(cc):
 def _verdicts(vs):
     if not vs:
         return
-    _write("### Verdicts\n\n" + "\n".join(f"- {v}" for v in vs) + "\n")
+    lines = [f"- **{v['metric']}** {v['model']} vs {v['base']}: {v['text']}" for v in vs]
+    _write("### Verdicts (medians, tie rule applied)\n\n" + "\n".join(lines) + "\n")
 
 
 def main():
@@ -260,8 +324,8 @@ def main():
         others = [m for m in timings if m != base]
         _sidebyside("COLD (median of dehydrate cycles)", timings, base, others,
                     "cold_median_ms", "cold_spread_pct")
-        _sidebyside("HOT (avg of steady-state runs)", timings, base, others,
-                    "hot_avg_ms", None)
+        _sidebyside("HOT (median of steady-state runs)", timings, base, others,
+                    "hot_median_ms", "hot_spread_pct")
     _cold_cost_table(analysis.get("cold_column_cost", {}))
     _verdicts(analysis.get("verdicts", []))
 

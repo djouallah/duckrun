@@ -174,16 +174,25 @@ jobs:
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
         run: python parquet_layout_tests/xmla_compare.py
 
-      - name: 📝 Render report to job summary
+      - name: 📝 Render report to job summary (computes + merges the analysis block)
         if: always()
         continue-on-error: true
         run: python parquet_layout_tests/render_report.py
 
-      - name: 📎 Upload run report
+      - name: 📑 Render specialist summary (SUMMARY.md, rendered from run_report.json)
+        if: always()
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python parquet_layout_tests/render_summary.py
+
+      - name: 📎 Upload run report + summary
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: run-report
-          path: run_report.json
+          path: |
+            run_report.json
+            SUMMARY.md
           if-no-files-found: warn

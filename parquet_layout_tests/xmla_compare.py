@@ -286,7 +286,9 @@ def bench_model(workspace, model, token, runs, want_cold, cold_repeats, queries)
                 res["cold_min_ms"] = min(cold)
                 lo, hi, med = min(cold), max(cold), statistics.median(cold)
                 res["cold_spread_pct"] = 100.0 * (hi - lo) / med if med else 0.0
-            # HOT: run WITHOUT dehydrating; drop run1/run2 as the warm transition, average the rest.
+            # HOT: run WITHOUT dehydrating; drop run1/run2 as the warm transition. Report the
+            # MEDIAN of the rest — a single capacity spike (a 2.5s blip among 110ms runs) blows up
+            # the mean and fabricates a verdict, so the mean is kept only for continuity.
             hot_times = []
             for _ in range(runs):
                 t, rows = run_query(conn, dax)
@@ -294,7 +296,12 @@ def bench_model(workspace, model, token, runs, want_cold, cold_repeats, queries)
                 rowcount = rows
             hot = hot_times[2:] or hot_times[1:] or hot_times[:1]
             res["all_hot_ms"] = hot_times
-            res["hot_avg_ms"] = sum(hot) / len(hot)
+            res["hot_avg_ms"] = sum(hot) / len(hot)      # continuity only — NOT used for verdicts
+            res["hot_median_ms"] = statistics.median(hot)
+            hlo, hhi, hmed = min(hot), max(hot), statistics.median(hot)
+            res["hot_spread_pct"] = 100.0 * (hhi - hlo) / hmed if hmed else 0.0
+            if tier == "hot_only":
+                res["first_touch_ms"] = hot_times[0]     # first run = the data-skipping measurement
             res["rows"] = rowcount
             results[name] = res
             # Console trace.
@@ -304,7 +311,8 @@ def bench_model(workspace, model, token, runs, want_cold, cold_repeats, queries)
                 print(f"      cold x{cold_repeats}: [{cold_str}]  median={res['cold_median_ms']:.1f}ms"
                       f"  spread={res['cold_spread_pct']:.1f}%")
             hot_str = ", ".join(f"{h:.1f}" for h in hot_times)
-            print(f"      hot   x{runs}: [{hot_str}]  hot_avg={res['hot_avg_ms']:.1f}ms")
+            print(f"      hot   x{runs}: [{hot_str}]  median={res['hot_median_ms']:.1f}ms"
+                  f"  spread={res['hot_spread_pct']:.1f}%")
     finally:
         conn.Close()
     return results, can_cold
@@ -448,8 +456,8 @@ def main():
         if base_cold and opt_cold:
             compare_table(f"{model} vs {base}  —  COLD (median of {cold_repeats} dehydrate cycles)",
                           base, model, base_res, opt_res, "cold_median_ms", "cold_spread_pct")
-        compare_table(f"{model} vs {base}  —  HOT (avg of hot runs, dropping run1/run2 warm)",
-                      base, model, base_res, opt_res, "hot_avg_ms")
+        compare_table(f"{model} vs {base}  —  HOT (median of hot runs, dropping run1/run2 warm)",
+                      base, model, base_res, opt_res, "hot_median_ms", "hot_spread_pct")
 
 
 if __name__ == "__main__":
