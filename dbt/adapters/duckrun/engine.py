@@ -39,10 +39,11 @@ except ImportError:  # pragma: no cover - older layouts
 
 
 # Row group size: 16M rows, used by BOTH the normal write path and the experimental sort-rewrite.
-# A Parquet row group maps 1:1 to a Direct Lake column segment, and Fabric wants segments
-# in the 8M–16M row band, uniform in size. 16M sits at the top of that band (kept under 2^24, so one row
-# group still maps to one segment); arrow-rs buffers a full uncompressed row group per open writer, which
-# is the real OOM lever on the hot path — so 16M is also the write-memory ceiling.
+# A Parquet row group maps 1:1 to a Direct Lake column segment; any size from 1M to 16M rows is a fine
+# segment, and 16M is the ceiling (kept under 2^24, so one row group still maps to one segment). This is
+# the max used for a large table; a small table shrinks it toward ~_RG_LANES groups (see rg_for). arrow-rs
+# buffers a full uncompressed row group per open writer, the real OOM lever on the hot path — so 16M is
+# also the write-memory ceiling.
 _ROW_GROUP_SIZE = 16_000_000
 # Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
 # overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
