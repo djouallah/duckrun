@@ -402,20 +402,22 @@ def s8_pointers(rep):
 
 
 def verify_verdicts(rep, analysis):
-    """Independent cross-check that the verdict winner is not inverted: for every cold pair, the
-    verdict winner must agree with BOTH the summed marginal-cold-cost winner and the per-query
-    cold-median majority. Returns a list of mismatch strings (empty = all consistent)."""
+    """Orientation guard: the verdict winner must agree with the per-query cold-median majority
+    over the SAME queries the verdict aggregates — a disagreement there is a true ratio inversion
+    and is fatal. The summed marginal PROBE cost is a second view over a DIFFERENT (probe-only)
+    query subset; probes and composites can legitimately point different ways, so a disagreement
+    there is a non-fatal note, not a build failure. Returns (errors, notes)."""
     tim = rep.get("timings", {})
     cc = analysis.get("cold_column_cost", {})
     base = next((m for m in tim if m.endswith("_optimized")), None)
     if not base or base not in cc:
-        return []
+        return [], []
     def _cost(m):
         cols = cc.get(m, {}).get("columns")
         return (sum(cols.values()) + cc[m]["rowcount_overhead_ms"]) if cols else None
     base_cost = _cost(base)
     vmap = {v["model"]: v for v in analysis.get("verdicts", []) if v["metric"] == "COLD"}
-    errs = []
+    errs, notes = [], []
     for m in tim:
         if m == base or m not in cc:
             continue
@@ -423,7 +425,7 @@ def verify_verdicts(rep, analysis):
         if not v or v["verdict"] == "tie":
             continue
         verdict_winner = base if v["verdict"] == "base" else m
-        # per-query cold-median majority — independent of the ratio's orientation, always runs.
+        # per-query cold-median majority — same query set as the verdict; the orientation invariant.
         bw = mw = 0
         for q, d in tim[m].items():
             b, x = tim[base].get(q, {}).get("cold_median_ms"), d.get("cold_median_ms")
@@ -432,15 +434,18 @@ def verify_verdicts(rep, analysis):
             bw += b < x
             mw += x < b
         median_winner = base if bw > mw else (m if mw > bw else None)
-        # summed marginal cold cost — second independent check, only when probes are present.
+        if median_winner and verdict_winner != median_winner:      # FATAL: real inversion
+            errs.append(f"{lbl(m)}: verdict says {lbl(verdict_winner)} but per-query cold-median "
+                        f"majority says {lbl(median_winner)}")
+            continue
+        # summed marginal probe cost — different subset, advisory only.
         mcost = _cost(m)
         cost_winner = (base if base_cost < mcost else m) if (base_cost and mcost) else None
-        if (median_winner and verdict_winner != median_winner) or \
-           (cost_winner and verdict_winner != cost_winner):
-            errs.append(f"{lbl(m)}: verdict says {lbl(verdict_winner)}, median-majority says "
-                        f"{lbl(median_winner) if median_winner else 'tie'}, summed-cost says "
-                        f"{lbl(cost_winner) if cost_winner else 'n/a'}")
-    return errs
+        if cost_winner and verdict_winner != cost_winner:
+            notes.append(f"{lbl(m)}: full-query verdict favours {lbl(verdict_winner)} while the "
+                         f"probe-only marginal cost favours {lbl(cost_winner)} — probes and "
+                         f"composites diverge (not an inversion)")
+    return errs, notes
 
 
 def main():
@@ -475,12 +480,15 @@ def main():
             f.write(text)
     print(text)
 
-    # Direction guard — SUMMARY.md is already written (so the artifact keeps it), but a genuine
-    # verdict inversion must fail the step so it can never be published silently.
-    errs = verify_verdicts(rep, analysis)
+    # Direction guard — SUMMARY.md is already written (so the artifact keeps it). A genuine verdict
+    # inversion (verdict disagrees with the same-query median majority) is fatal; a probe-vs-composite
+    # divergence is only a warning.
+    errs, notes = verify_verdicts(rep, analysis)
+    for n in notes:
+        print(f"::warning::{n}")
     if errs:
         for e in errs:
-            print(f"::error::verdict direction mismatch — {e}")
+            print(f"::error::verdict direction inversion — {e}")
         sys.exit(1)
 
 

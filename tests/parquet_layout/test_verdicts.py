@@ -49,18 +49,19 @@ def test_within_spread_is_a_tie_not_a_win():
 
 
 def test_verify_verdicts_passes_when_consistent():
-    """Direction guard is silent when the verdict agrees with summed cost and median majority."""
+    """Direction guard is silent when the verdict agrees with the per-query median majority."""
     rep = {"timings": {
         "aemo_electricity_optimized": {"probe_rowcount": _cold(100),
                                        "q1": _cold(100), "q2": _cold(100)},
         "aemo_electricity_vorder_base_sorted": {"probe_rowcount": _cold(100),
                                                 "q1": _cold(200), "q2": _cold(200)}}}
     analysis = rr.compute_analysis(rep)
-    assert rs.verify_verdicts(rep, analysis) == []     # optimized faster everywhere, consistent
+    errs, notes = rs.verify_verdicts(rep, analysis)     # optimized faster everywhere, consistent
+    assert errs == [] and notes == []
 
 
-def test_verify_verdicts_flags_an_inverted_verdict():
-    """If a verdict winner disagrees with the summed-cost winner, the guard must report it."""
+def test_verify_verdicts_flags_a_true_inversion():
+    """Fatal only when the verdict disagrees with the SAME-query median majority."""
     rep = {"timings": {
         "aemo_electricity_optimized": {"probe_rowcount": _cold(100),
                                        "q1": _cold(100), "q2": _cold(100)},
@@ -71,8 +72,27 @@ def test_verify_verdicts_flags_an_inverted_verdict():
     for v in analysis["verdicts"]:
         if v["metric"] == "COLD":
             v["verdict"] = "model"
-    errs = rs.verify_verdicts(rep, analysis)
+    errs, notes = rs.verify_verdicts(rep, analysis)
     assert errs and "verdict says vorder_sorted" in errs[0]
+
+
+def test_probe_vs_composite_divergence_is_a_note_not_fatal():
+    """When the verdict agrees with the median majority but the probe-only cost points the other
+    way (composites and probes diverge), it must be a non-fatal note — not a build failure. This
+    is the 6M-row-group regression case that false-failed the CI."""
+    # Composites favour the challenger (so verdict + median majority = challenger), but the single
+    # probe column favours the base — the two subsets legitimately disagree.
+    rep = {"timings": {
+        "aemo_electricity_optimized": {
+            "probe_rowcount": _cold(100), "probe_mw": _cold(200),   # base cheaper on the probe
+            "c1": _cold(500), "c2": _cold(500), "c3": _cold(500)},  # base slower on composites
+        "aemo_electricity_vorder_base_sorted": {
+            "probe_rowcount": _cold(100), "probe_mw": _cold(400),   # challenger dearer on the probe
+            "c1": _cold(300), "c2": _cold(300), "c3": _cold(300)}}} # challenger faster on composites
+    analysis = rr.compute_analysis(rep)
+    errs, notes = rs.verify_verdicts(rep, analysis)
+    assert errs == []                                   # not fatal
+    assert notes and "diverge" in notes[0]              # surfaced as a note
 
 
 def test_sort_label_never_contradicts_the_name():
