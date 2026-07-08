@@ -22,9 +22,9 @@ on:
         type: string
         default: "10"
       process_limit:
-        description: "CSV files to fold into the marts (default 1000)"
+        description: "CSV files to fold into the marts (default 50)"
         type: string
-        default: "1000"
+        default: "50"
 
 permissions:
   contents: read
