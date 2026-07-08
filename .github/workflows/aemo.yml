@@ -22,9 +22,9 @@ on:
         type: string
         default: "10"
       process_limit:
-        description: "CSV files to fold into the marts (default 50)"
+        description: "CSV files to fold into the marts (default 25)"
         type: string
-        default: "50"
+        default: "25"
 
 permissions:
   contents: read
@@ -51,7 +51,7 @@ jobs:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       download_limit: ${{ inputs.download_limit || '10' }}
-      process_limit: ${{ inputs.process_limit || '50' }}
+      process_limit: ${{ inputs.process_limit || '25' }}
       # The azure extension's default transport fails the OneLake TLS handshake on the runner
       # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
       AZURE_TRANSPORT_OPTION_TYPE: curl
