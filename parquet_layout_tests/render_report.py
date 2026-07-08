@@ -53,10 +53,9 @@ def _table(model):
 
 # Display labels. Physical names stay as-is (the base-detection keys off "_optimized"); these are
 # presentation only. "optimized" is renamed to "auto_sort" because it presumes the conclusion —
-# the layout is duckrun's SORTED BY AUTO, nothing more. The Spark-variant labels are shortened for
-# readability. Keys below must match the physical table/model name tokens.
-_LABELS = {"optimized": "auto_sort",
-           "vorder_base_sorted": "vorder"}
+# the layout is duckrun's SORTED BY AUTO, nothing more. "vorder" already reads cleanly, so it maps
+# to itself. Keys below must match the physical table/model name tokens.
+_LABELS = {"optimized": "auto_sort"}
 
 
 def _short(model):

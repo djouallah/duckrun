@@ -53,8 +53,8 @@ def test_verify_verdicts_passes_when_consistent():
     rep = {"timings": {
         "aemo_electricity_optimized": {"probe_rowcount": _cold(100),
                                        "q1": _cold(100), "q2": _cold(100)},
-        "aemo_electricity_vorder_base_sorted": {"probe_rowcount": _cold(100),
-                                                "q1": _cold(200), "q2": _cold(200)}}}
+        "aemo_electricity_vorder": {"probe_rowcount": _cold(100),
+                                    "q1": _cold(200), "q2": _cold(200)}}}
     analysis = rr.compute_analysis(rep)
     errs, notes = rs.verify_verdicts(rep, analysis)     # optimized faster everywhere, consistent
     assert errs == [] and notes == []
@@ -65,8 +65,8 @@ def test_verify_verdicts_flags_a_true_inversion():
     rep = {"timings": {
         "aemo_electricity_optimized": {"probe_rowcount": _cold(100),
                                        "q1": _cold(100), "q2": _cold(100)},
-        "aemo_electricity_vorder_base_sorted": {"probe_rowcount": _cold(100),
-                                                "q1": _cold(300), "q2": _cold(300)}}}
+        "aemo_electricity_vorder": {"probe_rowcount": _cold(100),
+                                    "q1": _cold(300), "q2": _cold(300)}}}
     analysis = rr.compute_analysis(rep)
     # optimized is clearly faster; corrupt the verdict to claim the challenger won.
     for v in analysis["verdicts"]:
@@ -86,7 +86,7 @@ def test_probe_vs_composite_divergence_is_a_note_not_fatal():
         "aemo_electricity_optimized": {
             "probe_rowcount": _cold(100), "probe_mw": _cold(200),   # base cheaper on the probe
             "c1": _cold(500), "c2": _cold(500), "c3": _cold(500)},  # base slower on composites
-        "aemo_electricity_vorder_base_sorted": {
+        "aemo_electricity_vorder": {
             "probe_rowcount": _cold(100), "probe_mw": _cold(400),   # challenger dearer on the probe
             "c1": _cold(300), "c2": _cold(300), "c3": _cold(300)}}} # challenger faster on composites
     analysis = rr.compute_analysis(rep)

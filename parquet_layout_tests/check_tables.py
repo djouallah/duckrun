@@ -13,7 +13,7 @@ import duckrun
 # build phase must run (each build script still skips the tables that already exist, so a partial
 # rebuild only rebuilds the gap).
 TABLES = ["tests.fct_summary_optimized",
-          "tests.fct_summary_vorder_base_sorted"]
+          "tests.fct_summary_vorder"]
 
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
                       storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})

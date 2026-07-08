@@ -186,7 +186,7 @@ def s1_header(rep):
 # Build intent per layout, used for the §2 sort column when this cycle reused prebuilt tables and
 # recorded no build metadata. Keyed by physical suffix. The name must never contradict this cell.
 _SORT_INTENT = {"optimized": "SORTED BY AUTO",
-                "vorder_base_sorted": "source order"}
+                "vorder": "source order"}
 
 
 def _sort_label(rep, t):

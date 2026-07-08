@@ -20,11 +20,11 @@ both hold the same rows, so only **speed** differs:
 | Model | Fact table | Layout |
 |:--|:--|:--|
 | `aemo_electricity_optimized` | `tests.fct_summary_optimized` | **duckrun** `sorted by auto` — the layout under test (current WriterProperties) |
-| `aemo_electricity_vorder_base_sorted` | `tests.fct_summary_vorder_base_sorted` | **Fabric Spark V-Order** — the reference |
+| `aemo_electricity_vorder` | `tests.fct_summary_vorder` | **Fabric Spark V-Order** — the reference |
 
 ## Pipeline (what the workflow runs, in order)
 
-1. **`build_spark_variant.py`** — builds `tests.fct_summary_vorder_base_sorted` on Fabric Spark via
+1. **`build_spark_variant.py`** — builds `tests.fct_summary_vorder` on Fabric Spark via
    the Livy API (V-Order is Spark-only), reading `mart.fct_summary` directly (applies `row_limit`).
    Skip-if-exists.
 2. **`build_optimized.py`** — builds `tests.fct_summary_optimized` via duckrun

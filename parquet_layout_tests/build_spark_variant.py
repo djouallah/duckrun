@@ -20,9 +20,9 @@ _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
 N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
 SOURCE = "mart.fct_summary" if N is None else f"(SELECT * FROM mart.fct_summary LIMIT {N})"
 
-VARIANTS = {"vorder_base_sorted": SOURCE}
+VARIANTS = {"vorder": SOURCE}
 # Human-readable sort provenance for the build metadata / summary layout matrix.
-SORTS = {"vorder_base_sorted": "source order"}
+SORTS = {"vorder": "source order"}
 
 
 def _record_build(variant, seconds, status):
