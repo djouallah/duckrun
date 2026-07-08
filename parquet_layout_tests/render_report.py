@@ -56,7 +56,7 @@ def _table(model):
 # the layout is duckrun's SORTED BY AUTO, nothing more. The Spark-variant labels are shortened for
 # readability. Keys below must match the physical table/model name tokens.
 _LABELS = {"optimized": "auto_sort",
-           "vorder_base_sorted": "vorder_sorted"}
+           "vorder_base_sorted": "vorder"}
 
 
 def _short(model):

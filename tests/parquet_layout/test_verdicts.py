@@ -73,7 +73,7 @@ def test_verify_verdicts_flags_a_true_inversion():
         if v["metric"] == "COLD":
             v["verdict"] = "model"
     errs, notes = rs.verify_verdicts(rep, analysis)
-    assert errs and "verdict says vorder_sorted" in errs[0]
+    assert errs and "verdict says vorder" in errs[0]
 
 
 def test_probe_vs_composite_divergence_is_a_note_not_fatal():

@@ -58,44 +58,49 @@ def _verdict_line(v, base_lbl, chal_lbl):
             f"({winner} wins {wc}, {loser} wins {lc}, ties {v['ties']})")
 
 
-def _metric_win(v, base_lbl, chal_lbl):
-    """(winner label, factor) for one metric verdict, or (None, None) for a tie/missing metric."""
-    if not v or v["verdict"] == "tie":
-        return None, None
-    fac = v["ratio"] if v["ratio"] >= 1 else (1 / v["ratio"] if v["ratio"] else 0)
-    return (base_lbl if v["verdict"] == "base" else chal_lbl), fac
-
-
 def s_tldr(rep, analysis, base, models):
-    """One-glance verdict table for readers who won't read the rest: per challenger, the cold and
-    hot winner (with the median-ratio speedup) and the overall call. Sits right under the layout
-    matrix (§2) so file size + speed are both visible up top."""
+    """One-glance verdict for readers who won't read the rest: one row per layout with its aggregate
+    cold and hot wall-clock, ✔ on the faster layout per column (tie rule), and the overall call.
+    Sits right under the layout matrix (§2) so file size + speed are both visible up top. Assumes a
+    single challenger (the current benchmark shape: auto_sort vs vorder)."""
     challengers = [m for m in models if m != base]
     if not challengers:
         return
+    chal = challengers[0]
     by = {}
     for v in analysis.get("verdicts", []):
         by.setdefault(v["model"], {})[v["metric"]] = v
-    base_lbl = lbl(base)
+    ref = by.get(rr._short(chal), {})
+    base_lbl, chal_lbl = lbl(base), lbl(chal)
+
+    def _winner(metric):
+        v = ref.get(metric)
+        if not v or v["verdict"] == "tie":
+            return None
+        return base_lbl if v["verdict"] == "base" else chal_lbl
+
+    cold_w, hot_w = _winner("COLD"), _winner("HOT")
+    rows = [
+        (base_lbl, ref.get("COLD", {}).get("base_total_ms"), ref.get("HOT", {}).get("base_total_ms")),
+        (chal_lbl, ref.get("COLD", {}).get("model_total_ms"), ref.get("HOT", {}).get("model_total_ms")),
+    ]
+    won = [w for w in (cold_w, hot_w) if w]
+    overall = "tie (within spread)" if not won else (
+        f"**{won[0]}**" if len(set(won)) == 1 else "split (cold vs hot disagree)")
+
     w("## TL;DR — who won")
     w()
-    w("_Medians, tie rule; ratios are the median speedup of the winner. Read the sections below "
-      "for the how and why._")
+    w("_Aggregate median wall-clock (ms) over the benchmarked queries; ✔ marks the faster layout "
+      "per column (tie rule). Read the sections below for the how and why._")
     w()
-    w("| matchup | cold | hot | overall |")
-    w("|:--|:--|:--|:--|")
-    for m in challengers:
-        chal = lbl(m)
-        mv = by.get(rr._short(m), {})
-        cells, winners = [], []
-        for metric in ("COLD", "HOT"):
-            wn, fac = _metric_win(mv.get(metric), base_lbl, chal)
-            cells.append("tie" if wn is None else f"{wn} {fac:.2f}× faster")
-            if wn is not None:
-                winners.append(wn)
-        uniq = set(winners)
-        overall = "tie" if not uniq else (f"**{winners[0]}**" if len(uniq) == 1 else "split")
-        w(f"| {base_lbl} vs {chal} | {cells[0]} | {cells[1]} | {overall} |")
+    w("| layout | cold (ms) | hot (ms) |")
+    w("|:--|--:|--:|")
+    for name, c, h in rows:
+        cc = f"{_ms(c)} ✔" if name == cold_w else _ms(c)
+        hc = f"{_ms(h)} ✔" if name == hot_w else _ms(h)
+        w(f"| {name} | {cc} | {hc} |")
+    w()
+    w(f"Overall winner: {overall}.")
     w()
 
 
