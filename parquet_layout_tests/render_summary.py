@@ -160,6 +160,27 @@ def s1_header(rep):
     w()
 
 
+# Build intent per layout, used for the §2 sort column when this cycle reused prebuilt tables and
+# recorded no build metadata. Keyed by physical suffix. The name must never contradict this cell.
+_SORT_INTENT = {"optimized": "SORTED BY AUTO",
+                "vorder_base_sorted": "source order",
+                "vorder_base_notsorted": "shuffled"}
+
+
+def _sort_label(rep, t):
+    """The §2 sort cell. Prefer build metadata (has the actual columns AUTO picked); otherwise the
+    layout's definitional intent — so auto_sort never shows an empty sort in open contradiction to
+    its name."""
+    b = rep["tables"].get(t, {}).get("build", {})
+    if b.get("sort"):
+        return b["sort"]
+    suf = t.removeprefix("fct_summary_")
+    if suf == "optimized":
+        opt = (rep.get("run", {}).get("inputs", {}) or {}).get("opt_sort")
+        return f"sorted by ({opt})" if (opt and str(opt).lower() != "auto") else "SORTED BY AUTO"
+    return _SORT_INTENT.get(suf, "—")
+
+
 def s2_layout(rep, tables_order):
     w("## 2. Layout matrix")
     w()
@@ -169,10 +190,14 @@ def s2_layout(rep, tables_order):
         p = rep["tables"][t].get("parquet", {})
         b = rep["tables"][t].get("build", {})
         engine = b.get("engine") or ("spark" if p.get("vorder") else "duckdb")
-        sort = b.get("sort") or "—"
-        w(f"| {lbl(t)} | {engine} | {sort} | "
+        w(f"| {lbl(t)} | {engine} | {_sort_label(rep, t)} | "
           f"{'yes' if p.get('vorder') else 'no'} | {p.get('files')} | {p.get('row_groups')} | "
           f"{_ms(p.get('avg_row_group'))} | {_rg_over(p)} | {_mb(p.get('size_mb'))} |")
+    w()
+    w("_Sort names each layout's build intent (from build metadata when the build ran this cycle, "
+      "else the layout definition). Labels describe layout behaviour, not a mechanism claim: "
+      "`auto_sort` applies `SORTED BY AUTO`, and its date-clustering is reinforced by the source's "
+      "natural time-ordering._")
     w()
 
 

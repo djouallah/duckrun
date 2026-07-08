@@ -75,6 +75,26 @@ def test_verify_verdicts_flags_an_inverted_verdict():
     assert errs and "verdict says vorder_sorted" in errs[0]
 
 
+def test_sort_label_never_contradicts_the_name():
+    """auto_sort must not render an empty §2 sort cell — the name asserts a sort, so the matrix
+    must show one even when the build was gated and recorded no metadata."""
+    rep = {"tables": {"fct_summary_optimized": {"parquet": {}}},
+           "run": {"inputs": {"opt_sort": "auto"}}}
+    s = rs._sort_label(rep, "fct_summary_optimized")
+    assert s not in ("", "—", None) and "AUTO" in s
+
+
+def test_sort_label_prefers_recorded_build_metadata():
+    rep = {"tables": {"fct_summary_optimized": {"build": {"sort": "sorted by (date, time)"}}}}
+    assert rs._sort_label(rep, "fct_summary_optimized") == "sorted by (date, time)"
+
+
+def test_sort_label_explicit_columns_from_inputs():
+    rep = {"tables": {"fct_summary_optimized": {"parquet": {}}},
+           "run": {"inputs": {"opt_sort": "region, date"}}}
+    assert rs._sort_label(rep, "fct_summary_optimized") == "sorted by (region, date)"
+
+
 def test_floor_uses_only_quotable_columns():
     """A cheap-but-noisy column (spread>25%) must not be named the irreducible floor."""
     noisy = {"tier": "probe", "cold_median_ms": 50, "cold_spread_pct": 110,
