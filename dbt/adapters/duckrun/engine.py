@@ -1695,6 +1695,41 @@ def merge_delta_clauses(
     # Pin the target to the snapshot the model read (vB, or vB+1 after a decoupled add-columns commit)
     # so OCC validates (effective_version, HEAD] — one snapshot for both the read and the commit.
     dt.load_as_version(effective_version)
+
+    # Explicit partition-bound pruning. delta_rs's auto early_filter (try_construct_early_filter) is
+    # fragile: it silently returns None — degrading to a FULL target scan — on multi-key predicates
+    # (delta-rs #3636) and whenever source min/max stats are unavailable. For each PARTITION column
+    # joined as `target.p = source.p`, compute the source's min/max here and fold a CONSTANT bound
+    # (`target.p BETWEEN <min> AND <max>`) into the ON predicate. This is RESULT-NEUTRAL — any target
+    # row that can match `source.p` already lies within [min(p), max(p)] — but hands delta_rs a
+    # plan-time literal it can push down to skip partition files deterministically, which is exactly
+    # what its own docs recommend doing by hand. Numeric partition cols only (minimal); skipped for
+    # by-source merges (streamed_exec, which can't prune anyway). Best-effort: never break a merge.
+    if not streamed_exec and hasattr(data, "query"):
+        try:
+            part_cols = list(dt.metadata().partition_columns or [])
+        except Exception:
+            part_cols = []
+        _bounds = []
+        for _pcol in part_cols:
+            if not re.search(rf'target\."?{re.escape(_pcol)}"?\s*=\s*source\."?{re.escape(_pcol)}"?',
+                             predicate, re.I):
+                continue
+            _q = '"' + _pcol.replace('"', '""') + '"'
+            try:
+                _lo, _hi = data.query("__mp", f"SELECT min({_q}), max({_q}) FROM __mp").fetchone()
+            except Exception as e:
+                logger.warning(f"merge partition-bound pruning: could not compute {_pcol!r} bounds "
+                               f"({e!r}); skipping")
+                continue
+            if _lo is None or isinstance(_lo, bool) or not isinstance(_lo, (int, float)):
+                continue
+            _tq = "target." + _q
+            _bounds.append(f"{_tq} >= {_lo} AND {_tq} <= {_hi}")
+            logger.info(f"merge partition-bound pruning: injected {_tq} BETWEEN {_lo} AND {_hi}")
+        if _bounds:
+            predicate = f"({predicate}) AND " + " AND ".join(_bounds)
+
     merger = dt.merge(
         source=data,
         predicate=predicate,
