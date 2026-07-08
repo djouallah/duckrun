@@ -27,7 +27,68 @@ def w(line=""):
 
 
 def lbl(model):
-    return model.removeprefix("aemo_electricity_").replace("vorder_base_", "vorder_")
+    return rr._short(model)  # canonical display label (optimized→auto_sort, vorder_base_*→vorder_*)
+
+
+def _noisy_cols(rep, thresh=25.0):
+    """Probe columns whose cold spread exceeds `thresh`% in ANY layout — measurement is too noisy
+    to quote (n = cold_repeats over shared capacity). These are excluded from headline sentences."""
+    tim = rep.get("timings", {})
+    noisy = set()
+    for m in tim:
+        for col in rr._PROBE_COLS:
+            sp = tim[m].get(f"probe_{col}", {}).get("cold_spread_pct")
+            if sp is not None and sp > thresh:
+                noisy.add(col)
+    return noisy
+
+
+def _verdict_line(v, base_lbl, chal_lbl):
+    """One metric's verdict, stated with explicit model names (never 'base'/'model')."""
+    if not v:
+        return None
+    if v["verdict"] == "tie":
+        return f"{v['metric']}: no measurable difference (all deltas within spread)"
+    fac = v["ratio"] if v["ratio"] >= 1 else (1 / v["ratio"] if v["ratio"] else 0)
+    if v["verdict"] == "base":
+        winner, loser, wc, lc = base_lbl, chal_lbl, v["losses"], v["wins"]
+    else:
+        winner, loser, wc, lc = chal_lbl, base_lbl, v["wins"], v["losses"]
+    return (f"{v['metric']}: {winner} {fac:.2f}× faster "
+            f"({winner} wins {wc}, {loser} wins {lc}, ties {v['ties']})")
+
+
+def _ablation_blowup(rep, base, ablation):
+    """Auto-name the columns whose compressed size balloons in the unsorted layout vs the sorted
+    V-Order layout — the concrete evidence that its slower cold time is a sort pathology."""
+    sortedm = next((m for m in rep.get("timings", {})
+                    if "sorted" in m and "notsorted" not in m and m != base), None)
+    if not sortedm:
+        return
+    for m in ablation:
+        comp_ns = _compression(rep["tables"][rr._table(m)].get("parquet", {}).get("column_chunks") or [])
+        comp_s = _compression(rep["tables"][rr._table(sortedm)].get("parquet", {}).get("column_chunks") or [])
+        blown = []
+        for col, d in comp_ns.items():
+            ns_mb, s_mb = d["comp"] / MB, comp_s.get(col, {}).get("comp", 0) / MB
+            if s_mb and ns_mb > 1.3 * s_mb and (ns_mb - s_mb) > 20:
+                blown.append((ns_mb - s_mb, col, ns_mb, s_mb,
+                              d["dict"] / MB, comp_s.get(col, {}).get("dict", 0) / MB))
+        blown.sort(reverse=True)
+        if blown:
+            frag = "; ".join(f"{c} {a:,.0f} MB vs {b:,.0f} (dict {dn:,.0f} vs {ds:,.0f})"
+                             for _, c, a, b, dn, ds in blown[:3])
+            w(f"  - {lbl(m)} bloats vs {lbl(sortedm)}: {frag}.")
+
+
+def _verdict_row(by, base_lbl, m):
+    chal = lbl(m)
+    mv = by.get(rr._short(m), {})
+    c, h = mv.get("COLD"), mv.get("HOT")
+    cr = "=" if (c and c["verdict"] == "tie") else (_ratio(c["ratio"]) if c else "—")
+    hr = "=" if (h and h["verdict"] == "tie") else (_ratio(h["ratio"]) if h else "—")
+    parts = [p for p in (_verdict_line(c, base_lbl, chal), _verdict_line(h, base_lbl, chal)) if p]
+    w(f"| {chal} vs {base_lbl} | {cr} | {hr} | {'; '.join(parts)} |")
 
 
 def _order(models):
@@ -109,40 +170,67 @@ def s2_layout(rep, tables_order):
         b = rep["tables"][t].get("build", {})
         engine = b.get("engine") or ("spark" if p.get("vorder") else "duckdb")
         sort = b.get("sort") or "—"
-        w(f"| {t.removeprefix('fct_summary_')} | {engine} | {sort} | "
+        w(f"| {lbl(t)} | {engine} | {sort} | "
           f"{'yes' if p.get('vorder') else 'no'} | {p.get('files')} | {p.get('row_groups')} | "
           f"{_ms(p.get('avg_row_group'))} | {_rg_over(p)} | {_mb(p.get('size_mb'))} |")
     w()
 
 
-def s3_verdicts(analysis, base_lbl):
-    vs = analysis.get("verdicts", [])
+def s3_verdicts(rep, analysis, base, models):
     by = {}
-    for v in vs:
+    for v in analysis.get("verdicts", []):
         by.setdefault(v["model"], {})[v["metric"]] = v
-    w("## 3. Headline verdicts (medians, tie rule)")
+    base_lbl = lbl(base)
+    headline = [m for m in models if m != base and "notsorted" not in m]
+    ablation = [m for m in models if m != base and "notsorted" in m]
+    noisy = sorted(_noisy_cols(rep))
+
+    w("## 3. Headline verdict (medians, tie rule)")
     w()
-    w("| pair | COLD base/model | HOT base/model | verdict |")
+    w(f"Ratio column is `{base_lbl} ÷ challenger` (< 1 ⇒ {base_lbl} faster). The unsorted layout "
+      "is degenerate — see the ablation below, not the headline.")
+    w()
+    w(f"| pair | COLD {base_lbl}÷chal | HOT {base_lbl}÷chal | verdict |")
     w("|:--|--:|--:|:--|")
-    for model, mv in by.items():
-        c, h = mv.get("COLD"), mv.get("HOT")
-        cr = "=" if (c and c["verdict"] == "tie") else _ratio(c["ratio"]) if c else "—"
-        hr = "=" if (h and h["verdict"] == "tie") else _ratio(h["ratio"]) if h else "—"
-        parts = []
-        if c:
-            parts.append("COLD " + (c["text"] if c["verdict"] != "tie" else "no measurable difference"))
-        if h:
-            parts.append("HOT " + (h["text"] if h["verdict"] != "tie"
-                                   else "no measurable difference (all deltas within spread)"))
-        w(f"| {model} vs {base_lbl} | {cr} | {hr} | {'; '.join(parts)} |")
+    for m in headline:
+        _verdict_row(by, base_lbl, m)
     w()
+    if noisy:
+        cr = rep.get("run", {}).get("inputs", {}).get("cold_repeats")
+        agg = []
+        for m in headline:
+            c = by.get(rr._short(m), {}).get("COLD")
+            if c and c["verdict"] != "tie":
+                tot = c["wins"] + c["losses"] + c["ties"]
+                who = base_lbl if c["verdict"] == "base" else lbl(m)
+                cnt = c["losses"] if c["verdict"] == "base" else c["wins"]
+                agg.append(f"{who} wins {cnt}/{tot} vs {lbl(m)}")
+        w(f"- ⚠ {len(noisy)} probe columns exceed 25% cold spread (n={cr}, shared capacity; see §7). "
+          f"The headline rests on the aggregate, not any single column: "
+          f"{'; '.join(agg) or 'see table'} (per-query cold median, tie rule).")
+        w()
+
+    if ablation:
+        w("### Ablation — the unsorted layout (not a comparator)")
+        w()
+        w(f"| pair | COLD {base_lbl}÷chal | HOT {base_lbl}÷chal | verdict |")
+        w("|:--|--:|--:|:--|")
+        for m in ablation:
+            _verdict_row(by, base_lbl, m)
+        w()
+        w("- writing over shuffled rows can't build RLE runs, so columns that should compress "
+          "balloon (below) — its slower cold time is that pathology, not a fair geometry "
+          "comparison; keep it out of the headline.")
+        _ablation_blowup(rep, base, ablation)
+        w()
 
 
-def s4_cold_decomp(analysis, models):
+def s4_cold_decomp(rep, analysis, models):
     cc = analysis.get("cold_column_cost", {})
     sz = analysis.get("size_attribution", {})
     if not cc:
         return
+    noisy = _noisy_cols(rep)
     w("## 4. Cold decomposition (marginal cost per column)")
     w()
     hdr = "| column |" + "".join(f" {lbl(m)} ms | {lbl(m)} ms/MB |" for m in models)
@@ -173,14 +261,27 @@ def s4_cold_decomp(analysis, models):
             floor[col] = statistics.mean(v)
     if cv:
         med_cv = statistics.median(cv.values())
-        hi = sorted((c for c, x in cv.items() if x >= med_cv), key=lambda c: -cv[c])
-        lo = [c for c, x in cv.items() if x < med_cv]
-        cheapest = min(floor, key=floor.get) if floor else None
-        w(f"- sort-sensitive (high cross-layout cost variance): "
-          f"{', '.join(f'{c} (CV {cv[c]:.2f})' for c in hi) or 'none'}.")
-        w(f"- layout-invariant (low variance): {', '.join(lo) or 'none'}.")
-        if cheapest:
-            w(f"- irreducible floor: {cheapest} (~{floor[cheapest]:,.0f} ms across layouts).")
+        # sort-sensitivity is only quotable for low-noise columns; noisy ones (spread>25%) have
+        # cost variance confounded with measurement noise, so name them separately.
+        hi = sorted((c for c, x in cv.items() if x >= med_cv and c not in noisy), key=lambda c: -cv[c])
+        lo = [c for c, x in cv.items() if x < med_cv and c not in noisy]
+        # The cheapest columns overall (candidate "floor"). If any is non-quotable, the irreducible
+        # transcode floor isn't measurable at this n — naming a noisy cheap column the floor while
+        # its own medians sit below it is the contradiction we refuse to print.
+        cheap = sorted(floor, key=floor.get)[:2]
+        cheap_noisy = [c for c in cheap if c in noisy]
+        w(f"- sort-sensitive (high cross-layout variance, low noise): "
+          f"{', '.join(f'{c} (CV {cv[c]:.2f})' for c in hi) or 'none clearly separable at this n'}.")
+        w(f"- layout-invariant (low variance, low noise): "
+          f"{', '.join(lo) or 'none clearly separable at this n'}.")
+        if noisy:
+            w(f"- non-quotable (cold spread >25%): {', '.join(sorted(noisy))}.")
+        if cheap_noisy:
+            w(f"- irreducible floor: not measurable at this n — the cheapest columns "
+              f"({', '.join(cheap_noisy)}) are non-quotable; anchor conclusions on the aggregate "
+              "cold win (§3) and the data-skipping evidence (§6), not per-column costs.")
+        elif cheap:
+            w(f"- irreducible floor (stable): {cheap[0]} (~{floor[cheap[0]]:,.0f} ms across layouts).")
         w()
 
 
@@ -275,6 +376,48 @@ def s8_pointers(rep):
     w()
 
 
+def verify_verdicts(rep, analysis):
+    """Independent cross-check that the verdict winner is not inverted: for every cold pair, the
+    verdict winner must agree with BOTH the summed marginal-cold-cost winner and the per-query
+    cold-median majority. Returns a list of mismatch strings (empty = all consistent)."""
+    tim = rep.get("timings", {})
+    cc = analysis.get("cold_column_cost", {})
+    base = next((m for m in tim if m.endswith("_optimized")), None)
+    if not base or base not in cc:
+        return []
+    def _cost(m):
+        cols = cc.get(m, {}).get("columns")
+        return (sum(cols.values()) + cc[m]["rowcount_overhead_ms"]) if cols else None
+    base_cost = _cost(base)
+    vmap = {v["model"]: v for v in analysis.get("verdicts", []) if v["metric"] == "COLD"}
+    errs = []
+    for m in tim:
+        if m == base or m not in cc:
+            continue
+        v = vmap.get(rr._short(m))
+        if not v or v["verdict"] == "tie":
+            continue
+        verdict_winner = base if v["verdict"] == "base" else m
+        # per-query cold-median majority — independent of the ratio's orientation, always runs.
+        bw = mw = 0
+        for q, d in tim[m].items():
+            b, x = tim[base].get(q, {}).get("cold_median_ms"), d.get("cold_median_ms")
+            if b is None or x is None:
+                continue
+            bw += b < x
+            mw += x < b
+        median_winner = base if bw > mw else (m if mw > bw else None)
+        # summed marginal cold cost — second independent check, only when probes are present.
+        mcost = _cost(m)
+        cost_winner = (base if base_cost < mcost else m) if (base_cost and mcost) else None
+        if (median_winner and verdict_winner != median_winner) or \
+           (cost_winner and verdict_winner != cost_winner):
+            errs.append(f"{lbl(m)}: verdict says {lbl(verdict_winner)}, median-majority says "
+                        f"{lbl(median_winner) if median_winner else 'tie'}, summed-cost says "
+                        f"{lbl(cost_winner) if cost_winner else 'n/a'}")
+    return errs
+
+
 def main():
     path = os.environ.get("RUN_REPORT", "run_report.json")
     if not os.path.exists(path):
@@ -291,8 +434,8 @@ def main():
     s1_header(rep)
     s2_layout(rep, tables_order)
     if base:
-        s3_verdicts(analysis, lbl(base))
-    s4_cold_decomp(analysis, models)
+        s3_verdicts(rep, analysis, base, models)
+    s4_cold_decomp(rep, analysis, models)
     s5_compression(rep, models)
     s6_skipping(analysis, models)
     s7_caveats(rep, analysis)
@@ -306,6 +449,14 @@ def main():
         with open(gh, "a", encoding="utf-8") as f:
             f.write(text)
     print(text)
+
+    # Direction guard — SUMMARY.md is already written (so the artifact keeps it), but a genuine
+    # verdict inversion must fail the step so it can never be published silently.
+    errs = verify_verdicts(rep, analysis)
+    if errs:
+        for e in errs:
+            print(f"::error::verdict direction mismatch — {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":

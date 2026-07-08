@@ -179,9 +179,8 @@ jobs:
         continue-on-error: true
         run: python parquet_layout_tests/render_report.py
 
-      - name: 📑 Render specialist summary (SUMMARY.md, rendered from run_report.json)
+      - name: 📑 Render specialist summary (SUMMARY.md; fails on verdict-direction mismatch)
         if: always()
-        continue-on-error: true
         env:
           PYTHONIOENCODING: utf-8
         run: python parquet_layout_tests/render_summary.py

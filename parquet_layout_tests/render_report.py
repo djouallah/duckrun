@@ -51,8 +51,18 @@ def _table(model):
     return "fct_summary" + model.removeprefix("aemo_electricity")
 
 
+# Display labels. Physical names stay as-is (the base-detection keys off "_optimized"); these are
+# presentation only. "optimized" is renamed to "auto_sort" because it presumes the conclusion —
+# the layout is duckrun's SORTED BY AUTO, nothing more. The Spark-variant labels are shortened for
+# readability. Keys below must match the physical table/model name tokens.
+_LABELS = {"optimized": "auto_sort",
+           "vorder_base_sorted": "vorder_sorted",
+           "vorder_base_notsorted": "vorder_notsorted"}
+
+
 def _short(model):
-    return model.removeprefix("aemo_electricity_") or model
+    s = model.removeprefix("aemo_electricity_").removeprefix("fct_summary_") or model
+    return _LABELS.get(s, s)
 
 
 # ---------------------------------------------------------------------------- derived analysis
