@@ -1,9 +1,9 @@
-"""duckrun get_stats for the summary tables → run_report.json (tables.<t>.parquet)
-plus a stats_detailed.csv of the raw per-row-group parquet_metadata.
+"""duckrun get_stats for the summary tables → run_report.json (tables.<t>.parquet):
+per-table summary, row_group_detail, and the raw per-column-chunk parquet_metadata
+(encodings, dictionary, sizes, stats) under column_chunks. One file, everything in it.
 
 Env in: ONELAKE_TABLES_PATH, ONELAKE_TOKEN, RUN_REPORT.
 """
-import csv as _csv
 import os
 import sys
 from collections import defaultdict
@@ -16,6 +16,19 @@ try:
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+
+def _jsonable(v):
+    if v is None or isinstance(v, (bool, int, float, str)):
+        return v
+    if isinstance(v, (bytes, bytearray)):
+        try:
+            return v.decode("utf-8")
+        except Exception:
+            return v.hex()
+    if isinstance(v, (list, tuple)):
+        return [_jsonable(x) for x in v]
+    return str(v)
 
 
 def main():
@@ -43,16 +56,18 @@ def main():
             "compression": d.get("compression"),
         }}}})
 
-    # --- per-row-group detail: CSV (raw) + row_group_detail into the report ---
+    # --- raw per-column-chunk parquet_metadata -> column_chunks + row_group_detail rollup ---
     det = con.get_stats("fct_summary*", detailed=True)
     det_cols, det_rows = det.columns, det.fetchall()
-    csv_path = os.environ.get("STATS_CSV", "stats_detailed.csv")
-    with open(csv_path, "w", newline="", encoding="utf-8") as f:
-        w = _csv.writer(f)
-        w.writerow(det_cols)
-        w.writerows(det_rows)
-    print(f"\nwrote detailed stats CSV -> {os.path.abspath(csv_path)} "
-          f"({len(det_rows)} rows × {len(det_cols)} cols)")
+    print(f"\ndetailed parquet_metadata: {len(det_rows)} rows × {len(det_cols)} cols "
+          f"-> tables.<t>.parquet.column_chunks")
+
+    chunks = defaultdict(list)
+    for r in det_rows:
+        d = {c: _jsonable(v) for c, v in zip(det_cols, r)}
+        chunks[d["table"]].append(d)
+    for t, lst in chunks.items():
+        report.merge({"tables": {t: {"parquet": {"column_chunks": lst}}}})
 
     try:
         i = {c: n for n, c in enumerate(det_cols)}
