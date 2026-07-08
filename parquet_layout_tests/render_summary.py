@@ -90,10 +90,11 @@ def s_tldr(rep, analysis, base, models):
 
     w("## TL;DR — who won")
     w()
-    w("_Aggregate median wall-clock (ms) over the benchmarked queries; ✔ marks the faster layout "
-      "per column (tie rule). Read the sections below for the how and why._")
+    w("_Total wall-clock (ms) for one full pass — each query's median, summed across the benchmarked "
+      "queries; ✔ marks the faster layout per column (tie rule). Read the sections below for the how "
+      "and why._")
     w()
-    w("| layout | cold (ms) | hot (ms) |")
+    w("| layout | cold total (ms) | hot total (ms) |")
     w("|:--|--:|--:|")
     for name, c, h in rows:
         cc = f"{_ms(c)} ✔" if name == cold_w else _ms(c)
