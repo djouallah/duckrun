@@ -17,8 +17,9 @@ except Exception:
     pass
 
 # Right-align these (numeric); everything else left-aligns.
-_NUM = {"total_rows", "num_files", "num_row_groups", "avg_row_group", "size_mb"}
-_FLOAT = {"avg_row_group", "size_mb"}
+_NUM = {"total_rows", "num_files", "num_row_groups", "avg_row_group", "size_mb",
+        "uncompressed_mb", "compressed_mb", "ratio"}
+_FLOAT = {"avg_row_group", "size_mb", "uncompressed_mb", "compressed_mb", "ratio"}
 
 
 def _fmt(col, v):
@@ -81,6 +82,40 @@ def main():
         w.writerows(det_rows)
     print(f"\nwrote detailed stats CSV -> {os.path.abspath(csv_path)} "
           f"({len(det_rows)} rows × {len(det_cols)} cols)")
+
+    # --- 3) RLE / encoding proxy — per column, which encoding it landed on (RLE_DICTIONARY vs PLAIN)
+    # and its compression ratio. Parquet stores no run *count*, but the encoding + uncompressed/compressed
+    # ratio is the observable signal of how well RLE/dictionary found runs (what a sort manufactures);
+    # compare the two layouts column by column. Best-effort — parquet_metadata column names can shift
+    # between DuckDB versions, so any failure just skips this section.
+    try:
+        enc = det.query("d", """
+            SELECT "table" AS tbl, path_in_schema AS column,
+                   string_agg(DISTINCT encodings, ' ') AS encodings,
+                   ROUND(SUM(total_uncompressed_size) / 1e6, 1) AS uncompressed_mb,
+                   ROUND(SUM(total_compressed_size) / 1e6, 1) AS compressed_mb,
+                   ROUND(SUM(total_uncompressed_size)::DOUBLE
+                         / NULLIF(SUM(total_compressed_size), 0), 2) AS ratio
+            FROM d
+            WHERE "table" IN ('fct_summary_optimized', 'fct_summary_vorder')
+              AND path_in_schema NOT IN ('', 'schema')
+            GROUP BY "table", path_in_schema
+            ORDER BY column, "table"
+        """)
+        print("\n=== Per-column encoding & compression (RLE proxy) ===")
+        try:
+            enc.show(max_width=100000, max_col_width=1000)
+        except TypeError:
+            enc.show()
+        _write_summary(_markdown(
+            "## 🧬 Per-column encoding & compression (RLE proxy)",
+            "_`encodings` = the Parquet encodings the column landed on (`RLE_DICTIONARY` vs `PLAIN`); "
+            "`ratio` = uncompressed / compressed — higher ⇒ RLE/dictionary found longer runs, which is "
+            "what a global sort manufactures. Compare `fct_summary_optimized` (duckrun) vs "
+            "`fct_summary_vorder` row by row._",
+            enc.columns, enc.fetchall()))
+    except Exception as e:
+        print(f"(encoding / RLE summary skipped: {str(e).splitlines()[0][:140]})")
 
 
 if __name__ == "__main__":

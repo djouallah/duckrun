@@ -15,9 +15,9 @@ on:
         type: string
         default: main
       runs:
-        description: "runs per query per model (run 1 = cold; runs 2+ averaged for the warm/hot number)"
+        description: "runs per query per model (run 1 = cold; run 2 = warm; runs 3+ averaged = hot)"
         type: string
-        default: "4"
+        default: "5"
       cold:
         description: "measure cold by dehydrating (clearValues+full) before each query"
         type: boolean

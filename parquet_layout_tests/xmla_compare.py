@@ -189,10 +189,11 @@ def bench_model(workspace, model, token, runs, want_cold):
             res = {"rows": rowcount, "all": times}
             if can_cold:
                 res["cold_min"] = times[0]                        # run1 = the real cold first-touch
-                # Warm/hot = the AVERAGE of every run after the cold one (run2 warm + run3..N hot),
-                # so the reported number is a mean of the warmed-up state, not a single last sample.
-                warm_hot = times[1:] or [times[0]]
-                res["hot_avg"] = sum(warm_hot) / len(warm_hot)
+                # Hot = the AVERAGE of the fully-warmed runs (run3..N) — dropping BOTH the cold
+                # first-touch (run1) AND the warm transition (run2), so it is a steady-state number
+                # that a slower-warming model is not penalized by.
+                hot = times[2:] or times[1:] or [times[0]]
+                res["hot_avg"] = sum(hot) / len(hot)
             else:
                 res["hot_avg"] = sum(times) / len(times)  # no cold path: average all runs
             results[name] = res
@@ -306,7 +307,7 @@ def main():
     workspace = os.environ["PBI_WORKSPACE"].strip()
     token = os.environ["PBI_TOKEN"].strip()
     adomd_dir = os.environ.get("ADOMD_DIR", ".")
-    runs = int(os.environ.get("BENCH_RUNS", "4"))
+    runs = int(os.environ.get("BENCH_RUNS", "5"))
     want_cold = (os.environ.get("BENCH_COLD", "true").strip().lower() != "false")
     gap = int(os.environ.get("BENCH_GAP_SECONDS", "300"))  # idle gap between models (>CU smoothing)
 
@@ -319,7 +320,7 @@ def main():
     _write_summary(
         f"# 🔍 XMLA benchmark — `{', '.join(others)}` vs `{base}`\n\n"
         f"Workspace `{workspace}` · one dehydrate then **{runs}** runs per query "
-        f"(run 1 = cold first-touch; runs 2–{runs} averaged = warm/hot) · same data (numbers identical) — "
+        f"(run 1 = cold first-touch; run 2 = warm; runs 3–{runs} averaged = hot) · same data (numbers identical) — "
         f"only speed differs. Lower ms is better; "
         f"**base/model ratio > 1× means the compared model is faster**.\n")
 
@@ -344,7 +345,7 @@ def main():
         if base_cold and opt_cold:
             compare_table(f"{model} vs {base}  —  COLD (run 1, first touch after one dehydrate)",
                           base, model, base_res, opt_res, "cold_min")
-        compare_table(f"{model} vs {base}  —  HOT (avg of runs 2–{runs}: 1 warm + {runs - 2} hot)",
+        compare_table(f"{model} vs {base}  —  HOT (avg of {runs - 2} hot runs, runs 3–{runs})",
                       base, model, base_res, opt_res, "hot_avg")
 
 
