@@ -13,13 +13,16 @@ BASE = (f"https://api.fabric.microsoft.com/v1/workspaces/{os.environ['WS_ID']}"
         f"/lakehouses/{os.environ['LH_ID']}/livyapi/versions/2023-12-01")
 FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 
-# Both derive from the shared limited base so all layouts hold the SAME rows: sorted reads the
-# natural-order twin, notsorted reads the shuffled one.
-VARIANTS = {"vorder_base_sorted": "tests.summary_sorted",
-            "vorder_base_notsorted": "tests.summary_unsorted"}
+# Read the source mart.fct_summary DIRECTLY (never a duckrun-written intermediate) so the V-Order
+# input is never influenced by duckrun's write layout. The row cap is applied here, independently
+# of the duckrun optimized build's own read.
+_lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
+N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
+SOURCE = "mart.fct_summary" if N is None else f"(SELECT * FROM mart.fct_summary LIMIT {N})"
+
+VARIANTS = {"vorder_base_sorted": SOURCE}
 # Human-readable sort provenance for the build metadata / summary layout matrix.
-SORTS = {"vorder_base_sorted": "source order (sorted base)",
-         "vorder_base_notsorted": "shuffled source"}
+SORTS = {"vorder_base_sorted": "source order"}
 
 
 def _record_build(variant, seconds, status):
@@ -33,7 +36,7 @@ def _spark_code(variant, source):
     return (
         'spark.sql("CREATE SCHEMA IF NOT EXISTS tests")\n'
         'spark.conf.set("spark.sql.parquet.vorder.default", "true")\n'
-        f'(spark.read.table("{source}")\n'
+        f'(spark.sql("SELECT * FROM {source}")\n'
         '      .write.mode("overwrite").format("delta")\n'
         '      .option("parquet.vorder.enabled", "true")\n'
         f'      .saveAsTable("tests.fct_summary_{variant}"))\n'

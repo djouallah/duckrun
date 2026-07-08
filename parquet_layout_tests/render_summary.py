@@ -58,29 +58,6 @@ def _verdict_line(v, base_lbl, chal_lbl):
             f"({winner} wins {wc}, {loser} wins {lc}, ties {v['ties']})")
 
 
-def _ablation_blowup(rep, base, ablation):
-    """Auto-name the columns whose compressed size balloons in the unsorted layout vs the sorted
-    V-Order layout — the concrete evidence that its slower cold time is a sort pathology."""
-    sortedm = next((m for m in rep.get("timings", {})
-                    if "sorted" in m and "notsorted" not in m and m != base), None)
-    if not sortedm:
-        return
-    for m in ablation:
-        comp_ns = _compression(rep["tables"][rr._table(m)].get("parquet", {}).get("column_chunks") or [])
-        comp_s = _compression(rep["tables"][rr._table(sortedm)].get("parquet", {}).get("column_chunks") or [])
-        blown = []
-        for col, d in comp_ns.items():
-            ns_mb, s_mb = d["comp"] / MB, comp_s.get(col, {}).get("comp", 0) / MB
-            if s_mb and ns_mb > 1.3 * s_mb and (ns_mb - s_mb) > 20:
-                blown.append((ns_mb - s_mb, col, ns_mb, s_mb,
-                              d["dict"] / MB, comp_s.get(col, {}).get("dict", 0) / MB))
-        blown.sort(reverse=True)
-        if blown:
-            frag = "; ".join(f"{c} {a:,.0f} MB vs {b:,.0f} (dict {dn:,.0f} vs {ds:,.0f})"
-                             for _, c, a, b, dn, ds in blown[:3])
-            w(f"  - {lbl(m)} bloats vs {lbl(sortedm)}: {frag}.")
-
-
 def _verdict_row(by, base_lbl, m):
     chal = lbl(m)
     mv = by.get(rr._short(m), {})
@@ -92,7 +69,7 @@ def _verdict_row(by, base_lbl, m):
 
 
 def _order(models):
-    """optimized first, then challengers by name (sorted before notsorted)."""
+    """optimized first, then challenger(s) by name."""
     base = [m for m in models if m.endswith("_optimized")]
     return base + sorted(m for m in models if not m.endswith("_optimized"))
 
@@ -163,8 +140,7 @@ def s1_header(rep):
 # Build intent per layout, used for the §2 sort column when this cycle reused prebuilt tables and
 # recorded no build metadata. Keyed by physical suffix. The name must never contradict this cell.
 _SORT_INTENT = {"optimized": "SORTED BY AUTO",
-                "vorder_base_sorted": "source order",
-                "vorder_base_notsorted": "shuffled"}
+                "vorder_base_sorted": "source order"}
 
 
 def _sort_label(rep, t):
@@ -206,14 +182,12 @@ def s3_verdicts(rep, analysis, base, models):
     for v in analysis.get("verdicts", []):
         by.setdefault(v["model"], {})[v["metric"]] = v
     base_lbl = lbl(base)
-    headline = [m for m in models if m != base and "notsorted" not in m]
-    ablation = [m for m in models if m != base and "notsorted" in m]
+    headline = [m for m in models if m != base]
     noisy = sorted(_noisy_cols(rep))
 
     w("## 3. Headline verdict (medians, tie rule)")
     w()
-    w(f"Ratio column is `{base_lbl} ÷ challenger` (< 1 ⇒ {base_lbl} faster). The unsorted layout "
-      "is degenerate — see the ablation below, not the headline.")
+    w(f"Ratio column is `{base_lbl} ÷ challenger` (< 1 ⇒ {base_lbl} faster).")
     w()
     w(f"| pair | COLD {base_lbl}÷chal | HOT {base_lbl}÷chal | verdict |")
     w("|:--|--:|--:|:--|")
@@ -233,20 +207,6 @@ def s3_verdicts(rep, analysis, base, models):
         w(f"- ⚠ {len(noisy)} probe columns exceed 25% cold spread (n={cr}, shared capacity; see §7). "
           f"The headline rests on the aggregate, not any single column: "
           f"{'; '.join(agg) or 'see table'} (per-query cold median, tie rule).")
-        w()
-
-    if ablation:
-        w("### Ablation — the unsorted layout (not a comparator)")
-        w()
-        w(f"| pair | COLD {base_lbl}÷chal | HOT {base_lbl}÷chal | verdict |")
-        w("|:--|--:|--:|:--|")
-        for m in ablation:
-            _verdict_row(by, base_lbl, m)
-        w()
-        w("- writing over shuffled rows can't build RLE runs, so columns that should compress "
-          "balloon (below) — its slower cold time is that pathology, not a fair geometry "
-          "comparison; keep it out of the headline.")
-        _ablation_blowup(rep, base, ablation)
         w()
 
 

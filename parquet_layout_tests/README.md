@@ -12,27 +12,30 @@ Ported from the AEMO project `djouallah/dbt_fabric_python_delta` (`benchmark/` +
 
 ## What it compares
 
-Two Direct Lake semantic models over the **same** ~140M-row AEMO fact, derived from the same
-pristine `mart.fct_summary` (never mutated) — so results are identical by construction and only
-**speed** differs:
+Two Direct Lake semantic models over the **same** ~140M-row AEMO fact. The duckrun and Spark builds
+each read the pristine `mart.fct_summary` (never mutated) **directly and independently** — so the
+V-Order input is never routed through a duckrun-written table, and (at the default full-table run)
+both hold the same rows, so only **speed** differs:
 
 | Model | Fact table | Layout |
 |:--|:--|:--|
-| `aemo_electricity_optimized` | `mart.fct_summary_optimized` | **duckrun** `sorted by auto` — the layout under test (current WriterProperties) |
-| `aemo_electricity_vorder` | `mart.fct_summary_vorder` | **Fabric Spark V-Order** — the reference |
+| `aemo_electricity_optimized` | `tests.fct_summary_optimized` | **duckrun** `sorted by auto` — the layout under test (current WriterProperties) |
+| `aemo_electricity_vorder_base_sorted` | `tests.fct_summary_vorder_base_sorted` | **Fabric Spark V-Order** — the reference |
 
 ## Pipeline (what the workflow runs, in order)
 
-1. **`livy_vorder.py`** — builds `mart.fct_summary_vorder` on Fabric Spark via the Livy API
-   (V-Order is Spark-only). Skip-if-exists.
-2. **`build_optimized.py`** — builds `mart.fct_summary_optimized` via duckrun
-   `create or replace table … sorted by auto`. This exercises the **current tree's**
-   WriterProperties (the workflow `pip install -e .`s the checked-out duckrun). Skip-if-exists;
-   set `rebuild=true` after changing a default.
+1. **`build_spark_variant.py`** — builds `tests.fct_summary_vorder_base_sorted` on Fabric Spark via
+   the Livy API (V-Order is Spark-only), reading `mart.fct_summary` directly (applies `row_limit`).
+   Skip-if-exists.
+2. **`build_optimized.py`** — builds `tests.fct_summary_optimized` via duckrun
+   `create or replace table … sorted by auto`, reading `mart.fct_summary` directly with its own
+   independent `row_limit` read. This exercises the **current tree's** WriterProperties (the workflow
+   `pip install -e .`s the checked-out duckrun). Skip-if-exists; set `rebuild=true` after changing a
+   default.
 3. **`deploy_vorder.py`** — deploys both `*.SemanticModel`s to the workspace via `fab` and refreshes.
 4. **`table_stats.py`** — duckrun `get_stats('fct_summary*')` row-group sidecar → job summary +
    `stats_detailed.csv` artifact (continue-on-error).
-5. **`xmla_compare.py`** — the payload: 7 heavy DAX queries per model over XMLA (ADOMD.NET),
+5. **`xmla_compare.py`** — the payload: heavy DAX queries per model over XMLA (ADOMD.NET),
    dehydrating per query for true cold timing; reports cold + hot `base/vorder` speedup tables.
 
 ## Run it
@@ -50,7 +53,7 @@ export FABRIC_TOKEN=...    # api.fabric.microsoft.com   (livy + deploy)
 export PBI_TOKEN=...       # analysis.windows.net/powerbi/api  (XMLA)
 export PBI_WORKSPACE="<workspace display name>"
 export WS_ID=... LH_ID=... ADOMD_DIR=<dir with AdomdClient.dll>
-python parquet_layout_tests/livy_vorder.py
+python parquet_layout_tests/build_spark_variant.py
 python parquet_layout_tests/build_optimized.py
 python parquet_layout_tests/deploy_vorder.py --env main
 python parquet_layout_tests/xmla_compare.py

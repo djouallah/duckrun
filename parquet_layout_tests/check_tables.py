@@ -9,13 +9,11 @@ import os
 
 import duckrun
 
-# All tables the three build steps produce. Missing any ⇒ the build phase must run (each build
-# script still skips the tables that already exist, so a partial rebuild only rebuilds the gap).
-TABLES = ["tests.summary_unsorted",
-          "tests.summary_sorted",
-          "tests.fct_summary_optimized",
-          "tests.fct_summary_vorder_base_sorted",
-          "tests.fct_summary_vorder_base_notsorted"]
+# All tables the two build steps produce (each reads mart.fct_summary directly). Missing any ⇒ the
+# build phase must run (each build script still skips the tables that already exist, so a partial
+# rebuild only rebuilds the gap).
+TABLES = ["tests.fct_summary_optimized",
+          "tests.fct_summary_vorder_base_sorted"]
 
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
                       storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})

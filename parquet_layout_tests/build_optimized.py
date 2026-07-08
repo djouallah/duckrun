@@ -10,6 +10,11 @@ import report  # noqa: E402
 sort = (os.environ.get("OPT_SORT") or "auto").strip()
 clause = "sorted by auto" if sort.lower() == "auto" else f"sorted by ({sort})"
 force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
+# Read the source mart.fct_summary DIRECTLY (its own independent read, separate from the Spark
+# V-Order build's) with the same row cap. SORTED BY AUTO re-sorts regardless of input order.
+_lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
+N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
+_src = "mart.fct_summary" if N is None else f"(select * from mart.fct_summary limit {N})"
 
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
                       storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
@@ -36,10 +41,10 @@ if not force and _exists():
     status = "skipped"
 else:
     print(f"Building tests.fct_summary_optimized with '{clause}' ...", flush=True)
-    # Derive from the shared limited base (tests.summary_unsorted) so it holds the SAME rows as the
-    # V-Order variants; SORTED BY AUTO re-sorts them regardless of the base's shuffled order.
+    # Read mart.fct_summary directly (independent of the Spark V-Order build's read); SORTED BY AUTO
+    # re-sorts regardless of the source's order.
     con.sql(f"create or replace table tests.fct_summary_optimized {clause} "
-            "as select * from tests.summary_unsorted")
+            f"as select * from {_src}")
     rows = con.sql("select count(*) from tests.fct_summary_optimized").fetchone()[0]
     print(f"done — tests.fct_summary_optimized built ({rows:,} rows)", flush=True)
     status = "rebuilt"

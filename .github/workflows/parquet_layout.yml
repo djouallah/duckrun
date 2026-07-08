@@ -1,10 +1,11 @@
 name: Direct Lake query benchmark
 
 # MANUAL ONLY, non-gating (never called by publish.yml). Validates duckrun's parquet write
-# layout against a real Fabric V-Order layout of the SAME data, by running heavy DAX queries over
+# layout against a real Fabric V-Order layout of the same data, by running heavy DAX queries over
 # the XMLA endpoint (ADOMD.NET) against two Direct Lake semantic models and TIMING them — the
 # _optimized model (duckrun-clustered fact, current WriterProperties) vs the _vorder model (Fabric
-# Spark V-Order fact). Both derive from the same pristine base fct_summary, so numbers are identical;
+# Spark V-Order fact). The duckrun and Spark builds each read mart.fct_summary DIRECTLY and
+# independently (applying row_limit), so the V-Order input is never routed through a duckrun write;
 # only speed differs. Runs on windows-latest where ADOMD.NET loads cleanly. See
 # parquet_layout_tests/README.md.
 on:
@@ -131,27 +132,21 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python parquet_layout_tests/check_tables.py
 
-      - name: 🧱 Build limited base — summary_unsorted + summary_sorted (duckrun)
+      - name: ⚡ Build Spark V-Order table (Livy, reads mart.fct_summary directly)
         if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
         env:
           PYTHONIOENCODING: utf-8
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
-        run: python parquet_layout_tests/build_not_sorted.py
-
-      - name: ⚡ Build Spark variant tables (Livy)
-        if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
-        env:
-          PYTHONIOENCODING: utf-8
-          FORCE_REBUILD: ${{ inputs.rebuild }}
         run: python parquet_layout_tests/build_spark_variant.py
 
-      - name: 🧭 Build optimized summary table (duckrun sorted, base untouched)
+      - name: 🧭 Build optimized summary table (duckrun sorted, reads mart.fct_summary directly)
         if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
         env:
           PYTHONIOENCODING: utf-8
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python parquet_layout_tests/build_optimized.py
 
       - name: 🚀 Deploy benchmark semantic models (optimized + vorder)
