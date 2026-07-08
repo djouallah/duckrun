@@ -7,6 +7,7 @@ C-stream interface (``__arrow_c_stream__``), which DuckDB relations do — so th
 pyarrow dependency.
 """
 import ctypes
+import json
 import os
 import re
 import time
@@ -78,8 +79,45 @@ _TARGET_FILE_SIZE = 256 * 1024 * 1024
 # IN list stops buying pruning (the source spans most of the table) and we let delta_rs plan on its own.
 _PART_PRUNE_MAX = 400
 
+# Adaptive row-group geometry for a SMALL CTAS result only. A Parquet row group maps 1:1 to a Direct
+# Lake column segment and each segment transcodes on its own lane, so a table with only 2 row groups
+# cold-loads on 2 lanes. For a small result we shrink the row-group size so the table still yields
+# ~_RG_LANES groups; a big or unknown estimate keeps _RG_MAX (== _ROW_GROUP_SIZE), so large tables and
+# every non-CTAS write path are byte-for-byte unchanged. Only max_row_group_size moves — never bytes.
+_RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # target row groups for a small CTAS
+_RG_MIN = 1_000_000
+_RG_MAX = _ROW_GROUP_SIZE  # 16M — today's value; big/unknown estimates keep this exactly
 
-def _writer_properties(plain_cols=None):
+
+def estimated_rows(cursor, body):
+    """Estimated result rows from DuckDB's planner (EXPLAIN, no execution). None on any failure."""
+    try:
+        raw = cursor.sql("EXPLAIN (FORMAT JSON) " + body).fetchall()[0][1]
+        plan = json.loads(raw)[0]
+    except Exception:
+        return None
+
+    def walk(n):
+        v = n.get("extra_info", {}).get("Estimated Cardinality")
+        if v is not None and int(v) > 0:      # MUST skip 0: the projection above an ORDER_BY reports
+            return int(v)                      # 0 (verified) — descend to the first non-zero (SEQ_SCAN)
+        for c in n.get("children", []):
+            r = walk(c)
+            if r is not None:
+                return r
+        return None
+
+    return walk(plan)
+
+
+def rg_for(est):
+    """Row-group size for this write. Big/unknown -> today's constant (no change)."""
+    if est is None or est >= _RG_LANES * _RG_MAX:
+        return _RG_MAX
+    return max(_RG_MIN, min(_RG_MAX, -(-est // _RG_LANES)))   # ceil(est / _RG_LANES)
+
+
+def _writer_properties(plain_cols=None, row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
     # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a 32 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
@@ -95,6 +133,7 @@ def _writer_properties(plain_cols=None):
     # Only the sort-rewrite passes them (it profiles for uniqueness); other writes leave it None.
     if WriterProperties is None:
         return None
+    rg = row_group_rows if row_group_rows is not None else _ROW_GROUP_SIZE
     col_props = None
     per_col = None
     if ColumnProperties is not None:
@@ -109,14 +148,14 @@ def _writer_properties(plain_cols=None):
                 per_col = None
     for kwargs in (
         dict(compression="SNAPPY",
-             max_row_group_size=_ROW_GROUP_SIZE,
+             max_row_group_size=rg,
              dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
              data_page_row_count_limit=_DATA_PAGE_ROW_LIMIT,
              statistics_truncate_length=64,
              default_column_properties=col_props,
              column_properties=per_col),
-        dict(compression="SNAPPY", max_row_group_size=_ROW_GROUP_SIZE),
+        dict(compression="SNAPPY", max_row_group_size=rg),
         dict(compression="SNAPPY"),
     ):
         try:
@@ -600,6 +639,7 @@ def build_write_deltalake_args(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     plain_cols: Optional[List[str]] = None,
+    row_group_rows: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
@@ -621,7 +661,7 @@ def build_write_deltalake_args(
     if schema_mode in ("merge", "overwrite"):
         args["schema_mode"] = schema_mode
     args["target_file_size"] = _TARGET_FILE_SIZE
-    wp = _writer_properties(plain_cols=plain_cols)
+    wp = _writer_properties(plain_cols=plain_cols, row_group_rows=row_group_rows)
     if wp is not None:
         args["writer_properties"] = wp
     return args
@@ -981,6 +1021,7 @@ def write_delta(
     cur=None,
     plain_cols: Optional[List[str]] = None,
     read_version: Optional[int] = None,
+    row_group_rows: Optional[int] = None,
 ) -> None:
     """
     Materialize ``data`` (a DuckDB relation / Arrow C-stream) to Delta and maintain it.
@@ -1021,6 +1062,7 @@ def write_delta(
         partition_by=partition_by,
         storage_options=storage_options,
         plain_cols=plain_cols,
+        row_group_rows=row_group_rows,
     )
     if read_version is None:
         write_deltalake(**args)

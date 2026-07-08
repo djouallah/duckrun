@@ -1349,6 +1349,86 @@ def test_writer_keeps_dictionary_encoding(conn):
         assert "RLE_DICTIONARY" in encodings, f"{col} not dictionary-encoded: {encodings}"
 
 
+def _row_groups(conn, table):
+    # Distinct (file, row_group_id) across every parquet file of a table — parquet_metadata returns one
+    # row per column chunk, so count DISTINCT row-group ids, not rows.
+    import glob
+    import os
+    files = [f.replace(os.sep, "/")
+             for f in glob.glob(os.path.join(conn.root_path, "dbo", table, "**", "*.parquet"),
+                                recursive=True)]
+    assert files, "no parquet files written"
+    return conn.sql(
+        f"select count(*) from (select distinct file_name, row_group_id "
+        f"from parquet_metadata({files!r}))").fetchone()[0]
+
+
+def test_ctas_small_result_adapts_row_groups(conn):
+    # A small CTAS result should shrink its row-group size so the table still yields ~_RG_LANES (8)
+    # Direct Lake segments, not the 2 it would get from the 16M constant. 20M rows / ceil(20M/8)=2.5M.
+    conn.sql("CREATE OR REPLACE TABLE small_ctas AS select i as j from range(20000000) t(i)")
+    n = _row_groups(conn, "small_ctas")
+    assert 7 <= n <= 9, f"expected ~8 row groups, got {n}"
+
+
+def test_ctas_sorted_result_adapts_row_groups(conn):
+    # Same, but SORTED BY (j): the projection above ORDER_BY reports Estimated Cardinality "0", so a
+    # naive estimator would collapse to _RG_MIN (1M → ~20 groups). The zero-skip must descend past it.
+    conn.sql("CREATE OR REPLACE TABLE sorted_ctas SORTED BY (j) AS select i as j from range(20000000) t(i)")
+    n = _row_groups(conn, "sorted_ctas")
+    assert 6 <= n <= 10, f"sorted CTAS collapsed/inflated to {n} row groups (zero-estimate not skipped?)"
+
+
+def test_ctas_large_estimate_keeps_16m_profile(conn, monkeypatch):
+    # A large estimate keeps today's 16M constant: 20M rows → ceil(20M/16M)=2 groups (byte-for-byte the
+    # pre-change layout). Forced via the estimate so we don't have to write 128M rows in a test.
+    from dbt.adapters.duckrun import engine
+    monkeypatch.setattr(engine, "estimated_rows", lambda cur, body: 200_000_000)
+    conn.sql("CREATE OR REPLACE TABLE big_ctas AS select i as j from range(20000000) t(i)")
+    n = _row_groups(conn, "big_ctas")
+    assert n == 2, f"large estimate should keep the 16M profile (2 groups), got {n}"
+
+
+def test_ctas_estimator_failure_is_safe(conn, monkeypatch):
+    # If the estimator raises, the CTAS must still succeed and fall back to the 16M profile.
+    from dbt.adapters.duckrun import engine
+
+    def boom(cur, body):
+        raise RuntimeError("planner exploded")
+
+    monkeypatch.setattr(engine, "estimated_rows", boom)
+    conn.sql("CREATE OR REPLACE TABLE safe_ctas AS select i as j from range(20000000) t(i)")
+    assert conn.sql("select count(*) from safe_ctas").fetchone()[0] == 20000000
+    assert _row_groups(conn, "safe_ctas") == 2  # None estimate → _RG_MAX
+
+
+def test_row_group_rows_reaches_only_ctas(conn, monkeypatch):
+    # The new knob must reach the write seam only for CTAS; every other file write (INSERT append) keeps
+    # row_group_rows=None → byte-identical writer properties to the current release.
+    from dbt.adapters.duckrun import engine
+    seen = []
+    orig = engine.build_write_deltalake_args
+
+    def spy(*a, **k):
+        seen.append(k.get("row_group_rows"))
+        return orig(*a, **k)
+
+    monkeypatch.setattr(engine, "build_write_deltalake_args", spy)
+    conn.sql("CREATE OR REPLACE TABLE seam AS select i as j from range(100) t(i)")  # CTAS → int
+    conn.sql("INSERT INTO seam select i from range(100, 110) t(i)")                 # append → None
+    assert seen, "no write seam calls recorded"
+    assert isinstance(seen[0], int) and seen[0] > 0, f"CTAS did not pass row_group_rows: {seen[0]}"
+    assert all(v is None for v in seen[1:]), f"a non-CTAS write leaked row_group_rows: {seen[1:]}"
+
+
+def test_rg_for_clamps():
+    from dbt.adapters.duckrun import engine
+    assert engine.rg_for(100) == engine._RG_MIN                       # tiny → floor
+    assert engine.rg_for(100_000_000) < engine._RG_MAX               # large but below cutoff → adapts
+    assert engine.rg_for(None) == engine._RG_MAX                     # unknown → today's constant
+    assert engine.rg_for(engine._RG_LANES * engine._RG_MAX) == engine._RG_MAX  # at/above cutoff → 16M
+
+
 # NOTE: sort / partition on write are covered by test_sql_only.py (CREATE TABLE … SORTED BY /
 # PARTITIONED BY / SORTED BY AUTO). optimize / replaceWhere / the append_if_unchanged verb still have
 # no DuckDB-SQL surface and are gaps for now — their engine capabilities remain covered by

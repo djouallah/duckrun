@@ -1025,11 +1025,21 @@ class _DeltaDML:
         if sort_cols:  # cluster the write: DuckDB ORDER BY the query, then materialize
             order = ", ".join('"' + c + '"' for c in sort_cols)
             body = f"SELECT * FROM ({body}) ORDER BY {order}"
+        # Small-CTAS row-group geometry: ask DuckDB's planner (EXPLAIN, no execution) for the row
+        # estimate over the FINAL body (after any SORTED BY wrap) and shrink the row-group size so a
+        # small result still yields ~_RG_LANES Direct Lake segments. Big/unknown estimates keep 16M.
+        try:
+            est = engine.estimated_rows(self.cursor, body)  # planner estimate; never break a write on it
+        except Exception:
+            est = None
+        rg = engine.rg_for(est)
+        logger.debug(f"duckrun: ctas geometry est={est} rg={rg}")
         data = self.cursor.sql(body)
         # overwrite_schema so this replaces a prior table (or a drop-tombstone) wholesale — a live
         # table is recreated with the real schema, clearing any tombstone marker.
         engine.write_delta(loc, data, "overwrite", overwrite_schema=True,
-                           partition_by=partition_cols or None, storage_options=self.so)
+                           partition_by=partition_cols or None, storage_options=self.so,
+                           row_group_rows=rg)
         self._refresh_view(rel, schema, loc)
         return True
 
