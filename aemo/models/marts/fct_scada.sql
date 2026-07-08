@@ -12,8 +12,8 @@
     merge_update_condition='source.source_priority >= target.source_priority',
     merge_exclude_columns=['intraday_file'],
     pre_hook=[
-      "SET VARIABLE scada_daily_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT daily_file FROM {{ this }} WHERE daily_file IS NOT NULL){% endif %} LIMIT {{ env_var('process_limit', '200') }}))",
-      "SET VARIABLE scada_today_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'scada_today'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT intraday_file FROM {{ this }} WHERE intraday_file IS NOT NULL){% endif %} LIMIT {{ env_var('process_limit', '200') }}))"
+      "SET VARIABLE scada_daily_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT daily_file FROM {{ this }} WHERE daily_file IS NOT NULL){% endif %} ORDER BY source_filename LIMIT {{ env_var('process_limit', '200') }}))",
+      "SET VARIABLE scada_today_paths = (SELECT COALESCE(NULLIF(list('{{ get_csv_archive_path() }}' || archive_path), []), ['']) FROM (SELECT archive_path FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'scada_today'{% if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT intraday_file FROM {{ this }} WHERE intraday_file IS NOT NULL){% endif %} ORDER BY source_filename LIMIT {{ env_var('process_limit', '200') }}))"
     ]
 ) }}
 
