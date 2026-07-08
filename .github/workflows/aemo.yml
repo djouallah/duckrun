@@ -45,6 +45,11 @@ jobs:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
       FILES_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Files
       DBT_SCHEMA: mart
+      # Exported to the *process* env (not just azure/login inputs) so the adapter's mid-run token
+      # refresh can re-exchange a fresh GitHub OIDC assertion for a new storage token — the one source
+      # that outlives the ~1h bearer token on a long backfill. See auth._github_oidc_token.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       download_limit: ${{ inputs.download_limit || '10' }}
       process_limit: ${{ inputs.process_limit || '1000' }}
       # The azure extension's default transport fails the OneLake TLS handshake on the runner
@@ -57,7 +62,9 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
         working-directory: ${{ github.workspace }}
-        run: pip install -e .
+        # [local] pulls azure-identity so the mid-run OIDC token refresh works — without it a build
+        # longer than the token's ~1h life 401s in the tail-end dbt test phase.
+        run: pip install -e ".[local]"
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
