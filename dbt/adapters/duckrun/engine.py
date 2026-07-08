@@ -74,6 +74,10 @@ _DATA_PAGE_ROW_LIMIT = 20_000
 # compaction. MERGE is the exception — it sets no target_file_size.
 _TARGET_FILE_SIZE = 256 * 1024 * 1024
 
+# Max distinct partition values folded into a merge's `target.p IN (…)` prune predicate. Past this the
+# IN list stops buying pruning (the source spans most of the table) and we let delta_rs plan on its own.
+_PART_PRUNE_MAX = 400
+
 
 def _writer_properties(plain_cols=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
@@ -1696,39 +1700,50 @@ def merge_delta_clauses(
     # so OCC validates (effective_version, HEAD] — one snapshot for both the read and the commit.
     dt.load_as_version(effective_version)
 
-    # Explicit partition-bound pruning. delta_rs's auto early_filter (try_construct_early_filter) is
+    # Explicit partition-set pruning. delta_rs's auto early_filter (try_construct_early_filter) is
     # fragile: it silently returns None — degrading to a FULL target scan — on multi-key predicates
     # (delta-rs #3636) and whenever source min/max stats are unavailable. For each PARTITION column
-    # joined as `target.p = source.p`, compute the source's min/max here and fold a CONSTANT bound
-    # (`target.p BETWEEN <min> AND <max>`) into the ON predicate. This is RESULT-NEUTRAL — any target
-    # row that can match `source.p` already lies within [min(p), max(p)] — but hands delta_rs a
-    # plan-time literal it can push down to skip partition files deterministically, which is exactly
-    # what its own docs recommend doing by hand. Numeric partition cols only (minimal); skipped for
-    # by-source merges (streamed_exec, which can't prune anyway). Best-effort: never break a merge.
+    # joined as `target.p = source.p`, collect the source's DISTINCT values here and fold a CONSTANT
+    # `target.p IN (<vals>)` into the ON predicate. This is RESULT-NEUTRAL — any target row that can
+    # match `source.p` already carries one of those values — but hands delta_rs a plan-time literal it
+    # can push down to skip partition files deterministically, which is exactly what its own docs
+    # recommend doing by hand. IN (not BETWEEN min/max): a source that unions two feeds (e.g. an old
+    # backfill + a current stream) is BIMODAL, so min/max would smear the bound across the whole table
+    # while the true set is a handful of partitions. Numeric partition cols only, capped at
+    # _PART_PRUNE_MAX distinct values (beyond that the IN list stops helping and we let delta_rs be);
+    # skipped for by-source merges (streamed_exec, which can't prune anyway). Best-effort: never break
+    # a merge.
     if not streamed_exec and hasattr(data, "query"):
         try:
             part_cols = list(dt.metadata().partition_columns or [])
         except Exception:
             part_cols = []
-        _bounds = []
+        _conds = []
         for _pcol in part_cols:
             if not re.search(rf'target\."?{re.escape(_pcol)}"?\s*=\s*source\."?{re.escape(_pcol)}"?',
                              predicate, re.I):
                 continue
             _q = '"' + _pcol.replace('"', '""') + '"'
             try:
-                _lo, _hi = data.query("__mp", f"SELECT min({_q}), max({_q}) FROM __mp").fetchone()
+                _rows = data.query(
+                    "__mp",
+                    f"SELECT DISTINCT {_q} FROM __mp WHERE {_q} IS NOT NULL LIMIT {_PART_PRUNE_MAX + 1}",
+                ).fetchall()
             except Exception as e:
-                logger.warning(f"merge partition-bound pruning: could not compute {_pcol!r} bounds "
+                logger.warning(f"merge partition-set pruning: could not collect {_pcol!r} values "
                                f"({e!r}); skipping")
                 continue
-            if _lo is None or isinstance(_lo, bool) or not isinstance(_lo, (int, float)):
+            _vals = [r[0] for r in _rows]
+            if not _vals or len(_vals) > _PART_PRUNE_MAX:
+                continue
+            if any(v is None or isinstance(v, bool) or not isinstance(v, (int, float)) for v in _vals):
                 continue
             _tq = "target." + _q
-            _bounds.append(f"{_tq} >= {_lo} AND {_tq} <= {_hi}")
-            logger.info(f"merge partition-bound pruning: injected {_tq} BETWEEN {_lo} AND {_hi}")
-        if _bounds:
-            predicate = f"({predicate}) AND " + " AND ".join(_bounds)
+            _lst = ", ".join(str(v) for v in sorted(_vals))
+            _conds.append(f"{_tq} IN ({_lst})")
+            logger.info(f"merge partition-set pruning: injected {_tq} IN ({_lst})")
+        if _conds:
+            predicate = f"({predicate}) AND " + " AND ".join(_conds)
 
     merger = dt.merge(
         source=data,
