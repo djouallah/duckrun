@@ -1383,7 +1383,7 @@ def test_ctas_large_estimate_keeps_16m_profile(conn, monkeypatch):
     # A large estimate keeps today's 16M constant: 20M rows → ceil(20M/16M)=2 groups (byte-for-byte the
     # pre-change layout). Forced via the estimate so we don't have to write 128M rows in a test.
     from dbt.adapters.duckrun import engine
-    monkeypatch.setattr(engine, "estimated_rows", lambda cur, body: 200_000_000)
+    monkeypatch.setattr(engine, "estimated_rows", lambda cur, data: 200_000_000)
     conn.sql("CREATE OR REPLACE TABLE big_ctas AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "big_ctas")
     assert n == 2, f"large estimate should keep the 16M profile (2 groups), got {n}"
@@ -1393,7 +1393,7 @@ def test_ctas_estimator_failure_is_safe(conn, monkeypatch):
     # If the estimator raises, the CTAS must still succeed and fall back to the 16M profile.
     from dbt.adapters.duckrun import engine
 
-    def boom(cur, body):
+    def boom(cur, data):
         raise RuntimeError("planner exploded")
 
     monkeypatch.setattr(engine, "estimated_rows", boom)
@@ -1402,23 +1402,49 @@ def test_ctas_estimator_failure_is_safe(conn, monkeypatch):
     assert _row_groups(conn, "safe_ctas") == 2  # None estimate → _RG_MAX
 
 
-def test_row_group_rows_reaches_only_ctas(conn, monkeypatch):
-    # The new knob must reach the write seam only for CTAS; every other file write (INSERT append) keeps
-    # row_group_rows=None → byte-identical writer properties to the current release.
+def test_overwrite_seam_adapts_regardless_of_caller(conn):
+    # dbt's table / --full-refresh path calls engine.write_delta(mode="overwrite") directly (via
+    # delta_plugin, NOT the SQL CTAS interception). Geometry is computed inside write_delta, so every
+    # overwrite caller adapts identically — dbt and SQL share one seam.
+    from dbt.adapters.duckrun import engine
+    loc = conn.root_path + "/dbo/ow_direct"
+    data = conn._connection.sql("select i as j from range(20000000) t(i)")
+    engine.write_delta(loc, data, "overwrite", storage_options=conn.storage_options,
+                       cur=conn._connection)
+    n = _row_groups(conn, "ow_direct")
+    assert 7 <= n <= 9, f"overwrite seam did not adapt: {n} row groups"
+
+
+def test_row_group_rows_reaches_only_overwrite(conn, monkeypatch):
+    # The adaptive geometry reaches the write seam only for overwrite; an append (INSERT) keeps
+    # row_group_rows=None and — like MERGE — gets delta_rs defaults, no tuned profile at all.
     from dbt.adapters.duckrun import engine
     seen = []
     orig = engine.build_write_deltalake_args
 
     def spy(*a, **k):
-        seen.append(k.get("row_group_rows"))
+        seen.append((k.get("mode") or (a[2] if len(a) > 2 else None), k.get("row_group_rows")))
         return orig(*a, **k)
 
     monkeypatch.setattr(engine, "build_write_deltalake_args", spy)
-    conn.sql("CREATE OR REPLACE TABLE seam AS select i as j from range(100) t(i)")  # CTAS → int
+    conn.sql("CREATE OR REPLACE TABLE seam AS select i as j from range(100) t(i)")  # overwrite → int
     conn.sql("INSERT INTO seam select i from range(100, 110) t(i)")                 # append → None
     assert seen, "no write seam calls recorded"
-    assert isinstance(seen[0], int) and seen[0] > 0, f"CTAS did not pass row_group_rows: {seen[0]}"
-    assert all(v is None for v in seen[1:]), f"a non-CTAS write leaked row_group_rows: {seen[1:]}"
+    ow = [rg for mode, rg in seen if mode == "overwrite"]
+    ap = [rg for mode, rg in seen if mode == "append"]
+    assert ow and isinstance(ow[0], int) and ow[0] > 0, f"overwrite did not pass row_group_rows: {ow}"
+    assert ap and all(rg is None for rg in ap), f"an append leaked row_group_rows: {ap}"
+
+
+def test_append_uses_delta_rs_defaults():
+    # Append is transient (compaction folds it into the read layout later), so it writes with delta_rs
+    # defaults — no tuned writer_properties, no target_file_size — exactly like MERGE. A full-table
+    # overwrite keeps the profile.
+    from dbt.adapters.duckrun import engine
+    ow = engine.build_write_deltalake_args("p", None, "overwrite")
+    ap = engine.build_write_deltalake_args("p", None, "append")
+    assert "target_file_size" in ow and "writer_properties" in ow
+    assert "target_file_size" not in ap and "writer_properties" not in ap
 
 
 def test_rg_for_clamps():

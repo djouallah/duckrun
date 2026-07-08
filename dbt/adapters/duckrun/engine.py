@@ -79,35 +79,48 @@ _TARGET_FILE_SIZE = 256 * 1024 * 1024
 # IN list stops buying pruning (the source spans most of the table) and we let delta_rs plan on its own.
 _PART_PRUNE_MAX = 400
 
-# Adaptive row-group geometry for a SMALL CTAS result only. A Parquet row group maps 1:1 to a Direct
-# Lake column segment and each segment transcodes on its own lane, so a table with only 2 row groups
-# cold-loads on 2 lanes. For a small result we shrink the row-group size so the table still yields
-# ~_RG_LANES groups; a big or unknown estimate keeps _RG_MAX (== _ROW_GROUP_SIZE), so large tables and
-# every non-CTAS write path are byte-for-byte unchanged. Only max_row_group_size moves — never bytes.
-_RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # target row groups for a small CTAS
+# Adaptive row-group geometry for a SMALL full-table write (overwrite: CTAS / dbt table / full-refresh).
+# A Parquet row group maps 1:1 to a Direct Lake column segment and each segment transcodes on its own
+# lane, so a table with only 2 row groups cold-loads on 2 lanes. For a small result we shrink the
+# row-group size so the table still yields ~_RG_LANES groups; a big or unknown estimate keeps _RG_MAX
+# (== _ROW_GROUP_SIZE). Only max_row_group_size moves — never bytes. Append is NOT sized here (it uses
+# delta_rs defaults and is compaction-folded); see build_write_deltalake_args.
+_RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # target row groups for a small overwrite
 _RG_MIN = 1_000_000
 _RG_MAX = _ROW_GROUP_SIZE  # 16M — today's value; big/unknown estimates keep this exactly
 
 
-def estimated_rows(cursor, body):
-    """Estimated result rows from DuckDB's planner (EXPLAIN, no execution). None on any failure."""
+def _walk_cardinality(plan):
+    v = plan.get("extra_info", {}).get("Estimated Cardinality")
+    if v is not None and int(v) > 0:      # MUST skip 0: the projection above an ORDER_BY reports
+        return int(v)                      # 0 (verified) — descend to the first non-zero (SEQ_SCAN)
+    for c in plan.get("children", []):
+        r = _walk_cardinality(c)
+        if r is not None:
+            return r
+    return None
+
+
+def estimated_rows(cur, data):
+    """Estimated result rows for a DuckDB relation (EXPLAIN, no execution). None on any failure.
+
+    Registers the relation on its connection and reads the planner's Estimated Cardinality. This is the
+    single overwrite seam the SQL CTAS path and the dbt table path both flow through, so they size
+    identically. ``cur`` must be the connection that produced ``data``; ``None`` skips the estimate
+    (the write keeps the 16M profile)."""
+    if cur is None:
+        return None
+    name = "__duckrun_rg_est"
     try:
-        raw = cursor.sql("EXPLAIN (FORMAT JSON) " + body).fetchall()[0][1]
-        plan = json.loads(raw)[0]
+        cur.register(name, data)
+        try:
+            raw = cur.execute(f"EXPLAIN (FORMAT JSON) SELECT * FROM {name}").fetchall()[0][1]
+            plan = json.loads(raw)[0]
+        finally:
+            cur.unregister(name)
     except Exception:
         return None
-
-    def walk(n):
-        v = n.get("extra_info", {}).get("Estimated Cardinality")
-        if v is not None and int(v) > 0:      # MUST skip 0: the projection above an ORDER_BY reports
-            return int(v)                      # 0 (verified) — descend to the first non-zero (SEQ_SCAN)
-        for c in n.get("children", []):
-            r = walk(c)
-            if r is not None:
-                return r
-        return None
-
-    return walk(plan)
+    return _walk_cardinality(plan)
 
 
 def rg_for(est):
@@ -643,10 +656,14 @@ def build_write_deltalake_args(
 ) -> Dict[str, Any]:
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
-    Every file write gets the one read-layout profile: the tuned writer properties plus the 256 MB
-    ``target_file_size``. (MERGE does not go through here — it passes no writer_properties, so a merge
-    stays quick and never rewrites fat files.) ``plain_cols`` are unique columns written PLAIN — no
-    dictionary; only the sort-rewrite passes them."""
+    A full-table write (overwrite / replace-where) gets the one read-layout profile: the tuned writer
+    properties plus the 256 MB ``target_file_size``. An ``append`` — like MERGE — writes with delta_rs
+    defaults (no writer_properties, no ``target_file_size``): appends are transient increments that
+    threshold-gated compaction folds into the read layout on a later pass, so paying the 16M-group
+    profile on every small append is wasted (and the 16M row group is the write-memory ceiling). MERGE
+    does not go through here at all. ``plain_cols`` are unique columns written PLAIN — no dictionary;
+    only the sort-rewrite passes them. ``row_group_rows`` is the adaptive overwrite geometry (see
+    ``write_delta`` / ``rg_for``); it is meaningless on append and ignored there."""
     args: Dict[str, Any] = {
         "table_or_uri": path,
         "data": data,
@@ -660,10 +677,11 @@ def build_write_deltalake_args(
     # mode only) — delta-rs's own schema_mode values, passed straight through.
     if schema_mode in ("merge", "overwrite"):
         args["schema_mode"] = schema_mode
-    args["target_file_size"] = _TARGET_FILE_SIZE
-    wp = _writer_properties(plain_cols=plain_cols, row_group_rows=row_group_rows)
-    if wp is not None:
-        args["writer_properties"] = wp
+    if mode != "append":  # append → delta_rs defaults (lean, compaction-folded), like MERGE
+        args["target_file_size"] = _TARGET_FILE_SIZE
+        wp = _writer_properties(plain_cols=plain_cols, row_group_rows=row_group_rows)
+        if wp is not None:
+            args["writer_properties"] = wp
     return args
 
 
@@ -1055,6 +1073,17 @@ def write_delta(
         if table_exists(path, storage_options):
             return
         mode = "overwrite"
+
+    # Adaptive row-group geometry for a full-table overwrite, computed HERE so the SQL CTAS path and the
+    # dbt table / full-refresh path (delta_plugin) share one seam and behave identically. A small result
+    # yields ~_RG_LANES groups; big/unknown keeps 16M. Needs the producing connection (cur); never break
+    # a write on the planner estimate.
+    if mode == "overwrite" and row_group_rows is None:
+        try:
+            row_group_rows = rg_for(estimated_rows(cur, data))
+        except Exception:
+            row_group_rows = None
+        logger.debug(f"duckrun: overwrite geometry rg={row_group_rows}")
 
     args = build_write_deltalake_args(
         path, data, mode,
