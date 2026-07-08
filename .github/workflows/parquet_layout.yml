@@ -101,13 +101,11 @@ jobs:
             "PBI_WORKSPACE=$wsName"
           ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: ⚡ Build V-Order table on Fabric Spark (Livy) — from the pristine base summary
-        # Both derived tables (vorder here, optimized next) are built from the untouched base
-        # fct_summary and never mutate it, so the benchmark only ever assumes the base exists.
+      - name: ⚡ Build Spark variant tables (Livy)
         env:
           PYTHONIOENCODING: utf-8
           FORCE_REBUILD: ${{ inputs.rebuild }}
-        run: python parquet_layout_tests/livy_vorder.py
+        run: python parquet_layout_tests/build_spark_variant.py
 
       - name: 🧭 Build optimized summary table (duckrun sorted, base untouched)
         env:

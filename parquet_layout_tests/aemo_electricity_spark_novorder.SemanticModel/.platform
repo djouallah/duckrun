@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "SemanticModel",
+    "displayName": "aemo_electricity_spark_novorder"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "3f8b1d64-9c2a-4e57-b0d3-6a1e8f45c2b9"
+  }
+}
