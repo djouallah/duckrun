@@ -20,7 +20,7 @@ except Exception:
 
 def main():
     import duckrun
-    con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"] + "/mart",
+    con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"] + "/tests",
                           storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})
 
     # --- per-table summary -> tables.<table>.parquet ---

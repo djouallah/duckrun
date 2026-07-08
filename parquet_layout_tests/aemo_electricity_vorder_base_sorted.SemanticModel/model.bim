@@ -246,9 +246,9 @@
             "mode": "directLake",
             "source": {
               "type": "entity",
-              "entityName": "fct_summary_vorder",
+              "entityName": "fct_summary_vorder_base_sorted",
               "expressionSource": "DirectLake",
-              "schemaName": "mart"
+              "schemaName": "tests"
             }
           }
         ]

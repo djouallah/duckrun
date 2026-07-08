@@ -248,7 +248,7 @@
               "type": "entity",
               "entityName": "fct_summary_optimized",
               "expressionSource": "DirectLake",
-              "schemaName": "mart"
+              "schemaName": "tests"
             }
           }
         ]

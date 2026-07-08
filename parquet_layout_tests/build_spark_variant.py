@@ -10,27 +10,29 @@ BASE = (f"https://api.fabric.microsoft.com/v1/workspaces/{os.environ['WS_ID']}"
         f"/lakehouses/{os.environ['LH_ID']}/livyapi/versions/2023-12-01")
 FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 
-VARIANTS = {"vorder": "true", "spark_novorder": "false"}
+VARIANTS = {"vorder_base_sorted": "mart.fct_summary",
+            "vorder_base_notsorted": "tests.summary_unsorted"}
 
 
-def _spark_code(variant, flag):
+def _spark_code(variant, source):
     return (
-        f'spark.conf.set("spark.sql.parquet.vorder.default", "{flag}")\n'
-        f'(spark.read.table("mart.fct_summary")\n'
-        f'      .write.mode("overwrite").format("delta")\n'
-        f'      .option("parquet.vorder.enabled", "{flag}")\n'
-        f'      .saveAsTable("mart.fct_summary_{variant}"))\n'
-        f'print("WRITE_OK fct_summary_{variant} rows=" '
-        f'+ str(spark.read.table("mart.fct_summary_{variant}").count()))\n'
+        'spark.sql("CREATE SCHEMA IF NOT EXISTS tests")\n'
+        'spark.conf.set("spark.sql.parquet.vorder.default", "true")\n'
+        f'(spark.read.table("{source}")\n'
+        '      .write.mode("overwrite").format("delta")\n'
+        '      .option("parquet.vorder.enabled", "true")\n'
+        f'      .saveAsTable("tests.fct_summary_{variant}"))\n'
+        f'print("WRITE_OK tests.fct_summary_{variant} rows=" '
+        f'+ str(spark.read.table("tests.fct_summary_{variant}").count()))\n'
     )
 
 
-def _exists(variant):
+def _table_exists(qualified):
     import duckrun
-    con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"] + "/mart",
+    con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
                           storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})
     try:
-        con.sql(f"select 1 from mart.fct_summary_{variant} limit 1").fetchone()
+        con.sql(f"select 1 from {qualified} limit 1").fetchone()
         return True
     except Exception:
         return False
@@ -89,11 +91,16 @@ def _run_statement(sid, code):
 
 
 def main():
-    todo = {v: f for v, f in VARIANTS.items() if FORCE or not _exists(v)}
-    for v in VARIANTS:
-        if v not in todo:
-            print(f"mart.fct_summary_{v} already exists — skipping (set rebuild=true to rebuild).",
-                  flush=True)
+    todo = {}
+    for v, src in VARIANTS.items():
+        out = f"tests.fct_summary_{v}"
+        if not FORCE and _table_exists(out):
+            print(f"{out} already exists — skipping (set rebuild=true to rebuild).", flush=True)
+            continue
+        if not _table_exists(src):
+            print(f"source {src} not found — skipping {v}.", flush=True)
+            continue
+        todo[v] = src
     if not todo:
         return
     print("Creating Livy session...", flush=True)
@@ -104,9 +111,9 @@ def main():
     try:
         _poll_state(f"sessions/{sid}", "session", {"idle"},
                     {"error", "dead", "killed", "shutting_down"}, timeout=900, interval=15)
-        for v, flag in todo.items():
-            print(f"Building mart.fct_summary_{v} (vorder={flag})...", flush=True)
-            _run_statement(sid, _spark_code(v, flag))
+        for v, src in todo.items():
+            print(f"Building tests.fct_summary_{v} (V-Order, source {src})...", flush=True)
+            _run_statement(sid, _spark_code(v, src))
     finally:
         print(f"Deleting session {sid}...", flush=True)
         try:

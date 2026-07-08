@@ -115,6 +115,12 @@ jobs:
             "PBI_WORKSPACE=$wsName"
           ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: 🧱 Build unsorted base (duckrun)
+        env:
+          PYTHONIOENCODING: utf-8
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+        run: python parquet_layout_tests/build_not_sorted.py
+
       - name: ⚡ Build Spark variant tables (Livy)
         env:
           PYTHONIOENCODING: utf-8
