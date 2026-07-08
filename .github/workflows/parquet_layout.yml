@@ -120,19 +120,28 @@ jobs:
             "PBI_WORKSPACE=$wsName"
           ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
+      - name: 🔎 Check existing tables (one duckrun connection gates the whole build phase)
+        id: check
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python parquet_layout_tests/check_tables.py
+
       - name: 🧱 Build unsorted base (duckrun)
+        if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
         env:
           PYTHONIOENCODING: utf-8
           FORCE_REBUILD: ${{ inputs.rebuild }}
         run: python parquet_layout_tests/build_not_sorted.py
 
       - name: ⚡ Build Spark variant tables (Livy)
+        if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
         env:
           PYTHONIOENCODING: utf-8
           FORCE_REBUILD: ${{ inputs.rebuild }}
         run: python parquet_layout_tests/build_spark_variant.py
 
       - name: 🧭 Build optimized summary table (duckrun sorted, base untouched)
+        if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
         env:
           PYTHONIOENCODING: utf-8
           OPT_SORT: ${{ inputs.opt_sort }}
