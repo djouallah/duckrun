@@ -53,6 +53,7 @@ def _init():
             "env": os.environ.get("BENCH_ENV"),
             "runs": _int("BENCH_RUNS"),
             "cold": _bool("BENCH_COLD"),
+            "cold_repeats": _int("COLD_REPEATS"),
             "gap_seconds": _int("BENCH_GAP_SECONDS"),
             "opt_sort": os.environ.get("OPT_SORT"),
             "rebuild": _bool("FORCE_REBUILD"),

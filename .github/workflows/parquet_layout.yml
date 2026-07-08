@@ -15,13 +15,17 @@ on:
         type: string
         default: main
       runs:
-        description: "runs per query per model (run 1 = cold; run 2 = warm; runs 3+ averaged = hot)"
+        description: "HOT runs per query per model (run 1/2 dropped as warm; rest averaged)"
         type: string
         default: "5"
       cold:
         description: "measure cold by dehydrating (clearValues+full) before each query"
         type: boolean
         default: true
+      cold_repeats:
+        description: "cold dehydrate→query cycles per cold-tier query (median + spread reported)"
+        type: string
+        default: "3"
       gap_seconds:
         description: "idle seconds between the base and vorder benchmarks (>5min CU smoothing => clean gap in the capacity chart)"
         type: string
@@ -64,6 +68,7 @@ jobs:
           BENCH_ENV: ${{ inputs.env }}
           BENCH_RUNS: ${{ inputs.runs }}
           BENCH_COLD: ${{ inputs.cold }}
+          COLD_REPEATS: ${{ inputs.cold_repeats }}
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
@@ -156,6 +161,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           BENCH_RUNS: ${{ inputs.runs }}
           BENCH_COLD: ${{ inputs.cold }}
+          COLD_REPEATS: ${{ inputs.cold_repeats }}
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
         run: python parquet_layout_tests/xmla_compare.py
 

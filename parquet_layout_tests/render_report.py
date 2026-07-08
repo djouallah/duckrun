@@ -1,6 +1,16 @@
+"""Render run_report.json to the GitHub job summary AND compute the derived `analysis` block,
+which is merged back into the same file. Pure post-processing — everything here is recomputable
+offline from the raw values already in run_report.json (cold samples, hot runs, per-column-chunk
+parquet_metadata). Layout in, wall-clock out; no engine internals.
+
+Env in: RUN_REPORT (the one JSON), GITHUB_STEP_SUMMARY (optional; also prints to stdout).
+"""
 import json
 import os
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import report  # noqa: E402
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -9,6 +19,9 @@ except Exception:
 
 _PARQUET_COLS = ["table", "rows", "files", "row_groups", "avg_row_group",
                  "size_mb", "vorder", "compression"]
+_PROBE_COLS = ["mw", "price", "duid", "date", "time"]     # probe_<col> minus probe_rowcount
+_FILTER_COLS = ["date", "time", "DUID"]                   # clustering candidates
+_RG_BIG = 1 << 24                                          # 16,777,216 rows — Direct Lake segment cap
 
 
 def _write(md):
@@ -29,6 +42,138 @@ def _fmt(v):
     return "" if v is None else str(v)
 
 
+def _table(model):
+    """Physical table name for a semantic-model name: fct_summary + the model's suffix."""
+    return "fct_summary" + model.removeprefix("aemo_electricity")
+
+
+def _short(model):
+    return model.removeprefix("aemo_electricity_") or model
+
+
+# ---------------------------------------------------------------------------- derived analysis
+
+def _coerce_intervals(chunks, col):
+    """[(min, max)] for column `col` across its column-chunks, coerced to a comparable type
+    (float if every bound parses as a number, else str)."""
+    raw = [(c.get("stats_min"), c.get("stats_max")) for c in chunks
+           if c.get("path_in_schema") == col and c.get("stats_min") is not None
+           and c.get("stats_max") is not None]
+    if not raw:
+        return []
+    flat = [v for pair in raw for v in pair]
+    try:
+        [float(v) for v in flat]
+        return [(float(a), float(b)) for a, b in raw]
+    except (TypeError, ValueError):
+        return [(str(a), str(b)) for a, b in raw]
+
+
+def _overlap_score(intervals):
+    """0 = perfectly clustered (no two row groups overlap on this column), ~1 = fully interleaved.
+    Mean over row groups of the fraction of OTHER row groups whose [min,max] overlaps this one."""
+    n = len(intervals)
+    if n < 2:
+        return 0.0
+    tot = 0.0
+    for i, (a0, a1) in enumerate(intervals):
+        c = sum(1 for j, (b0, b1) in enumerate(intervals)
+                if j != i and a0 <= b1 and b0 <= a1)
+        tot += c / (n - 1)
+    return round(tot / n, 4)
+
+
+def _tie(b, m, b_spread_pct, m_spread_pct):
+    """Winner of base vs model with the noise/tie rule (same logic as xmla_compare.tie)."""
+    if not b or not m:
+        return "tie" if b == m else ("model" if (m or 0) < (b or 0) else "base")
+    rel = abs(b - m) / max(b, m)
+    noise = max((b_spread_pct or 0.0), (m_spread_pct or 0.0)) / 100.0
+    if rel < noise:
+        return "tie"
+    return "model" if m < b else ("base" if m > b else "tie")
+
+
+def compute_analysis(rep):
+    timings = rep.get("timings", {})
+    tables = rep.get("tables", {})
+    models = list(timings)
+    analysis = {"cold_column_cost": {}, "cold_vs_geometry": {},
+                "size_attribution": {}, "clustering_scores": {}, "verdicts": []}
+
+    # cold_column_cost: probe_<col>.cold_median - probe_rowcount.cold_median (marginal transcode).
+    for m in models:
+        base = timings[m].get("probe_rowcount", {}).get("cold_median_ms")
+        if base is None:
+            continue
+        row = {}
+        for col in _PROBE_COLS:
+            v = timings[m].get(f"probe_{col}", {}).get("cold_median_ms")
+            if v is not None:
+                row[col] = round(v - base, 1)
+        analysis["cold_column_cost"][m] = {"rowcount_overhead_ms": round(base, 1), "columns": row}
+
+    # cold_vs_geometry: cold total (all cold-tier medians) alongside open geometry from parquet.
+    for m in models:
+        cold_total = sum(q["cold_median_ms"] for q in timings[m].values()
+                         if q.get("cold_median_ms") is not None)
+        p = tables.get(_table(m), {}).get("parquet", {})
+        rgd = p.get("row_group_detail") or []
+        analysis["cold_vs_geometry"][m] = {
+            "cold_total_ms": round(cold_total, 1),
+            "row_groups": p.get("row_groups"),
+            "avg_row_group": p.get("avg_row_group"),
+            "row_groups_over_2p24": sum(1 for r in rgd if (r.get("rows") or 0) > _RG_BIG),
+        }
+
+    # size_attribution: compressed bytes per column, per model (from raw column_chunks).
+    for m in models:
+        chunks = tables.get(_table(m), {}).get("parquet", {}).get("column_chunks") or []
+        by_col = {}
+        for c in chunks:
+            col = c.get("path_in_schema")
+            by_col[col] = by_col.get(col, 0) + (c.get("total_compressed_size") or 0)
+        if by_col:
+            analysis["size_attribution"][m] = {k: by_col[k] for k in sorted(by_col)}
+
+    # clustering_scores: overlap metric per (table, filter column).
+    for m in models:
+        chunks = tables.get(_table(m), {}).get("parquet", {}).get("column_chunks") or []
+        if not chunks:
+            continue
+        analysis["clustering_scores"][_table(m)] = {
+            col: _overlap_score(_coerce_intervals(chunks, col)) for col in _FILTER_COLS
+        }
+
+    # verdicts: one-liners, base vs each challenger, tie rule applied.
+    base = next((x for x in models if x.endswith("_optimized")), min(models, key=len) if models else None)
+    if base:
+        for m in models:
+            if m == base:
+                continue
+            for label, key, sk in (("COLD", "cold_median_ms", "cold_spread_pct"),
+                                    ("HOT", "hot_avg_ms", None)):
+                bt = mt = 0.0
+                for q, mv in timings[m].items():
+                    bv = timings[base].get(q, {})
+                    b, x = bv.get(key), mv.get(key)
+                    if b is not None and x is not None:
+                        bt += b
+                        mt += x
+                if not (bt or mt):
+                    continue
+                w = _tie(bt, mt, None, None)
+                fac = (bt / mt) if mt else float("inf")
+                fac = fac if fac >= 1 else (1 / fac if fac else 0)
+                who = {"base": _short(base), "model": _short(m), "tie": "tie"}[w]
+                analysis["verdicts"].append(
+                    f"{label}: {_short(m)} vs {_short(base)} — "
+                    + ("statistical tie" if w == "tie" else f"{who} {fac:.2f}× faster overall"))
+    return analysis
+
+
+# ---------------------------------------------------------------------------- rendering
+
 def _parquet_table(tables):
     rows = []
     for name, t in tables.items():
@@ -46,28 +191,49 @@ def _parquet_table(tables):
     _write("\n".join(out) + "\n")
 
 
-def _cmp(base, model, tb, tm, key, title):
-    out = [f"### {title}", "",
-           f"| Query | {base} (ms) | {model} (ms) | base/model | Winner |",
-           "|:--|--:|--:|--:|:--|"]
-    bt = mt = 0.0
-    for q in tm:
-        if q not in tb:
+def _sidebyside(title, timings, base, others, key, spread_key):
+    """One table: rows = queries, columns = base + each challenger, best model per row (tie rule)."""
+    models = [base] + others
+    labels = [_short(m) for m in models]
+    header = "| Query | " + " | ".join(f"{l} (ms)" for l in labels) + " | best |"
+    sep = "|:--|" + "--:|" * len(models) + ":--|"
+    out = [f"### {title}", "", header, sep]
+    any_row = False
+    for q in timings[base]:
+        vals = {m: timings[m].get(q, {}).get(key) for m in models}
+        if any(vals[m] is None for m in models):
             continue
-        b, m = tb[q].get(key), tm[q].get(key)
-        if b is None or m is None:
-            continue
-        bt += b
-        mt += m
-        sp = (b / m) if m else float("inf")
-        win = "model" if m < b else ("base" if m > b else "tie")
-        out.append(f"| `{q}` | {b:,.1f} | {m:,.1f} | {sp:.2f}× | {win} |")
-    if not (bt or mt):
+        any_row = True
+        spreads = {m: (timings[m].get(q, {}).get(spread_key) if spread_key else None) for m in models}
+        ranked = sorted(models, key=lambda m: vals[m])
+        best, second = ranked[0], ranked[1] if len(ranked) > 1 else ranked[0]
+        w = _tie(vals[second], vals[best], spreads[second], spreads[best])
+        best_lbl = "tie" if w == "tie" else _short(best)
+        cells = " | ".join(f"{vals[m]:,.1f}" for m in models)
+        out.append(f"| `{q}` | {cells} | {best_lbl} |")
+    if any_row:
+        _write("\n".join(out) + "\n")
+
+
+def _cold_cost_table(cc):
+    if not cc:
         return
-    ov = (bt / mt) if mt else float("inf")
-    win = "model" if mt < bt else ("base" if mt > bt else "tie")
-    out.append(f"| **TOTAL** | **{bt:,.1f}** | **{mt:,.1f}** | **{ov:.2f}×** | **{win}** |")
+    models = list(cc)
+    out = ["### Marginal cold column cost (probe_col − probe_rowcount, ms)", "",
+           "| column | " + " | ".join(_short(m) for m in models) + " |",
+           "|:--|" + "--:|" * len(models)]
+    for col in _PROBE_COLS:
+        cells = " | ".join(_fmt(cc[m]["columns"].get(col)) for m in models)
+        out.append(f"| `{col}` | {cells} |")
+    out.append("| _rowcount overhead_ | "
+               + " | ".join(_fmt(cc[m]["rowcount_overhead_ms"]) for m in models) + " |")
     _write("\n".join(out) + "\n")
+
+
+def _verdicts(vs):
+    if not vs:
+        return
+    _write("### Verdicts\n\n" + "\n".join(f"- {v}" for v in vs) + "\n")
 
 
 def main():
@@ -77,6 +243,9 @@ def main():
         return
     with open(path, encoding="utf-8") as f:
         rep = json.load(f)
+
+    analysis = compute_analysis(rep)
+    report.merge({"analysis": analysis})   # derived block lands in the same one file
 
     run = rep.get("run", {})
     _write(f"# Direct Lake query benchmark — `{run.get('sha')}` "
@@ -88,13 +257,13 @@ def main():
     base = next((m for m in timings if m.endswith("_optimized")),
                 min(timings, key=len) if timings else None)
     if base:
-        tb = timings[base]
-        for model in timings:
-            if model == base:
-                continue
-            tm = timings[model]
-            _cmp(base, model, tb, tm, "cold_ms", f"{model} vs {base} — COLD")
-            _cmp(base, model, tb, tm, "hot_avg_ms", f"{model} vs {base} — HOT")
+        others = [m for m in timings if m != base]
+        _sidebyside("COLD (median of dehydrate cycles)", timings, base, others,
+                    "cold_median_ms", "cold_spread_pct")
+        _sidebyside("HOT (avg of steady-state runs)", timings, base, others,
+                    "hot_avg_ms", None)
+    _cold_cost_table(analysis.get("cold_column_cost", {}))
+    _verdicts(analysis.get("verdicts", []))
 
 
 if __name__ == "__main__":
