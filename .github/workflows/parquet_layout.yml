@@ -169,6 +169,7 @@ jobs:
         env:
           PYTHONNET_RUNTIME: coreclr
           PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"   # non-TTY runner block-buffers stdout; stream the per-query trace live
           BENCH_RUNS: ${{ inputs.runs }}
           BENCH_COLD: ${{ inputs.cold }}
           COLD_REPEATS: ${{ inputs.cold_repeats }}
