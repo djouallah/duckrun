@@ -52,7 +52,8 @@ def _spark_code(variant, reader):
         f'({reader}\n'
         '      .write.mode("overwrite").format("delta")\n'
         '      .option("parquet.vorder.enabled", "true")\n'
-        f'      .saveAsTable("tests.sales_{variant}"))\n'
+        '      .option("overwriteSchema", "true")\n'   # a rebuild replaces schema too (raw parquet
+        f'      .saveAsTable("tests.sales_{variant}"))\n'   # types differ from the old duckrun Delta)
         f'print("WRITE_OK tests.sales_{variant} rows=" '
         f'+ str(spark.read.table("tests.sales_{variant}").count()))\n'
     )
