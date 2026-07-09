@@ -147,7 +147,6 @@ jobs:
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
-          DUCKRUN_RG_LANES: "16"   # experiment: 16 row groups for a small overwrite (vs default 8)
         run: python parquet_layout_tests/build_optimized.py
 
       - name: 🚀 Deploy benchmark semantic models (optimized + vorder)
