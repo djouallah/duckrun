@@ -152,7 +152,7 @@ def table_num_records(cur, dt):
     return int(row[0]) if row and row[0] else None   # 0 / null stats -> unknown -> keep 16M
 
 
-def _writer_properties(plain_cols=None, row_group_rows=None):
+def _writer_properties(row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
     # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a 32 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
@@ -162,25 +162,15 @@ def _writer_properties(plain_cols=None, row_group_rows=None):
     # so a merge stays quick and never rewrites fat files; post-merge compaction folds merged files up
     # into this layout later. Degrade gracefully if the pinned wheel rejects a newer parameter
     # (last rung: SNAPPY-only).
-    #
-    # ``plain_cols`` are unique/near-unique columns whose dictionary buys nothing (every value distinct);
-    # they get a per-column ColumnProperties(dictionary_enabled=False) so arrow-rs writes them PLAIN.
-    # Only the sort-rewrite passes them (it profiles for uniqueness); other writes leave it None.
     if WriterProperties is None:
         return None
     rg = row_group_rows if row_group_rows is not None else _ROW_GROUP_SIZE
     col_props = None
-    per_col = None
     if ColumnProperties is not None:
         try:
             col_props = ColumnProperties(dictionary_enabled=True, statistics_enabled="CHUNK")
         except Exception:  # best-effort: fall through to writer-level props without per-column knobs
             col_props = None
-        if plain_cols:
-            try:
-                per_col = {c: ColumnProperties(dictionary_enabled=False) for c in plain_cols}
-            except Exception:  # best-effort: a rejected per-column build just keeps the dictionary on
-                per_col = None
     for kwargs in (
         dict(compression="SNAPPY",
              max_row_group_size=rg,
@@ -188,8 +178,7 @@ def _writer_properties(plain_cols=None, row_group_rows=None):
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
              data_page_row_count_limit=_DATA_PAGE_ROW_LIMIT,
              statistics_truncate_length=64,
-             default_column_properties=col_props,
-             column_properties=per_col),
+             default_column_properties=col_props),
         dict(compression="SNAPPY", max_row_group_size=rg),
         dict(compression="SNAPPY"),
     ):
@@ -673,7 +662,6 @@ def build_write_deltalake_args(
     schema_mode: Optional[str] = None,
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
-    plain_cols: Optional[List[str]] = None,
     row_group_rows: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
@@ -683,8 +671,7 @@ def build_write_deltalake_args(
     defaults (no writer_properties, no ``target_file_size``): appends are transient increments that
     threshold-gated compaction folds into the read layout on a later pass, so paying the 16M-group
     profile on every small append is wasted (and the 16M row group is the write-memory ceiling). MERGE
-    does not go through here at all. ``plain_cols`` are unique columns written PLAIN — no dictionary;
-    only the sort-rewrite passes them. ``row_group_rows`` is the adaptive overwrite geometry (see
+    does not go through here at all. ``row_group_rows`` is the adaptive overwrite geometry (see
     ``write_delta`` / ``rg_for``); it is meaningless on append and ignored there."""
     args: Dict[str, Any] = {
         "table_or_uri": path,
@@ -701,7 +688,7 @@ def build_write_deltalake_args(
         args["schema_mode"] = schema_mode
     if mode != "append":  # append → delta_rs defaults (lean, compaction-folded), like MERGE
         args["target_file_size"] = _TARGET_FILE_SIZE
-        wp = _writer_properties(plain_cols=plain_cols, row_group_rows=row_group_rows)
+        wp = _writer_properties(row_group_rows=row_group_rows)
         if wp is not None:
             args["writer_properties"] = wp
     return args
@@ -1066,7 +1053,6 @@ def write_delta(
     overwrite_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
-    plain_cols: Optional[List[str]] = None,
     read_version: Optional[int] = None,
     row_group_rows: Optional[int] = None,
 ) -> None:
@@ -1086,7 +1072,6 @@ def write_delta(
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
     Every write lands in the one read-layout profile (tuned writer properties + 256 MB files).
-    ``plain_cols`` (sort-rewrite only) are unique columns written PLAIN — no dictionary.
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
@@ -1119,7 +1104,6 @@ def write_delta(
         schema_mode=schema_mode,
         partition_by=partition_by,
         storage_options=storage_options,
-        plain_cols=plain_cols,
         row_group_rows=row_group_rows,
     )
     if read_version is None:
@@ -1229,13 +1213,12 @@ def overwrite_if_unchanged(
     read_version: Optional[int],
     partition_by: Optional[List[str]] = None,
     overwrite_schema: bool = False,
-    plain_cols: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> None:
     """Optimistic FULL-TABLE overwrite: replace every row with ``data`` only if the table version
     has not moved since we read it — otherwise refuse with ``CommitFailedError``. The overwrite
     sibling of :func:`append_if_unchanged`, for the read-whole-table -> recompute -> write-it-back
-    pattern. ``plain_cols`` (sort-rewrite only) are unique columns written PLAIN — no dictionary.
+    pattern.
 
     Same compare-and-swap trick: pin to ``read_version`` and ``max_commit_retries=0`` so a concurrent
     commit fails the overwrite instead of clobbering it. (An overwrite, like an append, is
@@ -1254,7 +1237,6 @@ def overwrite_if_unchanged(
         path, data, "overwrite",
         partition_by=partition_by,
         overwrite_schema=overwrite_schema,
-        plain_cols=plain_cols,
         storage_options=storage_options,
         read_version=read_version,
     )
@@ -1269,7 +1251,6 @@ def replace_where(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
-    plain_cols: Optional[List[str]] = None,
 ) -> None:
     """``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
     replace the rows matching ``predicate`` with ``data``. One commit, not a delete-then-append
@@ -1291,7 +1272,6 @@ def replace_where(
         )
     args = build_write_deltalake_args(
         path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
-        plain_cols=plain_cols,
     )
     args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
     # Pin to the read snapshot and disable rebasing, so a concurrent commit since vB fails this
