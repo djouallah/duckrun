@@ -5,16 +5,17 @@ pre-exist, we *make* it by running SQLBI's tool (https://github.com/sql-bi/Conto
 MIT). We download the self-contained ``DatabaseGenerator`` binary for this platform, run it with the
 vendored ``config.json`` (``SalesOrders: BOTH`` → the full schema, ``OutputFormat: PARQUET``).
 
-Landing is deliberately split so the layout comparison stays FAIR:
+The raw base lands entirely as parquet in the lakehouse **Files** section — the whole generator
+output (all 8 tables), byte-verbatim, uploaded via obstore. Files is then the single source:
 
-  - The dimensions + Orders + OrderRows go to the ``contoso`` schema as Delta tables via duckrun.
-    Their layout is irrelevant to the benchmark (they're just what the Direct Lake model joins to).
-  - The SALES fact — the table under test — is NOT written by duckrun. Writing it as a duckrun Delta
-    would hand Spark's V-Order build a duckrun-shaped input (and V-Order preserves input row order, so
-    that would seed Spark's clustering). Instead the raw generator ``sales.parquet`` is streamed
-    byte-verbatim to the lakehouse **Files** section. BOTH layout copies then read that identical raw
-    parquet — Spark writes ``tests.sales_vorder`` from it, duckrun writes ``tests.sales_auto_sort``
-    from it — so neither engine's layout is seeded by the other; only its own clustering differs.
+  - The SALES fact — the table under test — is read from Files by BOTH layout builds. It is never
+    written by duckrun, because writing it as a duckrun Delta would hand Spark's V-Order build a
+    duckrun-shaped input (V-Order preserves input row order, so it would seed Spark's clustering).
+    Spark writes ``tests.sales_vorder`` from the Files parquet; duckrun writes ``tests.sales_auto_sort``
+    from the same Files parquet — neither engine's layout seeds the other; only its own differs.
+  - The dimensions + Orders + OrderRows are materialised as ``contoso.*`` Delta tables (the Direct
+    Lake model joins to them) by reading them back from the Files parquet. Their layout is irrelevant
+    to the benchmark, but they still flow from the same Files source, so nothing is special-cased.
 
 The generator's own semantic model (``pbit-Import``) is the source of the ported Direct Lake models
 under ``contoso_*.SemanticModel/`` — see README.md for full credit + source links.
@@ -41,9 +42,15 @@ import duckrun
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
 
-# The raw generator sales.parquet lands here in the lakehouse Files section (relative to the Files
-# root). build_spark_variant.py and build_auto_sort.py both read exactly this path.
-SALES_FILES_REL = "Files/contoso_base/sales.parquet"
+# All raw generator parquet lands under this folder in the lakehouse Files section.
+FILES_DIR = "Files/contoso_base"
+# The sales.parquet object path — build_spark_variant.py and build_auto_sort.py read exactly this.
+SALES_FILES_REL = f"{FILES_DIR}/sales.parquet"
+
+
+def files_object(pq):
+    """obstore object path for generator table ``pq`` in the Files section."""
+    return f"{FILES_DIR}/{pq}.parquet"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -144,16 +151,15 @@ def _files_exists(store_root, token):
         return False
 
 
-def _upload_raw_to_files(local_path, store_root, token):
-    """Upload the (multi-GB) raw sales.parquet byte-verbatim to OneLake Files via obstore, which
-    streams it as a multipart upload. duckrun's ``conn.copy`` reads a whole file into one BLOB, which
-    a ~5GB sales.parquet would OOM — obstore chunks it and preserves the generator's exact bytes."""
+def _upload_to_files(local_path, store_root, token, object_path):
+    """Upload a (possibly multi-GB) parquet byte-verbatim to OneLake Files via obstore, which streams
+    it as a multipart upload. duckrun's ``conn.copy`` reads a whole file into one BLOB, which a ~5GB
+    sales.parquet would OOM — obstore chunks it and preserves the generator's exact bytes."""
     import obstore
     gb = os.path.getsize(local_path) / 1e9
-    print(f"  obstore put → {SALES_FILES_REL} ({gb:.2f} GB, multipart)...", flush=True)
+    print(f"  obstore put → {object_path} ({gb:.2f} GB, multipart)...", flush=True)
     with open(local_path, "rb") as f:
-        obstore.put(_files_store(store_root, token), SALES_FILES_REL, f)
-    print(f"  upload complete: {SALES_FILES_REL}", flush=True)
+        obstore.put(_files_store(store_root, token), object_path, f)
 
 
 def main():
@@ -211,34 +217,40 @@ def main():
     gen_secs = time.perf_counter() - t0
     print(f"generation done ({gen_secs:.1f}s) — landing ...", flush=True)
 
-    # Dimensions + Orders + OrderRows → contoso.* Delta (duckrun); layout here is irrelevant.
-    for pq, tbl in dim_tables:
-        src = os.path.join(out, f"{pq}.parquet").replace("\\", "/")
-        if not os.path.exists(src):
-            raise SystemExit(f"generator did not produce {src}")
-        con.sql(f'create or replace table contoso."{tbl}" as '
-                f"select * from read_parquet('{src}')")
-        n = con.sql(f'select count(*) from contoso."{tbl}"').fetchone()[0]
-        print(f"  contoso.{tbl}: {n:,} rows", flush=True)
+    for pq, _tbl in TABLES:
+        if not os.path.exists(os.path.join(out, f"{pq}.parquet")):
+            raise SystemExit(f"generator did not produce {pq}.parquet")
 
-    # Sales fact → raw generator parquet, byte-verbatim, into Files (NOT a duckrun Delta write — that
-    # would seed Spark's V-Order clustering). On a local dry-run (no Files section) fall back to a
-    # plain Delta so the readers still have something.
-    sales_src = os.path.join(out, "sales.parquet").replace("\\", "/")
-    if not os.path.exists(sales_src):
-        raise SystemExit(f"generator did not produce {sales_src}")
     if store_root:
-        print("uploading raw sales.parquet byte-verbatim to Files (obstore) ...", flush=True)
-        _upload_raw_to_files(sales_src, store_root, token)
+        # 1) Upload EVERY generator parquet byte-verbatim to Files — the raw base, single source.
+        print("uploading all raw generator parquet to Files (obstore) ...", flush=True)
+        for pq, _tbl in TABLES:
+            src = os.path.join(out, f"{pq}.parquet").replace("\\", "/")
+            _upload_to_files(src, store_root, token, files_object(pq))
+        # 2) Materialise the dims + Orders + OrderRows as contoso.* Delta by reading them BACK from
+        #    Files (the model joins to them). Sales is left as parquet-only — both layout builds read
+        #    it straight from Files, so duckrun never shapes the fact under test.
+        for pq, tbl in dim_tables:
+            url = store_root + files_object(pq)
+            con.sql(f'create or replace table contoso."{tbl}" as '
+                    f"select * from read_parquet('{url}')")
+            n = con.sql(f'select count(*) from contoso."{tbl}"').fetchone()[0]
+            print(f"  contoso.{tbl}: {n:,} rows (from Files)", flush=True)
     else:
-        print("local dry-run: no Files section — writing contoso.sales as a plain Delta", flush=True)
-        con.sql(f"create or replace table contoso.\"sales\" as select * from read_parquet('{sales_src}')")
+        # Offline dry-run (local path, no Files section): materialise everything as local Delta so the
+        # readers have something.
+        for pq, tbl in TABLES:
+            src = os.path.join(out, f"{pq}.parquet").replace("\\", "/")
+            con.sql(f'create or replace table contoso."{tbl}" as '
+                    f"select * from read_parquet('{src}')")
+            print(f"  contoso.{tbl}: local Delta", flush=True)
 
     report.merge({"tables": {"contoso_base": {"build": {
         "engine": "sqlbi_generator", "generator_version": GEN_VERSION,
         "orders": int(orders) if orders.isdigit() else None,
         "seconds": round(gen_secs, 1), "status": "rebuilt"}}}})
-    print("contoso base ready (dims in Delta, raw sales.parquet in Files).", flush=True)
+    print("contoso base ready (all raw parquet in Files; dims materialised as contoso.* Delta).",
+          flush=True)
 
 
 if __name__ == "__main__":

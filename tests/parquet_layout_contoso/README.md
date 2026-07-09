@@ -60,12 +60,15 @@ models — exactly as AEMO swaps only its `fct_summary`. The full Contoso schema
    isolated from the AEMO `data` lakehouse.
 2. **[`build_base.py`](build_base.py)** — download the `DatabaseGenerator` binary for the runner,
    run it with the vendored [`config.json`](config.json) (`OrdersCount` overridable via the `orders`
-   input), and land all 8 Contoso tables to the `contoso` schema. Skip-if-exists.
+   input), upload **all 8 raw generator parquet** byte-verbatim to the lakehouse `Files/contoso_base/`
+   (via `obstore`, multipart), then materialise the dims + Orders + OrderRows as `contoso.*` Delta by
+   reading them back from Files. The `Sales` fact stays parquet-only in Files. Skip-if-exists.
 3. **[`build_spark_variant.py`](build_spark_variant.py)** — build `tests.sales_vorder` on Fabric
-   Spark (V-Order is Spark-only) via the Livy API, reading `contoso.sales` directly. Skip-if-exists.
+   Spark (V-Order is Spark-only) via the Livy API, reading the **raw `Files/contoso_base/sales.parquet`**.
+   Skip-if-exists.
 4. **[`build_auto_sort.py`](build_auto_sort.py)** — build `tests.sales_auto_sort` via duckrun
-   `create or replace table … sorted by auto`, reading `contoso.sales` directly. This exercises the
-   **current tree's** WriterProperties. Skip-if-exists; `rebuild=true` after changing a default.
+   `create or replace table … sorted by auto`, reading the **same raw `Files/contoso_base/sales.parquet`**.
+   This exercises the **current tree's** WriterProperties. Skip-if-exists; `rebuild=true` after changing a default.
 5. **[`deploy.py`](deploy.py)** — deploy both `*.SemanticModel`s to the workspace via `fab` + refresh.
 6. **[`table_stats.py`](table_stats.py)** — duckrun `get_stats('sales*')` row-group sidecar.
 7. **[`xmla_compare.py`](xmla_compare.py)** — the payload: heavy DAX per model over XMLA
