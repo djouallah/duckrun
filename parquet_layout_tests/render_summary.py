@@ -1,7 +1,8 @@
-"""SUMMARY.md — a specialist findings report for a storage/query-engine reader. Reads ONLY
-run_report.json and recomputes every number from it (nothing hardcoded); writes SUMMARY.md and
-appends the same content to $GITHUB_STEP_SUMMARY. Black-box constraint holds: DAX wall-clock and
-Parquet metadata only. Medians only — never a mean in any comparison or verdict; ties render as `=`.
+"""Specialist findings report for a storage/query-engine reader. Reads ONLY run_report.json and
+recomputes every number from it (nothing hardcoded); appends to the CI job summary
+($GITHUB_STEP_SUMMARY) and prints to stdout — no file artifact. Black-box constraint holds: DAX
+wall-clock and Parquet metadata only. Medians only — never a mean in any comparison or verdict;
+ties render as `=`.
 
 Env in: RUN_REPORT (the one JSON), GITHUB_STEP_SUMMARY (optional).
 """
@@ -311,7 +312,7 @@ def s7_caveats(rep, analysis):
 def s8_pointers(rep):
     w("## 7. Raw")
     w()
-    w("- artifact `run-report`: `run_report.json` (this summary is `SUMMARY.md` beside it).")
+    w("- artifact `run-report`: `run_report.json` (these findings are in the CI job summary).")
     w("- cross-run: `duckdb -c \"SELECT run.run_id, * FROM read_json('reports/*.json')\"`.")
     w("- every number above recomputes from run_report.json (timings.*, tables.*.parquet, analysis.*).")
     w()
@@ -386,16 +387,14 @@ def main():
     s8_pointers(rep)
 
     text = "\n".join(OUT) + "\n"
-    with open("SUMMARY.md", "w", encoding="utf-8") as f:
-        f.write(text)
     gh = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh:
         with open(gh, "a", encoding="utf-8") as f:
             f.write(text)
     print(text)
 
-    # Direction guard — SUMMARY.md is already written (so the artifact keeps it). A genuine verdict
-    # inversion (verdict disagrees with the same-query median majority) is fatal; a probe-vs-composite
+    # Direction guard — the findings are already in the job summary. A genuine verdict inversion
+    # (verdict disagrees with the same-query median majority) is fatal; a probe-vs-composite
     # divergence is only a warning.
     errs, notes = verify_verdicts(rep, analysis)
     for n in notes:

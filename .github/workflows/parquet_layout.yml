@@ -181,19 +181,17 @@ jobs:
         continue-on-error: true
         run: python parquet_layout_tests/render_report.py
 
-      - name: 📑 Render specialist summary (SUMMARY.md; fails on verdict-direction mismatch)
+      - name: 📑 Render specialist findings to job summary (fails on verdict-direction mismatch)
         if: always()
         env:
           PYTHONIOENCODING: utf-8
         run: python parquet_layout_tests/render_summary.py
 
-      - name: 📎 Upload run report + summary
+      - name: 📎 Upload run report
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
           name: run-report
-          path: |
-            run_report.json
-            SUMMARY.md
+          path: run_report.json
           if-no-files-found: warn
