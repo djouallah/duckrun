@@ -270,64 +270,8 @@ def s5_compression(rep, models):
     w()
 
 
-def s6_skipping(analysis, models):
-    sk = analysis.get("skipping", {})
-    if not sk:
-        return
-    w("## 5. Data skipping (first touch vs clustering)")
-    w()
-    w("| ladder query | filter | " + " | ".join(f"{lbl(m)} score" for m in models)
-      + " | " + " | ".join(f"{lbl(m)} ft ms" for m in models) + " |")
-    w("|:--|:--|" + "--:|" * (2 * len(models)))
-    for q, e in sk.items():
-        cols = e["filter_cols"]
-        scores, fts = [], []
-        for m in models:
-            mm = e["models"].get(m, {})
-            sc = mm.get("clustering", {})
-            s = min((sc[c] for c in cols if sc.get(c) is not None), default=None)
-            scores.append(s)
-            fts.append(mm.get("first_touch_ms"))
-        srow = " | ".join(_ratio(s) for s in scores)
-        frow = " | ".join(_ms(f) for f in fts)
-        w(f"| {q} | {','.join(cols)} | {srow} | {frow} |")
-        fv = [f for f in fts if f is not None]
-        sv = [s for s in scores if s is not None]
-        note = "inconclusive"
-        if fv and sv:
-            ratio = max(fv) / min(fv) if min(fv) else 1.0
-            if ratio > 1.5 and (max(sv) - min(sv)) > 0.3:
-                note = f"skipping observed ({ratio:.1f}× first-touch spread)"
-            elif ratio <= 1.5 and min(sv) > 0.8:
-                note = "no skipping anywhere (first-touch flat, all interleaved)"
-        w(f"  - {q}: {note}.")
-    w()
-
-
-def s7_caveats(rep, analysis):
-    w("## 6. Caveats")
-    w()
-    noisy = []
-    for m, qs in rep.get("timings", {}).items():
-        for q, d in qs.items():
-            for which, key in (("cold", "cold_spread_pct"), ("hot", "hot_spread_pct")):
-                sp = d.get(key)
-                if sp is not None and sp > 25:
-                    noisy.append(f"{lbl(m)}/{q} {which} spread {sp:.0f}%")
-    if noisy:
-        w(f"- high spread (>25%) — verdicts touching these are low-confidence: {'; '.join(noisy)}.")
-    else:
-        w("- no query exceeded 25% cold/hot spread.")
-    inp = rep.get("run", {}).get("inputs", {})
-    w(f"- n = {inp.get('cold_repeats')} per cold median; capacity is shared across tenants, so "
-      "absolute ms drift between models is expected — read ratios, not absolutes.")
-    w("- single dataset and shape (numeric-heavy fact, one modest-cardinality string column, "
-      "DUID); conclusions do not generalize to high-cardinality-string or wide-dimension tables.")
-    w()
-
-
 def s8_pointers(rep):
-    w("## 7. Raw")
+    w("## 5. Raw")
     w()
     w("- artifact `run-report`: `run_report.json` (these findings are in the CI job summary).")
     w("- cross-run: `duckdb -c \"SELECT run.run_id, * FROM read_json('reports/*.json')\"`.")
@@ -399,8 +343,6 @@ def main():
         s3_verdicts(rep, analysis, base, models)
     s4_cold_decomp(rep, analysis, models)
     s5_compression(rep, models)
-    s6_skipping(analysis, models)
-    s7_caveats(rep, analysis)
     s8_pointers(rep)
 
     text = "\n".join(OUT) + "\n"
