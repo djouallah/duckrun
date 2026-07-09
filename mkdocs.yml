@@ -104,7 +104,9 @@ validation:
 nav:
   - Home: index.md
   - Getting started: getting-started.md
-  - dbt: dbt-adapter.md
+  - dbt:
+      - Adapter: dbt-adapter.md
+      - Conformance: conformance.md
   - Notebook:
       - Connection API: connection-api.md
   - API reference: api-reference.md
@@ -126,12 +128,10 @@ nav:
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
-  - Advanced:
-      - How it works:
-          - Overview: overview.md
-          - Design document: design_document.md
-          - Parquet layout: parquet-layout.md
-          - Snapshot isolation: snapshot-isolation.md
-          - Snapshot pin walkthrough: snapshot-pin.md
-      - Conformance: conformance.md
+  - Internals:
+      - Overview: overview.md
+      - Design document: design_document.md
+      - Parquet layout: parquet-layout.md
+      - Snapshot isolation: snapshot-isolation.md
+      - Snapshot pin walkthrough: snapshot-pin.md
   - Limitations: limitations.md

@@ -279,27 +279,6 @@ over immediate disk savings.
 
 ## Limitations
 
-These are core design trade-offs, not bugs — they're inherent to gluing DuckDB to delta_rs and won't
-be "fixed" away:
-
-- **A single dbt run is single-threaded — but concurrency works fine.** This is purely a dbt-adapter
-  implementation detail: *within one dbt process* models run with `threads: 1`, because the in-process
-  delta_rs write path isn't thread-safe (parallel writes to a table in the *same* process collide). It
-  is **not** a limit on concurrent writers. Multiple independent writers — separate dbt runs,
-  notebooks, jobs, whatever — writing the same tables at the same time is fully supported and safe:
-  every write uses optimistic concurrency (snapshot-pinned MERGE, the auto-fenced append's
-  compare-and-swap, fail-loud on a conflicting commit). So you can absolutely run many writers in parallel; you just
-  can't multi-thread the models *inside a single* dbt invocation.
-- **Two engines share one machine's memory.** DuckDB executes the SQL and delta_rs materializes the
-  Delta table — two separate memory systems in the same process, each with its own pool. Under heavy
-  memory pressure (large merges especially) the budget has to be split between them, and getting that
-  split right is fragile: delta_rs's merge spill-to-disk is itself flaky, and coordinating two systems
-  that don't know about each other's allocations is the hard, unavoidable part of this design.
-- **`DROP TABLE` is a soft tombstone, not a physical delete.** delta_rs has no `DROP`, and duckrun
-  **deliberately will not delete your data files** — as a precaution it leaves that to you — so
-  `conn.sql("drop table x")` overwrites the table with a one-column tombstone marker and unregisters
-  it. The table vanishes from discovery, and a later `create table x as …` revives
-  the path with real data, but the **files are not reclaimed** (you purge them yourself when you're
-  sure). One consequence: reading the path *directly*
-  (`conn.sql("SELECT * FROM delta_scan('…/x')")`) bypasses discovery and returns the one-row tombstone
-  marker rather than erroring — address dropped tables by name, not by path.
+The adapter's trade-offs — single-threaded dbt runs (concurrent writers are still safe), the shared
+two-engine memory pool, the soft-tombstone `DROP TABLE`, rejected merge configs, add-only schema
+evolution — are consolidated with everything else in the top-level [Limitations](limitations.md) page.
