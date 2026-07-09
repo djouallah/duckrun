@@ -1,4 +1,4 @@
-"""Property tests for the sort-key recommender (``duckrun/sortkey.py``).
+"""Property tests for the sort-key recommender (``dbt/adapters/duckrun/sortkey.py``).
 
 Pure-local and network-free: each test plants a small DuckDB table with a KNOWN structure, calls
 ``sortkey.recommend_sort_key`` / ``sortkey.plan_sample`` directly, and asserts the R-rule outcome.
@@ -16,7 +16,7 @@ import duckdb
 import pytest
 
 import duckrun
-from duckrun import sortkey
+from dbt.adapters.duckrun import sortkey
 
 
 _COLS = ["table", "in_sort_key", "sort_position", "column", "data_type", "encoding", "ndv",

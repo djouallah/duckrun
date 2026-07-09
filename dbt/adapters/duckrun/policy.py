@@ -1,8 +1,13 @@
-"""Maintenance policy — the compact / vacuum decisions, owned in one place.
+"""Layout policy — write-geometry (row-group sizing) + compact/vacuum decisions, in one place.
 
-Extracted from the post-write upkeep that was inlined in ``engine._maintain`` (and duplicated in the
-Tier-0 safe button) so the trigger thresholds live in one testable object instead of scattered magic
-numbers. The byte-trigger design (2026-07-05):
+Pure decisions, no I/O: the row-group ``rg_for`` sizing rule and the ``MaintenancePolicy`` compact/
+vacuum thresholds. The engine owns the *mechanism* (estimating rows, building WriterProperties, running
+the compaction); this module owns *what shape to aim for*, so both the write path and maintenance size
+row groups identically from one place. See ``rg_for`` below for the write-geometry half.
+
+The maintenance half was extracted from the post-write upkeep that was inlined in ``engine._maintain``
+(and duplicated in the Tier-0 safe button) so the trigger thresholds live in one testable object
+instead of scattered magic numbers. The byte-trigger design (2026-07-05):
 
   small file  := size < 0.5 × target_file_size
   compact iff := count(small) >= min_small_files AND sum(small) >= byte_floor_multiplier × target
@@ -15,6 +20,7 @@ A raw file COUNT is deliberately not the trigger: a healthy big table sits at hu
 target-sized files forever and must never be compacted, while a hot small table earns a compaction on
 its byte debt, not its file count.
 """
+import os
 from typing import Callable, Iterable, Set, Tuple
 
 from deltalake.exceptions import CommitFailedError
@@ -25,6 +31,27 @@ logger = AdapterLogger("Duckrun")
 
 # The one read-layout target every file write, compaction, and sort-rewrite uses (see engine).
 DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
+
+# ------------------------------------------------------------------------- write-layout geometry
+# A Parquet row group maps 1:1 to a Direct Lake column segment: any size from 1M to 16M rows is a fine
+# segment, 16M is the ceiling (kept under 2^24 so one row group stays one segment), and 16M is also the
+# write-memory ceiling (arrow-rs buffers a full uncompressed row group per open writer). This is the max
+# used for a large table; a SMALL overwrite (CTAS / dbt table / full-refresh) shrinks the row-group size
+# so the table still yields ~RG_LANES groups — each segment transcodes on its own lane, so 2 groups
+# cold-load on 2 lanes. Only max_row_group_size moves — never bytes.
+ROW_GROUP_MAX_ROWS = 16_000_000
+RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # target row groups for a small overwrite
+RG_MIN = 1_000_000
+RG_MAX = ROW_GROUP_MAX_ROWS  # big/unknown estimates keep this exactly
+
+
+def rg_for(est):
+    """Row-group size for a write, from the estimated result rows. Big/unknown -> the 16M constant (the
+    pre-adaptive layout, unchanged); a small result shrinks toward ~RG_LANES groups, floored at RG_MIN so
+    a segment never drops below 1M rows."""
+    if est is None or est >= RG_LANES * RG_MAX:
+        return RG_MAX
+    return max(RG_MIN, min(RG_MAX, -(-est // RG_LANES)))   # ceil(est / RG_LANES)
 
 
 class MaintenancePolicy:

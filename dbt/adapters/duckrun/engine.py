@@ -17,7 +17,8 @@ from dbt.adapters.events.logging import AdapterLogger
 from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_deltalake
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
-from dbt.adapters.duckrun.policy import MaintenancePolicy
+from dbt.adapters.duckrun.policy import (MaintenancePolicy, DEFAULT_TARGET_FILE_SIZE,
+                                         ROW_GROUP_MAX_ROWS, RG_LANES, RG_MIN, RG_MAX, rg_for)
 
 logger = AdapterLogger("Duckrun")
 
@@ -38,13 +39,10 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# Row group size: 16M rows, used by BOTH the normal write path and the experimental sort-rewrite.
-# A Parquet row group maps 1:1 to a Direct Lake column segment; any size from 1M to 16M rows is a fine
-# segment, and 16M is the ceiling (kept under 2^24, so one row group still maps to one segment). This is
-# the max used for a large table; a small table shrinks it toward ~_RG_LANES groups (see rg_for). arrow-rs
-# buffers a full uncompressed row group per open writer, the real OOM lever on the hot path — so 16M is
-# also the write-memory ceiling.
-_ROW_GROUP_SIZE = 16_000_000
+# Row-group size (16M rows) + the adaptive sizing rule live in policy.py now (see policy.rg_for). This
+# alias is the default max_row_group_size _writer_properties uses when no adaptive size is passed; it is
+# also the write-memory ceiling (arrow-rs buffers a full uncompressed row group per open writer).
+_ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
 # Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
 # overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
 # shrinks the written files and gives the columnar reader denser, more uniform segments — the read
@@ -73,22 +71,19 @@ _DATA_PAGE_ROW_LIMIT = 20_000
 # bounded, 128/256/512 MB all merge in ~16s at ~4.5-5.2 GB (measured), so file size is free to serve the
 # read layout. Still deliberately far below 1 GB, which forced the whole-file copy-on-write that blew up
 # merges on disk. Applied by every file write (build_write_deltalake_args) and the routine post-write
-# compaction. MERGE is the exception — it sets no target_file_size.
-_TARGET_FILE_SIZE = 256 * 1024 * 1024
+# compaction. MERGE is the exception — it sets no target_file_size. Defined in policy.py (the one
+# read-layout target); aliased here so the many in-module references stay put.
+_TARGET_FILE_SIZE = DEFAULT_TARGET_FILE_SIZE
 
 # Max distinct partition values folded into a merge's `target.p IN (…)` prune predicate. Past this the
 # IN list stops buying pruning (the source spans most of the table) and we let delta_rs plan on its own.
 _PART_PRUNE_MAX = 400
 
-# Adaptive row-group geometry for a SMALL full-table write (overwrite: CTAS / dbt table / full-refresh).
-# A Parquet row group maps 1:1 to a Direct Lake column segment and each segment transcodes on its own
-# lane, so a table with only 2 row groups cold-loads on 2 lanes. For a small result we shrink the
-# row-group size so the table still yields ~_RG_LANES groups; a big or unknown estimate keeps _RG_MAX
-# (== _ROW_GROUP_SIZE). Only max_row_group_size moves — never bytes. Append is NOT sized here (it uses
-# delta_rs defaults and is compaction-folded); see build_write_deltalake_args.
-_RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # target row groups for a small overwrite
-_RG_MIN = 1_000_000
-_RG_MAX = _ROW_GROUP_SIZE  # 16M — today's value; big/unknown estimates keep this exactly
+# The adaptive row-group sizing rule (policy.rg_for) and its constants live in policy.py. Aliased here
+# so in-module callers and the tests keep referring to engine._RG_*. The overwrite geometry is computed
+# from policy.rg_for(estimated_rows(...)) in write_delta; append is NOT sized (delta_rs defaults,
+# compaction-folded).
+_RG_LANES, _RG_MIN, _RG_MAX = RG_LANES, RG_MIN, RG_MAX
 
 
 def _walk_cardinality(plan):
@@ -140,13 +135,6 @@ def estimated_rows(cur, data):
             cur.unregister(name)
     except Exception:
         return None
-
-
-def rg_for(est):
-    """Row-group size for this write. Big/unknown -> today's constant (no change)."""
-    if est is None or est >= _RG_LANES * _RG_MAX:
-        return _RG_MAX
-    return max(_RG_MIN, min(_RG_MAX, -(-est // _RG_LANES)))   # ceil(est / _RG_LANES)
 
 
 def table_num_records(cur, dt):

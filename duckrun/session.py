@@ -17,8 +17,8 @@ from typing import Dict, List, Optional
 
 import duckdb
 
-from dbt.adapters.duckrun import delta_dml, engine, remote, secret
-from . import auth, sortkey
+from dbt.adapters.duckrun import delta_dml, engine, remote, secret, sortkey
+from . import auth
 from ._runtime import check_runtime_versions
 
 
