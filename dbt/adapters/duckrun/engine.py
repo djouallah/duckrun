@@ -43,26 +43,28 @@ except ImportError:  # pragma: no cover - older layouts
 # alias is the default max_row_group_size _writer_properties uses when no adaptive size is passed; it is
 # also the write-memory ceiling (arrow-rs buffers a full uncompressed row group per open writer).
 _ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
-# Dictionary page limit — DERIVED per write to guarantee ZERO mid-chunk fallback: every column stays
-# 100% dictionary-encoded, which is the Direct Lake transcoder's fast path (a dictionary page maps
-# straight through; PLAIN data pages are transcoded value-by-value). So the dictionary stays ON for every
-# column uniformly — even near-unique columns whose dictionary COSTS bytes (no per-column dict-off, no
-# HASH/VALUE cleverness) — and the page limit is sized just above the worst-case dictionary (a near-unique
-# INT64 column, rg_rows * 8 bytes) so arrow-rs never falls back to PLAIN partway through a chunk. Adaptive
-# row groups bound the memory cost: the writer holds up to limit x columns-in-flight (3M rows -> ~28 MB,
-# 16M -> ~132 MB per column), and a delta_rs MERGE materializes those dictionaries on read (measured: a
-# 128 MB dictionary -> ~25 GB RSS on an 18M-row merge) — this is the knob most likely to regress the
-# merge-spill stress gate, and it now sits at the top of that curve for 16M-row groups. Columns WIDER than
-# a near-unique INT64 (long near-unique strings, ndv x avg_len > rg_rows * 8) can still exceed the limit
-# and fall back to PLAIN; that is an accepted edge, not silently patched by raising the limit further.
+# Dictionary page limit — DERIVED per write to keep every column 100% dictionary-encoded (the Direct Lake
+# transcoder's fast path: a dictionary page maps straight through, whereas PLAIN data pages are transcoded
+# value-by-value), UP TO the largest dictionary a bounded MERGE can still materialize. The limit is the
+# smaller of two bounds:
+#   - zero-fallback: rg_rows * 8 (+ slack) — above a near-unique INT64 column's worst-case dictionary, so
+#     arrow-rs never falls back to PLAIN partway through a chunk;
+#   - _DICT_PAGE_MAX (the merge ceiling): a delta_rs MERGE materializes these dictionaries on read, and an
+#     unbounded one blows the merge-spill stress gate (a ~132 MB per-column dictionary at 16M-row groups
+#     ran the merge out of spill disk). So a per-column dictionary bigger than the cap can't be merged; a
+#     near-unique column in a large (e.g. 16M-row) group whose zero-fallback dictionary exceeds the cap
+#     FALLS BACK to PLAIN — the one accepted exception, and cheap (PLAIN streams through a merge). The cap
+#     is tuned EMPIRICALLY as the largest value that keeps the merge-spill gate green (32 MB was long
+#     green; push it up until the gate goes red, take the last green).
 _DICT_PAGE_SLACK = 4 * 1024 * 1024   # page-framing headroom above the worst-case INT64 dictionary
+_DICT_PAGE_MAX = 64 * 1024 * 1024    # merge ceiling — tuned against the merge-spill gate (see above)
 
 
 def _dict_page_limit(rg_rows):
-    """Per-write dictionary page size limit, sized for ZERO mid-chunk fallback: the worst-case dictionary
-    (a near-unique INT64 column) is ``rg_rows * 8`` bytes, plus page-framing slack. Scales with the
-    (possibly adaptive) row-group size. See the block comment above."""
-    return int(rg_rows) * 8 + _DICT_PAGE_SLACK
+    """Per-write dictionary page size limit: the smaller of the zero-fallback size (``rg_rows * 8`` +
+    slack, so a near-unique INT64 column never falls back mid-chunk) and ``_DICT_PAGE_MAX`` (the largest
+    per-column dictionary a bounded MERGE can materialize). See the block comment above."""
+    return min(int(rg_rows) * 8 + _DICT_PAGE_SLACK, _DICT_PAGE_MAX)
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
@@ -162,18 +164,19 @@ def table_num_records(cur, dt):
 
 def _writer_properties(row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a row-group-derived,
-    # zero-fallback dictionary page limit (EVERY column stays 100% dictionary-encoded — no PLAIN data
-    # pages — the Direct Lake transcoder's dictionary fast path; see _dict_page_limit), a 1 MB data-page
-    # byte cap, an EXPLICIT 20k-row data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
+    # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a row-group-derived
+    # dictionary page limit that keeps columns dictionary-encoded up to the merge ceiling (the Direct Lake
+    # transcoder's fast path; see _dict_page_limit), a 1 MB data-page byte cap, an EXPLICIT 20k-row
+    # data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
     # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults)
     # so a merge stays quick and never rewrites fat files; post-merge compaction folds merged files up
     # into this layout later. Degrade gracefully if the pinned wheel rejects a newer parameter
     # (last rung: SNAPPY-only).
     #
     # Dictionary is enabled UNIFORMLY on every column (no dict-off / plain_cols): the policy is
-    # dictionary-everywhere, and the limit above is sized so it never falls back — the transcode happy
-    # path is worth more than the bytes a near-unique column's dictionary wastes.
+    # dictionary-everywhere up to _DICT_PAGE_MAX — the transcode happy path is worth the bytes a
+    # near-unique column's dictionary wastes, except a dictionary too big to MERGE, which _dict_page_limit
+    # caps back to a PLAIN fallback.
     if WriterProperties is None:
         return None
     rg = row_group_rows if row_group_rows is not None else _ROW_GROUP_SIZE
@@ -1084,7 +1087,7 @@ def write_delta(
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
     Every write lands in the one read-layout profile (tuned writer properties + 256 MB files),
-    dictionary-encoded uniformly on every column (the Direct Lake transcoder's dictionary fast path).
+    dictionary-encoded up to the merge ceiling (the Direct Lake transcoder's dictionary fast path).
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
