@@ -107,15 +107,29 @@ jobs:
           $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout_contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
           $wsId = $meta.ws
           $lhName = $meta.lh
-          $lhs = az rest --method get --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" | ConvertFrom-Json
+          # Use Invoke-RestMethod, NOT `az rest --body`: on the Windows runner az is a .cmd wrapper
+          # that mangles a JSON --body (quotes/newlines eaten) → the API gets an empty body and
+          # returns InvalidInput. IRM sends the JSON cleanly and throws on any non-2xx (Stop catches it).
+          $fabToken = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
+          $headers = @{ Authorization = "Bearer $fabToken"; "Content-Type" = "application/json" }
+          $base = "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses"
+          $lhs = Invoke-RestMethod -Method Get -Uri $base -Headers $headers
           $existing = ($lhs.value | Where-Object { $_.displayName -eq $lhName }).id
           if ($existing) {
             Write-Host "lakehouse '$lhName' already exists ($existing) — reusing."
           } else {
             Write-Host "creating lakehouse '$lhName' in workspace $wsId ..."
-            $body = @{ displayName = $lhName } | ConvertTo-Json
-            az rest --method post --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" --headers "Content-Type=application/json" --body $body | Out-Null
-            Start-Sleep -Seconds 15
+            $body = @{ displayName = $lhName } | ConvertTo-Json -Compress
+            Invoke-RestMethod -Method Post -Uri $base -Headers $headers -Body $body | Out-Null
+            # Creation can be async (202); poll the list until it actually appears (or give up).
+            $found = $false
+            for ($i = 1; $i -le 12; $i++) {
+              Start-Sleep -Seconds 5
+              $lhs = Invoke-RestMethod -Method Get -Uri $base -Headers $headers
+              if (($lhs.value | Where-Object { $_.displayName -eq $lhName }).id) { $found = $true; break }
+              Write-Host "  waiting for '$lhName' to appear ($i/12)..."
+            }
+            if (-not $found) { throw "lakehouse '$lhName' was not visible after creation" }
             Write-Host "created."
           }
 
