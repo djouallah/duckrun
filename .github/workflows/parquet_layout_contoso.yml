@@ -54,7 +54,9 @@ permissions:
 jobs:
   benchmark:
     name: 🔍 Benchmark (Contoso)
-    runs-on: windows-latest
+    # Linux (not windows-latest like the AEMO sibling): faster/cheaper runners, no Windows quirks.
+    # ADOMD.NET has a cross-platform .NET Core build that loads under pythonnet/coreclr on Linux.
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
       - name: 📥 Checkout
@@ -71,7 +73,6 @@ jobs:
           pip install -e .
 
       - name: 🧾 Init run report
-        shell: pwsh
         env:
           BENCH_ENV: ${{ inputs.env }}
           BENCH_RUNS: ${{ inputs.runs }}
@@ -82,16 +83,24 @@ jobs:
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
         run: |
-          "RUN_REPORT=$PWD\run_report.json" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $env:RUN_REPORT = "$PWD\run_report.json"
-          python tests/parquet_layout_contoso/report.py init
+          echo "RUN_REPORT=$PWD/run_report.json" >> "$GITHUB_ENV"
+          RUN_REPORT="$PWD/run_report.json" python tests/parquet_layout_contoso/report.py init
 
-      - name: 🧩 Install ADOMD.NET client (NuGet)
-        shell: pwsh
+      - name: 🧩 Install ADOMD.NET client (.NET Core build, cross-platform)
         run: |
-          # NetCore build so it loads under pythonnet's coreclr runtime. No -Version => latest stable.
-          nuget install Microsoft.AnalysisServices.AdomdClient.NetCore.retail.amd64 -OutputDirectory nuget -NonInteractive
-          "ADOMD_DIR=$PWD\nuget" >> $env:GITHUB_ENV
+          set -euo pipefail
+          # ADOMD.NET's NetCore build is cross-platform and loads under pythonnet/coreclr. `dotnet
+          # publish` a throwaway console app that references it so the DLL AND all its dependency
+          # assemblies (Microsoft.Identity.Client, IdentityModel.*, …) land in one folder that
+          # xmla_compare._load_adomd can glob. (A bare nupkg would miss the transitive deps.)
+          proj="$RUNNER_TEMP/adomd"
+          mkdir -p "$proj" && cd "$proj"
+          dotnet new console -o . --force >/dev/null
+          dotnet add package Microsoft.AnalysisServices.AdomdClient.NetCore.retail.amd64 >/dev/null
+          dotnet publish -c Release -o publish >/dev/null
+          test -f "$proj/publish/Microsoft.AnalysisServices.AdomdClient.dll"
+          echo "ADOMD_DIR=$proj/publish" >> "$GITHUB_ENV"
+          echo "resolved ADOMD_DIR=$proj/publish"
 
       - name: 🔐 Azure federated login
         uses: azure/login@v2
@@ -107,9 +116,9 @@ jobs:
           $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout_contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
           $wsId = $meta.ws
           $lhName = $meta.lh
-          # Use Invoke-RestMethod, NOT `az rest --body`: on the Windows runner az is a .cmd wrapper
-          # that mangles a JSON --body (quotes/newlines eaten) → the API gets an empty body and
-          # returns InvalidInput. IRM sends the JSON cleanly and throws on any non-2xx (Stop catches it).
+          # Use Invoke-RestMethod for the POST (sends JSON cleanly, throws on non-2xx so Stop catches
+          # it). `az rest --body` is avoided because it mangles a JSON body on Windows (.cmd wrapper);
+          # IRM is robust cross-platform.
           $fabToken = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
           $headers = @{ Authorization = "Bearer $fabToken"; "Content-Type" = "application/json" }
           $base = "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses"
