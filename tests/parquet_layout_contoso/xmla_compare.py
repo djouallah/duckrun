@@ -57,51 +57,51 @@ QUERIES = [
     ("probe", "probe_rowcount",    'EVALUATE ROW("x", COUNTROWS(Sales))'),
     # --- Tier 2: composite workloads across the star ---
     ("composite", "category_x_year",
-     'EVALUATE SUMMARIZECOLUMNS(Product[Category], Date[Year], '
+     'EVALUATE SUMMARIZECOLUMNS(Product[Category], \'Date\'[Year], '
      '"Amount", [Sales Amount], "Margin", [Margin], "Qty", [Total Quantity])'),
     ("composite", "brand_x_country",
      'EVALUATE SUMMARIZECOLUMNS(Product[Brand], Store[Country], '
      '"Amount", [Sales Amount], "Cost", [Total Cost])'),
     ("composite", "month_x_continent",
-     'EVALUATE SUMMARIZECOLUMNS(Date[Year Month], Customer[Continent], '
+     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year Month], Customer[Continent], '
      '"Amount", [Sales Amount], "MarginPct", [Margin %])'),
     ("composite", "product_x_year",
-     'EVALUATE SUMMARIZECOLUMNS(Product[Product Name], Date[Year], "Amount", [Sales Amount])'),
+     'EVALUATE SUMMARIZECOLUMNS(Product[Product Name], \'Date\'[Year], "Amount", [Sales Amount])'),
     ("composite", "filtered_us_2015_by_brand",
      'EVALUATE CALCULATETABLE('
      'SUMMARIZECOLUMNS(Product[Brand], "Amount", [Sales Amount], "Margin", [Margin]), '
-     'Store[Country] = "United States", Date[Year] = 2015)'),
+     'Store[Country] = "United States", \'Date\'[Year] = 2015)'),
     ("composite", "scalar_weighted_full_scan",
      'EVALUATE ROW('
      '"Amount", [Sales Amount], "Cost", [Total Cost], "Rows", COUNTROWS(Sales))'),
     ("composite", "topn_product_by_amount",
-     'EVALUATE TOPN(50, SUMMARIZECOLUMNS(Product[Product Name], Date[Year], '
+     'EVALUATE TOPN(50, SUMMARIZECOLUMNS(Product[Product Name], \'Date\'[Year], '
      '"Amount", [Sales Amount]), [Amount], DESC)'),
     # --- Tier 2 (cont.): exercise the Orders + OrderRows facts too ---
     ("composite", "orderrows_amount_x_year",
-     'EVALUATE SUMMARIZECOLUMNS(Date[Year], '
+     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year], '
      '"ORAmount", [OrderRows Amount], "ORQty", [OrderRows Quantity])'),
     ("composite", "orders_count_x_country",
-     'EVALUATE SUMMARIZECOLUMNS(Date[Year], Store[Country], "Orders", [Total Orders])'),
+     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year], Store[Country], "Orders", [Total Orders])'),
     # --- Tier 2 (cont.): column-width at fixed shape ---
     ("composite", "wide_all_measures",
-     'EVALUATE SUMMARIZECOLUMNS(Date[Year], "a", [Sales Amount], "b", [Total Cost], '
+     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year], "a", [Sales Amount], "b", [Total Cost], '
      '"c", [Margin], "d", [Total Quantity])'),
     ("composite", "narrow_one_measure",
-     'EVALUATE SUMMARIZECOLUMNS(Date[Year], "a", [Sales Amount])'),
+     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year], "a", [Sales Amount])'),
     # --- Tier 3: hot-only selectivity ladder (SUMX lifts work above the XMLA noise floor) ---
     ("hot_only", "sel_1yr",
      'EVALUATE ROW("r", CALCULATE(SUMX(Sales, Sales[Quantity] * Sales[Net Price]), '
-     'Date[Year] = 2015))'),
+     '\'Date\'[Year] = 2015))'),
     ("hot_only", "sel_1mo",
      'EVALUATE ROW("r", CALCULATE(SUMX(Sales, Sales[Quantity] * Sales[Net Price]), '
-     'Date[Year] = 2015, Date[Month Number] = 6))'),
+     '\'Date\'[Year] = 2015, \'Date\'[Month Number] = 6))'),
     ("hot_only", "sel_1brand",
      'EVALUATE ROW("r", CALCULATE(SUMX(Sales, Sales[Quantity] * Sales[Net Price]), '
      'Product[Brand] = "{brand}"))'),
     ("hot_only", "sel_1brand_1mo",
      'EVALUATE ROW("r", CALCULATE(SUMX(Sales, Sales[Quantity] * Sales[Net Price]), '
-     'Product[Brand] = "{brand}", Date[Year] = 2015, Date[Month Number] = 6))'),
+     'Product[Brand] = "{brand}", \'Date\'[Year] = 2015, \'Date\'[Month Number] = 6))'),
 ]
 
 COLD_TIERS = ("probe", "composite")   # tiers that get the dehydrate→query cold path
