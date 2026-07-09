@@ -58,6 +58,22 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   the table and writes a tombstone marker but **does not reclaim the data files** (a deliberate
   precaution — you purge them when you're sure). Address dropped tables by name, not by path.
 
+## Parquet layout
+
+- **`SORTED BY AUTO` picks the key with a naive, lightly-tested heuristic.** The auto sort-key picker
+  is a cheap greedy single pass over statistical *sketches* (approximate cardinalities, HyperLogLog
+  functional-dependency tests) — a stack of rules of thumb, each of which can be wrong on a given
+  distribution. It is not guaranteed to shrink anything and can occasionally pick a worse key than the
+  table's natural arrival order, and it has been validated against essentially one dataset, not a broad
+  workload sample. When you know your grain and query patterns, prefer an explicit `SORTED BY (cols)`,
+  and always compare `conn.get_stats()` before and after. See
+  [Automatic sorting](parquet-layout.md#automatic-sorting).
+- **Adaptive row-group sizing is a heuristic too, tuned on one dataset.** Row groups are sized from a
+  planner row estimate (`ceil(rows / 8)`, capped at 16M) grounded against that same single benchmark —
+  a rough rule, not a broadly tested optimum. A table with unusual width, cardinality, or skew may well
+  have its sweet spot elsewhere. See
+  [How the numbers are grounded](parquet-layout.md#how-the-numbers-are-grounded).
+
 ## Memory
 
 - **Two engines share one machine's memory.** DuckDB and delta-rs each keep their own pool in the same
