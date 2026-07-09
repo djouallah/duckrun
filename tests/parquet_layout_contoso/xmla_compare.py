@@ -55,6 +55,10 @@ QUERIES = [
     ("probe", "probe_NetPrice",    'EVALUATE ROW("x", SUM(Sales[Net Price]))'),
     ("probe", "probe_UnitCost",    'EVALUATE ROW("x", SUM(Sales[Unit Cost]))'),
     ("probe", "probe_ProductKey",  'EVALUATE ROW("x", DISTINCTCOUNT(Sales[ProductKey]))'),
+    # OrderKey (model column "Order Number") is the adversarial case for dictionary-everywhere: it is
+    # near-unique, so its dictionary costs the most bytes for the least value — if the pure-dictionary
+    # policy is wrong anywhere it is wrong here first (DISTINCTCOUNT forces the full column scan).
+    ("probe", "probe_OrderKey",    'EVALUATE ROW("x", DISTINCTCOUNT(Sales[Order Number]))'),
     ("probe", "probe_OrderDate",   'EVALUATE ROW("x", COUNTROWS(VALUES(Sales[Order Date])))'),
     ("probe", "probe_rowcount",    'EVALUATE ROW("x", COUNTROWS(Sales))'),
     # --- Tier 2: SQLBI DAX Patterns (https://www.daxpatterns.com), embedded as self-contained

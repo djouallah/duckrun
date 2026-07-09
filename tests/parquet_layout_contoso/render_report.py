@@ -18,7 +18,7 @@ except Exception:
     pass
 
 # probe_<col> minus probe_rowcount — raw parquet column names on the Sales fact.
-_PROBE_COLS = ["Quantity", "NetPrice", "UnitCost", "ProductKey", "OrderDate"]
+_PROBE_COLS = ["Quantity", "NetPrice", "UnitCost", "ProductKey", "OrderKey", "OrderDate"]
 _FILTER_COLS = ["OrderDate", "ProductKey", "StoreKey"]     # clustering candidates (sort-key columns)
 _RG_BIG = 1 << 24                                           # 16,777,216 rows — Direct Lake segment cap
 # hot_only ladder query -> the fact column(s) its predicate prunes on (year/month filter via Date
