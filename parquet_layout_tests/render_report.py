@@ -315,7 +315,7 @@ def _layout_table(rep, analysis):
                      _fmt(p.get("size_mb")), _fmt(p.get("compression")), cc, hc])
     if not body:
         return
-    out = ["## Table layout (Parquet)", "",
+    out = ["## Summary", "",
            "| " + " | ".join(_LAYOUT_COLS) + " |",
            "|:--|:--|:--|--:|--:|--:|--:|--:|:--|--:|--:|"]
     for r in body:
