@@ -1,11 +1,20 @@
-"""Generate the Contoso base with SQLBI's Contoso Data Generator V2, then land it to Delta.
+"""Generate the Contoso base with SQLBI's Contoso Data Generator V2, then land it.
 
 This is the Contoso analog of AEMO's pre-built ``mart.fct_summary`` — except the base doesn't
 pre-exist, we *make* it by running SQLBI's tool (https://github.com/sql-bi/Contoso-Data-Generator-V2,
 MIT). We download the self-contained ``DatabaseGenerator`` binary for this platform, run it with the
-vendored ``config.json`` (``SalesOrders: BOTH`` → the full schema, ``OutputFormat: PARQUET``), and
-write all 8 tables to the ``contoso`` schema of the target lakehouse via duckrun. This pristine base
-is never mutated afterward — both layout copies (auto_sort / vorder) derive from ``contoso.sales``.
+vendored ``config.json`` (``SalesOrders: BOTH`` → the full schema, ``OutputFormat: PARQUET``).
+
+Landing is deliberately split so the layout comparison stays FAIR:
+
+  - The dimensions + Orders + OrderRows go to the ``contoso`` schema as Delta tables via duckrun.
+    Their layout is irrelevant to the benchmark (they're just what the Direct Lake model joins to).
+  - The SALES fact — the table under test — is NOT written by duckrun. Writing it as a duckrun Delta
+    would hand Spark's V-Order build a duckrun-shaped input (and V-Order preserves input row order, so
+    that would seed Spark's clustering). Instead the raw generator ``sales.parquet`` is streamed
+    byte-verbatim to the lakehouse **Files** section. BOTH layout copies then read that identical raw
+    parquet — Spark writes ``tests.sales_vorder`` from it, duckrun writes ``tests.sales_auto_sort``
+    from it — so neither engine's layout is seeded by the other; only its own clustering differs.
 
 The generator's own semantic model (``pbit-Import``) is the source of the ported Direct Lake models
 under ``contoso_*.SemanticModel/`` — see README.md for full credit + source links.
@@ -13,12 +22,13 @@ under ``contoso_*.SemanticModel/`` — see README.md for full credit + source li
 Env in:
   ONELAKE_TABLES_PATH  target Tables root — abfss://… (OneLake) OR a local path (offline dry-run)
   ONELAKE_TOKEN        storage bearer token (omit for a local path)
-  CONTOSO_ORDERS       OrdersCount override (default: config.json's 1,000,000) — the scale knob
-  FORCE_REBUILD        "true" → rebuild even if contoso.sales already exists
+  CONTOSO_ORDERS       OrdersCount override (default: config.json's default) — the scale knob
+  FORCE_REBUILD        "true" → rebuild even if the base already exists
   CONTOSO_WORK         scratch dir for the generator download + OUT/CACHE (default: ./_contoso_work)
 """
 import os
 import platform
+import re
 import stat
 import subprocess
 import sys
@@ -30,6 +40,10 @@ import duckrun
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
+
+# The raw generator sales.parquet lands here in the lakehouse Files section (relative to the Files
+# root). build_spark_variant.py and build_auto_sort.py both read exactly this path.
+SALES_FILES_REL = "Files/contoso_base/sales.parquet"
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -98,11 +112,63 @@ def _exists(con, tbl):
         return False
 
 
+def sales_files_urls(tables_path=None):
+    """``(abfss_read_url, store_root)`` for the raw sales.parquet in the lakehouse Files section,
+    derived from ONELAKE_TABLES_PATH (``abfss://{ws}@{host}/{lh}/Tables``). ``(None, None)`` for a
+    local path (offline dry-run). ``abfss_read_url`` is what Spark / duckrun ``read_parquet`` consume;
+    ``store_root`` is the obstore ``AzureStore`` root (its object path is then ``SALES_FILES_REL``).
+    Single source of truth — build_spark_variant / build_auto_sort / check_tables all import this."""
+    path = (tables_path or os.environ["ONELAKE_TABLES_PATH"]).rstrip("/")
+    m = re.match(r"abfss://([^@]+)@([^/]+)/([^/]+)/Tables$", path)
+    if not m:
+        return None, None
+    ws, host, lh = m.groups()
+    root = f"abfss://{ws}@{host}/{lh}/"
+    return (root + SALES_FILES_REL, root)
+
+
+def _files_store(store_root, token):
+    from obstore.store import AzureStore
+    return AzureStore.from_url(store_root, bearer_token=token)
+
+
+def _files_exists(store_root, token):
+    """True if the raw sales.parquet is already in Files (obstore HEAD)."""
+    if not store_root:
+        return False
+    import obstore
+    try:
+        obstore.head(_files_store(store_root, token), SALES_FILES_REL)
+        return True
+    except Exception:
+        return False
+
+
+def _upload_raw_to_files(local_path, store_root, token):
+    """Upload the (multi-GB) raw sales.parquet byte-verbatim to OneLake Files via obstore, which
+    streams it as a multipart upload. duckrun's ``conn.copy`` reads a whole file into one BLOB, which
+    a ~5GB sales.parquet would OOM — obstore chunks it and preserves the generator's exact bytes."""
+    import obstore
+    gb = os.path.getsize(local_path) / 1e9
+    print(f"  obstore put → {SALES_FILES_REL} ({gb:.2f} GB, multipart)...", flush=True)
+    with open(local_path, "rb") as f:
+        obstore.put(_files_store(store_root, token), SALES_FILES_REL, f)
+    print(f"  upload complete: {SALES_FILES_REL}", flush=True)
+
+
 def main():
     force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
     orders = os.environ.get("CONTOSO_ORDERS", "").strip()
+    token = os.environ.get("ONELAKE_TOKEN")
+    _, store_root = sales_files_urls()       # store_root None on a local path (offline dry-run)
     con = _connect()
     con.sql("create schema if not exists contoso")
+
+    # Everything except sales lands as contoso.* Delta; sales is the raw parquet in Files (see docstring).
+    dim_tables = [(pq, tbl) for pq, tbl in TABLES if tbl != "sales"]
+
+    def _sales_present():
+        return _files_exists(store_root, token) if store_root else _exists(con, "sales")
 
     # Fast path: reuse an existing base instead of regenerating (existence-only — the generator is the
     # slow step). But guard against a SILENT scale mismatch: if the base on disk was built at a
@@ -112,16 +178,15 @@ def main():
     # chain. A scale change must rebuild the WHOLE chain, which is exactly what rebuild=true does, so
     # refuse loud and point at it. The generator emits a hair fewer orders than OrdersCount (a few %
     # drop for unassignable rows), so match the `orders` table on a tolerance, not equality.
-    if not force and all(_exists(con, tbl) for _, tbl in TABLES):
+    if not force and all(_exists(con, tbl) for _, tbl in dim_tables) and _sales_present():
         have = con.sql('select count(*) from contoso."orders"').fetchone()[0]
         if orders.isdigit() and int(orders) > 0 and abs(have - int(orders)) > 0.05 * int(orders):
             raise SystemExit(
                 f"contoso base exists at orders={have:,} but OrdersCount={orders} was requested — "
                 f"a scale change must rebuild the whole chain (base + both layout copies). "
                 f"Re-dispatch with rebuild=true.")
-        rows = con.sql('select count(*) from contoso."sales"').fetchone()[0]
-        print(f"contoso base already present (sales={rows:,} rows, orders={have:,}) — skipping "
-              "(rebuild=true to regenerate)", flush=True)
+        print(f"contoso base already present (orders={have:,}, raw sales.parquet in Files) — "
+              "skipping (rebuild=true to regenerate)", flush=True)
         report.merge({"tables": {"contoso_base": {"build": {
             "engine": "sqlbi_generator", "status": "skipped"}}}})
         return
@@ -144,9 +209,10 @@ def main():
     print(f"running generator: OrdersCount={orders or 'config default'} ...", flush=True)
     subprocess.run(cmd, check=True)
     gen_secs = time.perf_counter() - t0
-    print(f"generation done ({gen_secs:.1f}s) — landing to Delta ...", flush=True)
+    print(f"generation done ({gen_secs:.1f}s) — landing ...", flush=True)
 
-    for pq, tbl in TABLES:
+    # Dimensions + Orders + OrderRows → contoso.* Delta (duckrun); layout here is irrelevant.
+    for pq, tbl in dim_tables:
         src = os.path.join(out, f"{pq}.parquet").replace("\\", "/")
         if not os.path.exists(src):
             raise SystemExit(f"generator did not produce {src}")
@@ -155,11 +221,24 @@ def main():
         n = con.sql(f'select count(*) from contoso."{tbl}"').fetchone()[0]
         print(f"  contoso.{tbl}: {n:,} rows", flush=True)
 
+    # Sales fact → raw generator parquet, byte-verbatim, into Files (NOT a duckrun Delta write — that
+    # would seed Spark's V-Order clustering). On a local dry-run (no Files section) fall back to a
+    # plain Delta so the readers still have something.
+    sales_src = os.path.join(out, "sales.parquet").replace("\\", "/")
+    if not os.path.exists(sales_src):
+        raise SystemExit(f"generator did not produce {sales_src}")
+    if store_root:
+        print("uploading raw sales.parquet byte-verbatim to Files (obstore) ...", flush=True)
+        _upload_raw_to_files(sales_src, store_root, token)
+    else:
+        print("local dry-run: no Files section — writing contoso.sales as a plain Delta", flush=True)
+        con.sql(f"create or replace table contoso.\"sales\" as select * from read_parquet('{sales_src}')")
+
     report.merge({"tables": {"contoso_base": {"build": {
         "engine": "sqlbi_generator", "generator_version": GEN_VERSION,
         "orders": int(orders) if orders.isdigit() else None,
         "seconds": round(gen_secs, 1), "status": "rebuilt"}}}})
-    print("contoso base ready.", flush=True)
+    print("contoso base ready (dims in Delta, raw sales.parquet in Files).", flush=True)
 
 
 if __name__ == "__main__":

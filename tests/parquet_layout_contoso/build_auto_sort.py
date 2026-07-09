@@ -1,6 +1,10 @@
 """Build the duckrun-clustered layout copy of the Contoso Sales fact under test:
-tests.sales_auto_sort = contoso.sales, written `sorted by auto` (current WriterProperties).
-Mirror of the AEMO benchmark's build_auto_sort.py, retargeted to the Contoso base.
+tests.sales_auto_sort = the raw generator sales.parquet, written `sorted by auto` (current
+WriterProperties). Mirror of the AEMO benchmark's build_auto_sort.py, retargeted to the Contoso base.
+
+Reads the RAW generator sales.parquet straight from the lakehouse Files section (uploaded by
+build_base.py) — the identical input Spark's V-Order build reads — so neither engine's layout seeds
+the other. SORTED BY AUTO re-sorts regardless of input order.
 
 Env in: ONELAKE_TABLES_PATH, ONELAKE_TOKEN, OPT_SORT (default 'auto'), FORCE_REBUILD,
         BENCH_ROW_LIMIT (optional row cap on the shared base).
@@ -13,14 +17,17 @@ import duckrun
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
+import build_base  # noqa: E402  — sales_files_urls: one source of truth for the Files path
 
 sort = (os.environ.get("OPT_SORT") or "auto").strip()
 clause = "sorted by auto" if sort.lower() == "auto" else f"sorted by ({sort})"
 force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
-# Read contoso.sales directly with the same row cap. SORTED BY AUTO re-sorts regardless of input order.
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
 N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
-_src = "contoso.sales" if N is None else f"(select * from contoso.sales limit {N})"
+# Read the raw sales.parquet from Files (abfss) with the same row cap Spark applies.
+_ABFSS_URL, _STORE_ROOT = build_base.sales_files_urls()
+_base = f"read_parquet('{_ABFSS_URL}')"
+_src = _base if N is None else f"(select * from {_base} limit {N})"
 
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
                       storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},

@@ -77,7 +77,7 @@ jobs:
 
       - name: 📦 Install deps (duckrun from THIS tree — tests the current WriterProperties)
         run: |
-          pip install pythonnet pyyaml ms-fabric-cli
+          pip install pythonnet pyyaml ms-fabric-cli obstore
           pip install -e .
 
       - name: 🧾 Init run report

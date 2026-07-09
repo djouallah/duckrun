@@ -37,15 +37,17 @@ Alberto Ferrari. This benchmark **runs their tool**; it does not copy their pre-
 
 ## What it compares
 
-Two Direct Lake semantic models over the **same** Contoso `Sales` fact. The duckrun and Spark builds
-each read the pristine `contoso.sales` (never mutated) **directly and independently**, so the
-V-Order input is never routed through a duckrun-written table, and both hold the same rows — only
+Two Direct Lake semantic models over the **same** Contoso `Sales` fact. To keep it fair, **both**
+builds read the **raw generator `sales.parquet`** — uploaded byte-verbatim to the lakehouse **Files**
+section, never written by duckrun. This matters because Fabric V-Order *preserves input row order*:
+if Spark read a duckrun-clustered Delta, it would inherit duckrun's clustering for free. Reading the
+pristine parquet means each engine applies **only its own** layout to the identical input — so only
 **layout**, hence **speed**, differs:
 
 | Model | Fact table | Layout |
 |:--|:--|:--|
-| `contoso_auto_sort` | `tests.sales_auto_sort` | **duckrun** `sorted by auto` — the layout under test (current WriterProperties) |
-| `contoso_vorder` | `tests.sales_vorder` | **Fabric Spark V-Order** — the reference |
+| `contoso_auto_sort` | `tests.sales_auto_sort` | **duckrun** `sorted by auto` — reads the raw parquet, applies duckrun's layout (current WriterProperties) |
+| `contoso_vorder` | `tests.sales_vorder` | **Fabric Spark V-Order** — reads the same raw parquet, applies V-Order |
 
 The dimensions (`Customer`, `Product`, `Store`, `Date`, `Currency Exchange`) and the other facts
 (`Orders`, `OrderRows`) are generated + loaded to the `contoso` schema and stay stable in both

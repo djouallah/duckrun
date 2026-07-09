@@ -1,8 +1,12 @@
 """Build the Fabric Spark V-Order reference copy of the Contoso Sales fact:
-tests.sales_vorder = contoso.sales, written with V-Order enabled (Spark-only) via the Livy API.
-Mirror of the AEMO benchmark's build_spark_variant.py, retargeted to the Contoso base — reads
-contoso.sales DIRECTLY (never a duckrun-written intermediate), so the V-Order input is never
-influenced by duckrun's write layout; only speed differs.
+tests.sales_vorder = the raw generator sales.parquet, written with V-Order enabled (Spark-only) via
+the Livy API. Mirror of the AEMO benchmark's build_spark_variant.py, retargeted to the Contoso base.
+
+Spark reads the RAW generator ``sales.parquet`` straight from the lakehouse **Files** section (uploaded
+byte-verbatim by build_base.py) — NOT a duckrun-written Delta table. V-Order preserves input row order,
+so reading a duckrun-clustered Delta would seed Spark's clustering; reading the pristine parquet keeps
+the comparison fair: Spark and duckrun both start from the identical raw input and only their own
+layout engine differs.
 
 Env in: FABRIC_TOKEN, WS_ID, LH_ID, ONELAKE_TABLES_PATH, ONELAKE_TOKEN, FORCE_REBUILD,
         BENCH_ROW_LIMIT (optional).
@@ -16,17 +20,21 @@ import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
+import build_base  # noqa: E402  — sales_files_urls / _files_exists: one source of truth for the path
 
 TOKEN = os.environ["FABRIC_TOKEN"]
 BASE = (f"https://api.fabric.microsoft.com/v1/workspaces/{os.environ['WS_ID']}"
         f"/lakehouses/{os.environ['LH_ID']}/livyapi/versions/2023-12-01")
 FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 
+_ABFSS_URL, _STORE_ROOT = build_base.sales_files_urls()
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
 N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
-SOURCE = "contoso.sales" if N is None else f"(SELECT * FROM contoso.sales LIMIT {N})"
+# Spark reads the raw parquet from Files; .limit(N) applies the optional row cap.
+READER = f'spark.read.parquet("{_ABFSS_URL}")' + (f".limit({N})" if N else "")
+SOURCE_DESC = build_base.SALES_FILES_REL + (f" (limit {N})" if N else "")
 
-VARIANTS = {"vorder": SOURCE}
+VARIANTS = {"vorder": READER}
 SORTS = {"vorder": "source order"}
 
 
@@ -37,11 +45,11 @@ def _record_build(variant, seconds, status):
         "status": status}}}})
 
 
-def _spark_code(variant, source):
+def _spark_code(variant, reader):
     return (
         'spark.sql("CREATE SCHEMA IF NOT EXISTS tests")\n'
         'spark.conf.set("spark.sql.parquet.vorder.default", "true")\n'
-        f'(spark.sql("SELECT * FROM {source}")\n'
+        f'({reader}\n'
         '      .write.mode("overwrite").format("delta")\n'
         '      .option("parquet.vorder.enabled", "true")\n'
         f'      .saveAsTable("tests.sales_{variant}"))\n'
@@ -114,17 +122,18 @@ def _run_statement(sid, code):
 
 
 def main():
+    src_ok = build_base._files_exists(_STORE_ROOT, os.environ.get("ONELAKE_TOKEN"))
     todo = {}
-    for v, src in VARIANTS.items():
+    for v, reader in VARIANTS.items():
         out = f"tests.sales_{v}"
         if not FORCE and _table_exists(out):
             print(f"{out} already exists — skipping (set rebuild=true to rebuild).", flush=True)
             _record_build(v, None, "skipped")
             continue
-        if not _table_exists(src):
-            print(f"source {src} not found — skipping {v}.", flush=True)
+        if not src_ok:
+            print(f"source {SOURCE_DESC} not found in Files — skipping {v}.", flush=True)
             continue
-        todo[v] = src
+        todo[v] = reader
     if not todo:
         return
     print("Creating Livy session...", flush=True)
@@ -135,10 +144,10 @@ def main():
     try:
         _poll_state(f"sessions/{sid}", "session", {"idle"},
                     {"error", "dead", "killed", "shutting_down"}, timeout=900, interval=15)
-        for v, src in todo.items():
-            print(f"Building tests.sales_{v} (V-Order, source {src})...", flush=True)
+        for v, reader in todo.items():
+            print(f"Building tests.sales_{v} (V-Order, source {SOURCE_DESC})...", flush=True)
             t0 = time.perf_counter()
-            _run_statement(sid, _spark_code(v, src))
+            _run_statement(sid, _spark_code(v, reader))
             _record_build(v, time.perf_counter() - t0, "rebuilt")
     finally:
         print(f"Deleting session {sid}...", flush=True)
