@@ -1,5 +1,5 @@
 """Benchmark two semantic models by running the SAME heavy DAX queries against each
-over the XMLA endpoint and timing them — to compare the `_optimized` model (a duckrun-
+over the XMLA endpoint and timing them — to compare the `_auto_sort` model (a duckrun-
 clustered copy of the fact) against the `_vorder` model (a Fabric Spark V-Order copy).
 Both are derived from the same pristine base fct_summary, so this is apples-to-apples.
 
@@ -320,15 +320,15 @@ def bench_model(workspace, model, token, runs, want_cold, cold_repeats, queries)
 
 def discover_models():
     here = Path(__file__).resolve().parent  # this script lives alongside the *.SemanticModel folders
-    # Benchmark ONLY the experiment's derived models: optimized (duckrun-clustered) vs vorder
+    # Benchmark ONLY the experiment's derived models: auto_sort (duckrun-clustered) vs vorder
     # (Fabric Spark V-Order). Both are built from the same pristine base fct_summary, so this is
     # apples-to-apples.
     names = sorted(p.name.removesuffix(".SemanticModel")
                    for p in here.glob("*.SemanticModel"))
     if len(names) < 2:
         sys.exit(f"Need at least 2 benchmark semantic models, found {len(names)}: {names}")
-    # Reference = optimized (duckrun); challenger = vorder. Ratio reads base/vorder.
-    base = next((n for n in names if n.endswith("_optimized")), min(names, key=len))
+    # Reference = auto_sort (duckrun); challenger = vorder. Ratio reads base/vorder.
+    base = next((n for n in names if n.endswith("_auto_sort")), min(names, key=len))
     return base, [n for n in names if n != base]
 
 

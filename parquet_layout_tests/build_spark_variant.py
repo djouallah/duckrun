@@ -15,7 +15,7 @@ FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 
 # Read the source mart.fct_summary DIRECTLY (never a duckrun-written intermediate) so the V-Order
 # input is never influenced by duckrun's write layout. The row cap is applied here, independently
-# of the duckrun optimized build's own read.
+# of the duckrun auto_sort build's own read.
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
 N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
 SOURCE = "mart.fct_summary" if N is None else f"(SELECT * FROM mart.fct_summary LIMIT {N})"

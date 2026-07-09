@@ -49,16 +49,10 @@ def _table(model):
     return "fct_summary" + model.removeprefix("aemo_electricity")
 
 
-# Display labels. Physical names stay as-is (the base-detection keys off "_optimized"); these are
-# presentation only. "optimized" is renamed to "auto_sort" because it presumes the conclusion —
-# the layout is duckrun's SORTED BY AUTO, nothing more. "vorder" already reads cleanly, so it maps
-# to itself. Keys below must match the physical table/model name tokens.
-_LABELS = {"optimized": "auto_sort"}
-
-
 def _short(model):
-    s = model.removeprefix("aemo_electricity_").removeprefix("fct_summary_") or model
-    return _LABELS.get(s, s)
+    """Layout label: the physical name minus its aemo_electricity_/fct_summary_ prefix
+    (aemo_electricity_auto_sort → auto_sort, fct_summary_vorder → vorder)."""
+    return model.removeprefix("aemo_electricity_").removeprefix("fct_summary_") or model
 
 
 # ---------------------------------------------------------------------------- derived analysis
@@ -227,7 +221,7 @@ def compute_analysis(rep):
             analysis["skipping"][q] = entry
 
     # verdicts: structured, base vs each challenger, medians + tie rule (never a mean).
-    base = next((x for x in models if x.endswith("_optimized")), min(models, key=len) if models else None)
+    base = next((x for x in models if x.endswith("_auto_sort")), min(models, key=len) if models else None)
     if base:
         for m in models:
             if m == base:
@@ -245,7 +239,7 @@ def compute_analysis(rep):
 
 # Build intent per layout for the `sort` column when a cycle reused prebuilt tables and recorded no
 # build metadata. Keyed by physical suffix; the label must never contradict the layout's name.
-_SORT_INTENT = {"optimized": "SORTED BY AUTO", "vorder": "vorder"}
+_SORT_INTENT = {"auto_sort": "SORTED BY AUTO", "vorder": "vorder"}
 _LAYOUT_COLS = ["table", "writer", "sort", "rows", "files", "row groups", "avg RG rows",
                 "size MB", "compression", "cold total (ms)", "hot total (ms)"]
 
@@ -257,7 +251,7 @@ def _sort_label(rep, t):
     if b.get("sort"):
         return b["sort"]
     suf = t.removeprefix("fct_summary_")
-    if suf == "optimized":
+    if suf == "auto_sort":
         opt = (rep.get("run", {}).get("inputs", {}) or {}).get("opt_sort")
         return f"sorted by ({opt})" if (opt and str(opt).lower() != "auto") else "SORTED BY AUTO"
     return _SORT_INTENT.get(suf, "—")
@@ -273,7 +267,7 @@ def _layout_table(rep, analysis):
     Assumes a single challenger (the current benchmark shape: auto_sort vs vorder)."""
     tables = rep.get("tables", {})
     models = list(rep.get("timings", {}))
-    base = next((m for m in models if m.endswith("_optimized")),
+    base = next((m for m in models if m.endswith("_auto_sort")),
                 min(models, key=len) if models else None)
     order = ([base] + sorted(m for m in models if m != base)) if base else models
     chal = next((m for m in order if m != base), None)
@@ -387,7 +381,7 @@ def main():
     _layout_table(rep, analysis)
 
     timings = rep.get("timings", {})
-    base = next((m for m in timings if m.endswith("_optimized")),
+    base = next((m for m in timings if m.endswith("_auto_sort")),
                 min(timings, key=len) if timings else None)
     if base:
         others = [m for m in timings if m != base]

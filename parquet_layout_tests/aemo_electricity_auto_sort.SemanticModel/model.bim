@@ -246,7 +246,7 @@
             "mode": "directLake",
             "source": {
               "type": "entity",
-              "entityName": "fct_summary_optimized",
+              "entityName": "fct_summary_auto_sort",
               "expressionSource": "DirectLake",
               "schemaName": "tests"
             }

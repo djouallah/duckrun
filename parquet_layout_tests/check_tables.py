@@ -12,7 +12,7 @@ import duckrun
 # All tables the two build steps produce (each reads mart.fct_summary directly). Missing any ⇒ the
 # build phase must run (each build script still skips the tables that already exist, so a partial
 # rebuild only rebuilds the gap).
-TABLES = ["tests.fct_summary_optimized",
+TABLES = ["tests.fct_summary_auto_sort",
           "tests.fct_summary_vorder"]
 
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],

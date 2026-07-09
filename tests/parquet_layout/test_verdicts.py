@@ -51,24 +51,24 @@ def test_within_spread_is_a_tie_not_a_win():
 def test_verify_verdicts_passes_when_consistent():
     """Direction guard is silent when the verdict agrees with the per-query median majority."""
     rep = {"timings": {
-        "aemo_electricity_optimized": {"probe_rowcount": _cold(100),
+        "aemo_electricity_auto_sort": {"probe_rowcount": _cold(100),
                                        "q1": _cold(100), "q2": _cold(100)},
         "aemo_electricity_vorder": {"probe_rowcount": _cold(100),
                                     "q1": _cold(200), "q2": _cold(200)}}}
     analysis = rr.compute_analysis(rep)
-    errs, notes = rs.verify_verdicts(rep, analysis)     # optimized faster everywhere, consistent
+    errs, notes = rs.verify_verdicts(rep, analysis)     # auto_sort faster everywhere, consistent
     assert errs == [] and notes == []
 
 
 def test_verify_verdicts_flags_a_true_inversion():
     """Fatal only when the verdict disagrees with the SAME-query median majority."""
     rep = {"timings": {
-        "aemo_electricity_optimized": {"probe_rowcount": _cold(100),
+        "aemo_electricity_auto_sort": {"probe_rowcount": _cold(100),
                                        "q1": _cold(100), "q2": _cold(100)},
         "aemo_electricity_vorder": {"probe_rowcount": _cold(100),
                                     "q1": _cold(300), "q2": _cold(300)}}}
     analysis = rr.compute_analysis(rep)
-    # optimized is clearly faster; corrupt the verdict to claim the challenger won.
+    # auto_sort is clearly faster; corrupt the verdict to claim the challenger won.
     for v in analysis["verdicts"]:
         if v["metric"] == "COLD":
             v["verdict"] = "model"
@@ -83,7 +83,7 @@ def test_probe_vs_composite_divergence_is_a_note_not_fatal():
     # Composites favour the challenger (so verdict + median majority = challenger), but the single
     # probe column favours the base — the two subsets legitimately disagree.
     rep = {"timings": {
-        "aemo_electricity_optimized": {
+        "aemo_electricity_auto_sort": {
             "probe_rowcount": _cold(100), "probe_mw": _cold(200),   # base cheaper on the probe
             "c1": _cold(500), "c2": _cold(500), "c3": _cold(500)},  # base slower on composites
         "aemo_electricity_vorder": {
@@ -96,23 +96,23 @@ def test_probe_vs_composite_divergence_is_a_note_not_fatal():
 
 
 def test_sort_label_never_contradicts_the_name():
-    """auto_sort must not render an empty §2 sort cell — the name asserts a sort, so the matrix
+    """auto_sort must not render an empty sort cell — the name asserts a sort, so the Summary table
     must show one even when the build was gated and recorded no metadata."""
-    rep = {"tables": {"fct_summary_optimized": {"parquet": {}}},
+    rep = {"tables": {"fct_summary_auto_sort": {"parquet": {}}},
            "run": {"inputs": {"opt_sort": "auto"}}}
-    s = rs._sort_label(rep, "fct_summary_optimized")
+    s = rr._sort_label(rep, "fct_summary_auto_sort")
     assert s not in ("", "—", None) and "AUTO" in s
 
 
 def test_sort_label_prefers_recorded_build_metadata():
-    rep = {"tables": {"fct_summary_optimized": {"build": {"sort": "sorted by (date, time)"}}}}
-    assert rs._sort_label(rep, "fct_summary_optimized") == "sorted by (date, time)"
+    rep = {"tables": {"fct_summary_auto_sort": {"build": {"sort": "sorted by (date, time)"}}}}
+    assert rr._sort_label(rep, "fct_summary_auto_sort") == "sorted by (date, time)"
 
 
 def test_sort_label_explicit_columns_from_inputs():
-    rep = {"tables": {"fct_summary_optimized": {"parquet": {}}},
+    rep = {"tables": {"fct_summary_auto_sort": {"parquet": {}}},
            "run": {"inputs": {"opt_sort": "region, date"}}}
-    assert rs._sort_label(rep, "fct_summary_optimized") == "sorted by (region, date)"
+    assert rr._sort_label(rep, "fct_summary_auto_sort") == "sorted by (region, date)"
 
 
 def test_floor_uses_only_quotable_columns():
@@ -121,7 +121,7 @@ def test_floor_uses_only_quotable_columns():
              "hot_median_ms": 50, "hot_spread_pct": 110}     # date-like: cheap + very noisy
     stable = {"tier": "probe", "cold_median_ms": 300, "cold_spread_pct": 5,
               "hot_median_ms": 300, "hot_spread_pct": 5}
-    rep = {"timings": {"aemo_electricity_optimized": {
+    rep = {"timings": {"aemo_electricity_auto_sort": {
         "probe_rowcount": stable, "probe_date": noisy, "probe_mw": stable}}}
     assert "date" in rs._noisy_cols(rep)                # flagged non-quotable
     assert "mw" not in rs._noisy_cols(rep)

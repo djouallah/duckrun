@@ -1,4 +1,4 @@
-"""Deploy the benchmark semantic model(s) under parquet_layout_tests/ (aemo_electricity_optimized
+"""Deploy the benchmark semantic model(s) under parquet_layout_tests/ (aemo_electricity_auto_sort
 + aemo_electricity_vorder) and refresh them — used by the parquet-layout benchmark workflow.
 
 GUID-swap the bim (dev -> target ws/lh), `fab deploy` scoped to ./parquet_layout_tests, then

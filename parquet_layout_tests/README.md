@@ -19,7 +19,7 @@ both hold the same rows, so only **speed** differs:
 
 | Model | Fact table | Layout |
 |:--|:--|:--|
-| `aemo_electricity_optimized` | `tests.fct_summary_optimized` | **duckrun** `sorted by auto` — the layout under test (current WriterProperties) |
+| `aemo_electricity_auto_sort` | `tests.fct_summary_auto_sort` | **duckrun** `sorted by auto` — the layout under test (current WriterProperties) |
 | `aemo_electricity_vorder` | `tests.fct_summary_vorder` | **Fabric Spark V-Order** — the reference |
 
 ## Pipeline (what the workflow runs, in order)
@@ -27,7 +27,7 @@ both hold the same rows, so only **speed** differs:
 1. **`build_spark_variant.py`** — builds `tests.fct_summary_vorder` on Fabric Spark via
    the Livy API (V-Order is Spark-only), reading `mart.fct_summary` directly (applies `row_limit`).
    Skip-if-exists.
-2. **`build_optimized.py`** — builds `tests.fct_summary_optimized` via duckrun
+2. **`build_auto_sort.py`** — builds `tests.fct_summary_auto_sort` via duckrun
    `create or replace table … sorted by auto`, reading `mart.fct_summary` directly with its own
    independent `row_limit` read. This exercises the **current tree's** WriterProperties (the workflow
    `pip install -e .`s the checked-out duckrun). Skip-if-exists; set `rebuild=true` after changing a
@@ -54,16 +54,16 @@ export PBI_TOKEN=...       # analysis.windows.net/powerbi/api  (XMLA)
 export PBI_WORKSPACE="<workspace display name>"
 export WS_ID=... LH_ID=... ADOMD_DIR=<dir with AdomdClient.dll>
 python parquet_layout_tests/build_spark_variant.py
-python parquet_layout_tests/build_optimized.py
+python parquet_layout_tests/build_auto_sort.py
 python parquet_layout_tests/deploy_vorder.py --env main
 python parquet_layout_tests/xmla_compare.py
 ```
 
 ## Tuning workflow (the point of this folder)
 
-1. Run once at the current default → note the cold/hot `optimized vs vorder` totals.
+1. Run once at the current default → note the cold/hot `auto_sort vs vorder` totals.
 2. Change one WriterProperties default in `dbt/adapters/duckrun/engine.py`.
-3. Re-run with `rebuild=true` (rebuilds only the duckrun `_optimized` table; V-Order is the fixed
+3. Re-run with `rebuild=true` (rebuilds only the duckrun `_auto_sort` table; V-Order is the fixed
    reference and is left alone).
 4. Compare the new duckrun numbers against the **unchanged** V-Order row. Keep the change only if
    Direct Lake query speed moved toward (or past) V-Order — and the `merge_spill` gate still passes.

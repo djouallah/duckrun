@@ -28,7 +28,7 @@ def w(line=""):
 
 
 def lbl(model):
-    return rr._short(model)  # canonical display label (optimized→auto_sort, vorder_base_*→vorder_*)
+    return rr._short(model)  # layout label: physical name minus its aemo_electricity_/fct_summary_ prefix
 
 
 def _noisy_cols(rep, thresh=25.0):
@@ -70,9 +70,9 @@ def _verdict_row(by, base_lbl, m):
 
 
 def _order(models):
-    """optimized first, then challenger(s) by name."""
-    base = [m for m in models if m.endswith("_optimized")]
-    return base + sorted(m for m in models if not m.endswith("_optimized"))
+    """auto_sort (base) first, then challenger(s) by name."""
+    base = [m for m in models if m.endswith("_auto_sort")]
+    return base + sorted(m for m in models if not m.endswith("_auto_sort"))
 
 
 def _ms(v):
@@ -326,7 +326,7 @@ def verify_verdicts(rep, analysis):
     there is a non-fatal note, not a build failure. Returns (errors, notes)."""
     tim = rep.get("timings", {})
     cc = analysis.get("cold_column_cost", {})
-    base = next((m for m in tim if m.endswith("_optimized")), None)
+    base = next((m for m in tim if m.endswith("_auto_sort")), None)
     if not base or base not in cc:
         return [], []
     def _cost(m):
@@ -375,7 +375,7 @@ def main():
 
     analysis = rep.get("analysis") or rr.compute_analysis(rep)
     models = _order(list(rep.get("timings", {})))
-    base = next((m for m in models if m.endswith("_optimized")), models[0] if models else None)
+    base = next((m for m in models if m.endswith("_auto_sort")), models[0] if models else None)
 
     s1_header(rep)
     if base:
