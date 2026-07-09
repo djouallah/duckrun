@@ -58,53 +58,6 @@ def _verdict_line(v, base_lbl, chal_lbl):
             f"({winner} wins {wc}, {loser} wins {lc}, ties {v['ties']})")
 
 
-def s_tldr(rep, analysis, base, models):
-    """One-glance verdict for readers who won't read the rest: one row per layout with its aggregate
-    cold and hot wall-clock, ✔ on the faster layout per column (tie rule), and the overall call.
-    Sits right under the layout matrix (§2) so file size + speed are both visible up top. Assumes a
-    single challenger (the current benchmark shape: auto_sort vs vorder)."""
-    challengers = [m for m in models if m != base]
-    if not challengers:
-        return
-    chal = challengers[0]
-    by = {}
-    for v in analysis.get("verdicts", []):
-        by.setdefault(v["model"], {})[v["metric"]] = v
-    ref = by.get(rr._short(chal), {})
-    base_lbl, chal_lbl = lbl(base), lbl(chal)
-
-    def _winner(metric):
-        v = ref.get(metric)
-        if not v or v["verdict"] == "tie":
-            return None
-        return base_lbl if v["verdict"] == "base" else chal_lbl
-
-    cold_w, hot_w = _winner("COLD"), _winner("HOT")
-    rows = [
-        (base_lbl, ref.get("COLD", {}).get("base_total_ms"), ref.get("HOT", {}).get("base_total_ms")),
-        (chal_lbl, ref.get("COLD", {}).get("model_total_ms"), ref.get("HOT", {}).get("model_total_ms")),
-    ]
-    won = [w for w in (cold_w, hot_w) if w]
-    overall = "tie (within spread)" if not won else (
-        f"**{won[0]}**" if len(set(won)) == 1 else "split (cold vs hot disagree)")
-
-    w("## TL;DR — who won")
-    w()
-    w("_Total wall-clock (ms) for one full pass — each query's median, summed across the benchmarked "
-      "queries; ✔ marks the faster layout per column (tie rule). Read the sections below for the how "
-      "and why._")
-    w()
-    w("| layout | cold total (ms) | hot total (ms) |")
-    w("|:--|--:|--:|")
-    for name, c, h in rows:
-        cc = f"{_ms(c)} ✔" if name == cold_w else _ms(c)
-        hc = f"{_ms(h)} ✔" if name == hot_w else _ms(h)
-        w(f"| {name} | {cc} | {hc} |")
-    w()
-    w(f"Overall winner: {overall}.")
-    w()
-
-
 def _verdict_row(by, base_lbl, m):
     chal = lbl(m)
     mv = by.get(rr._short(m), {})
@@ -131,10 +84,6 @@ def _mb(v):
 
 def _ratio(v):
     return "—" if v is None else f"{v:.2f}"
-
-
-def _rg_over(parquet):
-    return sum(1 for r in (parquet.get("row_group_detail") or []) if (r.get("rows") or 0) > rr._RG_BIG)
 
 
 def _size_of(sz_model, col):
@@ -184,46 +133,6 @@ def s1_header(rep):
     w()
 
 
-# Build intent per layout, used for the §2 sort column when this cycle reused prebuilt tables and
-# recorded no build metadata. Keyed by physical suffix. The name must never contradict this cell.
-_SORT_INTENT = {"optimized": "SORTED BY AUTO",
-                "vorder": "source order"}
-
-
-def _sort_label(rep, t):
-    """The §2 sort cell. Prefer build metadata (has the actual columns AUTO picked); otherwise the
-    layout's definitional intent — so auto_sort never shows an empty sort in open contradiction to
-    its name."""
-    b = rep["tables"].get(t, {}).get("build", {})
-    if b.get("sort"):
-        return b["sort"]
-    suf = t.removeprefix("fct_summary_")
-    if suf == "optimized":
-        opt = (rep.get("run", {}).get("inputs", {}) or {}).get("opt_sort")
-        return f"sorted by ({opt})" if (opt and str(opt).lower() != "auto") else "SORTED BY AUTO"
-    return _SORT_INTENT.get(suf, "—")
-
-
-def s2_layout(rep, tables_order):
-    w("## 2. Layout matrix")
-    w()
-    w("| table | writer | sort | vorder | files | row groups | avg RG rows | RGs > 2²⁴ | MB |")
-    w("|:--|:--|:--|:--|--:|--:|--:|--:|--:|")
-    for t in tables_order:
-        p = rep["tables"][t].get("parquet", {})
-        b = rep["tables"][t].get("build", {})
-        engine = b.get("engine") or ("spark" if p.get("vorder") else "duckdb")
-        w(f"| {lbl(t)} | {engine} | {_sort_label(rep, t)} | "
-          f"{'yes' if p.get('vorder') else 'no'} | {p.get('files')} | {p.get('row_groups')} | "
-          f"{_ms(p.get('avg_row_group'))} | {_rg_over(p)} | {_mb(p.get('size_mb'))} |")
-    w()
-    w("_Sort names each layout's build intent (from build metadata when the build ran this cycle, "
-      "else the layout definition). Labels describe layout behaviour, not a mechanism claim: "
-      "`auto_sort` applies `SORTED BY AUTO`, and its date-clustering is reinforced by the source's "
-      "natural time-ordering._")
-    w()
-
-
 def s3_verdicts(rep, analysis, base, models):
     by = {}
     for v in analysis.get("verdicts", []):
@@ -232,7 +141,7 @@ def s3_verdicts(rep, analysis, base, models):
     headline = [m for m in models if m != base]
     noisy = sorted(_noisy_cols(rep))
 
-    w("## 3. Headline verdict (medians, tie rule)")
+    w("## 2. Headline verdict (medians, tie rule)")
     w()
     w(f"Ratio column is `{base_lbl} ÷ challenger` (< 1 ⇒ {base_lbl} faster).")
     w()
@@ -251,7 +160,7 @@ def s3_verdicts(rep, analysis, base, models):
                 who = base_lbl if c["verdict"] == "base" else lbl(m)
                 cnt = c["losses"] if c["verdict"] == "base" else c["wins"]
                 agg.append(f"{who} wins {cnt}/{tot} vs {lbl(m)}")
-        w(f"- ⚠ {len(noisy)} probe columns exceed 25% cold spread (n={cr}, shared capacity; see §7). "
+        w(f"- ⚠ {len(noisy)} probe columns exceed 25% cold spread (n={cr}, shared capacity; see §6). "
           f"The headline rests on the aggregate, not any single column: "
           f"{'; '.join(agg) or 'see table'} (per-query cold median, tie rule).")
         w()
@@ -263,7 +172,7 @@ def s4_cold_decomp(rep, analysis, models):
     if not cc:
         return
     noisy = _noisy_cols(rep)
-    w("## 4. Cold decomposition (marginal cost per column)")
+    w("## 3. Cold decomposition (marginal cost per column)")
     w()
     hdr = "| column |" + "".join(f" {lbl(m)} ms | {lbl(m)} ms/MB |" for m in models)
     w(hdr)
@@ -311,14 +220,14 @@ def s4_cold_decomp(rep, analysis, models):
         if cheap_noisy:
             w(f"- irreducible floor: not measurable at this n — the cheapest columns "
               f"({', '.join(cheap_noisy)}) are non-quotable; anchor conclusions on the aggregate "
-              "cold win (§3) and the data-skipping evidence (§6), not per-column costs.")
+              "cold win (§2) and the data-skipping evidence (§5), not per-column costs.")
         elif cheap:
             w(f"- irreducible floor (stable): {cheap[0]} (~{floor[cheap[0]]:,.0f} ms across layouts).")
         w()
 
 
 def s5_compression(rep, models):
-    w("## 5. Compression attribution")
+    w("## 4. Compression attribution")
     w()
     w("| column | model | comp MB | encodings | dict MB |")
     w("|:--|:--|--:|:--|--:|")
@@ -347,7 +256,7 @@ def s6_skipping(analysis, models):
     sk = analysis.get("skipping", {})
     if not sk:
         return
-    w("## 6. Data skipping (first touch vs clustering)")
+    w("## 5. Data skipping (first touch vs clustering)")
     w()
     w("| ladder query | filter | " + " | ".join(f"{lbl(m)} score" for m in models)
       + " | " + " | ".join(f"{lbl(m)} ft ms" for m in models) + " |")
@@ -378,7 +287,7 @@ def s6_skipping(analysis, models):
 
 
 def s7_caveats(rep, analysis):
-    w("## 7. Caveats")
+    w("## 6. Caveats")
     w()
     noisy = []
     for m, qs in rep.get("timings", {}).items():
@@ -400,7 +309,7 @@ def s7_caveats(rep, analysis):
 
 
 def s8_pointers(rep):
-    w("## 8. Raw")
+    w("## 7. Raw")
     w()
     w("- artifact `run-report`: `run_report.json` (this summary is `SUMMARY.md` beside it).")
     w("- cross-run: `duckdb -c \"SELECT run.run_id, * FROM read_json('reports/*.json')\"`.")
@@ -465,13 +374,10 @@ def main():
 
     analysis = rep.get("analysis") or rr.compute_analysis(rep)
     models = _order(list(rep.get("timings", {})))
-    tables_order = [rr._table(m) for m in models if rr._table(m) in rep.get("tables", {})]
     base = next((m for m in models if m.endswith("_optimized")), models[0] if models else None)
 
     s1_header(rep)
-    s2_layout(rep, tables_order)
     if base:
-        s_tldr(rep, analysis, base, models)
         s3_verdicts(rep, analysis, base, models)
     s4_cold_decomp(rep, analysis, models)
     s5_compression(rep, models)

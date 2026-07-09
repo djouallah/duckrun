@@ -17,8 +17,6 @@ try:
 except Exception:
     pass
 
-_PARQUET_COLS = ["table", "rows", "files", "row_groups", "avg_row_group",
-                 "size_mb", "vorder", "compression"]
 _PROBE_COLS = ["mw", "price", "duid", "date", "time"]     # probe_<col> minus probe_rowcount
 _FILTER_COLS = ["date", "time", "DUID"]                   # clustering candidates
 _RG_BIG = 1 << 24                                          # 16,777,216 rows — Direct Lake segment cap
@@ -245,20 +243,83 @@ def compute_analysis(rep):
 
 # ---------------------------------------------------------------------------- rendering
 
-def _parquet_table(tables):
-    rows = []
-    for name, t in tables.items():
-        p = t.get("parquet")
+# Build intent per layout for the `sort` column when a cycle reused prebuilt tables and recorded no
+# build metadata. Keyed by physical suffix; the label must never contradict the layout's name.
+_SORT_INTENT = {"optimized": "SORTED BY AUTO", "vorder": "vorder"}
+_LAYOUT_COLS = ["table", "writer", "sort", "rows", "files", "row groups", "avg RG rows",
+                "size MB", "compression", "cold total (ms)", "hot total (ms)"]
+
+
+def _sort_label(rep, t):
+    """The `sort` cell. Prefer build metadata (the actual columns AUTO picked); else the layout's
+    definitional intent, so auto_sort never shows an empty sort against its own name."""
+    b = rep.get("tables", {}).get(t, {}).get("build", {})
+    if b.get("sort"):
+        return b["sort"]
+    suf = t.removeprefix("fct_summary_")
+    if suf == "optimized":
+        opt = (rep.get("run", {}).get("inputs", {}) or {}).get("opt_sort")
+        return f"sorted by ({opt})" if (opt and str(opt).lower() != "auto") else "SORTED BY AUTO"
+    return _SORT_INTENT.get(suf, "—")
+
+
+def _int(v):
+    return "" if v is None else f"{v:,.0f}"
+
+
+def _layout_table(rep, analysis):
+    """One row per layout: file geometry + aggregate cold/hot wall-clock, ✔ on the faster layout per
+    column (tie rule). Merges the former parquet-layout, layout-matrix, and TL;DR tables into one.
+    Assumes a single challenger (the current benchmark shape: auto_sort vs vorder)."""
+    tables = rep.get("tables", {})
+    models = list(rep.get("timings", {}))
+    base = next((m for m in models if m.endswith("_optimized")),
+                min(models, key=len) if models else None)
+    order = ([base] + sorted(m for m in models if m != base)) if base else models
+    chal = next((m for m in order if m != base), None)
+
+    # cold/hot totals + ✔ winners, from the verdicts computed above. Blank if no challenger.
+    by = {}
+    for v in analysis.get("verdicts", []):
+        by.setdefault(v["model"], {})[v["metric"]] = v
+    ref = by.get(_short(chal), {}) if chal else {}
+    totals = {}
+    if base and chal:
+        totals[_short(base)] = (ref.get("COLD", {}).get("base_total_ms"),
+                                ref.get("HOT", {}).get("base_total_ms"))
+        totals[_short(chal)] = (ref.get("COLD", {}).get("model_total_ms"),
+                                ref.get("HOT", {}).get("model_total_ms"))
+
+    def _winner(metric):
+        v = ref.get(metric)
+        if not v or v["verdict"] == "tie":
+            return None
+        return _short(base) if v["verdict"] == "base" else _short(chal)
+
+    cold_w, hot_w = _winner("COLD"), _winner("HOT")
+
+    body = []
+    for m in order:
+        t = _table(m)
+        p = tables.get(t, {}).get("parquet")
         if not p:
             continue
-        rows.append([name] + [p.get(c) for c in _PARQUET_COLS[1:]])
-    if not rows:
+        b = tables.get(t, {}).get("build", {})
+        name = _short(m)
+        engine = b.get("engine") or ("spark" if p.get("vorder") else "delta_rs")
+        c, h = totals.get(name, (None, None))
+        cc = f"{_int(c)} ✔" if name == cold_w else _int(c)
+        hc = f"{_int(h)} ✔" if name == hot_w else _int(h)
+        body.append([name, engine, _sort_label(rep, t), _int(p.get("rows")),
+                     _fmt(p.get("files")), _fmt(p.get("row_groups")), _int(p.get("avg_row_group")),
+                     _fmt(p.get("size_mb")), _fmt(p.get("compression")), cc, hc])
+    if not body:
         return
     out = ["## Table layout (Parquet)", "",
-           "| " + " | ".join(_PARQUET_COLS) + " |",
-           "|" + "|".join([":--"] + ["--:"] * 5 + [":--", ":--"]) + "|"]
-    for r in rows:
-        out.append("| " + " | ".join(_fmt(v) for v in r) + " |")
+           "| " + " | ".join(_LAYOUT_COLS) + " |",
+           "|:--|:--|:--|--:|--:|--:|--:|--:|:--|--:|--:|"]
+    for r in body:
+        out.append("| " + " | ".join(r) + " |")
     _write("\n".join(out) + "\n")
 
 
@@ -323,7 +384,7 @@ def main():
     _write(f"# Direct Lake query benchmark — `{run.get('sha')}` "
            f"(run {run.get('run_id')})\n")
 
-    _parquet_table(rep.get("tables", {}))
+    _layout_table(rep, analysis)
 
     timings = rep.get("timings", {})
     base = next((m for m in timings if m.endswith("_optimized")),
