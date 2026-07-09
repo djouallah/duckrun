@@ -1,0 +1,11 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+  "metadata": {
+    "type": "SemanticModel",
+    "displayName": "contoso_vorder"
+  },
+  "config": {
+    "version": "2.0",
+    "logicalId": "c3a6dab2-5e8f-4d94-8b3a-2f7e9c1d4a68"
+  }
+}

@@ -78,6 +78,12 @@ finally:
 # Refresh each (Direct Lake reframe) — 3x retry for OneLake security propagation.
 for n in names:
     sm_id = cap(["fab", "get", f"{ws}.Workspace/{n}.SemanticModel", "-q", "id"]).stdout.strip()
+    # Fail loud if the item isn't in the workspace after deploy (e.g. the .SemanticModel folder was
+    # missing its .platform marker, so `fab deploy` published nothing) — otherwise we'd POST to
+    # datasets/[NotFound] and print a false "deployed + refreshed".
+    if not sm_id or sm_id == "[NotFound]":
+        raise SystemExit(f"semantic model '{n}' not found in workspace '{ws}' after deploy "
+                         f"(fab get id -> {sm_id!r}); check the .SemanticModel/.platform marker")
     for attempt in range(1, 4):
         try:
             run(["fab", "api", "-A", "powerbi", "-X", "post", f"groups/{WS_ID}/datasets/{sm_id}/refreshes"])
