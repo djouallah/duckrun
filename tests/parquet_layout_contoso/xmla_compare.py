@@ -41,7 +41,9 @@ import report  # noqa: E402
 #   probe      — one Sales column, full scan, scalar. probe_<Col> names match the raw parquet column
 #                so render_report can line cold cost up with size/clustering. probe_rowcount is the
 #                ~zero-column control (subtract in the marginal-cost analysis). Measured cold AND hot.
-#   composite  — realistic multi-column workloads across facts + dims. Measured cold AND hot.
+#   composite  — real SQLBI DAX Patterns (daxpatterns.com): YTD, year-over-year, cumulative total,
+#                ranking, new customers, related distinct count — embedded self-contained via DEFINE
+#                MEASURE, plus two Orders/OrderRows queries. Heavy SE scans. Measured cold AND hot.
 #   hot_only   — selectivity ladder on the Sales sort-key columns, HOT only. "{brand}" filled at
 #                runtime with the top Brand by Sales Amount.
 # All columns/measures exist in model.bim (Sales: Quantity/Net Price/Unit Cost/ProductKey/Order Date;
@@ -55,40 +57,58 @@ QUERIES = [
     ("probe", "probe_ProductKey",  'EVALUATE ROW("x", DISTINCTCOUNT(Sales[ProductKey]))'),
     ("probe", "probe_OrderDate",   'EVALUATE ROW("x", COUNTROWS(VALUES(Sales[Order Date])))'),
     ("probe", "probe_rowcount",    'EVALUATE ROW("x", COUNTROWS(Sales))'),
-    # --- Tier 2: composite workloads across the star ---
-    ("composite", "category_x_year",
-     'EVALUATE SUMMARIZECOLUMNS(Product[Category], \'Date\'[Year], '
-     '"Amount", [Sales Amount], "Margin", [Margin], "Qty", [Total Quantity])'),
-    ("composite", "brand_x_country",
-     'EVALUATE SUMMARIZECOLUMNS(Product[Brand], Store[Country], '
-     '"Amount", [Sales Amount], "Cost", [Total Cost])'),
-    ("composite", "month_x_continent",
-     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year Month], Customer[Continent], '
-     '"Amount", [Sales Amount], "MarginPct", [Margin %])'),
-    ("composite", "product_x_year",
-     'EVALUATE SUMMARIZECOLUMNS(Product[Product Name], \'Date\'[Year], "Amount", [Sales Amount])'),
-    ("composite", "filtered_us_2015_by_brand",
-     'EVALUATE CALCULATETABLE('
-     'SUMMARIZECOLUMNS(Product[Brand], "Amount", [Sales Amount], "Margin", [Margin]), '
-     'Store[Country] = "United States", \'Date\'[Year] = 2015)'),
-    ("composite", "scalar_weighted_full_scan",
-     'EVALUATE ROW('
-     '"Amount", [Sales Amount], "Cost", [Total Cost], "Rows", COUNTROWS(Sales))'),
-    ("composite", "topn_product_by_amount",
-     'EVALUATE TOPN(50, SUMMARIZECOLUMNS(Product[Product Name], \'Date\'[Year], '
-     '"Amount", [Sales Amount]), [Amount], DESC)'),
-    # --- Tier 2 (cont.): exercise the Orders + OrderRows facts too ---
+    # --- Tier 2: SQLBI DAX Patterns (https://www.daxpatterns.com), embedded as self-contained
+    #     DEFINE MEASURE queries so each runs verbatim against this model with NO extra model measures.
+    #     These are real analyst workloads, not toy group-bys — every one is a heavy storage-engine
+    #     scan of the Sales fact, which is exactly what the duckrun-clustered vs V-Order layout
+    #     comparison needs to move. Each is credited to its pattern page.
+    ("composite", "ytd",  # https://www.daxpatterns.com/standard-time-related-calculations/
+     '''DEFINE
+         MEASURE Sales[Sales YTD] = CALCULATE ( [Sales Amount], DATESYTD ( 'Date'[Date] ) )
+     EVALUATE
+         SUMMARIZECOLUMNS ( 'Date'[Year Month], "YTD", [Sales YTD] )'''),
+    ("composite", "year_over_year",  # https://www.daxpatterns.com/comparing-different-time-periods/
+     '''DEFINE
+         MEASURE Sales[Sales PY]  = CALCULATE ( [Sales Amount], DATEADD ( 'Date'[Date], -1, YEAR ) )
+         MEASURE Sales[Sales YOY] = [Sales Amount] - [Sales PY]
+     EVALUATE
+         SUMMARIZECOLUMNS ( 'Date'[Year], "Sales", [Sales Amount], "PY", [Sales PY], "YOY", [Sales YOY] )'''),
+    ("composite", "cumulative_total",  # https://www.daxpatterns.com/cumulative-total/
+     '''DEFINE
+         MEASURE Sales[Sales RT] =
+             VAR LastVisibleDate = MAX ( 'Date'[Date] )
+             RETURN CALCULATE ( [Sales Amount], 'Date'[Date] <= LastVisibleDate, ALL ( 'Date' ) )
+     EVALUATE
+         SUMMARIZECOLUMNS ( 'Date'[Year Month], "RunningTotal", [Sales RT] )'''),
+    ("composite", "ranking",  # https://www.daxpatterns.com/ranking/
+     '''DEFINE
+         MEASURE Sales[Product Rank] = RANKX ( ALLSELECTED ( 'Product'[Product Name] ), [Sales Amount] )
+     EVALUATE
+         TOPN ( 100,
+             SUMMARIZECOLUMNS ( 'Product'[Product Name], "Sales", [Sales Amount], "Rank", [Product Rank] ),
+             [Sales], DESC )'''),
+    ("composite", "new_customers",  # https://www.daxpatterns.com/new-and-returning-customers/
+     '''DEFINE
+         MEASURE Sales[First Purchase] = CALCULATE ( MIN ( Sales[Order Date] ), REMOVEFILTERS ( 'Date' ) )
+         MEASURE Sales[New Customers] =
+             VAR FirstDates  = ADDCOLUMNS ( VALUES ( Sales[CustomerKey] ), "@First", [First Purchase] )
+             VAR MinVisible  = MIN ( 'Date'[Date] )
+             VAR MaxVisible  = MAX ( 'Date'[Date] )
+             RETURN COUNTROWS ( FILTER ( FirstDates, [@First] >= MinVisible && [@First] <= MaxVisible ) )
+     EVALUATE
+         SUMMARIZECOLUMNS ( 'Date'[Year Month], "NewCustomers", [New Customers] )'''),
+    ("composite", "related_distinct_count",  # https://www.daxpatterns.com/related-distinct-count/
+     '''EVALUATE
+         SUMMARIZECOLUMNS ( 'Date'[Year],
+             "Distinct Products",  DISTINCTCOUNT ( Sales[ProductKey] ),
+             "Distinct Customers", DISTINCTCOUNT ( Sales[CustomerKey] ),
+             "Distinct Stores",    DISTINCTCOUNT ( Sales[StoreKey] ) )'''),
+    # --- Tier 2 (cont.): exercise the Orders + OrderRows facts too (the patterns above are Sales-only) ---
     ("composite", "orderrows_amount_x_year",
-     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year], '
-     '"ORAmount", [OrderRows Amount], "ORQty", [OrderRows Quantity])'),
+     '''EVALUATE SUMMARIZECOLUMNS ( 'Date'[Year],
+         "ORAmount", [OrderRows Amount], "ORQty", [OrderRows Quantity] )'''),
     ("composite", "orders_count_x_country",
-     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year], Store[Country], "Orders", [Total Orders])'),
-    # --- Tier 2 (cont.): column-width at fixed shape ---
-    ("composite", "wide_all_measures",
-     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year], "a", [Sales Amount], "b", [Total Cost], '
-     '"c", [Margin], "d", [Total Quantity])'),
-    ("composite", "narrow_one_measure",
-     'EVALUATE SUMMARIZECOLUMNS(\'Date\'[Year], "a", [Sales Amount])'),
+     '''EVALUATE SUMMARIZECOLUMNS ( 'Date'[Year], Store[Country], "Orders", [Total Orders] )'''),
     # --- Tier 3: hot-only selectivity ladder (SUMX lifts work above the XMLA noise floor) ---
     ("hot_only", "sel_1yr",
      'EVALUATE ROW("r", CALCULATE(SUMX(Sales, Sales[Quantity] * Sales[Net Price]), '

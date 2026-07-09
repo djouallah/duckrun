@@ -26,6 +26,11 @@ Alberto Ferrari. This benchmark **runs their tool**; it does not copy their pre-
   `pbit-Import` template** — its tables, star-schema relationships, and the five Sales measures
   (`Sales Amount`, `Total Cost`, `Margin`, `Margin %`, `Total Quantity`) are SQLBI's DAX, verbatim;
   we only rewrote the storage layer to **Direct Lake** pointing at the duckrun-written Delta.
+- **The benchmark's composite DAX queries** are real **[SQLBI DAX Patterns](https://www.daxpatterns.com/patterns/)**
+  — YTD, year-over-year, cumulative total, ranking, new customers, related distinct count — embedded
+  self-contained (via `DEFINE MEASURE`) so they run verbatim against this model. Each is credited to
+  its pattern page in [`xmla_compare.py`](xmla_compare.py). They're realistic analyst workloads, not
+  toy group-bys, so the layout comparison moves something meaningful.
 - **Full documentation:** https://docs.sqlbi.com/contoso-data-generator/ ·
   **Tool page:** https://www.sqlbi.com/tools/contoso-data-generator/
 - **License:** MIT — see the upstream repositories.
