@@ -58,6 +58,12 @@ jobs:
     # ADOMD.NET has a cross-platform .NET Core build that loads under pythonnet/coreclr on Linux.
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    env:
+      # The azure extension's default transport fails the OneLake TLS handshake on Linux runners
+      # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle. Every
+      # Linux OneLake workflow (aemo, parity, integration_tests_onelake) sets this — the Contoso
+      # sibling needs it too now it runs on ubuntu, not windows.
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4

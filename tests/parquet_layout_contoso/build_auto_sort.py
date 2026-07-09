@@ -25,10 +25,7 @@ _src = "contoso.sales" if N is None else f"(select * from contoso.sales limit {N
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
                       storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
                       read_only=False)
-try:
-    con.sql("create schema if not exists tests")
-except Exception:
-    con.con.execute("create schema if not exists tests")
+con.sql("create schema if not exists tests")
 
 
 def _exists():

@@ -101,10 +101,7 @@ def _exists(con, tbl):
 def main():
     force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
     con = _connect()
-    try:
-        con.sql("create schema if not exists contoso")
-    except Exception:
-        con.con.execute("create schema if not exists contoso")
+    con.sql("create schema if not exists contoso")
 
     # Fast path: the whole base already present → skip generation entirely (unless rebuild).
     if not force and all(_exists(con, tbl) for _, tbl in TABLES):
