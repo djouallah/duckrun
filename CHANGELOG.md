@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.14]
+
+Write-layout tuning for Direct Lake, plus a leaner `MERGE`.
+
+### Changed
+- **Adaptive row-group geometry.** A full-table write (`CREATE TABLE AS`, dbt `table` /
+  `--full-refresh`) and the post-write compaction now size Parquet row groups from the result's row
+  count instead of a flat 16M. A small table shrinks its row groups so it still yields ~8 Direct Lake
+  segments (each kept in the 1M–16M-row band) instead of one or two giant ones, so it cold-loads on
+  more transcode lanes; a large table is unchanged (16M rows, the ceiling under 2²⁴). Tunable via the
+  `DUCKRUN_RG_LANES` env var (default 8).
+- **`MERGE` rewrites only the partitions it touches.** The merge auto-injects the source's constant
+  partition bounds into the `ON` predicate and prunes matched partitions with `target.p IN (…)` (was
+  a `BETWEEN min/max` span), so an incremental merge reads and rewrites far fewer files — less memory,
+  faster commit.
+
+### Fixed
+- **Adaptive sizing respects `LIMIT`.** A `CREATE TABLE AS … LIMIT n` was sized off the whole source
+  (DuckDB's planner estimate can't see a `LIMIT`), producing too few, too-large row groups; it now
+  takes an exact count when the plan carries a limit (the limit short-circuits the scan, so it stays
+  cheap).
+
+### Internal
+- The row-group sizing rule and the sort-key recommender moved into the adapter core (`policy.py` /
+  `dbt.adapters.duckrun.sortkey`); the `import duckrun` public surface is unchanged.
+
 ## [0.4.11]
 
 Robustness fixes to the SQL-write path, shaken out by a new black-box conformance suite.
