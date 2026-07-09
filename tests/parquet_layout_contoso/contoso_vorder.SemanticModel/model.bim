@@ -1,0 +1,804 @@
+{
+  "compatibilityLevel": 1604,
+  "model": {
+    "culture": "en-US",
+    "defaultPowerBIDataSourceVersion": "powerBI_V3",
+    "annotations": [
+      {
+        "name": "PBI_ProTooling",
+        "value": "[\"RemoteModeling\", \"DirectLakeOnOneLakeCreatedInDesktop\"]"
+      }
+    ],
+    "expressions": [
+      {
+        "name": "DirectLake",
+        "kind": "m",
+        "description": "Direct Lake connection to OneLake \u2014 reads Delta tables directly, no SQL endpoint",
+        "expression": [
+          "let",
+          "    Source = AzureStorage.DataLake(\"https://onelake.dfs.fabric.microsoft.com/11111111-1111-1111-1111-111111111111/22222222-2222-2222-2222-222222222222\", [HierarchicalNavigation=true])",
+          "in",
+          "    Source"
+        ]
+      }
+    ],
+    "tables": [
+      {
+        "name": "Sales",
+        "sourceLineageTag": "[contoso].[sales_vorder]",
+        "columns": [
+          {
+            "name": "Order Number",
+            "dataType": "int64",
+            "sourceColumn": "OrderKey",
+            "sourceLineageTag": "OrderKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Line Number",
+            "dataType": "int64",
+            "sourceColumn": "LineNumber",
+            "sourceLineageTag": "LineNumber",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Order Date",
+            "dataType": "dateTime",
+            "sourceColumn": "OrderDate",
+            "sourceLineageTag": "OrderDate",
+            "summarizeBy": "none",
+            "formatString": "yyyy-MM-dd"
+          },
+          {
+            "name": "Delivery Date",
+            "dataType": "dateTime",
+            "sourceColumn": "DeliveryDate",
+            "sourceLineageTag": "DeliveryDate",
+            "summarizeBy": "none",
+            "formatString": "yyyy-MM-dd"
+          },
+          {
+            "name": "CustomerKey",
+            "dataType": "int64",
+            "sourceColumn": "CustomerKey",
+            "sourceLineageTag": "CustomerKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "StoreKey",
+            "dataType": "int64",
+            "sourceColumn": "StoreKey",
+            "sourceLineageTag": "StoreKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "ProductKey",
+            "dataType": "int64",
+            "sourceColumn": "ProductKey",
+            "sourceLineageTag": "ProductKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Quantity",
+            "dataType": "int64",
+            "sourceColumn": "Quantity",
+            "sourceLineageTag": "Quantity",
+            "summarizeBy": "sum"
+          },
+          {
+            "name": "Unit Price",
+            "dataType": "decimal",
+            "sourceColumn": "UnitPrice",
+            "sourceLineageTag": "UnitPrice",
+            "summarizeBy": "none",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Net Price",
+            "dataType": "decimal",
+            "sourceColumn": "NetPrice",
+            "sourceLineageTag": "NetPrice",
+            "summarizeBy": "none",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Unit Cost",
+            "dataType": "decimal",
+            "sourceColumn": "UnitCost",
+            "sourceLineageTag": "UnitCost",
+            "summarizeBy": "none",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Currency Code",
+            "dataType": "string",
+            "sourceColumn": "CurrencyCode",
+            "sourceLineageTag": "CurrencyCode",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Exchange Rate",
+            "dataType": "decimal",
+            "sourceColumn": "ExchangeRate",
+            "sourceLineageTag": "ExchangeRate",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "Sales",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "sales_vorder",
+              "expressionSource": "DirectLake",
+              "schemaName": "tests"
+            }
+          }
+        ],
+        "measures": [
+          {
+            "name": "Sales Amount",
+            "expression": "SUMX ( Sales, Sales[Quantity] * Sales[Net Price] )",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Total Cost",
+            "expression": "SUMX ( Sales, Sales[Quantity] * Sales[Unit Cost] )",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Margin",
+            "expression": "[Sales Amount] - [Total Cost]",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Margin %",
+            "expression": "DIVIDE ( [Margin], [Sales Amount] )",
+            "formatString": "0.00%;-0.00%;0.00%"
+          },
+          {
+            "name": "Total Quantity",
+            "expression": "SUM ( Sales[Quantity] )",
+            "formatString": "#,0"
+          }
+        ]
+      },
+      {
+        "name": "Orders",
+        "sourceLineageTag": "[contoso].[orders]",
+        "columns": [
+          {
+            "name": "Order Number",
+            "dataType": "int64",
+            "sourceColumn": "OrderKey",
+            "sourceLineageTag": "OrderKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "CustomerKey",
+            "dataType": "int64",
+            "sourceColumn": "CustomerKey",
+            "sourceLineageTag": "CustomerKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "StoreKey",
+            "dataType": "int64",
+            "sourceColumn": "StoreKey",
+            "sourceLineageTag": "StoreKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Order Date",
+            "dataType": "dateTime",
+            "sourceColumn": "DT",
+            "sourceLineageTag": "DT",
+            "summarizeBy": "none",
+            "formatString": "yyyy-MM-dd"
+          },
+          {
+            "name": "Delivery Date",
+            "dataType": "dateTime",
+            "sourceColumn": "DeliveryDate",
+            "sourceLineageTag": "DeliveryDate",
+            "summarizeBy": "none",
+            "formatString": "yyyy-MM-dd"
+          },
+          {
+            "name": "Currency Code",
+            "dataType": "string",
+            "sourceColumn": "CurrencyCode",
+            "sourceLineageTag": "CurrencyCode",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "Orders",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "orders",
+              "expressionSource": "DirectLake",
+              "schemaName": "contoso"
+            }
+          }
+        ],
+        "measures": [
+          {
+            "name": "Total Orders",
+            "expression": "COUNTROWS ( Orders )",
+            "formatString": "#,0"
+          }
+        ]
+      },
+      {
+        "name": "OrderRows",
+        "sourceLineageTag": "[contoso].[orderrows]",
+        "columns": [
+          {
+            "name": "Order Number",
+            "dataType": "int64",
+            "sourceColumn": "OrderKey",
+            "sourceLineageTag": "OrderKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Row Number",
+            "dataType": "int64",
+            "sourceColumn": "RowNumber",
+            "sourceLineageTag": "RowNumber",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "ProductKey",
+            "dataType": "int64",
+            "sourceColumn": "ProductKey",
+            "sourceLineageTag": "ProductKey",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Quantity",
+            "dataType": "int64",
+            "sourceColumn": "Quantity",
+            "sourceLineageTag": "Quantity",
+            "summarizeBy": "sum"
+          },
+          {
+            "name": "Unit Price",
+            "dataType": "decimal",
+            "sourceColumn": "UnitPrice",
+            "sourceLineageTag": "UnitPrice",
+            "summarizeBy": "none",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Net Price",
+            "dataType": "decimal",
+            "sourceColumn": "NetPrice",
+            "sourceLineageTag": "NetPrice",
+            "summarizeBy": "none",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Unit Cost",
+            "dataType": "decimal",
+            "sourceColumn": "UnitCost",
+            "sourceLineageTag": "UnitCost",
+            "summarizeBy": "none",
+            "formatString": "#,0.00"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "OrderRows",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "orderrows",
+              "expressionSource": "DirectLake",
+              "schemaName": "contoso"
+            }
+          }
+        ],
+        "measures": [
+          {
+            "name": "OrderRows Amount",
+            "expression": "SUMX ( OrderRows, OrderRows[Quantity] * OrderRows[Net Price] )",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "OrderRows Quantity",
+            "expression": "SUM ( OrderRows[Quantity] )",
+            "formatString": "#,0"
+          }
+        ]
+      },
+      {
+        "name": "Customer",
+        "sourceLineageTag": "[contoso].[customer]",
+        "columns": [
+          {
+            "name": "CustomerKey",
+            "dataType": "int64",
+            "sourceColumn": "CustomerKey",
+            "sourceLineageTag": "CustomerKey",
+            "summarizeBy": "none",
+            "isKey": true
+          },
+          {
+            "name": "Gender",
+            "dataType": "string",
+            "sourceColumn": "Gender",
+            "sourceLineageTag": "Gender",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Given Name",
+            "dataType": "string",
+            "sourceColumn": "GivenName",
+            "sourceLineageTag": "GivenName",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Surname",
+            "dataType": "string",
+            "sourceColumn": "Surname",
+            "sourceLineageTag": "Surname",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "City",
+            "dataType": "string",
+            "sourceColumn": "City",
+            "sourceLineageTag": "City",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "State",
+            "dataType": "string",
+            "sourceColumn": "State",
+            "sourceLineageTag": "State",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Country",
+            "dataType": "string",
+            "sourceColumn": "Country",
+            "sourceLineageTag": "Country",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Continent",
+            "dataType": "string",
+            "sourceColumn": "Continent",
+            "sourceLineageTag": "Continent",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Age",
+            "dataType": "int64",
+            "sourceColumn": "Age",
+            "sourceLineageTag": "Age",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "Customer",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "customer",
+              "expressionSource": "DirectLake",
+              "schemaName": "contoso"
+            }
+          }
+        ]
+      },
+      {
+        "name": "Product",
+        "sourceLineageTag": "[contoso].[product]",
+        "columns": [
+          {
+            "name": "ProductKey",
+            "dataType": "int64",
+            "sourceColumn": "ProductKey",
+            "sourceLineageTag": "ProductKey",
+            "summarizeBy": "none",
+            "isKey": true
+          },
+          {
+            "name": "Product Code",
+            "dataType": "string",
+            "sourceColumn": "ProductCode",
+            "sourceLineageTag": "ProductCode",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Product Name",
+            "dataType": "string",
+            "sourceColumn": "ProductName",
+            "sourceLineageTag": "ProductName",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Manufacturer",
+            "dataType": "string",
+            "sourceColumn": "Manufacturer",
+            "sourceLineageTag": "Manufacturer",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Brand",
+            "dataType": "string",
+            "sourceColumn": "Brand",
+            "sourceLineageTag": "Brand",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Color",
+            "dataType": "string",
+            "sourceColumn": "Color",
+            "sourceLineageTag": "Color",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Weight",
+            "dataType": "decimal",
+            "sourceColumn": "Weight",
+            "sourceLineageTag": "Weight",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Unit Cost",
+            "dataType": "decimal",
+            "sourceColumn": "Cost",
+            "sourceLineageTag": "Cost",
+            "summarizeBy": "none",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Unit Price",
+            "dataType": "decimal",
+            "sourceColumn": "Price",
+            "sourceLineageTag": "Price",
+            "summarizeBy": "none",
+            "formatString": "#,0.00"
+          },
+          {
+            "name": "Category",
+            "dataType": "string",
+            "sourceColumn": "CategoryName",
+            "sourceLineageTag": "CategoryName",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Subcategory",
+            "dataType": "string",
+            "sourceColumn": "SubCategoryName",
+            "sourceLineageTag": "SubCategoryName",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "Product",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "product",
+              "expressionSource": "DirectLake",
+              "schemaName": "contoso"
+            }
+          }
+        ]
+      },
+      {
+        "name": "Store",
+        "sourceLineageTag": "[contoso].[store]",
+        "columns": [
+          {
+            "name": "StoreKey",
+            "dataType": "int64",
+            "sourceColumn": "StoreKey",
+            "sourceLineageTag": "StoreKey",
+            "summarizeBy": "none",
+            "isKey": true
+          },
+          {
+            "name": "Store Code",
+            "dataType": "int64",
+            "sourceColumn": "StoreCode",
+            "sourceLineageTag": "StoreCode",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Country",
+            "dataType": "string",
+            "sourceColumn": "CountryName",
+            "sourceLineageTag": "CountryName",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "State",
+            "dataType": "string",
+            "sourceColumn": "State",
+            "sourceLineageTag": "State",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Name",
+            "dataType": "string",
+            "sourceColumn": "Description",
+            "sourceLineageTag": "Description",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Square Meters",
+            "dataType": "int64",
+            "sourceColumn": "SquareMeters",
+            "sourceLineageTag": "SquareMeters",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Open Date",
+            "dataType": "dateTime",
+            "sourceColumn": "OpenDate",
+            "sourceLineageTag": "OpenDate",
+            "summarizeBy": "none",
+            "formatString": "yyyy-MM-dd"
+          },
+          {
+            "name": "Status",
+            "dataType": "string",
+            "sourceColumn": "Status",
+            "sourceLineageTag": "Status",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "Store",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "store",
+              "expressionSource": "DirectLake",
+              "schemaName": "contoso"
+            }
+          }
+        ]
+      },
+      {
+        "name": "Date",
+        "sourceLineageTag": "[contoso].[date]",
+        "columns": [
+          {
+            "name": "Date",
+            "dataType": "dateTime",
+            "sourceColumn": "Date",
+            "sourceLineageTag": "Date",
+            "summarizeBy": "none",
+            "formatString": "yyyy-MM-dd",
+            "isKey": true
+          },
+          {
+            "name": "Year",
+            "dataType": "int64",
+            "sourceColumn": "Year",
+            "sourceLineageTag": "Year",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Year Month",
+            "dataType": "string",
+            "sourceColumn": "YearMonth",
+            "sourceLineageTag": "YearMonth",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Year Month Number",
+            "dataType": "int64",
+            "sourceColumn": "YearMonthNumber",
+            "sourceLineageTag": "YearMonthNumber",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Month",
+            "dataType": "string",
+            "sourceColumn": "Month",
+            "sourceLineageTag": "Month",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Month Number",
+            "dataType": "int64",
+            "sourceColumn": "MonthNumber",
+            "sourceLineageTag": "MonthNumber",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Quarter",
+            "dataType": "string",
+            "sourceColumn": "Quarter",
+            "sourceLineageTag": "Quarter",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Day of Week",
+            "dataType": "string",
+            "sourceColumn": "DayofWeek",
+            "sourceLineageTag": "DayofWeek",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Working Day",
+            "dataType": "int64",
+            "sourceColumn": "WorkingDay",
+            "sourceLineageTag": "WorkingDay",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "Date",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "date",
+              "expressionSource": "DirectLake",
+              "schemaName": "contoso"
+            }
+          }
+        ]
+      },
+      {
+        "name": "Currency Exchange",
+        "sourceLineageTag": "[contoso].[currency_exchange]",
+        "columns": [
+          {
+            "name": "Date",
+            "dataType": "dateTime",
+            "sourceColumn": "Date",
+            "sourceLineageTag": "Date",
+            "summarizeBy": "none",
+            "formatString": "yyyy-MM-dd"
+          },
+          {
+            "name": "From Currency",
+            "dataType": "string",
+            "sourceColumn": "FromCurrency",
+            "sourceLineageTag": "FromCurrency",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "To Currency",
+            "dataType": "string",
+            "sourceColumn": "ToCurrency",
+            "sourceLineageTag": "ToCurrency",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "Exchange",
+            "dataType": "decimal",
+            "sourceColumn": "Exchange",
+            "sourceLineageTag": "Exchange",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "Currency Exchange",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "currency_exchange",
+              "expressionSource": "DirectLake",
+              "schemaName": "contoso"
+            }
+          }
+        ]
+      }
+    ],
+    "relationships": [
+      {
+        "name": "sales_customer",
+        "fromTable": "Sales",
+        "fromColumn": "CustomerKey",
+        "toTable": "Customer",
+        "toColumn": "CustomerKey",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "sales_product",
+        "fromTable": "Sales",
+        "fromColumn": "ProductKey",
+        "toTable": "Product",
+        "toColumn": "ProductKey",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "sales_store",
+        "fromTable": "Sales",
+        "fromColumn": "StoreKey",
+        "toTable": "Store",
+        "toColumn": "StoreKey",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "sales_orderdate",
+        "fromTable": "Sales",
+        "fromColumn": "Order Date",
+        "toTable": "Date",
+        "toColumn": "Date",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "sales_deliverydate",
+        "fromTable": "Sales",
+        "fromColumn": "Delivery Date",
+        "toTable": "Date",
+        "toColumn": "Date",
+        "isActive": false
+      },
+      {
+        "name": "orders_customer",
+        "fromTable": "Orders",
+        "fromColumn": "CustomerKey",
+        "toTable": "Customer",
+        "toColumn": "CustomerKey",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "orders_store",
+        "fromTable": "Orders",
+        "fromColumn": "StoreKey",
+        "toTable": "Store",
+        "toColumn": "StoreKey",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "orders_orderdate",
+        "fromTable": "Orders",
+        "fromColumn": "Order Date",
+        "toTable": "Date",
+        "toColumn": "Date",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "orders_deliverydate",
+        "fromTable": "Orders",
+        "fromColumn": "Delivery Date",
+        "toTable": "Date",
+        "toColumn": "Date",
+        "isActive": false
+      },
+      {
+        "name": "orderrows_orders",
+        "fromTable": "OrderRows",
+        "fromColumn": "Order Number",
+        "toTable": "Orders",
+        "toColumn": "Order Number",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "orderrows_product",
+        "fromTable": "OrderRows",
+        "fromColumn": "ProductKey",
+        "toTable": "Product",
+        "toColumn": "ProductKey",
+        "relyOnReferentialIntegrity": true
+      },
+      {
+        "name": "currency_date",
+        "fromTable": "Currency Exchange",
+        "fromColumn": "Date",
+        "toTable": "Date",
+        "toColumn": "Date",
+        "relyOnReferentialIntegrity": true
+      }
+    ]
+  }
+}

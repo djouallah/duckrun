@@ -1,0 +1,5 @@
+# generator download + OUT/CACHE scratch (build_base.py default CONTOSO_WORK)
+_contoso_work/
+# local run report
+run_report.json
+__pycache__/
