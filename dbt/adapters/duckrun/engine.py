@@ -49,15 +49,16 @@ _ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
 # smaller of two bounds:
 #   - zero-fallback: rg_rows * 8 (+ slack) — above a near-unique INT64 column's worst-case dictionary, so
 #     arrow-rs never falls back to PLAIN partway through a chunk;
-#   - _DICT_PAGE_MAX (the merge ceiling): a delta_rs MERGE materializes these dictionaries on read, and an
-#     unbounded one blows the merge-spill stress gate (a ~132 MB per-column dictionary at 16M-row groups
-#     ran the merge out of spill disk). So a per-column dictionary bigger than the cap can't be merged; a
-#     near-unique column in a large (e.g. 16M-row) group whose zero-fallback dictionary exceeds the cap
-#     FALLS BACK to PLAIN — the one accepted exception, and cheap (PLAIN streams through a merge). The cap
-#     is tuned EMPIRICALLY as the largest value that keeps the merge-spill gate green: bisected at SF=10,
-#     48 MB spills the merge out of disk (red), 32 MB stays green — so 32 MB, the last green with margin.
+#   - _DICT_PAGE_MAX (the prudent cap): a delta_rs MERGE materializes these dictionaries and re-writes the
+#     touched files, so an unbounded per-column dictionary (a near-unique INT64 column at 16M-row groups is
+#     ~132 MB) inflates the merge's transient scratch. 32 MB keeps that bounded. A near-unique column in a
+#     large (e.g. 16M-row) group whose zero-fallback dictionary exceeds the cap FALLS BACK to PLAIN — the
+#     one accepted exception, and cheap (PLAIN streams through a merge). NOTE: this cap is NOT gate-derived.
+#     The merge-spill stress gate's earlier "reds" at 48/32 MB were scratch-DISK exhaustion (its temp landed
+#     on the small 18 GB root volume, now routed to the big disk like tpch-stress), not a RAM/OOM ceiling —
+#     so there is no clean empirical dictionary ceiling to read off it. 32 MB is a conservative default.
 _DICT_PAGE_SLACK = 4 * 1024 * 1024   # page-framing headroom above the worst-case INT64 dictionary
-_DICT_PAGE_MAX = 32 * 1024 * 1024    # merge ceiling — tuned against the merge-spill gate (see above)
+_DICT_PAGE_MAX = 32 * 1024 * 1024    # prudent per-column dictionary cap (see block comment; NOT gate-tuned)
 
 
 def _dict_page_limit(rg_rows):
