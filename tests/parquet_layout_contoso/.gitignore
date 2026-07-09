@@ -3,3 +3,7 @@ _contoso_work/
 # local run report
 run_report.json
 __pycache__/
+
+# Re-include the vendored generator config: the repo-root .gitignore has `*.json`, which would
+# otherwise silently drop this required input (build_base.py passes it to DatabaseGenerator).
+!config.json
