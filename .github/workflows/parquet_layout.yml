@@ -6,8 +6,8 @@ name: Direct Lake query benchmark
 # _auto_sort model (duckrun-clustered fact, current WriterProperties) vs the _vorder model (Fabric
 # Spark V-Order fact). The duckrun and Spark builds each read mart.fct_summary DIRECTLY and
 # independently (applying row_limit), so the V-Order input is never routed through a duckrun write;
-# only speed differs. Runs on windows-latest where ADOMD.NET loads cleanly. See
-# tests/parquet_layout_tests/README.md.
+# only speed differs. Runs on ubuntu-latest (ADOMD.NET's NetCore build is cross-platform and loads
+# under pythonnet/coreclr). See tests/parquet_layout_tests/README.md.
 on:
   workflow_dispatch:
     inputs:
@@ -51,8 +51,15 @@ permissions:
 jobs:
   benchmark:
     name: 🔍 Benchmark
-    runs-on: windows-latest
+    # Linux (was windows-latest): faster/cheaper runners, no Windows quirks. ADOMD.NET has a
+    # cross-platform .NET Core build that loads under pythonnet/coreclr on Linux.
+    runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # The azure extension's default transport fails the OneLake TLS handshake on Linux runners
+      # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle. Every
+      # Linux OneLake workflow (aemo, parity, integration_tests_onelake) sets this.
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
@@ -68,7 +75,6 @@ jobs:
           pip install -e .
 
       - name: 🧾 Init run report
-        shell: pwsh
         env:
           BENCH_ENV: ${{ inputs.env }}
           BENCH_RUNS: ${{ inputs.runs }}
@@ -79,16 +85,24 @@ jobs:
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
         run: |
-          "RUN_REPORT=$PWD\run_report.json" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          $env:RUN_REPORT = "$PWD\run_report.json"
-          python tests/parquet_layout_tests/report.py init
+          echo "RUN_REPORT=$PWD/run_report.json" >> "$GITHUB_ENV"
+          RUN_REPORT="$PWD/run_report.json" python tests/parquet_layout_tests/report.py init
 
-      - name: 🧩 Install ADOMD.NET client (NuGet)
-        shell: pwsh
+      - name: 🧩 Install ADOMD.NET client (.NET Core build, cross-platform)
         run: |
-          # NetCore build so it loads under pythonnet's coreclr runtime. No -Version => latest stable.
-          nuget install Microsoft.AnalysisServices.AdomdClient.NetCore.retail.amd64 -OutputDirectory nuget -NonInteractive
-          "ADOMD_DIR=$PWD\nuget" >> $env:GITHUB_ENV
+          set -euo pipefail
+          # ADOMD.NET's NetCore build is cross-platform and loads under pythonnet/coreclr. `dotnet
+          # publish` a throwaway console app that references it so the DLL AND all its dependency
+          # assemblies (Microsoft.Identity.Client, IdentityModel.*, …) land in one folder that
+          # xmla_compare._load_adomd can glob. (A bare nupkg would miss the transitive deps.)
+          proj="$RUNNER_TEMP/adomd"
+          mkdir -p "$proj" && cd "$proj"
+          dotnet new console -o . --force >/dev/null
+          dotnet add package Microsoft.AnalysisServices.AdomdClient.NetCore.retail.amd64 >/dev/null
+          dotnet publish -c Release -o publish >/dev/null
+          test -f "$proj/publish/Microsoft.AnalysisServices.AdomdClient.dll"
+          echo "ADOMD_DIR=$proj/publish" >> "$GITHUB_ENV"
+          echo "resolved ADOMD_DIR=$proj/publish"
 
       - name: 🔐 Azure federated login
         uses: azure/login@v2
