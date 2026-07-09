@@ -132,7 +132,7 @@ three-part target writes to that catalog; the attached catalogs are visible to n
 introspection (`SHOW DATABASES`, `information_schema`, `duckdb_databases()`).
 
 See the full runnable walkthrough in
-[`integration_tests/multicatalog/demo_multicatalog.py`](../integration_tests/multicatalog/demo_multicatalog.py)
+[`integration_tests/multicatalog/demo_multicatalog.py`](../tests/integration_tests/multicatalog/demo_multicatalog.py)
 (published as a [live report](https://djouallah.github.io/duckrun/multicatalog.html)).
 
 ## Raw SQL DML through `conn.sql`

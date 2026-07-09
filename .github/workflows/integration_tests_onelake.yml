@@ -23,19 +23,19 @@ on:
   push:
     branches: ["**"]
     paths:
-      - 'performance_test/merge_spill/**'
-      - 'integration_tests/coffee/**'
-      - 'integration_tests/taxi/**'
-      - 'integration_tests/multicatalog/**'
+      - 'tests/performance_test/merge_spill/**'
+      - 'tests/integration_tests/coffee/**'
+      - 'tests/integration_tests/taxi/**'
+      - 'tests/integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
       - 'tests/performance/merge_tpch_bench.py'
       - '.github/workflows/integration_tests_onelake.yml'
   pull_request:
     paths:
-      - 'performance_test/merge_spill/**'
-      - 'integration_tests/coffee/**'
-      - 'integration_tests/taxi/**'
-      - 'integration_tests/multicatalog/**'
+      - 'tests/performance_test/merge_spill/**'
+      - 'tests/integration_tests/coffee/**'
+      - 'tests/integration_tests/taxi/**'
+      - 'tests/integration_tests/multicatalog/**'
       - 'tests/connection_api/**'
       - 'tests/performance/merge_tpch_bench.py'
       - '.github/workflows/integration_tests_onelake.yml'
@@ -75,20 +75,20 @@ jobs:
         with:
           filters: |
             merge_spill:
-              - 'performance_test/merge_spill/**'
+              - 'tests/performance_test/merge_spill/**'
               - 'tests/performance/merge_tpch_bench.py'
               - 'tests/connection_api/**'
               - '.github/workflows/integration_tests_onelake.yml'
             coffee:
-              - 'integration_tests/coffee/**'
+              - 'tests/integration_tests/coffee/**'
               - 'tests/connection_api/**'
               - '.github/workflows/integration_tests_onelake.yml'
             taxi:
-              - 'integration_tests/taxi/**'
+              - 'tests/integration_tests/taxi/**'
               - 'tests/connection_api/**'
               - '.github/workflows/integration_tests_onelake.yml'
             multicatalog:
-              - 'integration_tests/multicatalog/**'
+              - 'tests/integration_tests/multicatalog/**'
               - 'tests/connection_api/**'
               - '.github/workflows/integration_tests_onelake.yml'
 
@@ -150,7 +150,7 @@ jobs:
       group: coffee-onelake
       cancel-in-progress: false
     env:
-      DBT_PROFILES_DIR: ${{ github.workspace }}/integration_tests/coffee
+      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
       AZURE_TRANSPORT_OPTION_TYPE: curl
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
     steps:
@@ -176,7 +176,7 @@ jobs:
         # (row counts/size) off the abfss:// Delta tables. COFFEE_ROWS sizes the fact (kept small — the
         # 100M scale is already proven); DBT_SCHEMA isolates it from the connection-API scenario's
         # schema in the shared lakehouse.
-        working-directory: integration_tests/coffee
+        working-directory: tests/integration_tests/coffee
         env:
           DBT_SCHEMA: duckrun_dbt_it
           COFFEE_ROWS: "10000"
@@ -184,13 +184,13 @@ jobs:
           dbt build --target dev
           dbt docs generate --static --target dev
       - name: Verify the coffee catalog carries Delta table stats (issue #3)
-        working-directory: integration_tests/coffee
+        working-directory: tests/integration_tests/coffee
         run: python "${{ github.workspace }}/tests/tools/check_catalog_stats.py" target/catalog.json coffee
       - name: Upload coffee docs
         uses: actions/upload-artifact@v4
         with:
           name: docs-coffee
-          path: integration_tests/coffee/target/static_index.html
+          path: tests/integration_tests/coffee/target/static_index.html
       - name: SORTED BY AUTO sort rewrite on fact_sales (dogfood)
         # Dogfood on the partitioned coffee fact: connect writable to the dbt build's schema, run the
         # SQL-only auto-key sort rewrite, print the before/after layout. fact_sales is partitioned by
@@ -224,13 +224,13 @@ jobs:
         env:
           DUCKRUN_IT_SCHEMA: duckrun_conn_it
           COFFEE_ONELAKE_ROWS: "2000"
-        run: python -m pytest integration_tests/coffee/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
+        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
 
       - name: OneLake Files copy/download round-trip (COPY … FORMAT BLOB, no obstore)
         # The live gate for conn.copy()/conn.download(): the azure COPY (FORMAT BLOB) write path can't
         # be proven off a laptop (different tenant), so it's proven here against the shared lakehouse's
         # Files scratch (never Tables).
-        run: python -m pytest integration_tests/coffee/test_coffee.py::test_onelake_files_copy_download_roundtrip -q -s -p no:cacheprovider
+        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_onelake_files_copy_download_roundtrip -q -s -p no:cacheprovider
 
       - name: Connect over a FRIENDLY-name OneLake path (delta-kernel #307 error-hygiene gate)
         # Same lakehouse as above, addressed by friendly workspace/lakehouse names instead of GUIDs.
@@ -239,7 +239,7 @@ jobs:
         # CREATE VIEW SQL) and carries the GUID workaround. The GUID jobs above can't cover this.
         env:
           WAREHOUSE_PATH_FRIENDLY: abfss://tpch@onelake.dfs.fabric.microsoft.com/duckrun.Lakehouse/Tables
-        run: python -m pytest integration_tests/coffee/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
+        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_onelake_friendly_name_connect_error_is_clean -q -s -p no:cacheprovider
 
   taxi:
     # The SQL-first NYC-taxi showcase: a runnable demo (not a gate) that reads real live NYC TLC
@@ -277,7 +277,7 @@ jobs:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
           DUCKRUN_TAXI_PAGE: taxi_run.html   # the demo writes its full SQL+results HTML report here
-        run: python integration_tests/taxi/demo_taxi.py
+        run: python tests/integration_tests/taxi/demo_taxi.py
 
       - name: SORTED BY AUTO sort rewrite on trips (dogfood)
         # Dogfood of the SQL-only auto-key sort rewrite on the demo fact table: connect writable, run
@@ -342,7 +342,7 @@ jobs:
         # `catalogs:` + `+database` write/read/incremental paths before the OneLake steps below.
         run: |
           python -m pytest \
-            integration_tests/multicatalog/dbt/test_multicatalog_dbt.py \
+            tests/integration_tests/multicatalog/dbt/test_multicatalog_dbt.py \
             -q -p no:cacheprovider
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
@@ -368,7 +368,7 @@ jobs:
           LH_GOLD_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/4fb792e8-b2e6-431c-b2d3-36727410bea8/Tables
           DBT_SCHEMA: multicatalog_dbt_demo
           DUCKRUN_MULTICAT_DBT_PAGE: multicatalog_dbt_run.html
-        run: python integration_tests/multicatalog/demo_multicatalog_dbt.py
+        run: python tests/integration_tests/multicatalog/demo_multicatalog_dbt.py
       - name: Upload the dbt multi-lakehouse HTML report (published as multicatalog_dbt.html)
         if: always() && hashFiles('multicatalog_dbt_run.html') != ''
         uses: actions/upload-artifact@v4
@@ -383,7 +383,7 @@ jobs:
           WAREHOUSE_RO_PATH: abfss://d5f25039-7f33-4668-b909-2c397b2626fb@onelake.dfs.fabric.microsoft.com/61bf56ea-a4d5-4895-a90e-a6daa6e02d04/Tables
           DUCKRUN_MULTICAT_SCHEMA: multicatalog_demo
           DUCKRUN_MULTICAT_PAGE: multicatalog_run.html   # the demo writes its full HTML report here
-        run: python integration_tests/multicatalog/demo_multicatalog.py
+        run: python tests/integration_tests/multicatalog/demo_multicatalog.py
 
       - name: Upload this run's HTML report for deploy-docs to publish as multicatalog.html
         if: always() && hashFiles('multicatalog_run.html') != ''

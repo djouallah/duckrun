@@ -22,13 +22,13 @@ on:
   push:
     branches: ["**"]   # any branch, but NOT a tag push (v*) — that is publish.yml's job
     paths:
-      - 'parity_tests/**'
+      - 'tests/parity_tests/**'
       - 'dbt/adapters/duckrun/**'
       - 'dbt/include/duckrun/**'
       - '.github/workflows/parity.yml'
   pull_request:
     paths:
-      - 'parity_tests/**'
+      - 'tests/parity_tests/**'
       - 'dbt/adapters/duckrun/**'
       - 'dbt/include/duckrun/**'
       - '.github/workflows/parity.yml'
@@ -84,10 +84,10 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Parity — jaffle_shop, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
-        run: python parity_tests/jaffle_shop/run_parity.py
+        run: python tests/parity_tests/jaffle_shop/run_parity.py
       - name: Generate jaffle_shop dbt docs (static — catalog with row/byte stats off the OneLake tables)
         env:
-          DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/jaffle_shop
+          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/parity_tests/jaffle_shop
         working-directory: /tmp/js
         run: dbt docs generate --static --target dev --target-path target_docs
       - name: Upload jaffle_shop dbt docs (deploy-docs publishes it as jaffle_shop.html)
@@ -130,10 +130,10 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Parity — sde, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
-        run: python parity_tests/sde/run_parity.py
+        run: python tests/parity_tests/sde/run_parity.py
       - name: Generate sde dbt docs (static — catalog stats off the OneLake tables)
         env:
-          DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/sde
+          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/parity_tests/sde
         working-directory: /tmp/sde_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
       - name: Upload sde dbt docs (deploy-docs publishes it as sde.html)
@@ -177,10 +177,10 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Parity — mrr, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
-        run: python parity_tests/mrr/run_parity.py
+        run: python tests/parity_tests/mrr/run_parity.py
       - name: Generate mrr dbt docs (static — catalog stats off the OneLake tables)
         env:
-          DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/mrr
+          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/parity_tests/mrr
         working-directory: /tmp/mrr_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
       - name: Upload mrr dbt docs (deploy-docs publishes it as mrr.html)
@@ -226,10 +226,10 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Parity — techflow, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
-        run: python parity_tests/techflow/run_parity.py
+        run: python tests/parity_tests/techflow/run_parity.py
       - name: Generate techflow dbt docs (static — catalog stats off the OneLake tables)
         env:
-          DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/techflow
+          DBT_PROFILES_DIR: ${{ github.workspace }}/tests/parity_tests/techflow
         working-directory: /tmp/techflow_duckrun
         run: dbt docs generate --static --target dev --target-path target_docs
       - name: Upload techflow dbt docs (deploy-docs publishes it as techflow.html)
@@ -254,7 +254,7 @@ jobs:
       # The duckrun connection lives OUTSIDE the cloned repo (dbt profiles always do); the Tuva repo
       # is run verbatim. httpfs + s3_region (in this profile) let the seed bootstrap read the public
       # tuva-public-resources S3 bucket anonymously; models materialize to OneLake.
-      DBT_PROFILES_DIR: ${{ github.workspace }}/parity_tests/tuva
+      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/parity_tests/tuva
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       AZURE_TRANSPORT_OPTION_TYPE: curl
       DBT_SCHEMA: tuva

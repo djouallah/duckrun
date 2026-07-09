@@ -7,7 +7,7 @@ name: Direct Lake query benchmark
 # Spark V-Order fact). The duckrun and Spark builds each read mart.fct_summary DIRECTLY and
 # independently (applying row_limit), so the V-Order input is never routed through a duckrun write;
 # only speed differs. Runs on windows-latest where ADOMD.NET loads cleanly. See
-# parquet_layout_tests/README.md.
+# tests/parquet_layout_tests/README.md.
 on:
   workflow_dispatch:
     inputs:
@@ -81,7 +81,7 @@ jobs:
         run: |
           "RUN_REPORT=$PWD\run_report.json" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           $env:RUN_REPORT = "$PWD\run_report.json"
-          python parquet_layout_tests/report.py init
+          python tests/parquet_layout_tests/report.py init
 
       - name: 🧩 Install ADOMD.NET client (NuGet)
         shell: pwsh
@@ -102,7 +102,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           # ws id from deploy_config; lakehouse id + workspace name from the Fabric/Power BI APIs.
-          $meta = python -c "import yaml, json; c = yaml.safe_load(open('parquet_layout_tests/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
+          $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout_tests/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
           $wsId = $meta.ws
           $lhs = az rest --method get --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" | ConvertFrom-Json
           $lhId = ($lhs.value | Where-Object { $_.displayName -eq $meta.lh }).id
@@ -130,7 +130,7 @@ jobs:
         id: check
         env:
           PYTHONIOENCODING: utf-8
-        run: python parquet_layout_tests/check_tables.py
+        run: python tests/parquet_layout_tests/check_tables.py
 
       - name: ⚡ Build Spark V-Order table (Livy, reads mart.fct_summary directly)
         if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
@@ -138,7 +138,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
-        run: python parquet_layout_tests/build_spark_variant.py
+        run: python tests/parquet_layout_tests/build_spark_variant.py
 
       - name: 🧭 Build auto_sort summary table (duckrun sorted, reads mart.fct_summary directly)
         if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
@@ -147,23 +147,23 @@ jobs:
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
-        run: python parquet_layout_tests/build_auto_sort.py
+        run: python tests/parquet_layout_tests/build_auto_sort.py
 
       - name: 🚀 Deploy benchmark semantic models (auto_sort + vorder)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           fab config set encryption_fallback_enabled true
-          # Federated (OIDC) login for fab — deploys only parquet_layout_tests/*.SemanticModel.
+          # Federated (OIDC) login for fab — deploys only tests/parquet_layout_tests/*.SemanticModel.
           $fed = (Invoke-RestMethod -Uri "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
           fab auth login -t ${{ secrets.AZURE_TENANT_ID }} -u ${{ secrets.AZURE_CLIENT_ID }} --federated-token $fed
-          python parquet_layout_tests/deploy_vorder.py --env ${{ inputs.env }}
+          python tests/parquet_layout_tests/deploy_vorder.py --env ${{ inputs.env }}
 
       - name: 📊 Table stats (duckrun) — fct_summary_auto_sort vs fct_summary_vorder
         continue-on-error: true   # nice-to-have; never block the benchmark
         env:
           PYTHONIOENCODING: utf-8
-        run: python parquet_layout_tests/table_stats.py
+        run: python tests/parquet_layout_tests/table_stats.py
 
       - name: 🔍 Benchmark both models over XMLA
         env:
@@ -174,18 +174,18 @@ jobs:
           BENCH_COLD: ${{ inputs.cold }}
           COLD_REPEATS: ${{ inputs.cold_repeats }}
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
-        run: python parquet_layout_tests/xmla_compare.py
+        run: python tests/parquet_layout_tests/xmla_compare.py
 
       - name: 📝 Render report to job summary (computes + merges the analysis block)
         if: always()
         continue-on-error: true
-        run: python parquet_layout_tests/render_report.py
+        run: python tests/parquet_layout_tests/render_report.py
 
       - name: 📑 Render specialist findings to job summary (fails on verdict-direction mismatch)
         if: always()
         env:
           PYTHONIOENCODING: utf-8
-        run: python parquet_layout_tests/render_summary.py
+        run: python tests/parquet_layout_tests/render_summary.py
 
       - name: 📎 Upload run report
         if: always()

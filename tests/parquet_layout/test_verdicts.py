@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-_PL = os.path.join(os.path.dirname(__file__), "..", "..", "parquet_layout_tests")
+_PL = os.path.join(os.path.dirname(__file__), "..", "parquet_layout_tests")
 sys.path.insert(0, os.path.abspath(_PL))
 
 import render_report as rr          # noqa: E402

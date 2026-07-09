@@ -158,7 +158,7 @@ jobs:
           # -s: stream the scenario's stage-by-stage narration into the log (without it pytest
           # captures the prints and the run shows nothing).
           /usr/bin/time -v python -m pytest \
-            integration_tests/coffee/test_coffee.py::test_coffee_local \
+            tests/integration_tests/coffee/test_coffee.py::test_coffee_local \
             -q -s -p no:cacheprovider 2>&1 | tee stress.log
           rc=${PIPESTATUS[0]}
           {
@@ -218,7 +218,7 @@ jobs:
         env:
           TMPDIR: /mnt/tpch
         run: |
-          python performance_test/tpch/tpch_card.py ; rc=$?
+          python tests/performance_test/tpch/tpch_card.py ; rc=$?
           if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
             echo "**TPC-H SF=$TPCH_SF: 💀 OOM / disk-killed (rc=$rc)** — did not fit the runner." >> "$GITHUB_STEP_SUMMARY"
           fi

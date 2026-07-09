@@ -23,10 +23,11 @@ name: cores
 #   • coffee-smoke            — fast connect/read/write/merge smoke at a small row count.
 #
 # Path-filtered to the offline surface it actually exercises — the adapter, the duckrun package, and
-# the test suites. A change that touches only docs, parity_tests/, or integration_tests/ doesn't
-# affect these tests, so it doesn't run cores. As a release gate it still runs UNFILTERED via
-# workflow_call from publish.yml. Out of scope here (deliberately): the live-OneLake projects
-# (integration_tests_onelake.yml) and the heavy local stress runs (local_stress_tests.yml).
+# the test suites (everything under tests/, which now also houses the aemo / parity / integration
+# projects). A change that touches only docs doesn't affect these tests, so it doesn't run cores. As
+# a release gate it still runs UNFILTERED via workflow_call from publish.yml. Out of scope here
+# (deliberately): the live-OneLake projects (integration_tests_onelake.yml) and the heavy local
+# stress runs (local_stress_tests.yml).
 
 on:
   push:
@@ -111,7 +112,7 @@ jobs:
         # Offline and deterministic, so it belongs on the per-change gate next to the unit tests.
         run: |
           python -m pytest \
-            integration_tests/snapshot_pin/test_snapshot_pin.py \
+            tests/integration_tests/snapshot_pin/test_snapshot_pin.py \
             -q -p no:cacheprovider
 
       - name: dbt native unit tests on duckrun (realistic jaffle-style project)
@@ -370,7 +371,7 @@ jobs:
       - name: Render the snapshot-pin scorecard (also writes the run summary)
         # Exit 0 = the demonstration holds (unpinned loses the update, pinned preserves it).
         # Exit non-zero = the pin's guarantee regressed -> the run fails.
-        run: python integration_tests/snapshot_pin/snapshot_pin_card.py
+        run: python tests/integration_tests/snapshot_pin/snapshot_pin_card.py
 
       - name: Inject the card into docs and commit to main
         # Only a push to main updates the canonical card in the docs; PRs/branches just show it in
@@ -412,7 +413,7 @@ jobs:
 
       - name: Run the local coffee-shop scenario (small N)
         # -s streams the scenario's stage-by-stage narration into the job log.
-        run: python -m pytest integration_tests/coffee/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider
+        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider
 
   tpch-smoke:
     # A fast SF=1 smoke of the connection-API TPCH benchmark (duckrun.connect): generate →
@@ -439,4 +440,4 @@ jobs:
       - name: Run the TPCH benchmark (SF=1) as the guard
         # Runs the full benchmark; exit non-zero = the read/write surface or the 22-query run
         # regressed. Writes docs/tpch_card.md (gitignored) + the job summary, but does NOT commit it.
-        run: python performance_test/tpch/tpch_card.py
+        run: python tests/performance_test/tpch/tpch_card.py

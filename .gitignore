@@ -60,9 +60,9 @@ conformance.xml
 *.csv
 
 # But DO keep integration test fixtures and dbt project files
-!integration_tests/**/*.csv
-!integration_tests/**/*.yml
-!integration_tests/**/*.json
+!tests/integration_tests/**/*.csv
+!tests/integration_tests/**/*.yml
+!tests/integration_tests/**/*.json
 # ...and the vendored connection-API fixtures (coffee dimension CSVs)
 !tests/connection_api/**/*.csv
 # ...and the native-unit-test project's seeds (raw_customers / raw_orders / top_level_email_domains)
@@ -72,28 +72,28 @@ conformance.xml
 !.claude-plugin/marketplace.json
 !plugins/**/.claude-plugin/plugin.json
 # ...except dbt's auto-generated local user file (aemo, any integration project)
-integration_tests/*/.user.yml
-performance_test/*/.user.yml
-parity_tests/*/.user.yml
+tests/integration_tests/*/.user.yml
+tests/performance_test/*/.user.yml
+tests/parity_tests/*/.user.yml
 
 # Delta output and dbt artifacts produced by the integration projects (runtime)
-integration_tests/*/warehouse/
-integration_tests/*/target/
-integration_tests/*/dbt_packages/
-integration_tests/*/logs/
-integration_tests/*/package-lock.yml
-# aemo — promoted to a top-level project (its own workflow, .github/workflows/aemo.yml)
-aemo/.user.yml
-aemo/warehouse/
-aemo/target/
-aemo/dbt_packages/
-aemo/logs/
-aemo/package-lock.yml
-# multicatalog's dbt demo is one level deeper (integration_tests/multicatalog/dbt/)
-integration_tests/multicatalog/dbt/target/
-integration_tests/multicatalog/dbt/dbt_packages/
-integration_tests/multicatalog/dbt/logs/
-integration_tests/multicatalog/dbt/.user.yml
+tests/integration_tests/*/warehouse/
+tests/integration_tests/*/target/
+tests/integration_tests/*/dbt_packages/
+tests/integration_tests/*/logs/
+tests/integration_tests/*/package-lock.yml
+# aemo — a dbt project under tests/ (its own workflow, .github/workflows/aemo.yml)
+tests/aemo/.user.yml
+tests/aemo/warehouse/
+tests/aemo/target/
+tests/aemo/dbt_packages/
+tests/aemo/logs/
+tests/aemo/package-lock.yml
+# multicatalog's dbt demo is one level deeper (tests/integration_tests/multicatalog/dbt/)
+tests/integration_tests/multicatalog/dbt/target/
+tests/integration_tests/multicatalog/dbt/dbt_packages/
+tests/integration_tests/multicatalog/dbt/logs/
+tests/integration_tests/multicatalog/dbt/.user.yml
 # dbt run artifacts from the native-unit-test project (the harness runs dbt build into PROJECT_DIR)
 tests/dbt_unit_tests/project/target/
 tests/dbt_unit_tests/project/dbt_packages/
@@ -106,11 +106,11 @@ tests/multi_catalog/logs/
 tests/multi_catalog/.user.yml
 # Runtime artifacts from the performance projects (merge_spill / tpch write to external dirs by
 # default, but a local run may drop these inside the project)
-performance_test/*/warehouse/
-performance_test/*/target/
-performance_test/*/dbt_packages/
-performance_test/*/logs/
-performance_test/*/package-lock.yml
+tests/performance_test/*/warehouse/
+tests/performance_test/*/target/
+tests/performance_test/*/dbt_packages/
+tests/performance_test/*/logs/
+tests/performance_test/*/package-lock.yml
 # The MERGE benchmark scorecard the runner writes (injected into docs/merge-benchmark.md in CI)
 docs/merge_card.md
 # The snapshot-pin scorecard the runner writes (injected into docs/snapshot-pin.md in CI)

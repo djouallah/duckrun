@@ -2,7 +2,7 @@
 
 duckrun is built to be a **drop-in for dbt-duckdb** — same DuckDB SQL, same models, but every
 table materializes to Delta Lake via delta-rs. `parity_tests/`
-([on GitHub](../parity_tests/)) proves that claim against *real, unmodified* dbt+DuckDB projects:
+([on GitHub](../tests/parity_tests/)) proves that claim against *real, unmodified* dbt+DuckDB projects:
 take a project whose profile says `type: duckdb`, run it **verbatim** on both dbt-duckdb (the
 oracle) and duckrun, and check the results match.
 
@@ -14,7 +14,7 @@ project does expose a gap, the fix lands in **duckrun**, never in the project.
 
 ## jaffle_shop — full differential { #jaffle_shop }
 
-[`parity_tests/jaffle_shop/run_parity.py`](../parity_tests/jaffle_shop/run_parity.py) clones
+[`parity_tests/jaffle_shop/run_parity.py`](../tests/parity_tests/jaffle_shop/run_parity.py) clones
 [dbt-labs/jaffle_shop_duckdb](https://github.com/dbt-labs/jaffle_shop_duckdb), runs `dbt build`
 once on dbt-duckdb and once on duckrun, then diffs **every persisted table** with a row-multiset
 `EXCEPT ALL` both ways. dbt-duckdb's tables are ground truth; a mismatch is a duckrun bug.
@@ -38,7 +38,7 @@ catalog with per-table row/byte stats), generated on duckrun by `dbt docs genera
 bronze→silver→gold project with a **`delete+insert` incremental model**, an **SCD2 snapshot**,
 packages, and an exposure. It ingests raw CSVs into a DuckDB file via its own EL and reads them as
 `sources` — so the duckrun profile sets `path` to that file and `root_path` to a Delta warehouse.
-[`run_parity.py`](../parity_tests/sde/run_parity.py) builds it on dbt-duckdb and duckrun and diffs
+[`run_parity.py`](../tests/parity_tests/sde/run_parity.py) builds it on dbt-duckdb and duckrun and diffs
 every persisted table.
 
 This is the project that exposed duckrun silently aliasing `delete+insert` to `merge`; with real
@@ -64,7 +64,7 @@ reactivation / retained (`fct_mrr_movements`). It's the first project here with 
 `unit_tests:`** (3 cases on the amortization model) plus singular tests and an exposure, so a green
 `dbt build` proves duckrun's unit-test / test path too. No external sources, so the duckrun profile
 just points `root_path` at a Delta warehouse.
-[`run_parity.py`](../parity_tests/mrr/run_parity.py) builds it on dbt-duckdb and duckrun and diffs
+[`run_parity.py`](../tests/parity_tests/mrr/run_parity.py) builds it on dbt-duckdb and duckrun and diffs
 every persisted table:
 
 | table | rows | duckrun == dbt-duckdb |
@@ -95,7 +95,7 @@ green on duckrun, unmodified.
 and the first parity project with **native dbt `unit_tests:`**. It also reads its raw data from
 committed **parquet** via dbt-duckdb `external_location` sources, and exercises an **incremental**
 model, two **timestamp snapshots**, `dbt_expectations` and exposures — all deterministic.
-[`run_parity.py`](../parity_tests/techflow/run_parity.py) builds it on dbt-duckdb and duckrun and
+[`run_parity.py`](../tests/parity_tests/techflow/run_parity.py) builds it on dbt-duckdb and duckrun and
 diffs every persisted table; the full `dbt build` (seeds, snapshots, ~30 models, 2 unit tests, 137
 data tests, exposures) runs green on duckrun, unmodified.
 
