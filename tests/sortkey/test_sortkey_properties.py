@@ -250,3 +250,26 @@ def test_optimize_analyze_seed_is_deterministic(session, capsys):
     capsys.readouterr()
     r2 = [tuple(row) for row in session._get_rle("seeded", seed=7).fetchall()]
     assert r1 == r2
+
+
+# ── 16. decimal_narrow_target: a wide DECIMAL (p>18 → FLBA, no arrow-rs dictionary) narrows to ──
+#        DECIMAL(18,s) iff its EXACT max fits; scale is preserved. Pure — no DB. ──────────────────
+def test_decimal_narrow_target():
+    from decimal import Decimal
+    f = sortkey.decimal_narrow_target
+    # p > 18 and the true max fits DECIMAL(18,s) → narrow, scale unchanged.
+    assert f("DECIMAL(38,6)", Decimal("9412.50")) == "DECIMAL(18,6)"
+    assert f("DECIMAL(38,6)", 9412.5) == "DECIMAL(18,6)"
+    assert f("DECIMAL(38,4)", 100) == "DECIMAL(18,4)"          # scale preserved, only precision cut
+    assert f("DECIMAL(38,2)", None) == "DECIMAL(18,2)"          # all-NULL column trivially fits
+    # p <= 18 already fits INT64 — nothing to narrow.
+    assert f("DECIMAL(18,2)", 5) is None
+    assert f("DECIMAL(10,2)", 5) is None
+    # true max does NOT fit DECIMAL(18,0) (>= 10**18) → keep FLBA (exact-fit rule, no headroom guess).
+    assert f("DECIMAL(38,0)", 10 ** 18) is None                # boundary: 10**18 does not fit
+    assert f("DECIMAL(38,0)", 5 * 10 ** 18) is None
+    # scale leaves no integer digit (s > 17) → cannot narrow to DECIMAL(18,s).
+    assert f("DECIMAL(38,18)", 0) is None
+    # non-decimal / unparseable → None.
+    assert f("BIGINT", 5) is None
+    assert f("VARCHAR", None) is None

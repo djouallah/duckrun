@@ -29,6 +29,7 @@ The recommendation, in order:
      join/segment locality instead of the marginal compression key.
 """
 import math
+import re
 
 # Above this distinct-value count the exact Σp² histogram (a GROUP BY = O(NDV) hash table) is skipped
 # for the uniform approximation Σp² ≈ 1/ndv — a high-card column is ~uniform and its runs are
@@ -64,6 +65,36 @@ _SCHEMA = (
 def _qid(name: str) -> str:
     """Quote a SQL identifier (schema/table/view/column name)."""
     return '"' + str(name).replace('"', '""') + '"'
+
+
+_DECIMAL_RE = re.compile(r"DECIMAL\(\s*(\d+)\s*,\s*(\d+)\s*\)", re.IGNORECASE)
+# DECIMAL(p, s) with p <= 18 fits INT64; p > 18 forces a 16-byte FIXED_LEN_BYTE_ARRAY, which
+# arrow-rs (the delta-rs writer) NEVER dictionary-encodes — such a column is written PLAIN even
+# when its value domain is tiny. Narrowing precision back to 18 (scale unchanged) restores INT64,
+# and with it dictionary/RLE encoding and a cheap transcode.
+_DECIMAL_NARROW_PRECISION = 18
+
+
+def decimal_narrow_target(type_str, max_abs):
+    """Target type for narrowing a wide DECIMAL so it regains dictionary encoding, or ``None``.
+
+    Returns ``"DECIMAL(18,s)"`` iff ``type_str`` is ``DECIMAL(p,s)`` with ``p > 18``, ``s <= 17``
+    (so at least one integer digit remains), and the column's true ``max_abs`` fits — i.e.
+    ``max_abs < 10**(18 - s)``. A ``None`` ``max_abs`` (all-NULL column) trivially fits. Scale is
+    never changed; only precision. Pure — no DB, no I/O — so it is unit-testable directly.
+
+    ``max_abs`` MUST be the exact column maximum (a single aggregate scan), not a sample: the cast
+    is unconditional at write time, so a sampled max that missed an outlier would fail the whole
+    write. With the exact max there is no overflow risk and no headroom heuristic is needed."""
+    m = _DECIMAL_RE.fullmatch(str(type_str).strip())
+    if not m:
+        return None
+    p, s = int(m.group(1)), int(m.group(2))
+    if p <= _DECIMAL_NARROW_PRECISION or s > _DECIMAL_NARROW_PRECISION - 1:
+        return None
+    if max_abs is not None and abs(max_abs) >= 10 ** (_DECIMAL_NARROW_PRECISION - s):
+        return None
+    return f"DECIMAL({_DECIMAL_NARROW_PRECISION},{s})"
 
 
 def plan_sample(total_rows, avg_row_bytes, *, byte_budget=_SAMPLE_BYTE_BUDGET,

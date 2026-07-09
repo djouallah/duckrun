@@ -37,6 +37,11 @@ _DESCRIBE_EXT_RE = re.compile(r"^describe\s+(?P<kind>detail|history)\s+(?P<rel>.
 # table verbatim, so SORTED BY AUTO can profile it EXACTLY from the Delta log instead of sampling.
 _SELECT_STAR_FROM = re.compile(
     r"\s*select\s+\*\s+from\s+(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)\s*", re.IGNORECASE)
+# A body whose top-level projection is a bare `*` (or `alias.*`) — every output column is a
+# passthrough of its source column, so decimal narrowing (which rewrites the projection) is safe.
+# Any explicit projection (including a user-written CAST — an instruction we must not override) is
+# NOT matched, so it is left untouched.
+_SELECT_STAR_BODY = re.compile(r"\s*select\s+(?:\*|\"?\w+\"?\.\*)\s+from\b", re.IGNORECASE)
 _DML_TARGET_RE = re.compile(
     r"^(?:insert\s+into|delete\s+from|update)\s+(?P<rel>\"?[\w.]+\"?)", re.IGNORECASE)
 _CREATE_TEMP_RE = re.compile(r"^create\s+(or\s+replace\s+)?(temp|temporary)\b", re.IGNORECASE)
@@ -753,8 +758,58 @@ class DuckSession:
         src = self._auto_sort_single_table(body)
         cols = (self._auto_sort_cols_from_table(src) if src is not None
                 else self._auto_sort_cols(self.con.sql(body)))
+        new_body = self._narrow_wide_decimals(body)
+        if new_body != body:
+            bstart, bend = m.span("body")
+            stripped = stripped[:bstart] + new_body + stripped[bend:]
         replacement = ("SORTED BY (" + ", ".join(_qid(c) for c in cols) + ")") if cols else ""
         return delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1)
+
+    def _narrow_wide_decimals(self, body: str) -> str:
+        """Rewrite a ``SELECT *`` body to narrow wide-``DECIMAL`` columns so they regain dictionary
+        encoding, or return it unchanged. A ``DECIMAL(p, s)`` with ``p > 18`` maps to a 16-byte
+        FIXED_LEN_BYTE_ARRAY, which arrow-rs (the delta-rs writer) NEVER dictionary-encodes — the
+        column is written PLAIN even when its value domain is tiny (measured: ~1 GB and a 10× cold
+        cliff on the Contoso price columns). Narrowing precision to 18 (scale unchanged) restores
+        INT64, hence dictionary/RLE and a cheap transcode. See ``sortkey.decimal_narrow_target``.
+
+        Only ``SELECT *`` bodies are eligible (every output column is a passthrough, so the outer
+        ``* REPLACE`` is safe) — any explicit projection, including a user-written CAST (an
+        instruction), is left untouched. Gated by ``DUCKRUN_NARROW_DECIMALS`` (default on). Uses the
+        EXACT per-column max (one aggregate scan) so the unconditional cast can never overflow at
+        write time. Prints one advisory per wide-decimal column (narrowed or kept)."""
+        if os.environ.get("DUCKRUN_NARROW_DECIMALS", "1") == "0":
+            return body
+        if not _SELECT_STAR_BODY.match(body.strip()):
+            return body
+        try:
+            desc = self.con.sql(f"DESCRIBE SELECT * FROM ({body}) _d").fetchall()
+        except Exception:
+            return body  # un-describable body (e.g. a macro DuckDB can't plan yet) — leave it alone
+        wide = []
+        for row in desc:
+            col, typ = row[0], str(row[1])
+            dm = sortkey._DECIMAL_RE.fullmatch(typ.strip())
+            if dm and int(dm.group(1)) > 18:
+                wide.append((col, typ))
+        if not wide:
+            return body
+        aggs = ", ".join(f"max(abs({_qid(c)}))" for c, _ in wide)
+        maxes = self.con.sql(f"SELECT {aggs} FROM ({body}) _m").fetchone()
+        max_abs = dict(zip((c for c, _ in wide), maxes))
+        repl = []
+        for col, typ in wide:
+            target = sortkey.decimal_narrow_target(typ, max_abs[col])
+            if target:
+                repl.append(f"CAST({_qid(col)} AS {target}) AS {_qid(col)}")
+                mv = max_abs[col]
+                print(f"  {col} {typ} → {target} "
+                      f"(max {mv if mv is not None else 'NULL'}; FLBA has no dictionary in arrow-rs)")
+            else:
+                print(f"  {col} {typ} kept: max too large to narrow — no dictionary encoding")
+        if not repl:
+            return body
+        return f"SELECT * REPLACE ({', '.join(repl)}) FROM ({body}) _n"
 
     def _auto_sort_single_table(self, body: str) -> Optional[str]:
         """If ``body`` is a bare ``SELECT * FROM <table>`` over a single duckrun-managed Delta table,

@@ -97,16 +97,22 @@ def _size_of(sz_model, col):
 
 
 def _compression(chunks):
-    """per column: compressed MB, distinct encodings, dictionary-page MB."""
+    """per column: compressed MB, distinct encodings, dictionary-page MB, physical parquet type,
+    and whether ANY chunk carried a dictionary page (dictionary_page_offset set) — the last two
+    catch the arrow-rs FLBA gap (a DECIMAL with precision > 18 is written PLAIN, no dictionary)."""
     out = {}
     for c in chunks:
         col = c.get("path_in_schema")
-        d = out.setdefault(col, {"comp": 0, "enc": set(), "dict": 0})
+        d = out.setdefault(col, {"comp": 0, "enc": set(), "dict": 0, "type": None, "has_dict": False})
         d["comp"] += c.get("total_compressed_size") or 0
+        if c.get("type"):
+            d["type"] = str(c["type"])
         if c.get("encodings"):
             for e in str(c["encodings"]).split(","):
                 d["enc"].add(e.strip())
         dpo, dp = c.get("dictionary_page_offset"), c.get("data_page_offset")
+        if dpo is not None:
+            d["has_dict"] = True
         if dpo is not None and dp is not None and dp > dpo:
             d["dict"] += dp - dpo
     return out
@@ -221,9 +227,10 @@ def s4_cold_decomp(rep, analysis, models):
 def s5_compression(rep, models):
     w("## 4. Compression attribution")
     w()
-    w("| column | model | comp MB | encodings | dict MB |")
-    w("|:--|:--|--:|:--|--:|")
+    w("| column | model | type | comp MB | encodings | dict MB |")
+    w("|:--|:--|:--|--:|:--|--:|")
     dict_by_col = {}  # col -> {model: dict_mb}
+    info = {}         # col -> {model: (physical_type, has_dict)}
     for m in models:
         chunks = rep["tables"][rr._table(m)].get("parquet", {}).get("column_chunks") or []
         comp = _compression(chunks)
@@ -231,8 +238,9 @@ def s5_compression(rep, models):
             d = comp[col]
             dmb = d["dict"] / MB
             dict_by_col.setdefault(col, {})[m] = dmb
-            w(f"| {col} | {lbl(m)} | {_mb(d['comp']/MB)} | {', '.join(sorted(d['enc']))} | "
-              f"{_mb(dmb)} |")
+            info.setdefault(col, {})[m] = (d["type"], d["has_dict"])
+            w(f"| {col} | {lbl(m)} | {d['type'] or '?'} | {_mb(d['comp']/MB)} | "
+              f"{', '.join(sorted(d['enc']))} | {_mb(dmb)} |")
     w()
     for col, dd in dict_by_col.items():
         vals = {k: v for k, v in dd.items() if v}
@@ -241,6 +249,15 @@ def s5_compression(rep, models):
             lo = min(vals, key=vals.get)
             w(f"- ⚠ {col} dictionary: {lbl(hi)} {vals[hi]:,.1f} MB vs {lbl(lo)} {vals[lo]:,.1f} MB "
               f"(>3×).")
+    # FLBA-written-PLAIN caveat: a column that is FIXED_LEN_BYTE_ARRAY with NO dictionary page in
+    # one layout while a counterpart layout dictionary-encodes the same column — the arrow-rs FLBA
+    # gap, i.e. a DECIMAL with precision > 18. (Fixed by narrowing precision to 18 at CTAS.)
+    for col, bym in info.items():
+        flat = [m for m, (typ, hd) in bym.items() if typ == "FIXED_LEN_BYTE_ARRAY" and not hd]
+        dictd = [m for m, (typ, hd) in bym.items() if hd]
+        if flat and dictd:
+            w(f"- ⚠ {col}: FLBA written PLAIN (no dictionary in {lbl(flat[0])}); "
+              f"{lbl(dictd[0])} dict-encodes it — check decimal precision (>18 → FLBA).")
     w()
 
 

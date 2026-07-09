@@ -1349,6 +1349,86 @@ def test_writer_keeps_dictionary_encoding(conn):
         assert "RLE_DICTIONARY" in encodings, f"{col} not dictionary-encoded: {encodings}"
 
 
+def _pq_meta(conn, table):
+    """{col: (physical_type, encodings, dictionary_page_offset)} from the delta-rs-written footer."""
+    import glob
+    import os
+    files = [f.replace(os.sep, "/")
+             for f in glob.glob(os.path.join(conn.root_path, "dbo", table, "**", "*.parquet"),
+                                recursive=True)]
+    assert files, f"no parquet files for {table}"
+    return {r[0]: (r[1], r[2], r[3]) for r in conn.sql(
+        f"select path_in_schema, type, encodings, dictionary_page_offset "
+        f"from parquet_metadata({files!r})").fetchall()}
+
+
+def test_wide_decimal_is_flba_without_dictionary(conn):
+    # Golden repro (this exact shape found the bug): arrow-rs (the delta-rs writer) does NOT
+    # dictionary-encode FIXED_LEN_BYTE_ARRAY, and a DECIMAL(p>18) maps to FLBA. So on a PLAIN CTAS
+    # (no SORTED BY AUTO → no narrowing) a wide decimal is written PLAIN even though its value
+    # domain is tiny, while DECIMAL(<=18) lands as INT64 and keeps its dictionary. Documents the raw
+    # pinned-runtime behaviour; flip the dec38 assertion if a future delta-rs bump dict-encodes FLBA.
+    conn.sql("CREATE OR REPLACE TABLE dectbl AS select "
+             "(i % 1000)::DECIMAL(18,2) as dec18, (i % 1000)::DECIMAL(10,2) as dec10, "
+             "(i % 1000)::DECIMAL(38,6) as dec38 from range(200000) t(i)")
+    md = _pq_meta(conn, "dectbl")
+    for col in ("dec18", "dec10"):
+        typ, enc, dict_off = md[col]
+        assert typ == "INT64", f"{col} unexpectedly {typ}"
+        assert dict_off is not None and "RLE_DICTIONARY" in enc, f"{col} lost its dictionary: {enc}"
+    typ38, enc38, dict38 = md["dec38"]
+    assert typ38 == "FIXED_LEN_BYTE_ARRAY", f"dec38 expected FLBA, got {typ38}"
+    assert dict38 is None, "dec38 (FLBA) unexpectedly got a dictionary page — did delta-rs change?"
+
+
+def test_sorted_by_auto_narrows_wide_decimal(conn, capsys):
+    # SORTED BY AUTO over a SELECT * body narrows DECIMAL(p>18) → DECIMAL(18,s) when the exact max
+    # fits, restoring INT64 physical + dictionary encoding. Scale is unchanged.
+    conn.sql("CREATE OR REPLACE TABLE decbase AS "
+             "select (i % 500)::DECIMAL(38,2) as amt from range(50000) t(i)")
+    capsys.readouterr()
+    conn.sql("CREATE OR REPLACE TABLE decnarrow SORTED BY AUTO AS select * from decbase")
+    out = capsys.readouterr().out
+    assert "DECIMAL(18,2)" in out, f"no narrowing advisory printed: {out!r}"
+    typ, enc, dict_off = _pq_meta(conn, "decnarrow")["amt"]
+    assert typ == "INT64", f"amt not narrowed to INT64: {typ}"
+    assert dict_off is not None and "RLE_DICTIONARY" in enc, f"amt lost its dictionary: {enc}"
+
+
+def test_sorted_by_auto_keeps_decimal_too_large_to_narrow(conn, capsys):
+    # A wide decimal whose exact max does NOT fit DECIMAL(18,s) is left FLBA (no unconditional cast
+    # that could overflow at write) and reported as kept.
+    conn.sql("CREATE OR REPLACE TABLE bigbase AS "
+             "select ((i + 5)::DECIMAL(38,0) * 1000000000000000000) as big from range(10) t(i)")
+    capsys.readouterr()
+    conn.sql("CREATE OR REPLACE TABLE bignarrow SORTED BY AUTO AS select * from bigbase")
+    out = capsys.readouterr().out
+    assert "kept" in out and "big" in out, f"expected a 'kept' advisory: {out!r}"
+    typ, _enc, _dict = _pq_meta(conn, "bignarrow")["big"]
+    assert typ == "FIXED_LEN_BYTE_ARRAY", f"big should stay FLBA, got {typ}"
+
+
+def test_sorted_by_auto_leaves_user_cast_untouched(conn):
+    # A user-written CAST is an instruction: only bare SELECT * bodies are eligible, so an explicit
+    # projection keeps its DECIMAL(38,6) (FLBA) even under SORTED BY AUTO.
+    conn.sql("CREATE OR REPLACE TABLE ucbase AS "
+             "select (i % 500)::DECIMAL(38,2) as amt from range(20000) t(i)")
+    conn.sql("CREATE OR REPLACE TABLE uccast SORTED BY AUTO AS "
+             "select cast(amt as DECIMAL(38,6)) as p from ucbase")
+    typ, _enc, _dict = _pq_meta(conn, "uccast")["p"]
+    assert typ == "FIXED_LEN_BYTE_ARRAY", f"user-cast column should stay FLBA, got {typ}"
+
+
+def test_narrow_decimals_kill_switch(conn, monkeypatch):
+    # DUCKRUN_NARROW_DECIMALS=0 disables narrowing entirely — the wide decimal stays FLBA.
+    monkeypatch.setenv("DUCKRUN_NARROW_DECIMALS", "0")
+    conn.sql("CREATE OR REPLACE TABLE ksbase AS "
+             "select (i % 500)::DECIMAL(38,2) as amt from range(20000) t(i)")
+    conn.sql("CREATE OR REPLACE TABLE ksoff SORTED BY AUTO AS select * from ksbase")
+    typ, _enc, _dict = _pq_meta(conn, "ksoff")["amt"]
+    assert typ == "FIXED_LEN_BYTE_ARRAY", f"kill-switch off but column was narrowed: {typ}"
+
+
 def _row_groups(conn, table):
     # Distinct (file, row_group_id) across every parquet file of a table — parquet_metadata returns one
     # row per column chunk, so count DISTINCT row-group ids, not rows.
