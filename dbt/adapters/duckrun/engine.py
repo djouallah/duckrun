@@ -43,29 +43,18 @@ except ImportError:  # pragma: no cover - older layouts
 # alias is the default max_row_group_size _writer_properties uses when no adaptive size is passed; it is
 # also the write-memory ceiling (arrow-rs buffers a full uncompressed row group per open writer).
 _ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
-# Dictionary page limit — DERIVED per write to keep every column 100% dictionary-encoded (the Direct Lake
-# transcoder's fast path: a dictionary page maps straight through, whereas PLAIN data pages are transcoded
-# value-by-value), UP TO the largest dictionary a bounded MERGE can still materialize. The limit is the
-# smaller of two bounds:
-#   - zero-fallback: rg_rows * 8 (+ slack) — above a near-unique INT64 column's worst-case dictionary, so
-#     arrow-rs never falls back to PLAIN partway through a chunk;
-#   - _DICT_PAGE_MAX (the prudent cap): a delta_rs MERGE materializes these dictionaries and re-writes the
-#     touched files, so an unbounded per-column dictionary (a near-unique INT64 column at 16M-row groups is
-#     ~132 MB) inflates the merge's transient scratch. 32 MB keeps that bounded. A near-unique column in a
-#     large (e.g. 16M-row) group whose zero-fallback dictionary exceeds the cap FALLS BACK to PLAIN — the
-#     one accepted exception, and cheap (PLAIN streams through a merge). NOTE: this cap is NOT gate-derived.
-#     The merge-spill stress gate's earlier "reds" at 48/32 MB were scratch-DISK exhaustion (its temp landed
-#     on the small 18 GB root volume, now routed to the big disk like tpch-stress), not a RAM/OOM ceiling —
-#     so there is no clean empirical dictionary ceiling to read off it. 32 MB is a conservative default.
-_DICT_PAGE_SLACK = 4 * 1024 * 1024   # page-framing headroom above the worst-case INT64 dictionary
-_DICT_PAGE_MAX = 32 * 1024 * 1024    # prudent per-column dictionary cap (see block comment; NOT gate-tuned)
-
-
-def _dict_page_limit(rg_rows):
-    """Per-write dictionary page size limit: the smaller of the zero-fallback size (``rg_rows * 8`` +
-    slack, so a near-unique INT64 column never falls back mid-chunk) and ``_DICT_PAGE_MAX`` (the largest
-    per-column dictionary a bounded MERGE can materialize). See the block comment above."""
-    return min(int(rg_rows) * 8 + _DICT_PAGE_SLACK, _DICT_PAGE_MAX)
+# Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
+# overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
+# shrinks the written files and gives the columnar reader denser, more uniform segments — the read
+# layout this write path is tuned for. The cost is merge memory: a delta_rs MERGE reads the table and
+# materializes those per-column dictionaries, so a larger limit means a larger merge working set.
+# Measured on an 18M-row merge: the old 128 MB limit hit ~25 GB RSS, 8 MB ~4 GB, 16 MB ~8.7 GB — so
+# 32 MB is a deliberate step further up the merge-memory curve, bought for read-layout density. Truly
+# near-unique join keys (e.g. l_orderkey / l_comment) still overflow to PLAIN — their dictionary would
+# be as big as the data, so no loss. This is the knob most likely to regress the merge-spill stress
+# gate; tests/parquet_layout_tests/ is the harness to confirm the read-side win against a real Direct Lake
+# reference before trusting it.
+_DICT_PAGE_SIZE_LIMIT = 32 * 1024 * 1024
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
@@ -163,38 +152,44 @@ def table_num_records(cur, dt):
     return int(row[0]) if row and row[0] else None   # 0 / null stats -> unknown -> keep 16M
 
 
-def _writer_properties(row_group_rows=None):
+def _writer_properties(plain_cols=None, row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a row-group-derived
-    # dictionary page limit that keeps columns dictionary-encoded up to the merge ceiling (the Direct Lake
-    # transcoder's fast path; see _dict_page_limit), a 1 MB data-page byte cap, an EXPLICIT 20k-row
-    # data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
+    # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a 32 MB dictionary page limit
+    # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
+    # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap, an EXPLICIT
+    # 20k-row data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
     # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults)
     # so a merge stays quick and never rewrites fat files; post-merge compaction folds merged files up
     # into this layout later. Degrade gracefully if the pinned wheel rejects a newer parameter
     # (last rung: SNAPPY-only).
     #
-    # Dictionary is enabled UNIFORMLY on every column (no dict-off / plain_cols): the policy is
-    # dictionary-everywhere up to _DICT_PAGE_MAX — the transcode happy path is worth the bytes a
-    # near-unique column's dictionary wastes, except a dictionary too big to MERGE, which _dict_page_limit
-    # caps back to a PLAIN fallback.
+    # ``plain_cols`` are unique/near-unique columns whose dictionary buys nothing (every value distinct);
+    # they get a per-column ColumnProperties(dictionary_enabled=False) so arrow-rs writes them PLAIN.
+    # Only the sort-rewrite passes them (it profiles for uniqueness); other writes leave it None.
     if WriterProperties is None:
         return None
     rg = row_group_rows if row_group_rows is not None else _ROW_GROUP_SIZE
     col_props = None
+    per_col = None
     if ColumnProperties is not None:
         try:
             col_props = ColumnProperties(dictionary_enabled=True, statistics_enabled="CHUNK")
         except Exception:  # best-effort: fall through to writer-level props without per-column knobs
             col_props = None
+        if plain_cols:
+            try:
+                per_col = {c: ColumnProperties(dictionary_enabled=False) for c in plain_cols}
+            except Exception:  # best-effort: a rejected per-column build just keeps the dictionary on
+                per_col = None
     for kwargs in (
         dict(compression="SNAPPY",
              max_row_group_size=rg,
-             dictionary_page_size_limit=_dict_page_limit(rg),
+             dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
              data_page_row_count_limit=_DATA_PAGE_ROW_LIMIT,
              statistics_truncate_length=64,
-             default_column_properties=col_props),
+             default_column_properties=col_props,
+             column_properties=per_col),
         dict(compression="SNAPPY", max_row_group_size=rg),
         dict(compression="SNAPPY"),
     ):
@@ -678,6 +673,7 @@ def build_write_deltalake_args(
     schema_mode: Optional[str] = None,
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
+    plain_cols: Optional[List[str]] = None,
     row_group_rows: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
@@ -687,7 +683,8 @@ def build_write_deltalake_args(
     defaults (no writer_properties, no ``target_file_size``): appends are transient increments that
     threshold-gated compaction folds into the read layout on a later pass, so paying the 16M-group
     profile on every small append is wasted (and the 16M row group is the write-memory ceiling). MERGE
-    does not go through here at all. ``row_group_rows`` is the adaptive overwrite geometry (see
+    does not go through here at all. ``plain_cols`` are unique columns written PLAIN — no dictionary;
+    only the sort-rewrite passes them. ``row_group_rows`` is the adaptive overwrite geometry (see
     ``write_delta`` / ``rg_for``); it is meaningless on append and ignored there."""
     args: Dict[str, Any] = {
         "table_or_uri": path,
@@ -704,7 +701,7 @@ def build_write_deltalake_args(
         args["schema_mode"] = schema_mode
     if mode != "append":  # append → delta_rs defaults (lean, compaction-folded), like MERGE
         args["target_file_size"] = _TARGET_FILE_SIZE
-        wp = _writer_properties(row_group_rows=row_group_rows)
+        wp = _writer_properties(plain_cols=plain_cols, row_group_rows=row_group_rows)
         if wp is not None:
             args["writer_properties"] = wp
     return args
@@ -1069,6 +1066,7 @@ def write_delta(
     overwrite_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
+    plain_cols: Optional[List[str]] = None,
     read_version: Optional[int] = None,
     row_group_rows: Optional[int] = None,
 ) -> None:
@@ -1087,8 +1085,8 @@ def write_delta(
     ONE Delta write seam), so a fenced write is pinned to the caller's snapshot and fails loudly on a
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
-    Every write lands in the one read-layout profile (tuned writer properties + 256 MB files),
-    dictionary-encoded up to the merge ceiling (the Direct Lake transcoder's dictionary fast path).
+    Every write lands in the one read-layout profile (tuned writer properties + 256 MB files).
+    ``plain_cols`` (sort-rewrite only) are unique columns written PLAIN — no dictionary.
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
@@ -1121,6 +1119,7 @@ def write_delta(
         schema_mode=schema_mode,
         partition_by=partition_by,
         storage_options=storage_options,
+        plain_cols=plain_cols,
         row_group_rows=row_group_rows,
     )
     if read_version is None:
@@ -1230,12 +1229,13 @@ def overwrite_if_unchanged(
     read_version: Optional[int],
     partition_by: Optional[List[str]] = None,
     overwrite_schema: bool = False,
+    plain_cols: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
 ) -> None:
     """Optimistic FULL-TABLE overwrite: replace every row with ``data`` only if the table version
     has not moved since we read it — otherwise refuse with ``CommitFailedError``. The overwrite
     sibling of :func:`append_if_unchanged`, for the read-whole-table -> recompute -> write-it-back
-    pattern.
+    pattern. ``plain_cols`` (sort-rewrite only) are unique columns written PLAIN — no dictionary.
 
     Same compare-and-swap trick: pin to ``read_version`` and ``max_commit_retries=0`` so a concurrent
     commit fails the overwrite instead of clobbering it. (An overwrite, like an append, is
@@ -1254,6 +1254,7 @@ def overwrite_if_unchanged(
         path, data, "overwrite",
         partition_by=partition_by,
         overwrite_schema=overwrite_schema,
+        plain_cols=plain_cols,
         storage_options=storage_options,
         read_version=read_version,
     )
@@ -1268,6 +1269,7 @@ def replace_where(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
+    plain_cols: Optional[List[str]] = None,
 ) -> None:
     """``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
     replace the rows matching ``predicate`` with ``data``. One commit, not a delete-then-append
@@ -1289,6 +1291,7 @@ def replace_where(
         )
     args = build_write_deltalake_args(
         path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
+        plain_cols=plain_cols,
     )
     args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
     # Pin to the read snapshot and disable rebasing, so a concurrent commit since vB fails this

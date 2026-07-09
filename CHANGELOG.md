@@ -4,19 +4,6 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.4.15]
-
-Uniform dictionary encoding for Direct Lake reads.
-
-### Changed
-- **Every column is written 100% dictionary-encoded.** The Parquet dictionary-page-size limit is now
-  derived per write from the row-group size — sized just above a near-unique `INT64` column's worst-case
-  dictionary (`rg_rows * 8` bytes) — so a column never falls back to PLAIN partway through a chunk. Pure
-  dictionary chunks are the Direct Lake transcoder's fast path (a dictionary page maps straight through,
-  whereas PLAIN pages are transcoded value-by-value), so near-unique columns keep their dictionary even
-  though it costs some bytes. Not a user knob; the limit scales down with the adaptive row groups. Trade-off:
-  this raises the peak memory a `MERGE` uses to materialize those dictionaries when it reads the table.
-
 ## [0.4.14]
 
 Write-layout tuning for Direct Lake, plus a leaner `MERGE`.
