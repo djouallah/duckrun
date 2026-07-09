@@ -19,7 +19,7 @@ import duckdb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)                                      # test_tpch.py (same dir)
-sys.path.insert(0, os.path.join(HERE, "..", "..", "tests", "performance"))  # tpch_summary.py
+sys.path.insert(0, os.path.join(HERE, "..", "..", "performance"))  # tpch_summary.py (tests/performance/)
 
 from test_tpch import TPCH_TABLES, run_tpch_benchmark  # noqa: E402
 from tpch_summary import render_card  # noqa: E402
