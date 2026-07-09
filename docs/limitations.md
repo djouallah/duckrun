@@ -58,16 +58,6 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   the table and writes a tombstone marker but **does not reclaim the data files** (a deliberate
   precaution — you purge them when you're sure). Address dropped tables by name, not by path.
 
-## Parquet layout
-
-- **Can't force exactly one row group per file.** Direct Lake prefers one file = one row group, and
-  Spark's Direct Lake-optimized writer appears to target exactly that — one row group per file. duckrun
-  writes through delta-rs, whose Parquet writer picks row-group boundaries from its own size/row
-  thresholds and — unlike DuckDB's own Parquet writer, which exposes a `row_groups_per_file` option —
-  gives no knob to force one group per file. The best we can do is align `target_file_size` and
-  `row_group_size` (256 MB against a row group capped at 16M rows): that *usually* yields one group per wide-fact file,
-  but narrow or odd-width tables can still emit two or three. See [Parquet layout](parquet-layout.md).
-
 ## Memory
 
 - **Two engines share one machine's memory.** DuckDB and delta-rs each keep their own pool in the same
