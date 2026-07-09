@@ -100,13 +100,27 @@ def _exists(con, tbl):
 
 def main():
     force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
+    orders = os.environ.get("CONTOSO_ORDERS", "").strip()
     con = _connect()
     con.sql("create schema if not exists contoso")
 
-    # Fast path: the whole base already present → skip generation entirely (unless rebuild).
+    # Fast path: reuse an existing base instead of regenerating (existence-only — the generator is the
+    # slow step). But guard against a SILENT scale mismatch: if the base on disk was built at a
+    # different scale than the CONTOSO_ORDERS now requested, reusing it would benchmark the wrong size.
+    # We can't safely auto-regenerate just the base here — the derived layout copies (sales_auto_sort /
+    # sales_vorder) have their own rebuild=false skip and would stay at the old scale, desyncing the
+    # chain. A scale change must rebuild the WHOLE chain, which is exactly what rebuild=true does, so
+    # refuse loud and point at it. The generator emits a hair fewer orders than OrdersCount (a few %
+    # drop for unassignable rows), so match the `orders` table on a tolerance, not equality.
     if not force and all(_exists(con, tbl) for _, tbl in TABLES):
+        have = con.sql('select count(*) from contoso."orders"').fetchone()[0]
+        if orders.isdigit() and int(orders) > 0 and abs(have - int(orders)) > 0.05 * int(orders):
+            raise SystemExit(
+                f"contoso base exists at orders={have:,} but OrdersCount={orders} was requested — "
+                f"a scale change must rebuild the whole chain (base + both layout copies). "
+                f"Re-dispatch with rebuild=true.")
         rows = con.sql('select count(*) from contoso."sales"').fetchone()[0]
-        print(f"contoso base already present (sales={rows:,} rows) — skipping "
+        print(f"contoso base already present (sales={rows:,} rows, orders={have:,}) — skipping "
               "(rebuild=true to regenerate)", flush=True)
         report.merge({"tables": {"contoso_base": {"build": {
             "engine": "sqlbi_generator", "status": "skipped"}}}})
@@ -122,7 +136,6 @@ def main():
     data_xlsx = os.path.join(os.path.dirname(exe), "data.xlsx")   # bundled seed workbook (MIT)
     config = os.path.join(HERE, "config.json")                    # vendored: BOTH + PARQUET
 
-    orders = os.environ.get("CONTOSO_ORDERS", "").strip()
     cmd = [exe, config, data_xlsx, out + os.sep, cache + os.sep]
     if orders.isdigit():
         cmd.append(f"param:OrdersCount={orders}")
