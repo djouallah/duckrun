@@ -54,10 +54,10 @@ _ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
 #     ran the merge out of spill disk). So a per-column dictionary bigger than the cap can't be merged; a
 #     near-unique column in a large (e.g. 16M-row) group whose zero-fallback dictionary exceeds the cap
 #     FALLS BACK to PLAIN — the one accepted exception, and cheap (PLAIN streams through a merge). The cap
-#     is tuned EMPIRICALLY as the largest value that keeps the merge-spill gate green (32 MB was long
-#     green; push it up until the gate goes red, take the last green).
+#     is tuned EMPIRICALLY as the largest value that keeps the merge-spill gate green: bisected at SF=10,
+#     48 MB spills the merge out of disk (red), 32 MB stays green — so 32 MB, the last green with margin.
 _DICT_PAGE_SLACK = 4 * 1024 * 1024   # page-framing headroom above the worst-case INT64 dictionary
-_DICT_PAGE_MAX = 48 * 1024 * 1024    # merge ceiling — tuned against the merge-spill gate (see above)
+_DICT_PAGE_MAX = 32 * 1024 * 1024    # merge ceiling — tuned against the merge-spill gate (see above)
 
 
 def _dict_page_limit(rg_rows):
