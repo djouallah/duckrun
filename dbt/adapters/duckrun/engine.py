@@ -43,18 +43,27 @@ except ImportError:  # pragma: no cover - older layouts
 # alias is the default max_row_group_size _writer_properties uses when no adaptive size is passed; it is
 # also the write-memory ceiling (arrow-rs buffers a full uncompressed row group per open writer).
 _ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
-# Dictionary page limit: 64 MB. Caps how large one column's dictionary grows before its values
-# overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
-# shrinks the written files and gives the columnar reader denser, more uniform segments — the read
-# layout this write path is tuned for. The cost is merge memory: a delta_rs MERGE reads the table and
-# materializes those per-column dictionaries, so a larger limit means a larger merge working set.
-# Measured on an 18M-row merge: the old 128 MB limit hit ~25 GB RSS, 16 MB ~8.7 GB, 8 MB ~4 GB — so
-# 64 MB is a large step further up that merge-memory curve, well toward the old 128 MB / ~25 GB point,
-# bought for read-layout density. Truly near-unique join keys (e.g. l_orderkey / l_comment) still
-# overflow to PLAIN — their dictionary would be as big as the data, so no loss. This is the knob most
-# likely to regress the merge-spill stress gate; tests/parquet_layout_tests/ is the harness to confirm
-# the read-side win against a real Direct Lake reference before trusting it.
-_DICT_PAGE_SIZE_LIMIT = 64 * 1024 * 1024
+# Dictionary page limit — DERIVED per write from the row-group size, not a fixed knob. A dictionary
+# earns its keep only while ndv stays well under the row count; once ndv approaches rg_rows/2 the
+# indices are as wide as the data and the dictionary stops paying off. So the limit is "half the row
+# group as INT64" (rg_rows * 8 / 2), clamped to [8 MB, 64 MB]: it scales DOWN automatically with the
+# adaptive row groups (2.5M rows -> ~10 MB, 16M -> 64 MB), so it never truncates a dictionary that is
+# still useful, and the cap bounds write/merge memory. The cost is merge memory: a delta_rs MERGE reads
+# the table and materializes those per-column dictionaries, so the cap is the real backstop (measured on
+# an 18M-row merge: 128 MB -> ~25 GB RSS, 16 MB -> ~8.7 GB, 8 MB -> ~4 GB; the writer holds up to
+# limit x columns-in-flight, so a 40-column table at the 64 MB cap is ~2.5 GB worst case). Deciding
+# whether a dictionary is useful AT ALL — a near-unique column that should be clean PLAIN, not a
+# fallback-mixed chunk — is the sort-rewrite's dict-off job, NOT this limit's. This is the knob most
+# likely to regress the merge-spill stress gate; tests/parquet_layout_tests/ confirms the read-side win
+# against a real Direct Lake reference before trusting it.
+_DICT_PAGE_MIN = 8 * 1024 * 1024
+_DICT_PAGE_MAX = 64 * 1024 * 1024
+
+
+def _dict_page_limit(rg_rows):
+    """Per-write dictionary page size limit, derived from the (possibly adaptive) row-group size: half
+    the row group measured as INT64 indices, clamped to [8 MB, 64 MB]. See the block comment above."""
+    return min(_DICT_PAGE_MAX, max(_DICT_PAGE_MIN, int(rg_rows) * 8 // 2))
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
@@ -154,9 +163,9 @@ def table_num_records(cur, dt):
 
 def _writer_properties(plain_cols=None, row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a 32 MB dictionary page limit
-    # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
-    # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap, an EXPLICIT
+    # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a row-group-derived
+    # dictionary page limit (mid-card columns keep a remappable dictionary; high-card ones overflow to
+    # PLAIN — see _dict_page_limit, the load-bearing merge-memory knob), a 1 MB data-page byte cap, an EXPLICIT
     # 20k-row data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
     # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults)
     # so a merge stays quick and never rewrites fat files; post-merge compaction folds merged files up
@@ -184,7 +193,7 @@ def _writer_properties(plain_cols=None, row_group_rows=None):
     for kwargs in (
         dict(compression="SNAPPY",
              max_row_group_size=rg,
-             dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
+             dictionary_page_size_limit=_dict_page_limit(rg),
              data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
              data_page_row_count_limit=_DATA_PAGE_ROW_LIMIT,
              statistics_truncate_length=64,
