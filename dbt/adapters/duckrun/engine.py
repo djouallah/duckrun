@@ -43,18 +43,18 @@ except ImportError:  # pragma: no cover - older layouts
 # alias is the default max_row_group_size _writer_properties uses when no adaptive size is passed; it is
 # also the write-memory ceiling (arrow-rs buffers a full uncompressed row group per open writer).
 _ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
-# Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
+# Dictionary page limit: 64 MB. Caps how large one column's dictionary grows before its values
 # overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
 # shrinks the written files and gives the columnar reader denser, more uniform segments — the read
 # layout this write path is tuned for. The cost is merge memory: a delta_rs MERGE reads the table and
 # materializes those per-column dictionaries, so a larger limit means a larger merge working set.
-# Measured on an 18M-row merge: the old 128 MB limit hit ~25 GB RSS, 8 MB ~4 GB, 16 MB ~8.7 GB — so
-# 32 MB is a deliberate step further up the merge-memory curve, bought for read-layout density. Truly
-# near-unique join keys (e.g. l_orderkey / l_comment) still overflow to PLAIN — their dictionary would
-# be as big as the data, so no loss. This is the knob most likely to regress the merge-spill stress
-# gate; tests/parquet_layout_tests/ is the harness to confirm the read-side win against a real Direct Lake
-# reference before trusting it.
-_DICT_PAGE_SIZE_LIMIT = 32 * 1024 * 1024
+# Measured on an 18M-row merge: the old 128 MB limit hit ~25 GB RSS, 16 MB ~8.7 GB, 8 MB ~4 GB — so
+# 64 MB is a large step further up that merge-memory curve, well toward the old 128 MB / ~25 GB point,
+# bought for read-layout density. Truly near-unique join keys (e.g. l_orderkey / l_comment) still
+# overflow to PLAIN — their dictionary would be as big as the data, so no loss. This is the knob most
+# likely to regress the merge-spill stress gate; tests/parquet_layout_tests/ is the harness to confirm
+# the read-side win against a real Direct Lake reference before trusting it.
+_DICT_PAGE_SIZE_LIMIT = 64 * 1024 * 1024
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
