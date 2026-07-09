@@ -5,13 +5,13 @@
 # AZURE_CLIENT_ID / AZURE_TENANT_ID GitHub secrets). The federated identity must be granted access
 # to the workspace below for the benchmark to run.
 #
-# Contoso lands in its OWN dedicated lakehouse `sqlbi` (created idempotently by the workflow),
-# isolated from the AEMO benchmark's `data` lakehouse. Same workspace as AEMO by default.
+# Contoso lands in its OWN dedicated, schema-enabled lakehouse `sqlbi` (created idempotently by the
+# workflow), in its own workspace — isolated from the AEMO benchmark.
 defaults:
   lakehouse_name: "sqlbi"
 
 main:
-  ws: "91588e42-0f1c-4e56-bcaa-cbf015b8f312"
+  ws: "1c52481c-0523-4a5a-bbde-fdc932bd77c2"
 
 production:
   ws: "be079b0f-3416-4de2-9184-9c546bad223c"

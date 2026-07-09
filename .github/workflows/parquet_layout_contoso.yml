@@ -118,8 +118,11 @@ jobs:
           if ($existing) {
             Write-Host "lakehouse '$lhName' already exists ($existing) — reusing."
           } else {
-            Write-Host "creating lakehouse '$lhName' in workspace $wsId ..."
-            $body = @{ displayName = $lhName } | ConvertTo-Json -Compress
+            Write-Host "creating schema-enabled lakehouse '$lhName' in workspace $wsId ..."
+            # enableSchemas: the Contoso + tests tables live under schemas (contoso.sales,
+            # tests.sales_auto_sort); Livy Spark + Direct Lake need a schema-enabled lakehouse to
+            # resolve them. A plain lakehouse has no schemas and the Spark V-Order build fails.
+            $body = @{ displayName = $lhName; creationPayload = @{ enableSchemas = $true } } | ConvertTo-Json -Compress
             Invoke-RestMethod -Method Post -Uri $base -Headers $headers -Body $body | Out-Null
             # Creation can be async (202); poll the list until it actually appears (or give up).
             $found = $false
