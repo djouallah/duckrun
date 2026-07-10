@@ -38,7 +38,7 @@ on:
       - 'tests/**'            # core suites; the '!' lines below carve out folders cores never runs
       # Non-gating folders cores never runs (each has its own dedicated workflow) — a change to
       # only these should NOT fire the core suite. Negations must follow 'tests/**' (last match wins).
-      - '!tests/aemo/**'                            # aemo.yml
+      - '!tests/integration_tests/aemo/**'          # aemo.yml
       - '!tests/parity_tests/**'                    # parity.yml
       - '!tests/parquet_layout/aemo/**'            # parquet_layout.yml (manual)
       - '!tests/parquet_layout/contoso/**'          # parquet_layout_contoso.yml (manual)
@@ -52,7 +52,7 @@ on:
       - 'dbt/**'
       - 'duckrun/**'
       - 'tests/**'
-      - '!tests/aemo/**'
+      - '!tests/integration_tests/aemo/**'
       - '!tests/parity_tests/**'
       - '!tests/parquet_layout/aemo/**'
       - '!tests/parquet_layout/contoso/**'

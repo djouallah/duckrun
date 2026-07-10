@@ -9,11 +9,11 @@ on:
   push:
     branches: ["**"]
     paths:
-      - 'tests/aemo/**'
+      - 'tests/integration_tests/aemo/**'
       - '.github/workflows/aemo.yml'
   pull_request:
     paths:
-      - 'tests/aemo/**'
+      - 'tests/integration_tests/aemo/**'
       - '.github/workflows/aemo.yml'
   workflow_dispatch:
     inputs:
@@ -39,9 +39,9 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: tests/aemo
+        working-directory: tests/integration_tests/aemo
     env:
-      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/aemo
+      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/aemo
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
       FILES_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Files
       DBT_SCHEMA: mart
@@ -95,7 +95,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: docs-aemo
-          path: tests/aemo/target/static_index.html
+          path: tests/integration_tests/aemo/target/static_index.html
       - name: SORTED BY AUTO sort rewrite on fct_summary (dogfood on real data)
         # Run the SQL-only auto-key sort rewrite on the real summary table over OneLake and print the
         # before/after layout. Last step on purpose — a rewrite the next dbt build supersedes.
