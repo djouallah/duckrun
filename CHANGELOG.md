@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.15]
+
+Keep wide `DECIMAL` columns dictionary-encoded for Direct Lake.
+
+### Fixed
+- **Wide `DECIMAL` columns stay dictionary-encoded.** A `DECIMAL` with precision > 18 maps to a Parquet
+  `FIXED_LEN_BYTE_ARRAY`, which the writer emits as PLAIN (never a dictionary page) — the slow path for
+  a Direct Lake read. `CREATE TABLE … SORTED BY AUTO` now narrows such a column to `DECIMAL(18, s)` when
+  every value fits the narrower precision, so it keeps a dictionary page; a column that genuinely needs
+  the wider precision is left unchanged.
+
 ## [0.4.14]
 
 Write-layout tuning for Direct Lake, plus a leaner `MERGE`.
