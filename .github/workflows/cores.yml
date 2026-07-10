@@ -160,7 +160,7 @@ jobs:
         # unit-test project runs standalone).
         run: |
           python -m pytest \
-            tests/multi_catalog/test_multi_catalog_e2e.py \
+            tests/correctness/multi_catalog/test_multi_catalog_e2e.py \
             -q -p no:cacheprovider
 
   conformance:

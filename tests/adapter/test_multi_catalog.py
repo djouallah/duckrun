@@ -1,6 +1,6 @@
 """Unit tests for the multi-catalog (multi-Lakehouse) plumbing (issue #7).
 
-The end-to-end behavior runs through real dbt in tests/multi_catalog/. These are the
+The end-to-end behavior runs through real dbt in tests/correctness/multi_catalog/. These are the
 fast, no-dbt-run guards on the individual pieces: the credential resolver (the single source of
 truth every write/read/discovery path routes through), the DML catalog matcher, the scoped-secret
 minting, and the plugin's write-token precedence.
