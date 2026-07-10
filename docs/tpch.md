@@ -20,7 +20,7 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 
 **What this checks:** duckrun registers the full TPC-H schema (8 tables) as Delta in place via `DeltaTable.convertToDelta` (zero-copy — writes only the `_delta_log`), then runs the 22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is the (near-free) convert; the **query** times are DuckDB reading Delta — there is no second engine to race here, so read them as "the whole schema loads and all 22 queries run at this scale", not a *duckrun is fast* claim.
 
-> **Ingest 8 tables in 748.6s** &middot; **run 22 queries in 491.8s** &middot; SF 100 &middot; 866.0M rows &middot; 4 cores
+> **Ingest 8 tables in 657.3s** &middot; **run 22 queries in 449.8s** &middot; SF 100 &middot; 866.0M rows &middot; 4 cores
 
 ### Setup
 | | |
@@ -32,41 +32,41 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 ### Ingestion — Parquet → Delta (zero-copy convertToDelta)
 | Table | Rows | Convert (s) |
 |---|---:|---:|
-| `nation` | 25 | 1.16 |
+| `nation` | 25 | 0.81 |
 | `region` | 5 | 0.02 |
-| `customer` | 15,000,000 | 16.63 |
-| `supplier` | 1,000,000 | 1.77 |
-| `lineitem` | 600,037,902 | 517.44 |
-| `orders` | 150,000,000 | 147.35 |
-| `partsupp` | 80,000,000 | 48.86 |
-| `part` | 20,000,000 | 15.34 |
-| **Total** | **866,037,932** | **748.57** |
+| `customer` | 15,000,000 | 17.17 |
+| `supplier` | 1,000,000 | 1.55 |
+| `lineitem` | 600,037,902 | 459.69 |
+| `orders` | 150,000,000 | 122.01 |
+| `partsupp` | 80,000,000 | 41.76 |
+| `part` | 20,000,000 | 14.33 |
+| **Total** | **866,037,932** | **657.33** |
 
 ### Queries — 22 TPC-H over `delta_scan`
 | Query | Duration (s) |
 |:---|---:|
-| Q01 | 23.371 |
-| Q02 | 3.819 |
-| Q03 | 14.444 |
-| Q04 | 8.056 |
-| Q05 | 22.894 |
-| Q06 | 4.583 |
-| Q07 | 15.880 |
-| Q08 | 30.600 |
-| Q09 | 52.500 |
-| Q10 | 18.407 |
-| Q11 | 2.249 |
-| Q12 | 9.436 |
-| Q13 | 18.515 |
-| Q14 | 18.130 |
-| Q15 | 7.239 |
-| Q16 | 3.476 |
-| Q17 | 95.344 |
-| Q18 | 33.437 |
-| Q19 | 18.473 |
-| Q20 | 18.083 |
-| Q21 | 64.978 |
-| Q22 | 7.873 |
-| **Total** | **491.79** |
+| Q01 | 20.732 |
+| Q02 | 3.396 |
+| Q03 | 12.285 |
+| Q04 | 7.371 |
+| Q05 | 20.722 |
+| Q06 | 4.293 |
+| Q07 | 14.360 |
+| Q08 | 28.802 |
+| Q09 | 47.316 |
+| Q10 | 16.455 |
+| Q11 | 2.190 |
+| Q12 | 9.198 |
+| Q13 | 17.145 |
+| Q14 | 17.423 |
+| Q15 | 6.655 |
+| Q16 | 3.145 |
+| Q17 | 97.048 |
+| Q18 | 25.004 |
+| Q19 | 16.110 |
+| Q20 | 16.395 |
+| Q21 | 57.363 |
+| Q22 | 6.425 |
+| **Total** | **449.83** |
 
 <!-- TPCH:END -->
