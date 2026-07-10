@@ -56,10 +56,12 @@ local = ["azure-identity"]
 # Test-only. pyarrow builds reusable Arrow fixtures; pandas is required by the DataFrame.toPandas()
 # test (DuckDB .df() materializes a pandas DataFrame, so it needs pandas+numpy). Production duckrun
 # stays pyarrow-/pandas-free — it streams DuckDB relations straight to deltalake.
-test = ["pytest>=7", "pyarrow", "pandas"]
+# pyarrow<25: 25.0.0 segfaults the exactly-pinned deltalake==1.5.0 in its native to_pyarrow_table
+# (ABI mismatch — 24.0.0 is the last good one). Lift together with the deltalake pin, not before.
+test = ["pytest>=7", "pyarrow<25", "pandas"]
 # Official dbt adapter conformance suite (dbt-labs/dbt-adapters). Subclassed in
 # tests/conformance/ to run the standard adapter tests against duckrun.
-conformance = ["pytest>=7", "pyarrow", "dbt-tests-adapter"]
+conformance = ["pytest>=7", "pyarrow<25", "dbt-tests-adapter"]
 
 [project.urls]
 Homepage = "https://github.com/djouallah/duckrun"
