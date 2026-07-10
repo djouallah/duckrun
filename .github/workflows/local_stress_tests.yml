@@ -3,9 +3,9 @@ name: local_stress_tests
 # The heavy, LOCAL-filesystem stress runs, collected as one workflow. Each takes several minutes and
 # the whole runner's RAM, so they NEVER run on push/PR: they are RELEASE GATES (workflow_call from
 # publish.yml — a tag publishes only if they pass) and can be run by hand (workflow_dispatch) to find
-# the ceiling. Each is its own job (own runner + install), and each serializes via a static group.
-# On the release path merge-spill runs first, then tpch-stress (needs: merge-spill), so the two
-# heavy runs never overlap.
+# the ceiling. Each is its own job (own GitHub-hosted VM + install), and each serializes against
+# other runs of ITSELF via a static concurrency group. merge-spill and tpch-stress run in parallel
+# (separate VMs, separate RAM — no cross-job memory contention).
 #
 # Jobs:
 #   • merge-spill   — generate a large TPCH lineitem (gate SF=10 ≈ 60M rows) and merge several
@@ -15,8 +15,8 @@ name: local_stress_tests
 #                     (1.6.0's merge is broken at scale). Renders the MERGE scorecard into docs and
 #                     commits to main on the release path.
 #   • tpch-stress   — the full TPC-H benchmark (ingest 8 tables → 22 queries). RELEASE GATE at a
-#                     modest SF=10 (workflow_call) — runs AFTER merge-spill (needs:) so the two heavy
-#                     runs never overlap. A manual workflow_dispatch cranks it to the ceiling (default
+#                     modest SF=10 (workflow_call), in PARALLEL with merge-spill (separate VMs, no
+#                     shared RAM). A manual workflow_dispatch cranks it to the ceiling (default
 #                     SF=100 ≈ 600M-row lineitem) and is the one that commits the canonical
 #                     docs/tpch.md scorecard; the release SF=10 run is a pass/fail guard only (never
 #                     commits the card). cores runs the SF=1 smoke.
@@ -121,10 +121,8 @@ jobs:
     # The full TPC-H benchmark (ingest the 8 tables Parquet → Delta, run the 22 queries, render the
     # docs/tpch.md scorecard). RELEASE GATE at a modest SF=10 (workflow_call, no inputs → 60M-row
     # lineitem); a manual workflow_dispatch cranks it to the ceiling (default SF=100 ≈ 600M rows).
-    # Runs AFTER merge-spill (needs:) so the two heavy runs never share a moment — the release path
-    # does merge, then tpch, one at a time. If merge-spill fails the release is already dead, so
-    # skipping tpch loses nothing. Generates onto /mnt (≈66 GB; / has only ~14 GB) via TMPDIR.
-    needs: merge-spill
+    # Runs in PARALLEL with merge-spill — each gate job is its own GitHub-hosted VM with its own RAM,
+    # so they never contend for memory. Generates onto /mnt (≈66 GB; / has only ~14 GB) via TMPDIR.
     runs-on: ubuntu-latest
     concurrency:
       group: tpch-stress
