@@ -6,3 +6,4 @@ dispatch), newest at the bottom. Written by the `tpch-stress` job; the live scor
 
 | Date | Run | Commit | DuckDB | delta_rs | SF | CPU | Ingest | Queries | OK |
 |------|-----|--------|--------|----------|----|-----|--------|---------|----|
+| 2026-07-10 | [#26](https://github.com/djouallah/duckrun/actions/runs/29089013898) | e491eaa | 1.5.4 | 1.5.0 | 10 | 4 | 62.9s | 26.3s | ✅ |
