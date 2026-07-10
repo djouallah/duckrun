@@ -15,9 +15,9 @@ on:
         type: string
         default: main
       orders:
-        description: "Contoso generator OrdersCount (scale knob; default matches the pre-built ~10M base so rebuild=false reuses it)"
+        description: "Contoso generator OrdersCount (scale knob; default matches the pre-built ~100M base so rebuild=false reuses it)"
         type: string
-        default: "10000000"
+        default: "100000000"
       runs:
         description: "HOT runs per query per model (run 1/2 dropped as warm; rest averaged)"
         type: string
@@ -57,9 +57,9 @@ jobs:
     # Linux (not windows-latest like the AEMO sibling): faster/cheaper runners, no Windows quirks.
     # ADOMD.NET has a cross-platform .NET Core build that loads under pythonnet/coreclr on Linux.
     runs-on: ubuntu-latest
-    # Default is the ~10M base (generation ~15min, or reused when rebuild=false); a larger requested
-    # scale (e.g. 100M ≈ ~2h, linear from ~86s at 1M) plus the delta landing, the duckrun auto_sort
-    # re-sort, and the XMLA passes still need headroom under the 6h hosted-job cap.
+    # Default is the ~100M base (reused when rebuild=false; a fresh rebuild is ~2h, linear from ~86s
+    # at 1M) plus the delta landing, the duckrun auto_sort re-sort, and the XMLA passes — all under
+    # the 6h hosted-job cap. A smaller scale (e.g. orders=10000000) needs rebuild=true to regenerate.
     timeout-minutes: 350
     env:
       # The azure extension's default transport fails the OneLake TLS handshake on Linux runners
