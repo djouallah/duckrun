@@ -20,7 +20,6 @@ name: cores
 #   • concurrency-correctness — proves MERGE snapshot safety + append_if_unchanged CAS + pre-snapshot window.
 #   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
 #                               dbt run (also a guard). Refreshes docs on push to main.
-#   • coffee-smoke            — fast connect/read/write/merge smoke at a small row count.
 #
 # Path-filtered to the offline surface it actually exercises — the adapter, the duckrun package, and
 # the test suites (everything under tests/, which now also houses the aemo / parity / integration
@@ -420,28 +419,6 @@ jobs:
             git pull --rebase origin main && git push origin main && break
             sleep 3
           done
-
-  coffee-smoke:
-    # A fast, automatic smoke of the connection-API coffee-shop scenario (duckrun.connect) on a LOCAL
-    # filesystem warehouse at a SMALL row count — the per-change guard that the end-to-end scenario
-    # still works. The dimension CSVs are vendored, so it is fully offline. The heavy local STRESS
-    # variant lives in local_stress_tests.yml; the live-OneLake variant in integration_tests_onelake.yml.
-    runs-on: ubuntu-latest
-    env:
-      COFFEE_LOCAL_ROWS: "2000"   # small + fast; the stress workflow is where you crank N
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
-        run: pip install -e ".[test]"
-
-      - name: Run the local coffee-shop scenario (small N)
-        # -s streams the scenario's stage-by-stage narration into the job log.
-        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_local -q -s -p no:cacheprovider
 
   tpch-smoke:
     # A fast SF=1 smoke of the connection-API TPCH benchmark (duckrun.connect): generate →

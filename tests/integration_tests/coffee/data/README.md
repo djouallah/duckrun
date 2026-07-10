@@ -4,10 +4,9 @@
 **Josue Bogran's** [coffeeshopdatageneratorv2](https://github.com/JosueBogran/coffeeshopdatageneratorv2)
 (MIT License, © Josue Bogran). All credit for the dataset goes to him.
 
-They are vendored here (rather than read over `https` at runtime) so the coffee-shop scenario —
-`test_coffee.py`, including the **coffee-stress release gate** — runs without any network dependency.
-That makes the stress timing/memory numbers legitimate (no upstream-fetch latency or flakiness) and
-keeps the release gate from being blocked by a transient `raw.githubusercontent.com` hiccup.
+They are vendored here (rather than read over `https` at runtime) so the coffee-shop scenario
+(`test_coffee.py`) runs without any network dependency. That keeps the run from being blocked by a
+transient `raw.githubusercontent.com` hiccup and its numbers free of upstream-fetch latency.
 
 To refresh from upstream:
 

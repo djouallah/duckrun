@@ -40,8 +40,8 @@ try:
 except Exception:
     pass
 
-# Dimension CSVs are vendored under data/ (see data/README.md) so the scenario — and the
-# coffee-stress release gate that runs it — never depend on the network. Forward-slash path so the
+# Dimension CSVs are vendored under data/ (see data/README.md) so the scenario never depends on
+# the network. Forward-slash path so the
 # DuckDB read_csv_auto string is valid on Windows too.
 DATA = (os.path.dirname(os.path.abspath(__file__)) + "/data").replace(os.sep, "/")
 

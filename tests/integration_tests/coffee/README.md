@@ -18,8 +18,7 @@ generated locally (random order lines), not taken from upstream.
 Two consumers, two ways of reading the same data:
 
 - **Connection-API scenario** (`integration_tests/coffee/test_coffee.py`) reads **vendored** copies
-  under [`data/`](data/) — so the scenario, and the `coffee-stress`
-  release gate that runs it, never touch the network (legit, repeatable stress numbers).
+  under [`data/`](data/) — so the scenario never touches the network (legit, repeatable numbers).
 - **This dbt project** reads the CSVs straight from upstream over `https`
   (`read_csv_auto('https://raw.githubusercontent.com/JosueBogran/coffeeshopdatageneratorv2/main/…')`).
   In CI it is only docs-built (`--empty-catalog`, models never execute), so it never actually fetches;
@@ -57,7 +56,6 @@ To target OneLake instead, point `WAREHOUSE_PATH` at an `abfss://…/Tables` pat
 
 ## CI
 
-The DAG is published to the docs site (built by the `aemo` job in `integration.yml`, no table
-build — `--static --empty-catalog`). The connection-API scenario is exercised by `coffee-smoke.yml`
-(local, small N), the `coffee-onelake` job in `integration.yml` (live OneLake, small N), and the
-manual `coffee` stress job (millions of rows).
+The DAG is published to the docs site. The connection-API scenario is exercised by the `coffee`
+job in `integration_tests_onelake.yml` (live OneLake, small N) — it is not run in the offline
+`cores` suite or the heavy `local_stress_tests` gate.
