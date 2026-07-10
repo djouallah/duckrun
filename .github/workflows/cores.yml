@@ -20,6 +20,8 @@ name: cores
 #   • concurrency-correctness — proves MERGE snapshot safety + append_if_unchanged CAS + pre-snapshot window.
 #   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
 #                               dbt run (also a guard). Refreshes docs on push to main.
+#   • merge-spill-smoke       — fast SF=1 smoke of the incremental-MERGE chain (full delta_rs clause
+#                               set) as a per-change guard; the heavy SF=10 gate is local_stress_tests.yml.
 #
 # Path-filtered to the offline surface it actually exercises — the adapter, the duckrun package, and
 # the test suites (everything under tests/, which now also houses the aemo / parity / integration
@@ -446,3 +448,32 @@ jobs:
         # Runs the full benchmark; exit non-zero = the read/write surface or the 22-query run
         # regressed. Writes docs/tpch_card.md (gitignored) + the job summary, but does NOT commit it.
         run: python tests/performance/tpch/tpch_card.py
+
+  merge-spill-smoke:
+    # A fast SF=1 smoke of the incremental-MERGE chain (tests/performance/merge_spill) run through
+    # the connection API — mixed upsert / insert-only / update-only / idempotent / the full delta_rs
+    # clause set (CDC, by-source delete, expression update) / append / overwrite. Pure per-change
+    # GUARD: the bench exits non-zero if any op's row count or value check is wrong. SF=1 (~6M-row
+    # lineitem) fits the runner's local disk, no /mnt needed. The PUBLISHED, RAM-ceiling SF=10 gate
+    # (which also commits the MERGE scorecard) is in local_stress_tests.yml; this job never commits
+    # the card. Fully offline bar tpchgen-cli.
+    runs-on: ubuntu-latest
+    env:
+      MERGE_SF: "1"   # small + fast; local_stress_tests.yml is where the SF is cranked
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
+        run: pip install -e ".[test]"
+
+      - name: Install tpchgen-cli (the bench shells out to it to generate lineitem)
+        run: pip install tpchgen-cli
+
+      - name: Run the incremental-MERGE chain (SF=1) as the guard
+        # Local warehouse under the runner's temp dir; the bench writes docs/merge_card.md (gitignored)
+        # + the job summary but is NOT committed here. Exit != 0 = a merge op regressed.
+        run: python tests/performance/merge_spill/merge_tpch_bench.py --dir "${RUNNER_TEMP}/merge_smoke" --sf "$MERGE_SF"
