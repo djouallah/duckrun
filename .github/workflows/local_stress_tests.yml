@@ -1,9 +1,11 @@
 name: local_stress_tests
 
-# The heavy, LOCAL-filesystem stress runs, collected as one workflow. Both take ~10 min and the
-# whole runner's RAM, so they NEVER run on push/PR: they are RELEASE GATES (workflow_call from
+# The heavy, LOCAL-filesystem stress runs, collected as one workflow. Each takes several minutes and
+# the whole runner's RAM, so they NEVER run on push/PR: they are RELEASE GATES (workflow_call from
 # publish.yml — a tag publishes only if they pass) and can be run by hand (workflow_dispatch) to find
 # the ceiling. Each is its own job (own runner + install), and each serializes via a static group.
+# On the release path merge-spill runs first, then tpch-stress (needs: merge-spill), so the two
+# heavy runs never overlap.
 #
 # Jobs:
 #   • merge-spill   — generate a large TPCH lineitem (gate SF=10 ≈ 60M rows) and merge several
@@ -12,10 +14,12 @@ name: local_stress_tests
 #                     runner's real RAM with duckrun's shipping defaults. Pinned deltalake 1.5.0
 #                     (1.6.0's merge is broken at scale). Renders the MERGE scorecard into docs and
 #                     commits to main on the release path.
-#   • tpch-stress   — the full TPC-H benchmark (ingest 8 tables → 22 queries) at a LARGE scale
-#                     factor (default SF=100). MANUAL ONLY (workflow_dispatch) — it is a
-#                     ceiling-finding run that may not fit the runner, so it never gates a release.
-#                     It renders + commits the canonical docs/tpch.md scorecard (cores runs SF=1).
+#   • tpch-stress   — the full TPC-H benchmark (ingest 8 tables → 22 queries). RELEASE GATE at a
+#                     modest SF=10 (workflow_call) — runs AFTER merge-spill (needs:) so the two heavy
+#                     runs never overlap. A manual workflow_dispatch cranks it to the ceiling (default
+#                     SF=100 ≈ 600M-row lineitem) and is the one that commits the canonical
+#                     docs/tpch.md scorecard; the release SF=10 run is a pass/fail guard only (never
+#                     commits the card). cores runs the SF=1 smoke.
 
 on:
   workflow_call:
@@ -26,7 +30,7 @@ on:
         required: false
         default: "10"
       tpch_sf:
-        description: "tpch-stress: TPCH scale factor (manual only; SF=100 ≈ 600M-row lineitem — ceiling-finding)"
+        description: "tpch-stress: TPCH scale factor for a MANUAL ceiling-finding run (default 100 ≈ 600M-row lineitem; the release gate ignores this and uses SF=10)"
         required: false
         default: "100"
 
@@ -114,18 +118,20 @@ jobs:
           done
 
   tpch-stress:
-    # The full TPC-H benchmark at a LARGE scale factor (default SF=100 ≈ 600M-row lineitem): ingest
-    # the 8 tables Parquet → Delta, then run the 22 queries, and render the docs/tpch.md scorecard.
-    # MANUAL ONLY (workflow_dispatch): SF=100 needs the big /mnt disk and may not fit, so it must
-    # never gate a release (local_stress is a release gate via workflow_call). Generates onto /mnt
-    # (≈66 GB; / has only ~14 GB) via TMPDIR. This is the canonical card source; cores runs SF=1.
-    if: github.event_name == 'workflow_dispatch'
+    # The full TPC-H benchmark (ingest the 8 tables Parquet → Delta, run the 22 queries, render the
+    # docs/tpch.md scorecard). RELEASE GATE at a modest SF=10 (workflow_call, no inputs → 60M-row
+    # lineitem); a manual workflow_dispatch cranks it to the ceiling (default SF=100 ≈ 600M rows).
+    # Runs AFTER merge-spill (needs:) so the two heavy runs never share a moment — the release path
+    # does merge, then tpch, one at a time. If merge-spill fails the release is already dead, so
+    # skipping tpch loses nothing. Generates onto /mnt (≈66 GB; / has only ~14 GB) via TMPDIR.
+    needs: merge-spill
     runs-on: ubuntu-latest
     concurrency:
       group: tpch-stress
       cancel-in-progress: false
     env:
-      TPCH_SF: "${{ inputs.tpch_sf || '100' }}"
+      # release gate (workflow_call, no inputs) -> SF=10; a manual dispatch picks its own (default 100).
+      TPCH_SF: "${{ inputs.tpch_sf || '10' }}"
       DIR: /mnt/tpch
     steps:
       - uses: actions/checkout@v4
@@ -159,9 +165,11 @@ jobs:
           exit $rc
 
       - name: Render the scorecard into docs and commit to main
-        # This manual run IS the canonical card source. Never fail the run on a commit hiccup;
-        # [skip ci] avoids re-triggering. No-op if the bench died before writing the card.
-        if: always() && hashFiles('docs/tpch_card.md') != ''
+        # Only the manual (ceiling-finding, default SF=100) run is the canonical card source and
+        # commits it. The release-gate SF=10 run (workflow_call) is a pass/fail guard only — it shows
+        # the card in its own summary but must NOT overwrite the published SF=100 card. Never fail the
+        # run on a commit hiccup; [skip ci] avoids re-triggering. No-op if the bench died first.
+        if: always() && hashFiles('docs/tpch_card.md') != '' && github.event_name == 'workflow_dispatch'
         continue-on-error: true
         run: |
           git fetch origin main
