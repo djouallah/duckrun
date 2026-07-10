@@ -1,9 +1,9 @@
-"""Deploy the Contoso benchmark semantic models under tests/parquet_layout_contoso/
-(contoso_auto_sort + contoso_vorder) and refresh them — used by the Contoso parquet-layout workflow.
+"""Deploy the benchmark semantic model(s) under tests/parquet_layout/aemo/ (aemo_electricity_auto_sort
++ aemo_electricity_vorder) and refresh them — used by the parquet-layout benchmark workflow.
 
-GUID-swap the bim (dev -> target ws/lh), `fab deploy` scoped to ./parquet_layout_contoso, then
-refresh via the Power BI API. Assumes `fab` is installed and logged in (federated) by the workflow.
-Args: --env (deploy_config.yml section, default main).
+GUID-swap the bim (dev -> target ws/lh), `fab deploy` scoped to ./aemo, then
+refresh via the Power BI API. Assumes `fab` is installed and logged in (federated) by the
+workflow. Args: --env (deploy_config.yml section, default main).
 """
 import argparse
 import json
@@ -14,10 +14,10 @@ from pathlib import Path
 
 import yaml
 
-HERE = Path(__file__).resolve().parent            # tests/parquet_layout_contoso/
-root = HERE.parent                                # tests/ — fab runs here; ./{REPO_SUBDIR} resolves back to HERE
+HERE = Path(__file__).resolve().parent            # this script lives in tests/parquet_layout/aemo/
+root = HERE.parent                                # tests/parquet_layout/ — fab runs here; ./{REPO_SUBDIR} resolves back to HERE
 BENCH = HERE                                       # the *.SemanticModel folders live here
-REPO_SUBDIR = HERE.name                            # "parquet_layout_contoso"
+REPO_SUBDIR = HERE.name                            # "aemo"
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--env", default="main")
@@ -56,7 +56,7 @@ for n in names:
     bim.write_text(text.replace(m.group(1), WS_ID).replace(m.group(2), lh_id))
     bims.append(bim)
 
-cfg_yml = root / "_bench_deploy_contoso.yml"
+cfg_yml = root / "_bench_deploy.yml"
 cfg_yml.write_text(
     f'core:\n  workspace: "{ws}"\n  repository_directory: "./{REPO_SUBDIR}"\n'
     '  item_types_in_scope:\n    - SemanticModel\n')
@@ -78,12 +78,6 @@ finally:
 # Refresh each (Direct Lake reframe) — 3x retry for OneLake security propagation.
 for n in names:
     sm_id = cap(["fab", "get", f"{ws}.Workspace/{n}.SemanticModel", "-q", "id"]).stdout.strip()
-    # Fail loud if the item isn't in the workspace after deploy (e.g. the .SemanticModel folder was
-    # missing its .platform marker, so `fab deploy` published nothing) — otherwise we'd POST to
-    # datasets/[NotFound] and print a false "deployed + refreshed".
-    if not sm_id or sm_id == "[NotFound]":
-        raise SystemExit(f"semantic model '{n}' not found in workspace '{ws}' after deploy "
-                         f"(fab get id -> {sm_id!r}); check the .SemanticModel/.platform marker")
     for attempt in range(1, 4):
         try:
             run(["fab", "api", "-A", "powerbi", "-X", "post", f"groups/{WS_ID}/datasets/{sm_id}/refreshes"])
@@ -94,4 +88,4 @@ for n in names:
             print(f"[{n}] refresh attempt {attempt} failed (OneLake security propagating); waiting 60s...")
             time.sleep(60)
 
-print("Contoso benchmark semantic model(s) deployed + refreshed:", ", ".join(names))
+print("Benchmark semantic model(s) deployed + refreshed:", ", ".join(names))

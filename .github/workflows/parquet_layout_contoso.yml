@@ -6,7 +6,7 @@ name: Direct Lake query benchmark — Contoso
 # TIMING them — contoso_auto_sort (duckrun-clustered) vs contoso_vorder (Fabric Spark V-Order). The
 # base is generated from scratch with SQLBI's Contoso Data Generator (MIT) and lands in a DEDICATED
 # `sqlbi` lakehouse, isolated from the AEMO `data` lakehouse. Runs on windows-latest where ADOMD.NET
-# loads cleanly. See tests/parquet_layout_contoso/README.md.
+# loads cleanly. See tests/parquet_layout/contoso/README.md.
 on:
   workflow_dispatch:
     inputs:
@@ -93,7 +93,7 @@ jobs:
           FORCE_REBUILD: ${{ inputs.rebuild }}
         run: |
           echo "RUN_REPORT=$PWD/run_report.json" >> "$GITHUB_ENV"
-          RUN_REPORT="$PWD/run_report.json" python tests/parquet_layout_contoso/report.py init
+          RUN_REPORT="$PWD/run_report.json" python tests/parquet_layout/contoso/report.py init
 
       - name: 🧩 Install ADOMD.NET client (.NET Core build, cross-platform)
         run: |
@@ -122,7 +122,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout_contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
+          $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout/contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
           $wsId = $meta.ws
           $lhName = $meta.lh
           # Use Invoke-RestMethod for the POST (sends JSON cleanly, throws on non-2xx so Stop catches
@@ -158,7 +158,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout_contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
+          $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout/contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
           $wsId = $meta.ws
           $lhs = az rest --method get --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" | ConvertFrom-Json
           $lhId = ($lhs.value | Where-Object { $_.displayName -eq $meta.lh }).id
@@ -187,13 +187,13 @@ jobs:
           PYTHONIOENCODING: utf-8
           CONTOSO_ORDERS: ${{ inputs.orders }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
-        run: python tests/parquet_layout_contoso/build_base.py
+        run: python tests/parquet_layout/contoso/build_base.py
 
       - name: 🔎 Check existing tables (one duckrun connection gates the build phase)
         id: check
         env:
           PYTHONIOENCODING: utf-8
-        run: python tests/parquet_layout_contoso/check_tables.py
+        run: python tests/parquet_layout/contoso/check_tables.py
 
       - name: ⚡ Build Spark V-Order table (Livy, reads contoso.sales directly)
         if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
@@ -201,7 +201,7 @@ jobs:
           PYTHONIOENCODING: utf-8
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
-        run: python tests/parquet_layout_contoso/build_spark_variant.py
+        run: python tests/parquet_layout/contoso/build_spark_variant.py
 
       - name: 🧭 Build auto_sort table (duckrun sorted, reads contoso.sales directly)
         if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
@@ -210,23 +210,23 @@ jobs:
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
-        run: python tests/parquet_layout_contoso/build_auto_sort.py
+        run: python tests/parquet_layout/contoso/build_auto_sort.py
 
       - name: 🚀 Deploy benchmark semantic models (auto_sort + vorder)
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           fab config set encryption_fallback_enabled true
-          # Federated (OIDC) login for fab — deploys only tests/parquet_layout_contoso/*.SemanticModel.
+          # Federated (OIDC) login for fab — deploys only tests/parquet_layout/contoso/*.SemanticModel.
           $fed = (Invoke-RestMethod -Uri "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
           fab auth login -t ${{ secrets.AZURE_TENANT_ID }} -u ${{ secrets.AZURE_CLIENT_ID }} --federated-token $fed
-          python tests/parquet_layout_contoso/deploy.py --env ${{ inputs.env }}
+          python tests/parquet_layout/contoso/deploy.py --env ${{ inputs.env }}
 
       - name: 📊 Table stats (duckrun) — sales_auto_sort vs sales_vorder
         continue-on-error: true   # nice-to-have; never block the benchmark
         env:
           PYTHONIOENCODING: utf-8
-        run: python tests/parquet_layout_contoso/table_stats.py
+        run: python tests/parquet_layout/contoso/table_stats.py
 
       # The tokens minted at job start have a ~75-min lifetime. On a full-rebuild 100M run, generation
       # + landing + the auto_sort benchmark can push the vorder pass past that, so it failed with
@@ -257,18 +257,18 @@ jobs:
           BENCH_COLD: ${{ inputs.cold }}
           COLD_REPEATS: ${{ inputs.cold_repeats }}
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
-        run: python tests/parquet_layout_contoso/xmla_compare.py
+        run: python tests/parquet_layout/contoso/xmla_compare.py
 
       - name: 📝 Render report to job summary (computes + merges the analysis block)
         if: always()
         continue-on-error: true
-        run: python tests/parquet_layout_contoso/render_report.py
+        run: python tests/parquet_layout/contoso/render_report.py
 
       - name: 📑 Render specialist findings to job summary (fails on verdict-direction mismatch)
         if: always()
         env:
           PYTHONIOENCODING: utf-8
-        run: python tests/parquet_layout_contoso/render_summary.py
+        run: python tests/parquet_layout/contoso/render_summary.py
 
       - name: 📎 Upload run report
         if: always()

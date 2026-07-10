@@ -1,4 +1,4 @@
-"""Regression guards for the Direct Lake benchmark verdict layer (parquet_layout_tests).
+"""Regression guards for the Direct Lake benchmark verdict layer (parquet_layout/aemo).
 
 The verdict layer once read a base/model ratio with the wrong orientation, so a lower total (the
 FASTER layout) could be reported as the loser. These tests pin the direction so it can't recur:
@@ -10,7 +10,7 @@ import sys
 
 import pytest
 
-_PL = os.path.join(os.path.dirname(__file__), "..", "parquet_layout_tests")
+_PL = os.path.join(os.path.dirname(__file__), "aemo")
 sys.path.insert(0, os.path.abspath(_PL))
 
 import render_report as rr          # noqa: E402

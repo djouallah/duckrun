@@ -52,7 +52,7 @@ _ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
 # 32 MB is a deliberate step further up the merge-memory curve, bought for read-layout density. Truly
 # near-unique join keys (e.g. l_orderkey / l_comment) still overflow to PLAIN — their dictionary would
 # be as big as the data, so no loss. This is the knob most likely to regress the merge-spill stress
-# gate; tests/parquet_layout_tests/ is the harness to confirm the read-side win against a real Direct Lake
+# gate; tests/parquet_layout/aemo/ is the harness to confirm the read-side win against a real Direct Lake
 # reference before trusting it.
 _DICT_PAGE_SIZE_LIMIT = 32 * 1024 * 1024
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible

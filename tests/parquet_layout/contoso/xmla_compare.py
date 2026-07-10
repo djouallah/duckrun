@@ -4,7 +4,7 @@ the Sales fact) against the `_vorder` model (a Fabric Spark V-Order copy). Both 
 pristine contoso.sales base, so this is apples-to-apples: only the Delta layout differs, which
 changes how much the Direct Lake engine transcodes (cold) and scans (hot).
 
-Adapted from the AEMO benchmark's xmla_compare.py (tests/parquet_layout_tests/) — same XMLA engine
+Adapted from the AEMO benchmark's xmla_compare.py (tests/parquet_layout/aemo/) — same XMLA engine
 and cold/hot methodology, retargeted to the Contoso star (Sales/OrderRows/Orders + dims) and its
 measures (Sales Amount, Total Cost, Margin, Margin %, Total Quantity — ported from SQLBI's pbit).
 

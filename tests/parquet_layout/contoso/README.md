@@ -1,7 +1,7 @@
-# parquet_layout_contoso — Direct Lake layout benchmark (duckrun vs real V-Order), Contoso dataset
+# contoso — Direct Lake layout benchmark (duckrun vs real V-Order), Contoso dataset
 
 A second dataset for the Direct Lake query benchmark that lives next door in
-[`../parquet_layout_tests/`](../parquet_layout_tests/) (AEMO). Same question, same machinery: **does
+[`../aemo/`](../aemo/) (AEMO). Same question, same machinery: **does
 the Power BI / Direct Lake engine query a duckrun-written table as fast as a real Fabric V-Order
 table of the same data?** — measured as DAX query speed (cold Delta→memory transcode + hot scan)
 over the XMLA endpoint. Where the AEMO benchmark reads a pre-built ~140M-row electricity fact, this

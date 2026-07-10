@@ -1,4 +1,4 @@
-# parquet_layout_tests — Direct Lake layout benchmark (duckrun vs real V-Order)
+# aemo — Direct Lake layout benchmark (duckrun vs real V-Order)
 
 A **manual, non-gating** benchmark that answers the only question that matters when tuning
 duckrun's parquet write layout: **does the Power BI / Direct Lake engine query a duckrun-written
@@ -53,10 +53,10 @@ export FABRIC_TOKEN=...    # api.fabric.microsoft.com   (livy + deploy)
 export PBI_TOKEN=...       # analysis.windows.net/powerbi/api  (XMLA)
 export PBI_WORKSPACE="<workspace display name>"
 export WS_ID=... LH_ID=... ADOMD_DIR=<dir with AdomdClient.dll>
-python tests/parquet_layout_tests/build_spark_variant.py
-python tests/parquet_layout_tests/build_auto_sort.py
-python tests/parquet_layout_tests/deploy_vorder.py --env main
-python tests/parquet_layout_tests/xmla_compare.py
+python tests/parquet_layout/aemo/build_spark_variant.py
+python tests/parquet_layout/aemo/build_auto_sort.py
+python tests/parquet_layout/aemo/deploy_vorder.py --env main
+python tests/parquet_layout/aemo/xmla_compare.py
 ```
 
 ## Tuning workflow (the point of this folder)
