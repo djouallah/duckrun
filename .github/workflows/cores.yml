@@ -111,6 +111,18 @@ jobs:
             tests/correctness/test_correctness.py \
             -q -p no:cacheprovider
 
+      - name: Pure-local property / regression guards (network-free)
+        # Fast, offline unit tests that lived outside any workflow path and so never ran: the
+        # sort-key recommender R-rules (tests/sortkey), the Direct Lake verdict-orientation guards
+        # (tests/parquet_layout), and the local multi-catalog de-risk (its dbt sibling runs on
+        # OneLake; this one is network-free and belongs on the per-change gate).
+        run: |
+          python -m pytest \
+            tests/sortkey/test_sortkey_properties.py \
+            tests/parquet_layout/test_verdicts.py \
+            tests/integration_tests/multicatalog/test_multicatalog.py \
+            -q -p no:cacheprovider
+
       - name: Conformance-SLT suite (black-box SQL router / Delta-semantics gate)
         # A vendored, DuckDB-oracle-validated sqllogictest suite (tests/conformance_slt/) run against
         # real duckrun with writes enabled. The wrapper asserts the oracle stays all-green AND that
