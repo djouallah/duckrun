@@ -73,7 +73,7 @@ conformance.xml
 !plugins/**/.claude-plugin/plugin.json
 # ...except dbt's auto-generated local user file (aemo, any integration project)
 tests/integration_tests/*/.user.yml
-tests/performance_test/*/.user.yml
+tests/performance/*/.user.yml
 tests/parity_tests/*/.user.yml
 
 # Delta output and dbt artifacts produced by the integration projects (runtime)
@@ -106,11 +106,11 @@ tests/multi_catalog/logs/
 tests/multi_catalog/.user.yml
 # Runtime artifacts from the performance projects (merge_spill / tpch write to external dirs by
 # default, but a local run may drop these inside the project)
-tests/performance_test/*/warehouse/
-tests/performance_test/*/target/
-tests/performance_test/*/dbt_packages/
-tests/performance_test/*/logs/
-tests/performance_test/*/package-lock.yml
+tests/performance/*/warehouse/
+tests/performance/*/target/
+tests/performance/*/dbt_packages/
+tests/performance/*/logs/
+tests/performance/*/package-lock.yml
 # The MERGE benchmark scorecard the runner writes (injected into docs/merge-benchmark.md in CI)
 docs/merge_card.md
 # The snapshot-pin scorecard the runner writes (injected into docs/snapshot-pin.md in CI)

@@ -6,7 +6,7 @@ to the console. SF defaults to 1 for a quick local run; CI sets ``TPCH_SF`` (the
 SF=10). Exit 0 iff the run is well-formed (all 8 tables ingested + 22 queries timed), else 1 — so it
 doubles as the CI guard (a broken read/write surface fails the job).
 
-    TPCH_SF=10 python tests/performance_test/tpch/tpch_card.py
+    TPCH_SF=10 python tests/performance/tpch/tpch_card.py
 
 Run from the repo root (it writes docs/tpch_card.md relative to the cwd).
 """
@@ -18,8 +18,7 @@ import deltalake
 import duckdb
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, HERE)                                      # test_tpch.py (same dir)
-sys.path.insert(0, os.path.join(HERE, "..", "..", "performance"))  # tpch_summary.py (tests/performance/)
+sys.path.insert(0, HERE)                                      # test_tpch.py + tpch_summary.py (same dir)
 
 from test_tpch import TPCH_TABLES, run_tpch_benchmark  # noqa: E402
 from tpch_summary import render_card  # noqa: E402

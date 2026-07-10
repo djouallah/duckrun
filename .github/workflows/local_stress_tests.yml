@@ -82,7 +82,7 @@ jobs:
         # line here for the case where it dies before writing — i.e. OOM-killed (rc 137/139).
         run: |
           set -o pipefail
-          python tests/performance/merge_tpch_bench.py --dir "$DIR" --sf "$SF" ; rc=$?
+          python tests/performance/merge_spill/merge_tpch_bench.py --dir "$DIR" --sf "$SF" ; rc=$?
           if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
             {
               echo "## 🔀 Incremental MERGE test — duckrun on Delta Lake"
@@ -218,7 +218,7 @@ jobs:
         env:
           TMPDIR: /mnt/tpch
         run: |
-          python tests/performance_test/tpch/tpch_card.py ; rc=$?
+          python tests/performance/tpch/tpch_card.py ; rc=$?
           if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
             echo "**TPC-H SF=$TPCH_SF: 💀 OOM / disk-killed (rc=$rc)** — did not fit the runner." >> "$GITHUB_STEP_SUMMARY"
           fi

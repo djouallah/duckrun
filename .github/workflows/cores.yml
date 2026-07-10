@@ -42,8 +42,7 @@ on:
       - '!tests/parity_tests/**'                    # parity.yml
       - '!tests/parquet_layout_tests/**'            # parquet_layout.yml (manual)
       - '!tests/parquet_layout_contoso/**'          # parquet_layout_contoso.yml (manual)
-      - '!tests/performance/**'                     # local_stress_tests.yml
-      - '!tests/performance_test/merge_spill/**'    # integration_tests_onelake.yml / stress
+      - '!tests/performance/merge_spill/**'         # local_stress_tests.yml + integration_tests_onelake.yml (tpch/ still fires cores)
       - '!tests/integration_tests/taxi/**'          # integration_tests_onelake.yml
       - '!tests/integration_tests/multicatalog/**'  # integration_tests_onelake.yml
       - 'pyproject.toml'      # dependency / version changes
@@ -57,8 +56,7 @@ on:
       - '!tests/parity_tests/**'
       - '!tests/parquet_layout_tests/**'
       - '!tests/parquet_layout_contoso/**'
-      - '!tests/performance/**'
-      - '!tests/performance_test/merge_spill/**'
+      - '!tests/performance/merge_spill/**'
       - '!tests/integration_tests/taxi/**'
       - '!tests/integration_tests/multicatalog/**'
       - 'pyproject.toml'
@@ -470,4 +468,4 @@ jobs:
       - name: Run the TPCH benchmark (SF=1) as the guard
         # Runs the full benchmark; exit non-zero = the read/write surface or the 22-query run
         # regressed. Writes docs/tpch_card.md (gitignored) + the job summary, but does NOT commit it.
-        run: python tests/performance_test/tpch/tpch_card.py
+        run: python tests/performance/tpch/tpch_card.py

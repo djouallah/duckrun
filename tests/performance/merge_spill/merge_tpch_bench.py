@@ -20,13 +20,13 @@ RAM:
                                      removed, a read-modify-append on the same table is auto-fenced)
     -> overwrite_all       (~5% sample, table overwrite -- replaces the whole table)
 
-Each op's SQL lives in ``tests/performance_test/merge_spill/sql/<op>.sql`` (plain DuckDB, no Jinja):
+Each op's SQL lives in ``tests/performance/merge_spill/sql/<op>.sql`` (plain DuckDB, no Jinja):
 it builds the batch into a ``_batch`` TEMP table and applies the op via ``conn.sql(...)`` (the merge
 runs through delta_rs's spill cap + the per-merge DuckDB memory pin — the same engine core the dbt
 adapter uses). Batches are sampled with deterministic markers (l_quantity = -1 / -2, l_shipdate =
 2035) so the runner can verify the effect by querying the table.
 
-    python tests/performance/merge_tpch_bench.py --dir /tmp/m --sf 10
+    python tests/performance/merge_spill/merge_tpch_bench.py --dir /tmp/m --sf 10
 """
 import argparse
 import os
@@ -42,9 +42,8 @@ import duckdb
 import deltalake
 import duckrun
 
-# merge_tpch_bench lives in tests/performance/ and merge_spill lives in tests/performance_test/,
-# so resolve from tests/ (parents[1]: performance -> tests).
-SQL_DIR = Path(__file__).resolve().parents[1] / "performance_test" / "merge_spill" / "sql"
+# The runner and its SQL are co-located under tests/performance/merge_spill/.
+SQL_DIR = Path(__file__).resolve().parent / "sql"
 SCHEMA = "mart"
 MARK_UPSERT = "-1.0"
 MARK_UPDATE = "-2.0"
