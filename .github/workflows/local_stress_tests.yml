@@ -17,9 +17,10 @@ name: local_stress_tests
 #   • tpch-stress   — the full TPC-H benchmark (ingest 8 tables → 22 queries). RELEASE GATE at a
 #                     modest SF=10 (workflow_call), in PARALLEL with merge-spill (separate VMs, no
 #                     shared RAM). A manual workflow_dispatch cranks it to the ceiling (default
-#                     SF=100 ≈ 600M-row lineitem) and is the one that commits the canonical
-#                     docs/tpch.md scorecard; the release SF=10 run is a pass/fail guard only (never
-#                     commits the card). cores runs the SF=1 smoke.
+#                     SF=100 ≈ 600M-row lineitem). ONLY that full-scale SF=100 dispatch commits the
+#                     canonical docs/tpch.md scorecard — the SF=10 release gate and any smaller
+#                     manual probe are pass/fail guards that must NOT clobber the published card.
+#                     cores runs the SF=1 smoke.
 
 on:
   workflow_call:
@@ -184,11 +185,13 @@ jobs:
           exit $rc
 
       - name: Render the scorecard into docs and commit to main
-        # Only the manual (ceiling-finding, default SF=100) run is the canonical card source and
-        # commits it. The release-gate SF=10 run (workflow_call) is a pass/fail guard only — it shows
-        # the card in its own summary but must NOT overwrite the published SF=100 card. Never fail the
-        # run on a commit hiccup; [skip ci] avoids re-triggering. No-op if the bench died first.
-        if: always() && hashFiles('docs/tpch_card.md') != '' && github.event_name == 'workflow_dispatch'
+        # docs/tpch.md is the PUBLISHED SF=100 scorecard — only a manual, full-scale SF=100 run may
+        # overwrite it. The SF=10 release gate (workflow_call) and any smaller manual dispatch (a
+        # test/ceiling-probe at SF=1/10/etc.) are guard-only: they show their card in the run summary
+        # but must NOT clobber the published card. Hence the explicit TPCH_SF == '100' gate — a
+        # manual dispatch alone is not enough. Never fail on a commit hiccup; [skip ci]. No-op if the
+        # bench died first.
+        if: always() && hashFiles('docs/tpch_card.md') != '' && github.event_name == 'workflow_dispatch' && env.TPCH_SF == '100'
         continue-on-error: true
         run: |
           git fetch origin main
