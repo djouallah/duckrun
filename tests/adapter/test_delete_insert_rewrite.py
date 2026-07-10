@@ -76,9 +76,10 @@ def test_delete_insert_large_composite_batch_scales(cur, tmp_path):
     n = 200_000
     path = (tmp_path / "t").as_posix()
     # Seed target with the even keys; batch re-emits ALL keys with a new value + adds none.
+    # Pass the DuckDB relation straight to write_deltalake (its Arrow C-stream) — no pyarrow .arrow().
     seed = cur.sql(
         "select (i*2) as k1, 'p' as k2, 'old' as val from range(%d) t(i)" % (n // 2)
-    ).arrow()
+    )
     write_deltalake(path, seed)
     cur.execute(
         "create or replace temp view batch as "
