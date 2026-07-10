@@ -111,6 +111,10 @@ docs/merge_card.md
 docs/snapshot_pin_card.md
 # The TPC-H scorecard the runner writes (injected into docs/tpch.md in CI)
 docs/tpch_card.md
+# Per-run history rows the benches write; the workflow appends them to the tracked
+# docs/*-benchmark-history.md files (which ARE committed) and then discards these.
+docs/merge_history_row.md
+docs/tpch_history_row.md
 # The NYC-taxi demo HTML report the runner writes (published as taxi.html in CI)
 taxi_run.html
 # CI-only scorecards: rendered from test XML and injected into the docs/*.md beside them

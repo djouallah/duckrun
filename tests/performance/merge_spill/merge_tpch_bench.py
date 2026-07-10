@@ -36,6 +36,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
@@ -453,10 +454,39 @@ def run(args):
     print("OK: duckrun ran the chain through the connection API and survived.")
 
 
+def _run_ref():
+    """A markdown link to this GitHub Actions run (or 'local' outside CI)."""
+    run_id = os.environ.get("GITHUB_RUN_ID")
+    if not run_id:
+        return "local"
+    num = os.environ.get("GITHUB_RUN_NUMBER", run_id)
+    url = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+           f"{os.environ.get('GITHUB_REPOSITORY', '')}/actions/runs/{run_id}")
+    return f"[#{num}]({url})"
+
+
+def _write_history_row(setup, results, peak, all_ok):
+    """Append-ready: write ONE markdown table row for this run to docs/merge_history_row.md.
+
+    The workflow appends this single line to the tracked docs/merge-benchmark-history.md so every
+    run leaves a permanent trend entry. Gitignored; harmless if written on a local run (the workflow
+    is the only thing that commits it)."""
+    date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    commit = os.environ.get("GITHUB_SHA", "")[:7] or "local"
+    rows = f"{setup['target_rows'] / 1e6:.1f}M"
+    peak_s = f"{peak:,} MB" if peak is not None else "n/a"
+    wall = sum(r["dt"] for r in results)
+    row = (f"| {date} | {_run_ref()} | {commit} | {setup['duckdb_ver']} | {setup['deltalake_ver']} "
+           f"| {setup['sf']} | {rows} | {peak_s} | {wall:.0f}s | {'✅' if all_ok else '❌'} |\n")
+    with open("docs/merge_history_row.md", "w", encoding="utf-8", newline="\n") as fh:
+        fh.write(row)
+
+
 def _write_summary(setup, results, final_rows, peak, all_ok):
     card = _build_card(setup, results, final_rows, peak, all_ok)
     with open("docs/merge_card.md", "w", encoding="utf-8", newline="\n") as fh:
         fh.write(card + "\n")
+    _write_history_row(setup, results, peak, all_ok)
     path = os.environ.get("GITHUB_STEP_SUMMARY")
     if path:
         with open(path, "a", encoding="utf-8") as fh:

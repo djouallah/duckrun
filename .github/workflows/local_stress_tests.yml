@@ -117,6 +117,27 @@ jobs:
             sleep 3
           done
 
+      - name: Append this run's result to the benchmark history
+        # Unlike the canonical card above (release-only), EVERY run — release gate AND manual
+        # dispatch — leaves one permanent row in docs/merge-benchmark-history.md for the trend log.
+        # The bench wrote the row to docs/merge_history_row.md (gitignored); append it to the tracked
+        # history against a fresh origin/main. Never fail the run on a git hiccup; [skip ci].
+        if: always() && hashFiles('docs/merge_history_row.md') != ''
+        continue-on-error: true
+        run: |
+          row="$(cat docs/merge_history_row.md)"
+          git fetch origin main
+          git checkout -B main origin/main
+          printf '%s\n' "$row" >> docs/merge-benchmark-history.md
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/merge-benchmark-history.md
+          git commit -m "docs: record MERGE benchmark result [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
+
   tpch-stress:
     # The full TPC-H benchmark (ingest the 8 tables Parquet → Delta, run the 22 queries, render the
     # docs/tpch.md scorecard). RELEASE GATE at a modest SF=10 (workflow_call, no inputs → 60M-row
@@ -181,6 +202,27 @@ jobs:
           git config user.email "mimoune.djouallah@gmail.com"
           git add docs/tpch.md
           git commit -m "docs: update TPCH scorecard [skip ci]"
+          for i in 1 2 3; do
+            git pull --rebase origin main && git push origin main && break
+            sleep 3
+          done
+
+      - name: Append this run's result to the benchmark history
+        # Every run — the SF=10 release gate AND a manual SF=100 dispatch — leaves one permanent row
+        # in docs/tpch-benchmark-history.md for the trend log (unlike the canonical card above, which
+        # only the manual run commits). The bench wrote the row to docs/tpch_history_row.md
+        # (gitignored); append it to the tracked history. Never fail on a git hiccup; [skip ci].
+        if: always() && hashFiles('docs/tpch_history_row.md') != ''
+        continue-on-error: true
+        run: |
+          row="$(cat docs/tpch_history_row.md)"
+          git fetch origin main
+          git checkout -B main origin/main
+          printf '%s\n' "$row" >> docs/tpch-benchmark-history.md
+          git config user.name "djouallah"
+          git config user.email "mimoune.djouallah@gmail.com"
+          git add docs/tpch-benchmark-history.md
+          git commit -m "docs: record TPCH benchmark result [skip ci]"
           for i in 1 2 3; do
             git pull --rebase origin main && git push origin main && break
             sleep 3
