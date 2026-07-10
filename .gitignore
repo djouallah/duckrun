@@ -92,11 +92,12 @@ tests/dbt_unit_tests/project/target/
 tests/dbt_unit_tests/project/dbt_packages/
 tests/dbt_unit_tests/project/logs/
 tests/dbt_unit_tests/project/.user.yml
-# dbt run artifacts from the multi-catalog end-to-end project (harness runs dbt into the dir)
-tests/correctness/multi_catalog/target/
-tests/correctness/multi_catalog/dbt_packages/
-tests/correctness/multi_catalog/logs/
-tests/correctness/multi_catalog/.user.yml
+# dbt run artifacts from the correctness dbt projects (multi_catalog, snapshot_pin — harness runs dbt into the dir)
+tests/correctness/*/target/
+tests/correctness/*/dbt_packages/
+tests/correctness/*/logs/
+tests/correctness/*/warehouse/
+tests/correctness/*/.user.yml
 # Runtime artifacts from the performance projects (merge_spill / tpch write to external dirs by
 # default, but a local run may drop these inside the project)
 tests/performance/*/warehouse/

@@ -140,7 +140,7 @@ jobs:
         # Offline and deterministic, so it belongs on the per-change gate next to the unit tests.
         run: |
           python -m pytest \
-            tests/integration_tests/snapshot_pin/test_snapshot_pin.py \
+            tests/correctness/snapshot_pin/test_snapshot_pin.py \
             -q -p no:cacheprovider
 
       - name: dbt native unit tests on duckrun (realistic jaffle-style project)
@@ -399,7 +399,7 @@ jobs:
       - name: Render the snapshot-pin scorecard (also writes the run summary)
         # Exit 0 = the demonstration holds (unpinned loses the update, pinned preserves it).
         # Exit non-zero = the pin's guarantee regressed -> the run fails.
-        run: python tests/integration_tests/snapshot_pin/snapshot_pin_card.py
+        run: python tests/correctness/snapshot_pin/snapshot_pin_card.py
 
       - name: Inject the card into docs and commit to main
         # Only a push to main updates the canonical card in the docs; PRs/branches just show it in
