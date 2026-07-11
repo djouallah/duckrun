@@ -462,18 +462,40 @@ class TestSqlDml:
             9: "z",    # unmatched → inserted
         }
 
-    def test_sql_merge_insert_subquery_value_rejected(self, conn):
-        # a scalar subquery inside a MERGE value is a hard delta_rs/datafusion panic — rejected loud
-        # (clean ValueError) before it reaches the merger, never a process-killing crash.
+    def test_sql_merge_constfold_duckdb_function_in_value(self, conn):
+        # a DuckDB-only function in a MERGE value is constant-folded in DuckDB before delta_rs/datafusion
+        # (which lacks it) ever sees the expression.
+        conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
+                 "WHEN NOT MATCHED THEN INSERT VALUES (source.id, upper('hi') || current_schema())")
+        assert conn.sql("select name from src where id = 9").fetchone()[0].startswith("HI")
+
+    def test_sql_merge_constfold_noncorrelated_subquery_in_value(self, conn):
+        # a subquery that references neither target nor source is constant w.r.t. the merge — folded to
+        # its literal in DuckDB (delta_rs can't plan a subquery), so the merge succeeds.
+        conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
+                 "WHEN NOT MATCHED THEN INSERT VALUES (source.id, (select name from src where id = 1))")
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "a"
+
+    def test_sql_merge_constfold_noncorrelated_subquery_in_predicate(self, conn):
+        # same fold in a WHEN predicate: (select count(*) …) > 0 is constant → folded, merge runs.
+        conn.sql("MERGE INTO src USING (values (1,'X')) t(id, name) ON target.id = source.id "
+                 "WHEN MATCHED AND (select count(*) from src) > 0 THEN UPDATE SET name = source.name")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+
+    def test_sql_merge_correlated_subquery_value_rejected(self, conn):
+        # a CORRELATED subquery (references target/source) can't be folded and is a hard datafusion
+        # panic — rejected loud (clean ValueError) before it reaches the merger.
         with pytest.raises(ValueError, match="subquery"):
             conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
-                     "WHEN NOT MATCHED THEN INSERT VALUES (source.id, (select name from src limit 1))")
+                     "WHEN NOT MATCHED THEN INSERT VALUES (source.id, "
+                     "(select name from src where id = source.id))")
 
-    def test_sql_merge_update_subquery_value_rejected(self, conn):
-        # same guard on the UPDATE SET path.
+    def test_sql_merge_correlated_subquery_predicate_rejected(self, conn):
+        # same guard on a correlated subquery in a WHEN predicate.
         with pytest.raises(ValueError, match="subquery"):
             conn.sql("MERGE INTO src USING (values (1,'x')) t(id, name) ON target.id = source.id "
-                     "WHEN MATCHED THEN UPDATE SET name = (select name from src limit 1)")
+                     "WHEN MATCHED AND (select count(*) from src where name = target.name) > 0 "
+                     "THEN UPDATE SET name = source.name")
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════

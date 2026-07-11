@@ -838,13 +838,131 @@ def validate_merge_condition(condition: str) -> None:
             )
 
 
+# ── Constant-folding of MERGE expressions ──────────────────────────────────────────────────────────
+# delta_rs evaluates a MERGE's ON/WHEN predicates and UPDATE/INSERT value expressions in datafusion,
+# which lacks DuckDB's function library (version(), current_schema(), epoch(), pi(), …) and can't plan a
+# subquery. But any subexpression that references NEITHER `target` NOR `source` is constant with respect
+# to the merge, so we evaluate it in DuckDB up front and splice the resulting typed literal into the
+# string handed to delta_rs. Column-bearing parts (target.x / source.y) stay for datafusion, which
+# supports them. A subexpression we can't evaluate or serialize is left untouched (no worse than before).
+_IDENT_CALL = re.compile(r"[A-Za-z_]\w*\s*\(")
+_MERGE_REL_REF = re.compile(r'(?i)(?<![\w."])(?:target|source)\s*\.')
+
+
+def _refs_merge_rel(s: str) -> bool:
+    """True if ``s`` references a ``target.``/``source.`` column — then it can't be folded out of the
+    merge (string literals blanked so a literal containing 'target.'/'source.' can't false-trip)."""
+    return bool(_MERGE_REL_REF.search(_blank_string_literals(s)))
+
+
+def _match_paren(s: str, i: int) -> int:
+    """Index of the ``)`` matching the ``(`` at ``s[i]`` (call with string literals blanked so a paren
+    inside a literal isn't counted), or -1 if unbalanced."""
+    depth = 0
+    while i < len(s):
+        c = s[i]
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _sql_literal(val, duck_type: str) -> Optional[str]:
+    """A datafusion-parseable literal for a DuckDB scalar ``val`` of type ``duck_type`` — or None when
+    the type isn't one we can safely serialize (decimal/list/struct/blob/…), so folding is skipped."""
+    import datetime
+    if isinstance(val, bool):
+        return "TRUE" if val else "FALSE"
+    if isinstance(val, int):
+        return str(val)
+    if isinstance(val, float):
+        return repr(val)
+    if isinstance(val, str):
+        return "'" + val.replace("'", "''") + "'"
+    if isinstance(val, datetime.datetime):
+        return f"CAST('{val.isoformat(sep=' ')}' AS TIMESTAMP)"
+    if isinstance(val, datetime.date):
+        return f"CAST('{val.isoformat()}' AS DATE)"
+    if val is None:
+        t = duck_type.upper()
+        for k in ("VARCHAR", "BIGINT", "INTEGER", "DOUBLE", "FLOAT", "BOOLEAN", "DATE", "TIMESTAMP"):
+            if t.startswith(k):
+                return f"CAST(NULL AS {k})"
+    return None
+
+
+def _try_literal(expr: str, cur) -> Optional[str]:
+    """Evaluate a merge-constant ``expr`` in DuckDB and return a datafusion literal, or None if it can't
+    be evaluated (references something unavailable, or isn't a lone scalar) or serialized — folding is
+    then skipped and the original text left for delta_rs (no worse than before)."""
+    try:
+        rel = cur.sql(f"SELECT ({expr}) AS v")
+        val = rel.fetchone()[0]
+        typ = str(rel.types[0])
+    except Exception:
+        return None
+    return _sql_literal(val, typ)
+
+
+def _fold_const(expr: Optional[str], cur) -> Optional[str]:
+    """Replace every maximal ``target``/``source``-free subexpression of a MERGE value/predicate with its
+    DuckDB-evaluated literal, so DuckDB functions and non-correlated subqueries resolve before delta_rs
+    (datafusion) sees the string. Correlated / column-bearing parts are left for datafusion."""
+    if expr is None or cur is None:
+        return expr
+    if not _refs_merge_rel(expr):                       # whole expression is constant
+        lit = _try_literal(expr, cur)
+        if lit is not None:
+            return lit
+    blanked = _blank_string_literals(expr)
+    out, i, n = [], 0, len(expr)
+    while i < n:
+        m = _IDENT_CALL.match(blanked, i)
+        if m:
+            open_i = m.end() - 1                        # a function call: <ident>(
+        elif blanked[i] == "(":
+            open_i = i                                  # a bare parenthesized group / subquery
+        else:
+            out.append(expr[i]); i += 1; continue
+        close = _match_paren(blanked, open_i)
+        if close == -1:
+            out.append(expr[i]); i += 1; continue
+        unit = expr[i:close + 1]
+        if not _refs_merge_rel(unit):
+            lit = _try_literal(unit, cur)
+            if lit is not None:
+                out.append(lit); i = close + 1; continue
+        # references target/source, or unserializable → keep the head (ident+'(' or '(') and descend to
+        # fold any nested constant subexpressions (e.g. epoch(source.x) stays, but foo(version()) folds).
+        head_end = open_i + 1
+        out.append(expr[i:head_end]); i = head_end
+    return "".join(out)
+
+
+def _fold_pred(pred: Optional[str], cur) -> Optional[str]:
+    """Fold a MERGE predicate. When the whole predicate is constant it is evaluated AS BOOLEAN so a
+    DuckDB truthy literal (``WHEN MATCHED AND 0``) becomes a real boolean datafusion accepts; otherwise
+    fall back to per-subexpression folding."""
+    if pred is None or cur is None:
+        return pred
+    if not _refs_merge_rel(pred):
+        lit = _try_literal(f"CAST(({pred}) AS BOOLEAN)", cur)
+        if lit is not None:
+            return lit
+    return _fold_const(pred, cur)
+
+
 def _reject_unplannable_merge_value(exprs_text: str, ctx: str) -> None:
-    """Fail loud on a MERGE value expression delta_rs/datafusion can't plan. A scalar SUBQUERY inside a
-    MERGE UPDATE/INSERT value is a hard Rust `not implemented` PANIC (delta_datafusion/expr.rs) that
-    kills the process, not a catchable error; DEFAULT isn't an expression delta_rs accepts either. Reject
-    both here — string literals blanked first so `'select …'` / `'default'` in a value can't false-trip —
-    so the statement is a clean ValueError instead of a crash. (Precompute the value into the USING
-    source and reference `source.<col>`.)"""
+    """Fail loud on a MERGE value expression delta_rs/datafusion can't plan AFTER constant-folding. A
+    scalar SUBQUERY that survives folding is CORRELATED (references target/source) — a hard Rust `not
+    implemented` PANIC (delta_datafusion/expr.rs) that kills the process, not a catchable error; DEFAULT
+    isn't an expression delta_rs accepts either. Reject both here — string literals blanked first so
+    `'select …'` / `'default'` in a value can't false-trip — so the statement is a clean ValueError
+    instead of a crash. (Precompute the value into the USING source and reference `source.<col>`.)"""
     blanked = _blank_string_literals(exprs_text)
     if _VALUES_HAS_SUBQUERY.search(blanked):
         raise ValueError(
@@ -855,26 +973,33 @@ def _reject_unplannable_merge_value(exprs_text: str, ctx: str) -> None:
                          f"explicit value")
 
 
-def _parse_set_exprs(assign: str) -> dict:
-    """``{col: expr}`` for a ``UPDATE SET col = <expr>, …`` clause. The expression is ANY SQL delta-rs
-    accepts (a plain ``source.col`` copy or an arbitrary expression like ``source.qty + 1``); it is
-    passed to delta-rs verbatim (already alias-rewritten to target/source)."""
-    _reject_unplannable_merge_value(assign, "MERGE UPDATE SET")
+def _fold_value(expr: str, cur, ctx: str) -> str:
+    """Constant-fold one MERGE value expression in DuckDB, then fail loud on what delta_rs still can't
+    plan (a surviving = correlated subquery, or DEFAULT)."""
+    folded = _fold_const(expr.strip(), cur) if cur is not None else expr.strip()
+    _reject_unplannable_merge_value(folded, ctx)
+    return folded
+
+
+def _parse_set_exprs(assign: str, cur=None) -> dict:
+    """``{col: expr}`` for a ``UPDATE SET col = <expr>, …`` clause. Each expression is constant-folded in
+    DuckDB (so DuckDB functions / non-correlated subqueries resolve) then passed to delta-rs; a plain
+    ``source.col`` copy or a column-bearing expression like ``source.qty + 1`` is left for datafusion."""
     updates: dict = {}
     for a in _split_top_level_commas(assign):
         col, sep, expr = a.partition("=")
         if not sep or not col.strip() or not expr.strip():
             raise ValueError(f"malformed UPDATE SET assignment: {a.strip()!r}")
-        updates[col.strip().strip('"')] = expr.strip()
+        updates[col.strip().strip('"')] = _fold_value(expr, cur, "MERGE UPDATE SET")
     if not updates:
         raise ValueError("UPDATE SET has no assignments")
     return updates
 
 
-def _parse_insert_cols(cols_text: str, vals_text: str) -> dict:
+def _parse_insert_cols(cols_text: str, vals_text: str, cur=None) -> dict:
     """``{col: value_expr}`` for ``INSERT (col, …) VALUES (<expr>, …)`` — columns and values zipped
-    positionally (values split at top level so a function call's commas don't break the pairing)."""
-    _reject_unplannable_merge_value(vals_text, "MERGE INSERT VALUES")
+    positionally (values split at top level so a function call's commas don't break the pairing); each
+    value is constant-folded in DuckDB before delta_rs."""
     cols = [c.strip().strip('"') for c in cols_text.split(",") if c.strip()]
     vals = _split_top_level_commas(vals_text)
     if len(cols) != len(vals):
@@ -883,21 +1008,21 @@ def _parse_insert_cols(cols_text: str, vals_text: str) -> dict:
         )
     if not cols:
         raise ValueError("INSERT has no columns")
-    return dict(zip(cols, vals))
+    return {c: _fold_value(v, cur, "MERGE INSERT VALUES") for c, v in zip(cols, vals)}
 
 
-def _parse_insert_values_positional(vals_text: str, target_cols: List[str]) -> dict:
+def _parse_insert_values_positional(vals_text: str, target_cols: List[str], cur=None) -> dict:
     """``{col: value_expr}`` for a columnless ``INSERT VALUES (<expr>, …)`` — the values are bound
     positionally to the target's columns in declared order (native-INSERT semantics), so the count must
-    match exactly. Name the columns (``INSERT (cols) VALUES …``) to insert a subset."""
-    _reject_unplannable_merge_value(vals_text, "MERGE INSERT VALUES")
+    match exactly. Name the columns (``INSERT (cols) VALUES …``) to insert a subset. Values are
+    constant-folded in DuckDB before delta_rs."""
     vals = _split_top_level_commas(vals_text)
     if len(vals) != len(target_cols):
         raise ValueError(
             f"MERGE INSERT VALUES has {len(vals)} value(s) but target has {len(target_cols)} column(s) "
             f"{target_cols}; list the columns explicitly (INSERT (cols) VALUES (…)) to insert a subset"
         )
-    return dict(zip(target_cols, vals))
+    return {c: _fold_value(v, cur, "MERGE INSERT VALUES") for c, v in zip(target_cols, vals)}
 
 
 def _split_when_clause(clause: str) -> Tuple[str, Optional[str], str]:
@@ -928,11 +1053,17 @@ _CLAUSE_NAME = {"matched": "matched", "not matched": "not_matched",
 
 
 def _build_merge_clause(kind: str, pred: Optional[str], action: str,
-                        target_cols: Optional[List[str]] = None) -> dict:
+                        target_cols: Optional[List[str]] = None, cur=None) -> dict:
     """Turn one parsed ``(kind, pred, action)`` WHEN clause into an ``engine.merge_delta_clauses``
     spec dict. Covers the full delta-rs TableMerger surface; only a malformed/typo action raises —
     legality of clause *combinations* is left to delta_rs. ``target_cols`` (the target's columns in
-    declared order) resolves a columnless ``INSERT VALUES (…)``."""
+    declared order) resolves a columnless ``INSERT VALUES (…)``; ``cur`` constant-folds the predicate
+    and value expressions in DuckDB before delta_rs."""
+    pred = _fold_pred(pred, cur)
+    # A subquery that SURVIVES folding is correlated (references target/source) — datafusion panics on
+    # it just like in a value, so reject loud instead of crashing the process.
+    if pred is not None and cur is not None:
+        _reject_unplannable_merge_value(pred, "MERGE WHEN predicate")
     # `THEN DO NOTHING` is a valid no-op action in any clause kind. delta_rs can't express a skip, so
     # emit a marker _resolve_do_nothing folds away before the merge reaches delta_rs.
     if _M_DO_NOTHING.fullmatch(action):
@@ -945,7 +1076,7 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str,
         sm = _M_UPDATE_SET.fullmatch(action)
         if sm:
             return {"clause": "matched", "action": "update",
-                    "updates": _parse_set_exprs(sm.group("assign")), "predicate": pred}
+                    "updates": _parse_set_exprs(sm.group("assign"), cur), "predicate": pred}
         raise ValueError(
             f"unsupported WHEN MATCHED action (expected UPDATE SET * / UPDATE SET col=… / DELETE / "
             f"DO NOTHING): {action!r}")
@@ -955,7 +1086,7 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str,
         im = _M_INSERT_COLS.fullmatch(action)
         if im:
             return {"clause": "not_matched", "action": "insert",
-                    "updates": _parse_insert_cols(im.group("cols"), im.group("vals")),
+                    "updates": _parse_insert_cols(im.group("cols"), im.group("vals"), cur),
                     "predicate": pred}
         iv = _M_INSERT_VALUES_ONLY.fullmatch(action)
         if iv:
@@ -963,7 +1094,7 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str,
                 raise ValueError("columnless MERGE INSERT VALUES needs the target schema "
                                  "(internal: target_cols not supplied)")
             return {"clause": "not_matched", "action": "insert",
-                    "updates": _parse_insert_values_positional(iv.group("vals"), target_cols),
+                    "updates": _parse_insert_values_positional(iv.group("vals"), target_cols, cur),
                     "predicate": pred}
         raise ValueError(
             f"unsupported WHEN NOT MATCHED action (expected INSERT * / INSERT (cols) VALUES (…) / "
@@ -974,7 +1105,7 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str,
     sm = _M_UPDATE_SET.fullmatch(action)
     if sm:
         return {"clause": "not_matched_by_source", "action": "update",
-                "updates": _parse_set_exprs(sm.group("assign")), "predicate": pred}
+                "updates": _parse_set_exprs(sm.group("assign"), cur), "predicate": pred}
     raise ValueError(
         f"unsupported WHEN NOT MATCHED BY SOURCE action (expected UPDATE SET … / DELETE / DO NOTHING): "
         f"{action!r}")
@@ -1637,6 +1768,9 @@ class _DeltaDML:
         if not cond:
             raise ValueError("MERGE requires an ON <condition> clause")
         validate_merge_condition(cond)
+        # Constant-fold DuckDB-only functions in the ON condition too (the join equalities reference
+        # target/source and are left intact for delta_rs).
+        cond = _fold_const(cond, self.cursor)
         clause_strs = [cond_clauses[a:b] for a, b in zip(whens, whens[1:] + [len(cond_clauses)])]
         # One clause spec per WHEN, in source order — delta_rs evaluates them top-to-bottom and
         # enforces its own legality rules (e.g. multiple unconditional matched clauses), so we don't
@@ -1644,7 +1778,8 @@ class _DeltaDML:
         # order) resolves a columnless `INSERT VALUES (…)` to explicit {col: expr} for delta_rs.
         loc_sql = loc.replace("'", "''")
         target_cols = list(self.cursor.sql(f"select * from delta_scan('{loc_sql}') limit 0").columns)
-        clauses = [_build_merge_clause(*_split_when_clause(c), target_cols=target_cols)
+        clauses = [_build_merge_clause(*_split_when_clause(c), target_cols=target_cols,
+                                       cur=self.cursor)
                    for c in clause_strs]
         # DO NOTHING has no delta_rs skip action — fold it into IS-NOT-TRUE guards on later same-kind
         # clauses. An all-DO-NOTHING merge folds to nothing: skip the write, the statement is a no-op.
