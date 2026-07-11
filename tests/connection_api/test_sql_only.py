@@ -352,6 +352,19 @@ def test_insert_values_casts_mixed_literal_types_to_target(w):
                  "count(*) filter (where f = 0.0) from fl").fetchone() == (2, 1, 2)
 
 
+def test_insert_values_default_fills_the_column_default(w):
+    """INSERT … VALUES (…, DEFAULT, …) is accepted: DEFAULT is a native-INSERT-only construct (illegal
+    in a bare `(VALUES …)` derived table), so the tuples are replayed through a real INSERT where it
+    resolves to the column default — NULL for a Delta table, which declares none — matching a native
+    INSERT rather than raising DuckDB's "DEFAULT is not allowed here". Positional and named forms both."""
+    w.sql("CREATE OR REPLACE TABLE d (a INTEGER, b INTEGER, c INTEGER)")
+    w.sql("INSERT INTO d VALUES (1, DEFAULT, 3)")                # positional, DEFAULT in the middle
+    w.sql("INSERT INTO d (a, c) VALUES (DEFAULT, 30)")           # named list, DEFAULT for a
+    w.sql("INSERT INTO d VALUES (DEFAULT, DEFAULT, DEFAULT)")    # every column DEFAULT → all NULL
+    assert w.sql("select a, b, c from d order by a nulls last, c nulls last").fetchall() == [
+        (1, None, 3), (None, None, 30), (None, None, None)]
+
+
 def test_insert_into_with_cte_after_target_shadowing_its_name(w):
     """INSERT INTO t WITH cte AS (…) SELECT … — a CTE placed AFTER the target (even one that SHADOWS the
     target's name) is routed, not swallowed into the relation: the CTE's row is appended."""

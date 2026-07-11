@@ -273,6 +273,11 @@ _M_INSERT_ALL = re.compile(r"\s*insert\s+\*\s*", re.I)
 _M_INSERT_COLS = re.compile(
     r"\s*insert\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>.+)\)\s*", re.I | re.S
 )
+# A bare DEFAULT keyword in a VALUES tuple. It's a native-INSERT-only construct — NOT legal inside a
+# `(VALUES …)` derived table — so the self-typing probe in _insert_values can't handle it and the
+# VALUES list must be replayed through a real INSERT (the typed-temp path). Word-boundaried so it
+# never fires on an identifier that merely contains "default" (e.g. default_value / date_default).
+_VALUES_HAS_DEFAULT = re.compile(r"\bdefault\b", re.I)
 _M_DELETE = re.compile(r"\s*delete\s*", re.I)
 # `create temp/temporary table …` is DuckDB-local scratch by design and must NEVER be captured —
 # checked first in try_handle so it always passes through to native DuckDB (the invariant: only
@@ -1222,6 +1227,13 @@ class _DeltaDML:
         cols = m.group("cols")
         provided = self._provided(cols) if cols else None
         body = m.group("body")
+        # DEFAULT is a native-INSERT-only construct — it is not legal inside the `(VALUES …)` derived
+        # table the fast path probes, so it can't be self-typed there. Replay the tuples through the
+        # typed-temp path's real `INSERT … VALUES`, where DEFAULT is valid and resolves to the column
+        # default — NULL for a Delta table (which declares none), matching a native INSERT.
+        if _VALUES_HAS_DEFAULT.search(_blank_string_literals(body)):
+            self._insert_values_via_typed_temp(loc, provided, body)
+            return
         derived = f"(values {body})"
         # Can DuckDB self-type the VALUES columns? Probe on a THROWAWAY connection: the tuples are pure
         # literals (no table refs), and a binder error would otherwise abort self.cursor's transaction.
