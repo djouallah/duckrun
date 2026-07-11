@@ -1011,13 +1011,21 @@ def test_rejected(tmp_path, stmt, msg):
         _seed(str(tmp_path / "wh")).sql(stmt)
 
 
-@pytest.mark.xfail(strict=True, reason="WITH … UPDATE can't be expressed through a delta_rs predicate")
-def test_with_prefixed_update_parked(tmp_path):
-    # Leading-CTE UPDATE is parked: the CTE can't be threaded into a delta_rs predicate, so it falls
-    # through and raises rather than applying — pinned strict-xfail so the gap stays visible.
+def test_with_prefixed_update(tmp_path):
+    # Leading-CTE UPDATE: the CTE can't be threaded into a delta_rs predicate, so it's evaluated via
+    # the DuckDB overwrite fallback with the CTE re-attached to the read.
     c = _seed(str(tmp_path / "wh"))
     c.sql("with bump as (select 1 id) update items set name = 'Z' where id in (select id from bump)")
     assert c.sql("select name from items where id = 1").fetchone()[0] == "Z"
+
+
+def test_with_prefixed_delete(tmp_path):
+    # Same for a leading-CTE DELETE — the CTE feeds the predicate's subquery via the fallback read.
+    c = _seed(str(tmp_path / "wh"))
+    before = c.sql("select count(*) from items").fetchone()[0]
+    c.sql("with victims as (select 1 id) delete from items where id in (select id from victims)")
+    assert c.sql("select count(*) from items where id = 1").fetchone()[0] == 0
+    assert c.sql("select count(*) from items").fetchone()[0] == before - 1
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════

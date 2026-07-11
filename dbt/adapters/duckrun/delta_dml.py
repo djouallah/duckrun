@@ -1340,8 +1340,8 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc or not self._exists(loc):
             return False  # native relation (e.g. the test's `fact`/`seed`) -> let DuckDB handle it
-        if self._with_clause and op != self._insert_select:
-            return False  # `WITH … UPDATE/DELETE` can't be expressed through a delta_rs predicate
+        if self._with_clause and op not in (self._insert_select, self._delete, self._update):
+            return False  # a leading `WITH …` only composes with INSERT … SELECT / UPDATE / DELETE
         op(m, rel, schema, loc)
         self._refresh_view(rel, schema, loc)
         return True
@@ -1353,7 +1353,10 @@ class _DeltaDML:
         # the fast path strips it (delta_rs binds bare columns), the subquery fallback aliases the
         # delta_scan to the same name so the qualified reference resolves there.
         tname = _split_relation(rel)[1]
-        if where and _PREDICATE_SUBQUERY.search(where):
+        # A leading `WITH …` (CTE the predicate references via a subquery) can only be evaluated by
+        # DuckDB, so force the overwrite fallback and re-attach the CTE to its read.
+        with_prefix = f"{self._with_clause} " if self._with_clause else ""
+        if where and (self._with_clause or _PREDICATE_SUBQUERY.search(where)):
             # delta_rs's delete(predicate) can't evaluate a predicate that references ANOTHER table
             # via subquery (`… in (select … from other)`): its datafusion expr engine raises a Rust
             # `not implemented` panic. DuckDB CAN evaluate it (the subquery's table is a live relation
@@ -1373,7 +1376,7 @@ class _DeltaDML:
             tmp = f"__duckrun_del_{abs(hash(loc)) & 0xFFFFFFFF}"
             scan = f"delta_scan('{loc_sql}', version => {vB})" + (f' as "{tname}"' if tname else "")
             self.cursor.execute(
-                f'create or replace temp table "{tmp}" as '
+                f'create or replace temp table "{tmp}" as {with_prefix}'
                 f"select * from {scan} where ({where}) is not true"
             )
             try:
@@ -1428,7 +1431,10 @@ class _DeltaDML:
         # the same name instead, so a qualified reference — even one inside a correlated subquery —
         # resolves correctly there.
         tname = _split_relation(rel)[1]
-        if where is None or (where and _PREDICATE_SUBQUERY.search(where)) or \
+        # A leading `WITH …` (CTE referenced by the SET exprs or predicate via a subquery) can only be
+        # evaluated by DuckDB, so force the overwrite fallback and re-attach the CTE to its read.
+        with_prefix = f"{self._with_clause} " if self._with_clause else ""
+        if where is None or self._with_clause or (where and _PREDICATE_SUBQUERY.search(where)) or \
                 any(_PREDICATE_SUBQUERY.search(e) for e in updates.values()):
             # Route to a DuckDB-evaluated fenced overwrite (instead of delta_rs's dt.update) in two cases:
             #  * a subquery in the predicate (`… where id in (select …)`) OR a SET expression (`set g =
@@ -1457,7 +1463,7 @@ class _DeltaDML:
             # inside a correlated subquery) binds to it; unqualified columns still resolve.
             scan = f"delta_scan('{loc_sql}', version => {vB})" + (f' as "{tname}"' if tname else "")
             self.cursor.execute(
-                f'create or replace temp table "{tmp}" as '
+                f'create or replace temp table "{tmp}" as {with_prefix}'
                 f"select * replace ({replaces}) from {scan}"
             )
             try:
