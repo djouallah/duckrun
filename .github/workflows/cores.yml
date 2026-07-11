@@ -18,6 +18,11 @@ name: cores
 #                               Test* classes of that same suite; every method must pass. Refreshes
 #                               the README card on push to main.
 #   • concurrency-correctness — proves MERGE snapshot safety + append_if_unchanged CAS + pre-snapshot window.
+#   • breaker                 — a black-box, multi-process chaos harness (tests/correctness/duckrun_breaker.py):
+#                               N workers hammer ONE Delta table through duckrun.connect().sql() (ins/upd/del/
+#                               merge/self-ref), with SIGKILL chaos, then a ledger replay checks 8 invariants
+#                               (lost/phantom/torn/duplicate writes, seam disagreement, wedged table/session,
+#                               crash tear). Exits non-zero on any violation.
 #   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • merge-spill-smoke       — fast SF=1 smoke of the incremental-MERGE chain (full delta_rs clause
@@ -379,6 +384,67 @@ jobs:
         if: steps.changes.outputs.code == 'true'
         # Exit 0 = both invariants hold (expected). Exit 1 = a case behaved unexpectedly.
         run: python tests/correctness/concurrency_correctness.py
+
+  breaker:
+    name: chaos breaker
+    # A black-box, multi-process chaos harness (tests/correctness/duckrun_breaker.py): N worker
+    # processes hammer ONE local-fs Delta table through duckrun.connect().sql() with random
+    # ins/upd/del/merge/self-ref ops, half of them SIGKILLed mid-flight, then a per-worker fsync'd
+    # ledger is replayed and diffed against the final table (read through BOTH duckrun and deltalake)
+    # to check 8 invariants. Exits non-zero on any violation, so a regression blocks the PR. SIGKILL
+    # + subprocess fan-out is a Linux/ubuntu-runner thing. The expensive run self-skips on docs-only.
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cores-breaker-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Need the previous commit(s) so we can diff what changed (push uses event.before).
+          fetch-depth: 0
+
+      # The chaos harness proves a property of the code, not the docs. A Markdown-only change can't
+      # regress it, so skip the (multi-minute) install + run and report green. Any non-.md change runs it.
+      - name: Detect whether code changed (vs docs-only)
+        id: changes
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base="${{ github.event.pull_request.base.sha }}"
+            head="${{ github.event.pull_request.head.sha }}"
+          else
+            base="${{ github.event.before }}"
+            head="${{ github.sha }}"
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Docs-only change — skipping the chaos breaker."
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.changes.outputs.code == 'true'
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (duckdb + deltalake + pyarrow)
+        if: steps.changes.outputs.code == 'true'
+        run: pip install -e ".[test]"
+
+      - name: Phase A — contention (no kills)
+        # Pure OCC contention: workers race on one table, no SIGKILL. Exit non-zero = an invariant
+        # (lost/phantom/torn/duplicate write, seam disagreement, wedged table/session) was violated.
+        if: steps.changes.outputs.code == 'true'
+        run: python tests/correctness/duckrun_breaker.py --workers 6 --ops 40 --seed 1
+
+      - name: Phase B — contention + SIGKILL chaos
+        # Same, plus half the workers are SIGKILLed mid-flight, so it also exercises crash-tear (V8):
+        # an in-flight op must be all-or-nothing. Pinned seed keeps a failure reproducible.
+        if: steps.changes.outputs.code == 'true'
+        run: python tests/correctness/duckrun_breaker.py --workers 6 --ops 200 --kill --seed 2
 
   snapshot-pin:
     # Renders the "DuckDB snapshot pin — version by version" scorecard from a real dbt run, running
