@@ -273,11 +273,15 @@ _M_INSERT_ALL = re.compile(r"\s*insert\s+\*\s*", re.I)
 _M_INSERT_COLS = re.compile(
     r"\s*insert\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>.+)\)\s*", re.I | re.S
 )
-# A bare DEFAULT keyword in a VALUES tuple. It's a native-INSERT-only construct — NOT legal inside a
-# `(VALUES …)` derived table — so the self-typing probe in _insert_values can't handle it and the
-# VALUES list must be replayed through a real INSERT (the typed-temp path). Word-boundaried so it
-# never fires on an identifier that merely contains "default" (e.g. default_value / date_default).
+# A VALUES tuple the self-typing probe in _insert_values can't handle on a throwaway connection, so
+# the list must instead be replayed through a real INSERT on the live cursor (the typed-temp path):
+#   • DEFAULT — a native-INSERT-only construct, illegal inside a `(VALUES …)` derived table.
+#   • a subquery — `(select … from other)` references a table the throwaway connection doesn't have,
+#     so the probe would raise "table does not exist"; on the live cursor the relation is present.
+# Word-boundaried so DEFAULT never fires on an identifier merely containing it (default_value); both
+# matched after string literals are blanked, so the words can't be caught inside a quoted value.
 _VALUES_HAS_DEFAULT = re.compile(r"\bdefault\b", re.I)
+_VALUES_HAS_SUBQUERY = re.compile(r"\bselect\b", re.I)
 _M_DELETE = re.compile(r"\s*delete\s*", re.I)
 # `create temp/temporary table …` is DuckDB-local scratch by design and must NEVER be captured —
 # checked first in try_handle so it always passes through to native DuckDB (the invariant: only
@@ -731,6 +735,40 @@ def _rewrite_qualifiers(s: str, mapping) -> str:
     return "".join(out)
 
 
+def _strip_qualifiers(s: str, names) -> str:
+    """Drop a leading ``<name>.`` table qualifier (for each identifier in ``names``, case-insensitive)
+    from the column references in ``s``, leaving string literals and quoted identifiers untouched.
+
+    A user may qualify a column with the target's own name — ``UPDATE t SET c = t.c WHERE t.k > 0`` /
+    ``DELETE FROM t WHERE t.k > 0`` — which DuckDB tolerates, but delta_rs's UPDATE/DELETE expression
+    context binds bare column names only (``t`` is not a relation there → "Referenced table not
+    found"). Only applied on the delta_rs fast path, which by construction carries NO subquery, so
+    every qualified reference IS the target and stripping is unambiguous."""
+    keep = {n.lower() for n in names if n}
+    out, i, n, quote = [], 0, len(s), None
+    while i < n:
+        ch = s[i]
+        if quote:
+            out.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            out.append(ch)
+            i += 1
+            continue
+        if not (i and (s[i - 1].isalnum() or s[i - 1] == "_")):  # only at an identifier boundary
+            m = _QUALIFIER.match(s, i)
+            if m and m.group(1).lower() in keep:
+                i = m.end()  # drop the "<name>." — the bare column that follows stays
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _split_top_level_commas(s: str) -> List[str]:
     """Split on commas that aren't inside parentheses or quotes (so ``left(email, 3)`` stays whole)."""
     out, depth, start, quote = [], 0, 0, None
@@ -1095,6 +1133,10 @@ class _DeltaDML:
     def _delete(self, m, rel, schema, loc) -> None:
         where = m.group("where")
         where = where.strip() if where else None
+        # The predicate may self-qualify columns with the target's name (`DELETE FROM t WHERE t.k>0`);
+        # the fast path strips it (delta_rs binds bare columns), the subquery fallback aliases the
+        # delta_scan to the same name so the qualified reference resolves there.
+        tname = _split_relation(rel)[1]
         if where and _PREDICATE_SUBQUERY.search(where):
             # delta_rs's delete(predicate) can't evaluate a predicate that references ANOTHER table
             # via subquery (`… in (select … from other)`): its datafusion expr engine raises a Rust
@@ -1113,9 +1155,10 @@ class _DeltaDML:
             vB = engine.table_version(loc, self.so)
             loc_sql = loc.replace("'", "''")
             tmp = f"__duckrun_del_{abs(hash(loc)) & 0xFFFFFFFF}"
+            scan = f"delta_scan('{loc_sql}', version => {vB})" + (f' as "{tname}"' if tname else "")
             self.cursor.execute(
                 f'create or replace temp table "{tmp}" as '
-                f"select * from delta_scan('{loc_sql}', version => {vB}) where ({where}) is not true"
+                f"select * from {scan} where ({where}) is not true"
             )
             try:
                 keep = self.cursor.sql(f'select * from "{tmp}"')
@@ -1124,6 +1167,9 @@ class _DeltaDML:
             finally:
                 self.cursor.execute(f'drop table if exists "{tmp}"')
             return
+        # Fast path (no subquery): delta_rs binds bare columns, so drop any self-qualifier.
+        if tname and where:
+            where = _strip_qualifiers(where, {tname})
         # Route through engine.delete_rows pinned to the version read at statement start — the SAME
         # snapshot-fenced path (read_version → load_as_version, OCC over (vB, HEAD], post-op
         # maintenance) every duckrun mutation uses; a raw delta-rs delete() at HEAD would skip the
@@ -1160,6 +1206,12 @@ class _DeltaDML:
             raise ValueError(
                 f"UPDATE on {loc!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
             )
+        # The target may be referenced by its own name in the SET expressions or the WHERE predicate
+        # (`UPDATE sales SET cat = sales.cat WHERE sales.id > 0`). The fast path strips that self-
+        # qualifier (delta_rs binds bare columns); the DuckDB fallback below aliases the delta_scan to
+        # the same name instead, so a qualified reference — even one inside a correlated subquery —
+        # resolves correctly there.
+        tname = _split_relation(rel)[1]
         if where is None or (where and _PREDICATE_SUBQUERY.search(where)) or \
                 any(_PREDICATE_SUBQUERY.search(e) for e in updates.values()):
             # Route to a DuckDB-evaluated fenced overwrite (instead of delta_rs's dt.update) in two cases:
@@ -1185,9 +1237,12 @@ class _DeltaDML:
                 for col, expr in updates.items()
             )
             tmp = f"__duckrun_upd_{abs(hash(loc)) & 0xFFFFFFFF}"
+            # Alias the scan to the target's name so a self-qualified reference (`sales.cat`, incl. one
+            # inside a correlated subquery) binds to it; unqualified columns still resolve.
+            scan = f"delta_scan('{loc_sql}', version => {vB})" + (f' as "{tname}"' if tname else "")
             self.cursor.execute(
                 f'create or replace temp table "{tmp}" as '
-                f"select * replace ({replaces}) from delta_scan('{loc_sql}', version => {vB})"
+                f"select * replace ({replaces}) from {scan}"
             )
             try:
                 new = self.cursor.sql(f'select * from "{tmp}"')
@@ -1196,6 +1251,11 @@ class _DeltaDML:
             finally:
                 self.cursor.execute(f'drop table if exists "{tmp}"')
             return
+        # Fast path (no subquery): delta_rs binds bare columns, so drop any self-qualifier the user
+        # wrote (`sales.cat` → `cat`) from the SET expressions and the predicate.
+        if tname:
+            updates = {c: _strip_qualifiers(e, {tname}) for c, e in updates.items()}
+            where = _strip_qualifiers(where, {tname}) if where else where
         # Same snapshot-fenced path (read_version → OCC) every duckrun mutation uses.
         engine.update_rows(
             loc, updates, where,
@@ -1227,11 +1287,12 @@ class _DeltaDML:
         cols = m.group("cols")
         provided = self._provided(cols) if cols else None
         body = m.group("body")
-        # DEFAULT is a native-INSERT-only construct — it is not legal inside the `(VALUES …)` derived
-        # table the fast path probes, so it can't be self-typed there. Replay the tuples through the
-        # typed-temp path's real `INSERT … VALUES`, where DEFAULT is valid and resolves to the column
-        # default — NULL for a Delta table (which declares none), matching a native INSERT.
-        if _VALUES_HAS_DEFAULT.search(_blank_string_literals(body)):
+        # DEFAULT (native-INSERT-only) and a value subquery (references a table the throwaway probe
+        # can't see) both defeat the self-typing fast path below — replay through the typed-temp path's
+        # real `INSERT … VALUES` on the live cursor, where DEFAULT resolves to the column default (NULL
+        # for a Delta table, matching a native INSERT) and the subquery's relations are present.
+        blanked = _blank_string_literals(body)
+        if _VALUES_HAS_DEFAULT.search(blanked) or _VALUES_HAS_SUBQUERY.search(blanked):
             self._insert_values_via_typed_temp(loc, provided, body)
             return
         derived = f"(values {body})"

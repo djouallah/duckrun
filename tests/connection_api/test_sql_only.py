@@ -365,6 +365,17 @@ def test_insert_values_default_fills_the_column_default(w):
         (1, None, 3), (None, None, 30), (None, None, None)]
 
 
+def test_insert_values_with_a_subquery_value(w):
+    """INSERT … VALUES (…, (SELECT … FROM other), …) — a scalar subquery inside a VALUES tuple is
+    evaluated on the live cursor (where the referenced relations exist), not the throwaway self-typing
+    probe (which lacks them and would raise "table does not exist"). Positional and named forms."""
+    w.sql("CREATE OR REPLACE TABLE src AS SELECT * FROM (VALUES (5),(6),(7)) v(n)")
+    w.sql("CREATE OR REPLACE TABLE dst (a INTEGER, b VARCHAR)")
+    w.sql("INSERT INTO dst VALUES ((SELECT max(n) FROM src), 'x')")             # positional
+    w.sql("INSERT INTO dst (b, a) VALUES ('y', (SELECT min(n) FROM src))")      # named, reordered
+    assert w.sql("select a, b from dst order by a").fetchall() == [(5, 'y'), (7, 'x')]
+
+
 def test_insert_into_with_cte_after_target_shadowing_its_name(w):
     """INSERT INTO t WITH cte AS (…) SELECT … — a CTE placed AFTER the target (even one that SHADOWS the
     target's name) is routed, not swallowed into the relation: the CTE's row is appended."""
@@ -381,6 +392,24 @@ def test_insert_by_name_aligns_source_columns_to_target(w):
     assert w.sql("select a, b, c from colorder").fetchall() == [(10, 20, 30)]
     w.sql("INSERT INTO colorder BY NAME SELECT 7 AS b")          # a, c omitted → NULL
     assert w.sql("select a, b, c from colorder where b = 7").fetchall() == [(None, 7, None)]
+
+
+def test_update_and_delete_accept_target_self_qualified_columns(w):
+    """`UPDATE t SET c = t.c WHERE t.k = …` / `DELETE FROM t WHERE t.k = …` — columns qualified with the
+    target's OWN name are accepted (DuckDB tolerates them), where delta_rs's bare-column expression
+    context otherwise raises "Referenced table not found". The fast path strips the self-qualifier; the
+    subquery fallback aliases the scan to the same name so even a correlated reference resolves."""
+    w.sql("CREATE OR REPLACE TABLE q AS SELECT * FROM (VALUES (1,10),(2,20),(3,30)) v(k, val)")
+    w.sql("UPDATE q SET val = q.val + 1 WHERE q.k = 2")                 # fast path, self-qualified
+    assert w.sql("select val from q where k = 2").fetchone() == (21,)
+    w.sql("UPDATE q SET val = q.val, k = q.k")                          # every SET self-qualified (no-op)
+    assert w.sql("select sum(val) from q").fetchone() == (61,)
+    # subquery in the predicate -> DuckDB fallback; the self-qualified `q.k` must resolve against the
+    # aliased scan alongside the subquery over another table.
+    w.sql("DELETE FROM q WHERE q.k IN (SELECT k FROM q WHERE val < 15)")
+    assert w.sql("select k from q order by k").fetchall() == [(2,), (3,)]
+    w.sql("DELETE FROM q WHERE q.k = 3")                                # fast path delete, self-qualified
+    assert w.sql("select k from q order by k").fetchall() == [(2,)]
 
 
 def test_predicate_less_update_touches_every_row_over_many_files(w):
