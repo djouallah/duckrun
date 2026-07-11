@@ -4,6 +4,39 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.16]
+
+`conn.sql()` DML: several `MERGE` / `UPDATE` / `DELETE` forms that used to fail — or crash — now work.
+
+### Added
+- **Columnless `MERGE … WHEN NOT MATCHED THEN INSERT VALUES (…)`.** With no column list the values
+  bind positionally to the target's columns, like a native positional `INSERT`.
+- **`MERGE … THEN DO NOTHING`.** A valid no-op action; it's folded into first-match-wins guards on the
+  later clauses of its kind (an all-`DO NOTHING` merge is a no-op).
+- **`WITH … UPDATE` / `WITH … DELETE`.** A leading CTE is evaluated through the DuckDB overwrite
+  fallback (with the CTE re-attached to the read) instead of being declined.
+- **DuckDB functions and non-correlated subqueries inside `MERGE` predicates and values.** delta_rs
+  evaluates a merge's `ON` / `WHEN` / `SET` / `INSERT` expressions in datafusion, which lacks DuckDB's
+  function library and can't plan a subquery. Any subexpression that references neither `target` nor
+  `source` is now constant-folded in DuckDB first, so `version()`, `current_schema()`, `epoch()`,
+  `pi()`, `(select …)` etc. resolve. A wholly-constant predicate folds to a real boolean, so
+  `WHEN MATCHED AND 0` no longer trips datafusion's type coercion.
+- **`DEFAULT` and subqueries in `INSERT … VALUES`.**
+
+### Fixed
+- **No process crash on an unplannable `MERGE` value.** A subquery or `DEFAULT` inside a merge value
+  that delta_rs can't plan — including a correlated subquery that survives folding — is now a clean
+  `ValueError` instead of a hard Rust panic that took down the process.
+- **Self-qualified columns in `UPDATE` / `DELETE`** (`UPDATE t SET t.c = …`) resolve correctly.
+- **`RETURNING`** in a `conn.sql()` DML statement raises a clear, actionable error (a Delta write
+  commits through the log and can't hand back the affected rows).
+
+### Internal
+- sqlsmith differential fuzzer hardening — `RETURNING` filtered from the generated corpus, and
+  window-`OVER` `ORDER BY`, unordered `LIMIT`, `TABLESAMPLE`, and clock/transaction functions
+  (`transaction_timestamp`, `txid_current`, …) are bucketed as nondeterministic instead of reported as
+  false-positive data divergences. A 10,000-statement soak runs clean.
+
 ## [0.4.15]
 
 Keep wide `DECIMAL` columns dictionary-encoded for Direct Lake.
