@@ -22,7 +22,8 @@ name: cores
 #                               N workers hammer ONE Delta table through duckrun.connect().sql() (ins/upd/del/
 #                               merge/self-ref), with SIGKILL chaos, then a ledger replay checks 8 invariants
 #                               (lost/phantom/torn/duplicate writes, seam disagreement, wedged table/session,
-#                               crash tear). Exits non-zero on any violation.
+#                               crash tear), plus a deterministic V9 read-target fence probe (self-ref INSERT
+#                               with a foreign commit invading its read window). Exits non-zero on any violation.
 #   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • merge-spill-smoke       — fast SF=1 smoke of the incremental-MERGE chain (full delta_rs clause
@@ -445,6 +446,15 @@ jobs:
         # an in-flight op must be all-or-nothing. Pinned seed keeps a failure reproducible.
         if: steps.changes.outputs.code == 'true'
         run: python tests/correctness/duckrun_breaker.py --workers 6 --ops 200 --kill --seed 2
+
+      - name: Phase C — read-target fence (V9)
+        # Deterministic probe the chaos phases can't reach (workers own disjoint keys, so nothing ever
+        # mutates the rows a self-ref reads): a UDF-slowed `INSERT INTO t SELECT ... FROM t` has a
+        # foreign commit landed inside its read window; the write-back MUST be refused (snapshot-pin
+        # CAS) or commit fresh — never commit stale rows on top of the foreign commit. No SIGKILL, so
+        # it is platform-independent. Exit non-zero = the fence let a silent lost update through.
+        if: steps.changes.outputs.code == 'true'
+        run: python tests/correctness/duckrun_breaker.py --fence
 
   snapshot-pin:
     # Renders the "DuckDB snapshot pin — version by version" scorecard from a real dbt run, running

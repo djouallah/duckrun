@@ -10,6 +10,8 @@ Hunts for:
   V6  wedged table          fresh connection cannot read or write after chaos
   V7  wedged session        a worker session stops working after an OCC refusal
   V8  crash tear            a SIGKILLed in-flight op is neither fully-in nor fully-out
+  V9  fence bypass          a self-ref write (INSERT ... SELECT FROM the same table) commits STALE
+                            rows after a foreign commit invades its read window (silent lost update)
 
 Design: N worker processes hammer ONE Delta table through duckrun.connect().sql()
 (pure black box, no engine imports). Keys are partitioned per worker, ops are
@@ -20,13 +22,21 @@ checked as all-or-nothing wildcard. The checker replays all ledgers into an
 expected key->val map (with wildcard branches) and diffs it against the final
 table read through BOTH duckdb and deltalake.
 
+V9 is a SEPARATE, deterministic probe (the chaos harness can't reach it: workers own
+disjoint keys, so nobody ever mutates the rows a self-ref reads). It slows a
+self-referential INSERT with a UDF, waits for it to reach mid-read, then lands a foreign
+commit inside that window and asserts the read-target fence REFUSES the stale write-back
+(a fresh post-foreign commit is also fine; only a stale commit is a lost update).
+
 Usage:
   python duckrun_breaker.py --workers 6 --ops 40                # phase A: contention
   python duckrun_breaker.py --workers 6 --ops 200 --kill        # phase B: + SIGKILL chaos
+  python duckrun_breaker.py --fence                             # phase C: read-target fence (V9)
   python duckrun_breaker.py ... --keep                          # keep warehouse dir
 """
 import argparse
 import json
+import multiprocessing as mp
 import os
 import random
 import signal
@@ -37,6 +47,9 @@ import time
 from pathlib import Path
 
 KEYSPACE = 1_000_000  # per-worker key range size
+
+FENCE_TRIGGER_AT = 7    # slow() call count at which the foreign commit fires (mid pass 2 of a 2x5 scan)
+FENCE_SLEEP = 1.5       # seconds the UDF stalls per row — wide enough for the foreign commit to land
 
 
 # --------------------------------------------------------------------------- worker
@@ -269,6 +282,81 @@ def _diff(violations, wid, expected, actual, tag):
                           f"(+{max(0, len(wrongval)-5)} more)")
 
 
+# --------------------------------------------------------------------------- V9 fence probe
+
+def _fence_victim(root, marker, q):
+    # Runs in a spawned child: a self-referential INSERT slowed by a UDF that touches `marker`
+    # once per row so the parent can time a foreign commit into the read window. Reports the
+    # outcome (committed / refused) back on the queue.
+    import os
+    import time
+
+    import duckrun
+    con = duckrun.connect(root, read_only=False)
+
+    def slow(x):
+        with open(marker, "a") as f:
+            f.write("x"); f.flush(); os.fsync(f.fileno())
+        time.sleep(FENCE_SLEEP)
+        return x
+
+    con.con.create_function("slow", slow, [int], int)
+    try:
+        con.sql("INSERT INTO fence_t SELECT k+1000, slow(val) FROM fence_t")
+        q.put("committed")
+    except Exception as e:
+        q.put(f"refused: {type(e).__name__}: {str(e)[:140]}")
+    con.close()
+
+
+def fence_probe(root):
+    """V9 read-target fence. A self-referential INSERT (reads AND writes fence_t) is slowed with a
+    UDF; once it is mid-read a foreign writer commits (an insert + an update to a row the victim is
+    copying). The victim MUST NOT commit rows derived from its pre-foreign snapshot on top of that
+    commit. Refusal (the snapshot-pin CAS tripping) or a commit over the FRESH post-foreign data are
+    both correct; a stale commit is a silent lost update. Returns (violations, outcome, struck_at)."""
+    import duckrun
+    from deltalake import DeltaTable
+
+    ctx = mp.get_context("spawn")   # not set_start_method: don't mutate global mp state
+    marker = str(Path(root) / "fence_calls")
+
+    c = duckrun.connect(root, read_only=False)
+    c.sql("CREATE TABLE fence_t AS SELECT * FROM (VALUES (0,0),(1,10),(2,20),(3,30),(4,40)) x(k,val)")
+    c.close()
+
+    q = ctx.Queue()
+    p = ctx.Process(target=_fence_victim, args=(root, marker, q))
+    p.start()
+
+    # wait until the victim has scanned into pass 2 (mid write-read), then strike
+    while not (os.path.exists(marker) and os.path.getsize(marker) >= FENCE_TRIGGER_AT):
+        time.sleep(0.05)
+    struck = os.path.getsize(marker)
+    fc = duckrun.connect(root, read_only=False)
+    fc.sql("INSERT INTO fence_t VALUES (777, 777)")
+    fc.sql("UPDATE fence_t SET val = val + 90000 WHERE k = 1")
+    fc.close()
+
+    outcome = q.get(timeout=300)
+    p.join()
+
+    rows = {r["k"]: r["val"] for r in
+            DeltaTable(str(Path(root) / "dbo" / "fence_t")).to_pyarrow_table().to_pylist()}
+
+    violations = []
+    if not outcome.startswith("refused"):
+        # committed. STALE = the victim copied the pre-foreign snapshot (no row from the foreign
+        # insert -> no 1777; the copied k=1 still carries the old 10) yet landed on top of it.
+        stale = (1777 not in rows) and rows.get(1001) == 10
+        if stale:
+            violations.append(
+                f"V9 fence bypass: self-ref INSERT committed STALE rows (pre-foreign snapshot) on "
+                f"top of the foreign commit — silent lost update. final={sorted(rows.items())}")
+        # committed with FRESH rows (saw the foreign commit) is acceptable — no stale write-back.
+    return violations, outcome, struck
+
+
 # --------------------------------------------------------------------------- supervisor
 
 def main():
@@ -278,6 +366,8 @@ def main():
     ap.add_argument("--batch", type=int, default=5)
     ap.add_argument("--kill", action="store_true", help="SIGKILL workers at random moments")
     ap.add_argument("--kill-delay", type=float, default=2.0)
+    ap.add_argument("--fence", action="store_true",
+                    help="run ONLY the deterministic read-target fence probe (V9), no chaos")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--root", default=None)
@@ -287,6 +377,21 @@ def main():
     rng = random.Random(seed)
     root = args.root or tempfile.mkdtemp(prefix="duckrun_breaker_")
     print(f"warehouse: {root}   seed: {seed}   kill={args.kill}")
+
+    # V9 read-target fence: a standalone, deterministic probe (its own table, no workers/ledgers).
+    if args.fence:
+        violations, outcome, struck = fence_probe(root)
+        print(f"fence victim: {outcome}   (foreign struck at slow-call {struck})")
+        if violations:
+            print(f"\n*** {len(violations)} VIOLATION(S) ***")
+            for v in violations:
+                print("  " + v)
+            sys.exit(1)
+        print("\nV9 fence holds — the self-ref write-back did not commit stale rows over the foreign commit.")
+        if not args.keep and args.root is None:
+            import shutil
+            shutil.rmtree(root, ignore_errors=True)
+        return
 
     # seed the table (single writer, no contention)
     import duckrun
