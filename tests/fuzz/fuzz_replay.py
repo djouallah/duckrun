@@ -42,7 +42,13 @@ SEED_TABLES = [
     "CREATE TABLE tiny AS SELECT * FROM (VALUES (1,'a'),(2,'b'),(3,NULL)) t(k,v)",
 ]
 TABLES = ["sales", "customers", "tiny"]
-NONDET = re.compile(r"\b(random|now|current_|today|get_current)\w*\s*\(", re.I)
+# Functions whose value differs between two independent connections (the oracle vs the engine): wall
+# clock, transaction/session identity, and randomness. A query using one can't be compared row-for-row,
+# so it lands in a 'suspect' bucket, not a finding.
+NONDET = re.compile(
+    r"\b(random|uuid|gen_random_uuid|now|today|get_current|current_|localtime|localtimestamp|"
+    r"transaction_timestamp|statement_timestamp|txid_current|nextval|currval|lastval|"
+    r"pg_backend_pid)\w*\s*\(", re.I)
 LIMIT_NO_ORDER = re.compile(r"\blimit\b", re.I)
 HAS_ORDER = re.compile(r"\border\s+by\b", re.I)
 IS_SELECT = re.compile(r"^\s*(select|with|from|values)\b", re.I)
