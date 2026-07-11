@@ -71,13 +71,8 @@ EXPECTED_DEVIATIONS = {
         "SELECT count(*) FROM Defaults_T",
         "FROM defaults_t SELECT count(*)",
         "FROM defaults_t",
-        # #8 CTE-prefixed DELETE/UPDATE whose predicate is a subquery over the CTE: duckrun surfaces a
-        # Delta table as a delta_scan VIEW (DuckDB can't DELETE/UPDATE a view) and declines the WITH+DML
-        # form, so it can't be routed to delta_rs either. Parked; the following reads cascade from it.
-        "WITH victims AS (SELECT id FROM cte_dml WHERE id % 3 = 0) DELETE FROM cte_dml WHERE id ...",
-        "SELECT count(*), sum(id) FROM cte_dml",
-        "WITH bump AS (SELECT 100 AS delta) UPDATE cte_dml SET id = id + (SELECT delta FROM bump...",
-        "SELECT max(id) FROM cte_dml",
+        # (CTE-prefixed DELETE/UPDATE is now supported via the DuckDB overwrite fallback with the CTE
+        # re-attached — no longer a deviation, dropped from this allowlist.)
     },
 }
 
