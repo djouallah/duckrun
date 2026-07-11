@@ -1,0 +1,77 @@
+name: fuzz
+
+# Manual, on-demand differential fuzzing of conn.sql() against a plain-DuckDB oracle
+# (tests/fuzz/fuzz_replay.py). This is NOT a per-PR gate: sqlsmith generates a fresh corpus every
+# run (it isn't seed-stable across duckdb versions), so it's a miner you trigger when you want to go
+# looking for new divergence — not a red/green guard on every push. It needs network (to INSTALL the
+# sqlsmith DuckDB extension), unlike the offline `cores` suite.
+#
+# Every run renders a summary to the Actions "Summary" tab: the reproduce seed, the bucket counts,
+# and findings split into DATA divergence (wrong data / lost write — what matters) vs error_mismatch
+# (the engine raised where DuckDB succeeded — usually a fail-loud gap on exotic syntax delta_rs can't
+# route, e.g. RETURNING / VALUES(…,DEFAULT) / TABLESAMPLE SYSTEM).
+#
+# The job goes RED per --fail-on:
+#   • data (default) — only a wrong-data / lost-write divergence fails it; syntax-gap mismatches are
+#                      reported but green, so the signal isn't drowned.
+#   • any            — every divergence fails it (strict; expect red on the known syntax gaps).
+
+on:
+  workflow_dispatch:
+    inputs:
+      queries:
+        description: "How many sqlsmith statements to generate & replay (~150/min)"
+        required: false
+        default: "1000"
+      seed:
+        description: "sqlsmith seed (leave blank for a random one — it's printed so any finding reproduces)"
+        required: false
+        default: ""
+      fail_on:
+        description: "Which findings fail the job"
+        required: false
+        default: "data"
+        type: choice
+        options: ["data", "any"]
+
+jobs:
+  fuzz:
+    name: sqlsmith differential fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install duckrun + test deps (duckdb + deltalake + pyarrow)
+        run: pip install -e ".[test]"
+
+      - name: Resolve seed (random if blank)
+        id: seed
+        run: |
+          seed="${{ inputs.seed }}"
+          if [ -z "$seed" ]; then
+            seed=$(( (RANDOM << 15) | RANDOM ))   # ~0..1e9, wider than $RANDOM alone
+          fi
+          echo "seed=$seed" >> "$GITHUB_OUTPUT"
+          echo "::notice title=fuzz seed::seed=$seed  (reproduce: python tests/fuzz/fuzz_replay.py --queries ${{ inputs.queries }} --seed $seed)"
+
+      - name: Run fuzzer (writes the Step Summary before it exits)
+        run: |
+          python tests/fuzz/fuzz_replay.py \
+            --queries "${{ inputs.queries }}" \
+            --seed "${{ steps.seed.outputs.seed }}" \
+            --fail-on "${{ inputs.fail_on }}" \
+            --summary-md fuzz_summary.md
+
+      - name: Publish summary
+        if: always()
+        run: |
+          if [ -f fuzz_summary.md ]; then
+            cat fuzz_summary.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "## fuzz_replay — no summary" >> "$GITHUB_STEP_SUMMARY"
+            echo "The fuzzer crashed before rendering (seed \`${{ steps.seed.outputs.seed }}\`) — see the job log." >> "$GITHUB_STEP_SUMMARY"
+          fi

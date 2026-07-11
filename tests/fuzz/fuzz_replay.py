@@ -46,6 +46,57 @@ LIMIT_NO_ORDER = re.compile(r"\blimit\b", re.I)
 HAS_ORDER = re.compile(r"\border\s+by\b", re.I)
 IS_SELECT = re.compile(r"^\s*(select|with|from|values)\b", re.I)
 
+# Correctness defects — the engine returned different rows, left tables in a different state, or lost
+# writes across a reconnect. error_mismatch (engine raised where DuckDB didn't) is the weaker signal.
+DATA_KINDS = ("result_diff", "state_diff", "persistence_diff")
+
+
+def _write_summary_md(path, args, stats, findings, fatal):
+    """Render a GitHub-flavored markdown report (for $GITHUB_STEP_SUMMARY) — verdict, the reproduce
+    seed, the bucket table, then findings split into DATA divergence (what matters) vs error_mismatch
+    (usually fail-loud syntax gaps)."""
+    import duckdb
+    try:
+        from importlib.metadata import version
+        dl = version("deltalake")
+    except Exception:
+        dl = "?"
+    data = [f for f in findings if f[0] in DATA_KINDS]
+    mism = [f for f in findings if f[0] == "error_mismatch"]
+    L = []
+    L.append("## fuzz_replay — sqlsmith differential run")
+    L.append(f"{'❌ **FAIL**' if fatal else '✅ **PASS**'} · `--fail-on {args.fail_on}` · "
+             f"**seed** `{args.seed}` · **queries** {args.queries} · "
+             f"duckdb {duckdb.__version__} · deltalake {dl}")
+    L.append(f"Reproduce: `python tests/fuzz/fuzz_replay.py "
+             f"--queries {args.queries} --seed {args.seed}`")
+    L.append("")
+    L.append("| bucket | count |")
+    L.append("|---|---:|")
+    for k, v in sorted(stats.items()):
+        L.append(f"| `{k}` | {v} |")
+    L.append("")
+    L.append(f"### ⚠️ Data divergence — {len(data)} (wrong data / lost write)")
+    if data:
+        for kind, i, q, a, _ in data:
+            L.append(f"- **[{kind}] #{i}** — {a}")
+            L.append(f"  ```sql\n  {q.strip()[:400]}\n  ```")
+    else:
+        L.append("_none — the engine never returned wrong data or lost a write._")
+    L.append("")
+    L.append(f"### Error mismatch — {len(mism)} "
+             "(engine raised where DuckDB succeeded; usually a fail-loud gap on syntax delta_rs "
+             "can't route — RETURNING / VALUES(…,DEFAULT) / TABLESAMPLE SYSTEM)")
+    if mism:
+        for kind, i, q, _, b in mism[:60]:
+            L.append(f"- **#{i}** {b} — `{' '.join(q.split())[:120]}`")
+        if len(mism) > 60:
+            L.append(f"- …and {len(mism) - 60} more (see the job log)")
+    else:
+        L.append("_none_")
+    L.append("")
+    Path(path).write_text("\n".join(L), encoding="utf-8")
+
 
 def _sorted_rows(rows):
     # NULL-safe: a column can mix None and values across rows, and None < int
@@ -165,6 +216,8 @@ def main():
                          "wrong-data / lost-write divergence: result_diff / state_diff / "
                          "persistence_diff). The nightly seed=$RANDOM miner uses 'data' so the known "
                          "fail-loud syntax gaps don't paint it red; every finding is still printed.")
+    ap.add_argument("--summary-md", metavar="PATH", default=None,
+                    help="also write a markdown report to PATH (point it at $GITHUB_STEP_SUMMARY in CI)")
     args = ap.parse_args()
 
     print(f"generating {args.queries} statements with sqlsmith(seed={args.seed})…")
@@ -236,20 +289,21 @@ def main():
 
     print("=" * 70)
     print("stats:", dict(stats))
-    # Two tiers of divergence. DATA_KINDS are correctness defects — the engine returned different
-    # rows, left tables in a different state, or lost writes across a reconnect. error_mismatch is a
-    # weaker signal: the engine raised where DuckDB succeeded (usually a fail-loud gap on exotic
-    # syntax delta_rs can't route — RETURNING, VALUES(…,DEFAULT), TABLESAMPLE SYSTEM). Both are always
-    # PRINTED; --fail-on decides which sets the exit code.
-    DATA_KINDS = {"result_diff", "state_diff", "persistence_diff"}
+    # Two tiers of divergence. DATA_KINDS (module-level) are correctness defects — the engine returned
+    # different rows, left tables in a different state, or lost writes across a reconnect. error_mismatch
+    # is weaker: the engine raised where DuckDB succeeded (usually a fail-loud gap on exotic syntax
+    # delta_rs can't route). Both are always PRINTED; --fail-on decides which sets the exit code.
+    fatal = findings if args.fail_on == "any" else [f for f in findings if f[0] in DATA_KINDS]
     if findings:
         print(f"\n*** {len(findings)} FINDING(S) ***")
         for kind, i, q, a, b in findings:
             print(f"\n[{kind}] stmt #{i}:\n  {q[:300]}\n  {a}\n  {b}")
-        fatal = findings if args.fail_on == "any" else [f for f in findings if f[0] in DATA_KINDS]
-        if fatal:
-            print(f"\nFAIL (--fail-on {args.fail_on}): {len(fatal)} fatal finding(s).")
-            sys.exit(1)
+    if args.summary_md:
+        _write_summary_md(args.summary_md, args, stats, findings, fatal)
+    if fatal:
+        print(f"\nFAIL (--fail-on {args.fail_on}): {len(fatal)} fatal finding(s).")
+        sys.exit(1)
+    if findings:
         print(f"\nPASS (--fail-on data): no wrong-data / lost-write divergence; "
               f"{len(findings)} error_mismatch(es) reported above for triage.")
         return
