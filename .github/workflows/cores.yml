@@ -24,6 +24,9 @@ name: cores
 #                               (lost/phantom/torn/duplicate writes, seam disagreement, wedged table/session,
 #                               crash tear), plus a deterministic V9 read-target fence probe (self-ref INSERT
 #                               with a foreign commit invading its read window). Exits non-zero on any violation.
+#                               Also renders a tamper-evident commit/reveal attestation to the run's Step
+#                               Summary: EXPECTED (sealed with a per-run nonce, before the table is read)
+#                               published in an earlier step than ACTUAL (diffed after) — no room to pre-bake.
 #   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • merge-spill-smoke       — fast SF=1 smoke of the incremental-MERGE chain (full delta_rs clause
@@ -455,6 +458,22 @@ jobs:
         # it is platform-independent. Exit non-zero = the fence let a silent lost update through.
         if: steps.changes.outputs.code == 'true'
         run: python tests/correctness/duckrun_breaker.py --fence
+
+      # Phase D — commit/reveal attestation, rendered to the run's Step Summary as a tamper-evident
+      # "expected first, actual later" page. Two SEPARATE steps sharing one warehouse so the sealed
+      # expectation is published (①) strictly before the table is read back (②). The nonce + chaos
+      # seed are fresh every run, so the expected page can't be pre-baked.
+      - name: Phase D① — seal EXPECTED (commit, before the table is read)
+        # Runs kill-free chaos, then writes the expected final state (from the ledgers only) + a
+        # per-run random nonce + a sha256 commitment to the Step Summary and to attest.json.
+        if: steps.changes.outputs.code == 'true'
+        run: python tests/correctness/duckrun_breaker.py --attest-declare --root "${RUNNER_TEMP}/breaker_attest" --workers 6 --ops 120
+
+      - name: Phase D② — reveal ACTUAL (diff vs the sealed expected)
+        # Reads the same warehouse through BOTH duckrun and deltalake, recomputes the commitment to
+        # prove ①'s expectation was not edited, and diffs. Exit non-zero = actual != sealed expected.
+        if: steps.changes.outputs.code == 'true'
+        run: python tests/correctness/duckrun_breaker.py --attest-reveal --root "${RUNNER_TEMP}/breaker_attest"
 
   snapshot-pin:
     # Renders the "DuckDB snapshot pin — version by version" scorecard from a real dbt run, running

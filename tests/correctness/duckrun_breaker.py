@@ -28,10 +28,18 @@ self-referential INSERT with a UDF, waits for it to reach mid-read, then lands a
 commit inside that window and asserts the read-target fence REFUSES the stale write-back
 (a fresh post-foreign commit is also fine; only a stale commit is a lost update).
 
+A tamper-evident commit/reveal attestation renders to the CI step summary: --attest-declare seals
+the EXPECTED final state (from the ledgers, before the table is read) with a per-run random nonce +
+sha256 commitment; a LATER --attest-reveal reads the real table and diffs it against that seal. The
+nonce and seed are fresh every run, so the expected page can't be pre-baked, and it is published in
+an earlier step than the actual — the prediction visibly lands before the result.
+
 Usage:
   python duckrun_breaker.py --workers 6 --ops 40                # phase A: contention
   python duckrun_breaker.py --workers 6 --ops 200 --kill        # phase B: + SIGKILL chaos
   python duckrun_breaker.py --fence                             # phase C: read-target fence (V9)
+  python duckrun_breaker.py --attest-declare --root DIR         # phase D①: seal expected (commit)
+  python duckrun_breaker.py --attest-reveal  --root DIR         # phase D②: reveal actual (diff)
   python duckrun_breaker.py ... --keep                          # keep warehouse dir
 """
 import argparse
@@ -174,6 +182,57 @@ def read_final_state(root):
     return rows_rs, n_rs, rows_dd, len(rows_dd_list), dt.version()
 
 
+def _apply_effect(eff, state):
+    """Apply one op's intent (adds/sets/dels) to a key->val state, returning a new dict."""
+    s = dict(state)
+    s.update({int(k): v for k, v in eff["adds"].items()})
+    s.update({int(k): v for k, v in eff["sets"].items()})
+    for k in eff["dels"]:
+        s.pop(int(k), None)
+    return s
+
+
+def _replay_worker(recs):
+    """Replay ONE worker's ledger into its expected key->val map (this worker's keys only) — the
+    independent oracle, computed with no table read. Returns (expected, pending, counts): `pending`
+    is the last intent with no matching outcome (a killed in-flight op) or None; `counts` carries
+    committed / refused / clean_exit / wedge. A `refused` op applies nothing (V2 probe: it must leave
+    no trace), so `expected` keeps the pre-op values and burned keys never reappear."""
+    expected = {}
+    pending = None
+    counts = {"committed": 0, "refused": 0, "clean_exit": False, "wedge": []}
+    for r in recs:
+        if r["phase"] == "intent":
+            pending = r
+        elif r["phase"] == "outcome":
+            eff, pending = pending, None
+            if r["outcome"] == "committed":
+                counts["committed"] += 1
+                expected = _apply_effect(eff, expected)
+            else:
+                counts["refused"] += 1
+        elif r["phase"] == "clean_exit":
+            counts["clean_exit"] = True
+        elif r["phase"] in ("wedge", "fatal_wedge"):
+            counts["wedge"].append(r)
+    return expected, pending, counts
+
+
+def _load_expected(root, n_workers):
+    """Replay every ledger into one flattened expected key->val map — the whole run's oracle, built
+    with NO table read. (Attestation runs are kill-free, so every op has a definite outcome; any
+    leftover in-flight intent is ignored here and would surface as a diff at reveal.)"""
+    flat = {}
+    for wid in range(n_workers):
+        lp = Path(root) / f"ledger_{wid}.jsonl"
+        if not lp.exists():
+            continue
+        recs = [json.loads(l) for l in lp.read_text().splitlines() if l.strip()]
+        expected, _pending, _counts = _replay_worker(recs)
+        flat.update(expected)
+    return flat
+
+
 def check(root, n_workers):
     violations = []
 
@@ -202,35 +261,13 @@ def check(root, n_workers):
         if not lp.exists():
             continue
         recs = [json.loads(l) for l in lp.read_text().splitlines() if l.strip()]
-        expected = {}          # key -> val (this worker's keys, definite branch)
-        pending = None         # (oid, effect) intent awaiting outcome
-
-        def apply(eff, state):
-            s = dict(state)
-            s.update({int(k): v for k, v in eff["adds"].items()})
-            s.update({int(k): v for k, v in eff["sets"].items()})
-            for k in eff["dels"]:
-                s.pop(int(k), None)
-            return s
-
-        for r in recs:
-            if r["phase"] == "intent":
-                pending = (r["oid"], r)
-            elif r["phase"] == "outcome":
-                oid, eff = pending
-                pending = None
-                if r["outcome"] == "committed":
-                    stats["committed"] += 1
-                    expected = apply(eff, expected)
-                else:
-                    stats["refused"] += 1
-                    # V2 probe: a refused op must leave NO trace. Its adds must be absent,
-                    # its sets/dels must not be reflected — detected below because `expected`
-                    # keeps the pre-op values and burned keys never reappear.
-            elif r["phase"] == "clean_exit":
-                stats["clean_exits"] += 1
-            elif r["phase"] in ("wedge", "fatal_wedge"):
-                violations.append(f"V7 wedged session: worker {wid} {r}")
+        expected, pending, counts = _replay_worker(recs)
+        stats["committed"] += counts["committed"]
+        stats["refused"] += counts["refused"]
+        if counts["clean_exit"]:
+            stats["clean_exits"] += 1
+        for w in counts["wedge"]:
+            violations.append(f"V7 wedged session: worker {wid} {w}")
 
         # this worker's slice of the actual table
         lo, hi = wid * KEYSPACE, (wid + 1) * KEYSPACE
@@ -241,15 +278,14 @@ def check(root, n_workers):
                 _diff(violations, wid, expected, mine, tag="")
         else:
             stats["inflight"] += 1
-            oid, eff = pending
             branch_out = expected
-            branch_in = apply(eff, expected)
+            branch_in = _apply_effect(pending, expected)
             if mine == branch_out or mine == branch_in:
                 pass  # all-or-nothing honored
             else:
                 violations.append(
-                    f"V8 crash tear: worker {wid} in-flight {oid} ({eff['kind']}) is neither "
-                    f"fully-in nor fully-out")
+                    f"V8 crash tear: worker {wid} in-flight {pending['oid']} ({pending['kind']}) is "
+                    f"neither fully-in nor fully-out")
                 _diff(violations, wid, branch_in, mine, tag=" (vs fully-in)")
                 _diff(violations, wid, branch_out, mine, tag=" (vs fully-out)")
 
@@ -280,6 +316,139 @@ def _diff(violations, wid, expected, actual, tag):
     if wrongval:
         violations.append(f"V1/V3 wrong values{tag}: worker {wid} {dict(list(wrongval.items())[:5])} "
                           f"(+{max(0, len(wrongval)-5)} more)")
+
+
+# ----------------------------------------------------------- attestation (commit / reveal)
+# A two-phase, tamper-evident report for the CI step summary. Phase ① seals the EXPECTED final state
+# — derived only from the workers' fsync'd ledgers, before the table is ever read — together with a
+# per-run random nonce and a sha256 commitment binding the two. Phase ② then reads the real table
+# (through BOTH duckrun and deltalake), recomputes the commitment to prove the expectation was not
+# edited, and diffs. Because the nonce (and the chaos seed) are fresh every run, the "expected" page
+# can't be pre-baked, and it is published in an EARLIER step than the actual — so a reader sees the
+# prediction land before the result, with no room for after-the-fact fitting.
+
+def _summary_write(md):
+    """Append markdown to the GitHub Step Summary (if running under Actions); always echo to stdout."""
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if path:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(md + "\n")
+    # stdout may be a non-UTF console (e.g. Windows cp1252) — never let rendering crash the run.
+    try:
+        print(md)
+    except UnicodeEncodeError:
+        enc = sys.stdout.encoding or "ascii"
+        print(md.encode(enc, "replace").decode(enc))
+
+
+def _canonical(expected):
+    """Stable, sorted JSON a reader can recompute byte-for-byte to re-verify the commitment."""
+    return json.dumps({str(k): expected[k] for k in sorted(expected)}, separators=(",", ":"))
+
+
+def _commit(nonce, expected):
+    import hashlib
+    return hashlib.sha256((nonce + "|" + _canonical(expected)).encode()).hexdigest()
+
+
+def attest_declare(root, n_workers, seed, nonce):
+    """Phase ①: from the ledgers ONLY (no table read), publish the expected final state, the per-run
+    nonce, and the commitment binding them. Persist to attest.json for the reveal step."""
+    expected = _load_expected(root, n_workers)
+    commit = _commit(nonce, expected)
+    (Path(root) / "attest.json").write_text(json.dumps(
+        {"nonce": nonce, "seed": seed, "commit": commit, "n_workers": n_workers,
+         "expected": {str(k): v for k, v in expected.items()}}))
+
+    sample = json.dumps(dict(sorted(expected.items())[:8]), indent=2)
+    run = os.environ.get("GITHUB_RUN_ID", "local")
+    md = f"""## 🔒 duckrun breaker — commit / reveal attestation
+
+### ① EXPECTED — sealed *before* the table is read · run `{run}`
+
+Built straight from the workers' fsync'd ledgers (the independent oracle) — the final Delta table has
+**not been read yet** at this point. The nonce is **fresh and random every run**, so this page can't
+be pre-baked; the commitment binds that nonce to the exact expected state.
+
+| field | value |
+|---|---|
+| run nonce (unique per run) | `{nonce}` |
+| chaos seed | `{seed}` |
+| workers | `{n_workers}` |
+| expected distinct keys | **{len(expected)}** |
+| commitment = `sha256(nonce \\| canonical_expected)` | `{commit}` |
+
+<details><summary>expected sample — first 8 keys (k → val)</summary>
+
+```json
+{sample}
+```
+</details>
+
+_The reveal below reads the real table and diffs it against this — the nonce and commitment must match._
+"""
+    _summary_write(md)
+    print(f"declared: {len(expected)} expected keys · nonce {nonce} · commit {commit}")
+
+
+def attest_reveal(root):
+    """Phase ②: read the real table through BOTH duckrun and deltalake, recompute the commitment to
+    prove the expected map is unchanged, and diff. Exits non-zero on any mismatch."""
+    att = json.loads((Path(root) / "attest.json").read_text())
+    nonce, commit = att["nonce"], att["commit"]
+    expected = {int(k): v for k, v in att["expected"].items()}
+
+    rows_rs, n_rs, rows_dd, n_dd, version = read_final_state(root)
+
+    violations = []
+    if n_rs != len(rows_rs):
+        violations.append(f"V4 duplicate keys: deltalake {n_rs} rows vs {len(rows_rs)} distinct")
+    if n_dd != len(rows_dd):
+        violations.append(f"V4 duplicate keys: duckdb {n_dd} rows vs {len(rows_dd)} distinct")
+    if rows_rs != rows_dd:
+        violations.append("V5 seam disagreement: the duckrun and deltalake reads differ")
+
+    recomputed = _commit(nonce, expected)
+    if recomputed != commit:
+        violations.append(f"commitment broken: the sealed expected was altered after ① "
+                          f"({recomputed} != {commit})")
+
+    actual = rows_rs
+    missing = {k: expected[k] for k in set(expected) - set(actual)}
+    phantom = {k: actual[k] for k in set(actual) - set(expected)}
+    wrong = {k: [expected[k], actual[k]] for k in set(expected) & set(actual) if expected[k] != actual[k]}
+    if missing:
+        violations.append(f"V1 lost writes: {len(missing)} keys missing, e.g. {dict(list(missing.items())[:5])}")
+    if phantom:
+        violations.append(f"V2 phantom writes: {len(phantom)} unexpected keys, e.g. {dict(list(phantom.items())[:5])}")
+    if wrong:
+        violations.append(f"V1/V3 wrong values: {len(wrong)} keys, e.g. {dict(list(wrong.items())[:5])}")
+
+    ok = not violations
+    verdict = ("✅ **MATCH** — the actual table equals the expectation sealed in ①, exactly."
+               if ok else f"❌ **{len(violations)} VIOLATION(S)**")
+    run = os.environ.get("GITHUB_RUN_ID", "local")
+    vlist = "\n".join(f"- {v}" for v in violations) if violations else "_none_"
+    md = f"""### ② ACTUAL — revealed *after* reading the table · run `{run}`
+
+Read back through **both** duckrun and deltalake (two independent readers) and diffed against the
+expectation sealed in ①. The nonce and recomputed commitment must equal ① for this to be trustworthy.
+
+| field | value |
+|---|---|
+| run nonce (echoed from ①) | `{nonce}` |
+| commitment recomputed from ①'s expected | `{recomputed}` |
+| final Delta version | `{version}` |
+| actual distinct keys (duckrun / deltalake) | `{len(rows_dd)}` / `{len(rows_rs)}` |
+
+### {verdict}
+
+{vlist}
+"""
+    _summary_write(md)
+    print(f"revealed: {len(rows_dd)} actual keys · verdict {'MATCH' if ok else 'VIOLATION'}")
+    if not ok:
+        sys.exit(1)
 
 
 # --------------------------------------------------------------------------- V9 fence probe
@@ -359,6 +528,36 @@ def fence_probe(root):
 
 # --------------------------------------------------------------------------- supervisor
 
+def _run_workers(root, n_workers, ops, batch, seed, rng, kill=False, kill_delay=2.0):
+    """Seed the table (single writer), spawn n_workers hammering it in parallel, optionally SIGKILL
+    half of them mid-flight, and wait for all to finish. Shared by the chaos run and the attestation."""
+    import duckrun
+    c = duckrun.connect(root, read_only=False)
+    c.sql("CREATE TABLE acct AS SELECT -1::BIGINT AS k, -1::BIGINT AS val, -1::INT AS w")
+    c.sql("DELETE FROM acct WHERE k = -1")
+    c.close()
+
+    procs = []
+    for wid in range(n_workers):
+        p = subprocess.Popen(
+            [sys.executable, __file__, "--_worker", str(wid), "--root", root,
+             "--ops", str(ops), "--seed", str(seed + wid), "--batch", str(batch)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        procs.append(p)
+
+    if kill:
+        alive = list(range(n_workers))
+        rng.shuffle(alive)
+        for wid in alive[: max(1, n_workers // 2)]:   # kill half of them
+            time.sleep(rng.uniform(0.5, kill_delay))
+            if procs[wid].poll() is None:
+                os.kill(procs[wid].pid, signal.SIGKILL)
+                print(f"  SIGKILL -> worker {wid}")
+
+    for p in procs:
+        p.wait()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--workers", type=int, default=6)
@@ -368,10 +567,22 @@ def main():
     ap.add_argument("--kill-delay", type=float, default=2.0)
     ap.add_argument("--fence", action="store_true",
                     help="run ONLY the deterministic read-target fence probe (V9), no chaos")
+    ap.add_argument("--attest-declare", action="store_true",
+                    help="run chaos then SEAL the expected state (commit) to the step summary; no table read")
+    ap.add_argument("--attest-reveal", action="store_true",
+                    help="read the table and REVEAL actual vs the sealed expected (needs --root from declare)")
+    ap.add_argument("--nonce", default=None, help="override the per-run nonce (default: run id + random)")
     ap.add_argument("--seed", type=int, default=None)
     ap.add_argument("--keep", action="store_true")
     ap.add_argument("--root", default=None)
     args = ap.parse_args()
+
+    # Reveal reads a warehouse that a prior declare step already built — no fresh root, no chaos.
+    if args.attest_reveal:
+        if not args.root:
+            sys.exit("--attest-reveal needs the --root that --attest-declare wrote")
+        attest_reveal(args.root)
+        return
 
     seed = args.seed if args.seed is not None else random.randrange(1 << 30)
     rng = random.Random(seed)
@@ -393,32 +604,16 @@ def main():
             shutil.rmtree(root, ignore_errors=True)
         return
 
-    # seed the table (single writer, no contention)
-    import duckrun
-    c = duckrun.connect(root, read_only=False)
-    c.sql("CREATE TABLE acct AS SELECT -1::BIGINT AS k, -1::BIGINT AS val, -1::INT AS w")
-    c.sql("DELETE FROM acct WHERE k = -1")
-    c.close()
+    # Attestation ①: run kill-free chaos (so every op has a definite outcome -> an exact expected map),
+    # then seal that expectation. The reveal step runs later against this same --root.
+    if args.attest_declare:
+        _run_workers(root, args.workers, args.ops, args.batch, seed, rng, kill=False)
+        nonce = args.nonce or (f"{os.environ.get('GITHUB_RUN_ID', 'local')}-"
+                               f"{os.environ.get('GITHUB_RUN_ATTEMPT', '0')}-{os.urandom(8).hex()}")
+        attest_declare(root, args.workers, seed, nonce)
+        return
 
-    procs = []
-    for wid in range(args.workers):
-        p = subprocess.Popen(
-            [sys.executable, __file__, "--_worker", str(wid), "--root", root,
-             "--ops", str(args.ops), "--seed", str(seed + wid), "--batch", str(args.batch)],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        procs.append(p)
-
-    if args.kill:
-        alive = list(range(args.workers))
-        rng.shuffle(alive)
-        for wid in alive[: max(1, args.workers // 2)]:   # kill half of them
-            time.sleep(rng.uniform(0.5, args.kill_delay))
-            if procs[wid].poll() is None:
-                os.kill(procs[wid].pid, signal.SIGKILL)
-                print(f"  SIGKILL -> worker {wid}")
-
-    for p in procs:
-        p.wait()
+    _run_workers(root, args.workers, args.ops, args.batch, seed, rng, args.kill, args.kill_delay)
     print("workers done; checking invariants…")
 
     violations, stats, version = check(root, args.workers)
