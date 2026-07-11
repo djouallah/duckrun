@@ -6,6 +6,10 @@ name: fuzz
 # looking for new divergence — not a red/green guard on every push. It needs network (to INSTALL the
 # sqlsmith DuckDB extension), unlike the offline `cores` suite.
 #
+# sqlsmith is NOT seed-stable across duckdb builds, so the seed alone can't replay a run. Every run
+# uploads a `fuzz-corpus` artifact (the exact numbered statements, dumped before replay) — that's the
+# faithful reproducer, and the only one that survives a hard delta_rs panic that kills the process.
+#
 # Every run renders a summary to the Actions "Summary" tab: the reproduce seed, the bucket counts,
 # and findings split into DATA divergence (wrong data / lost write — what matters) vs error_mismatch
 # (the engine raised where DuckDB succeeded — usually a fail-loud gap on exotic syntax delta_rs can't
@@ -64,7 +68,19 @@ jobs:
             --queries "${{ inputs.queries }}" \
             --seed "${{ steps.seed.outputs.seed }}" \
             --fail-on "${{ inputs.fail_on }}" \
+            --corpus-out fuzz_corpus.sql \
             --summary-md fuzz_summary.md
+
+      # Always upload the exact generated statements. sqlsmith isn't seed-stable across duckdb builds,
+      # so a hard delta_rs panic (kills the process — PanicException escapes the try/except) is only
+      # reproducible from this dump. The last '>>> #i' line in the job log names the crashing index.
+      - name: Upload corpus (reproduces a crash the seed can't)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-corpus
+          path: fuzz_corpus.sql
+          if-no-files-found: warn
 
       - name: Publish summary
         if: always()

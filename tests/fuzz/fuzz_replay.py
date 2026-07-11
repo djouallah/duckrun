@@ -218,6 +218,12 @@ def main():
                          "fail-loud syntax gaps don't paint it red; every finding is still printed.")
     ap.add_argument("--summary-md", metavar="PATH", default=None,
                     help="also write a markdown report to PATH (point it at $GITHUB_STEP_SUMMARY in CI)")
+    ap.add_argument("--corpus-out", metavar="PATH", default=None,
+                    help="dump the exact generated statements (numbered, ;-terminated) to PATH BEFORE "
+                         "replaying. sqlsmith is NOT seed-stable across duckdb builds, so the seed alone "
+                         "can't reproduce a crash — this file is the only faithful record. Upload it as a "
+                         "CI artifact so a hard delta_rs panic (which escapes the try/except as a "
+                         "BaseException and kills the process) is still reproducible statement-for-statement.")
     args = ap.parse_args()
 
     print(f"generating {args.queries} statements with sqlsmith(seed={args.seed})…")
@@ -225,12 +231,25 @@ def main():
     mix = Counter(q.split()[0].upper() for q in corpus)
     print(f"corpus: {dict(mix)}\n")
 
+    if args.corpus_out:
+        # Written up front, before a single statement runs, so it survives even a process-killing
+        # Rust panic mid-replay. Numbered to line up with the '>>> #i' progress markers below.
+        Path(args.corpus_out).write_text(
+            f"-- sqlsmith corpus · seed={args.seed} · queries={args.queries} · {len(corpus)} statements\n"
+            + "".join(f"-- #{i}\n{q};\n" for i, q in enumerate(corpus)),
+            encoding="utf-8")
+        print(f"wrote corpus ({len(corpus)} statements) to {args.corpus_out}\n")
+
     oracle, eng = Oracle(), Engine(args.module)
     stats = Counter()
     findings = []
     dml_since_reconnect = 0
 
     for i, q in enumerate(corpus):
+        # Flushed breadcrumb: a hard delta_rs panic kills the process (PanicException subclasses
+        # BaseException, so eng.run's `except Exception` can't catch it). This marker is then the LAST
+        # log line, naming the exact index to look up in the --corpus-out dump.
+        print(f">>> #{i} {q.split()[0].upper()}", flush=True)
         nondet = bool(NONDET.search(q))
         limit_noorder = bool(LIMIT_NO_ORDER.search(q)) and not HAS_ORDER.search(q)
         is_sel = bool(IS_SELECT.match(q))
