@@ -273,6 +273,13 @@ _M_INSERT_ALL = re.compile(r"\s*insert\s+\*\s*", re.I)
 _M_INSERT_COLS = re.compile(
     r"\s*insert\s*\((?P<cols>[^)]*)\)\s*values\s*\((?P<vals>.+)\)\s*", re.I | re.S
 )
+# Columnless `insert values (<expr>, …)` — DuckDB (and Spark/Snowflake) let a MERGE INSERT omit the
+# column list and bind the values positionally to the target's columns in declared order. delta_rs needs
+# an explicit {col: expr} map, so the target schema fills in the names (see _parse_insert_values_positional).
+_M_INSERT_VALUES_ONLY = re.compile(r"\s*insert\s+values\s*\((?P<vals>.+)\)\s*", re.I | re.S)
+# `THEN DO NOTHING` — a valid no-op MERGE action (DuckDB/Spark). delta_rs has no skip action, so it is
+# folded away in _resolve_do_nothing rather than handed to the TableMerger.
+_M_DO_NOTHING = re.compile(r"\s*do\s+nothing\s*", re.I)
 # A VALUES tuple the self-typing probe in _insert_values can't handle on a throwaway connection, so
 # the list must instead be replayed through a real INSERT on the live cursor (the typed-temp path):
 #   • DEFAULT — a native-INSERT-only construct, illegal inside a `(VALUES …)` derived table.
@@ -831,10 +838,28 @@ def validate_merge_condition(condition: str) -> None:
             )
 
 
+def _reject_unplannable_merge_value(exprs_text: str, ctx: str) -> None:
+    """Fail loud on a MERGE value expression delta_rs/datafusion can't plan. A scalar SUBQUERY inside a
+    MERGE UPDATE/INSERT value is a hard Rust `not implemented` PANIC (delta_datafusion/expr.rs) that
+    kills the process, not a catchable error; DEFAULT isn't an expression delta_rs accepts either. Reject
+    both here — string literals blanked first so `'select …'` / `'default'` in a value can't false-trip —
+    so the statement is a clean ValueError instead of a crash. (Precompute the value into the USING
+    source and reference `source.<col>`.)"""
+    blanked = _blank_string_literals(exprs_text)
+    if _VALUES_HAS_SUBQUERY.search(blanked):
+        raise ValueError(
+            f"{ctx}: delta_rs can't plan a subquery inside a MERGE value expression — precompute it "
+            f"into the USING source and reference source.<col>")
+    if _VALUES_HAS_DEFAULT.search(blanked):
+        raise ValueError(f"{ctx}: DEFAULT is not supported in a MERGE value expression — give an "
+                         f"explicit value")
+
+
 def _parse_set_exprs(assign: str) -> dict:
     """``{col: expr}`` for a ``UPDATE SET col = <expr>, …`` clause. The expression is ANY SQL delta-rs
     accepts (a plain ``source.col`` copy or an arbitrary expression like ``source.qty + 1``); it is
     passed to delta-rs verbatim (already alias-rewritten to target/source)."""
+    _reject_unplannable_merge_value(assign, "MERGE UPDATE SET")
     updates: dict = {}
     for a in _split_top_level_commas(assign):
         col, sep, expr = a.partition("=")
@@ -849,6 +874,7 @@ def _parse_set_exprs(assign: str) -> dict:
 def _parse_insert_cols(cols_text: str, vals_text: str) -> dict:
     """``{col: value_expr}`` for ``INSERT (col, …) VALUES (<expr>, …)`` — columns and values zipped
     positionally (values split at top level so a function call's commas don't break the pairing)."""
+    _reject_unplannable_merge_value(vals_text, "MERGE INSERT VALUES")
     cols = [c.strip().strip('"') for c in cols_text.split(",") if c.strip()]
     vals = _split_top_level_commas(vals_text)
     if len(cols) != len(vals):
@@ -858,6 +884,20 @@ def _parse_insert_cols(cols_text: str, vals_text: str) -> dict:
     if not cols:
         raise ValueError("INSERT has no columns")
     return dict(zip(cols, vals))
+
+
+def _parse_insert_values_positional(vals_text: str, target_cols: List[str]) -> dict:
+    """``{col: value_expr}`` for a columnless ``INSERT VALUES (<expr>, …)`` — the values are bound
+    positionally to the target's columns in declared order (native-INSERT semantics), so the count must
+    match exactly. Name the columns (``INSERT (cols) VALUES …``) to insert a subset."""
+    _reject_unplannable_merge_value(vals_text, "MERGE INSERT VALUES")
+    vals = _split_top_level_commas(vals_text)
+    if len(vals) != len(target_cols):
+        raise ValueError(
+            f"MERGE INSERT VALUES has {len(vals)} value(s) but target has {len(target_cols)} column(s) "
+            f"{target_cols}; list the columns explicitly (INSERT (cols) VALUES (…)) to insert a subset"
+        )
+    return dict(zip(target_cols, vals))
 
 
 def _split_when_clause(clause: str) -> Tuple[str, Optional[str], str]:
@@ -882,10 +922,21 @@ def _split_when_clause(clause: str) -> Tuple[str, Optional[str], str]:
     return kind, (pred.strip() if pred else None), action
 
 
-def _build_merge_clause(kind: str, pred: Optional[str], action: str) -> dict:
+# Canonical delta_rs clause name per parsed WHEN kind.
+_CLAUSE_NAME = {"matched": "matched", "not matched": "not_matched",
+                "not matched by source": "not_matched_by_source"}
+
+
+def _build_merge_clause(kind: str, pred: Optional[str], action: str,
+                        target_cols: Optional[List[str]] = None) -> dict:
     """Turn one parsed ``(kind, pred, action)`` WHEN clause into an ``engine.merge_delta_clauses``
     spec dict. Covers the full delta-rs TableMerger surface; only a malformed/typo action raises —
-    legality of clause *combinations* is left to delta_rs."""
+    legality of clause *combinations* is left to delta_rs. ``target_cols`` (the target's columns in
+    declared order) resolves a columnless ``INSERT VALUES (…)``."""
+    # `THEN DO NOTHING` is a valid no-op action in any clause kind. delta_rs can't express a skip, so
+    # emit a marker _resolve_do_nothing folds away before the merge reaches delta_rs.
+    if _M_DO_NOTHING.fullmatch(action):
+        return {"clause": _CLAUSE_NAME[kind], "action": "do_nothing", "predicate": pred}
     if kind == "matched":
         if _M_UPDATE_ALL.fullmatch(action):
             return {"clause": "matched", "action": "update_all", "predicate": pred}
@@ -896,8 +947,8 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str) -> dict:
             return {"clause": "matched", "action": "update",
                     "updates": _parse_set_exprs(sm.group("assign")), "predicate": pred}
         raise ValueError(
-            f"unsupported WHEN MATCHED action (expected UPDATE SET * / UPDATE SET col=… / DELETE): "
-            f"{action!r}")
+            f"unsupported WHEN MATCHED action (expected UPDATE SET * / UPDATE SET col=… / DELETE / "
+            f"DO NOTHING): {action!r}")
     if kind == "not matched":
         if _M_INSERT_ALL.fullmatch(action):
             return {"clause": "not_matched", "action": "insert_all", "predicate": pred}
@@ -906,9 +957,17 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str) -> dict:
             return {"clause": "not_matched", "action": "insert",
                     "updates": _parse_insert_cols(im.group("cols"), im.group("vals")),
                     "predicate": pred}
+        iv = _M_INSERT_VALUES_ONLY.fullmatch(action)
+        if iv:
+            if not target_cols:
+                raise ValueError("columnless MERGE INSERT VALUES needs the target schema "
+                                 "(internal: target_cols not supplied)")
+            return {"clause": "not_matched", "action": "insert",
+                    "updates": _parse_insert_values_positional(iv.group("vals"), target_cols),
+                    "predicate": pred}
         raise ValueError(
-            f"unsupported WHEN NOT MATCHED action (expected INSERT * or INSERT (cols) VALUES (…)): "
-            f"{action!r}")
+            f"unsupported WHEN NOT MATCHED action (expected INSERT * / INSERT (cols) VALUES (…) / "
+            f"INSERT VALUES (…) / DO NOTHING): {action!r}")
     # "not matched by source": UPDATE SET … or DELETE
     if _M_DELETE.fullmatch(action):
         return {"clause": "not_matched_by_source", "action": "delete", "predicate": pred}
@@ -917,8 +976,34 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str) -> dict:
         return {"clause": "not_matched_by_source", "action": "update",
                 "updates": _parse_set_exprs(sm.group("assign")), "predicate": pred}
     raise ValueError(
-        f"unsupported WHEN NOT MATCHED BY SOURCE action (expected UPDATE SET … or DELETE): "
+        f"unsupported WHEN NOT MATCHED BY SOURCE action (expected UPDATE SET … / DELETE / DO NOTHING): "
         f"{action!r}")
+
+
+def _resolve_do_nothing(clauses: List[dict]) -> List[dict]:
+    """Fold ``WHEN … THEN DO NOTHING`` clauses into the delta_rs surface, which has no skip action.
+
+    A DO NOTHING clause's only observable effect is first-match-wins: for rows of its kind matching its
+    predicate it does nothing AND stops any LATER clause of the SAME kind from firing on them. delta_rs
+    already does nothing when no clause matches, so we drop the DO NOTHING clause and push its predicate
+    as a ``(<pred>) IS NOT TRUE`` guard onto every later same-kind clause — an unconditional DO NOTHING
+    claims all such rows, so those later clauses are dropped outright. Same row outcome, no skip action.
+    An all-DO-NOTHING merge folds to zero clauses: a pure no-op the caller skips. ``IS NOT TRUE`` (not
+    ``NOT``) keeps NULL predicates correct — a row DO NOTHING didn't claim still reaches later clauses."""
+    for idx, c in enumerate(clauses):
+        if c.get("action") != "do_nothing" or c.get("_dead"):
+            continue
+        kind, pred = c["clause"], c.get("predicate")
+        for later in clauses[idx + 1:]:
+            if later["clause"] != kind or later.get("_dead"):
+                continue
+            if pred is None:
+                later["_dead"] = True  # unconditional skip: no row of this kind reaches a later clause
+            else:
+                guard = f"({pred}) IS NOT TRUE"
+                lp = later.get("predicate")
+                later["predicate"] = f"({lp}) AND {guard}" if lp else guard
+    return [c for c in clauses if c.get("action") != "do_nothing" and not c.get("_dead")]
 
 
 class _DeltaDML:
@@ -1555,8 +1640,17 @@ class _DeltaDML:
         clause_strs = [cond_clauses[a:b] for a, b in zip(whens, whens[1:] + [len(cond_clauses)])]
         # One clause spec per WHEN, in source order — delta_rs evaluates them top-to-bottom and
         # enforces its own legality rules (e.g. multiple unconditional matched clauses), so we don't
-        # second-guess combinations here: whatever delta_rs accepts, we accept.
-        clauses = [_build_merge_clause(*_split_when_clause(c)) for c in clause_strs]
+        # second-guess combinations here: whatever delta_rs accepts, we accept. target_cols (declared
+        # order) resolves a columnless `INSERT VALUES (…)` to explicit {col: expr} for delta_rs.
+        loc_sql = loc.replace("'", "''")
+        target_cols = list(self.cursor.sql(f"select * from delta_scan('{loc_sql}') limit 0").columns)
+        clauses = [_build_merge_clause(*_split_when_clause(c), target_cols=target_cols)
+                   for c in clause_strs]
+        # DO NOTHING has no delta_rs skip action — fold it into IS-NOT-TRUE guards on later same-kind
+        # clauses. An all-DO-NOTHING merge folds to nothing: skip the write, the statement is a no-op.
+        clauses = _resolve_do_nothing(clauses)
+        if not clauses:
+            return
 
         # Evaluate the whole USING operand (including any alias) so a bare name, an aliased name, and
         # a subquery with a column-renaming alias (`(values …) t(id, name)`) all work — delta_rs

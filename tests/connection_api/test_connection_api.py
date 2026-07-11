@@ -428,6 +428,53 @@ class TestSqlDml:
         assert conn.sql("select name from src where id = 1").fetchone()[0] == "A"  # updated
         assert conn.sql("select count(*) from src").fetchone()[0] == 3             # id=9 NOT inserted
 
+    def test_sql_merge_insert_values_columnless(self, conn):
+        # WHEN NOT MATCHED THEN INSERT VALUES (…) with NO column list — bound positionally to the
+        # target columns in declared order (id, name), like a native positional INSERT.
+        conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
+                 "WHEN NOT MATCHED THEN INSERT VALUES (source.id, upper(source.name))")
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "Z"
+
+    def test_sql_merge_insert_values_columnless_arity_mismatch(self, conn):
+        # a columnless INSERT VALUES whose value count != target column count is a clean error.
+        with pytest.raises(ValueError, match="value.*target has 2 column"):
+            conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
+                     "WHEN NOT MATCHED THEN INSERT VALUES (source.id)")
+
+    def test_sql_merge_do_nothing_noop(self, conn):
+        # a merge whose only clause is DO NOTHING changes nothing (valid syntax, not an error).
+        conn.sql("MERGE INTO src USING (values (2,'B'),(9,'z')) t(id, name) ON target.id = source.id "
+                 "WHEN NOT MATCHED THEN DO NOTHING")
+        assert dict(conn.sql("select id, name from src").fetchall()) == {1: "a", 2: "b", 3: "c"}
+
+    def test_sql_merge_do_nothing_gates_later_clause(self, conn):
+        # DO NOTHING is first-match-wins: matched id=2 is skipped, other matched rows update, and the
+        # unmatched row inserts — the same outcome DuckDB/Spark give, without a delta_rs skip action.
+        conn.sql("MERGE INTO src USING (values (1,'X'),(2,'Y'),(9,'z')) t(id, name) "
+                 "ON target.id = source.id "
+                 "WHEN MATCHED AND source.id = 2 THEN DO NOTHING "
+                 "WHEN MATCHED THEN UPDATE SET name = source.name "
+                 "WHEN NOT MATCHED THEN INSERT *")
+        assert dict(conn.sql("select id, name from src").fetchall()) == {
+            1: "X",    # matched, not gated → updated
+            2: "b",    # matched but gated by DO NOTHING → untouched
+            3: "c",    # not in source → untouched
+            9: "z",    # unmatched → inserted
+        }
+
+    def test_sql_merge_insert_subquery_value_rejected(self, conn):
+        # a scalar subquery inside a MERGE value is a hard delta_rs/datafusion panic — rejected loud
+        # (clean ValueError) before it reaches the merger, never a process-killing crash.
+        with pytest.raises(ValueError, match="subquery"):
+            conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
+                     "WHEN NOT MATCHED THEN INSERT VALUES (source.id, (select name from src limit 1))")
+
+    def test_sql_merge_update_subquery_value_rejected(self, conn):
+        # same guard on the UPDATE SET path.
+        with pytest.raises(ValueError, match="subquery"):
+            conn.sql("MERGE INTO src USING (values (1,'x')) t(id, name) ON target.id = source.id "
+                     "WHEN MATCHED THEN UPDATE SET name = (select name from src limit 1)")
+
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
 # 2. Local-filesystem contract & plumbing — discovery, save-MODE contracts, connect() errors, etc.
