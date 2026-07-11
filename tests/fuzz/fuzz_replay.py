@@ -15,8 +15,9 @@ Per statement:
   - both succeed, DML            -> full table-state diff  -> finding: state_diff
   - every RECONNECT_EVERY DMLs   -> close + reconnect engine, re-diff all tables
                                     -> finding: persistence_diff
-Statements with nondeterminism (random/now/LIMIT-without-ORDER) are compared
-leniently and land in 'suspect' buckets instead of findings.
+Statements with nondeterminism (random/now, TABLESAMPLE, or a LIMIT with no
+governing ORDER BY — an ORDER BY inside a window's OVER(...) does not count) are
+compared leniently and land in 'suspect' buckets instead of findings.
 
 Usage:
   python fuzz_replay.py --queries 300 --seed 42
@@ -45,6 +46,15 @@ NONDET = re.compile(r"\b(random|now|current_|today|get_current)\w*\s*\(", re.I)
 LIMIT_NO_ORDER = re.compile(r"\blimit\b", re.I)
 HAS_ORDER = re.compile(r"\border\s+by\b", re.I)
 IS_SELECT = re.compile(r"^\s*(select|with|from|values)\b", re.I)
+# TABLESAMPLE / bernoulli / system / USING SAMPLE draw a nondeterministic subset — the oracle's native
+# tables and the engine's Delta-backed storage sample different rows, so such queries can never be
+# compared row-for-row. Bucket them leniently rather than as a data divergence.
+SAMPLE = re.compile(r"\btablesample\b|\busing\s+sample\b", re.I)
+# An ORDER BY inside a window's OVER(...) governs the frame, NOT the result set, so it must not count
+# as the stabilizing order a top-level/subquery LIMIT needs. Strip OVER(...) before the HAS_ORDER test,
+# else a query like `… over (order by x) … limit 1 offset 4` is wrongly deemed deterministic and its
+# inherent LIMIT/OFFSET nondeterminism surfaces as a false result_diff. (handles one level of nesting)
+_OVER_CLAUSE = re.compile(r"\bover\s*\((?:[^()]|\([^()]*\))*\)", re.I)
 
 # Correctness defects — the engine returned different rows, left tables in a different state, or lost
 # writes across a reconnect. error_mismatch (engine raised where DuckDB didn't) is the weaker signal.
@@ -250,8 +260,9 @@ def main():
         # BaseException, so eng.run's `except Exception` can't catch it). This marker is then the LAST
         # log line, naming the exact index to look up in the --corpus-out dump.
         print(f">>> #{i} {q.split()[0].upper()}", flush=True)
-        nondet = bool(NONDET.search(q))
-        limit_noorder = bool(LIMIT_NO_ORDER.search(q)) and not HAS_ORDER.search(q)
+        q_no_over = _OVER_CLAUSE.sub("", q)
+        nondet = bool(NONDET.search(q)) or bool(SAMPLE.search(q))
+        limit_noorder = bool(LIMIT_NO_ORDER.search(q_no_over)) and not HAS_ORDER.search(q_no_over)
         is_sel = bool(IS_SELECT.match(q))
 
         o = oracle.run(q)
