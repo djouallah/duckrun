@@ -55,6 +55,7 @@ _TXN_VERB_RE = re.compile(r"^(begin|start|commit|rollback|end|abort)\b", re.IGNO
 # leading `\b`: _find_top_level probes every depth-0 index (see delta_dml._find_top_level).
 _TOP_FROM = re.compile(r"\bfrom\b", re.IGNORECASE)
 _TOP_USING = re.compile(r"\busing\b", re.IGNORECASE)
+_TOP_RETURNING = re.compile(r"\breturning\b", re.IGNORECASE)
 _strip_leading = delta_dml._strip_leading  # shared comment/whitespace stripper
 
 _UPDATE_FROM_MSG = (
@@ -64,6 +65,11 @@ _UPDATE_FROM_MSG = (
 _DELETE_USING_MSG = (
     "conn.sql() can't run DELETE … USING via delta_rs. Rewrite the predicate as a correlated "
     "subquery (DELETE … WHERE … IN (SELECT …)), or express the join as MERGE INTO … USING …."
+)
+_RETURNING_MSG = (
+    "conn.sql() can't run a RETURNING clause via delta_rs — a Delta write commits through the "
+    "transaction log and does not hand back the affected rows. Drop RETURNING, then read the "
+    "table back with a follow-up SELECT."
 )
 _MULTI_MSG = (
     "conn.sql() runs one statement at a time — split the batch into separate conn.sql() calls."
@@ -97,6 +103,12 @@ def _unsupported_dml(query: str) -> Optional[str]:
         return _UPDATE_FROM_MSG
     if low.startswith("delete") and delta_dml._find_top_level(s, _TOP_USING) != -1:
         return _DELETE_USING_MSG
+    # RETURNING (INSERT/UPDATE/DELETE/MERGE) — delta_rs commits via the log and can't return the
+    # affected rows. Caught here so the SET-clause parser can't mis-read the RETURNING list as more
+    # assignments (it otherwise reports a bogus "sets unknown column(s)" for the projected columns).
+    if re.match(r"(insert|update|delete|merge)\b", low) and \
+            delta_dml._find_top_level(s, _TOP_RETURNING) != -1:
+        return _RETURNING_MSG
     if re.match(r"(insert|update|delete|merge|create|alter|drop)\b", low) and _is_multi_statement(s):
         return _MULTI_MSG
     return None
