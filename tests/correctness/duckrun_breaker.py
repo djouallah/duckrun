@@ -428,7 +428,8 @@ def attest_reveal(root):
     verdict = ("✅ **MATCH** — the actual table equals the expectation sealed in ①, exactly."
                if ok else f"❌ **{len(violations)} VIOLATION(S)**")
     run = os.environ.get("GITHUB_RUN_ID", "local")
-    vlist = "\n".join(f"- {v}" for v in violations) if violations else "_none_"
+    # Only list violations when there are any — on a clean match the verdict line stands alone.
+    vlist = ("\n" + "\n".join(f"- {v}" for v in violations)) if violations else ""
     md = f"""### ② ACTUAL — revealed *after* reading the table · run `{run}`
 
 Read back through **both** duckrun and deltalake (two independent readers) and diffed against the
@@ -442,7 +443,6 @@ expectation sealed in ①. The nonce and recomputed commitment must equal ① fo
 | actual distinct keys (duckrun / deltalake) | `{len(rows_dd)}` / `{len(rows_rs)}` |
 
 ### {verdict}
-
 {vlist}
 """
     _summary_write(md)
