@@ -46,6 +46,9 @@ NONDET = re.compile(r"\b(random|now|current_|today|get_current)\w*\s*\(", re.I)
 LIMIT_NO_ORDER = re.compile(r"\blimit\b", re.I)
 HAS_ORDER = re.compile(r"\border\s+by\b", re.I)
 IS_SELECT = re.compile(r"^\s*(select|with|from|values)\b", re.I)
+# RETURNING is a deliberately-unsupported delta_rs gap (a Delta write commits via the log and can't
+# return affected rows) — filtered out of the corpus so its known fail-loud noise doesn't drown findings.
+_RETURNING = re.compile(r"\breturning\b", re.I)
 # TABLESAMPLE / bernoulli / system / USING SAMPLE draw a nondeterministic subset — the oracle's native
 # tables and the engine's Delta-backed storage sample different rows, so such queries can never be
 # compared row-for-row. Bucket them leniently rather than as a data divergence.
@@ -96,7 +99,7 @@ def _write_summary_md(path, args, stats, findings, fatal):
     L.append("")
     L.append(f"### Error mismatch — {len(mism)} "
              "(engine raised where DuckDB succeeded; usually a fail-loud gap on syntax delta_rs "
-             "can't route — RETURNING / VALUES(…,DEFAULT) / TABLESAMPLE SYSTEM)")
+             "can't route — VALUES(…,DEFAULT) / TABLESAMPLE SYSTEM; RETURNING is filtered out)")
     if mism:
         for kind, i, q, _, b in mism[:60]:
             L.append(f"- **#{i}** {b} — `{' '.join(q.split())[:120]}`")
@@ -128,7 +131,15 @@ def generate_corpus(n, seed):
     g.close()
     qs = [q.strip() for q in Path(log).read_text().split(";") if q.strip()]
     # sqlsmith qualifies with main. — normalize for both sides
-    return [re.sub(r"\bmain\.", "", q) for q in qs]
+    qs = [re.sub(r"\bmain\.", "", q) for q in qs]
+    # Drop RETURNING statements: a Delta write commits through the transaction log and can't hand back
+    # the affected rows, so the engine fail-loudly rejects RETURNING by design (session.py _RETURNING_MSG).
+    # Replaying it only floods the report with known error_mismatch noise, so filter it at the source.
+    kept = [q for q in qs if not _RETURNING.search(q)]
+    dropped = len(qs) - len(kept)
+    if dropped:
+        print(f"filtered out {dropped} RETURNING statement(s) (intentional delta_rs gap)")
+    return kept
 
 
 class Oracle:
