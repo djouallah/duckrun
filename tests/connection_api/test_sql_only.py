@@ -118,6 +118,20 @@ def test_multi_statement_dml_is_rejected_by_session():
     assert session_mod._unsupported_dml("select 1; select 2") is None  # non-DML batch is not our concern
 
 
+def test_unsupported_dml_ignores_comments():
+    """Interior comments must not inject a false statement-separator or FROM/USING boundary — the
+    pre-check strips `--` / `/* */` (quote-aware) before scanning, so a single commented statement
+    is not mis-rejected."""
+    # a `;` that is only inside / after a comment is not a real second statement
+    assert session_mod._unsupported_dml("insert into t values (1); -- trailing note") is None
+    assert session_mod._unsupported_dml("insert into t values (1) /* a; b */") is None
+    # the word FROM/USING appearing only in a comment must not trip the UPDATE…FROM / DELETE…USING guard
+    assert session_mod._unsupported_dml("update t set x = 1 -- pulled from cache\n where id = 2") is None
+    assert session_mod._unsupported_dml("delete from t /* not using anything */ where id = 2") is None
+    # a genuine second statement is still caught even with comments in the mix
+    assert session_mod._unsupported_dml("insert into t values (1); /* c */ delete from t") is not None
+
+
 # ─────────────────────────────────────────────── CREATE TABLE layout: SORTED BY / PARTITIONED BY
 
 def _first_file(w, name):

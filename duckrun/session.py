@@ -97,7 +97,10 @@ _READ_ONLY_MSG = (
 
 def _unsupported_dml(query: str) -> Optional[str]:
     """An error message if ``query`` is a DML form duckrun can't route to delta_rs, else None."""
-    s = _strip_leading(query)
+    # Strip interior comments too (not just leading ones) so a `--`/`/* */` can't inject a false
+    # FROM/USING/RETURNING boundary or a bogus statement-separator `;`. _strip_comments is quote/
+    # dollar-quote aware; _strip_leading then peels the leading whitespace/comment off the front.
+    s = _strip_leading(delta_dml._strip_comments(query))
     low = s.lower()
     if low.startswith("update") and delta_dml._find_top_level(s, _TOP_FROM) != -1:
         return _UPDATE_FROM_MSG
