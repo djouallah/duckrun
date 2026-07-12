@@ -135,6 +135,19 @@ jobs:
       - name: Audit warehouse (OneLake Tables)
         run: python $PROJ/audit/validate.py --warehouse "$WAREHOUSE_PATH" --schema "$DBT_SCHEMA"
 
+      # --- Docs: the static dbt catalog reflects the LIVE OneLake Delta tables, so the published
+      #     page carries real row-count / byte / last-modified stats per model (the "stats" page). ---
+      - name: dbt docs generate (static — real catalog over the OneLake Delta tables)
+        run: dbt docs generate --static --project-dir "$PROJ" --profiles-dir "$PROJ"
+      - name: Verify the tpc-di catalog carries Delta table stats (issue #3)
+        run: python tests/tools/check_catalog_stats.py "$PROJ/target/catalog.json" tpcdi
+      - name: Upload tpc-di docs (deploy-docs publishes it as tpcdi.html)
+        uses: actions/upload-artifact@v4
+        with:
+          name: docs-tpcdi
+          path: tests/integration_tests/tpc_di/target/static_index.html
+          if-no-files-found: error
+
       - name: Upload logs (always)
         if: always()
         uses: actions/upload-artifact@v4
