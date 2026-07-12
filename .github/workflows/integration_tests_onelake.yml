@@ -102,7 +102,7 @@ jobs:
     # (the abfss:// merge write/read path via conn.sql). The heavy SF=10 memory-spill version is a
     # local release gate (local_stress_tests.yml), not this.
     needs: changes
-    if: ${{ needs.changes.outputs.merge_spill == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'merge_spill' || inputs.project == 'all')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.merge_spill == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'merge_spill' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: merge-onelake
@@ -149,7 +149,7 @@ jobs:
     # the live OneLake tables — not a throwaway local build. Then the connection-API coffee scenario
     # (duckrun.connect) over OneLake, into an isolated schema.
     needs: changes
-    if: ${{ needs.changes.outputs.coffee == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'coffee' || inputs.project == 'all')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.coffee == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'coffee' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: coffee-onelake
@@ -252,7 +252,7 @@ jobs:
     # schema so it never collides with the coffee tables in the shared lakehouse. Its own job so it
     # shows up as a visible node; non-fatal so a flaky live source can't redden the run.
     needs: changes
-    if: ${{ needs.changes.outputs.taxi == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'taxi' || inputs.project == 'all')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.taxi == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'taxi' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: taxi-onelake
@@ -328,7 +328,7 @@ jobs:
     # writable OneLake lakehouse, a READ-ONLY Fabric Warehouse, and a local scratch dir as three
     # catalogs, JOINs across them, and writes a mart back to the lakehouse. Non-fatal like taxi.
     needs: changes
-    if: ${{ needs.changes.outputs.multicatalog == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'multicatalog' || inputs.project == 'all')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.multicatalog == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'multicatalog' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: multicatalog-onelake
@@ -411,7 +411,7 @@ jobs:
     # use — so the chaos writes + concurrent compaction never touch anything else. Isolated schema
     # (duckrun_breaker_it) + concurrency lock on top of that.
     needs: changes
-    if: ${{ needs.changes.outputs.breaker == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'breaker' || inputs.project == 'all')) }}
+    if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.breaker == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'breaker' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
     concurrency:
       group: breaker-onelake
