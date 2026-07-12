@@ -68,7 +68,7 @@ under `tests/integration_tests/tpc_di/**`:
 5. `validate.py` audits the OneLake warehouse via `duckrun.connect()` — see below.
 
 The scale factor is `${{ inputs.scale_factor }}` (workflow_dispatch) → repo variable `TPCDI_SF`
-→ `3`. Changing it uses a fresh `sf<N>` seed cache, so it regenerates once for that SF.
+→ `10`. Changing it uses a fresh `sf<N>` seed cache, so it regenerates once for that SF.
 
 ## Notes & design choices
 

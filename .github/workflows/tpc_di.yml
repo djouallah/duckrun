@@ -21,7 +21,7 @@ on:
       scale_factor:
         description: "TPC-DI scale factor (min 3)"
         type: string
-        default: "3"
+        default: "10"
 
 # OIDC (id-token) for the Azure login that creates the lakehouse + mints the storage token.
 permissions:
@@ -39,7 +39,7 @@ jobs:
     env:
       # scale_factor input wins, else the repo variable TPCDI_SF, else 3. It keys the seed cache
       # (Files/tpcdi/sf<N>), so changing it regenerates for that SF only.
-      TPCDI_SF: ${{ inputs.scale_factor || vars.TPCDI_SF || '3' }}
+      TPCDI_SF: ${{ inputs.scale_factor || vars.TPCDI_SF || '10' }}
       TPCDI_GEN_TIMEOUT: '900'
       # Local scratch the Java generator writes to before upload (only used on a cache miss).
       # On /mnt — the runner's big ephemeral disk (~65GB) — not github.workspace (~21GB on /), so a
