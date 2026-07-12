@@ -255,6 +255,12 @@ _MERGE = re.compile(
 _M_USING = re.compile(r"\busing\b", re.I)
 _M_ON = re.compile(r"\bon\b", re.I)
 _M_WHEN = re.compile(r"\bwhen\b", re.I)
+# A JOIN keyword at the top level of the USING source. A bare `USING a JOIN b ON …` puts the JOIN's
+# own `on` at paren-depth 0, so the USING/ON splitter grabs it instead of the merge's `on` and the
+# join predicate leaks into the merge condition. delta_rs's source is a single relation, so this is
+# unsupported — detected here to raise the real fix (wrap the join) rather than a misleading alias
+# complaint. A join nested inside a parenthesized subquery is NOT top-level, so it's unaffected.
+_M_JOIN = re.compile(r"\bjoin\b", re.I)
 # One WHEN clause, split on its top-level THEN (see _split_when_clause). _M_KIND parses the part
 # BEFORE that THEN: kind (most specific first) + optional `AND <pred>`. The THEN boundary is found
 # quote/paren-aware (_M_THEN via _find_top_level) so a string literal containing the word `then`
@@ -1753,6 +1759,14 @@ class _DeltaDML:
         if oi < 0:
             raise ValueError("MERGE requires an ON <condition> clause")
         source_part = after_using[:oi]
+        # A top-level JOIN in the source means the `on` we just split on is the JOIN's, not the merge's
+        # — the merge condition would be garbage. delta_rs merges against a single relation, so wrap the
+        # join in a subquery. Naming this here beats the downstream "unknown qualifier" alias error.
+        if _find_top_level(source_part, _M_JOIN) != -1:
+            raise ValueError(
+                "MERGE USING does not support a bare JOIN as the source. Wrap it in a subquery: "
+                "USING (SELECT … FROM a JOIN b ON …) AS s ON target.<col> = s.<col>"
+            )
         cond_clauses = after_using[oi + len("on"):]
         # Normalize whatever aliases the user wrote to the canonical target/source the engine uses.
         # The target may be referenced by its alias (`MERGE INTO t a …`) or its table name; the

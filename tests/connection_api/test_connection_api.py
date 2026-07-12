@@ -371,6 +371,20 @@ class TestSqlDml:
             conn.sql("MERGE INTO src s USING (values (1,'x')) t(id, name) ON foo.id = bar.id "
                      "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
 
+    def test_sql_merge_bare_join_source_rejected(self, conn):
+        # a bare JOIN in USING carries its own ON, which the USING/ON splitter would grab as the merge
+        # condition — rejected with a message naming the real fix (wrap the join), not an alias complaint.
+        with pytest.raises(ValueError, match="bare JOIN.*subquery"):
+            conn.sql("MERGE INTO src t USING src d INNER JOIN src s2 ON d.id = s2.id "
+                     "ON t.id = d.id WHEN MATCHED THEN DELETE")
+
+    def test_sql_merge_join_source_wrapped_ok(self, conn):
+        # the same join wrapped as a subquery is a single source relation and works.
+        conn.sql("MERGE INTO src USING (select t.id, t.name from (values (1,'X')) t(id, name) "
+                 "join (values (1)) u(k) on t.id = u.k) AS s ON target.id = s.id "
+                 "WHEN MATCHED THEN UPDATE SET name = s.name")
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+
     def test_sql_merge_matched_delete(self, conn):
         # WHEN MATCHED THEN DELETE — matched rows removed (full delta-rs surface).
         conn.sql("MERGE INTO src USING (values (2,'x'),(3,'x')) t(id, name) ON target.id = source.id "
