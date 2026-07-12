@@ -158,7 +158,39 @@ def main():
     _require_java()
     datagen = _fetch_datagen(args.work)
     _run_digen(datagen, args.sf, args.out)
+    _summarize(args.out)
     print("  done.", flush=True)
+
+
+def _summarize(out: str):
+    """Print concrete proof of what was generated: every Batch*/  file with its
+    size and row count. Fails loudly if a batch produced nothing."""
+    total_bytes = 0
+    total_rows = 0
+    for batch in ("Batch1", "Batch2", "Batch3"):
+        bdir = os.path.join(out, batch)
+        if not os.path.isdir(bdir):
+            print(f"  [{batch}] MISSING", flush=True)
+            continue
+        files = sorted(os.listdir(bdir))
+        print(f"  [{batch}] {len(files)} files:", flush=True)
+        for f in files:
+            fp = os.path.join(bdir, f)
+            if not os.path.isfile(fp):
+                continue
+            size = os.path.getsize(fp)
+            total_bytes += size
+            # Row count for text sources (skip huge/binary — these are all text).
+            try:
+                with open(fp, "rb") as fh:
+                    rows = sum(1 for _ in fh)
+            except OSError:
+                rows = -1
+            total_rows += max(rows, 0)
+            print(f"       {f:<24} {size:>12,} bytes  {rows:>10,} rows", flush=True)
+    print(f"  TOTAL generated: {total_bytes:,} bytes, {total_rows:,} rows across batches", flush=True)
+    if total_rows == 0:
+        sys.exit("ERROR: generation produced no rows")
 
 
 if __name__ == "__main__":
