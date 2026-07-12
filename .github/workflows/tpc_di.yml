@@ -39,7 +39,10 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '11'
+          # DIGen.jar uses Eclipse's jar-in-jar loader (bundles commons-cli via the
+          # rsrc: classloader), which breaks on Java 9+ with NoClassDefFoundError.
+          # Java 8 is what the reference runs it on.
+          java-version: '8'
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
