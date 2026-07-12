@@ -59,7 +59,8 @@ def main():
         print(">> validate", flush=True)
         subprocess.run(
             [sys.executable, os.path.join(PROJ, "audit", "validate.py"),
-             "--warehouse", env["WAREHOUSE_PATH"], "--schema", env["DBT_SCHEMA"]],
+             "--warehouse", env["WAREHOUSE_PATH"], "--schema", env["DBT_SCHEMA"],
+             "--source-dir", staging],
             check=True, env=env,
         )
     else:

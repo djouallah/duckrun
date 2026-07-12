@@ -139,8 +139,8 @@ jobs:
       - name: dbt run (full TPC-DI load — reads + writes OneLake)
         run: dbt run --project-dir "$PROJ" --profiles-dir "$PROJ"
 
-      - name: Audit warehouse (OneLake Tables)
-        run: python $PROJ/audit/validate.py --warehouse "$WAREHOUSE_PATH" --schema "$DBT_SCHEMA"
+      - name: Audit warehouse (OneLake Tables) — source→target reconciliation + SCD2 integrity
+        run: python $PROJ/audit/validate.py --warehouse "$WAREHOUSE_PATH" --schema "$DBT_SCHEMA" --source-dir "$TPCDI_DIR"
 
       # --- Docs: the static dbt catalog reflects the LIVE OneLake Delta tables, so the published
       #     page carries real row-count / byte / last-modified stats per model (the "stats" page). ---

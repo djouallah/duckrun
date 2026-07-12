@@ -33,7 +33,7 @@ models/staging/     stg_customermgmt — CustomerMgmt.xml flattened via the `web
 models/incremental/ SCD2 DimCustomer/DimAccount/DimTrade, Prospect, and the four facts
 macros/tpcdi.sql    shared read_pipe / read_csvfile / read_fixed helpers + xml/sk/status macros
 scripts/            generate_data.py (drives PDGF), upload_to_onelake.py, run_benchmark.py (driver)
-audit/validate.py   coverage/liveness smoke audit of the built warehouse
+audit/validate.py   source→target reconciliation + SCD2 integrity audit of the built warehouse
 ```
 
 ## Running it
@@ -65,7 +65,7 @@ under `tests/integration_tests/tpc_di/**`:
    `Batch1/2/3` in `Files/tpcdi/sf<N>`.
 4. `dbt run` reads the seed **from OneLake Files** (globs work over `abfss://`) and writes the
    Delta dimension/fact tables to **`Tables/tpcdi`** — the runner never hosts the data.
-5. `validate.py` audits the OneLake warehouse via `duckrun.connect()`.
+5. `validate.py` audits the OneLake warehouse via `duckrun.connect()` — see below.
 
 The scale factor is `${{ inputs.scale_factor }}` (workflow_dispatch) → repo variable `TPCDI_SF`
 → `3`. Changing it uses a fresh `sf<N>` seed cache, so it regenerates once for that SF.
@@ -105,11 +105,32 @@ The scale factor is `${{ inputs.scale_factor }}` (workflow_dispatch) → repo va
   project's window-function SQL (effective/end dating driven by batch dates and CDC
   actions), not dbt snapshots — dbt's hash-based snapshot semantics don't match
   TPC-DI's dating rules.
+- **CDC is fully processed — the load is single-*pass*, not single-*batch*.** The
+  incremental models read `Batch[123]/…` (all three batches: Batch1 historical +
+  Batch2/3 CDC inserts/updates), apply the `cdc_flag`, and fold everything into the
+  final SCD2 dimensions and facts in one `dbt run`. What we *don't* do is run the three
+  batches as three separate, sequentially-audited executions — we compute the final
+  end-state directly. The finished warehouse is the same; only the between-batch
+  checkpoints are absent (see the audit note).
+- **Audit — real data validation, not a liveness gate.** `audit/validate.py` is a
+  DuckDB port of the reference project's single-batch `data_validation.sql`. For every
+  source→target transition it **re-derives the expected value from the raw source files**
+  and asserts the finished table matches (e.g. distinct customers in `CustomerMgmt(NEW)`
+  + Batch2/3 `Customer.txt` CDC inserts must equal `DimCustomer`; every `DailyMarket` row
+  must survive into `FactMarketHistory`), then checks the invariants a correct
+  dimensional load must hold: no NULL surrogate keys, SCD2 windows with no overlaps /
+  zero-length gaps / more than one open version, `IsCurrent` consistent with `EndDate`,
+  foreign-key SKs contained in a valid parent version, and legal enum/format domains
+  (Gender, ExchangeID, TaxID, tax-rate pairs, …). Because expected values are *derived*
+  from the same `sf<N>` seed the warehouse was built from, the audit is
+  **scale-factor-agnostic** — it self-calibrates; nothing is hard-coded per SF. It reads
+  both the Delta tables and the raw source files through one `duckrun.connect()`
+  (the OneLake storage secret covers `read_csv` over `Files/` too).
 
 ## Not yet covered (follow-ups)
 
-- **Per-batch incremental audit.** This port is single-pass (the dbx *dbt* project
-  is too). The 3-batch-with-audit-checkpoints variant is a larger, separate build.
-- **Full Appendix-A audit.** `audit/validate.py` is a coverage/liveness gate (every
-  required table present and non-empty). The spec's row-count and business-rule
-  reconciliation against DIGen's audit CSVs is not yet implemented.
+- **Per-batch Appendix-A audit + DImessages.** The spec's *automated audit* (Appendix A)
+  and the `DImessages` validation log are inherently per-batch (row counts / phase-complete
+  records after each of the 3 batches) and assume the 3-separate-runs execution model. Our
+  single-pass load has no between-batch checkpoints, so that audit is a separate, larger
+  build. The final-table validation above (Appendix-B style) does not need it.
