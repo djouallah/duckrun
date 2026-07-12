@@ -70,12 +70,18 @@ def _run_digen(datagen: str, sf: int, out: str):
     # drops into its interactive shell asking us to "load <Filename>".
     #
     # We drive that shell explicitly through the relay:
-    #   ""     -> ENTER, reveal the license terms
-    #   YES    -> accept the license
-    #   load … -> load the schema then the generation config (paths relative to
-    #             PDGF's cwd = pdgf/; the generation file's XInclude hrefs resolve
-    #             from there too)
-    #   start  -> begin generation; -closeWhenDone makes PDGF exit when finished
+    #   ""       -> ENTER, reveal the license terms
+    #   YES      -> accept the license
+    #   libjars  -> load plugins/tpc-di.jar. The schema references custom PDGF
+    #               generator classes (tpc.di.generators.*, tpc.di.output.*) that
+    #               live in that jar and are NOT on pdgf.jar's manifest Class-Path;
+    #               without this the schema parse fails with
+    #               "Class 'tpc.di.generators.HRJobIdGenerator' was not found" and
+    #               nothing loads. (The cmdline `-start`'s implicit schema load runs
+    #               before this and fails harmlessly — expected; we reload below.)
+    #   load …   -> load the schema then the generation config (paths relative to
+    #               PDGF's cwd = pdgf/)
+    #   start    -> begin generation; -closeWhenDone makes PDGF exit when finished
     #
     # Keep stdin OPEN afterwards: DIGen's relay loops on readLine(), and EOF (a
     # closed pipe) becomes an endless stream of "null" commands that trips PDGF's
@@ -84,6 +90,7 @@ def _run_digen(datagen: str, sf: int, out: str):
     p.stdin.write(
         "\n"
         "YES\n"
+        "libjars plugins/tpc-di.jar\n"
         "load config/tpc-di-schema.xml\n"
         "load config/tpc-di-generation.xml\n"
         "start\n"
