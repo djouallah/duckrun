@@ -30,9 +30,10 @@ class. Two headless quirks we handle:
     aborting generation mid-run. We send ENTER+YES (license) then leave stdin open so
     the thread blocks. `-sf` is the TPC-DI scale ×1000, the scaling DIGen applies.
 
-Produces <out>/Batch1, Batch2, Batch3. The CustomerMgmt.xml files are read
-directly by dbt via the `webbed` DuckDB extension (see models/staging), so there
-is no XML pre-stage here. Requires a JDK (`java` on PATH); does not install Java.
+Produces <out>/Batch1, Batch2, Batch3. Batch1/CustomerMgmt.xml is then split into
+CustomerMgmt_NNNN.xml chunks (see _split_customermgmt) because it scales with SF and
+webbed can't parse a multi-hundred-MB XML doc; dbt reads the chunks via the `webbed`
+extension (see models/staging). Requires a JDK (`java` on PATH); does not install Java.
 
 Usage:
     python generate_data.py --sf 3 --out ./staging
@@ -162,6 +163,41 @@ def _run_digen(datagen: str, sf: int, out: str):
         sys.exit(f"ERROR: no Batch1/ produced under {out}")
 
 
+def _split_customermgmt(batch1_dir: str, per_chunk: int = 20000):
+    """Split Batch1/CustomerMgmt.xml into <per_chunk>-Action chunk files.
+
+    webbed's read_xml cannot parse a document past a few hundred MB — it silently
+    returns zero rows (no error) — and CustomerMgmt.xml scales with SF (~9MB at sf3,
+    ~300MB at sf100). So we split the single doc into CustomerMgmt_NNNN.xml chunks —
+    each the <TPCDI:Actions> envelope wrapped around a slice of <TPCDI:Action>
+    elements — which stg_customermgmt reads via the CustomerMgmt_*.xml glob (per-file
+    parse, bounded memory). The monolith is removed so the glob never sees it. The
+    whole file is read into memory once (fine to ~sf300 on a 16GB runner).
+    """
+    src = os.path.join(batch1_dir, "CustomerMgmt.xml")
+    if not os.path.isfile(src):
+        print(f"  no CustomerMgmt.xml under {batch1_dir}; skip split", flush=True)
+        return
+    with open(src, encoding="utf-8") as fh:
+        s = fh.read()
+    # Anchor the body on the root element's own '>' so the '<TPCDI:Action' search can't
+    # collide with the '<TPCDI:Actions' root open tag (it's a prefix of it).
+    body_start = s.index(">", s.index("<TPCDI:Actions")) + 1
+    body_end = s.rindex("</TPCDI:Actions>")
+    prolog, footer, body = s[:body_start], s[body_end:], s[body_start:body_end]
+    end = "</TPCDI:Action>"
+    actions = [p + end for p in body.split(end) if p.strip()]
+    nchunks = (len(actions) + per_chunk - 1) // per_chunk
+    for i in range(0, len(actions), per_chunk):
+        chunk = prolog + "".join(actions[i:i + per_chunk]) + footer
+        with open(os.path.join(batch1_dir, f"CustomerMgmt_{i // per_chunk:04d}.xml"),
+                  "w", encoding="utf-8") as fh:
+            fh.write(chunk)
+    os.remove(src)
+    print(f"  split CustomerMgmt.xml -> {nchunks} chunk(s) of <= {per_chunk} actions "
+          f"({len(actions):,} actions total)", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sf", type=int, default=int(os.environ.get("TPCDI_SF", "3")),
@@ -180,6 +216,8 @@ def main():
     _require_java()
     datagen = _fetch_datagen(args.work)
     _run_digen(datagen, args.sf, args.out)
+    _split_customermgmt(os.path.join(args.out, "Batch1"),
+                        int(os.environ.get("TPCDI_CM_CHUNK", "20000")))
     _summarize(args.out)
     print("  done.", flush=True)
 

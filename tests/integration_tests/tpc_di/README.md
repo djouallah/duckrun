@@ -32,7 +32,8 @@ models/silver/      FINWIRE-derived SCD2 dims (DimCompany, DimSecurity) + Financ
 models/staging/     stg_customermgmt — CustomerMgmt.xml flattened via the `webbed` extension
 models/incremental/ SCD2 DimCustomer/DimAccount/DimTrade, Prospect, and the four facts
 macros/tpcdi.sql    shared read_pipe / read_csvfile / read_fixed helpers + xml/sk/status macros
-scripts/            generate_data.py (drives PDGF), upload_to_onelake.py, run_benchmark.py (driver)
+scripts/            generate_data.py (drives PDGF + splits CustomerMgmt.xml), summarize_seed.py
+                    (precomputes audit source aggregates), upload_to_onelake.py, run_benchmark.py (driver)
 audit/validate.py   source→target reconciliation + SCD2 integrity audit of the built warehouse
 ```
 
@@ -61,17 +62,24 @@ under `tests/integration_tests/tpc_di/**`:
 2. **Check** whether the seed for this scale factor is already in `Files/tpcdi/sf<N>`
    (`check_seed.py` — a listing, no download). If present, **skip generation** — the Java
    generator only runs on a cache miss.
-3. On a miss: `generate_data.py` (PDGF, on the runner) → `upload_to_onelake.py` lands
-   `Batch1/2/3` in `Files/tpcdi/sf<N>`.
-4. `dbt run` reads the seed **from OneLake Files** (globs work over `abfss://`) and writes the
-   Delta dimension/fact tables to **`Tables/tpcdi`** — the runner never hosts the data.
-5. `validate.py` audits the OneLake warehouse via `duckrun.connect()` — see below.
+3. On a miss: `generate_data.py` writes `Batch1/2/3` to local `/mnt` (and splits
+   `CustomerMgmt.xml` into chunks); `summarize_seed.py` precomputes the audit's source
+   aggregates into `_seed_summary.json` while the files are on local disk (cheap). Then a
+   fresh token is minted and `upload_to_onelake.py` copies the whole seed (chunks + summary)
+   to `Files/tpcdi/sf<N>` — a **separate step** from generation.
+4. A fresh OneLake token is minted again, then `dbt run` reads the seed **from OneLake Files**
+   (globs work over `abfss://`) and writes the Delta dimension/fact tables to **`Tables/tpcdi`**
+   — the runner never hosts the data. (Token sequence: mint → copy → mint → dbt, since a large
+   seed's generation/upload can approach the storage token's ~1h lifetime.)
+5. `validate.py` audits the OneLake warehouse via `duckrun.connect()`, reading source-side
+   values from `_seed_summary.json` instead of re-scanning the raw files over abfss — see below.
 
 The scale factor is `${{ inputs.scale_factor }}` (workflow_dispatch) → repo variable `TPCDI_SF`
-→ `100` (~10GB seed / ~163M source rows / ~108M warehouse rows). Changing it uses a fresh
-`sf<N>` seed cache, so it regenerates once for that SF. Large factors need headroom, so the
-seed is staged on `/mnt` (the runner's ~65GB disk), the generation watchdog is 3h
-(`TPCDI_GEN_TIMEOUT`), and the PDGF heap is `TPCDI_JVM_XMX` (4g in CI).
+→ `3` (the TPC-DI spec minimum; a fast smoke test). It scales to `100` (~10GB seed / ~163M
+source rows / ~108M warehouse rows) and beyond. Changing it uses a fresh `sf<N>` seed cache, so
+it regenerates once for that SF. Large factors need headroom, so the seed is staged on `/mnt`
+(the runner's ~65GB disk), the generation watchdog is 3h (`TPCDI_GEN_TIMEOUT`), and the PDGF
+heap is `TPCDI_JVM_XMX` (4g in CI).
 
 ## Notes & design choices
 
@@ -97,10 +105,24 @@ seed is staged on `/mnt` (the runner's ~65GB disk), the generation watchdog is 3
   local scratch dir and `upload_to_onelake.py` (`conn.copy()`) lands them in
   `Files/tpcdi/sf<N>`. dbt then reads that seed straight from OneLake — the runner only
   hosts the bytes transiently, during the one-time generation.
-- **XML.** DuckDB has no first-party XML reader, so `stg_customermgmt` uses the
-  [`webbed`](https://github.com/teaguesterling/duckdb_webbed) community extension
-  (`INSTALL webbed FROM community; LOAD webbed`, via the model's `pre_hook`). It is
-  materialized as a table, so only that one model needs the extension.
+- **XML — and why we chunk it.** DuckDB has no first-party XML reader, so
+  `stg_customermgmt` uses the [`webbed`](https://github.com/teaguesterling/duckdb_webbed)
+  community extension (`INSTALL webbed FROM community; LOAD webbed`, via the model's
+  `pre_hook`), materialized as a table so only that one model needs the extension.
+  `CustomerMgmt.xml` scales with SF (~9MB at sf3, ~300MB at sf100) and webbed **silently
+  returns zero rows** on a multi-hundred-MB document (no error — it just parses nothing,
+  which is how an sf100 run first looked "green" while the customer/account/trade/fact
+  tables came out near-empty). So `generate_data.py` splits it into `CustomerMgmt_NNNN.xml`
+  chunks (~20k `<Action>` elements each), which the model reads with the
+  `CustomerMgmt_*.xml` glob (per-file parse, bounded memory). The audit is what caught the
+  silent truncation — see below.
+- **Precomputed audit summary.** The audit reconciles each table against a value derived
+  from the raw source files; over abfss those scans (tens of millions of rows) dominate.
+  So right after generation — while the seed is on local disk — `summarize_seed.py` computes
+  the raw-file-derived source values and writes `_seed_summary.json` next to the seed (running
+  the *same* SQL the audit would, imported from `validate.build_checks`, so they can't
+  diverge). It's uploaded with the seed; the audit reads it (`* ` in the report) instead of
+  re-scanning, and falls back to a live scan if it's absent.
 - **Headerless typed files.** duckrun keeps source scans to auto-detect, so the
   models read the raw files directly with an explicit `read_csv(columns=…)`
   (`macros/tpcdi.sql`) rather than declaring dbt sources.

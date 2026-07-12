@@ -21,7 +21,7 @@ on:
       scale_factor:
         description: "TPC-DI scale factor (min 3)"
         type: string
-        default: "100"
+        default: "3"
 
 # OIDC (id-token) for the Azure login that creates the lakehouse + mints the storage token.
 permissions:
@@ -39,7 +39,7 @@ jobs:
     env:
       # scale_factor input wins, else the repo variable TPCDI_SF, else 3. It keys the seed cache
       # (Files/tpcdi/sf<N>), so changing it regenerates for that SF only.
-      TPCDI_SF: ${{ inputs.scale_factor || vars.TPCDI_SF || '100' }}
+      TPCDI_SF: ${{ inputs.scale_factor || vars.TPCDI_SF || '3' }}
       # PDGF at SF100 (~10GB / ~163M source rows) runs well past the old 15-min watchdog.
       TPCDI_GEN_TIMEOUT: '10800'
       TPCDI_JVM_XMX: '4g'
@@ -128,21 +128,44 @@ jobs:
         id: seed
         run: python $PROJ/scripts/check_seed.py --prefix "tpcdi/sf${TPCDI_SF}"
 
-      - name: Generate TPC-DI data (PDGF) + upload the seed — only on a cache miss
+      - name: Generate TPC-DI data (PDGF) on local disk + precompute the seed summary — only on a cache miss
         if: steps.seed.outputs.exists != 'true'
         run: |
           # /mnt is root-owned on the runner; hand the scratch root to the runner user once.
           sudo mkdir -p /mnt/tpcdi && sudo chown "$USER:$USER" /mnt/tpcdi
           python $PROJ/scripts/generate_data.py --sf "${TPCDI_SF}" --out "$TPCDI_STAGING"
+          # Precompute the audit's source-side aggregates while the seed is on local disk
+          # (cheap) so the final audit never has to re-scan the raw files over abfss.
+          python $PROJ/scripts/summarize_seed.py --staging "$TPCDI_STAGING" --sf "${TPCDI_SF}"
           echo "== staging tree =="; find "$TPCDI_STAGING" -maxdepth 2 -type f | sort | head -60
-          python $PROJ/scripts/upload_to_onelake.py --staging "$TPCDI_STAGING" --prefix "tpcdi/sf${TPCDI_SF}"
+
+      # Fresh token right before the copy: generation of a large seed can eat into the storage
+      # token's lifetime, and upload_to_onelake.py uses this static token for the whole upload.
+      - name: Re-acquire a fresh OneLake bearer token before the copy — only on a cache miss
+        if: steps.seed.outputs.exists != 'true'
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+      - name: Copy the seed from local disk to OneLake Files — only on a cache miss
+        if: steps.seed.outputs.exists != 'true'
+        run: python $PROJ/scripts/upload_to_onelake.py --staging "$TPCDI_STAGING" --prefix "tpcdi/sf${TPCDI_SF}"
+
+      # And a fresh token again before the long dbt+audit phase (the copy of a large seed can
+      # itself approach the token lifetime); validate.py also uses this static token directly.
+      - name: Re-acquire a fresh OneLake bearer token before dbt
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       # --- dbt reads the seed from OneLake Files and writes the Delta tables to OneLake Tables. ---
       - name: dbt run (full TPC-DI load — reads + writes OneLake)
         run: dbt run --project-dir "$PROJ" --profiles-dir "$PROJ"
 
       - name: Audit warehouse (OneLake Tables) — source→target reconciliation + SCD2 integrity
-        run: python $PROJ/audit/validate.py --warehouse "$WAREHOUSE_PATH" --schema "$DBT_SCHEMA" --source-dir "$TPCDI_DIR"
+        run: python $PROJ/audit/validate.py --warehouse "$WAREHOUSE_PATH" --schema "$DBT_SCHEMA" --source-dir "$TPCDI_DIR" --summary "$TPCDI_DIR/_seed_summary.json"
 
       # --- Docs: the static dbt catalog reflects the LIVE OneLake Delta tables, so the published
       #     page carries real row-count / byte / last-modified stats per model (the "stats" page). ---

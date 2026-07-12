@@ -48,6 +48,12 @@ def main():
             gen.append("--force")
         print(">> generating data", flush=True)
         subprocess.run(gen, check=True, env=env)
+        print(">> summarizing seed (precompute audit source aggregates)", flush=True)
+        subprocess.run(
+            [sys.executable, os.path.join(HERE, "summarize_seed.py"),
+             "--staging", staging, "--sf", str(args.sf)],
+            check=True, env=env,
+        )
 
     print(">> dbt run", flush=True)
     subprocess.run(
@@ -60,7 +66,7 @@ def main():
         subprocess.run(
             [sys.executable, os.path.join(PROJ, "audit", "validate.py"),
              "--warehouse", env["WAREHOUSE_PATH"], "--schema", env["DBT_SCHEMA"],
-             "--source-dir", staging],
+             "--source-dir", staging, "--summary", os.path.join(staging, "_seed_summary.json")],
             check=True, env=env,
         )
     else:

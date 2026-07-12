@@ -41,6 +41,17 @@ REQUIRED = [
     "FactCashBalances", "FactHoldings", "FactWatches", "FactMarketHistory",
 ]
 
+# Reconciliation checks whose SOURCE value is derived purely from the raw source files
+# (no dependency on a dbt-built staging table). These are the expensive ones over abfss —
+# scanning tens of millions of raw rows — so scripts/summarize_seed.py precomputes them on
+# local disk at generation time and the audit reads them from _seed_summary.json instead.
+# The other five (DimCustomer/DimAccount via stg_customermgmt, DimCompany/DimSecurity/
+# Financial via FinWire) read small/moderate Delta tables, so the audit computes them live.
+RAW_SOURCE_CHECKS = {
+    "DimBroker", "DimTrade", "FactCashBalances", "FactHoldings",
+    "FactWatches", "FactMarketHistory", "Prospect",
+}
+
 # Column layouts of the raw source files (positional, headerless), matching macros/tpcdi.sql.
 # Batch1 (historical) files have no CDC prefix; Batch2/3 (incremental) prepend cdc_flag, cdc_dsn.
 _CUST_INC = ("cdc_flag VARCHAR, cdc_dsn BIGINT, c_id BIGINT, c_tax_id VARCHAR, c_st_id VARCHAR, "
@@ -272,6 +283,9 @@ def main():
     ap.add_argument("--schema", default="tpcdi")
     ap.add_argument("--source-dir", required=True,
                     help="the sf<N> source dir the warehouse was loaded from (local or abfss://Files/...)")
+    ap.add_argument("--summary", default=None,
+                    help="_seed_summary.json (local or abfss://) with precomputed source aggregates; "
+                         "falls back to scanning the raw source files if absent/unreadable")
     args = ap.parse_args()
 
     storage_options = None
@@ -284,6 +298,20 @@ def main():
     conn = duckrun.connect(
         args.warehouse, storage_options=storage_options, schema=args.schema, read_only=True)
     src = args.source_dir.rstrip("/")
+
+    # Precomputed source aggregates (from generation, on local disk) spare us the expensive
+    # raw-file scans over abfss. Read the tiny JSON through the same connection (read_text
+    # works local + abfss); any failure just falls back to live scans.
+    precomputed = {}
+    if args.summary:
+        try:
+            import json
+            txt = conn.sql(f"select content from read_text('{args.summary}')").fetchone()[0]
+            precomputed = json.loads(txt).get("source", {})
+            print(f"  using precomputed source aggregates from {args.summary} "
+                  f"({len(precomputed)} value(s))")
+        except Exception as e:  # noqa: BLE001
+            print(f"  no usable summary at {args.summary} ({str(e).splitlines()[0]}); scanning source files")
 
     # Liveness summary (context; a missing table also surfaces as a failed check below).
     print(f"\n  TPC-DI warehouse: {args.warehouse} (schema {args.schema})")
@@ -302,14 +330,17 @@ def main():
     def _scalar(sql):
         return conn.sql(sql).fetchone()[0]
 
-    print(f"\n  Reconciliation (source files -> warehouse)\n  {'check':<28}{'source':>14}{'target':>14}  status")
+    print(f"\n  Reconciliation (source files -> warehouse)   (* = source from precomputed summary)"
+          f"\n  {'check':<28}{'source':>14}{'target':>14}  status")
     print("  " + "-" * 72)
     for name, ssql, tsql, op, desc in recon:
         try:
-            s, t = _scalar(ssql), _scalar(tsql)
+            s = precomputed[name] if name in precomputed else _scalar(ssql)
+            t = _scalar(tsql)
             ok = (s == t) if op == "==" else (t >= s)
+            mark = "*" if name in precomputed else " "
             status = "PASS" if ok else f"FAIL ({op}) delta={t - s:+,}"
-            print(f"  {name:<28}{s:>14,}{t:>14,}  {status}")
+            print(f"  {name:<27}{mark}{s:>14,}{t:>14,}  {status}")
             if not ok:
                 failures.append(f"{name}: source={s:,} target={t:,} ({desc})")
         except Exception as e:  # noqa: BLE001
