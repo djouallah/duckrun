@@ -61,15 +61,21 @@ def _run_digen(datagen: str, sf: int, out: str):
     print(f"  running: {' '.join(cmd)}  (cwd={datagen})", flush=True)
     p = subprocess.Popen(
         cmd, cwd=datagen, text=True,
-        stdin=subprocess.PIPE, stdout=sys.stdout, stderr=sys.stderr,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     # DIGen prompts for license acceptance: a blank line reveals the terms, then
-    # YES agrees. Keep stdin OPEN afterwards — DIGen relays its stdin to the PDGF
-    # child, so closing it makes PDGF read EOF as an endless stream of null
-    # commands ("flooding prevention ... terminating"). The reference runner
-    # leaves the pipe open and lets DIGen exit on its own.
+    # YES agrees. Two things matter, both from the reference runner:
+    #  1. Keep stdin OPEN afterwards — DIGen relays its stdin to the PDGF child, so
+    #     closing it makes PDGF read EOF as endless null commands ("flooding
+    #     prevention ... terminating").
+    #  2. Actively DRAIN stdout — DIGen drives PDGF's interactive shell (load then
+    #     start) and only advances as its own output is consumed; if the parent
+    #     doesn't read stdout, the load/start sequence stalls ("Xml file was not
+    #     loaded") and it hangs.
     p.stdin.write("\nYES\n")
     p.stdin.flush()
+    for line in p.stdout:
+        print(line.rstrip("\n"), flush=True)
     rc = p.wait()
     try:
         p.stdin.close()
