@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.17]
+
+`conn.sql()` statement routing: multi-statement batches and interior comments are handled
+consistently for every verb, not just DML.
+
+### Changed
+- **`;`-batches are rejected for every verb, not just DML.** Routing keyed off the leading verb, so a
+  read-led batch (`select 1; create table foo as select 2`) slipped past the DML router into raw
+  DuckDB and silently made an ephemeral native table. The one-statement-in / one-relation-out guard
+  now runs at the top of `sql()`, so it holds for reads too. A `SET`/`PRAGMA; SELECT` one-liner must
+  now be two calls on the same connection (session state persists between them).
+
+### Fixed
+- **Interior comments no longer skew the DML pre-checks.** The unsupported-DML detection only stripped
+  *leading* comments, so a `--` / `/* */` comment could inject a false `;` separator or a false
+  `FROM` / `USING` / `RETURNING` boundary and wrongly reject a valid single statement. It now scans
+  the fully comment-stripped SQL (quote / dollar-quote aware).
+
 ## [0.4.16]
 
 `conn.sql()` DML: several `MERGE` / `UPDATE` / `DELETE` forms that used to fail — or crash — now work.
