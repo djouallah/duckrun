@@ -404,9 +404,12 @@ jobs:
     # (optimize.compact, dataChange=false) alongside them. It checks the same 9 invariants as the local
     # breaker (cores.yml) AND publishes a throughput (QPS) + compaction-concurrency report to the step
     # summary — proving a concurrent compaction never loses a writer's commit (a lost race is caught,
-    # not fatal). Small worker/op counts: the OneLake round-trip dominates, so keep it cheap. Isolated
-    # schema (duckrun_breaker_it) + concurrency lock so it doesn't collide with the other projects in
-    # the shared lakehouse.
+    # not fatal). Small worker/op counts: the OneLake round-trip dominates, so keep it cheap.
+    #
+    # It writes to its OWN dedicated lakehouse ('duckrun_breaker'), created idempotently below (same
+    # pattern as the Contoso benchmark's 'sqlbi' lakehouse) — NOT the shared lakehouse the other jobs
+    # use — so the chaos writes + concurrent compaction never touch anything else. Isolated schema
+    # (duckrun_breaker_it) + concurrency lock on top of that.
     needs: changes
     if: ${{ needs.changes.outputs.breaker == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'breaker' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
@@ -428,16 +431,52 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
+      - name: Create the dedicated 'duckrun_breaker' lakehouse (idempotent) + mint OneLake token
+        # Fabric REST create-if-absent, then resolve its GUID and build WAREHOUSE_PATH from it. The
+        # OIDC service principal already creates lakehouses in this workspace (the Contoso 'sqlbi'
+        # lakehouse), so it has the rights. Schema-enabled so duckrun's Tables/<schema>/<table> layout
+        # resolves, matching the other OneLake jobs. Reused across runs (never deleted) — the harness
+        # drops+recreates its own tables each run.
+        env:
+          WS_ID: 1c52481c-0523-4a5a-bbde-fdc932bd77c2
+          LH_NAME: duckrun_breaker
         run: |
+          set -euo pipefail
+          BASE="https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/lakehouses"
+          find_lh() {
+            az rest --method get --resource https://api.fabric.microsoft.com --url "$BASE" \
+              --query "value[?displayName=='$LH_NAME'].id | [0]" -o tsv 2>/dev/null
+          }
+          LH_ID="$(find_lh || true)"
+          if [ -z "${LH_ID:-}" ] || [ "$LH_ID" = "None" ]; then
+            echo "creating schema-enabled lakehouse '$LH_NAME' in workspace $WS_ID ..."
+            az rest --method post --resource https://api.fabric.microsoft.com --url "$BASE" \
+              --headers "Content-Type=application/json" \
+              --body '{"displayName":"'"$LH_NAME"'","creationPayload":{"enableSchemas":true}}' >/dev/null || true
+            for i in $(seq 1 12); do
+              sleep 5
+              LH_ID="$(find_lh || true)"
+              if [ -n "${LH_ID:-}" ] && [ "$LH_ID" != "None" ]; then break; fi
+              echo "  waiting for '$LH_NAME' to appear ($i/12)..."
+            done
+          else
+            echo "lakehouse '$LH_NAME' already exists ($LH_ID) — reusing."
+          fi
+          if [ -z "${LH_ID:-}" ] || [ "$LH_ID" = "None" ]; then
+            echo "lakehouse '$LH_NAME' was not visible after creation"; exit 1
+          fi
           TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Chaos + compaction concurrency + QPS against OneLake
+          {
+            echo "ONELAKE_TOKEN=$TOKEN"
+            echo "WAREHOUSE_PATH=abfss://$WS_ID@onelake.dfs.fabric.microsoft.com/$LH_ID/Tables"
+          } >> "$GITHUB_ENV"
+          echo "lakehouse '$LH_NAME' = $LH_ID"
+      - name: Chaos + compaction concurrency + QPS against the dedicated lakehouse
         # Contention only (no SIGKILL): writers hammer one Delta table while the compactor races them,
         # then the 9 invariants are checked and the QPS + compaction tables go to the step summary.
+        # WAREHOUSE_PATH comes from the create step above (the fresh lakehouse's GUID).
         env:
-          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           DBT_SCHEMA: duckrun_breaker_it
         run: >-
           python tests/correctness/duckrun_onelake_breaker.py
