@@ -32,14 +32,17 @@
   )
 {%- endmacro %}
 
-{# Comma-delimited files (Prospect.csv, HR.csv). Quoted, backslash escape. #}
+{# Comma-delimited files (Prospect.csv, HR.csv). DIGen emits these UNQUOTED — fields
+   never embed a comma (column counts are fixed) and stray '"' / '\' occur as literal
+   data, so we disable quoting/escaping. Treating '"' as a quote char makes DuckDB's
+   dialect sniffer choke on those stray quotes ("Error when sniffing"). #}
 {% macro read_csvfile(path, columns, with_filename=false) -%}
   read_csv(
     '{{ _abspath(path) }}',
     delim = ',',
     header = false,
-    quote = '"',
-    escape = '\',
+    quote = '',
+    escape = '',
     nullstr = '',
     all_varchar = false,
     null_padding = true,
