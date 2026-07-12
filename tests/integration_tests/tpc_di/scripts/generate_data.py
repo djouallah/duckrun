@@ -54,28 +54,60 @@ def _fetch_datagen(work: str) -> str:
     return datagen
 
 
+def _stage_plugin_classes(datagen: str):
+    """Make PDGF's TPC-DI plugin classes resolvable from JVM startup.
+
+    DIGen launches PDGF as `java -jar pdgf.jar -closeWhenDone -start ...` (cwd =
+    pdgf/) and passes NO -libjars. PDGF only scans plugins/*.jar when it enters its
+    interactive shell, but `-start` on the command line makes it parse the schema
+    during cmdline processing — *before* that scan — so the custom generator
+    classes (tpc.di.generators.*) aren't registered yet and the parse dies with
+    "Class 'tpc.di.generators.HRJobIdGenerator' was not found". (Interactive use
+    works because the shell scan runs first; that's why this only bites headless.)
+
+    Fix without fighting the load order: pdgf.jar's manifest Class-Path begins with
+    "." (its working dir, pdgf/), so we extract plugins/*.jar into pdgf/ itself.
+    The classes then live at pdgf/tpc/di/... and resolve on the classpath from the
+    very first schema parse — no shell, no libjars, no ordering dependency.
+    """
+    pdgf_dir = os.path.join(datagen, "pdgf")
+    plugins = os.path.join(pdgf_dir, "plugins")
+    marker = os.path.join(pdgf_dir, "tpc", "di")
+    if os.path.isdir(marker):
+        print("  plugin classes already staged into pdgf/", flush=True)
+        return
+    if not os.path.isdir(plugins):
+        sys.exit(f"ERROR: {plugins} not found — cannot stage TPC-DI plugin classes")
+    import zipfile
+    for jar in sorted(os.listdir(plugins)):
+        if not jar.endswith(".jar") or jar.endswith("_src.jar"):
+            continue  # skip the source jar; we only need compiled classes
+        jar_path = os.path.join(plugins, jar)
+        with zipfile.ZipFile(jar_path) as z:
+            members = [m for m in z.namelist() if not m.startswith("META-INF/")]
+            z.extractall(pdgf_dir, members)
+        print(f"  staged {len(members)} entries from plugins/{jar} into pdgf/", flush=True)
+    if not os.path.isdir(marker):
+        sys.exit(f"ERROR: staged plugins but {marker} still missing")
+
+
 def _run_digen(datagen: str, sf: int, out: str):
-    """Generate the data with DIGen.jar exactly the way the reference does.
+    """Generate the data by running DIGen.jar directly.
 
-    DIGen.jar is a thin Java launcher that starts the bundled PDGF engine with the
-    right classpath/libjars so its TPC-DI plugin classes (tpc.di.generators.*)
-    resolve, then loads config/ and generates. The one requirement is that it runs
-    with its **working directory set to the datagen dir** (where DIGen.jar sits,
-    one level above pdgf/), so PDGF finds pdgf/config and pdgf/plugins. It only
-    needs two lines on stdin: ENTER then YES to accept the BANKMARK license.
-
-    This mirrors src/tools/digen_runner.py in the upstream repo — an earlier
-    attempt to drive pdgf.jar directly failed because PDGF parses its schema at
-    startup, before any `libjars` shell command can put the plugin jar on the
-    classpath ("Class 'tpc.di.generators.HRJobIdGenerator' was not found").
+    DIGen.jar launches the bundled PDGF engine (`java -jar pdgf.jar -closeWhenDone
+    -start -sf N*1000 -o OUT`, cwd = pdgf/) and only needs two stdin lines — ENTER
+    then YES — to accept the BANKMARK license. We first stage the TPC-DI plugin
+    classes into pdgf/ (see _stage_plugin_classes) so PDGF's headless `-start`
+    schema parse can resolve tpc.di.generators.* on the classpath.
     """
     out = os.path.abspath(out)
     os.makedirs(out, exist_ok=True)
     if not os.path.isfile(os.path.join(datagen, "DIGen.jar")):
         sys.exit(f"ERROR: DIGen.jar not found under {datagen}")
+    _stage_plugin_classes(datagen)
 
     # DIGen's -sf is the TPC-DI scale factor (floored at 3); DIGen scales PDGF
-    # internally. -o is the output dir; DIGen writes Batch1/2/3 beneath it.
+    # internally (x1000). -o is the output dir; DIGen writes Batch1/2/3 beneath it.
     scale = max(sf, 3)
     cmd = ["java", "-Xmx2g", "-jar", "DIGen.jar", "-sf", str(scale), "-o", out]
     print(f"  running DIGen: {' '.join(cmd)}  (cwd={datagen}, sf={scale})", flush=True)
