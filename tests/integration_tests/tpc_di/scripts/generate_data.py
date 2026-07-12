@@ -63,22 +63,34 @@ def _run_digen(datagen: str, sf: int, out: str):
         cmd, cwd=datagen, text=True,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
-    # DIGen prompts for license acceptance: a blank line reveals the terms, then
-    # YES agrees. Two things matter, both from the reference runner:
-    #  1. Keep stdin OPEN afterwards — DIGen relays its stdin to the PDGF child, so
-    #     closing it makes PDGF read EOF as endless null commands ("flooding
-    #     prevention ... terminating").
-    #  2. Actively DRAIN stdout — DIGen drives PDGF's interactive shell (load then
-    #     start) and only advances as its own output is consumed; if the parent
-    #     doesn't read stdout, the load/start sequence stalls ("Xml file was not
-    #     loaded") and it hangs.
-    p.stdin.write("\nYES\n")
+    # DIGen has no prompt of its own — it spawns PDGF (cwd=pdgf/), passes
+    # `-closeWhenDone -start` but deliberately NOT `-load` ("-load not recognized
+    # by PDGF"), and relays its stdin straight to PDGF. So PDGF shows the BANKMARK
+    # license, then — because nothing was loaded — its cmdline `-start` fails and it
+    # drops into its interactive shell asking us to "load <Filename>".
+    #
+    # We drive that shell explicitly through the relay:
+    #   ""     -> ENTER, reveal the license terms
+    #   YES    -> accept the license
+    #   load … -> load the schema then the generation config (paths relative to
+    #             PDGF's cwd = pdgf/; the generation file's XInclude hrefs resolve
+    #             from there too)
+    #   start  -> begin generation; -closeWhenDone makes PDGF exit when finished
+    #
+    # Keep stdin OPEN afterwards: DIGen's relay loops on readLine(), and EOF (a
+    # closed pipe) becomes an endless stream of "null" commands that trips PDGF's
+    # flooding prevention. Leaving it open just parks the relay harmlessly until
+    # PDGF exits and DIGen calls System.exit.
+    p.stdin.write(
+        "\n"
+        "YES\n"
+        "load config/tpc-di-schema.xml\n"
+        "load config/tpc-di-generation.xml\n"
+        "start\n"
+    )
     p.stdin.flush()
-    # Drain with readline(), NOT `for line in p.stdout` — the file iterator does
-    # read-ahead buffering and won't yield lines promptly, so DIGen's output pipe
-    # fills, its main thread blocks, and `start` races ahead of `load` ("Xml file
-    # was not loaded"). readline() drains each line as it appears, matching the
-    # reference runner.
+    # Drain with readline() (not `for line in p.stdout`, whose read-ahead buffering
+    # delays lines) so DIGen/PDGF never block on a full stdout pipe.
     while True:
         line = p.stdout.readline()
         if not line and p.poll() is not None:
