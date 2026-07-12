@@ -42,7 +42,12 @@ jobs:
       TPCDI_SF: ${{ inputs.scale_factor || vars.TPCDI_SF || '3' }}
       TPCDI_GEN_TIMEOUT: '900'
       # Local scratch the Java generator writes to before upload (only used on a cache miss).
-      TPCDI_STAGING: ${{ github.workspace }}/tests/integration_tests/tpc_di/staging
+      # On /mnt — the runner's big ephemeral disk (~65GB) — not github.workspace (~21GB on /), so a
+      # large SF (the seed scales ~linearly: sf3 ~280MB → sf100 ~9GB) can't fill the root fs. Both
+      # the datagen clone / PDGF output/ (TPCDI_WORK) and the moved seed (TPCDI_STAGING) live here so
+      # the move is a same-disk rename, not a cross-device copy.
+      TPCDI_STAGING: /mnt/tpcdi/staging
+      TPCDI_WORK: /mnt/tpcdi/work
       WS_ID: 1c52481c-0523-4a5a-bbde-fdc932bd77c2
       LH_NAME: tpcdi
       DBT_SCHEMA: tpcdi
@@ -124,6 +129,8 @@ jobs:
       - name: Generate TPC-DI data (PDGF) + upload the seed — only on a cache miss
         if: steps.seed.outputs.exists != 'true'
         run: |
+          # /mnt is root-owned on the runner; hand the scratch root to the runner user once.
+          sudo mkdir -p /mnt/tpcdi && sudo chown "$USER:$USER" /mnt/tpcdi
           python $PROJ/scripts/generate_data.py --sf "${TPCDI_SF}" --out "$TPCDI_STAGING"
           echo "== staging tree =="; find "$TPCDI_STAGING" -maxdepth 2 -type f | sort | head -60
           python $PROJ/scripts/upload_to_onelake.py --staging "$TPCDI_STAGING" --prefix "tpcdi/sf${TPCDI_SF}"
