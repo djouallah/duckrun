@@ -27,7 +27,7 @@ on:
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/taxi/**'
       - 'tests/integration_tests/multicatalog/**'
-      - 'tests/correctness/duckrun_onelake_breaker.py'
+      - 'tests/integration_tests/onelake_breaker/**'
       - 'tests/connection_api/**'
       - '.github/workflows/integration_tests_onelake.yml'
   pull_request:
@@ -36,7 +36,7 @@ on:
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/taxi/**'
       - 'tests/integration_tests/multicatalog/**'
-      - 'tests/correctness/duckrun_onelake_breaker.py'
+      - 'tests/integration_tests/onelake_breaker/**'
       - 'tests/connection_api/**'
       - '.github/workflows/integration_tests_onelake.yml'
   workflow_dispatch:
@@ -93,7 +93,7 @@ jobs:
               - 'tests/connection_api/**'
               - '.github/workflows/integration_tests_onelake.yml'
             breaker:
-              - 'tests/correctness/duckrun_onelake_breaker.py'
+              - 'tests/integration_tests/onelake_breaker/**'
               - 'tests/connection_api/**'
               - '.github/workflows/integration_tests_onelake.yml'
 
@@ -399,7 +399,7 @@ jobs:
           if-no-files-found: warn
 
   breaker:
-    # The chaos harness (tests/correctness/duckrun_onelake_breaker.py) pointed at LIVE OneLake: N worker
+    # The chaos harness (tests/integration_tests/onelake_breaker/onelake_breaker.py) pointed at LIVE OneLake: N worker
     # processes hammer one Delta table through conn.sql() while a dedicated compactor loops VACUUM
     # (optimize.compact, dataChange=false) alongside them. It checks the same 9 invariants as the local
     # breaker (cores.yml) AND publishes a throughput (QPS) + compaction-concurrency report to the step
@@ -479,5 +479,5 @@ jobs:
         env:
           DBT_SCHEMA: duckrun_breaker_it
         run: >-
-          python tests/correctness/duckrun_onelake_breaker.py
+          python tests/integration_tests/onelake_breaker/onelake_breaker.py
           --workers 4 --ops 20 --compact-interval 2 --seed 1

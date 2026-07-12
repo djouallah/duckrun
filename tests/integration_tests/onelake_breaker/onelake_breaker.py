@@ -1,6 +1,6 @@
 """
-duckrun_onelake_breaker: the duckrun_breaker chaos harness, pointed at a LIVE OneLake lakehouse, with
-a throughput (QPS) report and a compaction-concurrency demonstration bolted on.
+onelake_breaker: the duckrun_breaker chaos harness, pointed at a LIVE OneLake lakehouse, turned into a
+benchmark — a throughput (QPS) report and a compaction-concurrency demonstration bolted on.
 
 It is a copy of tests/correctness/duckrun_breaker.py (same 9 invariants — see that file's header for
 V1..V9), with three differences:
@@ -28,13 +28,13 @@ V1..V9), with three differences:
      the concurrent compaction never changed a single row.
 
 Usage (OneLake — needs WAREHOUSE_PATH + ONELAKE_TOKEN in the env):
-  python duckrun_onelake_breaker.py --workers 4 --ops 20                   # contention + compaction + QPS
-  python duckrun_onelake_breaker.py --workers 4 --ops 60 --kill            # + SIGKILL crash chaos
-  python duckrun_onelake_breaker.py --fence                                # read-target fence (V9)
-  python duckrun_onelake_breaker.py --attest-declare --scratch DIR ...     # seal expected (commit)
-  python duckrun_onelake_breaker.py --attest-reveal  --scratch DIR         # reveal actual  (diff)
+  python onelake_breaker.py --workers 4 --ops 20                   # contention + compaction + QPS
+  python onelake_breaker.py --workers 4 --ops 60 --kill            # + SIGKILL crash chaos
+  python onelake_breaker.py --fence                                # read-target fence (V9)
+  python onelake_breaker.py --attest-declare --scratch DIR ...     # seal expected (commit)
+  python onelake_breaker.py --attest-reveal  --scratch DIR         # reveal actual  (diff)
 Usage (local smoke — no creds):
-  python duckrun_onelake_breaker.py --root /tmp/wh --workers 4 --ops 20
+  python onelake_breaker.py --root /tmp/wh --workers 4 --ops 20
 """
 import argparse
 import json
