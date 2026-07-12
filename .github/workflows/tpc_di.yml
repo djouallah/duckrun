@@ -1,0 +1,58 @@
+name: tpc-di
+
+# TPC-DI (the TPC data-integration / ETL benchmark) ported to duckrun. Generates
+# source data with DIGen (Java), runs the full single-pass dbt load (Batch1
+# historical + Batch2/3 incremental) writing Delta tables locally, then smoke-
+# audits the warehouse. This is the verification harness for the port — there is
+# no local Java on the author's machine, so CI is where it runs.
+on:
+  push:
+    branches: ["**"]
+    paths:
+      - 'tests/tpc_di/**'
+      - '.github/workflows/tpc_di.yml'
+  pull_request:
+    paths:
+      - 'tests/tpc_di/**'
+      - '.github/workflows/tpc_di.yml'
+  workflow_dispatch:
+    inputs:
+      scale_factor:
+        description: "TPC-DI scale factor (min 3)"
+        type: string
+        default: "3"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tpc-di-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tpc-di:
+    runs-on: ubuntu-latest
+    env:
+      TPCDI_SF: ${{ inputs.scale_factor || '3' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '11'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
+        run: pip install -e ".[local]"
+      - name: Run TPC-DI (generate -> dbt run -> audit)
+        run: python tests/tpc_di/scripts/run_benchmark.py --sf "${TPCDI_SF}" --target local
+      - name: Upload dbt logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpc-di-logs
+          path: |
+            tests/tpc_di/logs/
+            tests/tpc_di/target/
+          if-no-files-found: ignore

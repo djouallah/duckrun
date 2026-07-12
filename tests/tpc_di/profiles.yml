@@ -1,0 +1,10 @@
+tpcdi:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      threads: 1                      # duckrun is single-writer; keep at 1
+      schema: "{{ env_var('DBT_SCHEMA', 'tpcdi') }}"
+      root_path: "{{ env_var('WAREHOUSE_PATH', './warehouse') }}"
+      storage_options:
+        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"
