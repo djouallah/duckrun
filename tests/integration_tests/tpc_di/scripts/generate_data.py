@@ -55,70 +55,52 @@ def _fetch_datagen(work: str) -> str:
 
 
 def _run_digen(datagen: str, sf: int, out: str):
-    """Generate the data by driving PDGF directly (we bypass DIGen.jar).
+    """Generate the data with DIGen.jar exactly the way the reference does.
 
-    DIGen.jar just launches PDGF with a hardcoded `-closeWhenDone -start` and NO
-    `-load`/`-libjars`, so PDGF tries to `start` before its config (and TPC-DI
-    plugin classes) are loaded, fails, and drops to its interactive shell. Rather
-    than fight that through DIGen's stdin relay, we run `pdgf.jar` ourselves from
-    the pdgf/ dir with only `-o`/`-sf` (no `-start`, so no premature error) and
-    then feed its shell the correct, ordered commands:
+    DIGen.jar is a thin Java launcher that starts the bundled PDGF engine with the
+    right classpath/libjars so its TPC-DI plugin classes (tpc.di.generators.*)
+    resolve, then loads config/ and generates. The one requirement is that it runs
+    with its **working directory set to the datagen dir** (where DIGen.jar sits,
+    one level above pdgf/), so PDGF finds pdgf/config and pdgf/plugins. It only
+    needs two lines on stdin: ENTER then YES to accept the BANKMARK license.
 
-      ""       ENTER — reveal the BANKMARK license
-      YES      accept the license
-      libjars  load plugins/tpc-di.jar — the schema references custom generator
-               classes (tpc.di.generators.*, tpc.di.output.*) that live there and
-               are NOT on pdgf.jar's Class-Path; without this the schema fails to
-               parse ("Class 'tpc.di.generators.HRJobIdGenerator' was not found")
-      load     load the schema, then the generation config
-      closeWhenDone  exit once generation finishes
-      start    begin generation
+    This mirrors src/tools/digen_runner.py in the upstream repo — an earlier
+    attempt to drive pdgf.jar directly failed because PDGF parses its schema at
+    startup, before any `libjars` shell command can put the plugin jar on the
+    classpath ("Class 'tpc.di.generators.HRJobIdGenerator' was not found").
     """
     out = os.path.abspath(out)
     os.makedirs(out, exist_ok=True)
-    pdgf_dir = os.path.join(datagen, "pdgf")
-    if not os.path.isfile(os.path.join(pdgf_dir, "pdgf.jar")):
-        sys.exit(f"ERROR: pdgf.jar not found under {pdgf_dir}")
+    if not os.path.isfile(os.path.join(datagen, "DIGen.jar")):
+        sys.exit(f"ERROR: DIGen.jar not found under {datagen}")
 
-    # DIGen floors -sf at 3 and multiplies by 1000 (sf=3 -> PDGF scale 3000).
-    # Running PDGF directly we set the scale ourselves; TPCDI_PDGF_SCALE lets CI use
-    # a small scale for fast iteration.
-    scale = os.environ.get("TPCDI_PDGF_SCALE", "").strip() or str(sf * 1000)
-    # PDGF's -o is a path *expression*, so a literal path must be tick-quoted (this
-    # is exactly what DIGen does). Trailing slash = the output directory.
-    out_arg = "'" + out.replace(os.sep, "/") + "/'"
-    cmd = ["java", "-Xmx1g", "-jar", "pdgf.jar", "-o", out_arg, "-sf", scale]
-    print(f"  running PDGF: {' '.join(cmd)}  (cwd={pdgf_dir}, scale={scale})", flush=True)
+    # DIGen's -sf is the TPC-DI scale factor (floored at 3); DIGen scales PDGF
+    # internally. -o is the output dir; DIGen writes Batch1/2/3 beneath it.
+    scale = max(sf, 3)
+    cmd = ["java", "-Xmx2g", "-jar", "DIGen.jar", "-sf", str(scale), "-o", out]
+    print(f"  running DIGen: {' '.join(cmd)}  (cwd={datagen}, sf={scale})", flush=True)
     p = subprocess.Popen(
-        cmd, cwd=pdgf_dir, text=True,
+        cmd, cwd=datagen, text=True,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
-    cmds = [
-        "",
-        "YES",
-        "libjars plugins/tpc-di.jar",
-        "load config/tpc-di-schema.xml",
-        "load config/tpc-di-generation.xml",
-        "closeWhenDone",
-        "start",
-    ]
-    p.stdin.write("\n".join(cmds) + "\n")
+    # DIGen prompts for license acceptance: ENTER to reveal it, YES to accept.
+    p.stdin.write("\nYES\n")
     p.stdin.flush()
 
-    # Watchdog: if generation hangs (PDGF waiting at its shell), kill it so the job
-    # fails fast with full output instead of running to the 6h runner limit.
+    # Watchdog: if generation hangs, kill it so the job fails fast with full
+    # output instead of running to the 6h runner limit.
     timeout = int(os.environ.get("TPCDI_GEN_TIMEOUT", "1200"))
     timed_out = {"hit": False}
 
     def _kill():
         timed_out["hit"] = True
-        print(f"  ERROR: PDGF exceeded {timeout}s — killing.", flush=True)
+        print(f"  ERROR: DIGen exceeded {timeout}s — killing.", flush=True)
         p.kill()
 
     watchdog = threading.Timer(timeout, _kill)
     watchdog.start()
     try:
-        # Drain with readline() so PDGF never blocks on a full stdout pipe.
+        # Drain with readline() so DIGen never blocks on a full stdout pipe.
         while True:
             line = p.stdout.readline()
             if not line and p.poll() is not None:
@@ -133,9 +115,9 @@ def _run_digen(datagen: str, sf: int, out: str):
     except OSError:
         pass
     if timed_out["hit"]:
-        sys.exit("ERROR: PDGF timed out")
+        sys.exit("ERROR: DIGen timed out")
     if rc != 0:
-        sys.exit(f"ERROR: PDGF exited {rc}")
+        sys.exit(f"ERROR: DIGen exited {rc}")
     if not os.path.isdir(os.path.join(out, "Batch1")):
         sys.exit(f"ERROR: no Batch1/ produced under {out}")
 

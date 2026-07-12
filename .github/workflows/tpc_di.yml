@@ -34,11 +34,11 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TPCDI_SF: ${{ inputs.scale_factor || '3' }}
-      # DIGen floors -sf at 3 (scale 3000). Override PDGF's internal scale down for
-      # fast CI iteration — enough rows to exercise every model/join, far quicker to
-      # generate. Raise/remove for a spec-scale run.
-      TPCDI_PDGF_SCALE: '300'
-      TPCDI_GEN_TIMEOUT: '600'
+      TPCDI_GEN_TIMEOUT: '900'
+      TPCDI_DIR: ${{ github.workspace }}/tests/integration_tests/tpc_di/staging
+      WAREHOUSE_PATH: ${{ github.workspace }}/tests/integration_tests/tpc_di/warehouse
+      DBT_SCHEMA: tpcdi
+      PROJ: tests/integration_tests/tpc_di
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
@@ -53,10 +53,27 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
         run: pip install -e ".[local]"
-      - name: Run TPC-DI (generate -> dbt run -> audit)
-        run: python tests/integration_tests/tpc_di/scripts/run_benchmark.py --sf "${TPCDI_SF}" --target local
-      - name: Upload dbt logs on failure
-        if: failure()
+
+      # --- Data generation is its own step so a generator failure is unambiguous
+      #     and the file-by-file summary (proof of real data) is easy to find. ---
+      - name: Generate TPC-DI data (DIGen)
+        run: python $PROJ/scripts/generate_data.py --sf "${TPCDI_SF}" --out "$TPCDI_DIR"
+
+      - name: Show generated tree
+        run: |
+          echo "== staging tree =="
+          find "$TPCDI_DIR" -maxdepth 2 -type f | sort | head -100
+          echo "== total bytes =="
+          du -sh "$TPCDI_DIR"
+
+      - name: dbt run (full TPC-DI load)
+        run: dbt run --project-dir "$PROJ" --profiles-dir "$PROJ"
+
+      - name: Audit warehouse
+        run: python $PROJ/audit/validate.py --warehouse "$WAREHOUSE_PATH" --schema "$DBT_SCHEMA"
+
+      - name: Upload logs (always)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: tpc-di-logs
