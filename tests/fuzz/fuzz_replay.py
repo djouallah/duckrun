@@ -99,7 +99,7 @@ def _write_summary_md(path, args, stats, findings, fatal):
     if data:
         for kind, i, q, a, _ in data:
             L.append(f"- **[{kind}] #{i}** — {a}")
-            L.append(f"  ```sql\n  {q.strip()[:400]}\n  ```")
+            L.append(f"  ```sql\n{q.strip()}\n  ```")
     else:
         L.append("_none — the engine never returned wrong data or lost a write._")
     L.append("")
@@ -108,7 +108,8 @@ def _write_summary_md(path, args, stats, findings, fatal):
              "can't route — VALUES(…,DEFAULT) / TABLESAMPLE SYSTEM; RETURNING is filtered out)")
     if mism:
         for kind, i, q, _, b in mism[:60]:
-            L.append(f"- **#{i}** {b} — `{' '.join(q.split())[:120]}`")
+            L.append(f"- **#{i}** {b}")
+            L.append(f"  ```sql\n{q.strip()}\n  ```")
         if len(mism) > 60:
             L.append(f"- …and {len(mism) - 60} more (see the job log)")
     else:
@@ -344,7 +345,7 @@ def main():
     if findings:
         print(f"\n*** {len(findings)} FINDING(S) ***")
         for kind, i, q, a, b in findings:
-            print(f"\n[{kind}] stmt #{i}:\n  {q[:300]}\n  {a}\n  {b}")
+            print(f"\n[{kind}] stmt #{i}:\n  {q}\n  {a}\n  {b}")
     if args.summary_md:
         _write_summary_md(args.summary_md, args, stats, findings, fatal)
     if fatal:
