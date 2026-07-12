@@ -22,8 +22,10 @@ on:
         type: string
         default: "3"
 
+# The OneLake upload step logs in via OIDC federation (id-token) — same as aemo.yml.
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: tpc-di-${{ github.ref }}
@@ -36,17 +38,24 @@ jobs:
       TPCDI_SF: ${{ inputs.scale_factor || '3' }}
       TPCDI_GEN_TIMEOUT: '900'
       TPCDI_DIR: ${{ github.workspace }}/tests/integration_tests/tpc_di/staging
+      # dbt reads the LOCAL staging + writes a LOCAL Delta warehouse (kept green/offline);
+      # the generated batches are ALSO uploaded to OneLake as the durable seed (below).
       WAREHOUSE_PATH: ${{ github.workspace }}/tests/integration_tests/tpc_di/warehouse
+      # The shared sample lakehouse Tables path — conn.copy() lands the seed in its sibling
+      # Files/tpcdi section (same lakehouse the aemo/coffee jobs write to).
+      ONELAKE_WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
       DBT_SCHEMA: tpcdi
       PROJ: tests/integration_tests/tpc_di
+      # The azure extension's default transport fails the OneLake TLS handshake on the
+      # runner; the curl transport respects the system CA bundle.
+      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          # DIGen.jar uses Eclipse's jar-in-jar loader (bundles commons-cli via the
-          # rsrc: classloader), which breaks on Java 9+ with NoClassDefFoundError.
-          # Java 8 is what the reference runs it on.
+          # DIGen ships PDGF built with an Eclipse jar-in-jar loader that breaks on
+          # Java 9+ (NoClassDefFoundError). Java 8 is what the reference runs it on.
           java-version: '8'
       - uses: actions/setup-python@v5
         with:
@@ -55,8 +64,10 @@ jobs:
         run: pip install -e ".[local]"
 
       # --- Data generation is its own step so a generator failure is unambiguous
-      #     and the file-by-file summary (proof of real data) is easy to find. ---
-      - name: Generate TPC-DI data (DIGen)
+      #     and the file-by-file summary (proof of real data) is easy to find. We drive
+      #     PDGF directly (reloadPlugins→load→start); DIGen's headless -start can't
+      #     register the TPC-DI plugin. See scripts/generate_data.py. ---
+      - name: Generate TPC-DI data (PDGF)
         run: python $PROJ/scripts/generate_data.py --sf "${TPCDI_SF}" --out "$TPCDI_DIR"
 
       - name: Show generated tree
@@ -65,6 +76,24 @@ jobs:
           find "$TPCDI_DIR" -maxdepth 2 -type f | sort | head -100
           echo "== total bytes =="
           du -sh "$TPCDI_DIR"
+
+      # --- Land the generated batches in OneLake as the durable seed. OIDC login →
+      #     storage token → conn.copy() into Files/tpcdi (the aemo/coffee pattern). ---
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Upload generated batches to OneLake (Files/tpcdi)
+        env:
+          WAREHOUSE_PATH: ${{ env.ONELAKE_WAREHOUSE_PATH }}
+        run: python $PROJ/scripts/upload_to_onelake.py --staging "$TPCDI_DIR" --prefix tpcdi
 
       - name: dbt run (full TPC-DI load)
         run: dbt run --project-dir "$PROJ" --profiles-dir "$PROJ"
