@@ -78,24 +78,14 @@ jobs:
           filters: |
             merge_spill:
               - 'tests/performance/merge_spill/**'
-              - 'tests/connection_api/**'
-              - '.github/workflows/integration_tests_onelake.yml'
             coffee:
               - 'tests/integration_tests/coffee/**'
-              - 'tests/connection_api/**'
-              - '.github/workflows/integration_tests_onelake.yml'
             taxi:
               - 'tests/integration_tests/taxi/**'
-              - 'tests/connection_api/**'
-              - '.github/workflows/integration_tests_onelake.yml'
             multicatalog:
               - 'tests/integration_tests/multicatalog/**'
-              - 'tests/connection_api/**'
-              - '.github/workflows/integration_tests_onelake.yml'
             breaker:
               - 'tests/integration_tests/onelake_breaker/**'
-              - 'tests/connection_api/**'
-              - '.github/workflows/integration_tests_onelake.yml'
 
   merge_spill:
     # The incremental-MERGE project (SQL-only): the MERGE chain over OneLake at a SMALL scale factor
