@@ -20,6 +20,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 
 DEFAULT_REPO = os.environ.get(
     "DBX_TPCDI_REPO", "https://github.com/shannon-barrow/databricks-tpc-di.git")
@@ -79,6 +80,10 @@ def _run_digen(datagen: str, sf: int, out: str):
     #               "Class 'tpc.di.generators.HRJobIdGenerator' was not found" and
     #               nothing loads. (The cmdline `-start`'s implicit schema load runs
     #               before this and fails harmlessly — expected; we reload below.)
+    #   sf …     -> (optional) override PDGF's internal scale for a smaller/faster
+    #               dataset. DIGen hard-floors -sf at 3 and multiplies by 1000
+    #               (sf=3 -> scale 3000); TPCDI_PDGF_SCALE lets CI drop that to e.g.
+    #               100 for quick iteration. Omitted unless set.
     #   load …   -> load the schema then the generation config (paths relative to
     #               PDGF's cwd = pdgf/)
     #   start    -> begin generation; -closeWhenDone makes PDGF exit when finished
@@ -87,28 +92,51 @@ def _run_digen(datagen: str, sf: int, out: str):
     # closed pipe) becomes an endless stream of "null" commands that trips PDGF's
     # flooding prevention. Leaving it open just parks the relay harmlessly until
     # PDGF exits and DIGen calls System.exit.
-    p.stdin.write(
-        "\n"
-        "YES\n"
-        "libjars plugins/tpc-di.jar\n"
-        "load config/tpc-di-schema.xml\n"
-        "load config/tpc-di-generation.xml\n"
-        "start\n"
-    )
+    sf_override = os.environ.get("TPCDI_PDGF_SCALE", "").strip()
+    cmds = [
+        "",
+        "YES",
+        "libjars plugins/tpc-di.jar",
+        "load config/tpc-di-schema.xml",
+        "load config/tpc-di-generation.xml",
+    ]
+    if sf_override:
+        cmds.append(f"sf {sf_override}")
+        print(f"  (overriding PDGF scale -> {sf_override})", flush=True)
+    cmds.append("start")
+    p.stdin.write("\n".join(cmds) + "\n")
     p.stdin.flush()
-    # Drain with readline() (not `for line in p.stdout`, whose read-ahead buffering
-    # delays lines) so DIGen/PDGF never block on a full stdout pipe.
-    while True:
-        line = p.stdout.readline()
-        if not line and p.poll() is not None:
-            break
-        if line:
-            print(line.rstrip("\n"), flush=True)
-    rc = p.wait()
+
+    # Watchdog: if generation hangs (e.g. PDGF waiting at its shell), kill it so the
+    # job fails fast with full output instead of running to the 6h runner limit.
+    timeout = int(os.environ.get("TPCDI_GEN_TIMEOUT", "1200"))
+    timed_out = {"hit": False}
+
+    def _kill():
+        timed_out["hit"] = True
+        print(f"  ERROR: DIGen exceeded {timeout}s — killing.", flush=True)
+        p.kill()
+
+    watchdog = threading.Timer(timeout, _kill)
+    watchdog.start()
+    try:
+        # Drain with readline() (not `for line in p.stdout`, whose read-ahead
+        # buffering delays lines) so DIGen/PDGF never block on a full stdout pipe.
+        while True:
+            line = p.stdout.readline()
+            if not line and p.poll() is not None:
+                break
+            if line:
+                print(line.rstrip("\n"), flush=True)
+        rc = p.wait()
+    finally:
+        watchdog.cancel()
     try:
         p.stdin.close()
     except OSError:
         pass
+    if timed_out["hit"]:
+        sys.exit("ERROR: DIGen timed out")
     if rc != 0:
         sys.exit(f"ERROR: DIGen exited {rc}")
     if not os.path.isdir(os.path.join(out, "Batch1")):
