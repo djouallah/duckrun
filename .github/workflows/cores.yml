@@ -51,7 +51,7 @@ on:
       - '!tests/integration_tests/aemo/**'          # aemo.yml
       - '!tests/parity_tests/**'                    # parity.yml
       - '!tests/parquet_layout/aemo/**'            # parquet_layout.yml (manual)
-      - '!tests/parquet_layout/contoso/**'          # parquet_layout_contoso.yml (manual)
+      - '!tests/parquet_layout/contoso/**'          # parquet_layout.yml (manual, contoso job)
       - '!tests/performance/merge_spill/**'         # local_stress_tests.yml + integration_tests_onelake.yml (tpch/ still fires cores)
       - '!tests/integration_tests/taxi/**'          # integration_tests_onelake.yml
       - '!tests/integration_tests/multicatalog/**'  # integration_tests_onelake.yml
