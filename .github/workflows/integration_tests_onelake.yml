@@ -27,6 +27,7 @@ on:
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/taxi/**'
       - 'tests/integration_tests/multicatalog/**'
+      - 'tests/correctness/duckrun_onelake_breaker.py'
       - 'tests/connection_api/**'
       - '.github/workflows/integration_tests_onelake.yml'
   pull_request:
@@ -35,6 +36,7 @@ on:
       - 'tests/integration_tests/coffee/**'
       - 'tests/integration_tests/taxi/**'
       - 'tests/integration_tests/multicatalog/**'
+      - 'tests/correctness/duckrun_onelake_breaker.py'
       - 'tests/connection_api/**'
       - '.github/workflows/integration_tests_onelake.yml'
   workflow_dispatch:
@@ -49,6 +51,7 @@ on:
           - coffee
           - taxi
           - multicatalog
+          - breaker
 
 # The project jobs use OIDC (id-token) for the Azure login. (Pages publishing lives in deploy-docs.yml.)
 permissions:
@@ -66,6 +69,7 @@ jobs:
       coffee: ${{ steps.filter.outputs.coffee }}
       taxi: ${{ steps.filter.outputs.taxi }}
       multicatalog: ${{ steps.filter.outputs.multicatalog }}
+      breaker: ${{ steps.filter.outputs.breaker }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -86,6 +90,10 @@ jobs:
               - '.github/workflows/integration_tests_onelake.yml'
             multicatalog:
               - 'tests/integration_tests/multicatalog/**'
+              - 'tests/connection_api/**'
+              - '.github/workflows/integration_tests_onelake.yml'
+            breaker:
+              - 'tests/correctness/duckrun_onelake_breaker.py'
               - 'tests/connection_api/**'
               - '.github/workflows/integration_tests_onelake.yml'
 
@@ -389,3 +397,48 @@ jobs:
           name: docs-multicatalog-page
           path: multicatalog_run.html
           if-no-files-found: warn
+
+  breaker:
+    # The chaos harness (tests/correctness/duckrun_onelake_breaker.py) pointed at LIVE OneLake: N worker
+    # processes hammer one Delta table through conn.sql() while a dedicated compactor loops VACUUM
+    # (optimize.compact, dataChange=false) alongside them. It checks the same 9 invariants as the local
+    # breaker (cores.yml) AND publishes a throughput (QPS) + compaction-concurrency report to the step
+    # summary — proving a concurrent compaction never loses a writer's commit (a lost race is caught,
+    # not fatal). Small worker/op counts: the OneLake round-trip dominates, so keep it cheap. Isolated
+    # schema (duckrun_breaker_it) + concurrency lock so it doesn't collide with the other projects in
+    # the shared lakehouse.
+    needs: changes
+    if: ${{ needs.changes.outputs.breaker == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'breaker' || inputs.project == 'all')) }}
+    runs-on: ubuntu-latest
+    concurrency:
+      group: breaker-onelake
+      cancel-in-progress: false
+    env:
+      AZURE_TRANSPORT_OPTION_TYPE: curl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun (pulls duckdb + deltalake)
+        run: pip install -e ".[test]"
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake bearer token
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Chaos + compaction concurrency + QPS against OneLake
+        # Contention only (no SIGKILL): writers hammer one Delta table while the compactor races them,
+        # then the 9 invariants are checked and the QPS + compaction tables go to the step summary.
+        env:
+          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          DBT_SCHEMA: duckrun_breaker_it
+        run: >-
+          python tests/correctness/duckrun_onelake_breaker.py
+          --workers 4 --ops 20 --compact-interval 2 --seed 1
