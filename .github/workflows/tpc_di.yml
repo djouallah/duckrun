@@ -1,10 +1,11 @@
 name: tpc-di
 
-# TPC-DI (the TPC data-integration / ETL benchmark) ported to duckrun. Generates
-# source data with DIGen (Java), runs the full single-pass dbt load (Batch1
-# historical + Batch2/3 incremental) writing Delta tables locally, then smoke-
-# audits the warehouse. This is the verification harness for the port — there is
-# no local Java on the author's machine, so CI is where it runs.
+# TPC-DI (the TPC data-integration / ETL benchmark) ported to duckrun, run entirely on
+# Microsoft Fabric OneLake. A dedicated `tpcdi` lakehouse (created if absent) holds BOTH the
+# raw DIGen seed (Files/tpcdi/sf<N>) and the dbt warehouse (Tables/tpcdi). The seed is generated
+# ONCE per scale factor (the Java generator on the runner) and cached in Files; later runs detect
+# it and skip generation. dbt reads the seed from OneLake and writes the Delta tables to OneLake —
+# the runner never hosts the data. See tests/integration_tests/tpc_di/README.md.
 on:
   push:
     branches: ["**"]
@@ -22,40 +23,43 @@ on:
         type: string
         default: "3"
 
-# The OneLake upload step logs in via OIDC federation (id-token) — same as aemo.yml.
+# OIDC (id-token) for the Azure login that creates the lakehouse + mints the storage token.
 permissions:
   contents: read
   id-token: write
 
+# One TPC-DI run at a time — every run writes the same `tpcdi` schema in the one lakehouse.
 concurrency:
-  group: tpc-di-${{ github.ref }}
-  cancel-in-progress: true
+  group: tpcdi-onelake
+  cancel-in-progress: false
 
 jobs:
   tpc-di:
     runs-on: ubuntu-latest
     env:
-      TPCDI_SF: ${{ inputs.scale_factor || '3' }}
+      # scale_factor input wins, else the repo variable TPCDI_SF, else 3. It keys the seed cache
+      # (Files/tpcdi/sf<N>), so changing it regenerates for that SF only.
+      TPCDI_SF: ${{ inputs.scale_factor || vars.TPCDI_SF || '3' }}
       TPCDI_GEN_TIMEOUT: '900'
-      TPCDI_DIR: ${{ github.workspace }}/tests/integration_tests/tpc_di/staging
-      # dbt reads the LOCAL staging + writes a LOCAL Delta warehouse (kept green/offline);
-      # the generated batches are ALSO uploaded to OneLake as the durable seed (below).
-      WAREHOUSE_PATH: ${{ github.workspace }}/tests/integration_tests/tpc_di/warehouse
-      # The shared sample lakehouse Tables path — conn.copy() lands the seed in its sibling
-      # Files/tpcdi section (same lakehouse the aemo/coffee jobs write to).
-      ONELAKE_WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+      # Local scratch the Java generator writes to before upload (only used on a cache miss).
+      TPCDI_STAGING: ${{ github.workspace }}/tests/integration_tests/tpc_di/staging
+      WS_ID: 1c52481c-0523-4a5a-bbde-fdc932bd77c2
+      LH_NAME: tpcdi
       DBT_SCHEMA: tpcdi
       PROJ: tests/integration_tests/tpc_di
-      # The azure extension's default transport fails the OneLake TLS handshake on the
-      # runner; the curl transport respects the system CA bundle.
+      # Exported to the process env so the adapter's mid-run token refresh can re-exchange a fresh
+      # GitHub OIDC assertion (see auth._github_oidc_token).
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      # The azure extension's default transport fails the OneLake TLS handshake on the runner;
+      # the curl transport respects the system CA bundle.
       AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          # DIGen ships PDGF built with an Eclipse jar-in-jar loader that breaks on
-          # Java 9+ (NoClassDefFoundError). Java 8 is what the reference runs it on.
+          # DIGen ships PDGF built with an Eclipse jar-in-jar loader that breaks on Java 9+.
           java-version: '8'
       - uses: actions/setup-python@v5
         with:
@@ -63,42 +67,72 @@ jobs:
       - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
         run: pip install -e ".[local]"
 
-      # --- Data generation is its own step so a generator failure is unambiguous
-      #     and the file-by-file summary (proof of real data) is easy to find. We drive
-      #     PDGF directly (reloadPlugins→load→start); DIGen's headless -start can't
-      #     register the TPC-DI plugin. See scripts/generate_data.py. ---
-      - name: Generate TPC-DI data (PDGF)
-        run: python $PROJ/scripts/generate_data.py --sf "${TPCDI_SF}" --out "$TPCDI_DIR"
-
-      - name: Show generated tree
-        run: |
-          echo "== staging tree =="
-          find "$TPCDI_DIR" -maxdepth 2 -type f | sort | head -100
-          echo "== total bytes =="
-          du -sh "$TPCDI_DIR"
-
-      # --- Land the generated batches in OneLake as the durable seed. OIDC login →
-      #     storage token → conn.copy() into Files/tpcdi (the aemo/coffee pattern). ---
       - name: Azure login (OIDC federation — no client secret)
         uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
+
+      - name: Create the dedicated 'tpcdi' lakehouse (idempotent) + resolve its OneLake paths
+        # Fabric REST create-if-absent (same pattern as the onelake_breaker job), then build the
+        # Tables path (dbt warehouse) and Files path (seed) from its GUID. Schema-enabled so
+        # duckrun's Tables/<schema>/<table> layout resolves.
+        run: |
+          set -euo pipefail
+          BASE="https://api.fabric.microsoft.com/v1/workspaces/$WS_ID/lakehouses"
+          find_lh() {
+            az rest --method get --resource https://api.fabric.microsoft.com --url "$BASE" \
+              --query "value[?displayName=='$LH_NAME'].id | [0]" -o tsv 2>/dev/null
+          }
+          LH_ID="$(find_lh || true)"
+          if [ -z "${LH_ID:-}" ] || [ "$LH_ID" = "None" ]; then
+            echo "creating schema-enabled lakehouse '$LH_NAME' in workspace $WS_ID ..."
+            az rest --method post --resource https://api.fabric.microsoft.com --url "$BASE" \
+              --headers "Content-Type=application/json" \
+              --body '{"displayName":"'"$LH_NAME"'","creationPayload":{"enableSchemas":true}}' >/dev/null || true
+            for i in $(seq 1 12); do
+              sleep 5
+              LH_ID="$(find_lh || true)"
+              if [ -n "${LH_ID:-}" ] && [ "$LH_ID" != "None" ]; then break; fi
+              echo "  waiting for '$LH_NAME' to appear ($i/12)..."
+            done
+          else
+            echo "lakehouse '$LH_NAME' already exists ($LH_ID) — reusing."
+          fi
+          if [ -z "${LH_ID:-}" ] || [ "$LH_ID" = "None" ]; then
+            echo "lakehouse '$LH_NAME' was not visible after creation"; exit 1
+          fi
+          ROOT="abfss://$WS_ID@onelake.dfs.fabric.microsoft.com/$LH_ID"
+          {
+            echo "WAREHOUSE_PATH=$ROOT/Tables"
+            echo "TPCDI_DIR=$ROOT/Files/tpcdi/sf${TPCDI_SF}"
+          } >> "$GITHUB_ENV"
+          echo "lakehouse '$LH_NAME' = $LH_ID"
+
       - name: Acquire a fresh OneLake bearer token
         run: |
           TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Upload generated batches to OneLake (Files/tpcdi)
-        env:
-          WAREHOUSE_PATH: ${{ env.ONELAKE_WAREHOUSE_PATH }}
-        run: python $PROJ/scripts/upload_to_onelake.py --staging "$TPCDI_DIR" --prefix tpcdi
 
-      - name: dbt run (full TPC-DI load)
+      # --- Only generate the raw data when the seed for this SF isn't already in OneLake. ---
+      - name: Check whether the seed already exists in OneLake
+        id: seed
+        run: python $PROJ/scripts/check_seed.py --prefix "tpcdi/sf${TPCDI_SF}"
+
+      - name: Generate TPC-DI data (PDGF) + upload the seed — only on a cache miss
+        if: steps.seed.outputs.exists != 'true'
+        run: |
+          python $PROJ/scripts/generate_data.py --sf "${TPCDI_SF}" --out "$TPCDI_STAGING"
+          echo "== staging tree =="; find "$TPCDI_STAGING" -maxdepth 2 -type f | sort | head -60
+          python $PROJ/scripts/upload_to_onelake.py --staging "$TPCDI_STAGING" --prefix "tpcdi/sf${TPCDI_SF}"
+
+      # --- dbt reads the seed from OneLake Files and writes the Delta tables to OneLake Tables. ---
+      - name: dbt run (full TPC-DI load — reads + writes OneLake)
         run: dbt run --project-dir "$PROJ" --profiles-dir "$PROJ"
 
-      - name: Audit warehouse
+      - name: Audit warehouse (OneLake Tables)
         run: python $PROJ/audit/validate.py --warehouse "$WAREHOUSE_PATH" --schema "$DBT_SCHEMA"
 
       - name: Upload logs (always)

@@ -54,11 +54,21 @@ ONELAKE_TOKEN=<bearer> \
 python tests/integration_tests/tpc_di/scripts/run_benchmark.py --sf 3 --target onelake
 ```
 
-CI (`.github/workflows/tpc_di.yml`) runs the generate → **upload to OneLake** →
-dbt run → audit pipeline on every push under `tests/integration_tests/tpc_di/**` —
-that is the verification harness for this port. dbt reads the *local* staging and
-writes a local Delta warehouse; the generated batches are *also* uploaded to
-OneLake (`Files/tpcdi`) as the durable seed.
+CI (`.github/workflows/tpc_di.yml`) runs the whole thing **on OneLake**, on every push
+under `tests/integration_tests/tpc_di/**`:
+
+1. Create the dedicated **`tpcdi` lakehouse** if it doesn't exist (Fabric REST, schema-enabled).
+2. **Check** whether the seed for this scale factor is already in `Files/tpcdi/sf<N>`
+   (`check_seed.py` — a listing, no download). If present, **skip generation** — the Java
+   generator only runs on a cache miss.
+3. On a miss: `generate_data.py` (PDGF, on the runner) → `upload_to_onelake.py` lands
+   `Batch1/2/3` in `Files/tpcdi/sf<N>`.
+4. `dbt run` reads the seed **from OneLake Files** (globs work over `abfss://`) and writes the
+   Delta dimension/fact tables to **`Tables/tpcdi`** — the runner never hosts the data.
+5. `validate.py` audits the OneLake warehouse via `duckrun.connect()`.
+
+The scale factor is `${{ inputs.scale_factor }}` (workflow_dispatch) → repo variable `TPCDI_SF`
+→ `3`. Changing it uses a fresh `sf<N>` seed cache, so it regenerates once for that SF.
 
 ## Notes & design choices
 
@@ -78,11 +88,12 @@ OneLake (`Files/tpcdi`) as the durable seed.
   stdin open after the license ENTER+YES so PDGF's shell thread can't flood-kill the
   run. `-sf` is the TPC-DI factor ×1000 (what DIGen applies). No Spark. Override the
   source with `DBX_TPCDI_REPO` / `DBX_TPCDI_REF`.
-- **OneLake seed.** After generation, `upload_to_onelake.py` lands `Batch1/2/3` in
-  the lakehouse `Files/tpcdi` section via duckrun's `conn.copy()` (`WAREHOUSE_PATH` =
-  the OneLake Tables path, `ONELAKE_TOKEN` = a storage bearer token). This is the
-  "generate the data into OneLake" deliverable — a durable copy that doesn't depend
-  on re-running Java.
+- **Seed is generated once, then cached in OneLake.** `check_seed.py` lists
+  `Files/tpcdi/sf<N>/Batch1` (via duckrun's `conn.list_files()`, no download); if it's
+  there, generation is skipped. On a miss, `generate_data.py` writes `Batch1/2/3` to a
+  local scratch dir and `upload_to_onelake.py` (`conn.copy()`) lands them in
+  `Files/tpcdi/sf<N>`. dbt then reads that seed straight from OneLake — the runner only
+  hosts the bytes transiently, during the one-time generation.
 - **XML.** DuckDB has no first-party XML reader, so `stg_customermgmt` uses the
   [`webbed`](https://github.com/teaguesterling/duckdb_webbed) community extension
   (`INSTALL webbed FROM community; LOAD webbed`, via the model's `pre_hook`). It is
@@ -97,10 +108,6 @@ OneLake (`Files/tpcdi`) as the durable seed.
 
 ## Not yet covered (follow-ups)
 
-- **dbt reads the OneLake seed.** Today dbt reads the local staging; the OneLake
-  copy is a durable artifact only. Pointing `tpcdi_dir` at `abfss://…/Files/tpcdi`
-  (so a routine run never re-generates) needs the `webbed` XML read for
-  `CustomerMgmt.xml` proven over `abfss://` first.
 - **Per-batch incremental audit.** This port is single-pass (the dbx *dbt* project
   is too). The 3-batch-with-audit-checkpoints variant is a larger, separate build.
 - **Full Appendix-A audit.** `audit/validate.py` is a coverage/liveness gate (every
