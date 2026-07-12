@@ -695,6 +695,12 @@ class DuckSession:
         ``to timestamp as of '…'``) rolls the table back — a new commit on top of history, itself
         revertible.
         """
+        # One statement in, one relation out — for EVERY statement, not just DML. Routing keys off the
+        # leading verb, so a `;`-batch led by a read (`select 1; create table foo as select 2`) would
+        # otherwise slip past the DML router into raw DuckDB and silently make an ephemeral native table.
+        # Reject the whole batch up front. Comment-stripped so a `;` inside a comment isn't miscounted.
+        if _is_multi_statement(delta_dml._strip_comments(query)):
+            raise ValueError(_MULTI_MSG)
         # DESCRIBE DETAIL / DESCRIBE HISTORY — the Delta introspection verbs. DuckDB has plain
         # DESCRIBE (columns) but rejects these, so answer them from the Delta log as a native relation.
         mdesc = _DESCRIBE_EXT_RE.match(_strip_leading(query))

@@ -132,6 +132,21 @@ def test_unsupported_dml_ignores_comments():
     assert session_mod._unsupported_dml("insert into t values (1); /* c */ delete from t") is not None
 
 
+def test_sql_rejects_multi_statement_reads(w):
+    """A `;`-batch is refused for EVERY leading verb, not just DML — otherwise a read-led batch
+    (`select 1; create table foo …`) would slip past the DML router into raw DuckDB and silently
+    make an ephemeral native table. Single statements (incl. a trailing `;`) still run."""
+    with pytest.raises(ValueError, match="one statement"):
+        w.sql("select 1; select 2")
+    with pytest.raises(ValueError, match="one statement"):
+        w.sql("select 1; create table foo as select 2")  # the smuggling case the guard closes
+    # single statements are unaffected — trailing `;` and `;` inside a literal both run fine
+    assert w.sql("select 1 as x;").fetchone()[0] == 1
+    assert w.sql("select ';' as x").fetchone()[0] == ";"
+    # and the ephemeral-table smuggle never happened
+    assert w.sql("select count(*) from duckdb_tables() where table_name = 'foo'").fetchone()[0] == 0
+
+
 # ─────────────────────────────────────────────── CREATE TABLE layout: SORTED BY / PARTITIONED BY
 
 def _first_file(w, name):
