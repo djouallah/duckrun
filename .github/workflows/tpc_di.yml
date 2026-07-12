@@ -9,11 +9,11 @@ on:
   push:
     branches: ["**"]
     paths:
-      - 'tests/tpc_di/**'
+      - 'tests/integration_tests/tpc_di/**'
       - '.github/workflows/tpc_di.yml'
   pull_request:
     paths:
-      - 'tests/tpc_di/**'
+      - 'tests/integration_tests/tpc_di/**'
       - '.github/workflows/tpc_di.yml'
   workflow_dispatch:
     inputs:
@@ -49,13 +49,13 @@ jobs:
       - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake)
         run: pip install -e ".[local]"
       - name: Run TPC-DI (generate -> dbt run -> audit)
-        run: python tests/tpc_di/scripts/run_benchmark.py --sf "${TPCDI_SF}" --target local
+        run: python tests/integration_tests/tpc_di/scripts/run_benchmark.py --sf "${TPCDI_SF}" --target local
       - name: Upload dbt logs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: tpc-di-logs
           path: |
-            tests/tpc_di/logs/
-            tests/tpc_di/target/
+            tests/integration_tests/tpc_di/logs/
+            tests/integration_tests/tpc_di/target/
           if-no-files-found: ignore

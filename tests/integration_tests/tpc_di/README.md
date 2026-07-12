@@ -42,7 +42,7 @@ Requires a JDK (for DIGen) and network access (to fetch DIGen and install the
 `webbed` DuckDB community extension). One command does generate → dbt run → audit:
 
 ```bash
-python tests/tpc_di/scripts/run_benchmark.py --sf 3           # local ./warehouse
+python tests/integration_tests/tpc_di/scripts/run_benchmark.py --sf 3           # local ./warehouse
 ```
 
 OneLake (Delta output to a Fabric Lakehouse):
@@ -50,11 +50,11 @@ OneLake (Delta output to a Fabric Lakehouse):
 ```bash
 WAREHOUSE_PATH=abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>/Tables \
 ONELAKE_TOKEN=<bearer> \
-python tests/tpc_di/scripts/run_benchmark.py --sf 3 --target onelake
+python tests/integration_tests/tpc_di/scripts/run_benchmark.py --sf 3 --target onelake
 ```
 
 CI (`.github/workflows/tpc_di.yml`) runs the local path on every push under
-`tests/tpc_di/**` — that is the verification harness for this port.
+`tests/integration_tests/tpc_di/**` — that is the verification harness for this port.
 
 ## Notes & design choices
 

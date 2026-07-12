@@ -63,11 +63,18 @@ def _run_digen(datagen: str, sf: int, out: str):
         cmd, cwd=datagen, text=True,
         stdin=subprocess.PIPE, stdout=sys.stdout, stderr=sys.stderr,
     )
-    # DIGen prompts for license acceptance; auto-acknowledge (blank line, then YES).
+    # DIGen prompts for license acceptance: a blank line reveals the terms, then
+    # YES agrees. Keep stdin OPEN afterwards — DIGen relays its stdin to the PDGF
+    # child, so closing it makes PDGF read EOF as an endless stream of null
+    # commands ("flooding prevention ... terminating"). The reference runner
+    # leaves the pipe open and lets DIGen exit on its own.
     p.stdin.write("\nYES\n")
     p.stdin.flush()
-    p.stdin.close()
     rc = p.wait()
+    try:
+        p.stdin.close()
+    except OSError:
+        pass
     if rc != 0:
         sys.exit(f"ERROR: DIGen exited {rc}")
     if not os.path.isdir(os.path.join(out, "Batch1")):
