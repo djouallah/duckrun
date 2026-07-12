@@ -101,7 +101,10 @@ def _run_digen(datagen: str, sf: int, out: str):
     # `extlib/*` is glob-expanded by the JVM; os.pathsep keeps the classpath portable.
     scale = max(sf, 3)
     classpath = os.pathsep.join(["pdgf.jar", "plugins/tpc-di.jar", "extlib/*"])
-    cmd = ["java", "-Xmx2g", "-cp", classpath, "pdgf.Controller",
+    # Heap is env-driven so large scale factors can get more room (PDGF's footprint is
+    # ~constant in SF, but headroom is cheap insurance on a long run).
+    xmx = os.environ.get("TPCDI_JVM_XMX", "2g")
+    cmd = ["java", f"-Xmx{xmx}", "-cp", classpath, "pdgf.Controller",
            "-sf", str(scale * 1000), "-start", "-closeWhenDone"]
     print(f"  running PDGF: {' '.join(cmd)}  (cwd={pdgf_dir}, tpcdi_sf={scale})", flush=True)
     p = subprocess.Popen(

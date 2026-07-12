@@ -21,7 +21,7 @@ on:
       scale_factor:
         description: "TPC-DI scale factor (min 3)"
         type: string
-        default: "10"
+        default: "100"
 
 # OIDC (id-token) for the Azure login that creates the lakehouse + mints the storage token.
 permissions:
@@ -39,8 +39,10 @@ jobs:
     env:
       # scale_factor input wins, else the repo variable TPCDI_SF, else 3. It keys the seed cache
       # (Files/tpcdi/sf<N>), so changing it regenerates for that SF only.
-      TPCDI_SF: ${{ inputs.scale_factor || vars.TPCDI_SF || '10' }}
-      TPCDI_GEN_TIMEOUT: '900'
+      TPCDI_SF: ${{ inputs.scale_factor || vars.TPCDI_SF || '100' }}
+      # PDGF at SF100 (~10GB / ~163M source rows) runs well past the old 15-min watchdog.
+      TPCDI_GEN_TIMEOUT: '10800'
+      TPCDI_JVM_XMX: '4g'
       # Local scratch the Java generator writes to before upload (only used on a cache miss).
       # On /mnt — the runner's big ephemeral disk (~65GB) — not github.workspace (~21GB on /), so a
       # large SF (the seed scales ~linearly: sf3 ~280MB → sf100 ~9GB) can't fill the root fs. Both

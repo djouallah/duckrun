@@ -68,7 +68,10 @@ under `tests/integration_tests/tpc_di/**`:
 5. `validate.py` audits the OneLake warehouse via `duckrun.connect()` — see below.
 
 The scale factor is `${{ inputs.scale_factor }}` (workflow_dispatch) → repo variable `TPCDI_SF`
-→ `10`. Changing it uses a fresh `sf<N>` seed cache, so it regenerates once for that SF.
+→ `100` (~10GB seed / ~163M source rows / ~108M warehouse rows). Changing it uses a fresh
+`sf<N>` seed cache, so it regenerates once for that SF. Large factors need headroom, so the
+seed is staged on `/mnt` (the runner's ~65GB disk), the generation watchdog is 3h
+(`TPCDI_GEN_TIMEOUT`), and the PDGF heap is `TPCDI_JVM_XMX` (4g in CI).
 
 ## Notes & design choices
 
