@@ -74,8 +74,17 @@ def _run_digen(datagen: str, sf: int, out: str):
     #     loaded") and it hangs.
     p.stdin.write("\nYES\n")
     p.stdin.flush()
-    for line in p.stdout:
-        print(line.rstrip("\n"), flush=True)
+    # Drain with readline(), NOT `for line in p.stdout` — the file iterator does
+    # read-ahead buffering and won't yield lines promptly, so DIGen's output pipe
+    # fills, its main thread blocks, and `start` races ahead of `load` ("Xml file
+    # was not loaded"). readline() drains each line as it appears, matching the
+    # reference runner.
+    while True:
+        line = p.stdout.readline()
+        if not line and p.poll() is not None:
+            break
+        if line:
+            print(line.rstrip("\n"), flush=True)
     rc = p.wait()
     try:
         p.stdin.close()
