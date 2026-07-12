@@ -56,6 +56,7 @@ on:
       - '!tests/integration_tests/taxi/**'          # integration_tests_onelake.yml
       - '!tests/integration_tests/multicatalog/**'  # integration_tests_onelake.yml
       - '!tests/integration_tests/onelake_breaker/**'  # integration_tests_onelake.yml (its own breaker job)
+      - '!tests/integration_tests/tpc_di/**'           # tpc_di.yml
       - 'pyproject.toml'      # dependency / version changes
       - '.github/workflows/cores.yml'
   pull_request:
@@ -71,6 +72,7 @@ on:
       - '!tests/integration_tests/taxi/**'
       - '!tests/integration_tests/multicatalog/**'
       - '!tests/integration_tests/onelake_breaker/**'
+      - '!tests/integration_tests/tpc_di/**'
       - 'pyproject.toml'
       - '.github/workflows/cores.yml'
   # Callable as a release gate from publish.yml (runs unfiltered there).
