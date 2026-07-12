@@ -161,8 +161,41 @@ jobs:
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       # --- dbt reads the seed from OneLake Files and writes the Delta tables to OneLake Tables. ---
-      - name: dbt run (full TPC-DI load — reads + writes OneLake)
-        run: dbt run --project-dir "$PROJ" --profiles-dir "$PROJ"
+      # A big SF (e.g. sf1000) can run for hours, past the OneLake token's ~1h life. The adapter
+      # already refreshes the token mid-run via GitHub OIDC; on top of that, if an invocation still
+      # dies we re-mint and `dbt retry` — which RESUMES from the failed/ skipped models (via
+      # target/run_results.json), so completed models aren't rebuilt and progress accumulates.
+      - name: dbt run (full TPC-DI load — reads + writes OneLake; re-mints token + resumes on failure)
+        env:
+          DBT_MAX_ATTEMPTS: '5'
+        run: |
+          set +e
+          cmd="run"; attempt=1
+          while :; do
+            echo "== dbt $cmd — attempt $attempt/$DBT_MAX_ATTEMPTS =="
+            dbt $cmd --project-dir "$PROJ" --profiles-dir "$PROJ"
+            rc=$?
+            if [ $rc -eq 0 ]; then echo "dbt succeeded on attempt $attempt"; break; fi
+            if [ "$attempt" -ge "$DBT_MAX_ATTEMPTS" ]; then
+              echo "dbt still failing after $attempt attempt(s) (rc=$rc)"; exit $rc
+            fi
+            echo "attempt $attempt failed (rc=$rc) — re-minting OneLake token and resuming with 'dbt retry'"
+            TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv 2>/dev/null)
+            if [ -n "$TOKEN" ]; then
+              echo "::add-mask::$TOKEN"; export ONELAKE_TOKEN="$TOKEN"; echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+            else
+              echo "warning: az token refresh returned empty; relying on the adapter's own GH-OIDC refresh"
+            fi
+            cmd="retry"; attempt=$((attempt+1))
+          done
+
+      # A long dbt run leaves the pre-dbt token stale; validate.py connects with a static token, so
+      # mint a fresh one before the audit (and the quick docs steps that follow reuse it).
+      - name: Re-acquire a fresh OneLake bearer token before the audit
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
       - name: Audit warehouse (OneLake Tables) — source→target reconciliation + SCD2 integrity
         run: python $PROJ/audit/validate.py --warehouse "$WAREHOUSE_PATH" --schema "$DBT_SCHEMA" --source-dir "$TPCDI_DIR" --summary "$TPCDI_DIR/_seed_summary.json"
