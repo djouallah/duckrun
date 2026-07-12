@@ -10,9 +10,16 @@
 -- field. Output mirrors the reference project's CustomerMgmt staging table
 -- (phones concatenated, status decoded from ActionType). Materialized as a table
 -- so only this model needs the extension; downstream models read plain Delta.
+--
+-- CustomerMgmt.xml is a single monolithic document that scales with the scale
+-- factor (~9MB at sf3, ~300MB at sf100). webbed defaults maximum_file_size to
+-- 16 MiB, which rejects it past ~sf30, so we lift the cap (the doc is still read
+-- whole into memory — fine to sf100 on a 16GB runner; a far larger SF would need
+-- the file split into <cap chunks, which the CustomerMgmt*.xml glob already reads).
 with actions as (
   select unnest(xml_extract_elements(xml, $x$//*[local-name()='Action']$x$)) as node
-  from read_xml_objects('{{ var("tpcdi_dir") }}/Batch1/CustomerMgmt*.xml')
+  from read_xml_objects('{{ var("tpcdi_dir") }}/Batch1/CustomerMgmt*.xml',
+                        maximum_file_size => 2000000000)
 ),
 raw as (
   select
