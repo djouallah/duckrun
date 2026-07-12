@@ -65,14 +65,19 @@ OneLake (`Files/tpcdi`) as the durable seed.
 - **Data generator — we drive PDGF, not DIGen.** DIGen is TPC-licensed and not
   vendored; `generate_data.py` shallow-clones the dbx repo (which carries the whole
   standalone DIGen + PDGF toolkit). It does **not** call `DIGen.jar`, though: DIGen
-  merely shells out to `pdgf.jar -closeWhenDone -start`, which parses the schema and
-  exits *without* ever scanning `plugins/` — so the TPC-DI plugin (custom timeframe
-  modes / generators) is never registered and the schema parse dies on
-  `gen_ReferenceGenerator from="DailyMarket-…"`. Instead we launch `pdgf.jar`
-  directly and drive its shell — `reloadPlugins` (register the plugin) **before**
-  `load config/tpc-di-generation.xml` then `start`. `-sf` is the TPC-DI factor ×1000
-  (what DIGen applies). No Spark. Override the source with `DBX_TPCDI_REPO` /
-  `DBX_TPCDI_REF`.
+  shells out to `java -jar pdgf.jar …`, but this datagen's `pdgf.jar` manifest omits
+  `plugins/tpc-di.jar`, and PDGF discovers its generators/timeframe-modes by scanning
+  `java.class.path` — which under `-jar` holds only `pdgf.jar`. So the plugin is never
+  seen and the parse dies on `tpc.di.generators.HRJobIdGenerator was not found` (then
+  the custom `gen_ReferenceGenerator from="DailyMarket-…"` mode). We instead run
+  `java -cp pdgf.jar:plugins/tpc-di.jar:extlib/* pdgf.Controller -sf N000 -start
+  -closeWhenDone` — the plugin on `-cp` puts it on `java.class.path` so the scan
+  registers everything. We pass **no** `-o` (PDGF splices it into a javassist-compiled
+  file template un-quoted, which won't compile) and let PDGF write its default
+  `output/Batch{1,2,3}`, which the script moves under the staging dir; and we keep
+  stdin open after the license ENTER+YES so PDGF's shell thread can't flood-kill the
+  run. `-sf` is the TPC-DI factor ×1000 (what DIGen applies). No Spark. Override the
+  source with `DBX_TPCDI_REPO` / `DBX_TPCDI_REF`.
 - **OneLake seed.** After generation, `upload_to_onelake.py` lands `Batch1/2/3` in
   the lakehouse `Files/tpcdi` section via duckrun's `conn.copy()` (`WAREHOUSE_PATH` =
   the OneLake Tables path, `ONELAKE_TOKEN` = a storage bearer token). This is the

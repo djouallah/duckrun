@@ -6,26 +6,29 @@ databricks-tpc-di repo, which carries the whole datagen toolkit (DIGen.jar + the
 PDGF engine it drives), and run it at build time. Override the source repo with
 DBX_TPCDI_REPO / DBX_TPCDI_REF if the default becomes unavailable.
 
-Why we drive `pdgf/pdgf.jar` and NOT `DIGen.jar`
-------------------------------------------------
-DIGen generates nothing itself; it shells out to `pdgf.jar -closeWhenDone -start`.
-That flag combo makes PDGF parse the schema during command-line processing and exit
-immediately — it NEVER enters the interactive shell, and the shell is the only place
-PDGF scans its `plugins/` folder. So the TPC-DI plugin (`plugins/tpc-di.jar`, which
-registers custom timeframe modes DailyMarketTimeFrameMode / TradeTimeFrameMode and
-generators like HRJobIdGenerator) is never registered, and the schema parse dies on
-`gen_ReferenceGenerator from="DailyMarket-FinWireSecMapping"` ("value unsupported").
-Putting the plugin classes on the classpath can't help — registration is an active
-step PDGF only performs on a plugin scan, not a classloader lookup.
+Why we drive `pdgf.Controller` via `-cp` and NOT `DIGen.jar`
+------------------------------------------------------------
+DIGen generates nothing itself; it shells out to `java -jar pdgf.jar …`. The TPC-DI
+generators and custom timeframe modes (tpc.di.generators.HRJobIdGenerator,
+tpc/di/DailyMarketTimeFrameMode, …) live in `plugins/tpc-di.jar`, but this datagen's
+`pdgf.jar` manifest Class-Path does NOT list that plugin — and PDGF discovers its
+generator/mode classes by scanning `java.class.path`, which under `java -jar pdgf.jar`
+contains only pdgf.jar. So the plugin is never seen and the schema parse dies on
+`tpc.di.generators.HRJobIdGenerator was not found` (and then on the custom
+`gen_ReferenceGenerator from="DailyMarket-…"` mode). Manifest/classloader tricks don't
+help: the scan reads `java.class.path` specifically.
 
-So we launch `pdgf.jar` ourselves (cwd = pdgf/, so config/ and plugins/ resolve) and
-drive its interactive shell: `reloadPlugins` (scan plugins/ → register the custom
-modes/generators) BEFORE `load config/tpc-di-generation.xml` and `start`. That's the
-one order in which the schema parse succeeds headlessly. `-sf` is the TPC-DI scale
-factor ×1000, the same scaling DIGen applies. The TPC-DI plugin's own output writers
-(TradeSourceOutput / CustomerMgmtScheduler / AuditPersistenceStore) produce
-Batch1/2/3 during `start`, so we get the same files DIGen would — only DIGen's
-`digen_report.txt` is skipped (the test doesn't need it).
+So we launch PDGF ourselves as `java -cp pdgf.jar:plugins/tpc-di.jar:extlib/*
+pdgf.Controller -sf N000 -start -closeWhenDone` (cwd = pdgf/). Putting the plugin on
+`-cp` is what carries it onto `java.class.path` so the scan registers every custom
+class. Two headless quirks we handle:
+  • No `-o`. PDGF splices `-o` into a javassist-compiled fileTemplate *un-quoted*, so
+    any real path fails to compile ("no such field" / "; is missing"). We let PDGF
+    write to its default `<pdgf>/output/Batch{1,2,3}` and move those under <out>.
+  • Keep stdin OPEN. `-start` runs alongside an interactive shell thread; if stdin
+    hits EOF that thread loops on null commands into PDGF's flood-prevention kill,
+    aborting generation mid-run. We send ENTER+YES (license) then leave stdin open so
+    the thread blocks. `-sf` is the TPC-DI scale ×1000, the scaling DIGen applies.
 
 Produces <out>/Batch1, Batch2, Batch3. The CustomerMgmt.xml files are read
 directly by dbt via the `webbed` DuckDB extension (see models/staging), so there
@@ -76,49 +79,38 @@ def _fetch_datagen(work: str) -> str:
 
 
 def _run_digen(datagen: str, sf: int, out: str):
-    """Generate the data by driving PDGF's interactive shell directly.
+    """Generate the data by running pdgf.Controller with the TPC-DI plugin on the classpath.
 
-    We launch `pdgf/pdgf.jar` (cwd = pdgf/, so config/ and plugins/ resolve) with
-    the TPC-DI scale (`-sf N*1000`, matching DIGen) and the output dir, but WITHOUT
-    `-start`/`-closeWhenDone` on the command line — those would parse the schema
-    before any plugin scan. Instead we feed the shell, in order:
-
-        <ENTER> / YES   accept the BANKMARK license
-        reloadPlugins   scan plugins/ → register the TPC-DI modes + generators
-        closeWhenDone   exit once generation finishes
-        load <config>   load the generation project (references the schema)
-        start           generate
-        exit            safety net
-
-    reloadPlugins BEFORE load is the whole point: it registers the custom timeframe
-    modes/generators so the schema parse resolves `gen_ReferenceGenerator`.
+    See the module docstring for why: the plugin must be on `java.class.path` (hence `-cp`,
+    not `-jar`), we must NOT pass `-o` (it breaks a javassist-compiled fileTemplate), and we
+    keep stdin open so PDGF's shell thread doesn't flood-kill the run. PDGF writes to
+    `<pdgf>/output/Batch{1,2,3}`, which we then move under <out>.
     """
     out = os.path.abspath(out)
     os.makedirs(out, exist_ok=True)
     pdgf_dir = os.path.join(datagen, "pdgf")
     if not os.path.isfile(os.path.join(pdgf_dir, "pdgf.jar")):
         sys.exit(f"ERROR: pdgf.jar not found under {pdgf_dir}")
+    if not os.path.isfile(os.path.join(pdgf_dir, "plugins", "tpc-di.jar")):
+        sys.exit(f"ERROR: plugins/tpc-di.jar not found under {pdgf_dir}")
 
-    # -sf is the TPC-DI scale factor (floored at 3) ×1000 — the PDGF-native scale
-    # DIGen applies internally. Config path is relative to cwd (pdgf/).
+    pdgf_out = os.path.join(pdgf_dir, "output")
+    shutil.rmtree(pdgf_out, ignore_errors=True)  # start clean so we only move this run's files
+
+    # -sf is the TPC-DI scale factor (floored at 3) ×1000 — the PDGF-native scale DIGen applies.
+    # `extlib/*` is glob-expanded by the JVM; os.pathsep keeps the classpath portable.
     scale = max(sf, 3)
-    config = "config/tpc-di-generation.xml"
-    cmd = ["java", "-Xmx2g", "-jar", "pdgf.jar", "-sf", str(scale * 1000), "-o", out]
+    classpath = os.pathsep.join(["pdgf.jar", "plugins/tpc-di.jar", "extlib/*"])
+    cmd = ["java", "-Xmx2g", "-cp", classpath, "pdgf.Controller",
+           "-sf", str(scale * 1000), "-start", "-closeWhenDone"]
     print(f"  running PDGF: {' '.join(cmd)}  (cwd={pdgf_dir}, tpcdi_sf={scale})", flush=True)
     p = subprocess.Popen(
         cmd, cwd=pdgf_dir, text=True,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
-    # License prompt (ENTER reveals it, YES accepts), then drive the shell. Sending
-    # the whole script up front is fine — PDGF reads commands line by line.
-    p.stdin.write(
-        "\nYES\n"
-        "reloadPlugins\n"
-        "closeWhenDone\n"
-        f"load {config}\n"
-        "start\n"
-        "exit\n"
-    )
+    # ENTER+YES accepts the BANKMARK license; then leave stdin OPEN (see docstring) so the
+    # interactive shell thread blocks on read instead of EOF-looping into flood-prevention.
+    p.stdin.write("\nYES\n")
     p.stdin.flush()
 
     # Watchdog: if generation hangs, kill it so the job fails fast with full
@@ -152,6 +144,17 @@ def _run_digen(datagen: str, sf: int, out: str):
         sys.exit("ERROR: PDGF timed out")
     if rc != 0:
         sys.exit(f"ERROR: PDGF exited {rc}")
+
+    # PDGF wrote to <pdgf>/output/Batch{1,2,3}; move that tree under <out>.
+    if not os.path.isdir(pdgf_out):
+        sys.exit(f"ERROR: PDGF produced no output/ under {pdgf_dir}")
+    for name in sorted(os.listdir(pdgf_out)):
+        dst = os.path.join(out, name)
+        if os.path.isdir(dst):
+            shutil.rmtree(dst)
+        elif os.path.exists(dst):
+            os.remove(dst)
+        shutil.move(os.path.join(pdgf_out, name), dst)
     if not os.path.isdir(os.path.join(out, "Batch1")):
         sys.exit(f"ERROR: no Batch1/ produced under {out}")
 
