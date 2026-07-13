@@ -25,7 +25,7 @@ on:
     # (the scorecards they commit to docs with [skip ci] — conformance / connection / snapshot-pin
     # from cores, the SF=100 TPC-H card from local_stress_tests — which would otherwise not reach the
     # site, since [skip ci] suppresses the docs-push trigger).
-    workflows: ["integration_tests_onelake", "aemo", "tpc-di", "cores", "local_stress_tests", "parity"]
+    workflows: ["integration_tests_onelake", "aemo", "cores", "local_stress_tests", "parity"]
     types: [completed]
     branches: [main]
   workflow_dispatch:
@@ -101,13 +101,6 @@ jobs:
             echo "Reusing aemo docs from run $AEMO_RUN_ID"
             gh run download "$AEMO_RUN_ID" --pattern 'docs-aemo' --dir docs-artifacts || true
           fi
-          # tpc-di docs (its own workflow, builds the warehouse on OneLake) — pull from its latest run.
-          TPCDI_RUN_ID="$(gh run list --workflow=tpc_di.yml --branch=main \
-            --status=success --limit=1 --json databaseId --jq '.[0].databaseId' || true)"
-          if [ -n "${TPCDI_RUN_ID:-}" ]; then
-            echo "Reusing tpc-di docs from run $TPCDI_RUN_ID"
-            gh run download "$TPCDI_RUN_ID" --pattern 'docs-tpcdi' --dir docs-artifacts || true
-          fi
           # Overlay the per-project DAG catalogs and the live demo reports onto the built site.
           cp_art() { [ -f "$1" ] && cp "$1" "site/$2" && echo "  from artifact: $2"; }
           cp_art docs-artifacts/docs-aemo/static_index.html        aemo.html            || true
@@ -120,10 +113,9 @@ jobs:
           cp_art docs-artifacts/docs-multicatalog-dbt-page/multicatalog_dbt_run.html multicatalog_dbt.html || true
           cp_art docs-artifacts/docs-jaffle_shop/static_index.html jaffle_shop.html     || true
           cp_art docs-artifacts/docs-tuva/static_index.html        tuva.html            || true
-          cp_art docs-artifacts/docs-tpcdi/static_index.html       tpcdi.html           || true
           # Safety net: for any example page still absent (artifact download failed and no committed
           # fallback), preserve whatever is currently published so a deploy never wipes a live page.
-          for p in aemo coffee sde mrr techflow taxi multicatalog multicatalog_dbt jaffle_shop tuva tpcdi; do
+          for p in aemo coffee sde mrr techflow taxi multicatalog multicatalog_dbt jaffle_shop tuva; do
             if [ ! -f "site/$p.html" ]; then
               if curl -fsS "https://djouallah.github.io/duckrun/$p.html" -o "site/$p.html"; then
                 echo "  preserved live: $p.html"

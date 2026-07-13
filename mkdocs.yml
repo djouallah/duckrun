@@ -128,7 +128,6 @@ nav:
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
-      - TPC-DI: https://djouallah.github.io/duckrun/tpcdi.html
   - Internals:
       - Overview: overview.md
       - Design document: design_document.md
