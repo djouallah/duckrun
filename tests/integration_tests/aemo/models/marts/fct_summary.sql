@@ -6,8 +6,7 @@
 {{ config(
     materialized='table',
     schema='mart',
-    merge_schema=true,
-    post_hook="CREATE OR REPLACE TABLE {{ this }} SORTED BY (date, DUID) AS SELECT * FROM {{ this }}"
+    merge_schema=true
 ) }}
 
 WITH summary AS (
