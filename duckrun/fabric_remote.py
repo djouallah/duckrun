@@ -257,16 +257,12 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
     commands = [_normalize_command(c, "PROJ") for c in commands]
     env = env or {}
 
+    # Install into the job kernel. NO restartPython() here: in a RunNotebook job restarting the kernel
+    # makes the job exit -9 ("Ipython kernel exits with code -9"). A fresh job kernel hasn't imported
+    # duckdb/deltalake yet, so the just-installed wheels load on first import in the work cell below.
     setup = (
         "import subprocess, sys\n"
         f"subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', {install_target!r}], check=False)\n"
-        # A fresh duckdb/deltalake wheel must replace whatever Fabric preloaded, or duckrun's runtime
-        # guard trips; restart the kernel so the next cell imports the just-installed versions.
-        "try:\n"
-        "    import notebookutils\n"
-        "    notebookutils.session.restartPython()\n"
-        "except Exception:\n"
-        "    pass\n"
     )
 
     work = (
