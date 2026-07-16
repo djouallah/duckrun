@@ -24,8 +24,11 @@ permissions:
   contents: read
   id-token: write
 
+# Own group (NOT the local aemo.yml's aemo-onelake): a push that touches aemo/** fires aemo.yml,
+# and a shared group would leave this dispatched run pending/cancelled behind it. Manual + I control
+# timing, so concurrent writes to the shared lakehouse are my responsibility.
 concurrency:
-  group: aemo-onelake
+  group: aemo-remote
   cancel-in-progress: false
 
 jobs:
@@ -70,6 +73,6 @@ jobs:
       - name: Generate external sources (calendar Delta table — external, NOT embedded)
         run: python scripts/generate_calendar.py
       - name: Remote dbt build on Fabric (cores=8, throwaway notebook)
-        # Ships this commit's duckrun (git+@$GITHUB_SHA) into the notebook so the build tests the
-        # branch. Exit non-zero if the remote dbt build fails.
-        run: python scripts/run_remote_build.py
+        # -u = unbuffered stdout so the [duckrun.remote] progress + log tail survive even if the step
+        # is interrupted. Exit non-zero if the remote dbt build fails.
+        run: python -u scripts/run_remote_build.py

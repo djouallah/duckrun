@@ -114,12 +114,16 @@ def test_build_notebook_embeds_project_commands_and_cores():
 
 
 def test_build_notebook_is_python_notebook_not_pyspark():
-    # The metadata Fabric keys off to treat the item as a pure Python notebook (not PySpark).
+    # The metadata Fabric keys off to treat the item as a pure Python notebook (not PySpark) —
+    # kernel_info.name / kernelspec.name == "jupyter" (Spark uses "synapse_pyspark").
     nb = fr.build_notebook("r", "eA==", [["run"]], "abfss://x/Files/r.json", "duckrun", None, 8)
     md = nb["metadata"]
+    assert md["kernel_info"]["name"] == "jupyter"
+    assert md["kernelspec"]["name"] == "jupyter"
     assert md["microsoft"]["language_group"] == "jupyter_python"
-    assert md["kernelspec"]["name"] == "python3"
     assert md["language_info"]["name"] == "python"
+    # every cell carries the language marker too
+    assert all(c["metadata"]["microsoft"]["language_group"] == "jupyter_python" for c in nb["cells"])
 
 
 def test_build_notebook_cores_configure_cell_and_restart():

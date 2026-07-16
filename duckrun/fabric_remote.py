@@ -323,9 +323,12 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         "notebookutils.notebook.exit(json.dumps({'runid': RUNID, 'results': results}))\n"
     )
 
+    # Every cell also carries the Python language marker (matches a real Fabric Python notebook).
+    _cell_md = {"microsoft": {"language": "python", "language_group": "jupyter_python"}}
+
     def _cell(src):
         return {"cell_type": "code", "source": src.splitlines(keepends=True),
-                "metadata": {}, "execution_count": None, "outputs": []}
+                "metadata": dict(_cell_md), "execution_count": None, "outputs": []}
 
     cells = [_cell(configure)] if configure else []
     cells += [_cell(setup), _cell(work)]
@@ -334,13 +337,16 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         "nbformat": 4,
         "nbformat_minor": 5,
         "cells": cells,
-        # This metadata is what makes Fabric treat the item as a PURE PYTHON notebook (not PySpark):
-        # microsoft.language_group == "jupyter_python", python3 kernelspec, python language_info. Without
-        # it the item defaults to a Spark notebook and restartPython()/single-node compute don't apply.
+        # EXACTLY the metadata a real Fabric PURE-PYTHON notebook carries (copied from a known-good
+        # one). The determinant is kernel_info.name == "jupyter" (PySpark uses "synapse_pyspark") plus
+        # kernelspec.name == "jupyter" and microsoft.language_group == "jupyter_python". Getting any of
+        # these wrong makes Fabric create a Spark notebook, where restartPython() crashes the job (-9).
         "metadata": {
-            "kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},
+            "kernelspec": {"name": "jupyter", "language": "Jupyter", "display_name": "Jupyter"},
             "language_info": {"name": "python"},
             "microsoft": {"language": "python", "language_group": "jupyter_python"},
+            "kernel_info": {"name": "jupyter", "jupyter_kernel_name": "python3.12"},
+            "dependencies": {"lakehouse": {}},
             "duckrun": {"cores": cores, "runid": runid},
         },
     }
