@@ -12,13 +12,13 @@ on:
   workflow_dispatch:
     inputs:
       download_limit:
-        description: "files to download per source (default 10)"
+        description: "files to download per source (remote default 100 — bigger than local aemo's 10)"
         type: string
-        default: "10"
+        default: "100"
       process_limit:
-        description: "CSV files to fold into the marts (default 25)"
+        description: "CSV files to fold into the marts (remote default 500 — bigger than local aemo's 25)"
         type: string
-        default: "25"
+        default: "500"
 
 permissions:
   contents: read
@@ -44,8 +44,10 @@ jobs:
       DBT_SCHEMA: mart
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      download_limit: ${{ inputs.download_limit || '10' }}
-      process_limit: ${{ inputs.process_limit || '25' }}
+      # Turned up well past the local aemo runner (10 / 25): the point of going remote is Fabric
+      # compute, so process a much larger slice of AEMO data than a 2-core GitHub runner could.
+      download_limit: ${{ inputs.download_limit || '100' }}
+      process_limit: ${{ inputs.process_limit || '500' }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -72,7 +74,7 @@ jobs:
           echo "FABRIC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Generate external sources (calendar Delta table — external, NOT embedded)
         run: python scripts/generate_calendar.py
-      - name: Remote dbt build on Fabric (cores=8, throwaway notebook)
-        # -u = unbuffered stdout so the [duckrun.remote] progress + log tail survive even if the step
-        # is interrupted. Exit non-zero if the remote dbt build fails.
+      - name: Remote dbt build + test on Fabric (cores=8, ONE throwaway notebook)
+        # build then test in a single notebook. -u = unbuffered stdout so the [duckrun.remote]
+        # progress + log tails survive even if the step is interrupted. Exit non-zero on any failure.
         run: python -u scripts/run_remote_build.py
