@@ -4,7 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.19]
+
+### Added
+- **`RemoteRunner` — run a dbt project on Microsoft Fabric compute.** A drop-in for dbt's
+  `dbtRunner` that ships the dbt logic into a temporary Fabric Python notebook, runs the command
+  there, streams the log back, and deletes the notebook. Swap `dbtRunner()` for
+  `RemoteRunner(cores=8)` to move a build off your laptop/runner onto Fabric, co-located with the
+  lakehouse. Only the dbt logic is embedded (with a token-scrubbed `profiles.yml`); external data
+  assets stay in OneLake, non-secret `env_var` config is auto-forwarded, and the OneLake token never
+  travels (the notebook uses `notebookutils`). See [Remote execution on Fabric](remote.md).
+
 ### Fixed
+- **The dbt adapter now falls back to `notebookutils` for the OneLake token when the profile has
+  none.** Inside a Fabric notebook a read-only command (`dbt test` / `show` / `docs`) discovered
+  tables via the OneLake REST list, which needs an explicit bearer token; with no token in the
+  profile it found zero tables and failed with "schema does not exist". Discovery now acquires a
+  token from the live source (the same fallback `duckrun.connect()` uses), so an in-notebook dbt run
+  needs no token in `profiles.yml`.
 - **Snapshot metadata columns are now timezone-aware, not `TIMESTAMP_NTZ` (issue #9).** dbt's
   snapshot timestamps (`dbt_valid_from` / `dbt_valid_to` / `dbt_updated_at`) dispatched to
   dbt-duckdb's `snapshot_get_time` / `snapshot_string_as_time`, which cast to a bare
