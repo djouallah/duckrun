@@ -24,9 +24,9 @@ on:
         type: string
         default: "1000"
       process_limit:
-        description: "CSV files to fold into the marts per build (default 365)"
+        description: "CSV files to fold into the marts per build (default 1000)"
         type: string
-        default: "365"
+        default: "1000"
 
 permissions:
   contents: read
@@ -55,11 +55,11 @@ jobs:
       # The remote build runs on Fabric with RemoteRunner placing all scratch (DuckDB spill, delta_rs
       # write staging, tempfile, dbt target) on the notebook's ~135 GiB local work disk instead of the
       # cramped ~19 GiB /tmp. process_limit caps how many CSVs the fct_scada/fct_price merge folds per
-      # run; 365 keeps each fct_scada batch's month-partition span (and thus the merge spill) under
-      # DuckDB's ~100 GB cap on that disk — the spill scales with how many monthly partitions the
-      # merge rewrites, not just the file count, so keep the batch small.
+      # run; the spill scales with how many monthly partitions the merge rewrites. 1000 clears the
+      # whole remaining daily backlog in one run; the bound is DuckDB's ~100 GB spill cap on that disk,
+      # so if this overruns it, drop back down (or raise DuckDB max_temp_directory_size toward 135 GiB).
       download_limit: ${{ inputs.download_limit || '1000' }}
-      process_limit: ${{ inputs.process_limit || '365' }}
+      process_limit: ${{ inputs.process_limit || '1000' }}
       # Pre-flight cutoff: <= this many new pending files -> run dbt locally on the runner (no Fabric
       # spin-up); more than this -> go remote. A quick re-run has ~0 new files (local); a fresh
       # lakehouse / long gap has 100s (remote). See scripts/run_build.py.
