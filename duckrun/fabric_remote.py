@@ -646,7 +646,7 @@ class RemoteRunner:
 
         log_text = result.get("log", "")
         if log_text:
-            _print_log_tail(log_text)
+            _print_remote_log(log_text)
         return result.get("results", [])
 
 
@@ -663,8 +663,14 @@ def _apply(proxy: RemoteResult, res: dict) -> None:
     proxy.result = res.get("nodes", [])
 
 
-def _print_log_tail(log_text: str, lines: int = 40) -> None:
-    tail = log_text.splitlines()[-lines:]
-    _log("remote dbt log (tail):")
-    for line in tail:
+def _print_remote_log(log_text: str) -> None:
+    """Print the notebook's whole captured dbt log (every command), not just a tail.
+
+    The full remote stdout/stderr — every `dbt` command run in the notebook, plus any escaped
+    traceback — is captured in the result JSON. A short tail printed only the *last* command
+    (e.g. `test`), hiding an earlier `build` node's error behind it; surface all of it so CI
+    shows exactly why a remote run failed.
+    """
+    _log("remote dbt log:")
+    for line in log_text.splitlines():
         print(line)
