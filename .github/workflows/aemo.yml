@@ -89,7 +89,7 @@ jobs:
       - name: Generate external sources (calendar Delta table — external, NOT embedded)
         # dim_calendar is an external Delta table read via source('aemo','dim_calendar'), not a model.
         run: python scripts/generate_calendar.py
-      - name: Remote dbt build + test on Fabric (cores=8, ONE throwaway notebook)
+      - name: Remote dbt build + test on Fabric (cores=16, ONE throwaway notebook)
         # Ships the dbt logic into a temp Fabric Python notebook, runs build then test there (build's
         # inline tests + the standalone read-path test), deletes it. -u so the [duckrun.remote] log
         # tails survive interruption. Exit non-zero on any failure.
