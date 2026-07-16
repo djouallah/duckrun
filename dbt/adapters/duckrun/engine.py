@@ -567,16 +567,30 @@ def configure_duckdb_session(con) -> None:
         con.execute("SET parquet_metadata_cache=true")
     except Exception:
         pass
-    # An in-memory DuckDB can default to an empty temp_directory and then *cannot* spill; give it
-    # one so a tight memory_limit (set later for a merge) degrades to disk instead of an error.
+    # Spill location for BOTH DuckDB (temp_directory) and delta_rs / Python tempfile (TMPDIR). On a
+    # Fabric notebook /home/trusted-service-user/work is a ~135 GiB local disk while / and /tmp are a
+    # cramped ~19 GiB overlay; delta_rs stages writes to TMPDIR (default /tmp) and DuckDB spills to
+    # temp_directory, so a large merge fills /tmp. Point both at the work disk. delta_rs (Rust) only
+    # reads the TMPDIR env — SET temp_directory alone won't move it — so export TMPDIR too. Off Fabric
+    # the work dir is absent: keep the cwd-based DuckDB spill and leave TMPDIR (system temp) untouched.
+    _work = "/home/trusted-service-user/work"
+    on_fabric = os.path.isdir(_work)
+    spill_dir = os.path.join(_work if on_fabric else os.getcwd(), ".duckrun_spill")
+    try:
+        os.makedirs(spill_dir, exist_ok=True)
+        if on_fabric:
+            os.environ.setdefault("TMPDIR", spill_dir)  # delta_rs + tempfile off the tiny /tmp
+    except Exception:  # best-effort: never abort connection setup over a spill dir
+        pass
+    # An in-memory DuckDB defaults to an empty temp_directory and then *cannot* spill; give it one so a
+    # tight memory_limit (set later for a merge) degrades to disk instead of erroring. Respect an
+    # explicit temp_directory (a file-backed DB, or a user override).
     try:
         tmp = con.execute("SELECT current_setting('temp_directory')").fetchone()[0]
     except Exception:  # best-effort: if we can't read it, skip overriding rather than guess
         tmp = "skip"  # couldn't read it; don't risk overriding
     if not tmp:
-        spill_dir = os.path.join(os.getcwd(), ".duckrun_duckdb_spill")
         try:
-            os.makedirs(spill_dir, exist_ok=True)
             con.execute(f"SET temp_directory='{spill_dir}'")
         except Exception:  # best-effort spill dir: failure just leaves the default in place
             pass
