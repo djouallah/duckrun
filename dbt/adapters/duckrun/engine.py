@@ -485,7 +485,8 @@ def mem_profile(label: str, con=None, interval: float = 0.1):
 # tight limit, whereas the delta_rs pool is brittle, so the merge gets the bulk. 0.3 + 0.6 leaves
 # ~10% slack for Python, Arrow buffers, and page cache.
 _DUCKDB_MEM_FRACTION = 0.3   # DuckDB's memory_limit (see set_merge_memory_limit)
-_MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size
+_MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size (in-memory pool)
+_MERGE_TEMP_DIR_FRACTION = 0.8  # delta_rs merge max_temp_directory_size, as a share of free spill disk
 
 # Write path (overwrite/append/append_if_unchanged/microbatch): DuckDB runs alone — no competing delta_rs
 # merge pool — so it gets the bulk of the cap, not a 0.3 share. But it must still be BOUNDED to the
@@ -511,6 +512,34 @@ def _default_merge_spill_size() -> Optional[int]:
     large source the total can still exceed the cap. Override with ``merge_max_spill_size``."""
     limit = _effective_mem_limit_bytes()
     return int(limit * _MERGE_SPILL_FRACTION) if limit else None
+
+
+def _merge_spill_dir() -> str:
+    """Where delta_rs (DataFusion) writes merge spill files: TMPDIR when set — the adapter points it
+    at the roomy Fabric work disk in configure_duckdb_session — else the platform temp dir. This is
+    the disk whose free space bounds the merge's on-disk spill."""
+    import tempfile
+    return os.environ.get("TMPDIR") or tempfile.gettempdir()
+
+
+def _default_merge_temp_dir_size() -> Optional[int]:
+    """delta_rs merge ``max_temp_directory_size`` default: ~80% of the FREE space on the spill disk.
+
+    DataFusion's DiskManager otherwise hard-caps on-disk merge spill at a flat 100 GB regardless of
+    how big the disk is — so a wide-partition merge aborts with "Resources exhausted ... exceeded the
+    allowable limit of 100.0 GB" on a box with terabytes free (exactly the Fabric work disk, ~1.9 TiB).
+    This is a SEPARATE limit from ``max_spill_size`` (which bounds the in-*memory* pool): this one
+    bounds bytes on disk. Sizing it to the actual disk lets a big merge spill as far as the disk allows.
+
+    0.8, not all of it, because DuckDB spills to the same disk during the merge (source collection) and
+    the dbt target dir + delta_rs write staging also live there — leave ~20% slack. None if free space
+    can't be read (then delta_rs keeps its 100 GB default). Override with ``merge_max_temp_directory_size``."""
+    import shutil
+    try:
+        free = shutil.disk_usage(_merge_spill_dir()).free
+    except Exception:
+        return None
+    return int(free * _MERGE_TEMP_DIR_FRACTION) or None
 
 
 # Units DuckDB emits from current_setting('memory_limit') (e.g. "25.0 GiB"). Binary (GiB) and
@@ -1493,6 +1522,7 @@ def merge_delta(
     insert_condition: Optional[str] = None,
     merge_schema: bool = False,
     max_spill_size: Optional[int] = None,
+    max_temp_directory_size: Optional[int] = None,
     streamed_exec: bool = False,
     read_version: Optional[int] = None,
     delete_unmatched_by_source=None,
@@ -1525,6 +1555,9 @@ def merge_delta(
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
       join to disk instead of OOMing. None -> default to ~60% of RAM (_default_merge_spill_size);
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
+    - max_temp_directory_size caps the merge's ON-DISK spill (bytes). delta_rs/DataFusion otherwise
+      hard-caps it at a flat 100 GB regardless of disk size, aborting a wide merge on a terabyte disk.
+      None -> default to ~80% of free space on the spill disk (_default_merge_temp_dir_size).
     - read_version (REQUIRED): pin the merge TARGET to this Delta version (the model's ``vB``).
       delta_rs then validates OCC over ``(vB, HEAD]`` — the exact window the model's pinned read of
       ``{{ this }}`` could not have seen — so the read and the commit share one snapshot
@@ -1598,6 +1631,7 @@ def merge_delta(
         merge_schema=merge_schema,
         streamed_exec=streamed_exec,
         max_spill_size=max_spill_size,
+        max_temp_directory_size=max_temp_directory_size,
         storage_options=storage_options,
         cur=cur,
     )
@@ -1667,6 +1701,7 @@ def merge_delta_clauses(
     merge_schema: bool = False,
     streamed_exec: bool = False,
     max_spill_size: Optional[int] = None,
+    max_temp_directory_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
 ) -> None:
@@ -1693,6 +1728,17 @@ def merge_delta_clauses(
     # (e.g. RAM undetectable, or caller explicitly passed 0 to opt out).
     spill_kwargs = {"max_spill_size": max_spill_size} if max_spill_size else {}
 
+    # On-disk spill cap (SEPARATE from the in-memory max_spill_size above). delta_rs/DataFusion
+    # otherwise hard-caps disk spill at a flat 100 GB regardless of disk size, aborting a wide merge
+    # on the ~1.9 TiB Fabric work disk. Default to ~80% of the spill disk's FREE space so the cap
+    # tracks the actual disk instead of a constant. Only forwarded when we have a positive value —
+    # None leaves delta_rs on its 100 GB default (same as omitting it before this existed).
+    if max_temp_directory_size is None:
+        max_temp_directory_size = _default_merge_temp_dir_size()
+    temp_dir_kwargs = (
+        {"max_temp_directory_size": max_temp_directory_size} if max_temp_directory_size else {}
+    )
+
     # Make the spill decision observable: this is the only way to confirm, from a normal dbt
     # run, that the cgroup-aware cap is actually being applied (and what value it picked).
     if spill_kwargs:
@@ -1703,6 +1749,14 @@ def merge_delta_clauses(
         )
     else:
         logger.info("merge spill cap: disabled (memory limit undetectable or opted out) — merge runs unbounded")
+    if temp_dir_kwargs:
+        logger.info(
+            f"merge disk spill cap: {max_temp_directory_size / 2**30:.2f} GiB "
+            f"({int(_MERGE_TEMP_DIR_FRACTION * 100)}% of free on {_merge_spill_dir()}) "
+            f"— overrides delta_rs's 100 GB default"
+        )
+    else:
+        logger.info("merge disk spill cap: delta_rs default (100 GB) — free disk space undetectable")
     logger.info(
         "merge target pruning: "
         + ("on (source stats derive an early filter)" if not streamed_exec
@@ -1852,6 +1906,7 @@ def merge_delta_clauses(
         merge_schema=False,
         streamed_exec=streamed_exec,
         **spill_kwargs,
+        **temp_dir_kwargs,
     )
     for c in clauses:
         merger = _apply_merge_clause(merger, c)

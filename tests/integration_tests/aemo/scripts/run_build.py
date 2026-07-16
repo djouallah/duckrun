@@ -131,9 +131,10 @@ def run_remote():
 
     # Batched: build then test in ONE notebook (one session start, one install). Normal released
     # duckrun from PyPI runs the project; the thing under test is RemoteRunner's orchestration.
-    # cores=64 for RAM headroom on the fct_scada merge: a bigger SKU does NOT enlarge the disk, but
-    # more RAM raises DuckDB's merge memory_limit (0.3x RAM) so less of a month-spanning merge spills
-    # to the ~135 GiB work disk (which DuckDB caps at ~100 GB). cores=32 overran it at process_limit=1000.
+    # cores=64 for RAM headroom on the fct_scada merge: more RAM raises DuckDB's merge memory_limit
+    # (0.3x RAM) and delta_rs's max_spill_size (0.6x RAM), so less of a month-spanning merge spills to
+    # disk. The Fabric work disk is ~1.9 TiB (NOT small); the old "100 GB" wall was delta_rs's
+    # max_temp_directory_size default, now sized to ~80% of free disk by the adapter.
     with RemoteRunner(
         cores=64,
         target="dev",

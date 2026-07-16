@@ -313,6 +313,7 @@ class Plugin(BasePlugin):
                         clause_specs,
                         merge_schema=evolve_schema,
                         max_spill_size=cfg.get("merge_max_spill_size"),
+                        max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                         streamed_exec=(False if sx is None else bool(sx)),
                         read_version=cfg.get("read_version"),
                         storage_options=storage_options,
@@ -329,6 +330,7 @@ class Plugin(BasePlugin):
                         insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
                         merge_schema=evolve_schema,
                         max_spill_size=cfg.get("merge_max_spill_size"),
+                        max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                         streamed_exec=(False if sx is None else bool(sx)),
                         # Pin the merge target to the version the model read (vB, captured before it
                         # read {{ this }}), so OCC validates (vB, HEAD] — read and commit are one snapshot.
