@@ -72,7 +72,8 @@ jobs:
           echo "FABRIC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Generate external sources (calendar Delta table — external, NOT embedded)
         run: python scripts/generate_calendar.py
-      - name: Remote dbt build on Fabric (cores=8, throwaway notebook)
-        # -u = unbuffered stdout so the [duckrun.remote] progress + log tail survive even if the step
-        # is interrupted. Exit non-zero if the remote dbt build fails.
+      - name: Remote dbt build + test + docs on Fabric (cores=8, throwaway notebooks)
+        # Runs the full dbt lifecycle remotely — build, a fresh-process test, and docs generate —
+        # each in its own temp notebook. -u = unbuffered stdout so the [duckrun.remote] progress + log
+        # tails survive even if the step is interrupted. Exit non-zero if any remote step fails.
         run: python -u scripts/run_remote_build.py
