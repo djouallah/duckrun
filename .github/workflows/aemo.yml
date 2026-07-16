@@ -20,13 +20,13 @@ on:
   workflow_dispatch:
     inputs:
       download_limit:
-        description: "files to download per source (remote default 100)"
+        description: "files to download per source (remote default 1000)"
         type: string
-        default: "100"
+        default: "1000"
       process_limit:
-        description: "CSV files to fold into the marts (remote default 500)"
+        description: "CSV files to fold into the marts (remote default 3000)"
         type: string
-        default: "500"
+        default: "3000"
 
 permissions:
   contents: read
@@ -52,10 +52,10 @@ jobs:
       # that outlives the ~1h bearer token on a long backfill. See auth._github_oidc_token.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      # Turned up past the old local runner (10 / 25): the build now runs on Fabric compute, so
+      # Turned up far past the old local runner (10 / 25): the build now runs on Fabric compute, so
       # process a much larger slice of AEMO data than a 2-core GitHub runner could.
-      download_limit: ${{ inputs.download_limit || '100' }}
-      process_limit: ${{ inputs.process_limit || '500' }}
+      download_limit: ${{ inputs.download_limit || '1000' }}
+      process_limit: ${{ inputs.process_limit || '3000' }}
       # The azure extension's default transport fails the OneLake TLS handshake on the runner
       # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
       AZURE_TRANSPORT_OPTION_TYPE: curl
