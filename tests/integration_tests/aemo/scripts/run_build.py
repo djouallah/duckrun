@@ -99,8 +99,8 @@ def run_remote():
 
     # Batched: build then test in ONE notebook (one session start, one install). Normal released
     # duckrun from PyPI runs the project; the thing under test is RemoteRunner's orchestration.
-    # cores=32: a bigger Fabric SKU brings more RAM AND a larger local disk, so DuckDB's merge spill
-    # (fct_scada) has room instead of hitting the smaller notebook's ~19 GiB temp disk.
+    # cores=32 for RAM headroom on the fct_scada merge (a bigger SKU does NOT enlarge /tmp — the
+    # notebook disk wall is fixed; RemoteRunner handles that by placing scratch on the 135 GiB work disk).
     with RemoteRunner(
         cores=32,
         target="dev",

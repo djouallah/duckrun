@@ -281,11 +281,20 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         "import os, io, json, base64, zipfile, contextlib, traceback\n"
         f"for _k, _v in {json.dumps(env)}.items():\n"
         "    os.environ[_k] = _v\n"
+        # A Fabric notebook's container disk (/, /tmp) is a cramped ~19 GiB overlay, but the
+        # working area /home/trusted-service-user/work is a ~135 GiB local disk. Run everything
+        # there — the project, dbt's target/, DuckDB's spill (it defaults temp_directory to cwd),
+        # delta_rs write staging + tempfile downloads (TMPDIR) — so a big build doesn't fill /tmp.
+        # Fall back to /tmp off Fabric (the dir won't exist), keeping RemoteRunner host-agnostic.
+        "_SCRATCH = '/home/trusted-service-user/work' if os.path.isdir('/home/trusted-service-user/work') else '/tmp'\n"
+        "_TMPDIR = os.path.join(_SCRATCH, 'duckrun_tmp')\n"
+        "os.makedirs(_TMPDIR, exist_ok=True)\n"
+        "os.environ['TMPDIR'] = _TMPDIR\n"
         f"RUNID = {runid!r}\n"
         f"RESULT_PATH = {result_path!r}\n"
         f"COMMANDS = {json.dumps(commands)}\n"
         f"PROJECT_B64 = {project_b64!r}\n"
-        "PROJ = '/tmp/duckrun_proj/' + RUNID\n"
+        "PROJ = os.path.join(_SCRATCH, 'duckrun_proj', RUNID)\n"
         "_buf = io.StringIO()\n"
         "results = []\n"
         "try:\n"
