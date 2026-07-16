@@ -36,12 +36,12 @@ _LISTINGS = {
 }
 
 
-def count_pending() -> int:
-    """New files (per source, capped at download_limit) not yet in the archive log."""
+def count_pending() -> dict:
+    """Per-source count of files in the nemweb Current listing not yet in the archive log —
+    the real download backlog. Returns {source_type: new_file_count}, uncapped."""
     import duckrun
 
     files_path = os.environ["FILES_PATH"].rstrip("/")
-    download_limit = int(os.environ.get("download_limit", "1000"))
     storage_options = (
         {"bearer_token": os.environ["ONELAKE_TOKEN"]}
         if files_path.startswith(("abfss://", "az://")) and os.environ.get("ONELAKE_TOKEN")
@@ -59,7 +59,7 @@ def count_pending() -> int:
         ).fetchall():
             done.add(key)
 
-    pending = 0
+    pending = {}
     for source_type, (url, like) in _LISTINGS.items():
         rows = conn.sql(f"""
             WITH html AS (SELECT content AS h FROM read_text('{url}')),
@@ -69,8 +69,7 @@ def count_pending() -> int:
             FROM lines
             WHERE line LIKE '{like}'
         """).fetchall()
-        new = sum(1 for (fn,) in rows if fn and f"{source_type}::{fn}" not in done)
-        pending += min(new, download_limit)
+        pending[source_type] = sum(1 for (fn,) in rows if fn and f"{source_type}::{fn}" not in done)
     return pending
 
 
@@ -115,17 +114,26 @@ def run_remote():
 
 def main() -> int:
     download_limit = int(os.environ.get("download_limit", "1000"))
+    process_limit = int(os.environ.get("process_limit", "365"))
     threshold = int(os.environ.get("REMOTE_THRESHOLD", "50"))
     try:
         pending = count_pending()
-        remote = pending > threshold
-        why = f"pending new files (capped at download_limit={download_limit}): {pending}"
+        total = sum(pending.values())
+        remote = total > threshold
+        # Print exactly what drives the local-vs-remote decision: the per-source backlog, the total,
+        # and how much of it this one run will actually move (bounded by download_limit/process_limit).
+        print("[aemo] pending files not yet in the archive log (nemweb Current listing):", flush=True)
+        for src in ("daily", "scada_today", "price_today"):
+            print(f"[aemo]   {src:12s}: {pending.get(src, 0)} new")
+        print(f"[aemo]   TOTAL: {total} pending  "
+              f"(this run downloads up to {download_limit}/source, folds up to {process_limit}/source into the marts)")
+        why = f"{total} pending {'>' if remote else '<='} threshold={threshold}"
     except Exception as exc:  # network/listing failure — fail safe to remote, don't risk local OOM
-        pending, remote = None, True
+        remote = True
         why = f"pre-flight count failed ({exc!r}); defaulting to remote"
 
     mode = "REMOTE (Fabric)" if remote else "LOCAL (runner)"
-    print(f"[aemo] {why}; threshold={threshold} -> running {mode}", flush=True)
+    print(f"[aemo] {why} -> running {mode}", flush=True)
 
     build, test = run_remote() if remote else run_local()
 
