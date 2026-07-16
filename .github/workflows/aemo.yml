@@ -56,6 +56,10 @@ jobs:
       # process a much larger slice of AEMO data than a 2-core GitHub runner could.
       download_limit: ${{ inputs.download_limit || '1000' }}
       process_limit: ${{ inputs.process_limit || '3000' }}
+      # Pre-flight cutoff: <= this many new pending files -> run dbt locally on the runner (no Fabric
+      # spin-up); more than this -> go remote. A quick re-run has ~0 new files (local); a fresh
+      # lakehouse / long gap has 100s (remote). See scripts/run_build.py.
+      REMOTE_THRESHOLD: '50'
       # The azure extension's default transport fails the OneLake TLS handshake on the runner
       # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
       AZURE_TRANSPORT_OPTION_TYPE: curl
@@ -89,11 +93,13 @@ jobs:
       - name: Generate external sources (calendar Delta table — external, NOT embedded)
         # dim_calendar is an external Delta table read via source('aemo','dim_calendar'), not a model.
         run: python scripts/generate_calendar.py
-      - name: Remote dbt build + test on Fabric (cores=16, ONE throwaway notebook)
-        # Ships the dbt logic into a temp Fabric Python notebook, runs build then test there (build's
-        # inline tests + the standalone read-path test), deletes it. -u so the [duckrun.remote] log
-        # tails survive interruption. Exit non-zero on any failure.
-        run: python -u scripts/run_remote_build.py
+      - name: dbt build + test — local for a small run, Fabric-remote (cores=32) for a big one
+        # Pre-flight counts new AEMO files pending (nemweb listings minus the archive log, capped by
+        # download_limit). Few pending (a quick re-run) -> run dbt LOCALLY in-process; many pending
+        # (a backfill / long gap) -> ship the logic to a throwaway Fabric Python notebook at cores=32.
+        # Local vs remote is just which runner run_build.py constructs. -u so the [duckrun.remote]
+        # log survives interruption; the full remote dbt log is printed. Exit non-zero on any failure.
+        run: python -u scripts/run_build.py
       - name: dbt docs generate (static, real catalog over abfss:// Delta tables)
         run: dbt docs generate --static --target dev
       - name: Verify the aemo catalog carries Delta table stats (issue #3)
