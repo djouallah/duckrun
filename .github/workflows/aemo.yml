@@ -1,9 +1,11 @@
 name: aemo
 
-# The AEMO project, built against live Microsoft Fabric OneLake (abfss://) — the build IS the
-# OneLake exercise, and the standalone `dbt test` is the abfss:// read-path regression gate. Then
-# static docs. Split out of integration_tests_onelake so it runs on its own, not behind the other
-# projects. Serialize across branches (and against the parquet-layout benchmark, which reads its
+# The AEMO project, run REMOTELY on Microsoft Fabric compute by default: the runner ships the dbt
+# logic into a throwaway Fabric Python notebook (RemoteRunner) that runs `dbt build` + `dbt test`
+# there, then deletes it — that's the point of going remote (Fabric compute, co-located with the
+# lakehouse, far bigger data than a 2-core runner). The runner only orchestrates + does the light
+# post-steps (docs, catalog stats, the SORTED BY AUTO dogfood) reading the remotely-built OneLake
+# tables. Serialize across branches (and against the parquet-layout benchmark, which reads its
 # fct_summary): it writes a single shared OneLake lakehouse.
 on:
   push:
@@ -18,13 +20,13 @@ on:
   workflow_dispatch:
     inputs:
       download_limit:
-        description: "files to download per source (default 10)"
+        description: "files to download per source (remote default 100)"
         type: string
-        default: "10"
+        default: "100"
       process_limit:
-        description: "CSV files to fold into the marts (default 25)"
+        description: "CSV files to fold into the marts (remote default 500)"
         type: string
-        default: "25"
+        default: "500"
 
 permissions:
   contents: read
@@ -50,8 +52,10 @@ jobs:
       # that outlives the ~1h bearer token on a long backfill. See auth._github_oidc_token.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      download_limit: ${{ inputs.download_limit || '10' }}
-      process_limit: ${{ inputs.process_limit || '25' }}
+      # Turned up past the old local runner (10 / 25): the build now runs on Fabric compute, so
+      # process a much larger slice of AEMO data than a 2-core GitHub runner could.
+      download_limit: ${{ inputs.download_limit || '100' }}
+      process_limit: ${{ inputs.process_limit || '500' }}
       # The azure extension's default transport fails the OneLake TLS handshake on the runner
       # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
       AZURE_TRANSPORT_OPTION_TYPE: curl
@@ -71,22 +75,25 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
+      - name: Acquire a fresh OneLake storage token (calendar pre-step + reading the run log + local post-steps)
         # Bearer tokens last ~1h, so mint one per run. OneLake takes Azure Storage AAD tokens.
         run: |
           TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
           echo "::add-mask::$TOKEN"
           echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Generate external sources (calendar Delta table)
+      - name: Acquire a Fabric control-plane token (create/run/delete the temp notebook)
+        run: |
+          TOKEN=$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "FABRIC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Generate external sources (calendar Delta table — external, NOT embedded)
         # dim_calendar is an external Delta table read via source('aemo','dim_calendar'), not a model.
         run: python scripts/generate_calendar.py
-      - name: dbt build (OneLake — creates Delta tables over abfss://)
-        run: dbt build --target dev --exclude tag:heavy
-      - name: dbt test (fresh process — read-only delta_scan registration over abfss://)
-        # A standalone `dbt test` materializes nothing, so it only passes if the adapter re-registers
-        # every Delta table as a delta_scan view at run start — which on OneLake needs the Azure
-        # secret created at connection-open. The regression gate for "schema does not exist".
-        run: dbt test --target dev --exclude tag:heavy
+      - name: Remote dbt build + test on Fabric (cores=8, ONE throwaway notebook)
+        # Ships the dbt logic into a temp Fabric Python notebook, runs build then test there (build's
+        # inline tests + the standalone read-path test), deletes it. -u so the [duckrun.remote] log
+        # tails survive interruption. Exit non-zero on any failure.
+        run: python -u scripts/run_remote_build.py
       - name: dbt docs generate (static, real catalog over abfss:// Delta tables)
         run: dbt docs generate --static --target dev
       - name: Verify the aemo catalog carries Delta table stats (issue #3)
