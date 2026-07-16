@@ -65,6 +65,37 @@ _snapshot_sql = """
 """
 
 
+class TestSnapshotTimestampsAreTimezoneAware:
+    """Issue #9: snapshot SCD2 metadata columns must be timezone-aware (Delta `timestamp`,
+    isAdjustedToUTC=true), NOT TIMESTAMP_NTZ. Fabric's SQL endpoint rejects timestampNtz.
+
+    dbt-duckdb's snapshot_get_time casts to a bare ``::timestamp`` (NTZ); duckrun overrides it to
+    keep the time zone (now() -> TIMESTAMPTZ). delta_scan maps a Delta `timestamp` back to
+    DuckDB TIMESTAMP WITH TIME ZONE and a timestampNtz to plain TIMESTAMP, so typeof() over the
+    snapshot's delta_scan view distinguishes the two — pre-fix these read 'TIMESTAMP'."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"snap_source.sql": _source_v1}
+
+    @pytest.fixture(scope="class")
+    def snapshots(self):
+        return {"col_snapshot.sql": _snapshot_sql}
+
+    def test_metadata_columns_are_timestamptz(self, project):
+        run_dbt(["run"])
+        results = run_dbt(["snapshot"])
+        assert all(r.status == "success" for r in results)
+
+        relation = relation_from_name(project.adapter, "col_snapshot")
+        types = project.run_sql(
+            f"select typeof(dbt_valid_from), typeof(dbt_updated_at), typeof(dbt_valid_to) "
+            f"from {relation} limit 1",
+            fetch="one",
+        )
+        assert all(t == "TIMESTAMP WITH TIME ZONE" for t in types), types
+
+
 class TestSnapshotSchemaEvolution:
     """A column added upstream between snapshot runs must be tracked, not dropped,
     and existing SCD2 history must be preserved."""

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **Snapshot metadata columns are now timezone-aware, not `TIMESTAMP_NTZ` (issue #9).** dbt's
+  snapshot timestamps (`dbt_valid_from` / `dbt_valid_to` / `dbt_updated_at`) dispatched to
+  dbt-duckdb's `snapshot_get_time` / `snapshot_string_as_time`, which cast to a bare
+  `::timestamp` and landed in Delta as `timestampNtz` — a type Microsoft Fabric's SQL endpoint
+  rejects, so the snapshot table errored when queried through the SQL endpoint. duckrun now ships
+  `duckrun__snapshot_get_time` / `duckrun__snapshot_string_as_time` overrides that keep the time
+  zone (`now()` → `TIMESTAMPTZ`), writing a Delta `timestamp` Fabric accepts. Only the
+  dbt-generated snapshot columns are affected; user model column types are still written verbatim.
+  Snapshots created before this fix keep their `timestampNtz` columns on disk — run
+  `dbt snapshot --full-refresh` once to rebuild them as timezone-aware.
+
 ## [0.4.17]
 
 `conn.sql()` statement routing: multi-statement batches and interior comments are handled
