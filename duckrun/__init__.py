@@ -14,6 +14,7 @@ This is the interactive/notebook API; the dbt adapter lives under ``dbt.adapters
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 from .session import connect, DuckSession
+from .fabric_remote import RemoteRunner, RemoteResult
 
 try:
     # Single source of truth: the installed distribution's version (built from pyproject.toml).
@@ -23,4 +24,4 @@ try:
 except PackageNotFoundError:  # running from a source tree that was never installed
     __version__ = "0+unknown"
 
-__all__ = ["connect", "DuckSession", "__version__"]
+__all__ = ["connect", "DuckSession", "RemoteRunner", "RemoteResult", "__version__"]

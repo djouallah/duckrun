@@ -119,6 +119,7 @@ jobs:
             tests/adapter \
             tests/connection_api \
             tests/correctness/test_correctness.py \
+            tests/fabric_remote \
             -q -p no:cacheprovider
 
       - name: Pure-local property / regression guards (network-free)

@@ -23,6 +23,11 @@ from typing import Optional
 # OneLake storage scope; the resource notebookutils issues a "pbi"/"storage" token for.
 _STORAGE_SCOPE = "https://storage.azure.com/.default"
 
+# Fabric CONTROL-plane scope (api.fabric.microsoft.com) — a *different* audience than storage.
+# Needed only by RemoteRunner (fabric_remote.py) to create/run/delete a temp notebook; a storage
+# token 401s here. Inside a Fabric notebook the "pbi" audience already covers this API.
+_FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
+
 # Azure CLI's well-known public client id, used for the interactive/CLI fallbacks.
 _AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
@@ -137,6 +142,63 @@ def get_onelake_token() -> str:
         "https://storage.azure.com/.default`, or pass storage_options={'bearer_token': '...'} "
         "to connect()."
     )
+
+
+def get_fabric_token() -> str:
+    """Return a Fabric CONTROL-plane bearer token (``api.fabric.microsoft.com`` scope), trying the
+    Fabric notebook runtime → ``FABRIC_TOKEN`` env → azure-identity (Azure CLI) in turn.
+
+    This is the sibling of :func:`get_onelake_token` for the *control* plane: creating, running and
+    deleting the temporary notebook that ``RemoteRunner`` uses. A storage token cannot call this API,
+    so it is acquired separately. Raises ``RuntimeError`` with actionable guidance if none is
+    available rather than returning a token that would 401 later.
+    """
+    token = _notebook_fabric_api_token() or os.environ.get("FABRIC_TOKEN") or _azure_identity_fabric_token()
+    if token:
+        return token
+    raise RuntimeError(
+        "Could not acquire a Fabric API token. Inside a Fabric notebook this is automatic; "
+        "elsewhere set FABRIC_TOKEN, or install the optional dependency "
+        "(`pip install duckrun[local]`) and run "
+        "`az login --scope https://api.fabric.microsoft.com/.default`."
+    )
+
+
+def _notebook_fabric_api_token() -> Optional[str]:
+    """A Fabric control-plane token from the Fabric notebook runtime, or None when not in one.
+    Unlike :func:`_fabric_token` (which wants the *storage* audience), the control plane is served by
+    the "pbi" audience token."""
+    try:
+        import notebookutils  # type: ignore
+    except ImportError:
+        return None
+    try:
+        return notebookutils.credentials.getToken("pbi") or None
+    except Exception:
+        return None
+
+
+def _azure_identity_fabric_token(interactive: bool = True) -> Optional[str]:
+    """A Fabric control-plane token via azure-identity; None if azure-identity is missing or every
+    credential fails. Same credential selection as :func:`_azure_identity_token`, but for the Fabric
+    scope instead of storage."""
+    try:
+        from azure.identity import AzureCliCredential
+    except ImportError:
+        return None
+    credentials = [AzureCliCredential]
+    if interactive and sys.stdin.isatty():
+        try:
+            from azure.identity import InteractiveBrowserCredential
+            credentials.append(InteractiveBrowserCredential)
+        except ImportError:
+            pass
+    for credential in credentials:
+        try:
+            return credential().get_token(_FABRIC_SCOPE).token
+        except Exception:
+            continue
+    return None
 
 
 def _token_expiry_epoch(token: str) -> Optional[float]:
