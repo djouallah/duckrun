@@ -32,6 +32,7 @@ import base64
 import io
 import json
 import os
+import re
 import uuid
 import zipfile
 from typing import Dict, List, Optional
@@ -88,7 +89,6 @@ def _render_env_var(value):
     """Resolve ``{{ env_var('NAME') }}`` / ``env_var("NAME", "default")`` in a scalar profile value.
     A deliberately tiny subset of dbt's Jinja — enough for the common case where root_path or a token
     comes from the environment. Non-strings and plain literals pass through unchanged."""
-    import re
     if not isinstance(value, str) or "env_var" not in value:
         return value
 
@@ -203,6 +203,31 @@ def _read_bytes(path: str) -> bytes:
         return fh.read()
 
 
+# A forwarded env var whose NAME matches this is a secret and is NEVER shipped to the notebook — the
+# storage token in particular comes from notebookutils inside Fabric, not from us.
+_SECRET_RE = re.compile(r"TOKEN|SECRET|KEY|PASSWORD|PWD|CRED", re.IGNORECASE)
+# env_var('NAME') / env_var("NAME", default) as dbt writes it in models/macros/profiles.
+_ENV_VAR_RE = re.compile(r"""env_var\(\s*['"]([^'"]+)['"]""")
+
+
+def _scan_env_var_names(project_dir: str):
+    """The set of ``env_var('NAME')`` names referenced anywhere in the project's SQL/YAML/Python —
+    i.e. the config the embedded logic will read at run time. Used to forward exactly those (minus
+    secrets) into the notebook."""
+    names = set()
+    for root, dirs, files in os.walk(project_dir):
+        dirs[:] = [d for d in dirs if d not in _ZIP_EXCLUDE_DIRS]
+        for name in files:
+            if not name.endswith((".sql", ".yml", ".yaml", ".py")):
+                continue
+            try:
+                text = _read_bytes(os.path.join(root, name)).decode("utf-8", "ignore")
+            except OSError:
+                continue
+            names.update(_ENV_VAR_RE.findall(text))
+    return names
+
+
 def _normalize_command(args: List[str], proj_var: str) -> List[str]:
     """Drop any user ``--project-dir``/``--profiles-dir`` (they point at laptop paths) so the remote
     cell can force both to the unpacked project dir; keep everything else (verb, --select, --target,
@@ -220,20 +245,34 @@ def _normalize_command(args: List[str], proj_var: str) -> List[str]:
 
 
 def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
-                   result_path: str, duckrun_version: Optional[str], cores: Optional[int]) -> dict:
+                   result_path: str, install_target: str, env: Optional[Dict[str, str]],
+                   cores: Optional[int]) -> dict:
     """Build the throwaway notebook (nbformat 4) that installs duckrun, unpacks the project, runs
     each dbt command via ``dbtRunner``, writes a small result JSON to OneLake Files, and exits with a
-    summary. Pure: no network, no Fabric. ``cores`` is recorded in metadata for the job to pick up."""
+    summary. Pure: no network, no Fabric.
+
+    ``install_target`` is the exact pip requirement (``duckrun==<v>`` or a ``git+…`` spec). ``env`` is
+    the non-secret config to export before dbt runs (the project's own ``env_var`` names — never a
+    token). ``cores`` is recorded in metadata for the job to pick up."""
     commands = [_normalize_command(c, "PROJ") for c in commands]
-    version_spec = f"=={duckrun_version}" if duckrun_version else ""
+    env = env or {}
 
     setup = (
         "import subprocess, sys\n"
-        f"subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', 'duckrun{version_spec}'], check=False)\n"
+        f"subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', {install_target!r}], check=False)\n"
+        # A fresh duckdb/deltalake wheel must replace whatever Fabric preloaded, or duckrun's runtime
+        # guard trips; restart the kernel so the next cell imports the just-installed versions.
+        "try:\n"
+        "    import notebookutils\n"
+        "    notebookutils.session.restartPython()\n"
+        "except Exception:\n"
+        "    pass\n"
     )
 
     work = (
         "import os, io, json, base64, zipfile, contextlib\n"
+        f"for _k, _v in {json.dumps(env)}.items():\n"
+        "    os.environ[_k] = _v\n"
         f"RUNID = {runid!r}\n"
         f"RESULT_PATH = {result_path!r}\n"
         f"COMMANDS = {json.dumps(commands)}\n"
@@ -467,12 +506,16 @@ class RemoteRunner:
 
     def __init__(self, cores: Optional[int] = None, *, target: Optional[str] = None,
                  profiles_dir: Optional[str] = None, project_dir: Optional[str] = None,
-                 duckrun_version: Optional[str] = None,
+                 env: Optional[Dict[str, str]] = None, forward_env: bool = True,
+                 pip_spec: Optional[str] = None, duckrun_version: Optional[str] = None,
                  fabric_token: Optional[str] = None, storage_token: Optional[str] = None):
         self.cores = cores
         self.target = target
         self.profiles_dir = profiles_dir
         self.project_dir = project_dir
+        self.env = env or {}
+        self.forward_env = forward_env
+        self.pip_spec = pip_spec
         self._fabric_token = fabric_token
         self._storage_token = storage_token
         if duckrun_version is None:
@@ -480,6 +523,26 @@ class RemoteRunner:
             duckrun_version = None if __version__ in ("0+unknown", "") else __version__
         self.duckrun_version = duckrun_version
         self._queue: Optional[List] = None  # active only inside a `with` block
+
+    def _install_target(self) -> str:
+        """The exact pip requirement the notebook installs: an explicit ``pip_spec`` (e.g. a
+        ``git+…@sha`` branch install) wins; otherwise the local version as ``duckrun==<v>`` (bare
+        ``duckrun`` when the version is unknown)."""
+        if self.pip_spec:
+            return self.pip_spec
+        return f"duckrun=={self.duckrun_version}" if self.duckrun_version else "duckrun"
+
+    def _resolve_env(self, project_dir: str) -> Dict[str, str]:
+        """The config env to export in the notebook: the project's own ``env_var`` names pulled from
+        the current environment (secrets excluded), overlaid by the explicit ``env=`` dict. Never
+        includes a token — inside Fabric the storage token comes from ``notebookutils``."""
+        forwarded: Dict[str, str] = {}
+        if self.forward_env:
+            for name in _scan_env_var_names(project_dir):
+                if name in os.environ and not _SECRET_RE.search(name):
+                    forwarded[name] = os.environ[name]
+        forwarded.update(self.env)
+        return forwarded
 
     def __enter__(self):
         self._queue = []
@@ -525,8 +588,11 @@ class RemoteRunner:
         runid = uuid.uuid4().hex[:12]
         result_path = f"{files_base}/duckrun_remote/{runid}.json"
         project_b64 = base64.b64encode(zip_project(project_dir, profiles_dir)).decode("ascii")
+        env = self._resolve_env(project_dir)
+        if env:
+            _log(f"forwarding env: {', '.join(sorted(env))}")
         notebook = build_notebook(runid, project_b64, commands, result_path,
-                                  self.duckrun_version, self.cores)
+                                  self._install_target(), env, self.cores)
 
         ws_id = _resolve_workspace_id(fabric_token, workspace)
         _log(f"creating temp notebook duckrun-remote-{runid} in workspace {workspace}")

@@ -1,0 +1,75 @@
+name: aemo-remote
+
+# The AEMO project built on FABRIC COMPUTE via duckrun's RemoteRunner: instead of running dbt on the
+# runner, ship only the dbt logic into a throwaway Fabric notebook (cores=8), run `dbt build` there,
+# delete the notebook. The real end-to-end exercise of the remote executor against a live workspace.
+# External assets (dim_calendar, the AEMO CSVs) stay in OneLake and are read via source(); the
+# calendar is generated on the runner first (kept OUT of the notebook).
+#
+# Manual for now (workflow_dispatch): it writes the SAME shared OneLake lakehouse as aemo.yml, so it
+# shares the `aemo-onelake` concurrency group to serialize against the local aemo build.
+on:
+  workflow_dispatch:
+    inputs:
+      download_limit:
+        description: "files to download per source (default 10)"
+        type: string
+        default: "10"
+      process_limit:
+        description: "CSV files to fold into the marts (default 25)"
+        type: string
+        default: "25"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: aemo-onelake
+  cancel-in-progress: false
+
+jobs:
+  aemo-remote:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tests/integration_tests/aemo
+    env:
+      DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/aemo
+      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+      FILES_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Files
+      DBT_SCHEMA: mart
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      download_limit: ${{ inputs.download_limit || '10' }}
+      process_limit: ${{ inputs.process_limit || '25' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun (RemoteRunner + the calendar pre-step run on the runner)
+        working-directory: ${{ github.workspace }}
+        run: pip install -e ".[local]"
+      - name: Azure login (OIDC federation — no client secret)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+      - name: Acquire a fresh OneLake storage token (calendar pre-step + reading the run log back)
+        run: |
+          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Acquire a Fabric control-plane token (create/run/delete the temp notebook)
+        run: |
+          TOKEN=$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "FABRIC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      - name: Generate external sources (calendar Delta table — external, NOT embedded)
+        run: python scripts/generate_calendar.py
+      - name: Remote dbt build on Fabric (cores=8, throwaway notebook)
+        # Ships this commit's duckrun (git+@$GITHUB_SHA) into the notebook so the build tests the
+        # branch. Exit non-zero if the remote dbt build fails.
+        run: python scripts/run_remote_build.py

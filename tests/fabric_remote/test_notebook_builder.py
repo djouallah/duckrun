@@ -99,7 +99,7 @@ def test_normalize_command_drops_dir_flags():
 def test_build_notebook_embeds_project_commands_and_cores():
     b64 = base64.b64encode(b"zip-bytes").decode("ascii")
     commands = [["run", "--target", "fabric"], ["test", "--target", "fabric"]]
-    nb = fr.build_notebook("run123", b64, commands, "abfss://x/Files/r.json", "0.4.17", 8)
+    nb = fr.build_notebook("run123", b64, commands, "abfss://x/Files/r.json", "duckrun==0.4.17", None, 8)
 
     assert nb["nbformat"] == 4
     assert nb["metadata"]["duckrun"]["cores"] == 8
@@ -113,8 +113,46 @@ def test_build_notebook_embeds_project_commands_and_cores():
     assert "notebookutils.notebook.exit" in src
 
 
-def test_build_notebook_no_version_uses_bare_install():
-    nb = fr.build_notebook("r", "eA==", [["run"]], "abfss://x/Files/r.json", None, None)
+def test_build_notebook_pip_spec_branch_install():
+    spec = "git+https://github.com/djouallah/duckrun@abc123"
+    nb = fr.build_notebook("r", "eA==", [["run"]], "abfss://x/Files/r.json", spec, None, None)
     src = "".join(s for cell in nb["cells"] for s in cell["source"])
-    assert "'duckrun'" in src  # no ==version pin
-    assert nb["metadata"]["duckrun"]["cores"] is None
+    assert spec in src           # branch install used verbatim
+    assert "duckrun==" not in src
+
+
+def test_build_notebook_exports_forwarded_env():
+    env = {"WAREHOUSE_PATH": "abfss://w@h/L/Tables", "download_limit": "5"}
+    nb = fr.build_notebook("r", "eA==", [["run"]], "abfss://x/Files/r.json", "duckrun", env, None)
+    src = "".join(s for cell in nb["cells"] for s in cell["source"])
+    # the env is emitted so os.environ is set before dbt runs
+    assert json.dumps(env) in src
+    assert "os.environ[_k] = _v" in src
+
+
+def test_resolve_env_forwards_config_excludes_secrets(project, monkeypatch):
+    # aemo-style: profiles.yml references WAREHOUSE_PATH + ONELAKE_TOKEN via env_var
+    (project / "profiles.yml").write_text(
+        "demo:\n  target: fabric\n  outputs:\n    fabric:\n      type: duckrun\n"
+        f"      root_path: \"{{{{ env_var('WAREHOUSE_PATH') }}}}\"\n"
+        "      storage_options:\n"
+        "        bearer_token: \"{{ env_var('ONELAKE_TOKEN', '') }}\"\n",
+        encoding="utf-8",
+    )
+    (project / "models" / "m.sql").write_text(
+        "-- {{ env_var('download_limit', '2') }}\nselect 1 as id\n", encoding="utf-8")
+    monkeypatch.setenv("WAREHOUSE_PATH", "abfss://w@h/L/Tables")
+    monkeypatch.setenv("ONELAKE_TOKEN", "SECRET")
+    monkeypatch.setenv("download_limit", "9")
+
+    runner = fr.RemoteRunner(cores=8, project_dir=str(project))
+    env = runner._resolve_env(str(project))
+    assert env == {"WAREHOUSE_PATH": "abfss://w@h/L/Tables", "download_limit": "9"}
+    assert "ONELAKE_TOKEN" not in env  # secret excluded, even though referenced
+
+
+def test_scan_env_var_names(project):
+    (project / "models" / "m.sql").write_text(
+        "select '{{ env_var(\"FOO\") }}' as a, '{{ env_var('BAR', 'x') }}' as b\n", encoding="utf-8")
+    names = fr._scan_env_var_names(str(project))
+    assert {"FOO", "BAR"} <= names
