@@ -111,28 +111,3 @@ jobs:
         with:
           name: docs-aemo
           path: tests/integration_tests/aemo/target/static_index.html
-      - name: SORTED BY AUTO sort rewrite on fct_summary (dogfood on real data)
-        # Run the SQL-only auto-key sort rewrite on the real summary table over OneLake and print the
-        # before/after layout. Last step on purpose — a rewrite the next dbt build supersedes.
-        run: |
-          python - <<'PY'
-          import os, duckrun
-          conn = duckrun.connect(
-              os.environ["WAREHOUSE_PATH"],
-              storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
-              schema="mart", read_only=False)
-
-          def detail(t):
-              rel = conn.sql(f"DESCRIBE DETAIL {t}")
-              return dict(zip(rel.columns, rel.fetchone()))
-
-          before = detail("fct_summary")
-          # Auto-key sort rewrite, SQL-only: profile the key from the Delta log, re-cluster in one commit.
-          conn.sql("CREATE OR REPLACE TABLE fct_summary SORTED BY AUTO AS SELECT * FROM fct_summary")
-          after = detail("fct_summary")
-          print("=== CREATE TABLE fct_summary SORTED BY AUTO — auto-sort rewrite ===")
-          print(f"numFiles: {before['numFiles']} -> {after['numFiles']}  (version {before['version']} -> {after['version']})")
-          b, a = before["sizeInBytes"], after["sizeInBytes"]
-          if b:
-              print(f"actual on-disk size: {b/1e6:.1f} MB -> {a/1e6:.1f} MB")
-          PY
