@@ -273,8 +273,12 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         "notebookutils.session.restartPython()\n"
     )
 
+    # The whole body is wrapped so ANY failure (a bad pip install, an import error, a dbt crash) is
+    # captured with its traceback and written to OneLake before the notebook exits — otherwise the
+    # cell exception cancels the session and the runner gets no log to diagnose from. We always exit
+    # cleanly (the run's real success/failure is read from the per-command results, not the job state).
     work = (
-        "import os, io, json, base64, zipfile, contextlib\n"
+        "import os, io, json, base64, zipfile, contextlib, traceback\n"
         f"for _k, _v in {json.dumps(env)}.items():\n"
         "    os.environ[_k] = _v\n"
         f"RUNID = {runid!r}\n"
@@ -282,27 +286,40 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         f"COMMANDS = {json.dumps(commands)}\n"
         f"PROJECT_B64 = {project_b64!r}\n"
         "PROJ = '/tmp/duckrun_proj/' + RUNID\n"
-        "os.makedirs(PROJ, exist_ok=True)\n"
-        "with zipfile.ZipFile(io.BytesIO(base64.b64decode(PROJECT_B64))) as _z:\n"
-        "    _z.extractall(PROJ)\n"
-        "os.chdir(PROJ)\n"
-        "from dbt.cli.main import dbtRunner\n"
-        "_dbt = dbtRunner()\n"
         "_buf = io.StringIO()\n"
         "results = []\n"
-        "for _cmd in COMMANDS:\n"
-        "    _full = _cmd + ['--project-dir', PROJ, '--profiles-dir', PROJ]\n"
-        "    with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):\n"
-        "        _res = _dbt.invoke(_full)\n"
-        "    _nodes = []\n"
-        "    for _r in (getattr(_res, 'result', None) or []):\n"
-        "        _node = getattr(getattr(_r, 'node', None), 'name', None)\n"
-        "        if _node is not None:\n"
-        "            _nodes.append({'node': _node, 'status': str(getattr(_r, 'status', ''))})\n"
-        "    results.append({'command': _cmd, 'success': bool(getattr(_res, 'success', False)), 'nodes': _nodes})\n"
+        "try:\n"
+        "    os.makedirs(PROJ, exist_ok=True)\n"
+        "    with zipfile.ZipFile(io.BytesIO(base64.b64decode(PROJECT_B64))) as _z:\n"
+        "        _z.extractall(PROJ)\n"
+        "    os.chdir(PROJ)\n"
+        "    from dbt.cli.main import dbtRunner\n"
+        "    _dbt = dbtRunner()\n"
+        "    for _cmd in COMMANDS:\n"
+        "        _full = _cmd + ['--project-dir', PROJ, '--profiles-dir', PROJ]\n"
+        "        _ok, _nodes, _err = False, [], None\n"
+        "        try:\n"
+        "            with contextlib.redirect_stdout(_buf), contextlib.redirect_stderr(_buf):\n"
+        "                _res = _dbt.invoke(_full)\n"
+        "            _ok = bool(getattr(_res, 'success', False))\n"
+        "            for _r in (getattr(_res, 'result', None) or []):\n"
+        "                _node = getattr(getattr(_r, 'node', None), 'name', None)\n"
+        "                if _node is not None:\n"
+        "                    _nodes.append({'node': _node, 'status': str(getattr(_r, 'status', ''))})\n"
+        "        except Exception:\n"
+        "            _err = traceback.format_exc(); _buf.write('\\n' + _err)\n"
+        "        results.append({'command': _cmd, 'success': _ok, 'nodes': _nodes, 'error': _err})\n"
+        "except Exception:\n"
+        "    _buf.write('\\n' + traceback.format_exc())\n"
+        "# one result per command even if setup blew up before the loop\n"
+        "for _cmd in COMMANDS[len(results):]:\n"
+        "    results.append({'command': _cmd, 'success': False, 'nodes': [], 'error': 'setup failed'})\n"
         "_payload = json.dumps({'runid': RUNID, 'results': results, 'log': _buf.getvalue()})\n"
         "import notebookutils\n"
-        "notebookutils.fs.put(RESULT_PATH, _payload, overwrite=True)\n"
+        "try:\n"
+        "    notebookutils.fs.put(RESULT_PATH, _payload, overwrite=True)\n"
+        "except Exception:\n"
+        "    pass\n"
         "notebookutils.notebook.exit(json.dumps({'runid': RUNID, 'results': results}))\n"
     )
 
@@ -380,6 +397,18 @@ def _looks_like_guid(value: str) -> bool:
     return len(parts) == 5 and all(c in "0123456789abcdefABCDEF" for c in "".join(parts))
 
 
+def _platform_part(name: str) -> str:
+    """The base64 ``.platform`` file (item metadata). Fabric's Create-with-definition 'respects the
+    platform file if provided'; without it the notebook fell back to a PySpark item. Mirrors the
+    working reference (djouallah/dbt_fabric_python_delta run.Notebook/.platform)."""
+    platform = {
+        "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
+        "metadata": {"type": "Notebook", "displayName": name},
+        "config": {"version": "2.0", "logicalId": str(uuid.uuid4())},
+    }
+    return base64.b64encode(json.dumps(platform).encode("utf-8")).decode("ascii")
+
+
 def _create_notebook(token: str, ws_id: str, name: str, notebook: dict) -> str:
     """Create the notebook item from an inline base64 definition; return its item id. Handles both
     the synchronous 201 and the long-running-operation 202 (poll the ``Location`` until done)."""
@@ -389,7 +418,8 @@ def _create_notebook(token: str, ws_id: str, name: str, notebook: dict) -> str:
         "definition": {
             "format": "ipynb",
             "parts": [
-                {"path": "notebook-content.ipynb", "payload": payload_b64, "payloadType": "InlineBase64"}
+                {"path": "notebook-content.ipynb", "payload": payload_b64, "payloadType": "InlineBase64"},
+                {"path": ".platform", "payload": _platform_part(name), "payloadType": "InlineBase64"},
             ],
         },
     }

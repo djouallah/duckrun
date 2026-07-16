@@ -20,14 +20,12 @@ from duckrun import RemoteRunner
 
 
 def main() -> int:
-    # Install THIS commit's duckrun in the notebook so the run tests the branch, not the last release.
-    sha = os.environ.get("GITHUB_SHA", "main")
-    pip_spec = f"git+https://github.com/djouallah/duckrun@{sha}"
-
     runner = RemoteRunner(
         cores=8,
         target="dev",
-        pip_spec=pip_spec,
+        # The notebook runs the aemo project with the normal released duckrun from PyPI — the thing
+        # under test is RemoteRunner's orchestration (create/run/delete), which runs here on the runner.
+        pip_spec="duckrun",
         # Control plane vs storage: distinct scopes, minted separately in CI.
         fabric_token=os.environ["FABRIC_TOKEN"],
         storage_token=os.environ["ONELAKE_TOKEN"],
