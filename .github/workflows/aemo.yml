@@ -24,9 +24,9 @@ on:
         type: string
         default: "1000"
       process_limit:
-        description: "CSV files to fold into the marts per build (default 365)"
+        description: "CSV files to fold into the marts per build (default 1000)"
         type: string
-        default: "365"
+        default: "1000"
 
 permissions:
   contents: read
@@ -57,9 +57,10 @@ jobs:
       # cramped ~19 GiB /tmp. process_limit caps how many CSVs the fct_scada/fct_price merge folds per
       # run; the spill scales with how many monthly partitions the merge rewrites. 1000 previously hit
       # delta_rs's hidden 100 GB max_temp_directory_size default — now the adapter sizes that to ~80%
-      # of free disk, so the lever left is memory/partition-span, not this disk cap. 365 is a safe span.
+      # of free disk, so the lever left is memory/partition-span, not this disk cap. Back to 1000 to
+      # prove the disk-cap fix lets the batch that used to overrun the 100 GB wall now go through.
       download_limit: ${{ inputs.download_limit || '1000' }}
-      process_limit: ${{ inputs.process_limit || '365' }}
+      process_limit: ${{ inputs.process_limit || '1000' }}
       # Pre-flight cutoff: <= this many new pending files -> run dbt locally on the runner (no Fabric
       # spin-up); more than this -> go remote. A quick re-run has ~0 new files (local); a fresh
       # lakehouse / long gap has 100s (remote). See scripts/run_build.py.
