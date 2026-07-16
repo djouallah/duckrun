@@ -296,6 +296,17 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         f"PROJECT_B64 = {project_b64!r}\n"
         "PROJ = os.path.join(_SCRATCH, 'duckrun_proj', RUNID)\n"
         "_buf = io.StringIO()\n"
+        # Log the actual scratch disk the job landed on — DuckDB caps its temp spill at the free space
+        # of this drive (temp_directory defaults to cwd, which is under _SCRATCH), so this is the real
+        # spill ceiling. Printed to _buf so it reaches the runner's log even when the build then fails.
+        "import shutil as _sh\n"
+        "for _p in (_SCRATCH, '/tmp'):\n"
+        "    try:\n"
+        "        _u = _sh.disk_usage(_p)\n"
+        "        _buf.write(f'[duckrun] disk {_p}: {_u.free//2**30} GiB free / {_u.total//2**30} GiB total\\n')\n"
+        "    except Exception as _e:\n"
+        "        _buf.write(f'[duckrun] disk {_p}: n/a ({_e})\\n')\n"
+        "_buf.write(f'[duckrun] TMPDIR={_TMPDIR}\\n')\n"
         "results = []\n"
         "try:\n"
         "    os.makedirs(PROJ, exist_ok=True)\n"
