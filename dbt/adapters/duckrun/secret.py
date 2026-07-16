@@ -37,6 +37,30 @@ def bearer_token(storage_options: Optional[Dict[str, str]]) -> Optional[str]:
     return so.get("bearer_token") or so.get("token") or so.get("access_token")
 
 
+def with_onelake_token(root_path: Optional[str],
+                       storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """For an ``abfss://`` (OneLake) target whose profile carries **no** bearer token, acquire one
+    from the live source — ``notebookutils`` inside a Fabric notebook, else env / azure-identity —
+    and return ``storage_options`` with it. This is the same fallback ``duckrun.connect()`` uses, so
+    a dbt run inside a Fabric notebook needs no token in ``profiles.yml``: discovery (the OneLake DFS
+    REST list) and the DuckDB Azure secret both get a token, and read-only commands (``dbt test`` /
+    ``show`` / ``docs``) stop failing with "schema does not exist".
+
+    Returns ``storage_options`` UNCHANGED for a non-OneLake store, when a token is already present,
+    or when none can be acquired — so local / ``az://`` / s3 / gcs paths are untouched.
+    """
+    if not str(root_path or "").startswith("abfss://") or bearer_token(storage_options):
+        return storage_options
+    try:
+        from duckrun import auth  # lazy: keep the adapter importable without the connect package
+        token = auth.get_onelake_token()
+    except Exception:
+        return storage_options  # no live source (and not in a notebook) — leave it; discovery no-ops
+    out = dict(storage_options or {})
+    out["bearer_token"] = token
+    return out
+
+
 def refreshed(storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
     """``storage_options`` with a still-valid OneLake bearer token.
 

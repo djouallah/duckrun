@@ -195,7 +195,8 @@ class DuckrunAdapter(DuckDBAdapter):
         # Resolve the root/token of the catalog this (database, schema) belongs to: the default
         # catalog for the target database, an attached catalog for a `+database: <alias>` model.
         # Single-catalog projects resolve to the top-level root_path/storage_options, unchanged.
-        root_path, storage_options = self.config.credentials.root_for(schema_relation.database)
+        creds = self.config.credentials
+        root_path, storage_options = creds.root_for(schema_relation.database)
         if not root_path:
             return []
 
@@ -206,6 +207,22 @@ class DuckrunAdapter(DuckDBAdapter):
         # enumerate table directories with the OneLake DFS REST API; local / az:// stores use
         # DuckDB glob, which works there.
         if remote.is_abfss(root_path):
+            # Inside a Fabric notebook the profile carries no token (the notebook has its own); grab
+            # one from notebookutils so the REST list AND the delta_scan views work — otherwise a
+            # read-only command finds zero tables ("schema does not exist"). No-op when a token is
+            # already present or none can be acquired. Persist it onto the default catalog's creds so
+            # the write/refresh paths (configure_cursor) reuse it instead of re-fetching per schema.
+            fresh = secret.with_onelake_token(root_path, storage_options)
+            if secret.bearer_token(fresh) and not secret.bearer_token(storage_options):
+                storage_options = fresh
+                if str(database).strip('"') not in (getattr(creds, "catalogs", None) or {}):
+                    creds.storage_options = storage_options
+            # Mint the DuckDB Azure secret from that token so the delta_scan views we're about to
+            # register are actually queryable by read-only commands.
+            try:
+                secret.ensure_azure_secret(self._cursor(), storage_options)
+            except Exception as exc:  # pragma: no cover - logged, then discovery proceeds
+                logger.debug(f"duckrun: could not mint Azure secret before abfss discovery: {exc}")
             names = self._discover_via_rest(root_path, schema, storage_options)
         else:
             names = self._discover_via_glob(root_path, schema)

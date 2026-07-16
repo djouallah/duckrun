@@ -225,6 +225,70 @@ def test_discovery_propagates_access_error(monkeypatch):
         adapter._discover_delta_relations(_SchemaRelation())
 
 
+# ------------------------------------ notebookutils token fallback (Fabric, no profile token)
+# Inside a Fabric notebook the profile carries NO bearer token — the notebook has its own via
+# notebookutils. The adapter must acquire it so read-only discovery (the REST list) and the
+# delta_scan views work, exactly like duckrun.connect(). Without this a remote `dbt test` fails
+# every test with "schema does not exist".
+
+def test_with_onelake_token_acquires_for_abfss_without_token(monkeypatch):
+    import duckrun.auth as auth
+    monkeypatch.setattr(auth, "get_onelake_token", lambda: "NBTOK")
+    out = secret.with_onelake_token("abfss://x@h/y", {})
+    assert out["bearer_token"] == "NBTOK"
+
+
+def test_with_onelake_token_noop_when_token_present(monkeypatch):
+    import duckrun.auth as auth
+    monkeypatch.setattr(auth, "get_onelake_token",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not fetch when present")))
+    so = {"bearer_token": "HAVE"}
+    assert secret.with_onelake_token("abfss://x@h/y", so) is so  # unchanged, no fetch
+
+
+def test_with_onelake_token_noop_for_non_onelake(monkeypatch):
+    import duckrun.auth as auth
+    monkeypatch.setattr(auth, "get_onelake_token",
+                        lambda: (_ for _ in ()).throw(AssertionError("must not fetch for non-abfss")))
+    assert secret.with_onelake_token("az://lake/Tables", {}) == {}
+    assert secret.with_onelake_token("./warehouse", None) is None
+
+
+class _CredsNoToken:
+    """The Fabric-notebook profile: abfss root, no bearer token (it comes from notebookutils)."""
+    root_path = "abfss://duckrun@onelake.dfs.fabric.microsoft.com/dev.Lakehouse/Tables"
+    storage_options = {}
+    catalogs = None
+
+    def root_for(self, database=None):
+        return (self.root_path, self.storage_options)
+
+
+def test_discovery_acquires_notebook_token_when_profile_has_none(monkeypatch):
+    import duckrun.auth as auth
+    monkeypatch.setattr(auth, "get_onelake_token", lambda: "NBTOK")
+
+    captured = {}
+    def fake_list(root, schema, so):
+        captured["so"] = so
+        return ["fct_price"]
+    monkeypatch.setattr(remote, "list_delta_tables", fake_list)
+
+    conn = _RecordingConn()
+    adapter = object.__new__(DuckrunAdapter)
+    creds = _CredsNoToken()
+    adapter.config = type("_Cfg", (), {"credentials": creds})()
+    adapter._cursor = lambda: conn  # so the secret-mint has a connection to run on
+
+    rels = adapter._discover_delta_relations(_SchemaRelation())
+
+    assert [r.identifier for r in rels] == ["fct_price"]
+    # the notebookutils token reached the REST list, was minted as the DuckDB secret, and persisted
+    assert captured["so"]["bearer_token"] == "NBTOK"
+    assert "nbtok" in "\n".join(conn.sql).lower()
+    assert creds.storage_options.get("bearer_token") == "NBTOK"
+
+
 # ----------------------------------------------------- #7 pagination / #11 retry (review)
 
 class _PageResp:
