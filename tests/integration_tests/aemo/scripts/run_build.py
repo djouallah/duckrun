@@ -129,8 +129,9 @@ def run_local():
 def run_remote():
     from duckrun import RemoteRunner
 
-    # Batched: build then test in ONE notebook (one session start, one install). Normal released
-    # duckrun from PyPI runs the project; the thing under test is RemoteRunner's orchestration.
+    # Batched: build then test in ONE notebook (one session start, one install). This is a TEST, so
+    # the notebook installs duckrun straight from THIS repo's main (not the released PyPI wheel) —
+    # otherwise an adapter fix wouldn't be exercised remotely until the next release.
     # cores=64 for RAM headroom on the fct_scada merge: more RAM raises DuckDB's merge memory_limit
     # (0.3x RAM) and delta_rs's max_spill_size (0.6x RAM), so less of a month-spanning merge spills to
     # disk. The Fabric work disk is ~1.9 TiB (NOT small); the old "100 GB" wall was delta_rs's
@@ -138,7 +139,7 @@ def run_remote():
     with RemoteRunner(
         cores=64,
         target="dev",
-        pip_spec="duckrun",
+        pip_spec="git+https://github.com/djouallah/duckrun.git@main",
         fabric_token=os.environ["FABRIC_TOKEN"],
         storage_token=os.environ["ONELAKE_TOKEN"],
     ) as dbt:
