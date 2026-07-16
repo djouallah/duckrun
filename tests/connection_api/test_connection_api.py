@@ -1071,6 +1071,18 @@ def test_multi_catalog_cross_query(tmp_path):
     assert conn.sql("select count(*) from t1").fetchone()[0] == 2  # via USE lhA.dbo
 
 
+def test_multi_catalog_get_stats_spans_all(tmp_path):
+    conn = _two_lakehouses(tmp_path)
+    key = lambda st: {(r[st.columns.index("catalog")], r[st.columns.index("table")])
+                      for r in st.fetchall()}
+    # no-arg spans every attached catalog + schema (parity with `show all tables`)
+    assert key(conn.get_stats()) == {("lhA", "t1"), ("other", "t2"), ("other", "s")}
+    # wildcard matches a table regardless of catalog / schema
+    assert key(conn.get_stats("*t*")) == {("lhA", "t1"), ("other", "t2")}
+    assert key(conn.get_stats("sales.*")) == {("other", "s")}          # schema.table, any catalog
+    assert key(conn.get_stats("other.*.*")) == {("other", "t2"), ("other", "s")}  # catalog-qualified
+
+
 def _set_current_catalog(conn, name):
     """Switch the current catalog and pick its default database (dbo when present, else the first) —
     pure SQL, exactly as a user would: USE is the single switch (duckrun derives 'current' from

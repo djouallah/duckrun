@@ -628,20 +628,24 @@ class DuckSession:
 
     _SKIP_SCHEMAS = {"information_schema", "pg_catalog", "main"}
 
-    def _cat_databases(self) -> List[str]:
-        """Schemas in the current catalog (the discovered Delta schema folders), minus DuckDB internals."""
+    def _cat_databases(self, catalog: Optional[str] = None) -> List[str]:
+        """Schemas in ``catalog`` (default: the current catalog) — the discovered Delta schema
+        folders, minus DuckDB internals."""
+        cat = catalog or self._current_catalog
         rows = self.con.execute(
             "SELECT schema_name FROM information_schema.schemata "
-            "WHERE catalog_name = ? ORDER BY schema_name", [self._current_catalog]).fetchall()
+            "WHERE catalog_name = ? ORDER BY schema_name", [cat]).fetchall()
         return [r[0] for r in rows if r[0] not in self._SKIP_SCHEMAS]
 
-    def _cat_tables(self, dbName: Optional[str] = None) -> List[str]:
-        """Tables (registered delta_scan views) in ``dbName`` (default: the current database)."""
+    def _cat_tables(self, dbName: Optional[str] = None, catalog: Optional[str] = None) -> List[str]:
+        """Tables (registered delta_scan views) in ``dbName`` (default: the current database) of
+        ``catalog`` (default: the current catalog)."""
+        cat = catalog or self._current_catalog
         schema = dbName or self._current_database
         rows = self.con.execute(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_catalog = ? AND table_schema = ? ORDER BY table_name",
-            [self._current_catalog, schema]).fetchall()
+            [cat, schema]).fetchall()
         return [r[0] for r in rows]
 
     def _cat_table_exists(self, tableName: str) -> bool:
@@ -1002,9 +1006,10 @@ class DuckSession:
         native DuckDB relation, one row per table (``detailed=False``) or one row per parquet **row
         group** (``detailed=True``, the raw ``parquet_metadata`` columns).
 
-        ``source``: ``None`` → every table in the current schema; a table name (1/2/3-part) → that
-        table; a schema name → every table in it; a wildcard pattern (``fct_*``, ``mart.fct_*``) →
-        every matching table in the current catalog. Aggregated columns: ``catalog, schema, table,
+        ``source``: ``None`` → every table across all attached catalogs; a table name (1/2/3-part)
+        → that table; a schema name → every matching table in it (any catalog); a wildcard pattern
+        (``fct_*``, ``mart.fct_*``, ``*summary*``) → every matching table across all attached
+        catalogs. Aggregated columns: ``catalog, schema, table,
         total_rows, num_files, num_row_groups, avg_row_group, size_mb, vorder, compression``. Reads the
         Delta log for the active file list + size + VORDER, then the parquet footers for row-group
         shape — so it counts only live files (tombstoned ones are excluded)."""
@@ -1089,50 +1094,55 @@ class DuckSession:
 
     def _resolve_stats_targets(self, source: Optional[str]) -> List[tuple]:
         """Resolve a ``get_stats`` source to ``(catalog, schema, table)`` targets: ``None`` → every
-        table in the current schema; a known table (1/2/3-part) → itself; a schema name → its tables;
-        a wildcard pattern (``*``/``?``/``[...]``, e.g. ``fct_*`` or ``mart.fct_*``) → every matching
-        table in the current catalog."""
+        table across all attached catalogs; a known table (1/2/3-part) → itself; a schema name →
+        its tables in every catalog that has it; a wildcard pattern (``*``/``?``/``[...]``, e.g.
+        ``fct_*`` or ``mart.fct_*``) → every matching table across all attached catalogs."""
         if source is None:
-            db = self._current_database
-            return [(self._current_catalog, db, t) for t in self._cat_tables(db)]
+            return [(c, s, t) for c in self._catalogs
+                    for s in self._cat_databases(c) for t in self._cat_tables(s, c)]
         if any(ch in source for ch in "*?["):
             return self._glob_stats_targets(source)
         if self._cat_table_exists(source):
             return [self._resolve(source)]
-        if "." not in source and self._cat_database_exists(source):
-            return [(self._current_catalog, source, t) for t in self._cat_tables(source)]
+        if "." not in source:                          # a bare schema name, in any attached catalog
+            self.refresh(quiet=True)                   # re-discover schema folders first
+            hits = [(c, source, t) for c in self._catalogs
+                    if source in self._cat_databases(c) for t in self._cat_tables(source, c)]
+            if hits:
+                return hits
         raise ValueError(
-            f"get_stats: '{source}' is neither a known table nor a schema in catalog "
-            f"'{self._current_catalog}'.")
+            f"get_stats: '{source}' is neither a known table nor a schema in any attached catalog "
+            f"({list(self._catalogs)}).")
 
     def _glob_stats_targets(self, source: str) -> List[tuple]:
-        """Wildcard-match ``source`` (fnmatch ``*``/``?``/``[...]``, case-insensitive) against tables in
-        the current catalog. Accepts ``table``, ``schema.table``, or ``catalog.schema.table`` patterns;
-        a missing leading segment defaults to ``*`` (schema) / the current catalog. Returns the matched
-        ``(catalog, schema, table)`` targets (possibly empty — the caller reports the miss)."""
+        """Wildcard-match ``source`` (fnmatch ``*``/``?``/``[...]``, case-insensitive) against tables
+        across all attached catalogs. Accepts ``table``, ``schema.table``, or
+        ``catalog.schema.table`` patterns; a missing leading segment defaults to ``*`` (matches any
+        schema / any catalog). Returns the matched ``(catalog, schema, table)`` targets (possibly
+        empty — the caller reports the miss)."""
         import fnmatch
         parts = delta_dml._split_dotted(source)  # quote-aware split (matches _resolve / the router)
         if len(parts) == 1:
-            cat_pat, schema_pat, table_pat = self._current_catalog, "*", parts[0]
+            cat_pat, schema_pat, table_pat = "*", "*", parts[0]
         elif len(parts) == 2:
-            cat_pat, schema_pat, table_pat = self._current_catalog, parts[0], parts[1]
+            cat_pat, schema_pat, table_pat = "*", parts[0], parts[1]
         elif len(parts) == 3:
             cat_pat, schema_pat, table_pat = parts
         else:
             raise ValueError(
                 f"get_stats: too many segments in pattern {source!r} "
                 f"(use table, schema.table, or catalog.schema.table).")
-        cat = self._current_catalog
-        if not fnmatch.fnmatchcase(cat.lower(), cat_pat.lower()):
-            return []
-        sp, tp = schema_pat.lower(), table_pat.lower()
+        cp, sp, tp = cat_pat.lower(), schema_pat.lower(), table_pat.lower()
         out = []
-        for sch in self._cat_databases():
-            if not fnmatch.fnmatchcase(sch.lower(), sp):
+        for cat in self._catalogs:
+            if not fnmatch.fnmatchcase(cat.lower(), cp):
                 continue
-            for tbl in self._cat_tables(sch):
-                if fnmatch.fnmatchcase(tbl.lower(), tp):
-                    out.append((cat, sch, tbl))
+            for sch in self._cat_databases(cat):
+                if not fnmatch.fnmatchcase(sch.lower(), sp):
+                    continue
+                for tbl in self._cat_tables(sch, cat):
+                    if fnmatch.fnmatchcase(tbl.lower(), tp):
+                        out.append((cat, sch, tbl))
         return out
 
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
