@@ -24,9 +24,9 @@ on:
         type: string
         default: "1000"
       process_limit:
-        description: "CSV files to fold into the marts (remote default 3000)"
+        description: "CSV files to fold into the marts per build (default 500)"
         type: string
-        default: "3000"
+        default: "500"
 
 permissions:
   contents: read
@@ -52,10 +52,11 @@ jobs:
       # that outlives the ~1h bearer token on a long backfill. See auth._github_oidc_token.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      # Turned up far past the old local runner (10 / 25): the build now runs on Fabric compute, so
-      # process a much larger slice of AEMO data than a 2-core GitHub runner could.
+      # download_limit is generous (fetching is cheap); process_limit caps how many CSVs each
+      # fct_scada/fct_price build folds into the merge — the driver of the DuckDB spill — so keep it
+      # at 500 to stay under the Fabric notebook's local temp-disk ceiling.
       download_limit: ${{ inputs.download_limit || '1000' }}
-      process_limit: ${{ inputs.process_limit || '3000' }}
+      process_limit: ${{ inputs.process_limit || '500' }}
       # Pre-flight cutoff: <= this many new pending files -> run dbt locally on the runner (no Fabric
       # spin-up); more than this -> go remote. A quick re-run has ~0 new files (local); a fresh
       # lakehouse / long gap has 100s (remote). See scripts/run_build.py.
