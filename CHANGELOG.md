@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.20]
+
+### Fixed
+- **`RemoteRunner` now runs the Fabric notebook on the large local work disk, not `/tmp`.** A Fabric
+  Python notebook's container disk (`/`, `/tmp`) is a cramped ~19 GiB overlay, while
+  `/home/trusted-service-user/work` is a ~135 GiB local disk. RemoteRunner placed the whole run on
+  `/tmp` — the project, dbt's `target/`, DuckDB's spill, delta_rs write staging, and `tempfile`
+  downloads — so a large build filled it and failed ("No space left on device" / a DuckDB temp-spill
+  exhaustion). It now extracts the project and points `TMPDIR` under the work disk (falling back to
+  `/tmp` off Fabric), so big remote builds have room.
+- **`RemoteRunner` prints the full remote dbt log, not just the last 40 lines.** The notebook captures
+  every command's output, but the runner printed only a short tail — for a build+test run that tail
+  was entirely the `test` phase, hiding a failing `build` node's error. The whole captured log is now
+  printed so a failed remote run is diagnosable.
+
 ## [0.4.19]
 
 ### Added
