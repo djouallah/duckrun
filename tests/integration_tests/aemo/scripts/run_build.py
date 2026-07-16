@@ -1,8 +1,10 @@
 """Run the aemo dbt build + test, choosing local vs Fabric-remote by how much work is pending.
 
-A pre-flight counts the *new* AEMO files this build would fold in — the nemweb listings minus what's
-already in the archive log (``csv_archive_log.parquet`` in OneLake Files), capped per source by
-``download_limit``. Then:
+A pre-flight counts the real MART backlog — archive-log files not yet folded into the fact tables
+(fct_scada / fct_price): what's in ``csv_archive_log.parquet`` (OneLake Files) minus what's already
+processed (the fact tables' ``daily_file`` / ``intraday_file`` columns), the exact predicate the
+project's ``assert_all_*_processed_*`` tests and the incremental pre-hooks use. This is the true
+"files to process" and it shrinks as builds catch up (a download-side count never would). Then:
 
   * **few pending** (a quick re-run after a small model/doc tweak — barely any new files) → run dbt
     **locally** in-process on the runner. No Fabric notebook spin-up (~2-3 min) for a trivial build.
@@ -25,51 +27,82 @@ import sys
 BUILD = ["build", "--target", "dev", "--exclude", "tag:heavy"]
 TEST = ["test", "--target", "dev", "--exclude", "tag:heavy"]
 
-# Same three nemweb listings the staging model scrapes; (url, filename LIKE filter). We only need to
-# count how many listed files aren't already in the archive log — the GitHub backfill the model also
-# does only fires when a source is SHORT (i.e. already a small run), so it can't turn a local-sized
-# run into a remote-sized one and is safely ignored here.
-_LISTINGS = {
-    "daily": ("https://nemweb.com.au/Reports/Current/Daily_Reports/", "%PUBLIC_DAILY%.zip%"),
-    "scada_today": ("http://nemweb.com.au/Reports/Current/Dispatch_SCADA/", "%PUBLIC_DISPATCHSCADA%"),
-    "price_today": ("http://nemweb.com.au/Reports/Current/DispatchIS_Reports/", "%PUBLIC_DISPATCHIS_%.zip%"),
+# Which fact table consumes which archive-log source, and the fact column that records the processed
+# source file. 'daily' feeds BOTH facts; scada_today only fct_scada; price_today only fct_price;
+# duid_* feed only dim_duid (full rebuild, no per-file backlog) so they're excluded. Marts land in
+# schema 'landing' (dbt_project.yml +schema: landing).
+_FACTS = {
+    "fct_scada": ("landing/fct_scada", {"daily": "daily_file", "scada_today": "intraday_file"}),
+    "fct_price": ("landing/fct_price", {"daily": "daily_file", "price_today": "intraday_file"}),
 }
 
 
 def count_pending() -> dict:
-    """Per-source count of files in the nemweb Current listing not yet in the archive log —
-    the real download backlog. Returns {source_type: new_file_count}, uncapped."""
+    """Per-(fact, source) MART backlog: archive-log files not yet folded into the fact table, using
+    the exact predicate the assert tests / incremental pre-hooks use (log.csv_filename not present in
+    the fact's daily_file/intraday_file). The real "files to process" — it shrinks as builds catch up.
+    Returns {(fact, source_type): backlog_count}; {} when nothing has been downloaded yet."""
     import duckrun
 
     files_path = os.environ["FILES_PATH"].rstrip("/")
+    warehouse_path = os.environ["WAREHOUSE_PATH"].rstrip("/")
     storage_options = (
         {"bearer_token": os.environ["ONELAKE_TOKEN"]}
         if files_path.startswith(("abfss://", "az://")) and os.environ.get("ONELAKE_TOKEN")
         else None
     )
-    # connect() over a Files root discovers 0 Delta tables and moves on; we only want its DuckDB
-    # session (azure secret + httpfs) to read the log parquet and the http listings.
+    # One read-only session (one OneLake azure secret) reads BOTH the log parquet under Files and the
+    # fact Delta tables under Tables — sibling paths on the same account; everything by explicit path.
     conn = duckrun.connect(files_path, storage_options=storage_options, read_only=True)
 
     log_path = files_path + "/csv_archive_log.parquet"
-    done = set()
-    if conn.sql(f"SELECT count(*) FROM glob('{log_path}')").fetchone()[0] > 0:
-        for (key,) in conn.sql(
-            f"SELECT source_type || '::' || source_filename FROM read_parquet('{log_path}')"
-        ).fetchall():
-            done.add(key)
+    # Nothing downloaded yet -> nothing to process (routes local; the very first run is trivially small).
+    if conn.sql(f"SELECT count(*) FROM glob('{log_path}')").fetchone()[0] == 0:
+        return {}
+
+    conn.sql(f"""
+        CREATE OR REPLACE TEMP TABLE _log AS
+        SELECT source_type, csv_filename
+        FROM read_parquet('{log_path}')
+        WHERE csv_filename IS NOT NULL
+          AND source_type IN ('daily', 'scada_today', 'price_today')
+    """)
 
     pending = {}
-    for source_type, (url, like) in _LISTINGS.items():
-        rows = conn.sql(f"""
-            WITH html AS (SELECT content AS h FROM read_text('{url}')),
-                 lines AS (SELECT unnest(string_split(h, '<br>')) AS line FROM html)
-            SELECT DISTINCT
-                split_part(regexp_extract(line, 'HREF="[^"]+/([^"]+\\.zip)"', 1), '.', 1) AS filename
-            FROM lines
-            WHERE line LIKE '{like}'
-        """).fetchall()
-        pending[source_type] = sum(1 for (fn,) in rows if fn and f"{source_type}::{fn}" not in done)
+    for fact, (subpath, col_map) in _FACTS.items():
+        delta_path = f"{warehouse_path}/{subpath}"
+        try:
+            # Scan the (large) fact ONCE: pull the tiny distinct processed-file set for both tracking
+            # columns. daily_file/intraday_file are low-cardinality (one value per source file).
+            conn.sql(f"""
+                CREATE OR REPLACE TEMP TABLE _done AS
+                SELECT DISTINCT 'daily_file'    AS col, daily_file    AS f
+                FROM delta_scan('{delta_path}') WHERE daily_file    IS NOT NULL
+                UNION
+                SELECT DISTINCT 'intraday_file' AS col, intraday_file AS f
+                FROM delta_scan('{delta_path}') WHERE intraday_file IS NOT NULL
+            """)
+            fresh = False
+        except Exception:
+            # Fresh lakehouse (no _delta_log yet) or a transport error: treat every log file for this
+            # fact's sources as backlog (mirrors is_incremental()==False) — the safe over-count.
+            fresh = True
+
+        for source_type, fact_col in col_map.items():
+            if fresh:
+                (n,) = conn.sql(
+                    f"SELECT count(*) FROM _log WHERE source_type = '{source_type}'"
+                ).fetchone()
+            else:
+                # Null-safe anti-join = the assert_all_*_processed_* predicate exactly.
+                (n,) = conn.sql(f"""
+                    SELECT count(*) FROM _log l
+                    WHERE l.source_type = '{source_type}'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM _done d WHERE d.col = '{fact_col}' AND d.f = l.csv_filename
+                      )
+                """).fetchone()
+            pending[(fact, source_type)] = n
     return pending
 
 
@@ -117,20 +150,26 @@ def main() -> int:
     process_limit = int(os.environ.get("process_limit", "365"))
     threshold = int(os.environ.get("REMOTE_THRESHOLD", "50"))
     try:
-        pending = count_pending()
-        total = sum(pending.values())
-        remote = total > threshold
-        # Print exactly what drives the local-vs-remote decision: the per-source backlog, the total,
-        # and how much of it this one run will actually move (bounded by download_limit/process_limit).
-        print("[aemo] pending files not yet in the archive log (nemweb Current listing):", flush=True)
-        for src in ("daily", "scada_today", "price_today"):
-            print(f"[aemo]   {src:12s}: {pending.get(src, 0)} new")
-        print(f"[aemo]   TOTAL: {total} pending  "
-              f"(this run downloads up to {download_limit}/source, folds up to {process_limit}/source into the marts)")
-        why = f"{total} pending {'>' if remote else '<='} threshold={threshold}"
-    except Exception as exc:  # network/listing failure — fail safe to remote, don't risk local OOM
+        pending = count_pending()  # {(fact, source): unprocessed backlog}
+        sc_daily = pending.get(("fct_scada", "daily"), 0)
+        sc_today = pending.get(("fct_scada", "scada_today"), 0)
+        pr_daily = pending.get(("fct_price", "daily"), 0)
+        pr_today = pending.get(("fct_price", "price_today"), 0)
+        # Distinct source files still to process — the user's "log minus processed". A daily file feeds
+        # both facts and is folded in lockstep, so count it once (max of the two daily backlogs).
+        backlog = max(sc_daily, pr_daily) + sc_today + pr_today
+        remote = backlog > threshold
+        print("[aemo] mart backlog — archive-log files not yet folded into the facts:", flush=True)
+        print(f"[aemo]   fct_scada <- daily       : {sc_daily} unprocessed")
+        print(f"[aemo]   fct_scada <- scada_today : {sc_today} unprocessed")
+        print(f"[aemo]   fct_price <- daily       : {pr_daily} unprocessed")
+        print(f"[aemo]   fct_price <- price_today : {pr_today} unprocessed")
+        print(f"[aemo]   FILES TO PROCESS (distinct): {backlog}  "
+              f"(each build folds up to {process_limit}/source; downloads up to {download_limit}/source)")
+        why = f"{backlog} to process {'>' if remote else '<='} threshold={threshold}"
+    except Exception as exc:  # any pre-flight failure — fail safe to remote, don't risk local OOM
         remote = True
-        why = f"pre-flight count failed ({exc!r}); defaulting to remote"
+        why = f"pre-flight backlog count failed ({exc!r}); defaulting to remote"
 
     mode = "REMOTE (Fabric)" if remote else "LOCAL (runner)"
     print(f"[aemo] {why} -> running {mode}", flush=True)
