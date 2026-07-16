@@ -113,6 +113,29 @@ def test_build_notebook_embeds_project_commands_and_cores():
     assert "notebookutils.notebook.exit" in src
 
 
+def test_build_notebook_is_python_notebook_not_pyspark():
+    # The metadata Fabric keys off to treat the item as a pure Python notebook (not PySpark).
+    nb = fr.build_notebook("r", "eA==", [["run"]], "abfss://x/Files/r.json", "duckrun", None, 8)
+    md = nb["metadata"]
+    assert md["microsoft"]["language_group"] == "jupyter_python"
+    assert md["kernelspec"]["name"] == "python3"
+    assert md["language_info"]["name"] == "python"
+
+
+def test_build_notebook_cores_configure_cell_and_restart():
+    nb = fr.build_notebook("r", "eA==", [["run"]], "abfss://x/Files/r.json", "duckrun", None, 8)
+    first = "".join(nb["cells"][0]["source"])
+    assert first.startswith("%%configure")
+    assert '"vCores": 8' in first
+    src = "".join(s for cell in nb["cells"] for s in cell["source"])
+    assert "notebookutils.session.restartPython()" in src  # supported restart in a Python notebook
+
+
+def test_build_notebook_no_cores_omits_configure_cell():
+    nb = fr.build_notebook("r", "eA==", [["run"]], "abfss://x/Files/r.json", "duckrun", None, None)
+    assert not "".join(nb["cells"][0]["source"]).startswith("%%configure")
+
+
 def test_build_notebook_pip_spec_branch_install():
     spec = "git+https://github.com/djouallah/duckrun@abc123"
     nb = fr.build_notebook("r", "eA==", [["run"]], "abfss://x/Files/r.json", spec, None, None)

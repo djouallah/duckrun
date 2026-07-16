@@ -253,16 +253,24 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
 
     ``install_target`` is the exact pip requirement (``duckrun==<v>`` or a ``git+…`` spec). ``env`` is
     the non-secret config to export before dbt runs (the project's own ``env_var`` names — never a
-    token). ``cores`` is recorded in metadata for the job to pick up."""
+    token). ``cores`` sets the Python-notebook compute via a ``%%configure`` cell."""
     commands = [_normalize_command(c, "PROJ") for c in commands]
     env = env or {}
 
-    # Install into the job kernel. NO restartPython() here: in a RunNotebook job restarting the kernel
-    # makes the job exit -9 ("Ipython kernel exits with code -9"). A fresh job kernel hasn't imported
-    # duckdb/deltalake yet, so the just-installed wheels load on first import in the work cell below.
+    # First cell: set the single-node compute size (Fabric honors %%configure vCores on API-triggered
+    # runs). Recommended values [4, 8, 16, 32, 64]; memory scales with vCores. Omitted when cores is None.
+    configure = None
+    if cores:
+        configure = "%%configure -f\n" + json.dumps({"vCores": int(cores)})
+
+    # Install duckrun, then restartPython() so the just-upgraded duckdb/deltalake (the runtime
+    # pre-installs both) are the ones imported in the work cell. restartPython is the SUPPORTED restart
+    # in a Python notebook; the earlier -9 crash was from this landing in a *PySpark* notebook — the
+    # metadata below (microsoft.language_group = jupyter_python) is what makes this a Python notebook.
     setup = (
-        "import subprocess, sys\n"
-        f"subprocess.run([sys.executable, '-m', 'pip', 'install', '-q', {install_target!r}], check=False)\n"
+        f"!pip install -q {install_target} --upgrade\n"
+        "import notebookutils\n"
+        "notebookutils.session.restartPython()\n"
     )
 
     work = (
@@ -302,15 +310,20 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         return {"cell_type": "code", "source": src.splitlines(keepends=True),
                 "metadata": {}, "execution_count": None, "outputs": []}
 
+    cells = [_cell(configure)] if configure else []
+    cells += [_cell(setup), _cell(work)]
+
     return {
         "nbformat": 4,
         "nbformat_minor": 5,
-        "cells": [_cell(setup), _cell(work)],
+        "cells": cells,
+        # This metadata is what makes Fabric treat the item as a PURE PYTHON notebook (not PySpark):
+        # microsoft.language_group == "jupyter_python", python3 kernelspec, python language_info. Without
+        # it the item defaults to a Spark notebook and restartPython()/single-node compute don't apply.
         "metadata": {
+            "kernelspec": {"name": "python3", "display_name": "Python 3", "language": "python"},
             "language_info": {"name": "python"},
-            "kernelspec": {"name": "python", "display_name": "Python"},
-            # Compute hint for the Fabric Python notebook. The exact live schema is confirmed at the
-            # first real run; recorded here (and echoed into the job's executionData) so cores flows.
+            "microsoft": {"language": "python", "language_group": "jupyter_python"},
             "duckrun": {"cores": cores, "runid": runid},
         },
     }
@@ -411,17 +424,13 @@ def _await_lro_item_id(token: str, resp) -> str:
     raise RemoteRunError("timed out creating notebook")
 
 
-def _run_job_and_wait(token: str, ws_id: str, item_id: str, cores: Optional[int]) -> str:
+def _run_job_and_wait(token: str, ws_id: str, item_id: str) -> str:
     """Start the on-demand notebook job and poll the instance to a terminal state. Returns the
-    terminal status; raises ``RemoteRunError`` on a non-Completed terminal state or timeout."""
-    exec_data = {}
-    if cores:
-        # Compute size for the Python notebook. Exact live field confirmed at the first real run.
-        exec_data["configuration"] = {"vCores": cores}
-    body = {"executionData": exec_data} if exec_data else None
+    terminal status; raises ``RemoteRunError`` on a non-Completed terminal state or timeout. Compute
+    size (vCores) is carried by the notebook's ``%%configure`` cell, which API runs honor."""
     resp = _http_request(
         "POST", f"{_FABRIC_API}/workspaces/{ws_id}/items/{item_id}/jobs/instances",
-        token=token, params={"jobType": "RunNotebook"}, json_body=body,
+        token=token, params={"jobType": "RunNotebook"},
     )
     if resp.status_code not in (200, 201, 202):
         resp.raise_for_status()
@@ -594,7 +603,7 @@ class RemoteRunner:
         _log(f"creating temp notebook duckrun-remote-{runid} in workspace {workspace}")
         item_id = _create_notebook(fabric_token, ws_id, f"duckrun-remote-{runid}", notebook)
         try:
-            _run_job_and_wait(fabric_token, ws_id, item_id, self.cores)
+            _run_job_and_wait(fabric_token, ws_id, item_id)
             result = read_result_json(result_path, storage_token)
         finally:
             _delete_item(fabric_token, ws_id, item_id)
