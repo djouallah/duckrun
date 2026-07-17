@@ -120,6 +120,7 @@ taxi_run.html
 # CI-only scorecards: rendered from test XML and injected into the docs/*.md beside them
 docs/conformance_card.md
 docs/connection_card.md
+docs/workspace_card.md
 
 # dbt logs written to the repo root (e.g. running dbt with --project-dir)
 logs/

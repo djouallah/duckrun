@@ -24,6 +24,29 @@
 
 <!-- CONNECTION_API:END -->
 
+<!-- WORKSPACE_API:START -->
+
+## duckrun workspace API — Fabric artifact deploy
+
+🗂️ **10 public methods** · deploy · run · schedule
+
+> Introspected from the shipped classes — the exact public surface of `duckrun.workspace()` and the `Workspace` handle it returns, signatures and all, not a hand-maintained list. It drives Microsoft Fabric (create lakehouses, deploy notebooks / semantic models / pipelines / variable libraries, run and schedule them) — see the [Workspace (Fabric)](workspace.md) page. Exercised by the manual deploy demo ([`tests/integration_tests/deploy`](../tests/integration_tests/deploy)).
+
+| Surface | Method | Parameters |
+| --- | --- | --- |
+| `duckrun` | `workspace` | `workspace, token=None` |
+| `Workspace` | `create_lakehouse` | `name, schemas=True` |
+| `Workspace` | `deploy` | `source, lakehouse=None, variables=None, name=None, overwrite=False` |
+| `Workspace` | `display_name` | *property* |
+| `Workspace` | `id` | *accessor* |
+| `Workspace` | `lakehouse_id` | `name` |
+| `Workspace` | `list_lakehouses` | *(none)* |
+| `Workspace` | `name` | *accessor* |
+| `Workspace` | `run` | `name` |
+| `Workspace` | `schedule` | `name, every=None, daily=None, weekly=None, at=None, tz='UTC'` |
+
+<!-- WORKSPACE_API:END -->
+
 ## Delta SQL extensions (not in DuckDB)
 
 Everything you run through `conn.sql()` is standard DuckDB SQL — reads, CTEs, `SHOW`/`DESCRIBE`,

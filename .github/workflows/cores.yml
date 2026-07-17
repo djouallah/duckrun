@@ -314,23 +314,32 @@ jobs:
         if: always()
         run: python tests/tools/connection_summary.py connection.xml > docs/connection_card.md
 
+      - name: Render workspace API card
+        # Introspected from duckrun.workspace + the Workspace handle — no pytest badge (the surface
+        # drives live Fabric, exercised by the manual deploy demo, not this unit XML).
+        if: always()
+        run: python tests/tools/workspace_summary.py > docs/workspace_card.md
+
       - name: Publish scorecard to job summary
         if: always()
-        run: cat docs/connection_card.md >> "$GITHUB_STEP_SUMMARY"
+        run: |
+          cat docs/connection_card.md >> "$GITHUB_STEP_SUMMARY"
+          cat docs/workspace_card.md >> "$GITHUB_STEP_SUMMARY"
 
       - name: Inject card into docs and commit (main only)
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
         run: |
           python tests/tools/inject_readme.py docs/api-reference.md docs/connection_card.md CONNECTION_API
+          python tests/tools/inject_readme.py docs/api-reference.md docs/workspace_card.md WORKSPACE_API
           if git diff --quiet -- docs/api-reference.md; then
-            echo "Connection card unchanged."
+            echo "API-reference cards unchanged."
             exit 0
           fi
           git config user.name "djouallah"
           git config user.email "mimoune.djouallah@gmail.com"
           git add docs/api-reference.md
-          git commit -m "docs: refresh connection API method scorecard [skip ci]"
+          git commit -m "docs: refresh connection + workspace API scorecards [skip ci]"
           for i in 1 2 3; do
             git pull --rebase origin main && git push origin main && break
             sleep 3
