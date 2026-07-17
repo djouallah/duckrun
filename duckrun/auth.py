@@ -36,6 +36,25 @@ _POWERBI_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
 # Azure CLI's well-known public client id, used for the interactive/CLI fallbacks.
 _AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
+# Per-scope token cache. get_*_token() mints a token once and reuses it across the process instead of
+# re-acquiring on every call — a dbt run over N catalogs mints a scoped secret + discovers + writes per
+# catalog, so without this the OIDC/token endpoint is hammered (and rate-limits, then a later call fails
+# and delta-rs falls back to Azure IMDS). Refreshed automatically when the cached token nears expiry.
+_TOKEN_CACHE: dict = {}
+
+
+def _cached_token(scope: str, acquire):
+    """Return a cached token for ``scope`` if it's still comfortably valid, else acquire + cache one.
+    ``acquire`` is a zero-arg callable returning a token or None. A non-JWT token (can't read expiry)
+    is cached for the process — the same lifetime the caller would otherwise re-fetch it at."""
+    cached = _TOKEN_CACHE.get(scope)
+    if cached and not token_is_expiring(cached):
+        return cached
+    token = acquire()
+    if token:
+        _TOKEN_CACHE[scope] = token
+    return token
+
 
 def _fabric_token() -> Optional[str]:
     """A storage token from the Fabric notebook runtime, or None when not in one."""
@@ -134,12 +153,12 @@ def get_onelake_token() -> str:
     Raises ``RuntimeError`` with actionable guidance if none is available, rather than handing
     back an empty/placeholder token that would fail later as an opaque 403.
     """
-    token = (
+    token = _cached_token(_STORAGE_SCOPE, lambda: (
         _fabric_token()
         or _github_oidc_token()
         or os.environ.get("AZURE_STORAGE_TOKEN")
         or _azure_identity_token()
-    )
+    ))
     if token:
         return token
     raise RuntimeError(
@@ -160,12 +179,12 @@ def get_fabric_token() -> str:
     so it is acquired separately. Raises ``RuntimeError`` with actionable guidance if none is
     available rather than returning a token that would 401 later.
     """
-    token = (
+    token = _cached_token(_FABRIC_SCOPE, lambda: (
         _notebook_fabric_api_token()
         or _github_oidc_token(_FABRIC_SCOPE)
         or os.environ.get("FABRIC_TOKEN")
         or _azure_identity_fabric_token()
-    )
+    ))
     if token:
         return token
     raise RuntimeError(
@@ -222,12 +241,12 @@ def get_powerbi_token() -> str:
     as the Fabric control-plane token is reused. Raises ``RuntimeError`` with actionable guidance if
     none is available rather than returning a token that would 401 later.
     """
-    token = (
+    token = _cached_token(_POWERBI_SCOPE, lambda: (
         _notebook_fabric_api_token()
         or _github_oidc_token(_POWERBI_SCOPE)
         or os.environ.get("POWERBI_TOKEN")
         or _azure_identity_powerbi_token()
-    )
+    ))
     if token:
         return token
     raise RuntimeError(

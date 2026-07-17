@@ -127,6 +127,32 @@ def test_refresh_never_reaches_interactive_browser(monkeypatch):
 
 # ------------------------------------------ Fabric/Power BI tokens self-acquired via OIDC by scope
 
+@pytest.fixture(autouse=True)
+def _clear_token_cache():
+    """get_*_token caches per scope for the process; clear it so each test acquires fresh."""
+    auth._TOKEN_CACHE.clear()
+    yield
+    auth._TOKEN_CACHE.clear()
+
+
+def test_get_token_caches_and_reuses(monkeypatch):
+    # A burst of get_onelake_token calls (a multi-catalog dbt run) must mint the token ONCE, not hammer
+    # the OIDC endpoint — the second call returns the cached token without re-acquiring.
+    calls = {"n": 0}
+
+    def acquire():
+        calls["n"] += 1
+        return "TOKEN-XYZ"  # non-JWT → cached for the process
+
+    monkeypatch.setattr(auth, "_fabric_token", lambda: None)
+    monkeypatch.setattr(auth, "_github_oidc_token", lambda scope=auth._STORAGE_SCOPE: acquire())
+    monkeypatch.setattr(auth, "_azure_identity_token", lambda interactive=True: None)
+    monkeypatch.delenv("AZURE_STORAGE_TOKEN", raising=False)
+    assert auth.get_onelake_token() == "TOKEN-XYZ"
+    assert auth.get_onelake_token() == "TOKEN-XYZ"
+    assert calls["n"] == 1  # minted once, reused
+
+
 def _capture_oidc_scope(monkeypatch):
     """Stub _github_oidc_token to record the scope it's asked for and return a scope-tagged token."""
     seen = {}
