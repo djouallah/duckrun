@@ -110,6 +110,7 @@ nav:
       - Conformance: conformance.md
   - Notebook:
       - Connection API: connection-api.md
+      - Workspace (Fabric): workspace.md
   - API reference: api-reference.md
   - Examples:
       - examples.md
