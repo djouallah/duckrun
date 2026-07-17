@@ -47,12 +47,18 @@ dependencies = [
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
     # API directly; requests is otherwise only a transitive dbt dependency.
     "requests",
+    # OneLake/Fabric auth is core, not an add-on: duckrun self-acquires a bearer token (GitHub OIDC
+    # workload-identity / Azure CLI / interactive browser) whenever a profile or connect() call omits
+    # one, so `pip install duckrun` just works against OneLake with no extra to remember. Adds only a
+    # `cryptography` wheel (via msal) plus small pure-Python libs — no build step. Unused inside a
+    # Fabric notebook (notebookutils supplies the token) and for local/s3/gcs stores.
+    "azure-identity",
 ]
 
 [project.optional-dependencies]
-# Laptop OneLake auth for the connection API: acquire a storage token via Azure CLI / browser.
-# Not needed inside a Fabric notebook (notebookutils supplies the token) or for s3/gcs/local.
-local = ["azure-identity"]
+# Back-compat no-op: OneLake auth (azure-identity) is now a core dependency, so `duckrun[local]` is
+# just `duckrun`. Kept so existing installs/docs that reference the extra don't error.
+local = []
 # Test-only. pyarrow builds reusable Arrow fixtures; pandas is required by the DataFrame.toPandas()
 # test (DuckDB .df() materializes a pandas DataFrame, so it needs pandas+numpy). Production duckrun
 # stays pyarrow-/pandas-free — it streams DuckDB relations straight to deltalake.
