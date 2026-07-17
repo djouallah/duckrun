@@ -100,6 +100,29 @@ def test_transport_env_override_wins_even_in_fabric(monkeypatch):
     assert _transport_set(conn) == "default"
 
 
+# ------------------------------------------------- write-path token self-acquire
+
+def test_with_onelake_token_fills_bearer_for_abfss(monkeypatch):
+    # The dbt write path calls this for an abfss:// target with no token — it must self-acquire.
+    monkeypatch.setattr("duckrun.auth.get_onelake_token", lambda: "SELFACQUIRED")
+    out = secret.with_onelake_token(
+        "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo/m", {})
+    assert out["bearer_token"] == "SELFACQUIRED"
+
+
+def test_with_onelake_token_noop_when_token_present(monkeypatch):
+    monkeypatch.setattr("duckrun.auth.get_onelake_token",
+                        lambda: pytest.fail("must not self-acquire when a token is already set"))
+    so = {"bearer_token": "HAVE"}
+    assert secret.with_onelake_token("abfss://x@h/y", so) is so
+
+
+def test_with_onelake_token_noop_for_local_path(monkeypatch):
+    monkeypatch.setattr("duckrun.auth.get_onelake_token",
+                        lambda: pytest.fail("must not self-acquire for a non-abfss path"))
+    assert secret.with_onelake_token("./warehouse", {}) == {}
+
+
 # ----------------------------------------------------------------- abfss URL parse
 
 def test_parse_abfss_splits_filesystem_host_path():

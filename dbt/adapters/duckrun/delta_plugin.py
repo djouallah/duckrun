@@ -154,6 +154,10 @@ class Plugin(BasePlugin):
         storage_options = cfg.get("storage_options") or self._catalog_storage_options(
             getattr(target_config.relation, "database", None)
         )
+        # A profile that omits bearer_token is fine: for an abfss:// target, self-acquire a OneLake
+        # token (Fabric notebook / OIDC / azure-identity) so the delta-rs write authenticates — the
+        # same fallback the read/discovery path uses. No-op for local/az:// or when a token is present.
+        storage_options = secret.with_onelake_token(path, storage_options)
 
         # Keep `cur` referenced for the whole write so the relation's Arrow stream
         # stays valid while deltalake consumes it.

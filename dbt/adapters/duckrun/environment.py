@@ -55,6 +55,9 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
             # so single-catalog behavior is unchanged.
             target_cat = delta_dml.dml_target_catalog(sql)
             root_path, storage_options = creds.root_for(target_cat)
+            # Self-acquire a OneLake token for an abfss:// target whose profile omits bearer_token, so
+            # raw-DML / snapshot delta-rs writes authenticate (mirrors the plugin + read paths).
+            storage_options = secret.with_onelake_token(root_path, storage_options)
             if delta_dml.handle(self._cursor, root_path, storage_options, sql):
                 return self._cursor  # applied to Delta; nothing to run on DuckDB
         return super().execute(sql, bindings)
