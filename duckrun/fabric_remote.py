@@ -462,13 +462,20 @@ def _create_item(token: str, ws_id: str, endpoint: str, name: str, parts: List[d
     if fmt:
         definition["format"] = fmt
     body = {"displayName": name, "definition": definition}
-    resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{ws_id}/{endpoint}", token=token, json_body=body)
-    if resp.status_code in (200, 201):
-        return resp.json()["id"]
-    if resp.status_code == 202:
-        return _await_lro_item_id(token, resp)
-    resp.raise_for_status()
-    raise RemoteRunError(f"unexpected status {resp.status_code} creating {endpoint}: {resp.text[:200]}")
+    url = f"{_FABRIC_API}/workspaces/{ws_id}/{endpoint}"
+    # A 409 here means the name is still in use — Fabric's delete is a long-running op whose name
+    # release lags the item dropping from the listing, so an overwrite's recreate can race it. Retry.
+    for attempt in range(12):
+        resp = _http_request("POST", url, token=token, json_body=body)
+        if resp.status_code in (200, 201):
+            return resp.json()["id"]
+        if resp.status_code == 202:
+            return _await_lro_item_id(token, resp)
+        if resp.status_code == 409 and attempt < 11:
+            _sleep(_POLL_INTERVAL)
+            continue
+        resp.raise_for_status()
+        raise RemoteRunError(f"unexpected status {resp.status_code} creating {endpoint}: {resp.text[:200]}")
 
 
 def _create_notebook(token: str, ws_id: str, name: str, notebook: dict) -> str:

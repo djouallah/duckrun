@@ -41,8 +41,6 @@ from .fabric_remote import (
     _run_job_and_wait,
     _schedule_item,
     _delete_item,
-    _sleep,
-    _POLL_INTERVAL,
 )
 
 _WEEKDAYS = {d[:3].lower(): d for d in
@@ -148,15 +146,6 @@ class Workspace:
         resp.raise_for_status()
         return resp.json().get("value", [])
 
-    def _wait_item_absent(self, kind: str, name: str, tries: int = 12) -> None:
-        """Block until no item of ``kind`` is named ``name`` — Fabric's DELETE is a long-running op, so
-        a same-name create issued right after it races the name still being in use (HTTP 409)."""
-        for _ in range(tries):
-            if not any(it.get("displayName") == name for it in self._items(kind)):
-                return
-            _sleep(_POLL_INTERVAL)
-        raise RemoteRunError(f"timed out waiting for {name!r} to be deleted before recreating it")
-
     def list_lakehouses(self) -> List[Dict]:
         """Every lakehouse in the workspace as ``[{"displayName": ..., "id": ...}, ...]``."""
         return self._items("lakehouses")
@@ -227,8 +216,7 @@ class Workspace:
         if existing:
             if not overwrite:
                 raise RemoteRunError(f"an item named {name!r} already exists; pass overwrite=True to replace")
-            _delete_item(self._token, self.id, existing["id"])
-            self._wait_item_absent(endpoint, name)   # Fabric delete is async; a create before it lands 409s
+            _delete_item(self._token, self.id, existing["id"])   # async; the recreate retries on 409
 
         if endpoint == "notebooks":
             return _create_notebook(self._token, self.id, name, json.loads(content))
