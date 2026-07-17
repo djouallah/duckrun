@@ -15,7 +15,7 @@ import duckrun
 ws = duckrun.workspace("My Workspace")          # workspace name or GUID
 lh_id = ws.create_lakehouse("bronze")           # returns the lakehouse item id
 nb_id = ws.deploy("etl.ipynb")                  # deploy a notebook
-sm_id = ws.deploy("model.bim")                  # deploy + refresh a semantic model
+sm_id = ws.deploy("model.bim", lakehouse="bronze")  # Direct Lake model, pointed at a lakehouse
 pl_id = ws.deploy("pipeline.json")              # deploy a data pipeline
 ws.list_lakehouses()                            # [{"displayName": ..., "id": ...}, ...]
 ```
@@ -34,6 +34,20 @@ live. A `.json` is deployed **verbatim** as a data pipeline — its contents are
 pipeline definition (`properties.activities`) but no notebook/workspace ids are rewritten. It is
 **not** idempotent: if an item of that name already exists it is replaced only when `overwrite=True`,
 otherwise the call raises rather than hide a stale deploy.
+
+**Pointing a Direct Lake model at a lakehouse.** A Direct Lake `model.bim` bakes in the OneLake
+workspace + lakehouse GUIDs it reads from; deploying it elsewhere would leave it pointed at the wrong
+place. `lakehouse=` fixes that — you name a lakehouse in this workspace and duckrun rewrites those
+GUIDs for you (no connection strings or GUIDs to edit):
+
+```python
+ws.deploy("model.bim", lakehouse="silver")   # point the model at the silver lakehouse
+ws.deploy("model.bim")                        # workspace has one lakehouse → inferred
+```
+
+The lakehouse is **inferred** when the model already targets one that exists in this workspace, or
+the workspace has exactly one; with several you must name it (otherwise `deploy` raises, listing
+them). A wrong name raises with the available names. `lakehouse=` is ignored for `.ipynb` / `.json`.
 
 `deploy` does create + refresh; it does **not** set up a data-source *connection binding*. A freshly
 deployed Direct Lake model whose connection isn't already resolvable will fail the refresh — that

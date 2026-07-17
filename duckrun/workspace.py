@@ -16,8 +16,14 @@ reused as-is from :mod:`duckrun.fabric_remote`.
 """
 import json
 import os
+import re
 from typing import Dict, List, Optional
 from urllib.parse import urlsplit
+
+# A Direct-Lake-on-OneLake model.bim references its lakehouse by a OneLake URL carrying the
+# workspace + lakehouse GUIDs, e.g. onelake.dfs.fabric.microsoft.com/<ws-guid>/<lakehouse-guid>/...
+_ONELAKE_REF = re.compile(
+    r"onelake\.dfs\.fabric\.microsoft\.com/([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})")
 
 from .auth import get_fabric_token, get_powerbi_token
 from .fabric_remote import (
@@ -110,7 +116,8 @@ class Workspace:
         resp.raise_for_status()
         raise RemoteRunError(f"unexpected status {resp.status_code} creating lakehouse: {resp.text[:200]}")
 
-    def deploy(self, source: str, name: Optional[str] = None, overwrite: bool = False) -> str:
+    def deploy(self, source: str, lakehouse: Optional[str] = None,
+               name: Optional[str] = None, overwrite: bool = False) -> str:
         """Deploy a file artifact to the workspace; return its item id.
 
         ``source`` is a local file path or an ``http(s)`` URL (a raw file URL). The item type is keyed
@@ -118,6 +125,12 @@ class Workspace:
         — and the name defaults to the filename stem (overridable via ``name``). A ``.json`` is
         deployed verbatim; a semantic model is also **refreshed** after deploy (a *reframe* onto the
         latest Delta data for Direct Lake), so ``deploy`` returns only once it is live.
+
+        ``lakehouse`` (a lakehouse name in this workspace) points a **Direct Lake** ``.bim`` at that
+        lakehouse: duckrun rewrites the OneLake workspace/lakehouse GUIDs baked into the model so it
+        connects to the right place — no GUIDs or connection strings to edit by hand. It is inferred
+        when the model already targets a lakehouse in this workspace, or the workspace has exactly one;
+        with several you must name it. Ignored for ``.ipynb`` / ``.json``.
 
         Not idempotent: if an item of that name already exists it is replaced only when
         ``overwrite=True``, otherwise this raises.
@@ -134,6 +147,8 @@ class Workspace:
             raise RemoteRunError(
                 f"{source!r} is not a Fabric data-pipeline definition "
                 "(expected top-level {'properties': {'activities': ...}})")
+        if ext == ".bim":
+            content = self._repoint_bim(content, lakehouse, source)   # resolve before any delete
 
         existing = next((it for it in self._items(endpoint) if it.get("displayName") == name), None)
         if existing:
@@ -149,6 +164,42 @@ class Workspace:
         item_id = _create_semantic_model(self._token, self.id, name, content)
         _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
+
+    def _repoint_bim(self, content: bytes, lakehouse: Optional[str], source: str) -> bytes:
+        """Rewrite a Direct-Lake ``model.bim``'s OneLake workspace/lakehouse GUIDs to this workspace
+        and the chosen lakehouse. If the model carries no OneLake reference it isn't Direct Lake, so
+        it's returned unchanged (and an explicit ``lakehouse=`` then raises — nothing to point)."""
+        text = content.decode("utf-8")
+        m = _ONELAKE_REF.search(text)
+        if not m:
+            if lakehouse is not None:
+                raise RemoteRunError(
+                    f"{source!r} has no OneLake reference to point at lakehouse {lakehouse!r} "
+                    "(is it a Direct Lake model?)")
+            return content
+        source_ws, source_lh = m.group(1), m.group(2)
+        target_lh = self._resolve_lakehouse_id(lakehouse, source_lh)
+        return text.replace(source_ws, self.id).replace(source_lh, target_lh).encode("utf-8")
+
+    def _resolve_lakehouse_id(self, lakehouse: Optional[str], source_lh: str) -> str:
+        """The target lakehouse id for a Direct Lake repoint. Named → looked up (or raise, listing the
+        real names). Unnamed → the lakehouse the model already targets if it lives here, else the sole
+        lakehouse, else raise asking which one."""
+        lakehouses = self._items("lakehouses")
+        names = [lh.get("displayName") for lh in lakehouses]
+        if lakehouse is not None:
+            match = next((lh for lh in lakehouses if lh.get("displayName") == lakehouse), None)
+            if not match:
+                raise RemoteRunError(f"lakehouse {lakehouse!r} not found in workspace; have: {names}")
+            return match["id"]
+        ids = {lh["id"] for lh in lakehouses}
+        if source_lh in ids:
+            return source_lh                    # already targets a lakehouse in this workspace — keep it
+        if len(lakehouses) == 1:
+            return lakehouses[0]["id"]
+        if not lakehouses:
+            raise RemoteRunError("no lakehouse in this workspace to point the model at")
+        raise RemoteRunError(f"which lakehouse should the model use? pass lakehouse=; have: {names}")
 
 
 def workspace(workspace: str, token: Optional[str] = None) -> Workspace:

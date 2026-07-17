@@ -130,16 +130,19 @@ def test_guid_workspace_skips_name_lookup(_patch):
 class DeployFabric:
     """Scripts the deploy sequence (list/create/delete + a Power BI refresh) and records every call."""
 
-    def __init__(self, *, kind="notebooks", existing=None, refresh_status="Completed"):
-        self.kind = kind                    # "notebooks" | "semanticModels"
+    def __init__(self, *, kind="notebooks", existing=None, refresh_status="Completed", lakehouses=None):
+        self.kind = kind                    # "notebooks" | "semanticModels" | "dataPipelines"
         self.existing = existing or []
         self.refresh_status = refresh_status
+        self.lakehouses = lakehouses or []  # for the Direct Lake .bim repoint
         self.calls = []                     # (method, url, json_body)
 
     def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
         self.calls.append((method, url, json_body))
         if method == "GET" and url.endswith("/workspaces"):
             return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/lakehouses"):
+            return FakeResp(200, {"value": self.lakehouses})
         if method == "GET" and url.endswith(f"/workspaces/ws-guid/{self.kind}"):
             return FakeResp(200, {"value": self.existing})
         if method == "POST" and url.endswith(f"/workspaces/ws-guid/{self.kind}"):
@@ -209,6 +212,69 @@ def test_deploy_bim_failed_refresh_raises(_patch, monkeypatch, tmp_path):
     src = _write(tmp_path, "model.bim", "{}")
     with pytest.raises(fr.RemoteRunError, match="refresh"):
         _ws().deploy(src)
+
+
+# --- Direct Lake .bim repoint (OneLake workspace/lakehouse GUID rewrite) --------------------------
+
+_SRC_WS = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+_SRC_LH = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+
+def _directlake_bim():
+    """A minimal Direct-Lake-on-OneLake model.bim carrying a OneLake ws/lakehouse GUID reference."""
+    onelake = f"https://onelake.dfs.fabric.microsoft.com/{_SRC_WS}/{_SRC_LH}/Tables"
+    return json.dumps({"model": {"tables": [{"partitions": [
+        {"mode": "directLake", "source": {"expression": onelake}}]}]}})
+
+
+def _deployed_bim(fake):
+    import base64
+    parts = {p["path"]: p for p in fake.post_body("/workspaces/ws-guid/semanticModels")["definition"]["parts"]}
+    return base64.b64decode(parts["model.bim"]["payload"]).decode()
+
+
+def _bim_fabric(_patch, monkeypatch, lakehouses):
+    fake = _patch(DeployFabric(kind="semanticModels", lakehouses=lakehouses))
+    monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
+    return fake
+
+
+def test_deploy_bim_repoints_to_named_lakehouse(_patch, monkeypatch, tmp_path):
+    fake = _bim_fabric(_patch, monkeypatch, [{"displayName": "silver", "id": "lh-silver"},
+                                             {"displayName": "gold", "id": "lh-gold"}])
+    src = _write(tmp_path, "model.bim", _directlake_bim())
+    _ws().deploy(src, lakehouse="silver")
+    out = _deployed_bim(fake)
+    assert _SRC_WS not in out and "ws-guid" in out        # workspace GUID repointed to this workspace
+    assert _SRC_LH not in out and "lh-silver" in out       # lakehouse GUID repointed to the named one
+
+
+def test_deploy_bim_infers_single_lakehouse(_patch, monkeypatch, tmp_path):
+    fake = _bim_fabric(_patch, monkeypatch, [{"displayName": "only", "id": "lh-only"}])
+    src = _write(tmp_path, "model.bim", _directlake_bim())
+    _ws().deploy(src)                                       # no lakehouse= → the sole lakehouse
+    assert "lh-only" in _deployed_bim(fake)
+
+
+def test_deploy_bim_ambiguous_lakehouse_raises(_patch, monkeypatch, tmp_path):
+    _bim_fabric(_patch, monkeypatch, [{"displayName": "a", "id": "lh-a"}, {"displayName": "b", "id": "lh-b"}])
+    src = _write(tmp_path, "model.bim", _directlake_bim())
+    with pytest.raises(fr.RemoteRunError, match="which lakehouse"):
+        _ws().deploy(src)
+
+
+def test_deploy_bim_lakehouse_not_found_raises(_patch, monkeypatch, tmp_path):
+    _bim_fabric(_patch, monkeypatch, [{"displayName": "silver", "id": "lh-silver"}])
+    src = _write(tmp_path, "model.bim", _directlake_bim())
+    with pytest.raises(fr.RemoteRunError, match="not found"):
+        _ws().deploy(src, lakehouse="bronze")
+
+
+def test_deploy_lakehouse_arg_ignored_for_notebook(_patch, tmp_path):
+    fake = _patch(DeployFabric(kind="notebooks"))
+    src = _write(tmp_path, "etl.ipynb", json.dumps({"nbformat": 4, "cells": [], "metadata": {}}))
+    _ws().deploy(src, lakehouse="whatever")                 # ignored — no lakehouse lookup for a notebook
+    assert not any(u.endswith("/lakehouses") for _, u, _ in fake.calls)
 
 
 def test_deploy_pipeline_from_path(_patch, tmp_path):
