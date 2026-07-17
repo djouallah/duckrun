@@ -531,29 +531,49 @@ def _create_variable_library(token: str, ws_id: str, name: str, variables_json: 
     return _create_item(token, ws_id, "variableLibraries", name, parts)
 
 
+# A freshly created Direct Lake model's OneLake read permission propagates asynchronously — Microsoft
+# documents role-definition changes taking ~5 min. A reframe fired before it lands fails with a
+# transient "artifact not found / no permission", so retry a failed refresh across that window.
+_REFRESH_RETRY_WAIT = 60
+_REFRESH_RETRIES = 6
+
+
 def _refresh_semantic_model(pbi_token: str, ws_id: str, item_id: str) -> None:
     """Trigger an enhanced refresh (a *reframe* for Direct Lake) and poll it to completion. Raises
     ``RemoteRunError`` on a failed/cancelled refresh or timeout. Uses the Power BI REST API, so it
-    takes a Power BI-scoped token (``auth.get_powerbi_token``), not the Fabric control-plane one."""
-    base = f"{_POWERBI_API}/groups/{ws_id}/datasets/{item_id}/refreshes"
-    resp = _http_request("POST", base, token=pbi_token, json_body={})
-    if resp.status_code not in (200, 202):
-        resp.raise_for_status()
-        raise RemoteRunError(f"unexpected status {resp.status_code} starting refresh: {resp.text[:200]}")
+    takes a Power BI-scoped token (``auth.get_powerbi_token``), not the Fabric control-plane one.
 
-    deadline_polls = _POLL_TIMEOUT // max(_POLL_INTERVAL, 1)
-    for _ in range(int(deadline_polls) + 1):
-        _sleep(_POLL_INTERVAL)
-        r = _http_request("GET", base, token=pbi_token, params={"$top": 1})
-        r.raise_for_status()
-        entries = r.json().get("value", [])
-        status = entries[0].get("status") if entries else "Unknown"
-        _log(f"refresh {item_id} status: {status}")
-        if status in _REFRESH_DONE:
-            if status != "Completed":
-                raise RemoteRunError(f"semantic model refresh {status}: {entries[0]}")
+    Retries a failed refresh: right after a model is created its OneLake read permission may still be
+    propagating (~5 min), so the first reframe can transiently fail with 'artifact not found'."""
+    base = f"{_POWERBI_API}/groups/{ws_id}/datasets/{item_id}/refreshes"
+    for attempt in range(_REFRESH_RETRIES):
+        resp = _http_request("POST", base, token=pbi_token, json_body={})
+        if resp.status_code not in (200, 202):
+            resp.raise_for_status()
+            raise RemoteRunError(f"unexpected status {resp.status_code} starting refresh: {resp.text[:200]}")
+
+        deadline_polls = _POLL_TIMEOUT // max(_POLL_INTERVAL, 1)
+        entry, status = None, "Unknown"
+        for _ in range(int(deadline_polls) + 1):
+            _sleep(_POLL_INTERVAL)
+            r = _http_request("GET", base, token=pbi_token, params={"$top": 1})
+            r.raise_for_status()
+            entries = r.json().get("value", [])
+            entry = entries[0] if entries else None
+            status = entry.get("status") if entry else "Unknown"
+            _log(f"refresh {item_id} status: {status}")
+            if status in _REFRESH_DONE:
+                break
+        else:
+            raise RemoteRunError("timed out refreshing semantic model")
+
+        if status == "Completed":
             return
-    raise RemoteRunError("timed out refreshing semantic model")
+        if attempt < _REFRESH_RETRIES - 1:
+            _log(f"refresh {status}; OneLake permission may still be propagating — retrying in {_REFRESH_RETRY_WAIT}s")
+            _sleep(_REFRESH_RETRY_WAIT)
+            continue
+        raise RemoteRunError(f"semantic model refresh {status}: {entry}")
 
 
 def _await_lro_item_id(token: str, resp) -> str:
