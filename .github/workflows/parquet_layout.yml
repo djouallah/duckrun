@@ -73,8 +73,9 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # duckrun self-acquires every token from this OIDC identity (storage, Fabric, Power BI) and picks
-      # the curl transport itself; azure/login stays only for the `az rest` lakehouse/workspace lookups.
+      # The only Azure inputs: the OIDC federated identity. duckrun mints every token it needs (storage,
+      # Fabric, Power BI), picks the curl transport itself, AND resolves the workspace/lakehouse — so
+      # there's no azure/login and no az rest anywhere in this job.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
@@ -121,34 +122,10 @@ jobs:
           echo "ADOMD_DIR=$proj/publish" >> "$GITHUB_ENV"
           echo "resolved ADOMD_DIR=$proj/publish"
 
-      - name: 🔐 Azure federated login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: 🔑 Resolve lakehouse + workspace
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          # ws id from deploy_config; lakehouse id + workspace name from the Fabric/Power BI APIs.
-          # No tokens minted here — the scripts self-acquire storage/Fabric/Power BI tokens via duckrun.
-          $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout/aemo/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
-          $wsId = $meta.ws
-          $lhs = az rest --method get --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" | ConvertFrom-Json
-          $lhId = ($lhs.value | Where-Object { $_.displayName -eq $meta.lh }).id
-          if (-not $lhId) { throw "lakehouse '$($meta.lh)' not found in workspace $wsId" }
-          $grp = az rest --method get --resource "https://analysis.windows.net/powerbi/api" --url "https://api.powerbi.com/v1.0/myorg/groups?`$filter=id eq '$wsId'" | ConvertFrom-Json
-          $wsName = $grp.value[0].name
-          if (-not $wsName) { throw "workspace name not resolved for $wsId" }
-          @(
-            "WS_ID=$wsId",
-            "LH_ID=$lhId",
-            "WS_NAME=$wsName",
-            "ONELAKE_TABLES_PATH=abfss://$wsId@onelake.dfs.fabric.microsoft.com/$lhId/Tables",
-            "PBI_WORKSPACE=$wsName"
-          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: 🔑 Resolve lakehouse + workspace (duckrun, no az)
+        # ws id from deploy_config; lakehouse id + workspace display name via duckrun's Fabric handle
+        # (self-acquired OIDC token). Emits WS_ID / LH_ID / WS_NAME / ONELAKE_TABLES_PATH / PBI_WORKSPACE.
+        run: python tests/parquet_layout/aemo/resolve_env.py --env ${{ inputs.env }}
 
       - name: 🔎 Check existing tables (one duckrun connection gates the whole build phase)
         id: check
@@ -228,8 +205,9 @@ jobs:
     # the 6h hosted-job cap. A smaller scale (e.g. orders=10000000) needs rebuild=true to regenerate.
     timeout-minutes: 350
     env:
-      # duckrun self-acquires every token from this OIDC identity and picks the curl transport itself;
-      # azure/login stays only for the `az rest` lakehouse create/resolve + workspace lookup.
+      # The only Azure inputs: the OIDC federated identity. duckrun mints every token it needs, picks
+      # the curl transport itself, creates the lakehouse AND resolves the workspace/lakehouse — so
+      # there's no azure/login and no az rest anywhere in this job.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
@@ -276,13 +254,6 @@ jobs:
           echo "ADOMD_DIR=$proj/publish" >> "$GITHUB_ENV"
           echo "resolved ADOMD_DIR=$proj/publish"
 
-      - name: 🔐 Azure federated login
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
       - name: 🏗️ Create the sqlbi lakehouse (idempotent)
         env:
           PYTHONIOENCODING: utf-8
@@ -299,26 +270,10 @@ jobs:
           print(f"lakehouse '{e['lakehouse_name']}' ready ({lh})")
           PY
 
-      - name: 🔑 Resolve lakehouse + workspace
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          # No tokens minted here — the scripts self-acquire storage/Fabric/Power BI tokens via duckrun.
-          $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout/contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
-          $wsId = $meta.ws
-          $lhs = az rest --method get --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" | ConvertFrom-Json
-          $lhId = ($lhs.value | Where-Object { $_.displayName -eq $meta.lh }).id
-          if (-not $lhId) { throw "lakehouse '$($meta.lh)' not found in workspace $wsId" }
-          $grp = az rest --method get --resource "https://analysis.windows.net/powerbi/api" --url "https://api.powerbi.com/v1.0/myorg/groups?`$filter=id eq '$wsId'" | ConvertFrom-Json
-          $wsName = $grp.value[0].name
-          if (-not $wsName) { throw "workspace name not resolved for $wsId" }
-          @(
-            "WS_ID=$wsId",
-            "LH_ID=$lhId",
-            "WS_NAME=$wsName",
-            "ONELAKE_TABLES_PATH=abfss://$wsId@onelake.dfs.fabric.microsoft.com/$lhId/Tables",
-            "PBI_WORKSPACE=$wsName"
-          ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: 🔑 Resolve lakehouse + workspace (duckrun, no az)
+        # ws id from deploy_config; lakehouse id + workspace display name via duckrun's Fabric handle
+        # (self-acquired OIDC token). Emits WS_ID / LH_ID / WS_NAME / ONELAKE_TABLES_PATH / PBI_WORKSPACE.
+        run: python tests/parquet_layout/contoso/resolve_env.py --env ${{ inputs.env }}
 
       - name: 🏭 Generate Contoso base (SQLBI generator → contoso.* Delta tables)
         env:

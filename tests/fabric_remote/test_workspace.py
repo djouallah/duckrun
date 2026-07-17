@@ -47,6 +47,8 @@ class FakeFabric:
         self.calls.append((method, url, json_body))
         if method == "GET" and url.endswith("/workspaces"):
             return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid"):
+            return FakeResp(200, {"id": "ws-guid", "displayName": "Analytics"})
         if method == "GET" and url.endswith("/workspaces/ws-guid/lakehouses"):
             return FakeResp(200, {"value": self.existing})
         if method == "POST" and url.endswith("/workspaces/ws-guid/lakehouses"):
@@ -106,6 +108,26 @@ def test_list_lakehouses_shape(_patch):
     _patch(FakeFabric(existing=[{"displayName": "a", "id": "1"}, {"displayName": "b", "id": "2"}]))
     got = _ws().list_lakehouses()
     assert got == [{"displayName": "a", "id": "1"}, {"displayName": "b", "id": "2"}]
+
+
+def test_lakehouse_id_resolves_name(_patch):
+    _patch(FakeFabric(existing=[{"displayName": "bronze", "id": "lh-b"}, {"displayName": "silver", "id": "lh-s"}]))
+    assert _ws().lakehouse_id("silver") == "lh-s"
+
+
+def test_lakehouse_id_missing_name_raises_listing_names(_patch):
+    _patch(FakeFabric(existing=[{"displayName": "bronze", "id": "lh-b"}]))
+    with pytest.raises(Exception, match="gold.*not found.*bronze"):
+        _ws().lakehouse_id("gold")
+
+
+def test_display_name_resolves_from_id(_patch):
+    fake = _patch(FakeFabric(existing=[]))
+    ws = _ws()
+    assert ws.display_name == "Analytics"
+    assert ws.display_name == "Analytics"                       # cached
+    gets = [u for m, u, _ in fake.calls if m == "GET" and u.endswith("/workspaces/ws-guid")]
+    assert len(gets) == 1                                       # only one GET despite two accesses
 
 
 def test_guid_workspace_skips_name_lookup(_patch):

@@ -424,6 +424,14 @@ def _resolve_workspace_id(token: str, workspace: str) -> str:
     raise RemoteRunError(f"workspace {workspace!r} not found (or token can't see it)")
 
 
+def _workspace_display_name(token: str, ws_id: str) -> str:
+    """The display name for a workspace GUID (``GET /workspaces/{id}``). The reverse of
+    :func:`_resolve_workspace_id` — XMLA / data-source connection strings key off the name, not the id."""
+    resp = _http_request("GET", f"{_FABRIC_API}/workspaces/{ws_id}", token=token)
+    resp.raise_for_status()
+    return resp.json()["displayName"]
+
+
 def _looks_like_guid(value: str) -> bool:
     parts = value.split("-")
     return len(parts) == 5 and all(c in "0123456789abcdefABCDEF" for c in "".join(parts))

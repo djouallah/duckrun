@@ -32,6 +32,7 @@ from .fabric_remote import (
     RemoteRunError,
     _http_request,
     _resolve_workspace_id,
+    _workspace_display_name,
     _await_lro_item_id,
     _create_notebook,
     _create_semantic_model,
@@ -139,6 +140,25 @@ class Workspace:
         self.name = workspace
         self._token = token or get_fabric_token()
         self.id = _resolve_workspace_id(self._token, workspace)
+        self._display_name: Optional[str] = None
+
+    @property
+    def display_name(self) -> str:
+        """This workspace's display name, resolved from its id (the reverse of the name→GUID
+        resolution ``workspace()`` does). Connection strings that identify a workspace by name — XMLA
+        data sources, ``powerbi://…/myorg/<name>`` — need this rather than the GUID. Cached."""
+        if self._display_name is None:
+            self._display_name = _workspace_display_name(self._token, self.id)
+        return self._display_name
+
+    def lakehouse_id(self, name: str) -> str:
+        """The lakehouse id for a lakehouse named ``name`` in this workspace; raises listing the real
+        names if there's no match."""
+        for lh in self._items("lakehouses"):
+            if lh.get("displayName") == name:
+                return lh["id"]
+        have = ", ".join(sorted(lh.get("displayName", "?") for lh in self._items("lakehouses"))) or "(none)"
+        raise RemoteRunError(f"lakehouse {name!r} not found in workspace {self.id}; have: {have}")
 
     def _items(self, kind: str) -> List[Dict]:
         """Every item of ``kind`` (e.g. ``"lakehouses"`` / ``"notebooks"`` / ``"semanticModels"``)."""
