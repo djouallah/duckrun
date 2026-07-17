@@ -79,6 +79,15 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
 - **Two engines share one machine's memory.** DuckDB and delta-rs each keep their own pool in the same
   process; heavy merges split the budget, and that split is fragile (delta-rs's merge spill-to-disk is
   itself flaky). Background in the [Design document](design_document.md).
+- **delta-rs hard-codes a 100 GB merge disk-spill ceiling — arguably a bug.** A wide MERGE (one that
+  rewrites many partitions) spills to disk, and the DataFusion `DiskManager` under delta-rs caps that
+  spill at a **flat 100 GB regardless of how big the disk is** — so a merge aborts with *"Resources
+  exhausted … exceeded the allowable limit of 100.0 GB"* even on a machine with terabytes free. It
+  should scale to the available disk (or at least be documented and defaulted sanely), not hard-code a
+  constant. duckrun works around it by sizing `max_temp_directory_size` to **~80% of the spill disk's
+  free space** on every merge (override per model with `merge_max_temp_directory_size`); still, the true
+  fix for a merge this large is data layout — keep each batch inside one partition so the span, and thus
+  the spill, stays small. See [MERGE at scale](merge-benchmark.md).
 
 ---
 
