@@ -63,11 +63,14 @@ SELECT COUNT(*) AS cnt FROM {{ ref('stg_csv_archive_log') }} WHERE source_type =
 
 {% if has_files %}
 WITH
-{% if has_daily %}
 scada_daily AS (
   SELECT *
   FROM read_csv(
-    getvariable('scada_daily_paths'),
+    {#-- When this feed has no backlog, read the OTHER feed's guaranteed-present paths and discard
+        every row (WHERE FALSE below). The columns= schema is fixed, so the CTE keeps the full daily
+        schema at zero rows — avoids read_csv([''])'s empty-glob error while preserving the union's
+        column set for the merge. has_files guarantees the fallback feed is non-empty. --#}
+    getvariable({% if has_daily %}'scada_daily_paths'{% else %}'scada_today_paths'{% endif %}),
     skip = 1,
     header = 0,
     all_varchar = 1,
@@ -132,15 +135,13 @@ scada_daily AS (
     auto_detect = false,
     hive_partitioning = false
   )
-  WHERE I = 'D' AND UNIT = 'DUNIT' AND VERSION = '3'
+  WHERE {% if has_daily %}I = 'D' AND UNIT = 'DUNIT' AND VERSION = '3'{% else %}FALSE{% endif %}
 ),
-{% endif %}
 
-{% if has_intraday %}
 scada_intraday AS (
   SELECT *
   FROM read_csv(
-    getvariable('scada_today_paths'),
+    getvariable({% if has_intraday %}'scada_today_paths'{% else %}'scada_daily_paths'{% endif %}),
     skip = 1,
     header = 0,
     all_varchar = 1,
@@ -160,11 +161,9 @@ scada_intraday AS (
     auto_detect = false,
     hive_partitioning = false
   )
-  WHERE I = 'D' AND SCADAVALUE != '0'
+  WHERE {% if has_intraday %}I = 'D' AND SCADAVALUE != '0'{% else %}FALSE{% endif %}
 ),
-{% endif %}
 
-{% if has_daily %}
 -- Daily settled DUNIT rows: full schema, authoritative (source_priority = 1).
 daily_rows AS (
   SELECT
@@ -227,9 +226,7 @@ daily_rows AS (
       + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
   FROM scada_daily
 ),
-{% endif %}
 
-{% if has_intraday %}
 -- Intraday preliminary rows: only the columns SCADA carries; UNION ALL BY NAME fills every
 -- daily-only column with NULL. INTERVENTION is 0 (SCADA has no intervention concept).
 intraday_rows AS (
@@ -246,18 +243,11 @@ intraday_rows AS (
       + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
   FROM scada_intraday
 ),
-{% endif %}
 
 unioned AS (
-  {% if has_daily %}
   SELECT * FROM daily_rows
-  {% endif %}
-  {% if has_daily and has_intraday %}
   UNION ALL BY NAME
-  {% endif %}
-  {% if has_intraday %}
   SELECT * FROM intraday_rows
-  {% endif %}
 )
 
 SELECT

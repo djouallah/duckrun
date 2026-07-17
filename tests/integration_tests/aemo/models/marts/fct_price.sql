@@ -48,11 +48,14 @@ SELECT COUNT(*) AS cnt FROM {{ ref('stg_csv_archive_log') }} WHERE source_type =
 
 {% if has_files %}
 WITH
-{% if has_daily %}
 price_daily AS (
   SELECT *
   FROM read_csv(
-    getvariable('price_daily_paths'),
+    {#-- When this feed has no backlog, read the OTHER feed's guaranteed-present paths and discard
+        every row (WHERE FALSE below). The columns= schema is fixed, so the CTE keeps the full daily
+        schema at zero rows — avoids read_csv([''])'s empty-glob error while preserving the union's
+        column set for the merge. has_files guarantees the fallback feed is non-empty. --#}
+    getvariable({% if has_daily %}'price_daily_paths'{% else %}'price_today_paths'{% endif %}),
     skip = 1,
     header = 0,
     all_varchar = 1,
@@ -194,15 +197,13 @@ price_daily AS (
     auto_detect = false,
     hive_partitioning = false
   )
-  WHERE I = 'D' AND UNIT = 'DREGION' AND VERSION = '3'
+  WHERE {% if has_daily %}I = 'D' AND UNIT = 'DREGION' AND VERSION = '3'{% else %}FALSE{% endif %}
 ),
-{% endif %}
 
-{% if has_intraday %}
 price_intraday AS (
   SELECT *
   FROM read_csv(
-    getvariable('price_today_paths'),
+    getvariable({% if has_intraday %}'price_today_paths'{% else %}'price_daily_paths'{% endif %}),
     skip = 1,
     header = 0,
     all_varchar = 1,
@@ -284,11 +285,9 @@ price_intraday AS (
     auto_detect = false,
     hive_partitioning = false
   )
-  WHERE I = 'D' AND PRICE = 'PRICE'
+  WHERE {% if has_intraday %}I = 'D' AND PRICE = 'PRICE'{% else %}FALSE{% endif %}
 ),
-{% endif %}
 
-{% if has_daily %}
 -- Daily settled DREGION rows: full schema, authoritative (source_priority = 1).
 daily_rows AS (
 SELECT
@@ -428,9 +427,7 @@ SELECT
     + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
 FROM price_daily
 ),
-{% endif %}
 
-{% if has_intraday %}
 -- Intraday preliminary rows: the DispatchIS columns that overlap the daily schema; UNION ALL BY
 -- NAME fills every daily-only column (demand, dispatch, violations, …) with NULL.
 intraday_rows AS (
@@ -476,18 +473,11 @@ intraday_rows AS (
       + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
   FROM price_intraday
 ),
-{% endif %}
 
 unioned AS (
-  {% if has_daily %}
   SELECT * FROM daily_rows
-  {% endif %}
-  {% if has_daily and has_intraday %}
   UNION ALL BY NAME
-  {% endif %}
-  {% if has_intraday %}
   SELECT * FROM intraday_rows
-  {% endif %}
 )
 
 SELECT
