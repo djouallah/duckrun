@@ -137,7 +137,7 @@ def run_remote():
     # disk. The Fabric work disk is ~1.9 TiB (NOT small); the old "100 GB" wall was delta_rs's
     # max_temp_directory_size default, now sized to ~80% of free disk by the adapter.
     with RemoteRunner(
-        cores=64,
+        cores=8,
         target="dev",
         pip_spec="git+https://github.com/djouallah/duckrun.git@main",
         fabric_token=os.environ["FABRIC_TOKEN"],
