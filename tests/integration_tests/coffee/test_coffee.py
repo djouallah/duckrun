@@ -61,6 +61,14 @@ ONELAKE_ROWS = int(os.environ.get("COFFEE_ONELAKE_ROWS", "2000"))
 
 WAREHOUSE_PATH = os.environ.get("WAREHOUSE_PATH")
 ONELAKE_TOKEN = os.environ.get("ONELAKE_TOKEN") or os.environ.get("AZURE_STORAGE_TOKEN")
+# No token in the env (CI no longer mints one): self-acquire it from the OIDC identity, the same source
+# duckrun.connect() uses. Keeps these live OneLake gates running instead of silently skipping.
+if not ONELAKE_TOKEN and WAREHOUSE_PATH and WAREHOUSE_PATH.startswith("abfss://"):
+    try:
+        from duckrun import auth
+        ONELAKE_TOKEN = auth.get_onelake_token()
+    except Exception:
+        ONELAKE_TOKEN = None
 ONELAKE_SCHEMA = os.environ.get("DUCKRUN_IT_SCHEMA", "duckrun_conn_it")
 
 

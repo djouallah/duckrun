@@ -62,6 +62,14 @@ ZONE_CSV = f"{CF}/misc/taxi_zone_lookup.csv"
 
 WAREHOUSE_PATH = os.environ.get("WAREHOUSE_PATH")
 ONELAKE_TOKEN = os.environ.get("ONELAKE_TOKEN") or os.environ.get("AZURE_STORAGE_TOKEN")
+# No token in the env: self-acquire from the OIDC identity (same source duckrun.connect uses) so the
+# demo runs instead of printing "OneLake not configured".
+if not ONELAKE_TOKEN and WAREHOUSE_PATH and WAREHOUSE_PATH.startswith("abfss://"):
+    try:
+        from duckrun import auth
+        ONELAKE_TOKEN = auth.get_onelake_token()
+    except Exception:
+        ONELAKE_TOKEN = None
 TAXI_SCHEMA = os.environ.get("DUCKRUN_TAXI_SCHEMA", "duckrun_taxi_demo")
 TAXI_MONTH = os.environ.get("TAXI_MONTH", "2024-01")
 SAMPLE_ROWS = int(os.environ.get("TAXI_SAMPLE_ROWS", "2000000"))

@@ -11,11 +11,8 @@ multicatalog_dbt:
       # A dedicated schema keeps the demo's tables out of the way of anything else in the lakehouse.
       schema: "{{ env_var('DBT_SCHEMA', 'main') }}"
       root_path: "{{ env_var('LH_SILVER_PATH') }}"
-      # One OneLake token authenticates all three lakehouses (same storage resource): the default
-      # catalog's unscoped secret covers reads across all abfss roots, and Bronze/Gold writes inherit
-      # this token. Empty locally -> no secret, plain local-filesystem writes.
-      storage_options:
-        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"
+      # No bearer_token needed: duckrun self-acquires a OneLake token per catalog (all three lakehouses
+      # share the same storage resource, so it's one token). Empty locally -> plain filesystem writes.
       catalogs:
         lh_bronze:
           root_path: "{{ env_var('LH_BRONZE_PATH') }}"

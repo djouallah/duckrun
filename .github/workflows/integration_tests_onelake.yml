@@ -98,7 +98,9 @@ jobs:
       group: merge-onelake
       cancel-in-progress: false
     env:
-      AZURE_TRANSPORT_OPTION_TYPE: curl
+      # duckrun self-acquires every OneLake/Fabric token from this OIDC identity — no az token steps.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -108,17 +110,6 @@ jobs:
         run: |
           pip install -e ".[test]"
           pip install tpchgen-cli
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Run the MERGE chain against OneLake (tiny scale factor)
         # --warehouse abfss://… routes the whole chain to OneLake; this job only exercises the abfss://
         # MERGE write/read path, NOT memory — the heavy SF=10 spill gate runs locally
@@ -157,17 +148,6 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun + pytest
         run: pip install -e ".[test]"
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: dbt build + docs generate (OneLake — docs reflect the live tables)
         # Build the models straight onto OneLake so `dbt docs generate` collects the REAL catalog stats
         # (row counts/size) off the abfss:// Delta tables. COFFEE_ROWS sizes the fact (kept small — the
@@ -200,7 +180,6 @@ jobs:
           import os, duckrun
           conn = duckrun.connect(
               os.environ["WAREHOUSE_PATH"],
-              storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema=os.environ["DBT_SCHEMA"], read_only=False)
 
           def detail(t):
@@ -250,7 +229,9 @@ jobs:
       group: taxi-onelake
       cancel-in-progress: false
     env:
-      AZURE_TRANSPORT_OPTION_TYPE: curl
+      # duckrun self-acquires every OneLake/Fabric token from this OIDC identity — no az token steps.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -258,17 +239,6 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun (pulls duckdb + deltalake)
         run: pip install -e .
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: NYC taxi live demo (SQL-first connection-API showcase, OneLake)
         env:
           WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
@@ -287,7 +257,6 @@ jobs:
           import os, duckrun
           conn = duckrun.connect(
               os.environ["WAREHOUSE_PATH"],
-              storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
               schema=os.environ["DUCKRUN_TAXI_SCHEMA"], read_only=False)
 
           def detail(t):
@@ -326,7 +295,9 @@ jobs:
       group: multicatalog-onelake
       cancel-in-progress: false
     env:
-      AZURE_TRANSPORT_OPTION_TYPE: curl
+      # duckrun self-acquires every OneLake/Fabric token from this OIDC identity — no az token steps.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -341,25 +312,11 @@ jobs:
           python -m pytest \
             tests/integration_tests/multicatalog/dbt/test_multicatalog_dbt.py \
             -q -p no:cacheprovider
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          # The connection demo passes NO credentials (auto on OneLake, picked up from AZURE_STORAGE_TOKEN);
-          # the dbt profile reads ONELAKE_TOKEN from storage_options.
-          echo "AZURE_STORAGE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
       - name: Multi-lakehouse dbt demo — LIVE OneLake (writes Bronze/Silver/Gold to THREE lakehouses)
         env:
           # Three real OneLake Lakehouse roots — the dbt project writes one medallion layer to each,
           # into an isolated schema so nothing else in the lakehouse is touched. Swap the GUIDs to
-          # retarget. One ONELAKE_TOKEN (above) authenticates all three (same storage resource).
+          # retarget. duckrun self-acquires one token that authenticates all three (same storage resource).
           LH_SILVER_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
           LH_BRONZE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
           LH_GOLD_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/4fb792e8-b2e6-431c-b2d3-36727410bea8/Tables
@@ -409,7 +366,9 @@ jobs:
       group: breaker-onelake
       cancel-in-progress: false
     env:
-      AZURE_TRANSPORT_OPTION_TYPE: curl
+      # duckrun self-acquires every OneLake/Fabric token from this OIDC identity — no az token steps.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -457,12 +416,8 @@ jobs:
           if [ -z "${LH_ID:-}" ] || [ "$LH_ID" = "None" ]; then
             echo "lakehouse '$LH_NAME' was not visible after creation"; exit 1
           fi
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          {
-            echo "ONELAKE_TOKEN=$TOKEN"
-            echo "WAREHOUSE_PATH=abfss://$WS_ID@onelake.dfs.fabric.microsoft.com/$LH_ID/Tables"
-          } >> "$GITHUB_ENV"
+          # No OneLake token minted here — onelake_breaker.py self-acquires it (auth.get_onelake_token).
+          echo "WAREHOUSE_PATH=abfss://$WS_ID@onelake.dfs.fabric.microsoft.com/$LH_ID/Tables" >> "$GITHUB_ENV"
           echo "lakehouse '$LH_NAME' = $LH_ID"
       - name: Chaos + compaction concurrency + QPS against the dedicated lakehouse
         # Contention only (no SIGKILL): writers hammer one Delta table while the compactor races them,

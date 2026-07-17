@@ -64,6 +64,9 @@ def _storage_options(root):
     itself rather than trying to pickle a token through argv."""
     if str(root).startswith("abfss://"):
         tok = os.environ.get("ONELAKE_TOKEN") or os.environ.get("AZURE_STORAGE_TOKEN")
+        if not tok:  # no token in the env — self-acquire from the OIDC identity (per worker subprocess)
+            from duckrun import auth
+            tok = auth.get_onelake_token()
         return {"bearer_token": tok} if tok else None
     return None
 
