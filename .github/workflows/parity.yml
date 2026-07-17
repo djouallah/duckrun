@@ -5,10 +5,11 @@ name: parity
 # row. dbt-duckdb is the oracle; a mismatch is a duckrun bug (fixed in duckrun, never in the project).
 #
 # The duckrun side materializes to live Microsoft Fabric OneLake (abfss://), exactly like the
-# integration suite (integration_tests_onelake.yml): OIDC Azure login → a fresh OneLake bearer token →
-# WAREHOUSE_PATH points at the lakehouse's Tables. Each project writes its own Tables/parity_<proj>
-# subfolder so the shared lakehouse never collides, and takes a per-project concurrency lock. The diff
-# reads the duckrun tables back over abfss:// (delta_scan + the same Azure secret the adapter mints).
+# integration suite (integration_tests_onelake.yml): duckrun self-acquires the OneLake token from the
+# OIDC identity (AZURE_CLIENT_ID/AZURE_TENANT_ID) and WAREHOUSE_PATH points at the lakehouse's Tables.
+# Each project writes its own Tables/parity_<proj> subfolder so the shared lakehouse never collides,
+# and takes a per-project concurrency lock. The diff reads the duckrun tables back over abfss://
+# (delta_scan + the same Azure secret the adapter mints).
 # Run locally without OneLake by leaving WAREHOUSE_PATH unset — run_parity.py falls back to a local
 # Delta warehouse.
 #
@@ -39,7 +40,7 @@ on:
         type: boolean
         default: false
 
-# id-token for the OIDC Azure login (mints the OneLake token); contents to checkout.
+# id-token so duckrun can exchange a GitHub OIDC assertion for the OneLake token; contents to checkout.
 permissions:
   contents: read
   id-token: write
@@ -58,11 +59,8 @@ jobs:
       # a real Fabric table. (A subfolder in the path instead would nest a level too deep → "Unidentified".)
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       DBT_SCHEMA: parity_jaffle
-      # The azure extension's default transport fails the OneLake TLS handshake on the runner; curl
-      # respects the system CA bundle (same as the integration suite).
-      AZURE_TRANSPORT_OPTION_TYPE: curl
-      # Workload-identity federation, for re-minting the OneLake token if a long build outlives it
-      # (auth._github_oidc_token). No-op on short jobs (the token never nears expiry); harmless here.
+      # The only Azure input: the OIDC federated identity. duckrun mints the OneLake token itself
+      # (auth._github_oidc_token) and picks the curl transport — no azure/login, no az token step.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
@@ -71,18 +69,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun (dbt-duckdb + duckdb + deltalake come with it)
-        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        run: pip install -e ".[test]"
       - name: Parity — jaffle_shop, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python tests/parity_tests/jaffle_shop/run_parity.py
       - name: Generate jaffle_shop dbt docs (static — catalog with row/byte stats off the OneLake tables)
@@ -108,7 +95,6 @@ jobs:
     env:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       DBT_SCHEMA: parity_sde
-      AZURE_TRANSPORT_OPTION_TYPE: curl
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
@@ -117,18 +103,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun
-        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        run: pip install -e ".[test]"
       - name: Parity — sde, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python tests/parity_tests/sde/run_parity.py
       - name: Generate sde dbt docs (static — catalog stats off the OneLake tables)
@@ -155,7 +130,6 @@ jobs:
     env:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       DBT_SCHEMA: parity_mrr
-      AZURE_TRANSPORT_OPTION_TYPE: curl
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
@@ -164,18 +138,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun
-        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        run: pip install -e ".[test]"
       - name: Parity — mrr, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python tests/parity_tests/mrr/run_parity.py
       - name: Generate mrr dbt docs (static — catalog stats off the OneLake tables)
@@ -204,7 +167,6 @@ jobs:
     env:
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       DBT_SCHEMA: parity_techflow
-      AZURE_TRANSPORT_OPTION_TYPE: curl
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
@@ -213,18 +175,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun
-        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        run: pip install -e ".[test]"
       - name: Parity — techflow, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python tests/parity_tests/techflow/run_parity.py
       - name: Generate techflow dbt docs (static — catalog stats off the OneLake tables)
@@ -256,10 +207,9 @@ jobs:
       # tuva-public-resources S3 bucket anonymously; models materialize to OneLake.
       DBT_PROFILES_DIR: ${{ github.workspace }}/tests/parity_tests/tuva
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
-      AZURE_TRANSPORT_OPTION_TYPE: curl
       DBT_SCHEMA: tuva
-      # Workload-identity federation: lets the adapter re-mint the OneLake token mid-build when this
-      # ~40-66 min run outlives the ~1h token (auth._github_oidc_token / secret.refreshed).
+      # Workload-identity federation: duckrun mints the OneLake token from this identity and re-mints
+      # it mid-build when this ~40-66 min run outlives the ~1h token (auth._github_oidc_token / secret.refreshed).
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       # Low-noise (only prints when the token actually nears expiry): proves the mid-build refresh fired.
@@ -270,18 +220,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun
-        run: pip install -e ".[test,local]"   # [local] adds azure-identity → OneLake token refresh on long runs
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Acquire a fresh OneLake bearer token
-        run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+        run: pip install -e ".[test]"
       - name: Clone Tuva (the repo under test) — run VERBATIM
         run: git clone --depth 1 --branch v0.18.0 https://github.com/tuva-health/tuva /tmp/tv
       - name: dbt deps (local ../ package symlinks on Linux; hub + git deps resolve)

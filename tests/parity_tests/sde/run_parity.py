@@ -80,7 +80,7 @@ def diff() -> bool:
     c.execute("install delta; load delta")
     if _REMOTE:  # OneLake: mint the Azure secret so delta_scan can read abfss:// (same path the adapter uses)
         from dbt.adapters.duckrun import secret
-        secret.ensure_azure_secret(c, {"bearer_token": os.environ.get("ONELAKE_TOKEN", "")})
+        secret.ensure_azure_secret(c, secret.with_onelake_token(DUCKRUN_WH, {}))
     c.execute(f"attach '{(ORACLE_DIR / 'dbt.duckdb').as_posix()}' as o (read_only)")
     # Every base table the oracle persisted (skip views — duckrun has no durable view).
     tabs = c.execute(
