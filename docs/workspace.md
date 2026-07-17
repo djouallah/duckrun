@@ -54,9 +54,9 @@ The lakehouse is **inferred** when the model already targets one that exists in 
 the workspace has exactly one; with several you must name it (otherwise `deploy` raises, listing
 them). A wrong name raises with the available names. `lakehouse=` is ignored for `.ipynb` / `.json`.
 
-`deploy` does create + refresh; it does **not** set up a data-source *connection binding*. A freshly
-deployed Direct Lake model whose connection isn't already resolvable will fail the refresh — that
-Power BI error is surfaced, not swallowed. Binding is a separate step (needs a connection id).
+`deploy` does create + refresh, and for Direct Lake that's the whole story: a Direct Lake model reads
+the Delta files straight from OneLake with the caller's own identity, so there's no gateway or stored
+data-source credential to bind — the reframe just works once the model is deployed.
 
 **`run(name)`** executes a deployed notebook or data pipeline on Fabric compute and waits for it,
 returning the terminal job status (raising on failure). `name` is the item's display name with or
