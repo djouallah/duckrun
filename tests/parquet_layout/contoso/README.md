@@ -69,7 +69,8 @@ models — exactly as AEMO swaps only its `fct_summary`. The full Contoso schema
 4. **[`build_auto_sort.py`](build_auto_sort.py)** — build `tests.sales_auto_sort` via duckrun
    `create or replace table … sorted by auto`, reading the **same raw `Files/contoso_base/sales.parquet`**.
    This exercises the **current tree's** WriterProperties. Skip-if-exists; `rebuild=true` after changing a default.
-5. **[`deploy.py`](deploy.py)** — deploy both `*.SemanticModel`s to the workspace via `fab` + refresh.
+5. **[`deploy.py`](deploy.py)** — deploy both `*.SemanticModel`s to the workspace via duckrun's own
+   `workspace.deploy()` (repoint + create + Direct Lake refresh), no Fabric CLI.
 6. **[`table_stats.py`](table_stats.py)** — duckrun `get_stats('sales*')` row-group sidecar.
 7. **[`xmla_compare.py`](xmla_compare.py)** — the payload: heavy DAX per model over XMLA
    (ADOMD.NET), dehydrating per query for true cold timing; reports cold + hot `base/vorder`

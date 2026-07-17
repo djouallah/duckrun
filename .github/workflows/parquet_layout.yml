@@ -88,7 +88,7 @@ jobs:
 
       - name: 📦 Install deps (duckrun from THIS tree — tests the current WriterProperties)
         run: |
-          pip install pythonnet pyyaml ms-fabric-cli
+          pip install pythonnet pyyaml
           pip install -e .
 
       - name: 🧾 Init run report
@@ -174,14 +174,9 @@ jobs:
         run: python tests/parquet_layout/aemo/build_auto_sort.py
 
       - name: 🚀 Deploy benchmark semantic models (auto_sort + vorder)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          fab config set encryption_fallback_enabled true
-          # Federated (OIDC) login for fab — deploys only tests/parquet_layout/aemo/*.SemanticModel.
-          $fed = (Invoke-RestMethod -Uri "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
-          fab auth login -t ${{ secrets.AZURE_TENANT_ID }} -u ${{ secrets.AZURE_CLIENT_ID }} --federated-token $fed
-          python tests/parquet_layout/aemo/deploy_vorder.py --env ${{ inputs.env }}
+        # duckrun's own workspace.deploy() repoints, creates and refreshes each model with its
+        # self-acquired OIDC tokens — no Fabric CLI login.
+        run: python tests/parquet_layout/aemo/deploy_vorder.py --env ${{ inputs.env }}
 
       - name: 📊 Table stats (duckrun) — fct_summary_auto_sort vs fct_summary_vorder
         continue-on-error: true   # nice-to-have; never block the benchmark
@@ -248,7 +243,7 @@ jobs:
 
       - name: 📦 Install deps (duckrun from THIS tree — tests the current WriterProperties)
         run: |
-          pip install pythonnet pyyaml ms-fabric-cli obstore
+          pip install pythonnet pyyaml obstore
           pip install -e .
 
       - name: 🧾 Init run report
@@ -356,14 +351,9 @@ jobs:
         run: python tests/parquet_layout/contoso/build_auto_sort.py
 
       - name: 🚀 Deploy benchmark semantic models (auto_sort + vorder)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          fab config set encryption_fallback_enabled true
-          # Federated (OIDC) login for fab — deploys only tests/parquet_layout/contoso/*.SemanticModel.
-          $fed = (Invoke-RestMethod -Uri "$env:ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
-          fab auth login -t ${{ secrets.AZURE_TENANT_ID }} -u ${{ secrets.AZURE_CLIENT_ID }} --federated-token $fed
-          python tests/parquet_layout/contoso/deploy.py --env ${{ inputs.env }}
+        # duckrun's own workspace.deploy() repoints, creates and refreshes each model with its
+        # self-acquired OIDC tokens — no Fabric CLI login.
+        run: python tests/parquet_layout/contoso/deploy.py --env ${{ inputs.env }}
 
       - name: 📊 Table stats (duckrun) — sales_auto_sort vs sales_vorder
         continue-on-error: true   # nice-to-have; never block the benchmark

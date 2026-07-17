@@ -32,7 +32,8 @@ both hold the same rows, so only **speed** differs:
    independent `row_limit` read. This exercises the **current tree's** WriterProperties (the workflow
    `pip install -e .`s the checked-out duckrun). Skip-if-exists; set `rebuild=true` after changing a
    default.
-3. **`deploy_vorder.py`** — deploys both `*.SemanticModel`s to the workspace via `fab` and refreshes.
+3. **`deploy_vorder.py`** — deploys both `*.SemanticModel`s to the workspace via duckrun's own
+   `workspace.deploy()` (repoint + create + Direct Lake refresh), no Fabric CLI.
 4. **`table_stats.py`** — duckrun `get_stats('fct_summary*')` row-group sidecar → job summary +
    `stats_detailed.csv` artifact (continue-on-error).
 5. **`xmla_compare.py`** — the payload: heavy DAX queries per model over XMLA (ADOMD.NET),
