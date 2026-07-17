@@ -24,9 +24,9 @@ on:
         type: string
         default: "1000"
       process_limit:
-        description: "CSV files to fold into the marts per build (default 1000)"
+        description: "CSV files to fold into the marts per build (default 3000)"
         type: string
-        default: "1000"
+        default: "3000"
 
 permissions:
   contents: read
@@ -57,10 +57,10 @@ jobs:
       # cramped ~19 GiB /tmp. process_limit caps how many CSVs the fct_scada/fct_price merge folds per
       # run; the spill scales with how many monthly partitions the merge rewrites. 1000 previously hit
       # delta_rs's hidden 100 GB max_temp_directory_size default — now the adapter sizes that to ~80%
-      # of free disk, so the lever left is memory/partition-span, not this disk cap. Back to 1000 to
-      # prove the disk-cap fix lets the batch that used to overrun the 100 GB wall now go through.
+      # of free disk, so the lever left is memory/partition-span, not this disk cap. 3000 pushes a wide
+      # multi-month merge to see how far the free-disk-sized spill cap carries it on the current SKU.
       download_limit: ${{ inputs.download_limit || '1000' }}
-      process_limit: ${{ inputs.process_limit || '1000' }}
+      process_limit: ${{ inputs.process_limit || '3000' }}
       # Pre-flight cutoff: <= this many new pending files -> run dbt locally on the runner (no Fabric
       # spin-up); more than this -> go remote. A quick re-run has ~0 new files (local); a fresh
       # lakehouse / long gap has 100s (remote). See scripts/run_build.py.
@@ -98,10 +98,11 @@ jobs:
       - name: Generate external sources (calendar Delta table — external, NOT embedded)
         # dim_calendar is an external Delta table read via source('aemo','dim_calendar'), not a model.
         run: python scripts/generate_calendar.py
-      - name: dbt build + test — local for a small run, Fabric-remote (cores=32) for a big one
+      - name: dbt build + test — local for a small run, Fabric-remote for a big one
         # Pre-flight counts new AEMO files pending (nemweb listings minus the archive log, capped by
         # download_limit). Few pending (a quick re-run) -> run dbt LOCALLY in-process; many pending
-        # (a backfill / long gap) -> ship the logic to a throwaway Fabric Python notebook at cores=32.
+        # (a backfill / long gap) -> ship the logic to a throwaway Fabric Python notebook (the SKU is
+        # set by REMOTE_CORES in run_build.py, printed in the pre-flight next to the backlog).
         # Local vs remote is just which runner run_build.py constructs. -u so the [duckrun.remote]
         # log survives interruption; the full remote dbt log is printed. Exit non-zero on any failure.
         run: python -u scripts/run_build.py

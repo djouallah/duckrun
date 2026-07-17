@@ -27,6 +27,10 @@ import sys
 BUILD = ["build", "--target", "dev", "--exclude", "tag:heavy"]
 TEST = ["test", "--target", "dev", "--exclude", "tag:heavy"]
 
+# Fabric SKU the remote build runs on (RemoteRunner cores). Single-sourced so the pre-flight can
+# print it next to the backlog and run_remote() spins the notebook at the same size.
+REMOTE_CORES = 8
+
 # Which fact table consumes which archive-log source, and the fact column that records the processed
 # source file. 'daily' feeds BOTH facts; scada_today only fct_scada; price_today only fct_price;
 # duid_* feed only dim_duid (full rebuild, no per-file backlog) so they're excluded. Marts land in
@@ -137,7 +141,7 @@ def run_remote():
     # disk. The Fabric work disk is ~1.9 TiB (NOT small); the old "100 GB" wall was delta_rs's
     # max_temp_directory_size default, now sized to ~80% of free disk by the adapter.
     with RemoteRunner(
-        cores=8,
+        cores=REMOTE_CORES,
         target="dev",
         pip_spec="git+https://github.com/djouallah/duckrun.git@main",
         fabric_token=os.environ["FABRIC_TOKEN"],
@@ -168,7 +172,8 @@ def main() -> int:
         print(f"[aemo]   fct_price <- daily       : {pr_daily} unprocessed")
         print(f"[aemo]   fct_price <- price_today : {pr_today} unprocessed")
         print(f"[aemo]   FILES TO PROCESS (distinct): {backlog}  "
-              f"(each build folds up to {process_limit}/source; downloads up to {download_limit}/source)")
+              f"(each build folds up to {process_limit}/source; downloads up to {download_limit}/source; "
+              f"remote cores={REMOTE_CORES})")
         why = f"{backlog} to process {'>' if remote else '<='} threshold={threshold}"
     except Exception as exc:  # any pre-flight failure — fail safe to remote, don't risk local OOM
         remote = True
