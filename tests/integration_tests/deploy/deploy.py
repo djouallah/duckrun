@@ -13,17 +13,16 @@ import duckrun
 ws = duckrun.workspace(os.environ["FABRIC_WORKSPACE"])
 lh = ws.create_lakehouse("deploy_demo")
 
+# DEBUG: everything below except the semantic model is temporarily disabled. The lakehouse tables
+# already exist from earlier runs, so we redeploy ONLY the Direct Lake semantic model to iterate on it
+# (the created model is broken — won't open). Restore the rest once the .bim is fixed.
 # stage the coffee dbt project into the lakehouse Files, then let a notebook run it ON Fabric
-files = duckrun.connect(f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh}/Tables")
-files.copy("../coffee", "coffee")
-ws.deploy("build_coffee.ipynb", overwrite=True)
-ws.run("build_coffee")                       # runs the dbt project on Fabric → dbo.mart_revenue
+# files = duckrun.connect(f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh}/Tables")
+# files.copy("../coffee", "coffee")
+# ws.deploy("build_coffee.ipynb", overwrite=True)
+# ws.run("build_coffee")                       # runs the dbt project on Fabric → dbo.mart_revenue
 
-# the tables exist now — deploy the orchestration. overwrite=True keeps the demo re-runnable against
-# the shared workspace (items from a prior run are replaced, not errored).
-# TODO: the Direct Lake semantic model deploy is temporarily disabled — the created model is broken
-# (won't open) and needs rework before it goes back in.
-# ws.deploy("coffee_revenue.bim", lakehouse="deploy_demo", overwrite=True)
-ws.deploy("pipeline.json", overwrite=True)
-ws.deploy("variables.json", variables={"workspace_id": ws.id, "lakehouse_name": "deploy_demo"}, overwrite=True)
-ws.schedule("pipeline", daily="06:00")
+ws.deploy("coffee_revenue.bim", lakehouse="deploy_demo", overwrite=True)
+# ws.deploy("pipeline.json", overwrite=True)
+# ws.deploy("variables.json", variables={"workspace_id": ws.id, "lakehouse_name": "deploy_demo"}, overwrite=True)
+# ws.schedule("pipeline", daily="06:00")
