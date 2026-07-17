@@ -69,7 +69,7 @@
               "type": "entity",
               "entityName": "dim_calendar",
               "expressionSource": "DirectLake",
-              "schemaName": "mart"
+              "schemaName": "sources"
             }
           }
         ]
