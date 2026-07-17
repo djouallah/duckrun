@@ -56,6 +56,16 @@ class DuckrunCredentials(DuckDBCredentials):
             roots[alias] = (cfg.get("root_path"), cfg.get("storage_options"))
         return roots
 
+    @staticmethod
+    def _with_token(root, storage_options):
+        """Self-acquire a OneLake bearer token for an abfss:// root that has none (GitHub OIDC /
+        azure-identity / Fabric notebook) so a profile can omit it. No-op for local/az:// roots or
+        when a token is already present. Every catalog resolves through here, so per-catalog writes,
+        reads, discovery and stats all get a token even in a multi-catalog project. Cheap: auth caches
+        the token per scope, so the repeated resolver calls don't re-mint."""
+        from . import secret
+        return secret.with_onelake_token(root, storage_options)
+
     def storage_options_for_location(self, location) -> Optional[Dict[str, str]]:
         """The ``storage_options`` of whichever catalog root is a prefix of ``location``, else the
         default. Used by the ``@available`` helpers that receive a bare path (delta_version /
@@ -71,8 +81,8 @@ class DuckrunCredentials(DuckDBCredentials):
                 if loc == r or loc.startswith(r + "/"):
                     if best_root is None or len(r) > len(best_root):
                         best_root, best_so = r, so
-            return best_so
-        return self.storage_options
+            return self._with_token(best_root or self.root_path, best_so)
+        return self._with_token(self.root_path, self.storage_options)
 
     def root_for(self, database=None) -> tuple:
         """`(root_path, storage_options)` for `database`, falling back to the default catalog when
@@ -82,8 +92,9 @@ class DuckrunCredentials(DuckDBCredentials):
         if database is not None:
             db = str(database).strip('"')
             if db in roots:
-                return roots[db]
-        return (self.root_path, self.storage_options)
+                root, so = roots[db]
+                return (root, self._with_token(root, so))
+        return (self.root_path, self._with_token(self.root_path, self.storage_options))
 
     def __post_init__(self):
         # Normalize a trailing slash off every root once, here, so every consumer sees one spelling.
