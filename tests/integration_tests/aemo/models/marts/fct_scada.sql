@@ -52,7 +52,7 @@ SELECT COUNT(*) AS cnt FROM {{ ref('stg_csv_archive_log') }} WHERE source_type =
    {%- if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT intraday_file FROM {{ this }} WHERE intraday_file IS NOT NULL){% endif %}
 {%- endset -%}
 
-{%- if execute and flags.WHICH == 'run' -%}
+{%- if execute and flags.WHICH in ('run', 'build') -%}
   {%- set has_daily = run_query(daily_count_query).rows[0][0] > 0 -%}
   {%- set has_intraday = run_query(intraday_count_query).rows[0][0] > 0 -%}
 {%- else -%}
