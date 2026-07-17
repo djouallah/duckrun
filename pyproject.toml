@@ -53,6 +53,13 @@ dependencies = [
     # `cryptography` wheel (via msal) plus small pure-Python libs — no build step. Unused inside a
     # Fabric notebook (notebookutils supplies the token) and for local/s3/gcs stores.
     "azure-identity",
+    # Loose-file transfer (conn.copy / download / list_files) rides obstore — the Python binding over
+    # the same Rust object_store crate deltalake uses, so the storage_options we already forward to
+    # delta-rs configure it verbatim (no per-backend auth, one code path for local/s3/gcs/az/OneLake).
+    # Uploads stream from a file handle (multipart PUT), which the old DuckDB read_blob/COPY BLOB path
+    # couldn't — it buffered each file whole in memory and OOM'd on multi-GB files. A single prebuilt
+    # Rust wheel (~7 MB); a distinct compile from deltalake's object_store, so no shared-ABI pin risk.
+    "obstore",
 ]
 
 [project.optional-dependencies]

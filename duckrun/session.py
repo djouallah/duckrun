@@ -17,7 +17,7 @@ from typing import Dict, List, Optional
 
 import duckdb
 
-from dbt.adapters.duckrun import delta_dml, engine, remote, secret, sortkey
+from dbt.adapters.duckrun import delta_dml, engine, objectstore, remote, secret, sortkey
 from . import auth
 from ._runtime import check_runtime_versions
 
@@ -907,14 +907,14 @@ class DuckSession:
     def copy(self, local_folder: str, remote_folder: str,
              file_extensions: Optional[List[str]] = None, overwrite: bool = False) -> bool:
         """Upload every file under ``local_folder`` to ``remote_folder`` on the store, preserving the
-        directory tree. Storage-neutral: files move via DuckDB's ``COPY (SELECT content FROM
-        read_blob(local)) TO remote (FORMAT BLOB)`` over the secret ``connect()`` already minted — no
-        extra auth, no obstore. ``remote_folder`` is relative to the lakehouse Files section on OneLake
-        (or a full ``…://`` URL); ``file_extensions`` filters by suffix (``['.csv', '.parquet']``);
-        ``overwrite=False`` (default) skips files already present remotely. Returns ``True`` on success.
+        directory tree. Storage-neutral: files stream via obstore over the same ``storage_options``
+        ``connect()`` already holds — no extra auth. ``remote_folder`` is relative to the lakehouse
+        Files section on OneLake (or a full ``…://`` URL); ``file_extensions`` filters by suffix
+        (``['.csv', '.parquet']``); ``overwrite=False`` (default) skips files already present remotely.
+        Returns ``True`` on success.
 
-        Each file is read whole into memory as one BLOB, so this suits ordinary files, not multi-GB blobs.
-        """
+        Each file is streamed from an open handle (multipart PUT for large files), so this handles
+        multi-GB blobs, not just ordinary files."""
         exts = _norm_exts(file_extensions)
         base = self._files_base(remote_folder)
         pairs = []
@@ -924,54 +924,46 @@ class DuckSession:
                     continue
                 local_path = os.path.join(dirpath, n)
                 rel = os.path.relpath(local_path, local_folder).replace("\\", "/")
-                pairs.append((local_path.replace("\\", "/"), f"{base}/{rel}"))
+                pairs.append((local_path, rel))
         if not pairs:
             print(f"⚠️  no files to upload from '{local_folder}'"
                   + (f" (filtered by {file_extensions})" if exts else ""))
             return True
         print(f"📁 Uploading {len(pairs)} file(s) to '{base}'...")
-        for local_path, remote_path in pairs:
-            if not overwrite and self._remote_exists(remote_path):
-                print(f"  ⏭ exists: {remote_path}")
+        store = objectstore.build_store(base, secret.refreshed(self.storage_options))
+        for local_path, rel in pairs:
+            if not overwrite and objectstore.exists(store, rel):
+                print(f"  ⏭ exists: {base}/{rel}")
                 continue
-            if "://" not in remote_path:  # local target: object stores need no dirs, a local FS does
-                os.makedirs(os.path.dirname(remote_path) or ".", exist_ok=True)
-            # COMPRESSION 'none' is load-bearing: a file copy must be byte-verbatim. Without it,
-            # COPY TO re-encodes by the destination extension (a '.gz'/'.zst' target would re-compress
-            # an already-compressed blob → double-compressed, corrupt).
-            self.con.execute(
-                f"COPY (SELECT content FROM read_blob('{_qlit(local_path)}')) "
-                f"TO '{_qlit(remote_path)}' (FORMAT BLOB, COMPRESSION 'none')")
-            print(f"  ✓ {local_path} → {remote_path}")
+            objectstore.upload(store, rel, local_path)
+            print(f"  ✓ {local_path} → {base}/{rel}")
         print("✅ upload complete")
         return True
 
     def download(self, remote_folder: str = "", local_folder: str = "./downloaded_files",
                  file_extensions: Optional[List[str]] = None, overwrite: bool = False) -> bool:
         """Download every file under ``remote_folder`` to ``local_folder``, preserving the directory
-        tree. The mirror of :meth:`copy`: remote files are enumerated with ``glob`` and pulled via
-        ``COPY (SELECT content FROM read_blob(remote)) TO local (FORMAT BLOB)`` over the existing secret.
-        ``remote_folder`` is relative to the OneLake Files section (or a full ``…://`` URL);
-        ``file_extensions`` filters by suffix; ``overwrite=False`` (default) skips files already present
-        locally. Returns ``True`` on success."""
+        tree. The mirror of :meth:`copy`: remote files are enumerated and streamed back via obstore
+        over the existing ``storage_options``. ``remote_folder`` is relative to the OneLake Files
+        section (or a full ``…://`` URL); ``file_extensions`` filters by suffix; ``overwrite=False``
+        (default) skips files already present locally. Returns ``True`` on success."""
+        exts = _norm_exts(file_extensions)
         base = self._files_base(remote_folder)
-        pairs = [(fp, os.path.join(local_folder, *rel.split("/")))
-                 for fp, rel in self._enumerate_remote(base, _norm_exts(file_extensions))]
+        store = objectstore.build_store(base, secret.refreshed(self.storage_options))
+        pairs = [(key, os.path.join(local_folder, *key.split("/")))
+                 for key in objectstore.list_keys(store)
+                 if not exts or os.path.splitext(key)[1].lower() in exts]
         if not pairs:
             print(f"⚠️  no files to download from '{base}'"
                   + (f" (filtered by {file_extensions})" if file_extensions else ""))
             return True
         print(f"📁 Downloading {len(pairs)} file(s) to '{local_folder}'...")
-        for remote_path, local_path in pairs:
+        for key, local_path in pairs:
             if not overwrite and os.path.exists(local_path):
                 print(f"  ⏭ exists: {local_path}")
                 continue
-            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-            # COMPRESSION 'none' → byte-verbatim (see copy(): a '.gz'/'.zst' target must not re-compress).
-            self.con.execute(
-                f"COPY (SELECT content FROM read_blob('{_qlit(remote_path)}')) "
-                f"TO '{_qlit(local_path.replace(chr(92), '/'))}' (FORMAT BLOB, COMPRESSION 'none')")
-            print(f"  ✓ {remote_path} → {local_path}")
+            objectstore.download(store, key, local_path)
+            print(f"  ✓ {base}/{key} → {local_path}")
         print("✅ download complete")
         return True
 
@@ -981,10 +973,12 @@ class DuckSession:
         ``['csv/daily/a.csv.gz', 'csv/log.parquet']``) — the companion to :meth:`copy`/:meth:`download`
         (the returned paths feed straight back into ``download``). ``remote_folder`` is relative to the
         OneLake Files section (or a full ``…://`` URL); ``file_extensions`` filters by suffix. Recurses.
-        Storage-neutral: abfss via the DFS REST API (DuckDB can't glob OneLake, duckdb-azure#174),
-        local/s3/gcs/az via ``glob``."""
+        Storage-neutral: obstore lists every backend (local / s3 / gcs / az / OneLake) natively."""
+        exts = _norm_exts(file_extensions)
         base = self._files_base(remote_folder)
-        return [rel for _fp, rel in self._enumerate_remote(base, _norm_exts(file_extensions))]
+        store = objectstore.build_store(base, secret.refreshed(self.storage_options))
+        return [key for key in objectstore.list_keys(store)
+                if not exts or os.path.splitext(key)[1].lower() in exts]
 
     def convert_to_delta(self, identifier: str, partition_schema=None) -> str:
         """Convert an existing parquet directory to Delta **in place, zero-copy** — a ``_delta_log`` is
@@ -1303,29 +1297,6 @@ class DuckSession:
         recs = [dict(zip(prof.columns, row)) for row in prof.fetchall()]
         return [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
                                             key=lambda x: x["sort_position"])]
-
-    def _enumerate_remote(self, base: str, exts) -> List[tuple]:
-        """Enumerate files recursively under the resolved store URL ``base``, as ``(full_path,
-        relative_path)`` pairs honouring the extension filter. Shared by ``list_files``/``download``."""
-        if remote.is_abfss(base):
-            raw = remote.list_files(base, self.storage_options)
-        else:
-            raw = [r[0] for r in self.con.execute(f"SELECT file FROM glob('{_qlit(base)}/**')").fetchall()]
-        out = []
-        for p in raw:
-            fp = p.replace("\\", "/")
-            if exts and os.path.splitext(fp)[1].lower() not in exts:
-                continue
-            rel = fp[len(base):].lstrip("/") if fp.startswith(base) else os.path.basename(fp)
-            out.append((fp, rel))
-        return out
-
-    def _remote_exists(self, path: str) -> bool:
-        """True if a single file exists at ``path``. OneLake can't be globbed (duckdb-azure#174), so
-        abfss uses a REST HEAD; local/s3/gcs/az use ``glob`` on the exact path."""
-        if remote.is_abfss(path):
-            return remote.file_exists(path, self.storage_options)
-        return bool(self.con.execute(f"SELECT 1 FROM glob('{_qlit(path)}') LIMIT 1").fetchall())
 
     def close(self):
         """Close the underlying DuckDB connection. The session is unusable afterwards — registered
