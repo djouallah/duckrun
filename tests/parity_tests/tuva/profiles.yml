@@ -6,8 +6,9 @@
 #
 # Local-filesystem Delta warehouse by default (no OneLake needed). httpfs is loaded and the S3
 # region set so Tuva's synthetic-seed bootstrap can read the public tuva-public-resources bucket
-# anonymously (read_csv('s3://...')). Point WAREHOUSE_PATH at an abfss:// Tables path + set
-# ONELAKE_TOKEN to run the same unmodified project against a Microsoft Fabric Lakehouse later.
+# anonymously (read_csv('s3://...')). Point WAREHOUSE_PATH at an abfss:// Tables path to run the same
+# unmodified project against a Microsoft Fabric Lakehouse later — duckrun acquires the OneLake token
+# itself, no bearer_token needed here.
 default:
   target: dev
   outputs:
@@ -19,5 +20,3 @@ default:
         - httpfs
       settings:
         s3_region: us-east-1
-      storage_options:
-        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"

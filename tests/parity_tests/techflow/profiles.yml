@@ -11,7 +11,5 @@ techflow_analytics:
       type: duckrun
       schema: "{{ env_var('DBT_SCHEMA', 'main') }}"
       root_path: "{{ env_var('WAREHOUSE_PATH', './warehouse') }}"
-      # Empty by default (local fs). Set ONELAKE_TOKEN + point WAREHOUSE_PATH at an abfss:// Tables
-      # path to materialize to Microsoft Fabric OneLake (what the parity CI does).
-      storage_options:
-        bearer_token: "{{ env_var('ONELAKE_TOKEN', '') }}"
+      # Local fs by default. Point WAREHOUSE_PATH at an abfss:// Tables path to materialize to Microsoft
+      # Fabric OneLake (what the parity CI does) — duckrun acquires the OneLake token itself.
