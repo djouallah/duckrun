@@ -60,6 +60,46 @@ def test_ensure_azure_secret_noop_without_token():
     assert conn.sql == []  # nothing executed when there's no token
 
 
+# ------------------------------------------------------------- azure HTTP transport
+
+def _transport_set(conn):
+    """The value SET for azure_transport_option_type on ``conn``, or None if it wasn't set."""
+    for sql in conn.sql:
+        low = sql.lower()
+        if "set global azure_transport_option_type" in low:
+            return sql.split("'")[1]
+    return None
+
+
+def test_transport_defaults_to_curl_outside_fabric(monkeypatch):
+    # Off a Fabric notebook and with no override, duckrun picks curl (system CA bundle) so the
+    # OneLake TLS handshake works on a laptop / CI runner without any env spoon-feeding.
+    monkeypatch.delenv("AZURE_TRANSPORT_OPTION_TYPE", raising=False)
+    monkeypatch.setattr(secret, "_in_fabric_notebook", lambda: False)
+    conn = _RecordingConn()
+    secret.ensure_azure_secret(conn, {"bearer_token": "TOK"})
+    assert _transport_set(conn) == "curl"
+
+
+def test_transport_untouched_in_fabric_notebook(monkeypatch):
+    # Inside a Fabric notebook the default transport already works — leave it alone (no regression).
+    monkeypatch.delenv("AZURE_TRANSPORT_OPTION_TYPE", raising=False)
+    monkeypatch.setattr(secret, "_in_fabric_notebook", lambda: True)
+    conn = _RecordingConn()
+    secret.ensure_azure_secret(conn, {"bearer_token": "TOK"})
+    assert _transport_set(conn) is None            # no SET issued
+    assert any("create or replace secret" in s.lower() for s in conn.sql)  # secret still minted
+
+
+def test_transport_env_override_wins_even_in_fabric(monkeypatch):
+    # An explicit env value overrides everything, including the in-notebook "leave it" default.
+    monkeypatch.setenv("AZURE_TRANSPORT_OPTION_TYPE", "default")
+    monkeypatch.setattr(secret, "_in_fabric_notebook", lambda: True)
+    conn = _RecordingConn()
+    secret.ensure_azure_secret(conn, {"bearer_token": "TOK"})
+    assert _transport_set(conn) == "default"
+
+
 # ----------------------------------------------------------------- abfss URL parse
 
 def test_parse_abfss_splits_filesystem_host_path():

@@ -104,13 +104,15 @@ def _github_oidc_assertion() -> Optional[str]:
         return json.loads(resp.read().decode()).get("value")
 
 
-def _github_oidc_token() -> Optional[str]:
-    """A storage token via GitHub Actions **workload-identity federation**: exchange a fresh GitHub
-    OIDC JWT for an Azure AD storage token (client-assertion flow — no client secret, no refresh
-    token). This keeps working after an ``az``-CLI session token has expired, which the CLI cannot
-    renew under OIDC (the federated assertion it logged in with is long gone), so it is the one source
-    that survives a build longer than the token's ~1h life. None unless running under GitHub Actions
-    with ``AZURE_CLIENT_ID`` / ``AZURE_TENANT_ID`` set and azure-identity present."""
+def _github_oidc_token(scope: str = _STORAGE_SCOPE) -> Optional[str]:
+    """An Azure AD token for ``scope`` via GitHub Actions **workload-identity federation**: exchange a
+    fresh GitHub OIDC JWT for the token (client-assertion flow — no client secret, no refresh token).
+    This keeps working after an ``az``-CLI session token has expired, which the CLI cannot renew under
+    OIDC (the federated assertion it logged in with is long gone), so it is the one source that
+    survives a build longer than the token's ~1h life. The same assertion authenticates the service
+    principal for any scope it is authorized for — storage, the Fabric control plane, Power BI. None
+    unless running under GitHub Actions with ``AZURE_CLIENT_ID`` / ``AZURE_TENANT_ID`` set and
+    azure-identity present."""
     client_id = os.environ.get("AZURE_CLIENT_ID")
     tenant_id = os.environ.get("AZURE_TENANT_ID")
     if not (client_id and tenant_id and os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")):
@@ -121,7 +123,7 @@ def _github_oidc_token() -> Optional[str]:
         return None
     try:
         cred = ClientAssertionCredential(tenant_id, client_id, _github_oidc_assertion)
-        return cred.get_token(_STORAGE_SCOPE).token
+        return cred.get_token(scope).token
     except Exception:
         return None
 
@@ -158,7 +160,12 @@ def get_fabric_token() -> str:
     so it is acquired separately. Raises ``RuntimeError`` with actionable guidance if none is
     available rather than returning a token that would 401 later.
     """
-    token = _notebook_fabric_api_token() or os.environ.get("FABRIC_TOKEN") or _azure_identity_fabric_token()
+    token = (
+        _notebook_fabric_api_token()
+        or _github_oidc_token(_FABRIC_SCOPE)
+        or os.environ.get("FABRIC_TOKEN")
+        or _azure_identity_fabric_token()
+    )
     if token:
         return token
     raise RuntimeError(
@@ -215,7 +222,12 @@ def get_powerbi_token() -> str:
     as the Fabric control-plane token is reused. Raises ``RuntimeError`` with actionable guidance if
     none is available rather than returning a token that would 401 later.
     """
-    token = _notebook_fabric_api_token() or os.environ.get("POWERBI_TOKEN") or _azure_identity_powerbi_token()
+    token = (
+        _notebook_fabric_api_token()
+        or _github_oidc_token(_POWERBI_SCOPE)
+        or os.environ.get("POWERBI_TOKEN")
+        or _azure_identity_powerbi_token()
+    )
     if token:
         return token
     raise RuntimeError(

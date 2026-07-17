@@ -37,6 +37,44 @@ def bearer_token(storage_options: Optional[Dict[str, str]]) -> Optional[str]:
     return so.get("bearer_token") or so.get("token") or so.get("access_token")
 
 
+def _in_fabric_notebook() -> bool:
+    """True when running inside a Microsoft Fabric notebook (``notebookutils`` importable)."""
+    try:
+        import notebookutils  # type: ignore  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
+
+def _resolve_azure_transport() -> Optional[str]:
+    """The DuckDB ``azure_transport_option_type`` to set, or None to leave DuckDB's default.
+
+    An explicit ``AZURE_TRANSPORT_OPTION_TYPE`` env var always wins. Otherwise: outside Fabric (a
+    laptop or CI runner) the azure extension's ``default`` transport can fail the OneLake TLS handshake
+    ("Problem with the SSL CA cert") — ``curl`` respects the system CA bundle, so default to it. Inside
+    a Fabric notebook the ``default`` transport already works, so return None and change nothing there.
+    """
+    env = os.environ.get("AZURE_TRANSPORT_OPTION_TYPE")
+    if env:
+        return env
+    return None if _in_fabric_notebook() else "curl"
+
+
+def _set_azure_transport(conn) -> None:
+    """Set the azure HTTP transport at connection-open (see :func:`_resolve_azure_transport`). Done
+    here, NOT via an on-run-start hook: hooks only fire for run/build/seed, so read-only commands that
+    still open the store — dbt test / show / docs generate — would miss it. A ``SET`` failure (e.g. an
+    unsupported value) must never hard-fail the connection, so it's swallowed."""
+    transport = _resolve_azure_transport()
+    if not transport:
+        return
+    transport_sql = transport.replace("'", "''")
+    try:
+        conn.execute(f"SET GLOBAL azure_transport_option_type = '{transport_sql}'")
+    except Exception:
+        pass
+
+
 def with_onelake_token(root_path: Optional[str],
                        storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, str]]:
     """For an ``abfss://`` (OneLake) target whose profile carries **no** bearer token, acquire one
@@ -131,16 +169,7 @@ def ensure_azure_secret(conn, storage_options: Optional[Dict[str, str]]) -> bool
     if not token:
         return False
     conn.execute("INSTALL azure; LOAD azure;")
-    # Set the azure HTTP transport at connection-open (here), NOT via an on-run-start hook:
-    # hooks only fire for run/build/seed, so read-only commands that still open the store —
-    # dbt test / show / docs generate — would miss it. On some runners the azure extension's
-    # default transport fails the OneLake TLS handshake ("Problem with the SSL CA cert"); the
-    # curl transport respects the system CA bundle. Driven by AZURE_TRANSPORT_OPTION_TYPE so the
-    # value isn't hardcoded; absent → leave DuckDB's default.
-    transport = os.environ.get("AZURE_TRANSPORT_OPTION_TYPE")
-    if transport:
-        transport_sql = transport.replace("'", "''")
-        conn.execute(f"SET GLOBAL azure_transport_option_type = '{transport_sql}'")
+    _set_azure_transport(conn)
     # Escape single quotes so a token containing one can't break out of the SQL string literal.
     token_sql = token.replace("'", "''")
     conn.execute(
@@ -163,10 +192,7 @@ def mint_scoped_secret(conn, secret_name: str, root: str,
     if not token:
         return False
     conn.execute("INSTALL azure; LOAD azure;")
-    transport = os.environ.get("AZURE_TRANSPORT_OPTION_TYPE")
-    if transport:
-        transport_sql = transport.replace("'", "''")
-        conn.execute(f"SET GLOBAL azure_transport_option_type = '{transport_sql}'")
+    _set_azure_transport(conn)
     token_sql = token.replace("'", "''")
     scope_sql = str(root).replace("'", "''")
     conn.execute(

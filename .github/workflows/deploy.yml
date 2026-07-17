@@ -20,38 +20,16 @@ jobs:
     runs-on: ubuntu-latest
     env:
       FABRIC_WORKSPACE: 91588e42-0f1c-4e56-bcaa-cbf015b8f312
-      # Exported to the process env so auth's GitHub-OIDC token refresh can re-exchange a fresh
-      # assertion (mirrors aemo.yml).
+      # The only Azure inputs: the OIDC federated identity. duckrun mints every token it needs
+      # (storage, Fabric control plane, Power BI) by exchanging a fresh GitHub OIDC assertion — no
+      # azure/login, no az token steps — and picks the curl HTTP transport itself. This is the test:
+      # duckrun's deploy surface must stand on its own.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      # The azure extension's default transport fails the OneLake TLS handshake on the runner; curl
-      # respects the system CA bundle.
-      AZURE_TRANSPORT_OPTION_TYPE: curl
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install duckrun from the checkout ([local] adds azure-identity for OIDC token refresh)
-        run: pip install -e ".[local]"
-      - name: Azure login (OIDC federation — no client secret)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-      - name: Storage token (stage the dbt project into Files via conn.copy)
-        run: |
-          T=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$T"; echo "AZURE_STORAGE_TOKEN=$T" >> "$GITHUB_ENV"
-      - name: Fabric control-plane token (create lakehouse + deploy + run items)
-        run: |
-          T=$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)
-          echo "::add-mask::$T"; echo "FABRIC_TOKEN=$T" >> "$GITHUB_ENV"
-      - name: Power BI token (semantic-model refresh)
-        run: |
-          T=$(az account get-access-token --resource https://analysis.windows.net/powerbi/api --query accessToken -o tsv)
-          echo "::add-mask::$T"; echo "POWERBI_TOKEN=$T" >> "$GITHUB_ENV"
-      - name: Deploy everything — the simplest deploy.py ever
-        working-directory: tests/integration_tests/deploy
-        run: python deploy.py
+      - name: Install duckrun from the checkout and deploy (self-contained — tokens + transport via duckrun)
+        run: pip install -e ".[local]" && cd tests/integration_tests/deploy && python deploy.py

@@ -119,10 +119,52 @@ def test_refresh_never_reaches_interactive_browser(monkeypatch):
         return "tok"
 
     monkeypatch.setattr(auth, "_fabric_token", lambda: None)
-    monkeypatch.setattr(auth, "_github_oidc_token", lambda: None)
+    monkeypatch.setattr(auth, "_github_oidc_token", lambda scope=auth._STORAGE_SCOPE: None)
     monkeypatch.setattr(auth, "_azure_identity_token", fake_identity)
     assert auth.refresh_storage_token() == "tok"
     assert seen["interactive"] is False
+
+
+# ------------------------------------------ Fabric/Power BI tokens self-acquired via OIDC by scope
+
+def _capture_oidc_scope(monkeypatch):
+    """Stub _github_oidc_token to record the scope it's asked for and return a scope-tagged token."""
+    seen = {}
+
+    def fake_oidc(scope=auth._STORAGE_SCOPE):
+        seen["scope"] = scope
+        return f"OIDC::{scope}"
+
+    monkeypatch.setattr(auth, "_github_oidc_token", fake_oidc)
+    return seen
+
+
+def test_get_fabric_token_uses_oidc_with_fabric_scope(monkeypatch):
+    # Off a Fabric notebook and with no FABRIC_TOKEN env, the control-plane token comes from the OIDC
+    # exchange at the Fabric scope — no az/env spoon-feeding needed.
+    monkeypatch.delenv("FABRIC_TOKEN", raising=False)
+    monkeypatch.setattr(auth, "_notebook_fabric_api_token", lambda: None)
+    seen = _capture_oidc_scope(monkeypatch)
+    assert auth.get_fabric_token() == f"OIDC::{auth._FABRIC_SCOPE}"
+    assert seen["scope"] == auth._FABRIC_SCOPE
+
+
+def test_get_powerbi_token_uses_oidc_with_powerbi_scope(monkeypatch):
+    monkeypatch.delenv("POWERBI_TOKEN", raising=False)
+    monkeypatch.setattr(auth, "_notebook_fabric_api_token", lambda: None)
+    seen = _capture_oidc_scope(monkeypatch)
+    assert auth.get_powerbi_token() == f"OIDC::{auth._POWERBI_SCOPE}"
+    assert seen["scope"] == auth._POWERBI_SCOPE
+
+
+def test_notebook_token_still_wins_over_oidc(monkeypatch):
+    # In a Fabric notebook the runtime token is used first — the OIDC branch is a pure fallback, so
+    # the notebook path is unchanged.
+    monkeypatch.setattr(auth, "_notebook_fabric_api_token", lambda: "NBTOK")
+    monkeypatch.setattr(auth, "_github_oidc_token",
+                        lambda scope=auth._STORAGE_SCOPE: pytest.fail("OIDC must not be reached"))
+    assert auth.get_fabric_token() == "NBTOK"
+    assert auth.get_powerbi_token() == "NBTOK"
 
 
 # ------------------------------------------------------- #4 quote-aware predicate rewriting

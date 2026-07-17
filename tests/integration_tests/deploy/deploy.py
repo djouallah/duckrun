@@ -2,9 +2,11 @@
 
 Stages the coffee dbt project into the lakehouse Files, deploys a notebook that runs it on Fabric
 (producing `dbo.mart_revenue` etc.), then deploys a Direct Lake semantic model over those tables plus
-a pipeline and a variable library, and schedules the pipeline. Tokens come from the environment:
-`AZURE_STORAGE_TOKEN` (the Files copy), `FABRIC_TOKEN` (control plane) and `POWERBI_TOKEN` (the model
-refresh) are auto-resolved by duckrun — nothing is passed here.
+a pipeline and a variable library, and schedules the pipeline. Nothing about auth is passed here or
+set up by CI: given only the OIDC federated identity (`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`), duckrun
+mints every token it needs — storage (the Files copy), the Fabric control plane, and Power BI (the
+model refresh) — by exchanging a fresh GitHub OIDC assertion, and picks the OneLake HTTP transport
+itself. That self-sufficiency is the point of this test.
 """
 import os
 

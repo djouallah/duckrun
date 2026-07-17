@@ -169,10 +169,10 @@ Patterns worth reusing from this:
   models that would change its answer get built — order the probe accordingly.
 - **`dbt retry` once** on a failed main build, before failing the run.
 - **Mirror the exact same step sequence in CI.** The reference repo's GitHub Actions
-  job runs the identical five steps in bash, authenticating via OIDC →
-  `az account get-access-token --resource https://storage.azure.com` (mask the token in
-  logs), with `AZURE_TRANSPORT_OPTION_TYPE=curl` set for the runner environment. Parity
-  between notebook and CI means a green laptop run predicts a green scheduled run.
+  job runs the identical five steps in bash, authenticating via OIDC. duckrun picks the
+  OneLake HTTP transport itself (`curl` off a Fabric notebook, so the runner's system CA
+  bundle is used) — set `AZURE_TRANSPORT_OPTION_TYPE` only to override it. Parity between
+  notebook and CI means a green laptop run predicts a green scheduled run.
 
 ## Materializations
 
