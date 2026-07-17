@@ -146,7 +146,9 @@ jobs:
       cancel-in-progress: false
     env:
       DBT_PROFILES_DIR: ${{ github.workspace }}/tests/integration_tests/coffee
-      AZURE_TRANSPORT_OPTION_TYPE: curl
+      # duckrun self-acquires the OneLake token from the OIDC identity — no bearer_token in the profile.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
     steps:
       - uses: actions/checkout@v4
