@@ -16,11 +16,12 @@ lh = ws.create_lakehouse("deploy_demo")
 # stage the coffee dbt project into the lakehouse Files, then let a notebook run it ON Fabric
 files = duckrun.connect(f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh}/Tables")
 files.copy("../coffee", "coffee")
-ws.deploy("build_coffee.ipynb")
+ws.deploy("build_coffee.ipynb", overwrite=True)
 ws.run("build_coffee")                       # runs the dbt project on Fabric → dbo.mart_revenue
 
-# the tables exist now — deploy the semantic model over them, plus orchestration
-ws.deploy("coffee_revenue.bim", lakehouse="deploy_demo")
-ws.deploy("pipeline.json")
-ws.deploy("variables.json", variables={"workspace_id": ws.id, "lakehouse_name": "deploy_demo"})
+# the tables exist now — deploy the semantic model over them, plus orchestration. overwrite=True keeps
+# the demo re-runnable against the shared workspace (items from a prior run are replaced, not errored).
+ws.deploy("coffee_revenue.bim", lakehouse="deploy_demo", overwrite=True)
+ws.deploy("pipeline.json", overwrite=True)
+ws.deploy("variables.json", variables={"workspace_id": ws.id, "lakehouse_name": "deploy_demo"}, overwrite=True)
 ws.schedule("pipeline", daily="06:00")
