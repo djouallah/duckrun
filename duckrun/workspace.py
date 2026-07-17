@@ -1,22 +1,25 @@
 """A Fabric workspace handle for control-plane item management.
 
 ``connect()`` is storage-neutral (local, ``s3://``, ``gs://``, ``abfss://``) and points *into* an
-existing lakehouse's ``Tables/``. Creating a lakehouse is the opposite: Fabric-only, control-plane,
-and there is no lakehouse to point at yet. So it lives here, on a separate workspace-scoped handle
+existing lakehouse's ``Tables/``. Workspace-level operations are the opposite: Fabric-only, control-
+plane, with no lakehouse to point at yet. So they live here, on a separate workspace-scoped handle
 rather than on the :class:`~duckrun.session.DuckSession` that ``connect()`` returns::
 
     import duckrun
     ws = duckrun.workspace("My Workspace")            # name or GUID
-    lh_id = ws.create_lakehouse("bronze")             # idempotent; returns the item id
-    ws.list_lakehouses()
+    ws.create_lakehouse("bronze")                     # provision an empty container (by name)
+    ws.deploy("etl.ipynb")                            # deploy a file artifact (a notebook)
+    ws.deploy("model.bim")                            # deploy + refresh a semantic model
 
-The Fabric REST plumbing (auth, retry, workspace resolution, LRO polling) is reused as-is from
-:mod:`duckrun.fabric_remote`.
+The Fabric REST plumbing (auth, retry, workspace resolution, LRO polling, item create, refresh) is
+reused as-is from :mod:`duckrun.fabric_remote`.
 """
 import json
-from typing import Dict, List, Optional, Union
+import os
+from typing import Dict, List, Optional
+from urllib.parse import urlsplit
 
-from .auth import get_fabric_token
+from .auth import get_fabric_token, get_powerbi_token
 from .fabric_remote import (
     _FABRIC_API,
     RemoteRunError,
@@ -24,21 +27,30 @@ from .fabric_remote import (
     _resolve_workspace_id,
     _await_lro_item_id,
     _create_notebook,
+    _create_semantic_model,
+    _refresh_semantic_model,
     _delete_item,
-    _python_notebook,
-    _python_code_cell,
 )
 
+# Which Fabric item each source extension deploys to: (item-collection endpoint, human label).
+_ARTIFACTS = {".ipynb": ("notebooks", "notebook"), ".bim": ("semanticModels", "semantic model")}
 
-def _load_notebook(source: Union[str, dict, None]) -> dict:
-    """Resolve ``source`` to a notebook (nbformat) dict: an already-parsed ``dict``, a path to a
-    local ``.ipynb`` file, or ``None`` for a minimal empty Python notebook."""
-    if source is None:
-        return _python_notebook([_python_code_cell("")])
-    if isinstance(source, dict):
-        return source
-    with open(source, encoding="utf-8") as f:
-        return json.load(f)
+
+def _basename(source: str) -> str:
+    """The filename of ``source``, whether it's a local path or an ``http(s)`` URL."""
+    path = urlsplit(source).path if source.startswith(("http://", "https://")) else source
+    return os.path.basename(path)
+
+
+def _read_source(source: str) -> bytes:
+    """The raw bytes of ``source`` — fetched over HTTP for a URL, else read from the local file."""
+    if source.startswith(("http://", "https://")):
+        import requests
+        resp = requests.get(source, timeout=60)
+        resp.raise_for_status()
+        return resp.content
+    with open(source, "rb") as f:
+        return f.read()
 
 
 class Workspace:
@@ -54,7 +66,7 @@ class Workspace:
         self.id = _resolve_workspace_id(self._token, workspace)
 
     def _items(self, kind: str) -> List[Dict]:
-        """Every item of ``kind`` (``"lakehouses"`` / ``"notebooks"``) in the workspace."""
+        """Every item of ``kind`` (e.g. ``"lakehouses"`` / ``"notebooks"`` / ``"semanticModels"``)."""
         resp = _http_request("GET", f"{_FABRIC_API}/workspaces/{self.id}/{kind}", token=self._token)
         resp.raise_for_status()
         return resp.json().get("value", [])
@@ -85,23 +97,38 @@ class Workspace:
         resp.raise_for_status()
         raise RemoteRunError(f"unexpected status {resp.status_code} creating lakehouse: {resp.text[:200]}")
 
-    def create_notebook(self, name: str, source: Union[str, dict, None] = None,
-                        overwrite: bool = False) -> str:
-        """Create a notebook named ``name``; return its item id.
+    def deploy(self, source: str, name: Optional[str] = None, overwrite: bool = False) -> str:
+        """Deploy a file artifact to the workspace; return its item id.
 
-        ``source`` is the notebook content: a path to a local ``.ipynb``, an already-parsed nbformat
-        ``dict``, or ``None`` for a minimal empty Python notebook. Unlike ``create_lakehouse`` this is
-        NOT idempotent: if a notebook of that name already exists it is replaced only when
-        ``overwrite=True``, otherwise this raises (a notebook has content, so silently keeping the old
-        one would hide a stale deploy).
+        ``source`` is a local file path or an ``http(s)`` URL (a raw file URL). The item type is keyed
+        off the extension — ``.ipynb`` → notebook, ``.bim`` → semantic model — and the name defaults to
+        the filename stem (overridable via ``name``). A semantic model is also **refreshed** after
+        deploy (a *reframe* onto the latest Delta data for Direct Lake), so ``deploy`` returns only
+        once it is live.
+
+        Not idempotent: if an item of that name already exists it is replaced only when
+        ``overwrite=True``, otherwise this raises.
         """
-        notebook = _load_notebook(source)
-        existing = next((nb for nb in self._items("notebooks") if nb.get("displayName") == name), None)
+        stem, ext = os.path.splitext(_basename(source))
+        if ext.lower() not in _ARTIFACTS:
+            raise RemoteRunError(
+                f"unsupported file type {ext!r}: deploy handles {', '.join(sorted(_ARTIFACTS))}")
+        endpoint, label = _ARTIFACTS[ext.lower()]
+        name = name or stem
+        content = _read_source(source)
+
+        existing = next((it for it in self._items(endpoint) if it.get("displayName") == name), None)
         if existing:
             if not overwrite:
-                raise RemoteRunError(f"notebook {name!r} already exists; pass overwrite=True to replace")
+                raise RemoteRunError(f"{label} {name!r} already exists; pass overwrite=True to replace")
             _delete_item(self._token, self.id, existing["id"])
-        return _create_notebook(self._token, self.id, name, notebook)
+
+        if ext.lower() == ".ipynb":
+            return _create_notebook(self._token, self.id, name, json.loads(content))
+        # .bim → create the semantic model, then refresh/reframe it so it is live.
+        item_id = _create_semantic_model(self._token, self.id, name, content)
+        _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
+        return item_id
 
 
 def workspace(workspace: str, token: Optional[str] = None) -> Workspace:

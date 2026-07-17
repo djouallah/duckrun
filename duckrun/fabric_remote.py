@@ -429,39 +429,98 @@ def _looks_like_guid(value: str) -> bool:
     return len(parts) == 5 and all(c in "0123456789abcdefABCDEF" for c in "".join(parts))
 
 
-def _platform_part(name: str) -> str:
-    """The base64 ``.platform`` file (item metadata). Fabric's Create-with-definition 'respects the
-    platform file if provided'; without it the notebook fell back to a PySpark item. Mirrors the
-    working reference (djouallah/dbt_fabric_python_delta run.Notebook/.platform)."""
-    platform = {
+def _platform_part(name: str, item_type: str = "Notebook") -> dict:
+    """The ``.platform`` file (item metadata). Fabric's Create-with-definition 'respects the platform
+    file if provided'; without it a notebook fell back to a PySpark item. Mirrors the working
+    reference (djouallah/dbt_fabric_python_delta run.Notebook/.platform)."""
+    return {
         "$schema": "https://developer.microsoft.com/json-schemas/fabric/gitIntegration/platformProperties/2.0.0/schema.json",
-        "metadata": {"type": "Notebook", "displayName": name},
+        "metadata": {"type": item_type, "displayName": name},
         "config": {"version": "2.0", "logicalId": str(uuid.uuid4())},
     }
-    return base64.b64encode(json.dumps(platform).encode("utf-8")).decode("ascii")
 
 
-def _create_notebook(token: str, ws_id: str, name: str, notebook: dict) -> str:
-    """Create the notebook item from an inline base64 definition; return its item id. Handles both
-    the synchronous 201 and the long-running-operation 202 (poll the ``Location`` until done)."""
-    payload_b64 = base64.b64encode(json.dumps(notebook).encode("utf-8")).decode("ascii")
-    body = {
-        "displayName": name,
-        "definition": {
-            "format": "ipynb",
-            "parts": [
-                {"path": "notebook-content.ipynb", "payload": payload_b64, "payloadType": "InlineBase64"},
-                {"path": ".platform", "payload": _platform_part(name), "payloadType": "InlineBase64"},
-            ],
-        },
-    }
-    resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{ws_id}/notebooks", token=token, json_body=body)
+def _b64_part(path: str, content) -> dict:
+    """One inline definition part: base64 ``content`` (a ``dict`` → JSON, ``str`` → utf-8, or raw
+    ``bytes``) at ``path``."""
+    if isinstance(content, dict):
+        raw = json.dumps(content).encode("utf-8")
+    elif isinstance(content, str):
+        raw = content.encode("utf-8")
+    else:
+        raw = content
+    return {"path": path, "payload": base64.b64encode(raw).decode("ascii"), "payloadType": "InlineBase64"}
+
+
+def _create_item(token: str, ws_id: str, endpoint: str, name: str, parts: List[dict],
+                 fmt: Optional[str] = None) -> str:
+    """Create a Fabric item from an inline base64 definition; return its item id. Handles both the
+    synchronous 201 and the long-running-operation 202 (poll the ``Location`` until done). ``endpoint``
+    is the item collection (e.g. ``"notebooks"`` / ``"semanticModels"``); ``parts`` are ``_b64_part``
+    dicts; ``fmt`` is the definition ``format`` when the item type needs one (notebooks: ``"ipynb"``)."""
+    definition = {"parts": parts}
+    if fmt:
+        definition["format"] = fmt
+    body = {"displayName": name, "definition": definition}
+    resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{ws_id}/{endpoint}", token=token, json_body=body)
     if resp.status_code in (200, 201):
         return resp.json()["id"]
     if resp.status_code == 202:
         return _await_lro_item_id(token, resp)
     resp.raise_for_status()
-    raise RemoteRunError(f"unexpected status {resp.status_code} creating notebook: {resp.text[:200]}")
+    raise RemoteRunError(f"unexpected status {resp.status_code} creating {endpoint}: {resp.text[:200]}")
+
+
+def _create_notebook(token: str, ws_id: str, name: str, notebook: dict) -> str:
+    """Create a notebook item from an inline base64 ipynb definition; return its item id."""
+    parts = [
+        _b64_part("notebook-content.ipynb", notebook),
+        _b64_part(".platform", _platform_part(name, "Notebook")),
+    ]
+    return _create_item(token, ws_id, "notebooks", name, parts, fmt="ipynb")
+
+
+# Fabric requires this small settings part alongside a TMSL model.bim; supplied internally.
+_PBISM = {
+    "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/semanticModel/definitionProperties/1.0.0/schema.json",
+    "version": "5.0",
+    "settings": {},
+}
+# Power BI REST API — enhanced refresh lives here (a different host/audience than the Fabric API).
+_POWERBI_API = "https://api.powerbi.com/v1.0/myorg"
+# Terminal states of a Power BI enhanced-refresh operation.
+_REFRESH_DONE = {"Completed", "Failed", "Cancelled", "Disabled"}
+
+
+def _create_semantic_model(token: str, ws_id: str, name: str, model_bim: bytes) -> str:
+    """Create a semantic model from a TMSL ``model.bim`` (raw file bytes); return its item id."""
+    parts = [_b64_part("model.bim", model_bim), _b64_part("definition.pbism", _PBISM)]
+    return _create_item(token, ws_id, "semanticModels", name, parts)
+
+
+def _refresh_semantic_model(pbi_token: str, ws_id: str, item_id: str) -> None:
+    """Trigger an enhanced refresh (a *reframe* for Direct Lake) and poll it to completion. Raises
+    ``RemoteRunError`` on a failed/cancelled refresh or timeout. Uses the Power BI REST API, so it
+    takes a Power BI-scoped token (``auth.get_powerbi_token``), not the Fabric control-plane one."""
+    base = f"{_POWERBI_API}/groups/{ws_id}/datasets/{item_id}/refreshes"
+    resp = _http_request("POST", base, token=pbi_token, json_body={})
+    if resp.status_code not in (200, 202):
+        resp.raise_for_status()
+        raise RemoteRunError(f"unexpected status {resp.status_code} starting refresh: {resp.text[:200]}")
+
+    deadline_polls = _POLL_TIMEOUT // max(_POLL_INTERVAL, 1)
+    for _ in range(int(deadline_polls) + 1):
+        _sleep(_POLL_INTERVAL)
+        r = _http_request("GET", base, token=pbi_token, params={"$top": 1})
+        r.raise_for_status()
+        entries = r.json().get("value", [])
+        status = entries[0].get("status") if entries else "Unknown"
+        _log(f"refresh {item_id} status: {status}")
+        if status in _REFRESH_DONE:
+            if status != "Completed":
+                raise RemoteRunError(f"semantic model refresh {status}: {entries[0]}")
+            return
+    raise RemoteRunError("timed out refreshing semantic model")
 
 
 def _await_lro_item_id(token: str, resp) -> str:
@@ -482,8 +541,8 @@ def _await_lro_item_id(token: str, resp) -> str:
             rr.raise_for_status()
             return rr.json()["id"]
         if status in ("Failed", "Undetermined"):
-            raise RemoteRunError(f"notebook create failed: {body}")
-    raise RemoteRunError("timed out creating notebook")
+            raise RemoteRunError(f"item create failed: {body}")
+    raise RemoteRunError("timed out creating item")
 
 
 def _run_job_and_wait(token: str, ws_id: str, item_id: str) -> str:

@@ -28,6 +28,11 @@ _STORAGE_SCOPE = "https://storage.azure.com/.default"
 # token 401s here. Inside a Fabric notebook the "pbi" audience already covers this API.
 _FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
 
+# Power BI REST scope (api.powerbi.com) — a *third* audience, needed only to refresh a semantic model
+# after deploying it (workspace.deploy of a .bim). Inside a Fabric notebook the same "pbi" audience
+# token covers it, so only the local azure-identity path needs this distinct scope.
+_POWERBI_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
+
 # Azure CLI's well-known public client id, used for the interactive/CLI fallbacks.
 _AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
@@ -196,6 +201,48 @@ def _azure_identity_fabric_token(interactive: bool = True) -> Optional[str]:
     for credential in credentials:
         try:
             return credential().get_token(_FABRIC_SCOPE).token
+        except Exception:
+            continue
+    return None
+
+
+def get_powerbi_token() -> str:
+    """Return a Power BI REST token (``api.powerbi.com`` scope), trying the Fabric notebook runtime →
+    ``POWERBI_TOKEN`` env → azure-identity (Azure CLI) in turn.
+
+    Needed only to refresh a semantic model after ``workspace.deploy`` of a ``.bim``. Inside a Fabric
+    notebook the ``"pbi"`` audience token already covers the Power BI API, so the same runtime source
+    as the Fabric control-plane token is reused. Raises ``RuntimeError`` with actionable guidance if
+    none is available rather than returning a token that would 401 later.
+    """
+    token = _notebook_fabric_api_token() or os.environ.get("POWERBI_TOKEN") or _azure_identity_powerbi_token()
+    if token:
+        return token
+    raise RuntimeError(
+        "Could not acquire a Power BI token (needed to refresh the deployed semantic model). "
+        "Inside a Fabric notebook this is automatic; elsewhere set POWERBI_TOKEN, or install the "
+        "optional dependency (`pip install duckrun[local]`) and run "
+        "`az login --scope https://analysis.windows.net/powerbi/api/.default`."
+    )
+
+
+def _azure_identity_powerbi_token(interactive: bool = True) -> Optional[str]:
+    """A Power BI token via azure-identity; None if azure-identity is missing or every credential
+    fails. Same credential selection as :func:`_azure_identity_token`, but for the Power BI scope."""
+    try:
+        from azure.identity import AzureCliCredential
+    except ImportError:
+        return None
+    credentials = [AzureCliCredential]
+    if interactive and sys.stdin.isatty():
+        try:
+            from azure.identity import InteractiveBrowserCredential
+            credentials.append(InteractiveBrowserCredential)
+        except ImportError:
+            pass
+    for credential in credentials:
+        try:
+            return credential().get_token(_POWERBI_SCOPE).token
         except Exception:
             continue
     return None
