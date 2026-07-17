@@ -19,9 +19,11 @@ files.copy("../coffee", "coffee")
 ws.deploy("build_coffee.ipynb", overwrite=True)
 ws.run("build_coffee")                       # runs the dbt project on Fabric → dbo.mart_revenue
 
-# the tables exist now — deploy the semantic model over them, plus orchestration. overwrite=True keeps
-# the demo re-runnable against the shared workspace (items from a prior run are replaced, not errored).
-ws.deploy("coffee_revenue.bim", lakehouse="deploy_demo", overwrite=True)
+# the tables exist now — deploy the orchestration. overwrite=True keeps the demo re-runnable against
+# the shared workspace (items from a prior run are replaced, not errored).
+# TODO: the Direct Lake semantic model deploy is temporarily disabled — the created model is broken
+# (won't open) and needs rework before it goes back in.
+# ws.deploy("coffee_revenue.bim", lakehouse="deploy_demo", overwrite=True)
 ws.deploy("pipeline.json", overwrite=True)
 ws.deploy("variables.json", variables={"workspace_id": ws.id, "lakehouse_name": "deploy_demo"}, overwrite=True)
 ws.schedule("pipeline", daily="06:00")
