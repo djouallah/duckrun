@@ -60,7 +60,7 @@
         ],
         "measures": [
           {
-            "name": "Revenue",
+            "name": "Total Revenue",
             "expression": "SUM(mart_revenue[revenue])",
             "formatString": "$#,##0.00"
           },
