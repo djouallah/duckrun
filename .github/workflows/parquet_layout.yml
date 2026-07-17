@@ -243,8 +243,8 @@ jobs:
 
       - name: 📦 Install deps (duckrun from THIS tree — tests the current WriterProperties)
         run: |
-          pip install pythonnet pyyaml obstore
-          pip install -e .
+          pip install pythonnet pyyaml
+          pip install -e .  # brings obstore (core dep) for the XMLA compare's OneLake reads
 
       - name: 🧾 Init run report
         env:
