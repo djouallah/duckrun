@@ -277,6 +277,67 @@ def test_deploy_lakehouse_arg_ignored_for_notebook(_patch, tmp_path):
     assert not any(u.endswith("/lakehouses") for _, u, _ in fake.calls)
 
 
+# --- run -----------------------------------------------------------------------------------------
+
+class RunFabric:
+    """Scripts item lookup + an on-demand job run to a terminal state; records the job POST params."""
+
+    def __init__(self, *, notebooks=None, pipelines=None, status="Completed"):
+        self.notebooks = notebooks or []
+        self.pipelines = pipelines or []
+        self.status = status
+        self.calls = []                     # (method, url, params)
+
+    def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
+        self.calls.append((method, url, params))
+        if method == "GET" and url.endswith("/workspaces"):
+            return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/notebooks"):
+            return FakeResp(200, {"value": self.notebooks})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/dataPipelines"):
+            return FakeResp(200, {"value": self.pipelines})
+        if method == "POST" and "/jobs/instances" in url:
+            return FakeResp(202, headers={"Location": "u/inst"})
+        if method == "GET" and url == "u/inst":
+            return FakeResp(200, {"id": "inst", "status": self.status})
+        raise AssertionError(f"unexpected call {method} {url}")
+
+    def job(self):
+        return next((u, p) for m, u, p in self.calls if m == "POST" and "/jobs/instances" in u)
+
+
+def test_run_notebook_by_filename(_patch):
+    fake = _patch(RunFabric(notebooks=[{"displayName": "etl", "id": "nb-1"}]))
+    assert _ws().run("etl.ipynb") == "Completed"
+    url, params = fake.job()
+    assert "/items/nb-1/jobs/instances" in url and params == {"jobType": "RunNotebook"}
+
+
+def test_run_pipeline_by_filename(_patch):
+    fake = _patch(RunFabric(pipelines=[{"displayName": "load", "id": "pl-1"}]))
+    assert _ws().run("load.json") == "Completed"
+    url, params = fake.job()
+    assert "/items/pl-1/jobs/instances" in url and params == {"jobType": "Pipeline"}
+
+
+def test_run_bare_name_searches_both(_patch):
+    fake = _patch(RunFabric(pipelines=[{"displayName": "etl", "id": "pl-9"}]))
+    assert _ws().run("etl") == "Completed"          # no extension → looks in notebooks then pipelines
+    assert fake.job()[1] == {"jobType": "Pipeline"}
+
+
+def test_run_not_found_raises(_patch):
+    _patch(RunFabric())
+    with pytest.raises(fr.RemoteRunError, match="to run"):
+        _ws().run("nope")
+
+
+def test_run_failed_status_raises(_patch):
+    _patch(RunFabric(notebooks=[{"displayName": "etl", "id": "nb-1"}], status="Failed"))
+    with pytest.raises(fr.RemoteRunError):
+        _ws().run("etl.ipynb")
+
+
 def test_deploy_pipeline_from_path(_patch, tmp_path):
     fake = _patch(DeployFabric(kind="dataPipelines"))
     src = _write(tmp_path, "pipeline.json", json.dumps({"properties": {"activities": []}}))

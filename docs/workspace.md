@@ -17,6 +17,7 @@ lh_id = ws.create_lakehouse("bronze")           # returns the lakehouse item id
 nb_id = ws.deploy("etl.ipynb")                  # deploy a notebook
 sm_id = ws.deploy("model.bim", lakehouse="bronze")  # Direct Lake model, pointed at a lakehouse
 pl_id = ws.deploy("pipeline.json")              # deploy a data pipeline
+ws.run("etl.ipynb")                             # run a deployed notebook/pipeline on Fabric, wait
 ws.list_lakehouses()                            # [{"displayName": ..., "id": ...}, ...]
 ```
 
@@ -52,6 +53,13 @@ them). A wrong name raises with the available names. `lakehouse=` is ignored for
 `deploy` does create + refresh; it does **not** set up a data-source *connection binding*. A freshly
 deployed Direct Lake model whose connection isn't already resolvable will fail the refresh — that
 Power BI error is surfaced, not swallowed. Binding is a separate step (needs a connection id).
+
+**`run(name)`** executes a deployed notebook or data pipeline on Fabric compute and waits for it,
+returning the terminal job status (raising on failure). `name` is the item's display name with or
+without the source extension — `run("etl.ipynb")` / `run("etl")` run the notebook,
+`run("pipeline.json")` the pipeline; a bare name is looked up as a notebook then a pipeline. It's
+inherently remote (the job runs on Fabric, not your machine). Parameterizing a run is a **pipeline's**
+job — a pipeline passes parameters to the notebooks it orchestrates — so `run` itself takes none.
 
 Authentication reuses the same Fabric control-plane token as [remote execution](remote.md): inside a
 Fabric notebook it's automatic (`notebookutils`), and locally it comes from `FABRIC_TOKEN`, GitHub

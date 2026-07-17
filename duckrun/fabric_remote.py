@@ -555,13 +555,15 @@ def _await_lro_item_id(token: str, resp) -> str:
     raise RemoteRunError("timed out creating item")
 
 
-def _run_job_and_wait(token: str, ws_id: str, item_id: str) -> str:
-    """Start the on-demand notebook job and poll the instance to a terminal state. Returns the
-    terminal status; raises ``RemoteRunError`` on a non-Completed terminal state or timeout. Compute
-    size (vCores) is carried by the notebook's ``%%configure`` cell, which API runs honor."""
+def _run_job_and_wait(token: str, ws_id: str, item_id: str, job_type: str = "RunNotebook") -> str:
+    """Start an on-demand job for the item and poll the instance to a terminal state. Returns the
+    terminal status; raises ``RemoteRunError`` on a non-Completed terminal state or timeout.
+    ``job_type`` is the Fabric job kind — ``"RunNotebook"`` for a notebook, ``"Pipeline"`` for a data
+    pipeline. Compute size (vCores) is carried by the notebook's ``%%configure`` cell, which API runs
+    honor."""
     resp = _http_request(
         "POST", f"{_FABRIC_API}/workspaces/{ws_id}/items/{item_id}/jobs/instances",
-        token=token, params={"jobType": "RunNotebook"},
+        token=token, params={"jobType": job_type},
     )
     if resp.status_code not in (200, 201, 202):
         resp.raise_for_status()

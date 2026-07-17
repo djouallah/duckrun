@@ -36,8 +36,14 @@ from .fabric_remote import (
     _create_semantic_model,
     _refresh_semantic_model,
     _create_pipeline,
+    _run_job_and_wait,
     _delete_item,
 )
+
+# Item collections that ``run`` can execute, and the Fabric job type for each.
+_RUNNABLE = {"notebooks": "RunNotebook", "dataPipelines": "Pipeline"}
+# Which collections to look in for a given source extension when running by file name.
+_RUN_EXT = {".ipynb": ["notebooks"], ".json": ["dataPipelines"]}
 
 # Which Fabric item each source extension deploys to: (item-collection endpoint, human label).
 _ARTIFACTS = {
@@ -164,6 +170,27 @@ class Workspace:
         item_id = _create_semantic_model(self._token, self.id, name, content)
         _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
+
+    def run(self, name: str) -> str:
+        """Run a deployed notebook or data pipeline on Fabric compute and wait for it; return the
+        terminal job status. Raises :class:`RemoteRunError` on a failed run or timeout.
+
+        ``name`` is the item's display name, with or without the source extension —
+        ``run("etl.ipynb")`` / ``run("etl")`` run the notebook, ``run("pipeline.json")`` the pipeline.
+        A bare name is looked up as a notebook then a pipeline. Parameterizing a run is a pipeline's
+        job (a pipeline passes parameters to the notebooks it orchestrates), so ``run`` takes none.
+        """
+        stem, ext = os.path.splitext(name)
+        kinds = _RUN_EXT.get(ext.lower(), list(_RUNNABLE))
+        target = stem if ext.lower() in _RUN_EXT else name
+        hits = [(kind, it["id"]) for kind in kinds
+                for it in self._items(kind) if it.get("displayName") == target]
+        if not hits:
+            raise RemoteRunError(f"no notebook or pipeline named {target!r} in workspace to run")
+        if len(hits) > 1:
+            raise RemoteRunError(f"{target!r} matches multiple items; can't tell which to run")
+        kind, item_id = hits[0]
+        return _run_job_and_wait(self._token, self.id, item_id, job_type=_RUNNABLE[kind])
 
     def _repoint_bim(self, content: bytes, lakehouse: Optional[str], source: str) -> bytes:
         """Rewrite a Direct-Lake ``model.bim``'s OneLake workspace/lakehouse GUIDs to this workspace
