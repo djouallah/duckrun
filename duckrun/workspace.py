@@ -296,13 +296,7 @@ class Workspace:
             return content
         source_ws, source_lh = m.group(1), m.group(2)
         target_lh = self._resolve_lakehouse_id(lakehouse, source_lh)
-        # Rebuild the whole ``<host>/<workspace>/<lakehouse>`` path per match rather than two
-        # independent ``str.replace``s: a placeholder .bim may use the SAME GUID for both (as the
-        # test model does), and sequential replaces would then collapse them — the first turns both
-        # into the workspace id and the second finds nothing, leaving a broken Direct Lake binding.
-        repointed = _ONELAKE_REF.sub(
-            lambda _m: f"onelake.dfs.fabric.microsoft.com/{self.id}/{target_lh}", text)
-        return repointed.encode("utf-8")
+        return text.replace(source_ws, self.id).replace(source_lh, target_lh).encode("utf-8")
 
     def _resolve_lakehouse_id(self, lakehouse: Optional[str], source_lh: str) -> str:
         """The target lakehouse id for a Direct Lake repoint. Named → looked up (or raise, listing the

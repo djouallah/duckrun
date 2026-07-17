@@ -13,10 +13,10 @@
       {
         "name": "DirectLake",
         "kind": "m",
-        "description": "Direct Lake connection to OneLake — reads Delta tables directly, no SQL endpoint. The workspace/lakehouse GUIDs below are placeholders; duckrun rewrites them at deploy time.",
+        "description": "Direct Lake connection to OneLake — reads Delta tables directly, no SQL endpoint. The first GUID is the workspace, the second the lakehouse — distinct placeholders (as in a real export); duckrun rewrites them at deploy time.",
         "expression": [
           "let",
-          "    Source = AzureStorage.DataLake(\"https://onelake.dfs.fabric.microsoft.com/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000\", [HierarchicalNavigation=true])",
+          "    Source = AzureStorage.DataLake(\"https://onelake.dfs.fabric.microsoft.com/00000000-0000-0000-0000-000000000000/11111111-1111-1111-1111-111111111111\", [HierarchicalNavigation=true])",
           "in",
           "    Source"
         ]
