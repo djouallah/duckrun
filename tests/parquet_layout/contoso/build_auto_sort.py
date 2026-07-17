@@ -25,7 +25,7 @@ force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
 N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
 # Read the raw sales.parquet from Files (abfss) with the same row cap Spark applies.
-_ABFSS_URL, _STORE_ROOT = build_base.sales_files_urls()
+_ABFSS_URL, _ = build_base.sales_files_urls()
 _base = f"read_parquet('{_ABFSS_URL}')"
 _src = _base if N is None else f"(select * from {_base} limit {N})"
 

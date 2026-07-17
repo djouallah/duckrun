@@ -22,8 +22,7 @@ TABLES = ["tests.sales_auto_sort",
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"])
 
 missing = []
-_abfss_url, _store_root = build_base.sales_files_urls()
-if build_base._files_exists(_store_root, os.environ.get("ONELAKE_TOKEN")):
+if build_base._files_exists(con):
     print(f"  exists : {build_base.SALES_FILES_REL} (raw base)", flush=True)
 else:
     missing.append(build_base.SALES_FILES_REL)

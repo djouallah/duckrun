@@ -6,7 +6,8 @@ MIT). We download the self-contained ``DatabaseGenerator`` binary for this platf
 vendored ``config.json`` (``SalesOrders: BOTH`` → the full schema, ``OutputFormat: PARQUET``).
 
 The raw base lands entirely as parquet in the lakehouse **Files** section — the whole generator
-output (all 8 tables), byte-verbatim, uploaded via obstore. Files is then the single source:
+output (all 8 tables), byte-verbatim, uploaded with duckrun's own ``conn.copy`` (which streams each
+file via obstore, multipart for the multi-GB fact). Files is then the single source:
 
   - The SALES fact — the table under test — is read from Files by BOTH layout builds. It is never
     written by duckrun, because writing it as a duckrun Delta would hand Spark's V-Order build a
@@ -44,12 +45,17 @@ import report  # noqa: E402
 
 # All raw generator parquet lands under this folder in the lakehouse Files section.
 FILES_DIR = "Files/contoso_base"
+# The same folder, but relative to the Files section — what conn.copy/list_files take (they resolve
+# the …/Tables root to its sibling …/Files themselves), vs FILES_DIR which is lakehouse-root-relative
+# for the read URLs the Spark / read_parquet consumers build.
+FILES_FOLDER = "contoso_base"
 # The sales.parquet object path — build_spark_variant.py and build_auto_sort.py read exactly this.
 SALES_FILES_REL = f"{FILES_DIR}/sales.parquet"
 
 
 def files_object(pq):
-    """obstore object path for generator table ``pq`` in the Files section."""
+    """Lakehouse-root-relative object path for generator table ``pq`` in the Files section — used to
+    build the ``read_parquet`` / Spark read URL (``store_root + files_object(pq)``)."""
     return f"{FILES_DIR}/{pq}.parquet"
 
 try:
@@ -121,7 +127,7 @@ def sales_files_urls(tables_path=None):
     """``(abfss_read_url, store_root)`` for the raw sales.parquet in the lakehouse Files section,
     derived from ONELAKE_TABLES_PATH (``abfss://{ws}@{host}/{lh}/Tables``). ``(None, None)`` for a
     local path (offline dry-run). ``abfss_read_url`` is what Spark / duckrun ``read_parquet`` consume;
-    ``store_root`` is the obstore ``AzureStore`` root (its object path is then ``SALES_FILES_REL``).
+    ``store_root`` is the lakehouse root the read URLs are built from (``store_root + SALES_FILES_REL``).
     Single source of truth — build_spark_variant / build_auto_sort / check_tables all import this."""
     path = (tables_path or os.environ["ONELAKE_TABLES_PATH"]).rstrip("/")
     m = re.match(r"abfss://([^@]+)@([^/]+)/([^/]+)/Tables$", path)
@@ -132,45 +138,19 @@ def sales_files_urls(tables_path=None):
     return (root + SALES_FILES_REL, root)
 
 
-def _files_store(store_root, token):
-    from obstore.store import AzureStore
-    return AzureStore.from_url(store_root, bearer_token=token)
-
-
-def _files_exists(store_root, token=None):
-    """True if the raw sales.parquet is already in Files (obstore HEAD)."""
-    if not store_root:
-        return False
-    if not token:  # no token passed — self-acquire the OneLake token from the OIDC identity
-        from duckrun import auth
-        token = auth.get_onelake_token()
-    import obstore
+def _files_exists(con):
+    """True if the raw sales.parquet is already in the Files section — via duckrun's own
+    ``conn.list_files`` (dogfooding the storage-neutral file API, no direct obstore)."""
     try:
-        obstore.head(_files_store(store_root, token), SALES_FILES_REL)
-        return True
+        return "sales.parquet" in con.list_files(FILES_FOLDER, file_extensions=[".parquet"])
     except Exception:
         return False
-
-
-def _upload_to_files(local_path, store_root, token, object_path):
-    """Upload a (possibly multi-GB) parquet byte-verbatim to OneLake Files via obstore, which streams
-    it as a multipart upload. duckrun's ``conn.copy`` reads a whole file into one BLOB, which a ~5GB
-    sales.parquet would OOM — obstore chunks it and preserves the generator's exact bytes."""
-    import obstore
-    gb = os.path.getsize(local_path) / 1e9
-    print(f"  obstore put → {object_path} ({gb:.2f} GB, multipart)...", flush=True)
-    with open(local_path, "rb") as f:
-        obstore.put(_files_store(store_root, token), object_path, f)
 
 
 def main():
     force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
     orders = os.environ.get("CONTOSO_ORDERS", "").strip()
     _, store_root = sales_files_urls()       # store_root None on a local path (offline dry-run)
-    token = os.environ.get("ONELAKE_TOKEN")
-    if store_root and not token:  # abfss upload target — self-acquire the OneLake token from OIDC
-        from duckrun import auth
-        token = auth.get_onelake_token()
     con = _connect()
     con.sql("create schema if not exists contoso")
 
@@ -178,7 +158,7 @@ def main():
     dim_tables = [(pq, tbl) for pq, tbl in TABLES if tbl != "sales"]
 
     def _sales_present():
-        return _files_exists(store_root, token) if store_root else _exists(con, "sales")
+        return _files_exists(con) if store_root else _exists(con, "sales")
 
     # Fast path: reuse an existing base instead of regenerating (existence-only — the generator is the
     # slow step). But guard against a SILENT scale mismatch: if the base on disk was built at a
@@ -227,10 +207,10 @@ def main():
 
     if store_root:
         # 1) Upload EVERY generator parquet byte-verbatim to Files — the raw base, single source.
-        print("uploading all raw generator parquet to Files (obstore) ...", flush=True)
-        for pq, _tbl in TABLES:
-            src = os.path.join(out, f"{pq}.parquet").replace("\\", "/")
-            _upload_to_files(src, store_root, token, files_object(pq))
+        #    conn.copy dogfoods duckrun's own file API: it streams each file (multipart for the
+        #    multi-GB sales.parquet), so the whole OUT folder lands in one call.
+        print("uploading all raw generator parquet to Files (conn.copy) ...", flush=True)
+        con.copy(out, FILES_FOLDER, file_extensions=[".parquet"], overwrite=True)
         # 2) Materialise the dims + Orders + OrderRows as contoso.* Delta by reading them BACK from
         #    Files (the model joins to them). Sales is left as parquet-only — both layout builds read
         #    it straight from Files, so duckrun never shapes the fact under test.

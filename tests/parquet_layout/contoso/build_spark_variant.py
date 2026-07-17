@@ -28,7 +28,7 @@ BASE = (f"https://api.fabric.microsoft.com/v1/workspaces/{os.environ['WS_ID']}"
         f"/lakehouses/{os.environ['LH_ID']}/livyapi/versions/2023-12-01")
 FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 
-_ABFSS_URL, _STORE_ROOT = build_base.sales_files_urls()
+_ABFSS_URL, _ = build_base.sales_files_urls()
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
 N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
 # Spark reads the raw parquet from Files; .limit(N) applies the optional row cap.
@@ -123,7 +123,8 @@ def _run_statement(sid, code):
 
 
 def main():
-    src_ok = build_base._files_exists(_STORE_ROOT, os.environ.get("ONELAKE_TOKEN"))
+    import duckrun
+    src_ok = build_base._files_exists(duckrun.connect(os.environ["ONELAKE_TABLES_PATH"]))
     todo = {}
     for v, reader in VARIANTS.items():
         out = f"tests.sales_{v}"
