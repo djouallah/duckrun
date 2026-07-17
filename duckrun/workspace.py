@@ -29,11 +29,24 @@ from .fabric_remote import (
     _create_notebook,
     _create_semantic_model,
     _refresh_semantic_model,
+    _create_pipeline,
     _delete_item,
 )
 
 # Which Fabric item each source extension deploys to: (item-collection endpoint, human label).
-_ARTIFACTS = {".ipynb": ("notebooks", "notebook"), ".bim": ("semanticModels", "semantic model")}
+_ARTIFACTS = {
+    ".ipynb": ("notebooks", "notebook"),
+    ".bim": ("semanticModels", "semantic model"),
+    ".json": ("dataPipelines", "data pipeline"),
+}
+
+
+def _is_pipeline_json(obj) -> bool:
+    """Whether ``obj`` (parsed JSON) is a Fabric data-pipeline definition: a ``pipeline-content.json``
+    is ``{"properties": {"activities": [...]}}``. Guards against deploying a non-pipeline ``.json``
+    (a variables/config file, a ``.bim`` exported as ``.json``) as a broken pipeline."""
+    return isinstance(obj, dict) and isinstance(obj.get("properties"), dict) \
+        and "activities" in obj["properties"]
 
 
 def _basename(source: str) -> str:
@@ -101,21 +114,26 @@ class Workspace:
         """Deploy a file artifact to the workspace; return its item id.
 
         ``source`` is a local file path or an ``http(s)`` URL (a raw file URL). The item type is keyed
-        off the extension — ``.ipynb`` → notebook, ``.bim`` → semantic model — and the name defaults to
-        the filename stem (overridable via ``name``). A semantic model is also **refreshed** after
-        deploy (a *reframe* onto the latest Delta data for Direct Lake), so ``deploy`` returns only
-        once it is live.
+        off the extension — ``.ipynb`` → notebook, ``.bim`` → semantic model, ``.json`` → data pipeline
+        — and the name defaults to the filename stem (overridable via ``name``). A ``.json`` is
+        deployed verbatim; a semantic model is also **refreshed** after deploy (a *reframe* onto the
+        latest Delta data for Direct Lake), so ``deploy`` returns only once it is live.
 
         Not idempotent: if an item of that name already exists it is replaced only when
         ``overwrite=True``, otherwise this raises.
         """
         stem, ext = os.path.splitext(_basename(source))
-        if ext.lower() not in _ARTIFACTS:
+        ext = ext.lower()
+        if ext not in _ARTIFACTS:
             raise RemoteRunError(
                 f"unsupported file type {ext!r}: deploy handles {', '.join(sorted(_ARTIFACTS))}")
-        endpoint, label = _ARTIFACTS[ext.lower()]
+        endpoint, label = _ARTIFACTS[ext]
         name = name or stem
         content = _read_source(source)
+        if ext == ".json" and not _is_pipeline_json(json.loads(content)):
+            raise RemoteRunError(
+                f"{source!r} is not a Fabric data-pipeline definition "
+                "(expected top-level {'properties': {'activities': ...}})")
 
         existing = next((it for it in self._items(endpoint) if it.get("displayName") == name), None)
         if existing:
@@ -123,8 +141,10 @@ class Workspace:
                 raise RemoteRunError(f"{label} {name!r} already exists; pass overwrite=True to replace")
             _delete_item(self._token, self.id, existing["id"])
 
-        if ext.lower() == ".ipynb":
+        if ext == ".ipynb":
             return _create_notebook(self._token, self.id, name, json.loads(content))
+        if ext == ".json":
+            return _create_pipeline(self._token, self.id, name, content)
         # .bim → create the semantic model, then refresh/reframe it so it is live.
         item_id = _create_semantic_model(self._token, self.id, name, content)
         _refresh_semantic_model(get_powerbi_token(), self.id, item_id)

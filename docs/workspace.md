@@ -16,6 +16,7 @@ ws = duckrun.workspace("My Workspace")          # workspace name or GUID
 lh_id = ws.create_lakehouse("bronze")           # returns the lakehouse item id
 nb_id = ws.deploy("etl.ipynb")                  # deploy a notebook
 sm_id = ws.deploy("model.bim")                  # deploy + refresh a semantic model
+pl_id = ws.deploy("pipeline.json")              # deploy a data pipeline
 ws.list_lakehouses()                            # [{"displayName": ..., "id": ...}, ...]
 ```
 
@@ -26,10 +27,12 @@ lakehouse. It raises on a real API failure rather than returning a sentinel.
 
 **`deploy(source, name=None, overwrite=False)`** pushes a file artifact to the workspace. `source` is
 a local file path or an `http(s)` URL (e.g. a GitHub raw URL). The item type comes from the
-extension — `.ipynb` → notebook, `.bim` → semantic model — and the name defaults to the filename
-stem (override with `name=`). A `.bim` is also **refreshed** after deploy (a *reframe* onto the
-latest Delta data for Direct Lake), so `deploy` returns only once the model is live. It is **not**
-idempotent: if an item of that name already exists it is replaced only when `overwrite=True`,
+extension — `.ipynb` → notebook, `.bim` → semantic model, `.json` → data pipeline — and the name
+defaults to the filename stem (override with `name=`). A `.bim` is also **refreshed** after deploy (a
+*reframe* onto the latest Delta data for Direct Lake), so `deploy` returns only once the model is
+live. A `.json` is deployed **verbatim** as a data pipeline — its contents are validated as a Fabric
+pipeline definition (`properties.activities`) but no notebook/workspace ids are rewritten. It is
+**not** idempotent: if an item of that name already exists it is replaced only when `overwrite=True`,
 otherwise the call raises rather than hide a stale deploy.
 
 `deploy` does create + refresh; it does **not** set up a data-source *connection binding*. A freshly

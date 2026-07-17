@@ -211,6 +211,23 @@ def test_deploy_bim_failed_refresh_raises(_patch, monkeypatch, tmp_path):
         _ws().deploy(src)
 
 
+def test_deploy_pipeline_from_path(_patch, tmp_path):
+    fake = _patch(DeployFabric(kind="dataPipelines"))
+    src = _write(tmp_path, "pipeline.json", json.dumps({"properties": {"activities": []}}))
+    assert _ws().deploy(src) == "item-new"
+    body = fake.post_body("/workspaces/ws-guid/dataPipelines")
+    assert body["displayName"] == "pipeline"
+    assert {p["path"] for p in body["definition"]["parts"]} == {"pipeline-content.json", ".platform"}
+
+
+def test_deploy_non_pipeline_json_raises(_patch, tmp_path):
+    fake = _patch(DeployFabric(kind="dataPipelines"))
+    src = _write(tmp_path, "variables.json", json.dumps({"variables": []}))
+    with pytest.raises(fr.RemoteRunError, match="not a Fabric data-pipeline"):
+        _ws().deploy(src)
+    assert not any(m == "POST" for m, _, _ in fake.calls)   # rejected before any create
+
+
 def test_deploy_exists_without_overwrite_raises(_patch, tmp_path):
     _patch(DeployFabric(kind="notebooks", existing=[{"displayName": "etl", "id": "old"}]))
     src = _write(tmp_path, "etl.ipynb", "{}")

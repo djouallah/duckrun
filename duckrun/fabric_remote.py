@@ -498,6 +498,16 @@ def _create_semantic_model(token: str, ws_id: str, name: str, model_bim: bytes) 
     return _create_item(token, ws_id, "semanticModels", name, parts)
 
 
+def _create_pipeline(token: str, ws_id: str, name: str, pipeline_json: bytes) -> str:
+    """Create a data pipeline from a ``pipeline-content.json`` (raw file bytes); return its item id.
+    The JSON is shipped verbatim — no id/reference rewriting."""
+    parts = [
+        _b64_part("pipeline-content.json", pipeline_json),
+        _b64_part(".platform", _platform_part(name, "DataPipeline")),
+    ]
+    return _create_item(token, ws_id, "dataPipelines", name, parts)
+
+
 def _refresh_semantic_model(pbi_token: str, ws_id: str, item_id: str) -> None:
     """Trigger an enhanced refresh (a *reframe* for Direct Lake) and poll it to completion. Raises
     ``RemoteRunError`` on a failed/cancelled refresh or timeout. Uses the Power BI REST API, so it
