@@ -244,6 +244,33 @@ def _normalize_command(args: List[str], proj_var: str) -> List[str]:
     return out
 
 
+def _python_code_cell(src: str) -> dict:
+    """A code cell carrying the Python language marker (matches a real Fabric Python notebook)."""
+    return {"cell_type": "code", "source": src.splitlines(keepends=True),
+            "metadata": {"microsoft": {"language": "python", "language_group": "jupyter_python"}},
+            "execution_count": None, "outputs": []}
+
+
+def _python_notebook(cells: List[dict]) -> dict:
+    """An nbformat-4 PURE-PYTHON Fabric notebook wrapping ``cells``. The metadata here is EXACTLY
+    what a real Fabric pure-Python notebook carries (copied from a known-good one) and is load-
+    bearing: kernel_info.name == "jupyter" (PySpark uses "synapse_pyspark") plus kernelspec.name ==
+    "jupyter" and microsoft.language_group == "jupyter_python". Getting any of these wrong makes
+    Fabric create a Spark notebook, where restartPython() crashes the job (-9)."""
+    return {
+        "nbformat": 4,
+        "nbformat_minor": 5,
+        "cells": cells,
+        "metadata": {
+            "kernelspec": {"name": "jupyter", "language": "Jupyter", "display_name": "Jupyter"},
+            "language_info": {"name": "python"},
+            "microsoft": {"language": "python", "language_group": "jupyter_python"},
+            "kernel_info": {"name": "jupyter", "jupyter_kernel_name": "python3.12"},
+            "dependencies": {"lakehouse": {}},
+        },
+    }
+
+
 def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
                    result_path: str, install_target: str, env: Optional[Dict[str, str]],
                    cores: Optional[int]) -> dict:
@@ -343,33 +370,12 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         "notebookutils.notebook.exit(json.dumps({'runid': RUNID, 'results': results}))\n"
     )
 
-    # Every cell also carries the Python language marker (matches a real Fabric Python notebook).
-    _cell_md = {"microsoft": {"language": "python", "language_group": "jupyter_python"}}
+    cells = [_python_code_cell(configure)] if configure else []
+    cells += [_python_code_cell(setup), _python_code_cell(work)]
 
-    def _cell(src):
-        return {"cell_type": "code", "source": src.splitlines(keepends=True),
-                "metadata": dict(_cell_md), "execution_count": None, "outputs": []}
-
-    cells = [_cell(configure)] if configure else []
-    cells += [_cell(setup), _cell(work)]
-
-    return {
-        "nbformat": 4,
-        "nbformat_minor": 5,
-        "cells": cells,
-        # EXACTLY the metadata a real Fabric PURE-PYTHON notebook carries (copied from a known-good
-        # one). The determinant is kernel_info.name == "jupyter" (PySpark uses "synapse_pyspark") plus
-        # kernelspec.name == "jupyter" and microsoft.language_group == "jupyter_python". Getting any of
-        # these wrong makes Fabric create a Spark notebook, where restartPython() crashes the job (-9).
-        "metadata": {
-            "kernelspec": {"name": "jupyter", "language": "Jupyter", "display_name": "Jupyter"},
-            "language_info": {"name": "python"},
-            "microsoft": {"language": "python", "language_group": "jupyter_python"},
-            "kernel_info": {"name": "jupyter", "jupyter_kernel_name": "python3.12"},
-            "dependencies": {"lakehouse": {}},
-            "duckrun": {"cores": cores, "runid": runid},
-        },
-    }
+    nb = _python_notebook(cells)
+    nb["metadata"]["duckrun"] = {"cores": cores, "runid": runid}
+    return nb
 
 
 # --------------------------------------------------------------------------------------------------

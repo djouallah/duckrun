@@ -13,7 +13,8 @@ rather than on the :class:`~duckrun.session.DuckSession` that ``connect()`` retu
 The Fabric REST plumbing (auth, retry, workspace resolution, LRO polling) is reused as-is from
 :mod:`duckrun.fabric_remote`.
 """
-from typing import Dict, List, Optional
+import json
+from typing import Dict, List, Optional, Union
 
 from .auth import get_fabric_token
 from .fabric_remote import (
@@ -22,7 +23,22 @@ from .fabric_remote import (
     _http_request,
     _resolve_workspace_id,
     _await_lro_item_id,
+    _create_notebook,
+    _delete_item,
+    _python_notebook,
+    _python_code_cell,
 )
+
+
+def _load_notebook(source: Union[str, dict, None]) -> dict:
+    """Resolve ``source`` to a notebook (nbformat) dict: an already-parsed ``dict``, a path to a
+    local ``.ipynb`` file, or ``None`` for a minimal empty Python notebook."""
+    if source is None:
+        return _python_notebook([_python_code_cell("")])
+    if isinstance(source, dict):
+        return source
+    with open(source, encoding="utf-8") as f:
+        return json.load(f)
 
 
 class Workspace:
@@ -37,11 +53,15 @@ class Workspace:
         self._token = token or get_fabric_token()
         self.id = _resolve_workspace_id(self._token, workspace)
 
-    def list_lakehouses(self) -> List[Dict]:
-        """Every lakehouse in the workspace as ``[{"displayName": ..., "id": ...}, ...]``."""
-        resp = _http_request("GET", f"{_FABRIC_API}/workspaces/{self.id}/lakehouses", token=self._token)
+    def _items(self, kind: str) -> List[Dict]:
+        """Every item of ``kind`` (``"lakehouses"`` / ``"notebooks"``) in the workspace."""
+        resp = _http_request("GET", f"{_FABRIC_API}/workspaces/{self.id}/{kind}", token=self._token)
         resp.raise_for_status()
         return resp.json().get("value", [])
+
+    def list_lakehouses(self) -> List[Dict]:
+        """Every lakehouse in the workspace as ``[{"displayName": ..., "id": ...}, ...]``."""
+        return self._items("lakehouses")
 
     def create_lakehouse(self, name: str, schemas: bool = True) -> str:
         """Ensure a lakehouse named ``name`` exists; return its item id.
@@ -49,7 +69,7 @@ class Workspace:
         Idempotent: if one already exists it is returned unchanged (no create). ``schemas=True``
         makes it schema-enabled. Raises :class:`RemoteRunError` on a real API failure.
         """
-        for lh in self.list_lakehouses():
+        for lh in self._items("lakehouses"):
             if lh.get("displayName") == name:
                 return lh["id"]
         body: Dict = {"displayName": name}
@@ -64,6 +84,24 @@ class Workspace:
             return _await_lro_item_id(self._token, resp)
         resp.raise_for_status()
         raise RemoteRunError(f"unexpected status {resp.status_code} creating lakehouse: {resp.text[:200]}")
+
+    def create_notebook(self, name: str, source: Union[str, dict, None] = None,
+                        overwrite: bool = False) -> str:
+        """Create a notebook named ``name``; return its item id.
+
+        ``source`` is the notebook content: a path to a local ``.ipynb``, an already-parsed nbformat
+        ``dict``, or ``None`` for a minimal empty Python notebook. Unlike ``create_lakehouse`` this is
+        NOT idempotent: if a notebook of that name already exists it is replaced only when
+        ``overwrite=True``, otherwise this raises (a notebook has content, so silently keeping the old
+        one would hide a stale deploy).
+        """
+        notebook = _load_notebook(source)
+        existing = next((nb for nb in self._items("notebooks") if nb.get("displayName") == name), None)
+        if existing:
+            if not overwrite:
+                raise RemoteRunError(f"notebook {name!r} already exists; pass overwrite=True to replace")
+            _delete_item(self._token, self.id, existing["id"])
+        return _create_notebook(self._token, self.id, name, notebook)
 
 
 def workspace(workspace: str, token: Optional[str] = None) -> Workspace:

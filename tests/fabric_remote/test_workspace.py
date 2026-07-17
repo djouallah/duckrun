@@ -1,10 +1,12 @@
-"""Mocked-REST tests for the ``duckrun.workspace(...)`` handle and ``create_lakehouse``.
+"""Mocked-REST tests for the ``duckrun.workspace(...)`` handle: ``create_lakehouse`` and
+``create_notebook``.
 
 No network: every control-plane call funnels through ``_http_request``, stubbed here. The handle
 imports that helper into its own module, and the workspace-resolver / LRO poller call it from
-``fabric_remote``'s globals — so both modules are patched to the same fake. These pin: idempotency
-(existing name → no POST), the create body (``enableSchemas`` on/off), the 201 and 202-LRO paths,
-and that a GUID workspace skips the name lookup.
+``fabric_remote``'s globals — so both modules are patched to the same fake. These pin: lakehouse
+idempotency (existing name → no POST), the create body (``enableSchemas`` on/off), the 201 and
+202-LRO paths, a GUID workspace skipping the name lookup, and notebook overwrite semantics
+(exists + ``overwrite=False`` → raise; ``overwrite=True`` → delete-then-create).
 """
 import pytest
 
@@ -119,3 +121,62 @@ def test_guid_workspace_skips_name_lookup(_patch):
     fake = _patch(GuidFabric())
     workspace(guid, token="FAB-TOKEN").create_lakehouse("bronze")
     assert not any(u.endswith("/workspaces") for _, u, _ in fake.calls)  # no GET /workspaces
+
+
+# --- create_notebook -----------------------------------------------------------------------------
+
+class NotebookFabric:
+    """Scripts the notebook create/list/delete sequence and records the create payload."""
+
+    def __init__(self, *, existing=None):
+        self.existing = existing or []
+        self.calls = []                 # (method, url, json_body)
+
+    def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
+        self.calls.append((method, url, json_body))
+        if method == "GET" and url.endswith("/workspaces"):
+            return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/notebooks"):
+            return FakeResp(200, {"value": self.existing})
+        if method == "POST" and url.endswith("/workspaces/ws-guid/notebooks"):
+            return FakeResp(201, {"id": "nb-new"})
+        if method == "DELETE" and "/items/" in url:
+            return FakeResp(200)
+        raise AssertionError(f"unexpected call {method} {url}")
+
+
+def _created_definition(fake):
+    """The nbformat dict from the single notebook-create POST (base64-decoded from its definition)."""
+    import base64, json as _json
+    post = next(c for c in fake.calls if c[0] == "POST" and c[1].endswith("/notebooks"))
+    parts = {p["path"]: p for p in post[2]["definition"]["parts"]}
+    return _json.loads(base64.b64decode(parts["notebook-content.ipynb"]["payload"]))
+
+
+def test_create_notebook_default_is_empty_python_notebook(_patch):
+    fake = _patch(NotebookFabric(existing=[]))
+    nb_id = _ws().create_notebook("test")
+    assert nb_id == "nb-new"
+    nb = _created_definition(fake)
+    # the load-bearing Python-vs-PySpark metadata contract, carried through from _python_notebook
+    assert nb["metadata"]["kernel_info"]["name"] == "jupyter"
+    assert nb["metadata"]["microsoft"]["language_group"] == "jupyter_python"
+
+
+def test_create_notebook_exists_without_overwrite_raises(_patch):
+    _patch(NotebookFabric(existing=[{"displayName": "test", "id": "nb-old"}]))
+    with pytest.raises(fr.RemoteRunError, match="already exists"):
+        _ws().create_notebook("test")
+
+
+def test_create_notebook_overwrite_deletes_then_creates(_patch):
+    fake = _patch(NotebookFabric(existing=[{"displayName": "test", "id": "nb-old"}]))
+    assert _ws().create_notebook("test", overwrite=True) == "nb-new"
+    seq = [(m, u.rsplit("/", 1)[-1]) for m, u, _ in fake.calls if m in ("DELETE", "POST")]
+    assert seq == [("DELETE", "nb-old"), ("POST", "notebooks")]   # delete before create
+
+
+def test_create_notebook_from_dict_source(_patch):
+    fake = _patch(NotebookFabric(existing=[]))
+    _ws().create_notebook("test", source={"nbformat": 4, "cells": [], "metadata": {"mine": True}})
+    assert _created_definition(fake)["metadata"] == {"mine": True}
