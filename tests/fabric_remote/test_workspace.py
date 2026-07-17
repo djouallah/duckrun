@@ -328,7 +328,7 @@ def test_run_bare_name_searches_both(_patch):
 
 def test_run_not_found_raises(_patch):
     _patch(RunFabric())
-    with pytest.raises(fr.RemoteRunError, match="to run"):
+    with pytest.raises(fr.RemoteRunError, match="no notebook or pipeline"):
         _ws().run("nope")
 
 
@@ -336,6 +336,86 @@ def test_run_failed_status_raises(_patch):
     _patch(RunFabric(notebooks=[{"displayName": "etl", "id": "nb-1"}], status="Failed"))
     with pytest.raises(fr.RemoteRunError):
         _ws().run("etl.ipynb")
+
+
+# --- schedule ------------------------------------------------------------------------------------
+
+class ScheduleFabric:
+    """Scripts item lookup + the schedule list/create/update calls; records the schedule body."""
+
+    def __init__(self, *, notebooks=None, pipelines=None, existing_schedules=None):
+        self.notebooks = notebooks or []
+        self.pipelines = pipelines or []
+        self.existing = existing_schedules or []
+        self.calls = []                     # (method, url, json_body)
+
+    def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
+        self.calls.append((method, url, json_body))
+        if method == "GET" and url.endswith("/workspaces"):
+            return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/notebooks"):
+            return FakeResp(200, {"value": self.notebooks})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/dataPipelines"):
+            return FakeResp(200, {"value": self.pipelines})
+        if method == "GET" and url.endswith("/schedules"):
+            return FakeResp(200, {"value": self.existing})
+        if method == "POST" and url.endswith("/schedules"):
+            return FakeResp(201, {"id": "sch-new"})
+        if method == "PATCH" and "/schedules/" in url:
+            return FakeResp(200, {"id": "sch-upd"})
+        raise AssertionError(f"unexpected call {method} {url}")
+
+    def body(self):
+        return next(b for m, u, b in self.calls if m in ("POST", "PATCH") and "/schedules" in u)
+
+
+def test_schedule_defaults_to_daily(_patch):
+    fake = _patch(ScheduleFabric(pipelines=[{"displayName": "load", "id": "pl-1"}]))
+    assert _ws().schedule("load.json") == "sch-new"
+    cfg = fake.body()["configuration"]
+    assert cfg["type"] == "Daily" and cfg["times"] == ["00:00"]
+    assert any("/items/pl-1/jobs/Pipeline/schedules" in u for m, u, _ in fake.calls if m == "POST")
+
+
+def test_schedule_every_interval(_patch):
+    fake = _patch(ScheduleFabric(notebooks=[{"displayName": "etl", "id": "nb-1"}]))
+    _ws().schedule("etl.ipynb", every="30m")
+    cfg = fake.body()["configuration"]
+    assert cfg["type"] == "Cron" and cfg["interval"] == 30
+
+
+def test_schedule_hours_interval(_patch):
+    fake = _patch(ScheduleFabric(notebooks=[{"displayName": "etl", "id": "nb-1"}]))
+    _ws().schedule("etl", every="2h")
+    assert fake.body()["configuration"]["interval"] == 120
+
+
+def test_schedule_daily_times(_patch):
+    fake = _patch(ScheduleFabric(pipelines=[{"displayName": "load", "id": "pl-1"}]))
+    _ws().schedule("load.json", daily=["06:00", "18:00"])
+    cfg = fake.body()["configuration"]
+    assert cfg["type"] == "Daily" and cfg["times"] == ["06:00", "18:00"]
+
+
+def test_schedule_weekly(_patch):
+    fake = _patch(ScheduleFabric(pipelines=[{"displayName": "load", "id": "pl-1"}]))
+    _ws().schedule("load.json", weekly=["Mon", "Fri"], at="06:00")
+    cfg = fake.body()["configuration"]
+    assert cfg["type"] == "Weekly" and cfg["weekdays"] == ["Monday", "Friday"] and cfg["times"] == ["06:00"]
+
+
+def test_schedule_updates_existing_not_duplicates(_patch):
+    fake = _patch(ScheduleFabric(pipelines=[{"displayName": "load", "id": "pl-1"}],
+                                 existing_schedules=[{"id": "sch-old"}]))
+    assert _ws().schedule("load.json") == "sch-upd"
+    assert any(m == "PATCH" and u.endswith("/schedules/sch-old") for m, u, _ in fake.calls)
+    assert not any(m == "POST" and u.endswith("/schedules") for m, u, _ in fake.calls)
+
+
+def test_schedule_conflicting_cadence_raises(_patch):
+    _patch(ScheduleFabric(pipelines=[{"displayName": "load", "id": "pl-1"}]))
+    with pytest.raises(fr.RemoteRunError, match="only one of"):
+        _ws().schedule("load.json", every="1h", daily="06:00")
 
 
 def test_deploy_pipeline_from_path(_patch, tmp_path):

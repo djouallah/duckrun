@@ -605,6 +605,25 @@ def _run_job_and_wait(token: str, ws_id: str, item_id: str, job_type: str = "Run
     raise RemoteRunError(f"remote job did not finish within {_POLL_TIMEOUT}s (last status {status})")
 
 
+def _schedule_item(token: str, ws_id: str, item_id: str, job_type: str, configuration: dict) -> str:
+    """Create (or update) the item's job schedule and return the schedule id. Idempotent: if the item
+    already has a schedule, the first one is updated in place rather than stacking a duplicate — Fabric
+    allows many schedules per item, so a blind create on every deploy would pile them up."""
+    base = f"{_FABRIC_API}/workspaces/{ws_id}/items/{item_id}/jobs/{job_type}/schedules"
+    body = {"enabled": True, "configuration": configuration}
+    listing = _http_request("GET", base, token=token)
+    listing.raise_for_status()
+    existing = listing.json().get("value", [])
+    if existing:
+        resp = _http_request("PATCH", f"{base}/{existing[0]['id']}", token=token, json_body=body)
+    else:
+        resp = _http_request("POST", base, token=token, json_body=body)
+    if resp.status_code not in (200, 201):
+        resp.raise_for_status()
+        raise RemoteRunError(f"unexpected status {resp.status_code} scheduling: {resp.text[:200]}")
+    return resp.json()["id"]
+
+
 def _delete_item(token: str, ws_id: str, item_id: str) -> None:
     """Best-effort teardown of the temp notebook; warns rather than raising so a delete failure
     never masks the run's own result."""

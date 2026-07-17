@@ -19,6 +19,7 @@ sm_id = ws.deploy("model.bim", lakehouse="bronze")  # Direct Lake model, pointed
 pl_id = ws.deploy("pipeline.json")              # deploy a data pipeline
 vl_id = ws.deploy("variables.json", variables={"lakehouse_name": "bronze", "workspace_id": ws.id})
 ws.run("etl.ipynb")                             # run a deployed notebook/pipeline on Fabric, wait
+ws.schedule("pipeline", daily="06:00")          # or every="1h" / weekly=["Mon"], at="06:00"
 ws.list_lakehouses()                            # [{"displayName": ..., "id": ...}, ...]
 ```
 
@@ -64,6 +65,12 @@ without the source extension — `run("etl.ipynb")` / `run("etl")` run the noteb
 `run("pipeline.json")` the pipeline; a bare name is looked up as a notebook then a pipeline. It's
 inherently remote (the job runs on Fabric, not your machine). Parameterizing a run is a **pipeline's**
 job — a pipeline passes parameters to the notebooks it orchestrates — so `run` itself takes none.
+
+**`schedule(name, every=/daily=/weekly=, at=, tz="UTC")`** schedules a deployed notebook or pipeline
+to run on Fabric, returning the schedule id. Fabric's scheduler is interval / daily / weekly, not
+free-form cron, so pass one of: `every="30m"` / `"2h"` (interval), `daily="06:00"` or
+`daily=["06:00","18:00"]`, or `weekly=["Mon","Fri"], at="06:00"`. No cadence → **daily at midnight**.
+It's idempotent — re-scheduling the same item updates its schedule instead of stacking a duplicate.
 
 Authentication reuses the same Fabric control-plane token as [remote execution](remote.md): inside a
 Fabric notebook it's automatic (`notebookutils`), and locally it comes from `FABRIC_TOKEN`, GitHub

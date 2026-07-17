@@ -14,6 +14,7 @@ rather than on the :class:`~duckrun.session.DuckSession` that ``connect()`` retu
 The Fabric REST plumbing (auth, retry, workspace resolution, LRO polling, item create, refresh) is
 reused as-is from :mod:`duckrun.fabric_remote`.
 """
+import datetime
 import json
 import os
 import re
@@ -38,8 +39,42 @@ from .fabric_remote import (
     _create_pipeline,
     _create_variable_library,
     _run_job_and_wait,
+    _schedule_item,
     _delete_item,
 )
+
+_WEEKDAYS = {d[:3].lower(): d for d in
+             ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday")}
+_FAR_FUTURE = "2099-12-31T23:59:00"      # schedule end — effectively "runs forever"
+
+
+def _interval_minutes(every) -> int:
+    """``"30m"`` → 30, ``"2h"`` → 120, ``"1d"`` → 1440, a bare number → minutes."""
+    s = str(every).strip().lower()
+    unit = {"m": 1, "h": 60, "d": 1440}.get(s[-1:])
+    return int(s[:-1]) * unit if unit else int(s)
+
+
+def _times(v) -> List[str]:
+    return [v] if isinstance(v, str) else list(v)
+
+
+def _schedule_config(every, daily, weekly, at, tz) -> dict:
+    """A Fabric schedule ``configuration`` from one cadence knob. Fabric's scheduler is interval /
+    daily / weekly (not free-form cron); pass exactly one of ``every`` / ``daily`` / ``weekly`` — none
+    defaults to daily at midnight. ``startDateTime`` is now (UTC), so it begins immediately."""
+    if sum(x is not None for x in (every, daily, weekly)) > 1:
+        raise RemoteRunError("pass only one of every= / daily= / weekly=")
+    base = {"startDateTime": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S"),
+            "endDateTime": _FAR_FUTURE, "localTimeZoneId": tz}
+    if every is not None:
+        return {**base, "type": "Cron", "interval": _interval_minutes(every)}
+    if weekly is not None:
+        days = [_WEEKDAYS.get(str(d)[:3].lower()) for d in _times(weekly)]
+        if None in days:
+            raise RemoteRunError(f"invalid weekday in {weekly!r}; use Mon..Sun")
+        return {**base, "type": "Weekly", "weekdays": days, "times": _times(at or "00:00")}
+    return {**base, "type": "Daily", "times": _times(daily or "00:00")}
 
 # Source extensions deploy handles (a ``.json`` is a pipeline or a variable library, told apart by
 # its content — see ``_json_artifact``).
@@ -216,17 +251,36 @@ class Workspace:
         A bare name is looked up as a notebook then a pipeline. Parameterizing a run is a pipeline's
         job (a pipeline passes parameters to the notebooks it orchestrates), so ``run`` takes none.
         """
+        kind, item_id = self._resolve_runnable(name)
+        return _run_job_and_wait(self._token, self.id, item_id, job_type=_RUNNABLE[kind])
+
+    def schedule(self, name: str, every=None, daily=None, weekly=None, at=None, tz: str = "UTC") -> str:
+        """Schedule a deployed notebook or pipeline to run on Fabric; return the schedule id.
+
+        Fabric's scheduler is interval / daily / weekly (not free-form cron), so pass one of:
+        ``every="30m"`` / ``"2h"`` (interval), ``daily="06:00"`` or ``daily=["06:00","18:00"]``, or
+        ``weekly=["Mon","Fri"], at="06:00"``. No cadence defaults to **daily at midnight**. ``tz`` is
+        the schedule's time zone (default UTC). Idempotent: re-scheduling the same item updates its
+        schedule rather than stacking a duplicate.
+        """
+        config = _schedule_config(every, daily, weekly, at, tz)   # validate cadence before any lookup
+        kind, item_id = self._resolve_runnable(name)
+        return _schedule_item(self._token, self.id, item_id, _RUNNABLE[kind], config)
+
+    def _resolve_runnable(self, name: str):
+        """``(collection, item_id)`` for a runnable named ``name`` — extension picks the collection
+        (``.ipynb`` → notebooks, ``.json`` → pipelines), a bare name searches both. Raises if it
+        matches no item or more than one."""
         stem, ext = os.path.splitext(name)
         kinds = _RUN_EXT.get(ext.lower(), list(_RUNNABLE))
         target = stem if ext.lower() in _RUN_EXT else name
         hits = [(kind, it["id"]) for kind in kinds
                 for it in self._items(kind) if it.get("displayName") == target]
         if not hits:
-            raise RemoteRunError(f"no notebook or pipeline named {target!r} in workspace to run")
+            raise RemoteRunError(f"no notebook or pipeline named {target!r} in workspace")
         if len(hits) > 1:
-            raise RemoteRunError(f"{target!r} matches multiple items; can't tell which to run")
-        kind, item_id = hits[0]
-        return _run_job_and_wait(self._token, self.id, item_id, job_type=_RUNNABLE[kind])
+            raise RemoteRunError(f"{target!r} matches multiple items; can't tell which")
+        return hits[0]
 
     def _repoint_bim(self, content: bytes, lakehouse: Optional[str], source: str) -> bytes:
         """Rewrite a Direct-Lake ``model.bim``'s OneLake workspace/lakehouse GUIDs to this workspace
