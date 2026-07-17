@@ -508,6 +508,22 @@ def _create_pipeline(token: str, ws_id: str, name: str, pipeline_json: bytes) ->
     return _create_item(token, ws_id, "dataPipelines", name, parts)
 
 
+# Fabric requires a settings part alongside variables.json; supplied internally (no value sets).
+_VARLIB_SETTINGS = {
+    "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/variableLibrary/definition/settings/1.0.0/schema.json",
+    "valueSetsOrder": [],
+}
+
+
+def _create_variable_library(token: str, ws_id: str, name: str, variables_json: bytes) -> str:
+    """Create a variable library from a ``variables.json`` (raw file bytes); return its item id."""
+    parts = [
+        _b64_part("variables.json", variables_json),
+        _b64_part("settings.json", _VARLIB_SETTINGS),
+    ]
+    return _create_item(token, ws_id, "variableLibraries", name, parts)
+
+
 def _refresh_semantic_model(pbi_token: str, ws_id: str, item_id: str) -> None:
     """Trigger an enhanced refresh (a *reframe* for Direct Lake) and poll it to completion. Raises
     ``RemoteRunError`` on a failed/cancelled refresh or timeout. Uses the Power BI REST API, so it

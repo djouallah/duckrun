@@ -36,29 +36,44 @@ from .fabric_remote import (
     _create_semantic_model,
     _refresh_semantic_model,
     _create_pipeline,
+    _create_variable_library,
     _run_job_and_wait,
     _delete_item,
 )
+
+# Source extensions deploy handles (a ``.json`` is a pipeline or a variable library, told apart by
+# its content — see ``_json_artifact``).
+_DEPLOY_EXT = (".ipynb", ".bim", ".json")
 
 # Item collections that ``run`` can execute, and the Fabric job type for each.
 _RUNNABLE = {"notebooks": "RunNotebook", "dataPipelines": "Pipeline"}
 # Which collections to look in for a given source extension when running by file name.
 _RUN_EXT = {".ipynb": ["notebooks"], ".json": ["dataPipelines"]}
 
-# Which Fabric item each source extension deploys to: (item-collection endpoint, human label).
-_ARTIFACTS = {
-    ".ipynb": ("notebooks", "notebook"),
-    ".bim": ("semanticModels", "semantic model"),
-    ".json": ("dataPipelines", "data pipeline"),
-}
-
 
 def _is_pipeline_json(obj) -> bool:
-    """Whether ``obj`` (parsed JSON) is a Fabric data-pipeline definition: a ``pipeline-content.json``
-    is ``{"properties": {"activities": [...]}}``. Guards against deploying a non-pipeline ``.json``
-    (a variables/config file, a ``.bim`` exported as ``.json``) as a broken pipeline."""
+    """Whether ``obj`` (parsed JSON) is a Fabric data-pipeline definition — a ``pipeline-content.json``
+    is ``{"properties": {"activities": [...]}}``."""
     return isinstance(obj, dict) and isinstance(obj.get("properties"), dict) \
         and "activities" in obj["properties"]
+
+
+def _is_variable_library_json(obj) -> bool:
+    """Whether ``obj`` (parsed JSON) is a variable-library ``variables.json`` — ``{"variables": [...]}``."""
+    return isinstance(obj, dict) and isinstance(obj.get("variables"), list)
+
+
+def _apply_variables(obj: dict, overrides: Dict) -> bytes:
+    """A ``variables.json`` with each named variable's ``value`` replaced from ``overrides`` — how
+    you set environment-specific values (lakehouse name, workspace id, limits) at deploy time. An
+    override for a name the library doesn't define raises (catches a typo, rather than silently
+    deploying a stale value)."""
+    by_name = {v["name"]: v for v in obj.get("variables", [])}
+    for key, value in overrides.items():
+        if key not in by_name:
+            raise RemoteRunError(f"variable {key!r} not in the library; has: {list(by_name)}")
+        by_name[key]["value"] = value
+    return json.dumps(obj).encode("utf-8")
 
 
 def _basename(source: str) -> str:
@@ -122,54 +137,75 @@ class Workspace:
         resp.raise_for_status()
         raise RemoteRunError(f"unexpected status {resp.status_code} creating lakehouse: {resp.text[:200]}")
 
-    def deploy(self, source: str, lakehouse: Optional[str] = None,
+    def deploy(self, source: str, lakehouse: Optional[str] = None, variables: Optional[Dict] = None,
                name: Optional[str] = None, overwrite: bool = False) -> str:
         """Deploy a file artifact to the workspace; return its item id.
 
         ``source`` is a local file path or an ``http(s)`` URL (a raw file URL). The item type is keyed
-        off the extension — ``.ipynb`` → notebook, ``.bim`` → semantic model, ``.json`` → data pipeline
-        — and the name defaults to the filename stem (overridable via ``name``). A ``.json`` is
-        deployed verbatim; a semantic model is also **refreshed** after deploy (a *reframe* onto the
-        latest Delta data for Direct Lake), so ``deploy`` returns only once it is live.
+        off the extension — ``.ipynb`` → notebook, ``.bim`` → semantic model, ``.json`` → a data
+        pipeline or a variable library (told apart by content) — and the name defaults to the filename
+        stem (overridable via ``name``). A semantic model is also **refreshed** after deploy (a
+        *reframe* onto the latest Delta data for Direct Lake), so ``deploy`` returns only once it is live.
 
         ``lakehouse`` (a lakehouse name in this workspace) points a **Direct Lake** ``.bim`` at that
         lakehouse: duckrun rewrites the OneLake workspace/lakehouse GUIDs baked into the model so it
         connects to the right place — no GUIDs or connection strings to edit by hand. It is inferred
         when the model already targets a lakehouse in this workspace, or the workspace has exactly one;
-        with several you must name it. Ignored for ``.ipynb`` / ``.json``.
+        with several you must name it.
 
-        Not idempotent: if an item of that name already exists it is replaced only when
-        ``overwrite=True``, otherwise this raises.
+        ``variables`` sets values in a **variable library** ``variables.json`` at deploy time
+        (``{"lakehouse_name": "bronze", "workspace_id": ws.id, ...}``) — the environment-specific
+        injection, without editing the file. An unknown variable name raises.
+
+        ``lakehouse`` / ``variables`` are ignored for artifact types they don't apply to. Not
+        idempotent: if an item of that name already exists it is replaced only when ``overwrite=True``,
+        otherwise this raises.
         """
         stem, ext = os.path.splitext(_basename(source))
         ext = ext.lower()
-        if ext not in _ARTIFACTS:
+        if ext not in _DEPLOY_EXT:
             raise RemoteRunError(
-                f"unsupported file type {ext!r}: deploy handles {', '.join(sorted(_ARTIFACTS))}")
-        endpoint, label = _ARTIFACTS[ext]
+                f"unsupported file type {ext!r}: deploy handles {', '.join(_DEPLOY_EXT)}")
         name = name or stem
         content = _read_source(source)
-        if ext == ".json" and not _is_pipeline_json(json.loads(content)):
-            raise RemoteRunError(
-                f"{source!r} is not a Fabric data-pipeline definition "
-                "(expected top-level {'properties': {'activities': ...}})")
-        if ext == ".bim":
+
+        if ext == ".ipynb":
+            endpoint = "notebooks"
+        elif ext == ".bim":
+            endpoint = "semanticModels"
             content = self._repoint_bim(content, lakehouse, source)   # resolve before any delete
+        else:                                                          # .json → pipeline or variable library
+            endpoint, content = self._json_artifact(source, content, variables)
 
         existing = next((it for it in self._items(endpoint) if it.get("displayName") == name), None)
         if existing:
             if not overwrite:
-                raise RemoteRunError(f"{label} {name!r} already exists; pass overwrite=True to replace")
+                raise RemoteRunError(f"an item named {name!r} already exists; pass overwrite=True to replace")
             _delete_item(self._token, self.id, existing["id"])
 
-        if ext == ".ipynb":
+        if endpoint == "notebooks":
             return _create_notebook(self._token, self.id, name, json.loads(content))
-        if ext == ".json":
+        if endpoint == "dataPipelines":
             return _create_pipeline(self._token, self.id, name, content)
-        # .bim → create the semantic model, then refresh/reframe it so it is live.
+        if endpoint == "variableLibraries":
+            return _create_variable_library(self._token, self.id, name, content)
+        # semanticModels → create, then refresh/reframe so it is live.
         item_id = _create_semantic_model(self._token, self.id, name, content)
         _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
+
+    def _json_artifact(self, source: str, content: bytes, variables: Optional[Dict]):
+        """Resolve a ``.json`` source to ``(endpoint, content)`` by sniffing it — a data pipeline
+        (``properties.activities``) or a variable library (``variables``); anything else raises.
+        Variable-library values are applied here."""
+        obj = json.loads(content)
+        if _is_pipeline_json(obj):
+            return "dataPipelines", content
+        if _is_variable_library_json(obj):
+            return "variableLibraries", _apply_variables(obj, variables or {})
+        raise RemoteRunError(
+            f"{source!r} is neither a Fabric data pipeline (properties.activities) nor a "
+            "variable library (variables)")
 
     def run(self, name: str) -> str:
         """Run a deployed notebook or data pipeline on Fabric compute and wait for it; return the

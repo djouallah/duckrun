@@ -17,6 +17,7 @@ lh_id = ws.create_lakehouse("bronze")           # returns the lakehouse item id
 nb_id = ws.deploy("etl.ipynb")                  # deploy a notebook
 sm_id = ws.deploy("model.bim", lakehouse="bronze")  # Direct Lake model, pointed at a lakehouse
 pl_id = ws.deploy("pipeline.json")              # deploy a data pipeline
+vl_id = ws.deploy("variables.json", variables={"lakehouse_name": "bronze", "workspace_id": ws.id})
 ws.run("etl.ipynb")                             # run a deployed notebook/pipeline on Fabric, wait
 ws.list_lakehouses()                            # [{"displayName": ..., "id": ...}, ...]
 ```
@@ -31,10 +32,13 @@ a local file path or an `http(s)` URL (e.g. a GitHub raw URL). The item type com
 extension — `.ipynb` → notebook, `.bim` → semantic model, `.json` → data pipeline — and the name
 defaults to the filename stem (override with `name=`). A `.bim` is also **refreshed** after deploy (a
 *reframe* onto the latest Delta data for Direct Lake), so `deploy` returns only once the model is
-live. A `.json` is deployed **verbatim** as a data pipeline — its contents are validated as a Fabric
-pipeline definition (`properties.activities`) but no notebook/workspace ids are rewritten. It is
-**not** idempotent: if an item of that name already exists it is replaced only when `overwrite=True`,
-otherwise the call raises rather than hide a stale deploy.
+live. A `.json` is a **data pipeline** or a **variable library**, told apart by content: a pipeline
+(`properties.activities`) is deployed verbatim (no id rewriting); a variable library (`variables`)
+takes an optional `variables=` mapping to set values at deploy time —
+`ws.deploy("variables.json", variables={"lakehouse_name": "bronze", "workspace_id": ws.id})` — the
+environment-specific injection, without editing the file (an unknown variable name raises). A `.json`
+that is neither raises. `deploy` is **not** idempotent: if an item of that name already exists it is
+replaced only when `overwrite=True`, otherwise the call raises rather than hide a stale deploy.
 
 **Pointing a Direct Lake model at a lakehouse.** A Direct Lake `model.bim` bakes in the OneLake
 workspace + lakehouse GUIDs it reads from; deploying it elsewhere would leave it pointed at the wrong

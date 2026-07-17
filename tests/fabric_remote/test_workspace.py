@@ -347,12 +347,34 @@ def test_deploy_pipeline_from_path(_patch, tmp_path):
     assert {p["path"] for p in body["definition"]["parts"]} == {"pipeline-content.json", ".platform"}
 
 
-def test_deploy_non_pipeline_json_raises(_patch, tmp_path):
+def test_deploy_unrecognized_json_raises(_patch, tmp_path):
     fake = _patch(DeployFabric(kind="dataPipelines"))
-    src = _write(tmp_path, "variables.json", json.dumps({"variables": []}))
-    with pytest.raises(fr.RemoteRunError, match="not a Fabric data-pipeline"):
+    src = _write(tmp_path, "config.json", json.dumps({"foo": "bar"}))   # neither pipeline nor varlib
+    with pytest.raises(fr.RemoteRunError, match="neither a Fabric data pipeline"):
         _ws().deploy(src)
     assert not any(m == "POST" for m, _, _ in fake.calls)   # rejected before any create
+
+
+def test_deploy_variable_library_sets_values(_patch, tmp_path):
+    fake = _patch(DeployFabric(kind="variableLibraries"))
+    lib = {"variables": [{"name": "lakehouse_name", "type": "String", "value": "OLD"},
+                         {"name": "workspace_id", "type": "String", "value": "OLD"}]}
+    src = _write(tmp_path, "variables.json", json.dumps(lib))
+    _ws().deploy(src, variables={"lakehouse_name": "bronze", "workspace_id": "ws-guid"})
+    parts = {p["path"]: p for p in fake.post_body("/workspaces/ws-guid/variableLibraries")["definition"]["parts"]}
+    import base64
+    vals = {v["name"]: v["value"]
+            for v in json.loads(base64.b64decode(parts["variables.json"]["payload"]))["variables"]}
+    assert vals == {"lakehouse_name": "bronze", "workspace_id": "ws-guid"}   # values injected
+    assert "settings.json" in parts                                          # supplied internally
+
+
+def test_deploy_variable_library_unknown_var_raises(_patch, tmp_path):
+    _patch(DeployFabric(kind="variableLibraries"))
+    src = _write(tmp_path, "variables.json",
+                 json.dumps({"variables": [{"name": "a", "type": "String", "value": "x"}]}))
+    with pytest.raises(fr.RemoteRunError, match="not in the library"):
+        _ws().deploy(src, variables={"typo": "y"})
 
 
 def test_deploy_exists_without_overwrite_raises(_patch, tmp_path):
