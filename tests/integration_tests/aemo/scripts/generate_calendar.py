@@ -5,8 +5,8 @@ reads through ``source('aemo', 'dim_calendar')``. Run this before ``dbt build`` 
 so the table exists when the source (and its tests) resolve.
 
 Output:  $WAREHOUSE_PATH/sources/dim_calendar   (default WAREHOUSE_PATH=/tmp)
-Auth:    on abfss:///az:// paths, $ONELAKE_TOKEN is forwarded as a deltalake bearer_token
-         (matches profiles.yml storage_options and engine.write_delta).
+Auth:    on abfss:///az:// paths, duckrun self-acquires the OneLake bearer token
+         (auth.get_onelake_token — GitHub OIDC / azure-identity), matching how the adapter writes.
 
 DuckDB builds the rows (the same generate_series the old dim_calendar.sql model used) and the
 relation is handed straight to write_deltalake over Arrow's C-stream interface — no pyarrow
@@ -38,9 +38,9 @@ def main() -> None:
     path = f"{root}/sources/dim_calendar"
 
     storage_options = None
-    token = os.environ.get("ONELAKE_TOKEN")
-    if path.startswith(("abfss://", "az://")) and token:
-        storage_options = {"bearer_token": token}
+    if path.startswith(("abfss://", "az://")):
+        from duckrun import auth
+        storage_options = {"bearer_token": auth.get_onelake_token()}
 
     con = duckdb.connect()
     n = con.sql(f"SELECT count(*) FROM ({CALENDAR_SQL})").fetchone()[0]
