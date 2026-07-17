@@ -39,24 +39,32 @@
     - The source is deduped to one row per key with QUALIFY (daily wins, then latest file) — this is
       exactly the fix the duplicate-source-key cardinality guard recommends. --#}
 
-{%- set check_files_query -%}
-SELECT
-  (SELECT COUNT(*) FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'
-   {%- if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT daily_file FROM {{ this }} WHERE daily_file IS NOT NULL){% endif %})
-  +
-  (SELECT COUNT(*) FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'scada_today'
-   {%- if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT intraday_file FROM {{ this }} WHERE intraday_file IS NOT NULL){% endif %}) AS cnt
+{#-- Gate each feed independently: the guard used to sum both counts, so a run with only one feed
+    backlogged (e.g. daily = 0, scada_today > 0) still entered the body and then hit
+    read_csv(['']) — the empty-list sentinel globs to nothing and DuckDB raises "No files found".
+    Reading only the feeds that actually have files avoids the sentinel entirely. --#}
+{%- set daily_count_query -%}
+SELECT COUNT(*) AS cnt FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'daily'
+   {%- if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT daily_file FROM {{ this }} WHERE daily_file IS NOT NULL){% endif %}
+{%- endset -%}
+{%- set intraday_count_query -%}
+SELECT COUNT(*) AS cnt FROM {{ ref('stg_csv_archive_log') }} WHERE source_type = 'scada_today'
+   {%- if is_incremental() %} AND csv_filename NOT IN (SELECT DISTINCT intraday_file FROM {{ this }} WHERE intraday_file IS NOT NULL){% endif %}
 {%- endset -%}
 
 {%- if execute and flags.WHICH == 'run' -%}
-  {%- set files_result = run_query(check_files_query) -%}
-  {%- set has_files = files_result and files_result.rows[0][0] > 0 -%}
+  {%- set has_daily = run_query(daily_count_query).rows[0][0] > 0 -%}
+  {%- set has_intraday = run_query(intraday_count_query).rows[0][0] > 0 -%}
 {%- else -%}
-  {%- set has_files = true -%}
+  {%- set has_daily = true -%}
+  {%- set has_intraday = true -%}
 {%- endif -%}
+{%- set has_files = has_daily or has_intraday -%}
 
 {% if has_files %}
-WITH scada_daily AS (
+WITH
+{% if has_daily %}
+scada_daily AS (
   SELECT *
   FROM read_csv(
     getvariable('scada_daily_paths'),
@@ -126,7 +134,9 @@ WITH scada_daily AS (
   )
   WHERE I = 'D' AND UNIT = 'DUNIT' AND VERSION = '3'
 ),
+{% endif %}
 
+{% if has_intraday %}
 scada_intraday AS (
   SELECT *
   FROM read_csv(
@@ -152,7 +162,9 @@ scada_intraday AS (
   )
   WHERE I = 'D' AND SCADAVALUE != '0'
 ),
+{% endif %}
 
+{% if has_daily %}
 -- Daily settled DUNIT rows: full schema, authoritative (source_priority = 1).
 daily_rows AS (
   SELECT
@@ -215,7 +227,9 @@ daily_rows AS (
       + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
   FROM scada_daily
 ),
+{% endif %}
 
+{% if has_intraday %}
 -- Intraday preliminary rows: only the columns SCADA carries; UNION ALL BY NAME fills every
 -- daily-only column with NULL. INTERVENTION is 0 (SCADA has no intervention concept).
 intraday_rows AS (
@@ -232,11 +246,18 @@ intraday_rows AS (
       + CAST(MONTH(CAST(SETTLEMENTDATE AS TIMESTAMP)) AS INT) AS month_key
   FROM scada_intraday
 ),
+{% endif %}
 
 unioned AS (
+  {% if has_daily %}
   SELECT * FROM daily_rows
+  {% endif %}
+  {% if has_daily and has_intraday %}
   UNION ALL BY NAME
+  {% endif %}
+  {% if has_intraday %}
   SELECT * FROM intraday_rows
+  {% endif %}
 )
 
 SELECT
