@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.22]
+
+### Added
+- **`duckrun.workspace()` — deploy and orchestrate Fabric artifacts.** A workspace handle with
+  idempotent `create_lakehouse` / `create_notebook`, plus `ws.deploy(...)` for file artifacts:
+  `.ipynb` notebooks, `.bim` semantic models (with refresh, and `lakehouse=` to repoint a Direct
+  Lake model at a lakehouse), `pipeline.json` Data Pipelines, and `variables.json` variable
+  libraries (`deploy('variables.json', variables={...})`). Deployed items can be run and scheduled:
+  `ws.run(name)` runs a notebook/pipeline and waits, and `ws.schedule(name, ...)` sets a Fabric
+  cron schedule. See `tests/integration_tests/deploy` for a full-project deploy demo.
+
+### Changed
+- **OneLake/Fabric/Power BI auth is now self-acquiring via OIDC — `az login` is no longer required.**
+  `azure-identity` is promoted to a **core dependency** (OneLake auth is no longer an optional
+  extra), and duckrun mints its own OneLake, Fabric, and Power BI tokens, caching them per scope
+  within the process. Both the delta-rs write path and the per-catalog resolvers self-acquire, so a
+  CI job needs only `AZURE_CLIENT_ID` / `AZURE_TENANT_ID` (federated OIDC) and drops all explicit
+  `az login` + token-plumbing steps.
+- **`conn.copy` / `conn.download` stream through obstore across every store.** File transfer is
+  streamed via obstore (which now ships with duckrun) uniformly across local, S3, GCS, ADLS, and
+  OneLake, so no separate obstore install or direct-obstore usage is needed.
+
 ## [0.4.21]
 
 ### Fixed
