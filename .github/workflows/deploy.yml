@@ -1,10 +1,9 @@
 name: deploy
 
-# A manual, end-to-end demo of the duckrun.workspace(...) deploy surface. Build a real dbt project
-# (coffee) into a fresh lakehouse, then deploy a Direct Lake semantic model + a notebook + a pipeline
-# + a variable library over it, run the notebook, and schedule the pipeline — all from the tiny
-# tests/integration_tests/deploy/deploy.py. Manual only (workflow_dispatch); writes to a shared
-# workspace, so serialize runs.
+# A manual, end-to-end demo of the duckrun.workspace(...) deploy surface. Stage the coffee dbt project
+# into a fresh lakehouse's Files, deploy a notebook that runs it ON Fabric, then deploy a Direct Lake
+# semantic model over the built tables + a pipeline + a variable library, and schedule the pipeline —
+# all from tests/integration_tests/deploy/deploy.py. Manual only; writes a shared workspace, so serialize.
 on:
   workflow_dispatch:
 
@@ -20,9 +19,7 @@ jobs:
   deploy:
     runs-on: ubuntu-latest
     env:
-      # The CI-tenant workspace the service principal can write to (same one aemo.yml targets).
-      FABRIC_WORKSPACE: 1c52481c-0523-4a5a-bbde-fdc932bd77c2
-      DBT_SCHEMA: dbo
+      FABRIC_WORKSPACE: 91588e42-0f1c-4e56-bcaa-cbf015b8f312
       # Exported to the process env so auth's GitHub-OIDC token refresh can re-exchange a fresh
       # assertion (mirrors aemo.yml).
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -43,27 +40,18 @@ jobs:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
-      - name: Acquire a OneLake storage token (dbt reads/writes Delta)
+      - name: Storage token (stage the dbt project into Files via conn.copy)
         run: |
-          TOKEN=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "ONELAKE_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Acquire a Fabric control-plane token (create lakehouse + deploy items)
+          T=$(az account get-access-token --resource https://storage.azure.com/ --query accessToken -o tsv)
+          echo "::add-mask::$T"; echo "AZURE_STORAGE_TOKEN=$T" >> "$GITHUB_ENV"
+      - name: Fabric control-plane token (create lakehouse + deploy + run items)
         run: |
-          TOKEN=$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "FABRIC_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Acquire a Power BI token (semantic-model refresh)
+          T=$(az account get-access-token --resource https://api.fabric.microsoft.com --query accessToken -o tsv)
+          echo "::add-mask::$T"; echo "FABRIC_TOKEN=$T" >> "$GITHUB_ENV"
+      - name: Power BI token (semantic-model refresh)
         run: |
-          TOKEN=$(az account get-access-token --resource https://analysis.windows.net/powerbi/api --query accessToken -o tsv)
-          echo "::add-mask::$TOKEN"
-          echo "POWERBI_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-      - name: Create the demo lakehouse and point dbt at it
-        run: |
-          LH=$(python -c "import os,duckrun; print(duckrun.workspace(os.environ['FABRIC_WORKSPACE']).create_lakehouse('deploy_demo'))")
-          echo "WAREHOUSE_PATH=abfss://$FABRIC_WORKSPACE@onelake.dfs.fabric.microsoft.com/$LH/Tables" >> "$GITHUB_ENV"
-      - name: Build the full project (coffee) into deploy_demo
-        run: dbt build --project-dir tests/integration_tests/coffee --profiles-dir tests/integration_tests/coffee
+          T=$(az account get-access-token --resource https://analysis.windows.net/powerbi/api --query accessToken -o tsv)
+          echo "::add-mask::$T"; echo "POWERBI_TOKEN=$T" >> "$GITHUB_ENV"
       - name: Deploy everything — the simplest deploy.py ever
         working-directory: tests/integration_tests/deploy
         run: python deploy.py

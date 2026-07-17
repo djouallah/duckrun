@@ -1,19 +1,26 @@
-"""The simplest Fabric deploy script — build nothing here, just push artifacts by name.
+"""Deploy the whole thing to Fabric from one small script.
 
-Run from this folder after the lakehouse is populated (the workflow builds the coffee dbt project
-into `deploy_demo` first). Tokens come from the environment: `FABRIC_TOKEN` (control plane) and
-`POWERBI_TOKEN` (the semantic-model refresh) are auto-resolved by duckrun — nothing is passed here.
+Stages the coffee dbt project into the lakehouse Files, deploys a notebook that runs it on Fabric
+(producing `dbo.mart_revenue` etc.), then deploys a Direct Lake semantic model over those tables plus
+a pipeline and a variable library, and schedules the pipeline. Tokens come from the environment:
+`AZURE_STORAGE_TOKEN` (the Files copy), `FABRIC_TOKEN` (control plane) and `POWERBI_TOKEN` (the model
+refresh) are auto-resolved by duckrun — nothing is passed here.
 """
 import os
 
 import duckrun
 
 ws = duckrun.workspace(os.environ["FABRIC_WORKSPACE"])
+lh = ws.create_lakehouse("deploy_demo")
 
-ws.deploy("hello.ipynb")
+# stage the coffee dbt project into the lakehouse Files, then let a notebook run it ON Fabric
+files = duckrun.connect(f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh}/Tables")
+files.copy("../coffee", "coffee")
+ws.deploy("build_coffee.ipynb")
+ws.run("build_coffee")                       # runs the dbt project on Fabric → dbo.mart_revenue
+
+# the tables exist now — deploy the semantic model over them, plus orchestration
+ws.deploy("coffee_revenue.bim", lakehouse="deploy_demo")
 ws.deploy("pipeline.json")
 ws.deploy("variables.json", variables={"workspace_id": ws.id, "lakehouse_name": "deploy_demo"})
-ws.deploy("coffee_revenue.bim", lakehouse="deploy_demo")   # Direct Lake — repointed + refreshed
-
-ws.run("hello")
 ws.schedule("pipeline", daily="06:00")
