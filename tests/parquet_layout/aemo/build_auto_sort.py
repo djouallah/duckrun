@@ -16,9 +16,7 @@ _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
 N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
 _src = "mart.fct_summary" if N is None else f"(select * from mart.fct_summary limit {N})"
 
-con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
-                      storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
-                      read_only=False)
+con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"], read_only=False)
 try:
     con.sql("create schema if not exists tests")
 except Exception:

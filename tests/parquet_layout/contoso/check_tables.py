@@ -19,8 +19,7 @@ import build_base  # noqa: E402  — sales_files_urls / _files_exists: base live
 TABLES = ["tests.sales_auto_sort",
           "tests.sales_vorder"]
 
-con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
-                      storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})
+con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"])
 
 missing = []
 _abfss_url, _store_root = build_base.sales_files_urls()

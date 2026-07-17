@@ -73,10 +73,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     env:
-      # The azure extension's default transport fails the OneLake TLS handshake on Linux runners
-      # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle. Every
-      # Linux OneLake workflow (aemo, parity, integration_tests_onelake) sets this.
-      AZURE_TRANSPORT_OPTION_TYPE: curl
+      # duckrun self-acquires every token from this OIDC identity (storage, Fabric, Power BI) and picks
+      # the curl transport itself; azure/login stays only for the `az rest` lakehouse/workspace lookups.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
@@ -128,11 +128,12 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           allow-no-subscriptions: true
 
-      - name: 🔑 Resolve lakehouse + mint tokens
+      - name: 🔑 Resolve lakehouse + workspace
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           # ws id from deploy_config; lakehouse id + workspace name from the Fabric/Power BI APIs.
+          # No tokens minted here — the scripts self-acquire storage/Fabric/Power BI tokens via duckrun.
           $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout/aemo/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
           $wsId = $meta.ws
           $lhs = az rest --method get --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" | ConvertFrom-Json
@@ -141,19 +142,11 @@ jobs:
           $grp = az rest --method get --resource "https://analysis.windows.net/powerbi/api" --url "https://api.powerbi.com/v1.0/myorg/groups?`$filter=id eq '$wsId'" | ConvertFrom-Json
           $wsName = $grp.value[0].name
           if (-not $wsName) { throw "workspace name not resolved for $wsId" }
-          # Mint ALL tokens now, while the OIDC client assertion is fresh (later steps outlive it).
-          $onelake = az account get-access-token --resource "https://storage.azure.com/" --query accessToken -o tsv
-          $fabric  = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-          $pbi     = az account get-access-token --resource "https://analysis.windows.net/powerbi/api" --query accessToken -o tsv
-          echo "::add-mask::$onelake"; echo "::add-mask::$fabric"; echo "::add-mask::$pbi"
           @(
             "WS_ID=$wsId",
             "LH_ID=$lhId",
             "WS_NAME=$wsName",
             "ONELAKE_TABLES_PATH=abfss://$wsId@onelake.dfs.fabric.microsoft.com/$lhId/Tables",
-            "ONELAKE_TOKEN=$onelake",
-            "FABRIC_TOKEN=$fabric",
-            "PBI_TOKEN=$pbi",
             "PBI_WORKSPACE=$wsName"
           ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -196,26 +189,8 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/parquet_layout/aemo/table_stats.py
 
-      # The tokens minted at job start have a ~75-min lifetime. A full rebuild (heavy auto_sort/vorder
-      # builds on the runner) plus the auto_sort benchmark can push the vorder pass past that, failing
-      # it with "PowerBI Request Failed". Re-authenticate (fresh OIDC assertion → brand-new token, NOT
-      # the cached expiring one az would hand back) and re-mint PBI_TOKEN so the XMLA clock starts here.
-      - name: 🔐 Re-auth for XMLA (initial token can expire on long runs)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: 🔑 Re-mint Power BI token for XMLA
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $pbi = az account get-access-token --resource "https://analysis.windows.net/powerbi/api" --query accessToken -o tsv
-          if (-not $pbi) { throw "failed to re-mint Power BI token" }
-          echo "::add-mask::$pbi"
-          "PBI_TOKEN=$pbi" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
+      # No token re-mint before XMLA: xmla_compare.py self-acquires the Power BI token via duckrun,
+      # which re-exchanges a fresh OIDC assertion (so a long rebuild can't hand back an expiring token).
       - name: 🔍 Benchmark both models over XMLA
         env:
           PYTHONNET_RUNTIME: coreclr
@@ -258,9 +233,10 @@ jobs:
     # the 6h hosted-job cap. A smaller scale (e.g. orders=10000000) needs rebuild=true to regenerate.
     timeout-minutes: 350
     env:
-      # The azure extension's default transport fails the OneLake TLS handshake on Linux runners
-      # ("Problem with the SSL CA cert"); the curl transport respects the system CA bundle.
-      AZURE_TRANSPORT_OPTION_TYPE: curl
+      # duckrun self-acquires every token from this OIDC identity and picks the curl transport itself;
+      # azure/login stays only for the `az rest` lakehouse create/resolve + workspace lookup.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
@@ -313,45 +289,26 @@ jobs:
           allow-no-subscriptions: true
 
       - name: 🏗️ Create the sqlbi lakehouse (idempotent)
-        shell: pwsh
+        env:
+          PYTHONIOENCODING: utf-8
+        # duckrun's own workspace API creates the schema-enabled lakehouse idempotently and
+        # self-acquires the Fabric control-plane token from the OIDC identity — no az token step.
+        # enableSchemas (schemas=True default): Contoso + tests tables live under schemas, which
+        # Livy Spark + Direct Lake need to resolve.
         run: |
-          $ErrorActionPreference = "Stop"
-          $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout/contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
-          $wsId = $meta.ws
-          $lhName = $meta.lh
-          # Use Invoke-RestMethod for the POST (sends JSON cleanly, throws on non-2xx so Stop catches
-          # it). `az rest --body` is avoided because it mangles a JSON body on Windows (.cmd wrapper);
-          # IRM is robust cross-platform.
-          $fabToken = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-          $headers = @{ Authorization = "Bearer $fabToken"; "Content-Type" = "application/json" }
-          $base = "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses"
-          $lhs = Invoke-RestMethod -Method Get -Uri $base -Headers $headers
-          $existing = ($lhs.value | Where-Object { $_.displayName -eq $lhName }).id
-          if ($existing) {
-            Write-Host "lakehouse '$lhName' already exists ($existing) — reusing."
-          } else {
-            Write-Host "creating schema-enabled lakehouse '$lhName' in workspace $wsId ..."
-            # enableSchemas: the Contoso + tests tables live under schemas (contoso.sales,
-            # tests.sales_auto_sort); Livy Spark + Direct Lake need a schema-enabled lakehouse to
-            # resolve them. A plain lakehouse has no schemas and the Spark V-Order build fails.
-            $body = @{ displayName = $lhName; creationPayload = @{ enableSchemas = $true } } | ConvertTo-Json -Compress
-            Invoke-RestMethod -Method Post -Uri $base -Headers $headers -Body $body | Out-Null
-            # Creation can be async (202); poll the list until it actually appears (or give up).
-            $found = $false
-            for ($i = 1; $i -le 12; $i++) {
-              Start-Sleep -Seconds 5
-              $lhs = Invoke-RestMethod -Method Get -Uri $base -Headers $headers
-              if (($lhs.value | Where-Object { $_.displayName -eq $lhName }).id) { $found = $true; break }
-              Write-Host "  waiting for '$lhName' to appear ($i/12)..."
-            }
-            if (-not $found) { throw "lakehouse '$lhName' was not visible after creation" }
-            Write-Host "created."
-          }
+          python - <<'PY'
+          import yaml, duckrun
+          c = yaml.safe_load(open("tests/parquet_layout/contoso/deploy_config.yml"))
+          e = {**c.get("defaults", {}), **c["${{ inputs.env }}"]}
+          lh = duckrun.workspace(e["ws"]).create_lakehouse(e["lakehouse_name"], schemas=True)
+          print(f"lakehouse '{e['lakehouse_name']}' ready ({lh})")
+          PY
 
-      - name: 🔑 Resolve lakehouse + mint tokens
+      - name: 🔑 Resolve lakehouse + workspace
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
+          # No tokens minted here — the scripts self-acquire storage/Fabric/Power BI tokens via duckrun.
           $meta = python -c "import yaml, json; c = yaml.safe_load(open('tests/parquet_layout/contoso/deploy_config.yml')); e = {**c.get('defaults', {}), **c['${{ inputs.env }}']}; print(json.dumps({'ws': e['ws'], 'lh': e['lakehouse_name']}))" | ConvertFrom-Json
           $wsId = $meta.ws
           $lhs = az rest --method get --resource "https://api.fabric.microsoft.com" --url "https://api.fabric.microsoft.com/v1/workspaces/$wsId/lakehouses" | ConvertFrom-Json
@@ -360,19 +317,11 @@ jobs:
           $grp = az rest --method get --resource "https://analysis.windows.net/powerbi/api" --url "https://api.powerbi.com/v1.0/myorg/groups?`$filter=id eq '$wsId'" | ConvertFrom-Json
           $wsName = $grp.value[0].name
           if (-not $wsName) { throw "workspace name not resolved for $wsId" }
-          # Mint ALL tokens now, while the OIDC client assertion is fresh (later steps outlive it).
-          $onelake = az account get-access-token --resource "https://storage.azure.com/" --query accessToken -o tsv
-          $fabric  = az account get-access-token --resource "https://api.fabric.microsoft.com" --query accessToken -o tsv
-          $pbi     = az account get-access-token --resource "https://analysis.windows.net/powerbi/api" --query accessToken -o tsv
-          echo "::add-mask::$onelake"; echo "::add-mask::$fabric"; echo "::add-mask::$pbi"
           @(
             "WS_ID=$wsId",
             "LH_ID=$lhId",
             "WS_NAME=$wsName",
             "ONELAKE_TABLES_PATH=abfss://$wsId@onelake.dfs.fabric.microsoft.com/$lhId/Tables",
-            "ONELAKE_TOKEN=$onelake",
-            "FABRIC_TOKEN=$fabric",
-            "PBI_TOKEN=$pbi",
             "PBI_WORKSPACE=$wsName"
           ) | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
@@ -422,26 +371,8 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/parquet_layout/contoso/table_stats.py
 
-      # The tokens minted at job start have a ~75-min lifetime. On a full-rebuild 100M run, generation
-      # + landing + the auto_sort benchmark can push the vorder pass past that, so it failed with
-      # "PowerBI Request Failed". Re-authenticate (fresh OIDC assertion → brand-new token, NOT the
-      # cached expiring one az would hand back) and re-mint PBI_TOKEN so the XMLA clock starts here.
-      - name: 🔐 Re-auth for XMLA (initial token can expire on long runs)
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-          allow-no-subscriptions: true
-
-      - name: 🔑 Re-mint Power BI token for XMLA
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $pbi = az account get-access-token --resource "https://analysis.windows.net/powerbi/api" --query accessToken -o tsv
-          if (-not $pbi) { throw "failed to re-mint Power BI token" }
-          echo "::add-mask::$pbi"
-          "PBI_TOKEN=$pbi" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-
+      # No token re-mint before XMLA: xmla_compare.py self-acquires the Power BI token via duckrun,
+      # which re-exchanges a fresh OIDC assertion (so a long rebuild can't hand back an expiring token).
       - name: 🔍 Benchmark both models over XMLA
         env:
           PYTHONNET_RUNTIME: coreclr

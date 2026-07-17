@@ -34,8 +34,7 @@ def _jsonable(v):
 
 def main():
     import duckrun
-    con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"] + "/tests",
-                          storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})
+    con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"] + "/tests")
 
     # --- per-table summary -> tables.<table>.parquet ---
     summ = con.get_stats("sales*")

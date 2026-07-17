@@ -406,7 +406,8 @@ def compare_table(title, base, model, base_res, opt_res, key, spread_key=None):
 
 def main():
     workspace = os.environ["PBI_WORKSPACE"].strip()
-    token = os.environ["PBI_TOKEN"].strip()
+    from duckrun import auth
+    token = os.environ.get("PBI_TOKEN") or auth.get_powerbi_token()  # self-acquire the XMLA/Power BI token
     adomd_dir = os.environ.get("ADOMD_DIR", ".")
     runs = int(os.environ.get("BENCH_RUNS", "5"))
     cold_repeats = int(os.environ.get("COLD_REPEATS", "3"))

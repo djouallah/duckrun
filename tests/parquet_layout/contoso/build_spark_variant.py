@@ -22,7 +22,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
 import build_base  # noqa: E402  — sales_files_urls / _files_exists: one source of truth for the path
 
-TOKEN = os.environ["FABRIC_TOKEN"]
+from duckrun import auth  # noqa: E402
+TOKEN = auth.get_fabric_token()  # self-acquire the Fabric control-plane token (Livy) from OIDC
 BASE = (f"https://api.fabric.microsoft.com/v1/workspaces/{os.environ['WS_ID']}"
         f"/lakehouses/{os.environ['LH_ID']}/livyapi/versions/2023-12-01")
 FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
@@ -61,8 +62,7 @@ def _spark_code(variant, reader):
 
 def _table_exists(qualified):
     import duckrun
-    con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
-                          storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})
+    con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"])
     try:
         con.sql(f"select 1 from {qualified} limit 1").fetchone()
         return True

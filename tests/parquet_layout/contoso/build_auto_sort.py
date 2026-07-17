@@ -29,9 +29,7 @@ _ABFSS_URL, _STORE_ROOT = build_base.sales_files_urls()
 _base = f"read_parquet('{_ABFSS_URL}')"
 _src = _base if N is None else f"(select * from {_base} limit {N})"
 
-con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
-                      storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]},
-                      read_only=False)
+con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"], read_only=False)
 con.sql("create schema if not exists tests")
 
 

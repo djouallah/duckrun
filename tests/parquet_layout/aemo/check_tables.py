@@ -15,8 +15,7 @@ import duckrun
 TABLES = ["tests.fct_summary_auto_sort",
           "tests.fct_summary_vorder"]
 
-con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"],
-                      storage_options={"bearer_token": os.environ["ONELAKE_TOKEN"]})
+con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"])
 
 missing = []
 for t in TABLES:

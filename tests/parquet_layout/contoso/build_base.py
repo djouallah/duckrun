@@ -105,10 +105,8 @@ def _fetch_generator(work):
 
 
 def _connect():
-    path = os.environ["ONELAKE_TABLES_PATH"]
-    token = os.environ.get("ONELAKE_TOKEN")
-    so = {"bearer_token": token} if token else None
-    return duckrun.connect(path, storage_options=so, read_only=False)
+    # No token passed: duckrun self-acquires the OneLake token (OIDC / azure-identity) for abfss://.
+    return duckrun.connect(os.environ["ONELAKE_TABLES_PATH"], read_only=False)
 
 
 def _exists(con, tbl):
@@ -139,10 +137,13 @@ def _files_store(store_root, token):
     return AzureStore.from_url(store_root, bearer_token=token)
 
 
-def _files_exists(store_root, token):
+def _files_exists(store_root, token=None):
     """True if the raw sales.parquet is already in Files (obstore HEAD)."""
     if not store_root:
         return False
+    if not token:  # no token passed — self-acquire the OneLake token from the OIDC identity
+        from duckrun import auth
+        token = auth.get_onelake_token()
     import obstore
     try:
         obstore.head(_files_store(store_root, token), SALES_FILES_REL)
@@ -165,8 +166,11 @@ def _upload_to_files(local_path, store_root, token, object_path):
 def main():
     force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
     orders = os.environ.get("CONTOSO_ORDERS", "").strip()
-    token = os.environ.get("ONELAKE_TOKEN")
     _, store_root = sales_files_urls()       # store_root None on a local path (offline dry-run)
+    token = os.environ.get("ONELAKE_TOKEN")
+    if store_root and not token:  # abfss upload target — self-acquire the OneLake token from OIDC
+        from duckrun import auth
+        token = auth.get_onelake_token()
     con = _connect()
     con.sql("create schema if not exists contoso")
 
