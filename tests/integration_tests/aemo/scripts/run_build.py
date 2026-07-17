@@ -27,9 +27,25 @@ import sys
 BUILD = ["build", "--target", "dev", "--exclude", "tag:heavy"]
 TEST = ["test", "--target", "dev", "--exclude", "tag:heavy"]
 
-# Fabric SKU the remote build runs on (RemoteRunner cores). Single-sourced so the pre-flight can
-# print it next to the backlog and run_remote() spins the notebook at the same size.
-REMOTE_CORES = 8
+# Size the remote Fabric SKU (RemoteRunner cores) to how much work THIS run will actually merge.
+# The merge working set — and thus RAM pressure, spill volume, and wall-clock — scales with the
+# number of files folded, which is min(process_limit, backlog): a big backlog capped by a small
+# process_limit is still a small merge, and a backlog below process_limit folds entirely in one go.
+# Bigger fold -> bigger SKU: more RAM keeps more of the merge in memory (DuckDB limit 0.3x RAM,
+# delta_rs max_spill_size 0.6x RAM) and a bigger disk to spill onto, trading $ for wall-clock so a
+# large fold doesn't grind for an hour. Validated points: 8 cores (~60 GiB RAM, ~275 GiB disk)
+# folded 3000 files but took ~74 min (heavy spill); 64 cores (~497 GiB RAM, ~2 TiB disk) did 1000
+# fast. Rough tiers, not a tuned optimum — "or something", but monotonic in the work.
+_CORE_TIERS = ((250, 8), (1000, 16), (2500, 32))  # (files <= N -> cores); above the top tier -> _MAX_CORES
+_MAX_CORES = 64
+
+
+def cores_for(files: int) -> int:
+    """Remote SKU size for a run that will fold ``files`` source files into the marts."""
+    for ceiling, cores in _CORE_TIERS:
+        if files <= ceiling:
+            return cores
+    return _MAX_CORES
 
 # Which fact table consumes which archive-log source, and the fact column that records the processed
 # source file. 'daily' feeds BOTH facts; scada_today only fct_scada; price_today only fct_price;
@@ -130,18 +146,17 @@ def run_local():
     return _normalize(dbt.invoke(BUILD)), _normalize(dbt.invoke(TEST))
 
 
-def run_remote():
+def run_remote(cores):
     from duckrun import RemoteRunner
 
     # Batched: build then test in ONE notebook (one session start, one install). This is a TEST, so
     # the notebook installs duckrun straight from THIS repo's main (not the released PyPI wheel) —
-    # otherwise an adapter fix wouldn't be exercised remotely until the next release.
-    # cores=64 for RAM headroom on the fct_scada merge: more RAM raises DuckDB's merge memory_limit
-    # (0.3x RAM) and delta_rs's max_spill_size (0.6x RAM), so less of a month-spanning merge spills to
-    # disk. The Fabric work disk is ~1.9 TiB (NOT small); the old "100 GB" wall was delta_rs's
-    # max_temp_directory_size default, now sized to ~80% of free disk by the adapter.
+    # otherwise an adapter fix wouldn't be exercised remotely until the next release. ``cores`` is
+    # sized to the fold size by cores_for() — more RAM raises DuckDB's merge memory_limit (0.3x RAM)
+    # and delta_rs's max_spill_size (0.6x RAM), so less of a month-spanning merge spills to disk; the
+    # old "100 GB" wall was delta_rs's max_temp_directory_size default, now sized to ~80% of free disk.
     with RemoteRunner(
-        cores=REMOTE_CORES,
+        cores=cores,
         target="dev",
         pip_spec="git+https://github.com/djouallah/duckrun.git@main",
         fabric_token=os.environ["FABRIC_TOKEN"],
@@ -166,6 +181,8 @@ def main() -> int:
         # both facts and is folded in lockstep, so count it once (max of the two daily backlogs).
         backlog = max(sc_daily, pr_daily) + sc_today + pr_today
         remote = backlog > threshold
+        # The merge this run actually folds is capped by process_limit; size the SKU to that.
+        cores = cores_for(min(process_limit, backlog))
         print("[aemo] mart backlog — archive-log files not yet folded into the facts:", flush=True)
         print(f"[aemo]   fct_scada <- daily       : {sc_daily} unprocessed")
         print(f"[aemo]   fct_scada <- scada_today : {sc_today} unprocessed")
@@ -173,16 +190,17 @@ def main() -> int:
         print(f"[aemo]   fct_price <- price_today : {pr_today} unprocessed")
         print(f"[aemo]   FILES TO PROCESS (distinct): {backlog}  "
               f"(each build folds up to {process_limit}/source; downloads up to {download_limit}/source; "
-              f"remote cores={REMOTE_CORES})")
+              f"remote cores={cores})")
         why = f"{backlog} to process {'>' if remote else '<='} threshold={threshold}"
     except Exception as exc:  # any pre-flight failure — fail safe to remote, don't risk local OOM
         remote = True
-        why = f"pre-flight backlog count failed ({exc!r}); defaulting to remote"
+        cores = _MAX_CORES  # can't measure the backlog -> assume the worst case and give it headroom
+        why = f"pre-flight backlog count failed ({exc!r}); defaulting to remote at cores={cores}"
 
     mode = "REMOTE (Fabric)" if remote else "LOCAL (runner)"
     print(f"[aemo] {why} -> running {mode}", flush=True)
 
-    build, test = run_remote() if remote else run_local()
+    build, test = run_remote(cores) if remote else run_local()
 
     ok = True
     for label, (success, nodes) in (("build", build), ("test", test)):
