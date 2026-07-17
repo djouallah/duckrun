@@ -793,7 +793,7 @@ def run_taxi_demo(conn, schema):
     _part("Part 5 · loose files — conn.copy() / conn.download() (non-Delta, storage-neutral)",
           "Not everything is a Delta table: source drops, exports, sidecar files live in the lakehouse "
           "Files section. conn.copy()/conn.download() move a local folder tree to/from the store via "
-          "DuckDB's COPY … (FORMAT BLOB) — same secret as every read/write above, no extra dependency.")
+          "obstore — same storage_options as every read/write above, streamed (multipart for big files).")
 
     # 22 ── conn.copy(): export a result as a loose CSV and upload it to the Files section ──────────────
     with _step(22, "conn.copy(local_dir, 'demo_files/…'): export zone_scorecard to a local CSV, then "

@@ -202,10 +202,10 @@ jobs:
           COFFEE_ONELAKE_ROWS: "2000"
         run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_coffee_onelake -q -s -p no:cacheprovider
 
-      - name: OneLake Files copy/download round-trip (COPY … FORMAT BLOB, no obstore)
-        # The live gate for conn.copy()/conn.download(): the azure COPY (FORMAT BLOB) write path can't
-        # be proven off a laptop (different tenant), so it's proven here against the shared lakehouse's
-        # Files scratch (never Tables).
+      - name: OneLake Files copy/download round-trip (obstore streaming)
+        # The live gate for conn.copy()/conn.download(): the obstore write path against real OneLake
+        # can't be proven off a laptop (different tenant), so it's proven here against the shared
+        # lakehouse's Files scratch (never Tables).
         run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_onelake_files_copy_download_roundtrip -q -s -p no:cacheprovider
 
       - name: Connect over a FRIENDLY-name OneLake path (delta-kernel #307 error-hygiene gate)

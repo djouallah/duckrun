@@ -252,7 +252,7 @@ def test_coffee_onelake():
 )
 def test_onelake_files_copy_download_roundtrip(tmp_path):
     """The live gate for conn.copy()/conn.download() on OneLake — the offline suite can't prove the
-    azure COPY … (FORMAT BLOB) write path (a laptop's az session is a different tenant). Uploads a
+    obstore write path against real OneLake (a laptop's az session is a different tenant). Uploads a
     couple of files to the lakehouse **Files** scratch (never Tables), pulls them back, asserts the
     bytes round-trip. Writes under a per-run folder so concurrent branches don't collide."""
     conn = duckrun.connect(WAREHOUSE_PATH, storage_options={"bearer_token": ONELAKE_TOKEN},

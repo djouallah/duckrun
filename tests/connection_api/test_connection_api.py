@@ -103,7 +103,7 @@ class TestSession:
         assert "src" in {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
 
     def test_copy(self, conn, tmp_path):
-        # upload preserves the tree and honours the extension filter (COPY … FORMAT BLOB, no obstore).
+        # upload preserves the tree and honours the extension filter (streamed via obstore).
         src = tmp_path / "src"
         (src / "sub").mkdir(parents=True)
         (src / "a.csv").write_bytes(b"hello")
