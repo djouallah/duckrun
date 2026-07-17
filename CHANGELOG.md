@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.21]
+
+### Fixed
+- **MERGE no longer aborts at a hidden 100 GB disk-spill ceiling.** A wide MERGE (one that rewrites
+  many partitions) spills to disk, and the DataFusion `DiskManager` under delta-rs caps that spill at
+  a flat **100 GB regardless of disk size** — so a large merge failed with *"Resources exhausted … the
+  used disk space during the spilling process has exceeded the allowable limit of 100.0 GB"* even on a
+  machine with terabytes free. duckrun now sets `max_temp_directory_size` to **~80% of the free space
+  on the spill disk** on every merge (both the dbt incremental path and `conn.sql` `MERGE INTO`), so
+  the on-disk spill scales to the actual disk instead of a constant. Override per model with
+  `merge_max_temp_directory_size`. This is separate from the in-memory `max_spill_size` cap. See
+  [Limitations → Memory](docs/limitations.md).
+
 ## [0.4.20]
 
 ### Fixed
