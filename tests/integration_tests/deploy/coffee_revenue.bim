@@ -1,0 +1,88 @@
+{
+  "compatibilityLevel": 1604,
+  "model": {
+    "culture": "en-US",
+    "defaultPowerBIDataSourceVersion": "powerBI_V3",
+    "annotations": [
+      {
+        "name": "PBI_ProTooling",
+        "value": "[\"RemoteModeling\", \"DirectLakeOnOneLakeCreatedInDesktop\"]"
+      }
+    ],
+    "expressions": [
+      {
+        "name": "DirectLake",
+        "kind": "m",
+        "description": "Direct Lake connection to OneLake — reads Delta tables directly, no SQL endpoint. The workspace/lakehouse GUIDs below are placeholders; duckrun rewrites them at deploy time.",
+        "expression": [
+          "let",
+          "    Source = AzureStorage.DataLake(\"https://onelake.dfs.fabric.microsoft.com/00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000\", [HierarchicalNavigation=true])",
+          "in",
+          "    Source"
+        ]
+      }
+    ],
+    "tables": [
+      {
+        "name": "mart_revenue",
+        "description": "Coffee-shop revenue by product category and season (the coffee dbt project's revenue mart).",
+        "sourceLineageTag": "[dbo].[mart_revenue]",
+        "columns": [
+          {
+            "name": "category",
+            "dataType": "string",
+            "sourceColumn": "category",
+            "sourceLineageTag": "category",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "season",
+            "dataType": "string",
+            "sourceColumn": "season",
+            "sourceLineageTag": "season",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "order_lines",
+            "dataType": "int64",
+            "sourceColumn": "order_lines",
+            "sourceLineageTag": "order_lines",
+            "summarizeBy": "sum"
+          },
+          {
+            "name": "revenue",
+            "dataType": "double",
+            "formatString": "$#,##0.00",
+            "sourceColumn": "revenue",
+            "sourceLineageTag": "revenue",
+            "summarizeBy": "sum"
+          }
+        ],
+        "measures": [
+          {
+            "name": "Revenue",
+            "expression": "SUM(mart_revenue[revenue])",
+            "formatString": "$#,##0.00"
+          },
+          {
+            "name": "Orders",
+            "expression": "SUM(mart_revenue[order_lines])",
+            "formatString": "#,##0"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "mart_revenue",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "mart_revenue",
+              "expressionSource": "DirectLake",
+              "schemaName": "dbo"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

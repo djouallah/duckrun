@@ -1,0 +1,23 @@
+{
+  "$schema": "https://developer.microsoft.com/json-schemas/fabric/item/variableLibrary/definition/variables/1.0.0/schema.json",
+  "variables": [
+    {
+      "name": "workspace_id",
+      "note": "Target workspace GUID — set at deploy time",
+      "type": "String",
+      "value": ""
+    },
+    {
+      "name": "lakehouse_name",
+      "note": "Target lakehouse — set at deploy time",
+      "type": "String",
+      "value": ""
+    },
+    {
+      "name": "download_limit",
+      "note": "Example pipeline knob, left at its default",
+      "type": "String",
+      "value": "1000"
+    }
+  ]
+}
