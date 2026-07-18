@@ -41,7 +41,7 @@ from .fabric_remote import (
     _create_variable_library,
     _run_job_and_wait,
     _schedule_item,
-    _delete_item,
+    _delete_item_and_wait,
 )
 
 _WEEKDAYS = {d[:3].lower(): d for d in
@@ -236,7 +236,10 @@ class Workspace:
         if existing:
             if not overwrite:
                 raise RemoteRunError(f"an item named {name!r} already exists; pass overwrite=True to replace")
-            _delete_item(self._token, self.id, existing["id"])   # async; the recreate retries on 409
+            # Await the delete (and raise loudly if it fails) BEFORE recreating — a fire-and-forget
+            # delete races Fabric's async name-release into a 409, and a genuine delete failure would
+            # otherwise be swallowed and resurface as an opaque 409 on the recreate.
+            _delete_item_and_wait(self._token, self.id, existing["id"])
 
         if endpoint == "notebooks":
             return _create_notebook(self._token, self.id, name, json.loads(content))

@@ -670,6 +670,35 @@ def _delete_item(token: str, ws_id: str, item_id: str) -> None:
         _log(f"warning: could not delete temp notebook {item_id}: {exc}")
 
 
+def _delete_item_and_wait(token: str, ws_id: str, item_id: str) -> None:
+    """Delete an item and WAIT until the delete finalizes — for the ``deploy(overwrite=True)`` path,
+    which recreates the same name immediately after. Fabric's delete is a long-running op whose name
+    release lags the request, so a fire-and-forget delete races the recreate into a 409. Unlike
+    :func:`_delete_item` (best-effort teardown that only warns), this RAISES on a real delete failure,
+    so a stuck / undeletable item surfaces HERE with its actual status and body instead of as an
+    opaque 409 on the recreate. The recreate's own 409 retry (:func:`_create_item`) still covers the
+    brief residual name-release lag after a successful delete."""
+    resp = _http_request("DELETE", f"{_FABRIC_API}/workspaces/{ws_id}/items/{item_id}", token=token)
+    if resp.status_code in (200, 204):
+        return
+    if resp.status_code == 202:  # long-running delete — poll the operation to completion
+        location = resp.headers.get("Location")
+        if not location:
+            return
+        for _ in range(12):
+            _sleep(_POLL_INTERVAL)
+            r = _http_request("GET", location, token=token)
+            r.raise_for_status()
+            status = r.json().get("status")
+            if status == "Succeeded":
+                return
+            if status in ("Failed", "Undetermined"):
+                raise RemoteRunError(f"item delete failed: {r.json()}")
+        raise RemoteRunError(f"timed out deleting item {item_id}")
+    raise RemoteRunError(
+        f"could not delete item {item_id} (HTTP {resp.status_code}): {resp.text[:300]}")
+
+
 def read_result_json(files_url: str, storage_token: str) -> dict:
     """Read back the small result JSON the notebook wrote to OneLake Files, via a data-plane DFS
     GET (mirrors remote.py). ``files_url`` is the ``abfss://`` path of the result file."""
