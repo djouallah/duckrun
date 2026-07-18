@@ -41,7 +41,6 @@ from .fabric_remote import (
     _create_variable_library,
     _run_job_and_wait,
     _schedule_item,
-    _delete_item_and_wait,
 )
 
 _WEEKDAYS = {d[:3].lower(): d for d in
@@ -233,22 +232,21 @@ class Workspace:
             endpoint, content = self._json_artifact(source, content, variables)
 
         existing = next((it for it in self._items(endpoint) if it.get("displayName") == name), None)
-        if existing:
-            if not overwrite:
-                raise RemoteRunError(f"an item named {name!r} already exists; pass overwrite=True to replace")
-            # Await the delete (and raise loudly if it fails) BEFORE recreating — a fire-and-forget
-            # delete races Fabric's async name-release into a 409, and a genuine delete failure would
-            # otherwise be swallowed and resurface as an opaque 409 on the recreate.
-            _delete_item_and_wait(self._token, self.id, existing["id"])
+        if existing and not overwrite:
+            raise RemoteRunError(f"an item named {name!r} already exists; pass overwrite=True to replace")
+        # Overwrite UPDATES the existing item's definition in place (updateDefinition) rather than
+        # delete-then-recreate: the item id and its schedules survive, there is no async-delete name
+        # race, and a stuck/undeletable item can't block a redeploy. None → a fresh create.
+        item_id = existing["id"] if existing else None
 
         if endpoint == "notebooks":
-            return _create_notebook(self._token, self.id, name, json.loads(content))
+            return _create_notebook(self._token, self.id, name, json.loads(content), item_id=item_id)
         if endpoint == "dataPipelines":
-            return _create_pipeline(self._token, self.id, name, content)
+            return _create_pipeline(self._token, self.id, name, content, item_id=item_id)
         if endpoint == "variableLibraries":
-            return _create_variable_library(self._token, self.id, name, content)
-        # semanticModels → create, then refresh/reframe so it is live.
-        item_id = _create_semantic_model(self._token, self.id, name, content)
+            return _create_variable_library(self._token, self.id, name, content, item_id=item_id)
+        # semanticModels → create/update, then refresh/reframe so it is live.
+        item_id = _create_semantic_model(self._token, self.id, name, content, item_id=item_id)
         _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
 

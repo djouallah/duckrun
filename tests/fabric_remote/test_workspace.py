@@ -153,12 +153,12 @@ class DeployFabric:
     """Scripts the deploy sequence (list/create/delete + a Power BI refresh) and records every call."""
 
     def __init__(self, *, kind="notebooks", existing=None, refresh_status="Completed", lakehouses=None,
-                 delete_resp=None):
+                 update_resp=None):
         self.kind = kind                    # "notebooks" | "semanticModels" | "dataPipelines"
         self.existing = existing or []
         self.refresh_status = refresh_status
         self.lakehouses = lakehouses or []  # for the Direct Lake .bim repoint
-        self.delete_resp = delete_resp      # overwrite-path DELETE response (default 200 sync)
+        self.update_resp = update_resp      # overwrite-path updateDefinition response (default 200 sync)
         self.calls = []                     # (method, url, json_body)
 
     def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
@@ -169,12 +169,12 @@ class DeployFabric:
             return FakeResp(200, {"value": self.lakehouses})
         if method == "GET" and url.endswith(f"/workspaces/ws-guid/{self.kind}"):
             return FakeResp(200, {"value": self.existing})
+        if method == "POST" and url.endswith("/updateDefinition"):  # overwrite → update in place
+            return self.update_resp if self.update_resp is not None else FakeResp(200)
+        if method == "GET" and url == "u/upd-lro":                  # async updateDefinition LRO poll
+            return FakeResp(200, {"status": "Succeeded"})
         if method == "POST" and url.endswith(f"/workspaces/ws-guid/{self.kind}"):
             return FakeResp(201, {"id": "item-new"})
-        if method == "GET" and url == "u/del-lro":                  # overwrite delete LRO poll
-            return FakeResp(200, {"status": "Succeeded"})
-        if method == "DELETE" and "/items/" in url:
-            return self.delete_resp if self.delete_resp is not None else FakeResp(200)
         if method == "POST" and url.endswith("/refreshes"):
             return FakeResp(202)
         if method == "GET" and "/refreshes" in url:
@@ -490,36 +490,36 @@ def test_deploy_exists_without_overwrite_raises(_patch, tmp_path):
         _ws().deploy(src)
 
 
-def test_deploy_overwrite_deletes_then_creates(_patch, tmp_path):
+def test_deploy_overwrite_updates_in_place(_patch, tmp_path):
+    # Overwrite UPDATES the existing item's definition in place (updateDefinition) — no delete, no
+    # recreate. It returns the EXISTING id (identity + schedules survive) and never POSTs to the
+    # collection to create a new item.
     fake = _patch(DeployFabric(kind="notebooks", existing=[{"displayName": "etl", "id": "old"}]))
     src = _write(tmp_path, "etl.ipynb", json.dumps({"nbformat": 4}))
-    assert _ws().deploy(src, overwrite=True) == "item-new"
-    assert [m for m, _, _ in fake.calls if m in ("DELETE", "POST")] == ["DELETE", "POST"]
+    assert _ws().deploy(src, overwrite=True) == "old"          # existing id preserved
+    assert not any(m == "DELETE" for m, _, _ in fake.calls)    # no delete-then-recreate
+    assert any(m == "POST" and u.endswith("/notebooks/old/updateDefinition") for m, u, _ in fake.calls)
+    assert not any(m == "POST" and u.endswith("/workspaces/ws-guid/notebooks") for m, u, _ in fake.calls)
 
 
-def test_deploy_overwrite_awaits_async_delete_before_create(_patch, tmp_path):
-    # A 202 delete is a long-running op: deploy must poll it to Succeeded BEFORE recreating (else the
-    # recreate races the name release into a 409). DELETE -> GET(lro) -> POST, in that order.
+def test_deploy_overwrite_awaits_async_update(_patch, tmp_path):
+    # A 202 updateDefinition is a long-running op: deploy polls it to Succeeded before returning.
     fake = _patch(DeployFabric(
         kind="notebooks", existing=[{"displayName": "etl", "id": "old"}],
-        delete_resp=FakeResp(202, headers={"Location": "u/del-lro"})))
+        update_resp=FakeResp(202, headers={"Location": "u/upd-lro"})))
     src = _write(tmp_path, "etl.ipynb", json.dumps({"nbformat": 4}))
-    assert _ws().deploy(src, overwrite=True) == "item-new"
-    seq = [m for m, u, _ in fake.calls if m == "DELETE" or (m == "GET" and u == "u/del-lro") or
-           (m == "POST" and u.endswith("/notebooks"))]
-    assert seq == ["DELETE", "GET", "POST"]        # awaited the delete LRO, then created
+    assert _ws().deploy(src, overwrite=True) == "old"
+    assert any(m == "GET" and u == "u/upd-lro" for m, u, _ in fake.calls)   # awaited the update LRO
 
 
-def test_deploy_overwrite_delete_failure_raises_loudly(_patch, tmp_path):
-    # The deploy #? bug: the pre-existing item's DELETE returned HTTP 400 and was swallowed as a
-    # warning, so the recreate 409'd opaquely. A real delete failure must surface HERE, with the body.
+def test_deploy_overwrite_update_failure_raises_loudly(_patch, tmp_path):
+    # A real update failure must surface with its body, not be swallowed.
     fake = _patch(DeployFabric(
         kind="notebooks", existing=[{"displayName": "etl", "id": "old"}],
-        delete_resp=FakeResp(400, text="item is in use")))
+        update_resp=FakeResp(400, text="bad definition")))
     src = _write(tmp_path, "etl.ipynb", json.dumps({"nbformat": 4}))
-    with pytest.raises(fr.RemoteRunError, match="could not delete item.*400.*item is in use"):
+    with pytest.raises(fr.RemoteRunError, match="could not update.*400.*bad definition"):
         _ws().deploy(src, overwrite=True)
-    assert not any(m == "POST" and u.endswith("/notebooks") for m, u, _ in fake.calls)  # never recreated
 
 
 def test_deploy_unsupported_extension_raises(_patch, tmp_path):

@@ -461,38 +461,49 @@ def _b64_part(path: str, content) -> dict:
 
 
 def _create_item(token: str, ws_id: str, endpoint: str, name: str, parts: List[dict],
-                 fmt: Optional[str] = None) -> str:
-    """Create a Fabric item from an inline base64 definition; return its item id. Handles both the
-    synchronous 201 and the long-running-operation 202 (poll the ``Location`` until done). ``endpoint``
-    is the item collection (e.g. ``"notebooks"`` / ``"semanticModels"``); ``parts`` are ``_b64_part``
-    dicts; ``fmt`` is the definition ``format`` when the item type needs one (notebooks: ``"ipynb"``)."""
+                 fmt: Optional[str] = None, item_id: Optional[str] = None) -> str:
+    """Create a Fabric item from an inline base64 definition, or — when ``item_id`` is given — UPDATE
+    that existing item's definition in place; return the item id. Handles both the synchronous 200/201
+    and the long-running-operation 202 (poll to done). ``endpoint`` is the item collection (e.g.
+    ``"notebooks"`` / ``"semanticModels"``); ``parts`` are ``_b64_part`` dicts; ``fmt`` is the
+    definition ``format`` when the item type needs one (notebooks: ``"ipynb"``).
+
+    Overwrite goes through ``updateDefinition`` (not delete-then-recreate): the item id and its
+    schedules survive, there is no async-delete name-release race, and a stuck/undeletable item can't
+    block a redeploy. ``updateMetadata`` is deliberately NOT sent, so only the definition content is
+    replaced — the item's identity (displayName / logicalId) is left untouched."""
     definition = {"parts": parts}
     if fmt:
         definition["format"] = fmt
-    body = {"displayName": name, "definition": definition}
-    url = f"{_FABRIC_API}/workspaces/{ws_id}/{endpoint}"
-    # A 409 here means the name is still in use — Fabric's delete is a long-running op whose name
-    # release lags the item dropping from the listing, so an overwrite's recreate can race it. Retry.
-    for attempt in range(12):
-        resp = _http_request("POST", url, token=token, json_body=body)
+    if item_id is not None:
+        url = f"{_FABRIC_API}/workspaces/{ws_id}/{endpoint}/{item_id}/updateDefinition"
+        resp = _http_request("POST", url, token=token, json_body={"definition": definition})
         if resp.status_code in (200, 201):
-            return resp.json()["id"]
+            return item_id
         if resp.status_code == 202:
-            return _await_lro_item_id(token, resp)
-        if resp.status_code == 409 and attempt < 11:
-            _sleep(_POLL_INTERVAL)
-            continue
-        resp.raise_for_status()
-        raise RemoteRunError(f"unexpected status {resp.status_code} creating {endpoint}: {resp.text[:200]}")
+            _await_operation(token, resp.headers.get("Location"))
+            return item_id
+        raise RemoteRunError(
+            f"could not update {endpoint} {item_id} (HTTP {resp.status_code}): {resp.text[:300]}")
+    body = {"displayName": name, "definition": definition}
+    resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{ws_id}/{endpoint}", token=token, json_body=body)
+    if resp.status_code in (200, 201):
+        return resp.json()["id"]
+    if resp.status_code == 202:
+        return _await_lro_item_id(token, resp)
+    resp.raise_for_status()
+    raise RemoteRunError(f"unexpected status {resp.status_code} creating {endpoint}: {resp.text[:200]}")
 
 
-def _create_notebook(token: str, ws_id: str, name: str, notebook: dict) -> str:
-    """Create a notebook item from an inline base64 ipynb definition; return its item id."""
+def _create_notebook(token: str, ws_id: str, name: str, notebook: dict,
+                     item_id: Optional[str] = None) -> str:
+    """Create a notebook item from an inline base64 ipynb definition (or update ``item_id`` in place);
+    return its item id."""
     parts = [
         _b64_part("notebook-content.ipynb", notebook),
         _b64_part(".platform", _platform_part(name, "Notebook")),
     ]
-    return _create_item(token, ws_id, "notebooks", name, parts, fmt="ipynb")
+    return _create_item(token, ws_id, "notebooks", name, parts, fmt="ipynb", item_id=item_id)
 
 
 # Fabric requires this small settings part alongside a TMSL model.bim; supplied internally.
@@ -507,20 +518,23 @@ _POWERBI_API = "https://api.powerbi.com/v1.0/myorg"
 _REFRESH_DONE = {"Completed", "Failed", "Cancelled", "Disabled"}
 
 
-def _create_semantic_model(token: str, ws_id: str, name: str, model_bim: bytes) -> str:
-    """Create a semantic model from a TMSL ``model.bim`` (raw file bytes); return its item id."""
+def _create_semantic_model(token: str, ws_id: str, name: str, model_bim: bytes,
+                           item_id: Optional[str] = None) -> str:
+    """Create a semantic model from a TMSL ``model.bim`` (raw file bytes), or update ``item_id`` in
+    place; return its item id."""
     parts = [_b64_part("model.bim", model_bim), _b64_part("definition.pbism", _PBISM)]
-    return _create_item(token, ws_id, "semanticModels", name, parts)
+    return _create_item(token, ws_id, "semanticModels", name, parts, item_id=item_id)
 
 
-def _create_pipeline(token: str, ws_id: str, name: str, pipeline_json: bytes) -> str:
-    """Create a data pipeline from a ``pipeline-content.json`` (raw file bytes); return its item id.
-    The JSON is shipped verbatim — no id/reference rewriting."""
+def _create_pipeline(token: str, ws_id: str, name: str, pipeline_json: bytes,
+                     item_id: Optional[str] = None) -> str:
+    """Create a data pipeline from a ``pipeline-content.json`` (raw file bytes), or update ``item_id``
+    in place; return its item id. The JSON is shipped verbatim — no id/reference rewriting."""
     parts = [
         _b64_part("pipeline-content.json", pipeline_json),
         _b64_part(".platform", _platform_part(name, "DataPipeline")),
     ]
-    return _create_item(token, ws_id, "dataPipelines", name, parts)
+    return _create_item(token, ws_id, "dataPipelines", name, parts, item_id=item_id)
 
 
 # Fabric requires a settings part alongside variables.json; supplied internally (no value sets).
@@ -530,13 +544,15 @@ _VARLIB_SETTINGS = {
 }
 
 
-def _create_variable_library(token: str, ws_id: str, name: str, variables_json: bytes) -> str:
-    """Create a variable library from a ``variables.json`` (raw file bytes); return its item id."""
+def _create_variable_library(token: str, ws_id: str, name: str, variables_json: bytes,
+                             item_id: Optional[str] = None) -> str:
+    """Create a variable library from a ``variables.json`` (raw file bytes), or update ``item_id`` in
+    place; return its item id."""
     parts = [
         _b64_part("variables.json", variables_json),
         _b64_part("settings.json", _VARLIB_SETTINGS),
     ]
-    return _create_item(token, ws_id, "variableLibraries", name, parts)
+    return _create_item(token, ws_id, "variableLibraries", name, parts, item_id=item_id)
 
 
 # A freshly created Direct Lake model's OneLake read permission propagates asynchronously — Microsoft
@@ -670,33 +686,22 @@ def _delete_item(token: str, ws_id: str, item_id: str) -> None:
         _log(f"warning: could not delete temp notebook {item_id}: {exc}")
 
 
-def _delete_item_and_wait(token: str, ws_id: str, item_id: str) -> None:
-    """Delete an item and WAIT until the delete finalizes — for the ``deploy(overwrite=True)`` path,
-    which recreates the same name immediately after. Fabric's delete is a long-running op whose name
-    release lags the request, so a fire-and-forget delete races the recreate into a 409. Unlike
-    :func:`_delete_item` (best-effort teardown that only warns), this RAISES on a real delete failure,
-    so a stuck / undeletable item surfaces HERE with its actual status and body instead of as an
-    opaque 409 on the recreate. The recreate's own 409 retry (:func:`_create_item`) still covers the
-    brief residual name-release lag after a successful delete."""
-    resp = _http_request("DELETE", f"{_FABRIC_API}/workspaces/{ws_id}/items/{item_id}", token=token)
-    if resp.status_code in (200, 204):
+def _await_operation(token: str, location: Optional[str]) -> None:
+    """Poll a Fabric long-running operation (no item-id result — e.g. ``updateDefinition``) to
+    ``Succeeded``; raise on ``Failed`` or timeout. No-op when there's no ``Location`` to poll."""
+    if not location:
         return
-    if resp.status_code == 202:  # long-running delete — poll the operation to completion
-        location = resp.headers.get("Location")
-        if not location:
+    deadline_polls = _POLL_TIMEOUT // max(_POLL_INTERVAL, 1)
+    for _ in range(int(deadline_polls) + 1):
+        _sleep(_POLL_INTERVAL)
+        r = _http_request("GET", location, token=token)
+        r.raise_for_status()
+        status = r.json().get("status")
+        if status == "Succeeded":
             return
-        for _ in range(12):
-            _sleep(_POLL_INTERVAL)
-            r = _http_request("GET", location, token=token)
-            r.raise_for_status()
-            status = r.json().get("status")
-            if status == "Succeeded":
-                return
-            if status in ("Failed", "Undetermined"):
-                raise RemoteRunError(f"item delete failed: {r.json()}")
-        raise RemoteRunError(f"timed out deleting item {item_id}")
-    raise RemoteRunError(
-        f"could not delete item {item_id} (HTTP {resp.status_code}): {resp.text[:300]}")
+        if status in ("Failed", "Undetermined"):
+            raise RemoteRunError(f"operation failed: {r.json()}")
+    raise RemoteRunError("timed out waiting for operation")
 
 
 def read_result_json(files_url: str, storage_token: str) -> dict:
