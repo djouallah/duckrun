@@ -1,4 +1,4 @@
-name: deploy
+name: deploy_to_fabric
 
 # A manual, end-to-end test of the duckrun.workspace(...) deploy surface against a REAL-WORLD Fabric
 # project. Parity-style (like tests/parity_tests/): clone github.com/djouallah/dbt_fabric_python_delta

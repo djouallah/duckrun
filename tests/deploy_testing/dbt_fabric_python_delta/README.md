@@ -27,4 +27,4 @@ ws.schedule("run", daily="06:00")
   never modified.
 - **The DataPipeline is skipped.** It references the notebook by GUID and `ws.deploy` writes pipeline
   JSON verbatim (no notebook-ref repoint), so the notebook is scheduled directly instead.
-- **CI-only** (needs Fabric + OIDC): **Actions → deploy → Run workflow**.
+- **CI-only** (needs Fabric + OIDC): **Actions → deploy_to_fabric → Run workflow**.

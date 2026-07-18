@@ -12,6 +12,6 @@ by name, no `fab` CLI. Two projects, each in its own folder:
 - **[coffee/](coffee/) — a self-contained example.** Hand-authored assets, no external clone; a
   minimal illustration of the same API. Not run by the workflow.
 
-Both write a shared Fabric workspace, so [the workflow](../../.github/workflows/deploy.yml) is manual
+Both write a shared Fabric workspace, so [the workflow](../../.github/workflows/deploy_to_fabric.yml) is manual
 and serialized, and authenticates via OIDC only (`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`) — duckrun mints
 every token it needs (storage, Fabric control plane, Power BI) itself.
