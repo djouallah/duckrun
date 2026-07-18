@@ -9,13 +9,13 @@ deploy entirely through `duckrun.workspace(...)`.
 
 ```python
 ws = duckrun.workspace(os.environ["FABRIC_WORKSPACE"])
-lh_id = ws.create_lakehouse("deploy_demo")
+lh_id = ws.create_lakehouse("data")   # created if it doesn't already exist (idempotent)
 # ... build the cloned repo's dbt project on the runner via duckrun (→ OneLake Delta) ...
 ws.deploy(".../run.Notebook/notebook-content.ipynb", name="run", overwrite=True)
 ws.deploy(".../deploy_config.VariableLibrary/variables.json", name="deploy_config",
-          variables={"workspace_id": ws.id, "lakehouse_name": "deploy_demo"}, overwrite=True)
+          variables={"workspace_id": ws.id, "lakehouse_name": "data"}, overwrite=True)
 ws.deploy(".../aemo_electricity.SemanticModel/model.bim", name="aemo_electricity",
-          lakehouse="deploy_demo", overwrite=True)   # repoint OneLake GUIDs + refresh
+          lakehouse="data", overwrite=True)   # repoint OneLake GUIDs + refresh
 ws.schedule("run", daily="06:00")
 ```
 

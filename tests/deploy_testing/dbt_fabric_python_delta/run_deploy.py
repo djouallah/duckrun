@@ -39,7 +39,7 @@ REPO_URL = "https://github.com/djouallah/dbt_fabric_python_delta"
 CLONE_DIR = Path("C:/tmp/dfpd") if os.name == "nt" else Path("/tmp/dfpd")
 FABRIC_ITEMS = CLONE_DIR / "fabric_items"
 DBT_DIR = CLONE_DIR / "dbt"
-LH_NAME = "deploy_demo"                 # dedicated/isolated; the .bim is repointed by GUID, not name
+LH_NAME = "data"                        # created if it doesn't exist (create_lakehouse is idempotent)
 DBT_SCHEMA = os.environ.get("DBT_SCHEMA", "mart")
 DOWNLOAD_LIMIT = os.environ.get("DOWNLOAD_LIMIT", "2")   # bound the AEMO ingest so the demo stays fast
 
@@ -65,7 +65,7 @@ def main():
         sh(["git", "clone", "--depth", "1", "--branch", "main", REPO_URL, str(CLONE_DIR)])
 
     ws = duckrun.workspace(os.environ["FABRIC_WORKSPACE"])
-    lh_id = ws.create_lakehouse(LH_NAME)
+    lh_id = ws.create_lakehouse(LH_NAME)   # creates the 'data' lakehouse if it doesn't already exist
     tables = f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh_id}/Tables"
     files = f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh_id}/Files"
 
