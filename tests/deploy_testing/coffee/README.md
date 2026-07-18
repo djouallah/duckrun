@@ -1,9 +1,8 @@
-# deploy — build a dbt project on Fabric, then deploy everything over it
+# coffee — a self-contained deploy example
 
-A manually-triggered (`workflow_dispatch`) end-to-end demo of the `duckrun.workspace(...)` deploy
-surface. It stages a **real dbt project** into a lakehouse, deploys a **notebook that runs it on
-Fabric compute**, then deploys a **Direct Lake semantic model + a pipeline + a variable library** over
-the built tables, runs the notebook, and schedules the pipeline — all by name, no `fab` CLI.
+A minimal illustration of the `duckrun.workspace(...)` deploy surface with hand-authored assets and no
+external clone. Kept as a reference; **not run by the workflow** (that runs
+[../dbt_fabric_python_delta/](../dbt_fabric_python_delta/)).
 
 ## The whole thing ([deploy.py](deploy.py))
 
@@ -14,7 +13,7 @@ ws = duckrun.workspace(os.environ["FABRIC_WORKSPACE"])
 lh = ws.create_lakehouse("deploy_demo")
 
 files = duckrun.connect(f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh}/Tables")
-files.copy("../coffee", "coffee")            # stage the coffee dbt project → Files/coffee
+files.copy("../../integration_tests/coffee", "coffee")   # stage the coffee dbt project → Files/coffee
 ws.deploy("build_coffee.ipynb")
 ws.run("build_coffee")                        # runs the dbt project ON Fabric → dbo.mart_revenue
 
@@ -40,12 +39,3 @@ ws.schedule("pipeline", daily="06:00")
 | [variables.json](variables.json) | a variable library | `workspace_id` / `lakehouse_name` injected at deploy time via `variables=` |
 
 5. **schedule** the pipeline daily.
-
-## Running it
-
-CI-only, on demand: **Actions → deploy → Run workflow**. It authenticates to Fabric via OIDC (service
-principal), mints the storage / Fabric / Power BI tokens, and runs `deploy.py`. The dbt build itself
-runs on **Fabric** (inside `build_coffee`), not on the runner.
-
-Idea for a richer next step: have `pipeline.json` orchestrate `build_coffee` (a notebook activity) and
-read its target from the variable library — then the whole thing is environment-agnostic and self-wiring.

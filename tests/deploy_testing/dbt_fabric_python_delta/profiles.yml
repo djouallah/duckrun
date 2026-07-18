@@ -1,0 +1,12 @@
+# Injected duckrun profile for the cloned aemo_electricity project (name matches its dbt_project.yml).
+# Passed via --profiles-dir so the repo is never modified. No storage_options / bearer_token: duckrun
+# self-acquires the OneLake token from the OIDC identity (AZURE_CLIENT_ID/AZURE_TENANT_ID).
+aemo_electricity:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      schema: "{{ env_var('DBT_SCHEMA', 'mart') }}"
+      root_path: "{{ env_var('ONELAKE_TABLES_PATH') }}"
+      settings:
+        preserve_insertion_order: false

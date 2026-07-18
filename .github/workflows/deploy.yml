@@ -1,9 +1,11 @@
 name: deploy
 
-# A manual, end-to-end demo of the duckrun.workspace(...) deploy surface. Stage the coffee dbt project
-# into a fresh lakehouse's Files, deploy a notebook that runs it ON Fabric, then deploy a Direct Lake
-# semantic model over the built tables + a pipeline + a variable library, and schedule the pipeline —
-# all from tests/integration_tests/deploy/deploy.py. Manual only; writes a shared workspace, so serialize.
+# A manual, end-to-end test of the duckrun.workspace(...) deploy surface against a REAL-WORLD Fabric
+# project. Parity-style (like tests/parity_tests/): clone github.com/djouallah/dbt_fabric_python_delta
+# fresh at runtime (nothing vendored), build its AEMO dbt project on the runner via duckrun (→ OneLake
+# Delta), then deploy its notebook + variable library + Direct Lake semantic model and schedule the
+# notebook — all via duckrun instead of that repo's `fab`-CLI deploy.py. From
+# tests/deploy_testing/dbt_fabric_python_delta/run_deploy.py. Manual only; writes a shared workspace, so serialize.
 on:
   workflow_dispatch:
 
@@ -18,6 +20,7 @@ concurrency:
 jobs:
   deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     env:
       FABRIC_WORKSPACE: 91588e42-0f1c-4e56-bcaa-cbf015b8f312
       # The only Azure inputs: the OIDC federated identity. duckrun mints every token it needs
@@ -26,10 +29,14 @@ jobs:
       # duckrun's deploy surface must stand on its own.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      # The OneLake read/write transport: the cloned project's on-run-start reads the first, and the
+      # DuckDB abfss:// read needs both (the extension's default transport fails the OneLake TLS handshake).
+      AZURE_TRANSPORT_OPTION_TYPE: curl
+      CURL_CA_INFO: /etc/ssl/certs/ca-certificates.crt
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install duckrun from the checkout and deploy (self-contained — tokens + transport via duckrun)
-        run: pip install -e ".[local]" && cd tests/integration_tests/deploy && python deploy.py
+      - name: Install duckrun from the checkout and deploy the cloned project (self-contained — tokens + transport via duckrun)
+        run: pip install -e ".[test]" && python tests/deploy_testing/dbt_fabric_python_delta/run_deploy.py

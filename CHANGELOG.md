@@ -13,7 +13,7 @@ All notable changes to this project will be documented in this file.
   Lake model at a lakehouse), `pipeline.json` Data Pipelines, and `variables.json` variable
   libraries (`deploy('variables.json', variables={...})`). Deployed items can be run and scheduled:
   `ws.run(name)` runs a notebook/pipeline and waits, and `ws.schedule(name, ...)` sets a Fabric
-  cron schedule. See `tests/integration_tests/deploy` for a full-project deploy demo.
+  cron schedule. See `tests/deploy_testing` for a full-project deploy demo.
 
 ### Changed
 - **OneLake/Fabric/Power BI auth is now self-acquiring via OIDC — `az login` is no longer required.**

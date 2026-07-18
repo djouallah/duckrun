@@ -17,7 +17,7 @@ lh = ws.create_lakehouse("deploy_demo")
 
 # stage the coffee dbt project into the lakehouse Files, then let a notebook run it ON Fabric
 files = duckrun.connect(f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh}/Tables")
-files.copy("../coffee", "coffee")
+files.copy("../../integration_tests/coffee", "coffee")
 ws.deploy("build_coffee.ipynb", overwrite=True)
 ws.run("build_coffee")                       # runs the dbt project on Fabric → dbo.mart_revenue
 

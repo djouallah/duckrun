@@ -30,7 +30,7 @@
 
 🗂️ **10 public methods** · deploy · run · schedule
 
-> Introspected from the shipped classes — the exact public surface of `duckrun.workspace()` and the `Workspace` handle it returns, signatures and all, not a hand-maintained list. It drives Microsoft Fabric (create lakehouses, deploy notebooks / semantic models / pipelines / variable libraries, run and schedule them) — see the [Workspace (Fabric)](workspace.md) page. Exercised by the manual deploy demo ([`tests/integration_tests/deploy`](../tests/integration_tests/deploy)).
+> Introspected from the shipped classes — the exact public surface of `duckrun.workspace()` and the `Workspace` handle it returns, signatures and all, not a hand-maintained list. It drives Microsoft Fabric (create lakehouses, deploy notebooks / semantic models / pipelines / variable libraries, run and schedule them) — see the [Workspace (Fabric)](workspace.md) page. Exercised by the manual deploy demo ([`tests/deploy_testing`](../tests/deploy_testing)).
 
 | Surface | Method | Parameters |
 | --- | --- | --- |

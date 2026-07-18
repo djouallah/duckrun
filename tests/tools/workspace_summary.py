@@ -11,7 +11,7 @@ the same signature/entry formatting from public_api.py so they can never disagre
 method's parameters are.
 
 Unlike the connection card there's no pass/fail badge: the Workspace surface talks to live Microsoft
-Fabric, so it's exercised by the manual deploy demo (tests/integration_tests/deploy), not a unit XML.
+Fabric, so it's exercised by the manual deploy demo (tests/deploy_testing), not a unit XML.
 """
 import inspect
 import os
@@ -60,7 +60,7 @@ def render():
             "hand-maintained list. It drives Microsoft Fabric (create lakehouses, deploy notebooks / "
             "semantic models / pipelines / variable libraries, run and schedule them) — see the "
             "[Workspace (Fabric)](workspace.md) page. Exercised by the manual deploy demo "
-            "([`tests/integration_tests/deploy`](../tests/integration_tests/deploy)).", ""]
+            "([`tests/deploy_testing`](../tests/deploy_testing)).", ""]
     out += ["| Surface | Method | Parameters |", "| --- | --- | --- |"]
     for surface, method, params in rows:
         if params in _MARKERS:
