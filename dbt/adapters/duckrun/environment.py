@@ -101,10 +101,28 @@ class DuckrunEnvironment(LocalEnvironment):
         # Swap dbt-duckdb's cursor wrapper for ours so raw DML on Delta relations is intercepted
         # on every cursor (connection-manager AND test-harness paths) — see DuckrunCursorWrapper.
         h = super().handle()  # initializes self.conn (+ mints the default catalog's secret)
+        self._ensure_default_secret()
         self._attach_catalogs()
         if isinstance(h, DuckDBConnectionWrapper):
             h._cursor = DuckrunCursorWrapper(h._cursor._cursor, self.creds)
         return h
+
+    def _ensure_default_secret(self) -> None:
+        """Mint the default catalog's DuckDB Azure secret from a SELF-ACQUIRED OneLake token.
+
+        dbt-duckdb's connection open (via the delta plugin's configure_connection) mints the secret
+        from the profile's ``storage_options`` VERBATIM — which is empty under pure-OIDC self-acquire,
+        so no read secret is minted and every in-model OneLake read (``delta_scan`` of ``{{ this }}``,
+        ``read_parquet`` of ``Files/``, a python model on the raw connection) authenticates
+        anonymously → ``Unauthorized`` (delta_scan falls back to Azure IMDS). ``root_for()`` resolves
+        the default root through ``_with_token``, which self-acquires for an abfss:// root the same way
+        the write path does — so reads and writes can't drift. No-op for local/az:// roots or when a
+        token is already present; a genuine abfss root with no acquirable token raises (fail loud —
+        better than a later opaque ``Unauthorized``)."""
+        if self.conn is None:
+            return
+        _, so = self.creds.root_for()   # self-acquires for an abfss:// default root
+        secret.ensure_azure_secret(self.conn, so)
 
     def _attach_catalogs(self) -> None:
         """ATTACH each declared (non-default) catalog as an in-memory DuckDB catalog and mint its
@@ -125,9 +143,11 @@ class DuckrunEnvironment(LocalEnvironment):
             try:
                 # A quoted identifier so an alias with odd characters can't break the ATTACH.
                 self.conn.execute(f'ATTACH IF NOT EXISTS \':memory:\' AS "{alias}"')
+                # Self-acquire for a token-less abfss:// catalog root (same as the default + write
+                # paths) so a pure-OIDC multi-catalog project can READ each Lakehouse, not just write.
                 secret.mint_scoped_secret(
-                    self.conn, secret.scoped_secret_name(alias),
-                    cfg.get("root_path"), cfg.get("storage_options"),
+                    self.conn, secret.scoped_secret_name(alias), cfg.get("root_path"),
+                    secret.with_onelake_token(cfg.get("root_path"), cfg.get("storage_options")),
                 )
             except Exception as e:  # best-effort: a bad attach shouldn't sink an otherwise-usable run
                 if os.environ.get("DUCKRUN_AUTH_DEBUG"):

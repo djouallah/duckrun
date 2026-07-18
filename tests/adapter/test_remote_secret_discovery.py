@@ -35,6 +35,9 @@ class _RecordingConn:
         self.sql.append(sql)
         return self
 
+    def close(self):  # LocalEnvironment.__del__ calls conn.close(); no-op for the fake
+        pass
+
 
 def test_ensure_azure_secret_mints_secret_from_bearer_token():
     conn = _RecordingConn()
@@ -58,6 +61,27 @@ def test_ensure_azure_secret_noop_without_token():
     assert secret.ensure_azure_secret(conn, {}) is False
     assert secret.ensure_azure_secret(conn, {"account_name": "x"}) is False
     assert conn.sql == []  # nothing executed when there's no token
+
+
+def test_default_read_secret_self_acquires_for_tokenless_abfss(monkeypatch):
+    # The OneLake read bug: a pure-OIDC (token-less) abfss profile minted NO DuckDB read secret at
+    # connection open, so every in-model delta_scan/read of OneLake 401'd. handle() now mints the
+    # default catalog's secret from a SELF-ACQUIRED token (creds.root_for -> with_onelake_token), so
+    # reads authenticate exactly like writes. This pins that the connection-open mint self-acquires.
+    from dbt.adapters.duckrun.credentials import DuckrunCredentials
+    from dbt.adapters.duckrun.environment import DuckrunEnvironment
+
+    monkeypatch.setattr("duckrun.auth.get_onelake_token", lambda: "OIDCTOK")
+    creds = DuckrunCredentials(
+        database="db", schema="mart", path=":memory:",
+        root_path="abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables",
+        storage_options=None)  # <-- no bearer_token: the pure-OIDC case
+    env = DuckrunEnvironment(creds)
+    env.conn = _RecordingConn()
+    env._ensure_default_secret()
+    joined = "\n".join(env.conn.sql).lower()
+    assert "create or replace secret duckrun_onelake" in joined
+    assert "oidctok" in joined  # the self-acquired token was minted into the read secret
 
 
 # ------------------------------------------------------------- azure HTTP transport
