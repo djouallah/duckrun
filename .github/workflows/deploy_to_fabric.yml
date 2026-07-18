@@ -1,13 +1,23 @@
 name: deploy_to_fabric
 
-# A manual, end-to-end test of the duckrun.workspace(...) deploy surface against a REAL-WORLD Fabric
-# project. Parity-style (like tests/parity_tests/): clone github.com/djouallah/dbt_fabric_python_delta
-# fresh at runtime (nothing vendored), build its AEMO dbt project on the runner via duckrun (→ OneLake
-# Delta), then deploy its notebook + variable library + Direct Lake semantic model and schedule the
-# notebook — all via duckrun instead of that repo's `fab`-CLI deploy.py. From
-# tests/deploy_testing/dbt_fabric_python_delta/run_deploy.py. Manual only; writes a shared workspace, so serialize.
+# A manual, end-to-end test of the duckrun.workspace(...) deploy surface. Pick a project via the
+# `project` input:
+#   aemo   — parity-style: clone github.com/djouallah/dbt_fabric_python_delta fresh at runtime
+#            (nothing vendored), build its AEMO dbt project on the runner via duckrun (→ OneLake
+#            Delta), then deploy its notebook + variable library + Direct Lake semantic model.
+#            (tests/deploy_testing/dbt_fabric_python_delta/run_deploy.py)
+#   coffee — the self-contained hand-authored example (tests/deploy_testing/coffee/deploy.py).
+# Both go via duckrun (no `fab` CLI). Manual only; writes a shared workspace, so serialize.
 on:
   workflow_dispatch:
+    inputs:
+      project:
+        description: "Which deploy project to run"
+        type: choice
+        options:
+          - aemo      # tests/deploy_testing/dbt_fabric_python_delta (clone + build + deploy)
+          - coffee    # tests/deploy_testing/coffee (self-contained example)
+        default: aemo
 
 permissions:
   contents: read
@@ -38,5 +48,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-      - name: Install duckrun from the checkout and deploy the cloned project (self-contained — tokens + transport via duckrun)
-        run: pip install -e ".[test]" && python tests/deploy_testing/dbt_fabric_python_delta/run_deploy.py
+      - name: Install duckrun and deploy the selected project (self-contained — tokens + transport via duckrun)
+        run: |
+          pip install -e ".[test]"
+          if [ "${{ inputs.project }}" = "coffee" ]; then
+            cd tests/deploy_testing/coffee && python deploy.py
+          else
+            python tests/deploy_testing/dbt_fabric_python_delta/run_deploy.py
+          fi
