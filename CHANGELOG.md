@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.23]
+
+### Fixed
+- **Token-less (pure-OIDC) profiles now authenticate OneLake *reads*, not just writes (issue #10).**
+  With a profile that omits `bearer_token` (relying on GitHub OIDC / azure-identity self-acquire),
+  duckrun self-acquired a token for the delta-rs *write* and for discovery, but the DuckDB Azure
+  secret used for *reads* was minted from the profile's `storage_options` verbatim — empty under
+  OIDC — so no read secret was ever created. Every in-model OneLake read (`delta_scan` of
+  `{{ this }}`, `read_parquet` of `Files/`, a python model on the connection) then authenticated
+  anonymously and failed with an opaque `Unauthorized` (delta_scan falling back to Azure IMDS). The
+  adapter now mints the read secret from a self-acquired token at connection open **and** per attached
+  catalog, so reads and writes authenticate through the same path.
+- **The GitHub-OIDC token exchange retries transient timeouts** (a single 15s timeout no longer loses
+  the token), and `with_onelake_token` no longer swallows an acquisition failure on an `abfss://` root
+  — a real token-fetch error surfaces with its actionable message instead of a later `Unauthorized`.
+
+### Changed
+- **`workspace.deploy(overwrite=True)` updates the item definition in place instead of
+  delete-then-recreate.** It now calls Fabric's `updateDefinition`, so the item id and its schedules
+  survive, there is no async-delete name-release race, and a stuck/undeletable item can't block a
+  redeploy. A genuine deploy/delete failure surfaces loudly (with the response body) rather than being
+  swallowed into an opaque `409 Conflict`.
+
 ## [0.4.22]
 
 ### Added

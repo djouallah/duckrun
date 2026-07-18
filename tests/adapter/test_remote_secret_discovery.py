@@ -84,6 +84,47 @@ def test_default_read_secret_self_acquires_for_tokenless_abfss(monkeypatch):
     assert "oidctok" in joined  # the self-acquired token was minted into the read secret
 
 
+def test_handle_wires_the_read_secret_mint(monkeypatch):
+    # Wiring guard: handle() MUST invoke the read-secret mint. This pins the exact omission that caused
+    # the #10 read bug — self-acquire was wired into writes/discovery/connect() but the adapter's
+    # connection-open read mint was never called. Removing _ensure_default_secret() from handle() (or
+    # never adding it) fails HERE, not silently in production against a token-less OneLake profile.
+    from dbt.adapters.duckrun.credentials import DuckrunCredentials
+    from dbt.adapters.duckrun.environment import DuckrunEnvironment
+    from dbt.adapters.duckdb.environments.local import LocalEnvironment
+
+    monkeypatch.setattr(LocalEnvironment, "handle", lambda self: None)  # no real DuckDB connection
+    creds = DuckrunCredentials(
+        database="db", schema="mart", path=":memory:",
+        root_path="abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables", storage_options=None)
+    env = DuckrunEnvironment(creds)
+    called = []
+    monkeypatch.setattr(env, "_ensure_default_secret", lambda: called.append("mint"))
+    monkeypatch.setattr(env, "_attach_catalogs", lambda: None)
+    env.handle()
+    assert called == ["mint"]  # handle() invoked the connection-open read-secret mint
+
+
+def test_attach_catalogs_self_acquires_for_tokenless_catalog(monkeypatch):
+    # The per-catalog read path: a token-less abfss:// catalog root must self-acquire before minting its
+    # scoped secret, so a pure-OIDC MULTI-Lakehouse project can READ each Lakehouse, not just write.
+    from dbt.adapters.duckrun.credentials import DuckrunCredentials
+    from dbt.adapters.duckrun.environment import DuckrunEnvironment
+
+    monkeypatch.setattr("duckrun.auth.get_onelake_token", lambda: "OIDCTOK")
+    creds = DuckrunCredentials(
+        database="db", schema="mart", path=":memory:",
+        root_path="abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables", storage_options=None,
+        catalogs={"bronze": {
+            "root_path": "abfss://ws@onelake.dfs.fabric.microsoft.com/bronze/Tables",
+            "storage_options": None}})   # <-- token-less catalog
+    env = DuckrunEnvironment(creds)
+    env.conn = _RecordingConn()
+    env._attach_catalogs()
+    joined = "\n".join(env.conn.sql).lower()
+    assert "oidctok" in joined  # the per-catalog secret self-acquired the OIDC token
+
+
 # ------------------------------------------------------------- azure HTTP transport
 
 def _transport_set(conn):
