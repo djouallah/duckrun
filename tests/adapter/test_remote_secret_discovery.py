@@ -301,6 +301,16 @@ def test_with_onelake_token_acquires_for_abfss_without_token(monkeypatch):
     assert out["bearer_token"] == "NBTOK"
 
 
+def test_with_onelake_token_propagates_acquire_failure_for_abfss(monkeypatch):
+    # issue #10: a swallowed token-fetch failure on an abfss root turns into an opaque
+    # "Unauthorized" downstream. The RuntimeError must surface as itself, not a silent no-op.
+    import duckrun.auth as auth
+    monkeypatch.setattr(auth, "get_onelake_token",
+                        lambda: (_ for _ in ()).throw(RuntimeError("token fetch timed out")))
+    with pytest.raises(RuntimeError, match="token fetch timed out"):
+        secret.with_onelake_token("abfss://x@h/y", {})
+
+
 def test_with_onelake_token_noop_when_token_present(monkeypatch):
     import duckrun.auth as auth
     monkeypatch.setattr(auth, "get_onelake_token",
@@ -419,3 +429,46 @@ def test_dfs_request_does_not_retry_404(monkeypatch):
         "abfss://duckrun@onelake.dfs.fabric.microsoft.com/root", "missing", {"bearer_token": "TOK"})
     assert names == []
     assert calls["n"] == 1
+
+
+# ------------------------------------------------- OIDC token-exchange retry (issue #10)
+
+class _FlakyCred:
+    """A ClientAssertionCredential stand-in whose get_token fails ``fail_first`` times, then
+    returns a token. ``calls`` records how many attempts were made across all instances."""
+    calls = {"n": 0}
+    fail_first = 0
+
+    def __init__(self, tenant_id, client_id, assertion):
+        pass
+
+    def get_token(self, scope):
+        _FlakyCred.calls["n"] += 1
+        if _FlakyCred.calls["n"] <= _FlakyCred.fail_first:
+            raise TimeoutError("The read operation timed out")
+        return type("T", (), {"token": "OIDCTOK"})()
+
+
+def _arm_oidc(monkeypatch, fail_first):
+    import duckrun.auth as auth
+    import azure.identity
+    _FlakyCred.calls = {"n": 0}
+    _FlakyCred.fail_first = fail_first
+    monkeypatch.setattr(azure.identity, "ClientAssertionCredential", _FlakyCred)
+    monkeypatch.setattr(auth, "_sleep", lambda s: None)  # no real waiting
+    monkeypatch.setenv("AZURE_CLIENT_ID", "cid")
+    monkeypatch.setenv("AZURE_TENANT_ID", "tid")
+    monkeypatch.setenv("ACTIONS_ID_TOKEN_REQUEST_URL", "https://gh/oidc")
+    return auth
+
+
+def test_github_oidc_token_retries_transient_then_succeeds(monkeypatch):
+    auth = _arm_oidc(monkeypatch, fail_first=1)  # 1st attempt times out, 2nd succeeds
+    assert auth._github_oidc_token() == "OIDCTOK"
+    assert _FlakyCred.calls["n"] == 2
+
+
+def test_github_oidc_token_returns_none_after_all_attempts_fail(monkeypatch):
+    auth = _arm_oidc(monkeypatch, fail_first=99)  # every attempt times out
+    assert auth._github_oidc_token() is None
+    assert _FlakyCred.calls["n"] == auth._OIDC_ATTEMPTS

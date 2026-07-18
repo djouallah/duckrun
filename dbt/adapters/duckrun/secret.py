@@ -85,15 +85,21 @@ def with_onelake_token(root_path: Optional[str],
     ``show`` / ``docs``) stop failing with "schema does not exist".
 
     Returns ``storage_options`` UNCHANGED for a non-OneLake store, when a token is already present,
-    or when none can be acquired — so local / ``az://`` / s3 / gcs paths are untouched.
+    or when the ``duckrun`` auth package isn't installed — so local / ``az://`` / s3 / gcs paths are
+    untouched.
+
+    For an ``abfss://`` root, a token acquisition *failure* (``RuntimeError``) is deliberately NOT
+    swallowed: with no token the subsequent OneLake read falls back to anonymous and dies with an
+    opaque ``Unauthorized`` (issue #10). Letting the acquisition error propagate surfaces the real
+    cause — a token-fetch timeout — with its actionable guidance instead.
     """
     if not str(root_path or "").startswith("abfss://") or bearer_token(storage_options):
         return storage_options
     try:
         from duckrun import auth  # lazy: keep the adapter importable without the connect package
-        token = auth.get_onelake_token()
-    except Exception:
-        return storage_options  # no live source (and not in a notebook) — leave it; discovery no-ops
+    except ImportError:
+        return storage_options  # connect package absent — nothing to acquire from; leave it untouched
+    token = auth.get_onelake_token()  # RuntimeError propagates: an abfss read with no token is fatal
     out = dict(storage_options or {})
     out["bearer_token"] = token
     return out

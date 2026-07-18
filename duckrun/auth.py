@@ -36,6 +36,16 @@ _POWERBI_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
 # Azure CLI's well-known public client id, used for the interactive/CLI fallbacks.
 _AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
 
+# GitHub-OIDC token exchange retries: the assertion fetch + AAD exchange is a short network hop that
+# intermittently times out inside a busy dbt process (see issue #10). A single 15s timeout must not
+# lose the whole token, so retry a couple of times with exponential backoff before giving up.
+_OIDC_ATTEMPTS = 3
+
+
+def _sleep(seconds: float) -> None:
+    """Indirection so tests can stub out the retry wait."""
+    time.sleep(seconds)
+
 # Per-scope token cache. get_*_token() mints a token once and reuses it across the process instead of
 # re-acquiring on every call — a dbt run over N catalogs mints a scoped secret + discovers + writes per
 # catalog, so without this the OIDC/token endpoint is hammered (and rate-limits, then a later call fails
@@ -140,11 +150,14 @@ def _github_oidc_token(scope: str = _STORAGE_SCOPE) -> Optional[str]:
         from azure.identity import ClientAssertionCredential
     except ImportError:
         return None
-    try:
-        cred = ClientAssertionCredential(tenant_id, client_id, _github_oidc_assertion)
-        return cred.get_token(scope).token
-    except Exception:
-        return None
+    cred = ClientAssertionCredential(tenant_id, client_id, _github_oidc_assertion)
+    for attempt in range(_OIDC_ATTEMPTS):
+        try:
+            return cred.get_token(scope).token
+        except Exception:
+            if attempt < _OIDC_ATTEMPTS - 1:
+                _sleep(float(2 ** attempt))  # 1s, 2s — ride out a transient endpoint timeout
+    return None
 
 
 def get_onelake_token() -> str:
