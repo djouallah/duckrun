@@ -36,7 +36,7 @@
 | --- | --- | --- |
 | `duckrun` | `workspace` | `workspace, token=None` |
 | `Workspace` | `create_lakehouse` | `name, schemas=True` |
-| `Workspace` | `deploy` | `source, lakehouse=None, variables=None, name=None, overwrite=False` |
+| `Workspace` | `deploy` | `source, lakehouse=None, variables=None, name=None, overwrite=False, notebook=None` |
 | `Workspace` | `display_name` | *property* |
 | `Workspace` | `id` | *accessor* |
 | `Workspace` | `lakehouse_id` | `name` |
