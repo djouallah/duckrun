@@ -192,7 +192,7 @@ class Workspace:
         raise RemoteRunError(f"unexpected status {resp.status_code} creating lakehouse: {resp.text[:200]}")
 
     def deploy(self, source: str, lakehouse: Optional[str] = None, variables: Optional[Dict] = None,
-               name: Optional[str] = None, overwrite: bool = False) -> str:
+               name: Optional[str] = None, overwrite: bool = False, notebook: Optional[str] = None) -> str:
         """Deploy a file artifact to the workspace; return its item id.
 
         ``source`` is a local file path or an ``http(s)`` URL (a raw file URL). The item type is keyed
@@ -207,13 +207,19 @@ class Workspace:
         when the model already targets a lakehouse in this workspace, or the workspace has exactly one;
         with several you must name it.
 
+        ``notebook`` (a notebook name in this workspace) points a **data pipeline**'s notebook
+        activities at that notebook: duckrun rewrites the ``notebookId`` / ``workspaceId`` GUIDs baked
+        into the pipeline JSON to that notebook's id and this workspace — so a pipeline authored
+        elsewhere runs here by NAME, no GUIDs to edit by hand. Deploy the notebook first. Omit it to
+        deploy the pipeline JSON verbatim.
+
         ``variables`` sets values in a **variable library** ``variables.json`` at deploy time
         (``{"lakehouse_name": "bronze", "workspace_id": ws.id, ...}``) — the environment-specific
         injection, without editing the file. An unknown variable name raises.
 
-        ``lakehouse`` / ``variables`` are ignored for artifact types they don't apply to. Not
-        idempotent: if an item of that name already exists it is replaced only when ``overwrite=True``,
-        otherwise this raises.
+        ``lakehouse`` / ``notebook`` / ``variables`` are ignored for artifact types they don't apply
+        to. Not idempotent: if an item of that name already exists it is replaced only when
+        ``overwrite=True``, otherwise this raises.
         """
         stem, ext = os.path.splitext(_basename(source))
         ext = ext.lower()
@@ -229,7 +235,7 @@ class Workspace:
             endpoint = "semanticModels"
             content = self._repoint_bim(content, lakehouse, source)   # resolve before any delete
         else:                                                          # .json → pipeline or variable library
-            endpoint, content = self._json_artifact(source, content, variables)
+            endpoint, content = self._json_artifact(source, content, variables, notebook)
 
         existing = next((it for it in self._items(endpoint) if it.get("displayName") == name), None)
         if existing and not overwrite:
@@ -250,13 +256,15 @@ class Workspace:
         _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
 
-    def _json_artifact(self, source: str, content: bytes, variables: Optional[Dict]):
+    def _json_artifact(self, source: str, content: bytes, variables: Optional[Dict],
+                       notebook: Optional[str] = None):
         """Resolve a ``.json`` source to ``(endpoint, content)`` by sniffing it — a data pipeline
         (``properties.activities``) or a variable library (``variables``); anything else raises.
-        Variable-library values are applied here."""
+        Pipeline notebook activities are repointed at ``notebook`` (by name) and variable-library
+        values are applied here."""
         obj = json.loads(content)
         if _is_pipeline_json(obj):
-            return "dataPipelines", content
+            return "dataPipelines", self._repoint_pipeline(content, notebook)
         if _is_variable_library_json(obj):
             return "variableLibraries", _apply_variables(obj, variables or {})
         raise RemoteRunError(
@@ -302,6 +310,38 @@ class Workspace:
         if len(hits) > 1:
             raise RemoteRunError(f"{target!r} matches multiple items; can't tell which")
         return hits[0]
+
+    def _repoint_pipeline(self, content: bytes, notebook: Optional[str]) -> bytes:
+        """Point a data pipeline's notebook activities at ``notebook`` (a notebook name in this
+        workspace): rewrite every ``TridentNotebook`` activity's ``notebookId`` to that notebook's id
+        and ``workspaceId`` to this workspace. So a pipeline authored elsewhere — its JSON carries the
+        source workspace/notebook GUIDs — runs here by NAME, exactly like ``_repoint_bim`` does for a
+        Direct Lake model. No-op (deploy verbatim) when ``notebook`` is None."""
+        if notebook is None:
+            return content
+        nb_id = self._notebook_id(notebook)
+        obj = json.loads(content)
+        activities = (obj.get("properties") or {}).get("activities") or []
+        repointed = 0
+        for act in activities:
+            if act.get("type") == "TridentNotebook":
+                tp = act.setdefault("typeProperties", {})
+                tp["notebookId"] = nb_id
+                tp["workspaceId"] = self.id
+                repointed += 1
+        if not repointed:
+            raise RemoteRunError(
+                f"pipeline has no TridentNotebook activity to point at notebook {notebook!r}")
+        return json.dumps(obj).encode("utf-8")
+
+    def _notebook_id(self, name: str) -> str:
+        """The notebook id for a notebook named ``name`` in this workspace; raises listing the real
+        names if there's no match (deploy the notebook before the pipeline that references it)."""
+        match = next((it for it in self._items("notebooks") if it.get("displayName") == name), None)
+        if match:
+            return match["id"]
+        have = ", ".join(sorted(it.get("displayName", "?") for it in self._items("notebooks"))) or "(none)"
+        raise RemoteRunError(f"notebook {name!r} not found in workspace {self.id}; have: {have}")
 
     def _repoint_bim(self, content: bytes, lakehouse: Optional[str], source: str) -> bytes:
         """Rewrite a Direct-Lake ``model.bim``'s OneLake workspace/lakehouse GUIDs to this workspace

@@ -9,14 +9,14 @@ built on the Fabric CLI (`fab`); this is the same deploy expressed entirely thro
 
 The flow:
   1. clone the repo,
-  2. build its dbt project on THIS runner through the duckrun adapter (writing Delta to OneLake) so
+  2. copy its dbt project into the lakehouse `Files/dbt` so the deployed notebook can run it INSIDE
+     Fabric (the scheduled pipeline runs `run` on Fabric compute, which reads the project from there),
+  3. build its dbt project on THIS runner through the duckrun adapter (writing Delta to OneLake) so
      the semantic model has tables to reframe onto,
-  3. deploy the notebook, variable library, and Direct Lake semantic model with `ws.deploy(...)`
-     (the `.bim`'s OneLake GUIDs are repointed at our lakehouse and the model is refreshed), and
-  4. schedule the notebook.
-
-The DataPipeline is deliberately skipped: it references the notebook by GUID and `ws.deploy` writes
-pipeline JSON verbatim (no notebook-ref repoint), so we schedule the notebook directly instead.
+  4. deploy the notebook, variable library, Direct Lake semantic model, and data pipeline with
+     `ws.deploy(...)` (the `.bim`'s OneLake GUIDs are repointed at our lakehouse and the model is
+     refreshed; the pipeline's notebook activities are pointed at the `run` notebook by name), and
+  5. schedule the pipeline.
 
 Auth: nothing is passed here. Given only the OIDC federated identity
 (`AZURE_CLIENT_ID`/`AZURE_TENANT_ID`), duckrun mints every token it needs — storage (the dbt write),
@@ -69,8 +69,16 @@ def main():
     tables = f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh_id}/Tables"
     files = f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh_id}/Files"
 
-    # 1. Build the AEMO dbt project on this runner via duckrun (parity-style): our profiles.yml here
-    #    (self-acquire, no token) via --profiles-dir; the repo's macros/profile read these env vars.
+    # 1. Stage the cloned dbt project into the lakehouse Files so the deployed notebook can run it
+    #    INSIDE Fabric: the scheduled pipeline runs `run` on Fabric compute, which chdir's to its
+    #    mounted Files/dbt and invokes dbt there (`--profiles-dir .`). Without this the notebook has no
+    #    project to run. Copy the CLONED repo's dbt/ (its OWN profiles.yml, not ours) → Files/dbt,
+    #    BEFORE the runner build so no build artifacts are staged. A /Tables connection maps to /Files.
+    duckrun.connect(tables).copy(str(DBT_DIR), "dbt")
+
+    # 2. Build the AEMO dbt project on this runner via duckrun (parity-style), to populate the tables
+    #    the semantic model reframes onto: our profiles.yml here (self-acquire, no token) via
+    #    --profiles-dir; the repo's macros/profile read these env vars.
     env = {**os.environ,
            "DBT_PROFILES_DIR": str(HERE),
            "ONELAKE_TABLES_PATH": tables,
@@ -81,19 +89,22 @@ def main():
         "--vars", json.dumps({"download_limit": DOWNLOAD_LIMIT, "process_limit": DOWNLOAD_LIMIT})],
        cwd=DBT_DIR, env=env)
 
-    # 2. Deploy the Fabric items over the built tables — all by name, no `fab` CLI.
+    # 3. Deploy the Fabric items over the built tables — all by name, no `fab` CLI. Notebook first, so
+    #    the pipeline can point its notebook activities at it by name (duckrun resolves name → id).
     nb_path, nb_name = fabric_item("Notebook", "notebook-content.ipynb")
     vl_path, vl_name = fabric_item("VariableLibrary", "variables.json")
     sm_path, sm_name = fabric_item("SemanticModel", "model.bim")
+    pl_path, pl_name = fabric_item("DataPipeline", "pipeline-content.json")
 
     ws.deploy(str(nb_path), name=nb_name, overwrite=True)
     ws.deploy(str(vl_path), name=vl_name, overwrite=True,
               variables={"workspace_id": ws.id, "lakehouse_name": LH_NAME})
     ws.deploy(str(sm_path), name=sm_name, lakehouse=LH_NAME, overwrite=True)  # repoint GUIDs + refresh
+    ws.deploy(str(pl_path), name=pl_name, notebook=nb_name, overwrite=True)   # point activities at 'run' by name
 
-    # 3. Schedule the notebook (the pipeline is skipped — see module docstring).
-    ws.schedule(nb_name, daily="06:00")
-    print(f"\nDEPLOY: OK — {nb_name} / {vl_name} / {sm_name} deployed to {ws.name}/{LH_NAME}")
+    # 4. Schedule the pipeline (it orchestrates the notebook).
+    ws.schedule(pl_name, daily="06:00")
+    print(f"\nDEPLOY: OK — {nb_name} / {vl_name} / {sm_name} / {pl_name} deployed to {ws.name}/{LH_NAME}")
 
 
 if __name__ == "__main__":

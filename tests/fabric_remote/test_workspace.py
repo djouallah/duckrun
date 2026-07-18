@@ -453,6 +453,42 @@ def test_deploy_pipeline_from_path(_patch, tmp_path):
     assert {p["path"] for p in body["definition"]["parts"]} == {"pipeline-content.json", ".platform"}
 
 
+def test_repoint_pipeline_points_notebook_by_name(_patch):
+    # A pipeline authored elsewhere carries the SOURCE workspace/notebook GUIDs. notebook="run" rewrites
+    # every TridentNotebook activity to the deployed 'run' notebook's id + this workspace — by name, no
+    # GUID surgery. Non-notebook activities are left untouched.
+    _patch(DeployFabric(kind="notebooks", existing=[{"displayName": "run", "id": "nb-123"}]))
+    ws = _ws()
+    pipeline = json.dumps({"properties": {"activities": [
+        {"type": "TridentNotebook", "typeProperties": {"notebookId": "SRC-NB", "workspaceId": "SRC-WS"}},
+        {"type": "Wait", "typeProperties": {"waitTimeInSeconds": 1}},
+    ]}}).encode()
+    acts = json.loads(ws._repoint_pipeline(pipeline, "run"))["properties"]["activities"]
+    assert acts[0]["typeProperties"] == {"notebookId": "nb-123", "workspaceId": "ws-guid"}
+    assert acts[1] == {"type": "Wait", "typeProperties": {"waitTimeInSeconds": 1}}   # untouched
+
+
+def test_repoint_pipeline_none_is_verbatim(_patch):
+    _patch(DeployFabric(kind="notebooks"))
+    content = json.dumps({"properties": {"activities": []}}).encode()
+    assert _ws()._repoint_pipeline(content, None) is content   # no notebook → deploy the JSON as-is
+
+
+def test_repoint_pipeline_unknown_notebook_raises(_patch):
+    _patch(DeployFabric(kind="notebooks", existing=[]))
+    pipeline = json.dumps({"properties": {"activities": [
+        {"type": "TridentNotebook", "typeProperties": {}}]}}).encode()
+    with pytest.raises(fr.RemoteRunError, match="notebook 'run' not found"):
+        _ws()._repoint_pipeline(pipeline, "run")
+
+
+def test_repoint_pipeline_no_notebook_activity_raises(_patch):
+    _patch(DeployFabric(kind="notebooks", existing=[{"displayName": "run", "id": "nb-123"}]))
+    pipeline = json.dumps({"properties": {"activities": [{"type": "Wait", "typeProperties": {}}]}}).encode()
+    with pytest.raises(fr.RemoteRunError, match="no TridentNotebook activity"):
+        _ws()._repoint_pipeline(pipeline, "run")
+
+
 def test_deploy_unrecognized_json_raises(_patch, tmp_path):
     fake = _patch(DeployFabric(kind="dataPipelines"))
     src = _write(tmp_path, "config.json", json.dumps({"foo": "bar"}))   # neither pipeline nor varlib
