@@ -83,9 +83,10 @@ def _fabric_token() -> Optional[str]:
     return None
 
 
-def _azure_identity_token(interactive: bool = True) -> Optional[str]:
-    """A storage token via azure-identity; None if the optional dependency is missing or every
-    credential fails.
+def _azure_identity_token(scope: str = _STORAGE_SCOPE, interactive: bool = True) -> Optional[str]:
+    """An Azure AD token for ``scope`` via azure-identity; None if the optional dependency is missing
+    or every credential fails. ``scope`` selects the audience — storage (default), the Fabric control
+    plane, or Power BI — so one credential chain serves all three.
 
     Non-interactive sources (``AzureCliCredential``) are always tried. ``InteractiveBrowserCredential``
     is only appended when ``interactive`` is True AND we're attached to a TTY — never on a headless
@@ -105,7 +106,7 @@ def _azure_identity_token(interactive: bool = True) -> Optional[str]:
             pass
     for credential in credentials:
         try:
-            return credential().get_token(_STORAGE_SCOPE).token
+            return credential().get_token(scope).token
         except Exception:
             continue
     return None
@@ -196,7 +197,7 @@ def get_fabric_token() -> str:
         _notebook_fabric_api_token()
         or _github_oidc_token(_FABRIC_SCOPE)
         or os.environ.get("FABRIC_TOKEN")
-        or _azure_identity_fabric_token()
+        or _azure_identity_token(_FABRIC_SCOPE)
     ))
     if token:
         return token
@@ -222,29 +223,6 @@ def _notebook_fabric_api_token() -> Optional[str]:
         return None
 
 
-def _azure_identity_fabric_token(interactive: bool = True) -> Optional[str]:
-    """A Fabric control-plane token via azure-identity; None if azure-identity is missing or every
-    credential fails. Same credential selection as :func:`_azure_identity_token`, but for the Fabric
-    scope instead of storage."""
-    try:
-        from azure.identity import AzureCliCredential
-    except ImportError:
-        return None
-    credentials = [AzureCliCredential]
-    if interactive and sys.stdin.isatty():
-        try:
-            from azure.identity import InteractiveBrowserCredential
-            credentials.append(InteractiveBrowserCredential)
-        except ImportError:
-            pass
-    for credential in credentials:
-        try:
-            return credential().get_token(_FABRIC_SCOPE).token
-        except Exception:
-            continue
-    return None
-
-
 def get_powerbi_token() -> str:
     """Return a Power BI REST token (``api.powerbi.com`` scope), trying the Fabric notebook runtime →
     ``POWERBI_TOKEN`` env → azure-identity (Azure CLI) in turn.
@@ -258,7 +236,7 @@ def get_powerbi_token() -> str:
         _notebook_fabric_api_token()
         or _github_oidc_token(_POWERBI_SCOPE)
         or os.environ.get("POWERBI_TOKEN")
-        or _azure_identity_powerbi_token()
+        or _azure_identity_token(_POWERBI_SCOPE)
     ))
     if token:
         return token
@@ -268,28 +246,6 @@ def get_powerbi_token() -> str:
         "optional dependency (`pip install duckrun[local]`) and run "
         "`az login --scope https://analysis.windows.net/powerbi/api/.default`."
     )
-
-
-def _azure_identity_powerbi_token(interactive: bool = True) -> Optional[str]:
-    """A Power BI token via azure-identity; None if azure-identity is missing or every credential
-    fails. Same credential selection as :func:`_azure_identity_token`, but for the Power BI scope."""
-    try:
-        from azure.identity import AzureCliCredential
-    except ImportError:
-        return None
-    credentials = [AzureCliCredential]
-    if interactive and sys.stdin.isatty():
-        try:
-            from azure.identity import InteractiveBrowserCredential
-            credentials.append(InteractiveBrowserCredential)
-        except ImportError:
-            pass
-    for credential in credentials:
-        try:
-            return credential().get_token(_POWERBI_SCOPE).token
-        except Exception:
-            continue
-    return None
 
 
 def _token_expiry_epoch(token: str) -> Optional[float]:
