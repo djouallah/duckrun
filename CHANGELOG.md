@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.24]
+
 ### Added
 - **Folder deploy**: `ws.deploy("fabric_items")` now accepts a folder in the Fabric
   git-integration layout (`name.ItemType/` subfolders with `.platform` files) and deploys every
