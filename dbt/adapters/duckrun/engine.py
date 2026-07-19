@@ -7,6 +7,7 @@ C-stream interface (``__arrow_c_stream__``), which DuckDB relations do — so th
 pyarrow dependency.
 """
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -746,6 +747,15 @@ def _delta_table(path: str, storage_options: Optional[Dict[str, str]]) -> DeltaT
     return DeltaTable(path)
 
 
+def tmp_name(tag: str, key) -> str:
+    """A deterministic temp-relation name for ``key`` (a table location or identifier tuple): a
+    12-hex-digit SHA-1 prefix, replacing the earlier 32-bit-truncated ``hash()`` whose collision
+    between two distinct paths mutated on one cursor would have had ``create or replace temp
+    table`` silently clobber the other operation's temp mid-flight."""
+    digest = hashlib.sha1(str(key).encode("utf-8", "surrogatepass")).hexdigest()[:12]
+    return f"__duckrun_{tag}_{digest}"
+
+
 def quote_ident(name) -> str:
     """A double-quoted SQL identifier from a possibly already-quoted, possibly padded name: strip
     whitespace and any quotes the caller put on, then quote and escape embedded quotes. Accepted by
@@ -1244,8 +1254,11 @@ def write_delta(
 
     if mode == "overwrite":
         dt = _delta_table(path, storage_options)
-        dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
-        dt.cleanup_metadata()
+        # A fresh table (this overwrite created v0) has no prior versions — nothing for vacuum or
+        # cleanup_metadata to reclaim, so skip both store-listing operations on a brand-new create.
+        if dt.version() > 0:
+            dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
+            dt.cleanup_metadata()
     else:  # append
         _maintain(cur, path, storage_options=storage_options)
 

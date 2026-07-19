@@ -230,7 +230,7 @@ class Plugin(BasePlugin):
         _merge_path = (incremental and not full_refresh and exists
                        and _resolved_strategy in ("merge", "insert"))
         if _merge_path and (cfg.get("merge_materialize_source") or not_null_columns):
-            src_tmp = f'"__duckrun_msrc_{abs(hash(path)) & 0xFFFFFFFF}"'
+            src_tmp = '"' + engine.tmp_name("msrc", path) + '"'
             cur.execute(f"CREATE OR REPLACE TEMP TABLE {src_tmp} AS SELECT * FROM {name}")
             name = src_tmp                       # guard + view name both read the one materialization
             data = cur.sql(f"SELECT * FROM {src_tmp}")
@@ -538,7 +538,7 @@ class Plugin(BasePlugin):
         # column regardless of the model SELECT's column order — a reorder can't shift values.
         tcols_t = ", ".join(f't."{c}"' for c in target_cols)
         tcols = ", ".join(f'"{c}"' for c in target_cols)
-        tmp = f"__duckrun_di_{abs(hash(path)) & 0xFFFFFFFF}"
+        tmp = engine.tmp_name("di", path)
         cur.execute(
             f'CREATE OR REPLACE TEMP TABLE "{tmp}" AS '
             f"SELECT {tcols_t} FROM delta_scan('{loc_sql}', version => {vB}) t "

@@ -1348,7 +1348,8 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
-        live = self._exists(loc) and not is_dropped(self.cursor, loc, self.so)
+        existed = self._exists(loc)                       # ONE check — also picks the create mode below
+        live = existed and not is_dropped(self.cursor, loc, self.so)
         if m.group("ine") and live:                       # IF NOT EXISTS over a live table → no-op
             self._refresh_view(rel, schema, loc)
             return True
@@ -1361,13 +1362,15 @@ class _DeltaDML:
         # as a TEMP, then take its Arrow schema and create an EMPTY Delta table from it. DeltaTable.create
         # logs a CREATE TABLE operation (not a WRITE/Overwrite). A live table or a drop-tombstone already
         # has files at ``loc``, so it must be replaced (overwrite); otherwise create-if-absent (error).
-        tmp = f"__duckrun_empty_{abs(hash((schema, identifier))) & 0xFFFFFFFF}"
+        tmp = engine.tmp_name("empty", (schema, identifier))
         self.cursor.execute(f'create or replace temp table "{tmp}" ({m.group("defs")})')
         try:
             arrow_schema = self.cursor.sql(f'select * from "{tmp}" limit 0').arrow().schema
         finally:
             self.cursor.execute(f'drop table if exists "{tmp}"')
-        mode = "overwrite" if self._exists(loc) else "error"
+        # Mode from the SAME existence check as the guards above (no second open, no window in
+        # which a table appearing/disappearing could make guard and mode disagree).
+        mode = "overwrite" if existed else "error"
         engine.create_empty_delta(loc, arrow_schema, mode=mode, storage_options=self.so)
         self._refresh_view(rel, schema, loc)
         return True
@@ -1407,7 +1410,7 @@ class _DeltaDML:
             engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
                                           storage_options=self.so)
             return
-        tmp = f"__duckrun_{materialize_tag}_{abs(hash(loc)) & 0xFFFFFFFF}"
+        tmp = engine.tmp_name(materialize_tag, loc)
         self.cursor.execute(f'create or replace temp table "{tmp}" as {sql}')
         try:
             data = self.cursor.sql(f'select * from "{tmp}"')
@@ -1602,7 +1605,7 @@ class _DeltaDML:
                 cols_types.append(hit)
         coldefs = ", ".join(f'"{c}" {t}' for c, t in cols_types)
         collist = ", ".join(f'"{c}"' for c, _ in cols_types)
-        tmp = f"__duckrun_vals_{abs(hash(loc)) & 0xFFFFFFFF}"
+        tmp = engine.tmp_name("vals", loc)
         self.cursor.execute(f'create or replace temp table "{tmp}" ({coldefs})')
         try:
             self.cursor.execute(f'insert into "{tmp}" ({collist}) values {body}')
