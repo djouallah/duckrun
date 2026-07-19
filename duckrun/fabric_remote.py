@@ -37,6 +37,8 @@ import uuid
 import zipfile
 from typing import Dict, List, Optional
 
+from dbt.adapters.duckrun.secret import TOKEN_KEYS as _TOKEN_KEYS
+
 from . import auth
 
 # Fabric REST control plane.
@@ -46,9 +48,9 @@ _DFS_API_VERSION = "2023-11-03"
 
 # Project dirs that must never travel to the remote notebook: build/output/vcs cruft.
 _ZIP_EXCLUDE_DIRS = {"target", "dbt_packages", "logs", ".git", "__pycache__", ".venv", "venv"}
-# storage_options keys that carry a laptop bearer token — stripped from the profile we ship, so the
-# remote notebook authenticates through its own Fabric runtime token (notebookutils) instead.
-_TOKEN_KEYS = ("bearer_token", "token", "access_token")
+# _TOKEN_KEYS (imported above from secret): storage_options keys that carry a laptop bearer token —
+# stripped from the profile we ship, so the remote notebook authenticates through its own Fabric
+# runtime token (notebookutils) instead. Shared with secret.bearer_token so the spellings can't drift.
 
 # Terminal Fabric job-instance states.
 _JOB_DONE = {"Completed", "Failed", "Cancelled", "Deduped"}

@@ -25,6 +25,11 @@ from typing import Dict, Optional
 # Stable name so repeated creation is an idempotent CREATE OR REPLACE, not a pile-up.
 SECRET_NAME = "duckrun_onelake"
 
+# The storage_options keys a bearer token may arrive under, most-preferred first. The single source of
+# truth for the alias set — bearer_token(), the obstore builder, and fabric_remote all read it, so the
+# accepted spellings can't drift between the read, write, and file-transfer paths.
+TOKEN_KEYS = ("bearer_token", "token", "access_token")
+
 
 def scoped_secret_name(catalog_name: str) -> str:
     """A stable DuckDB secret name for an attached catalog's path-scoped Azure token."""
@@ -34,7 +39,10 @@ def scoped_secret_name(catalog_name: str) -> str:
 def bearer_token(storage_options: Optional[Dict[str, str]]) -> Optional[str]:
     """The bearer token from ``storage_options`` under any of the accepted keys, or None."""
     so = storage_options or {}
-    return so.get("bearer_token") or so.get("token") or so.get("access_token")
+    for k in TOKEN_KEYS:
+        if so.get(k):
+            return so[k]
+    return None
 
 
 def _in_fabric_notebook() -> bool:
@@ -153,7 +161,7 @@ def refreshed(storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, s
     if not fresh or fresh == tok:
         return storage_options  # best effort — keep the (stale) token; nothing better available
     out = dict(storage_options)
-    for k in ("bearer_token", "token", "access_token"):
+    for k in TOKEN_KEYS:
         if k in out:
             out[k] = fresh
     out.setdefault("bearer_token", fresh)

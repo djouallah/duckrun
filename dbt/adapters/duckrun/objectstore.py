@@ -14,7 +14,7 @@ byte-verbatim: obstore never re-encodes by extension, so a ``.gz``/``.zst`` file
 import os
 from typing import Dict, List, Optional
 
-from .secret import bearer_token
+from .secret import TOKEN_KEYS, bearer_token
 
 
 def build_store(base_url: str, storage_options: Optional[Dict[str, str]]):
@@ -30,7 +30,7 @@ def build_store(base_url: str, storage_options: Optional[Dict[str, str]]):
         os.makedirs(base_url, exist_ok=True)
         return st.LocalStore(prefix=base_url)
     config = {k: v for k, v in (storage_options or {}).items()
-              if k not in ("token", "access_token", "bearer_token")}
+              if k not in TOKEN_KEYS}
     tok = bearer_token(storage_options)
     if tok:
         config["bearer_token"] = tok

@@ -18,7 +18,6 @@ from typing import Dict, List, Optional
 import duckdb
 
 from dbt.adapters.duckrun import delta_dml, engine, objectstore, remote, secret, sortkey
-from . import auth
 from ._runtime import check_runtime_versions
 
 
@@ -404,10 +403,9 @@ class DuckSession:
         ro = self.read_only if read_only is None else bool(read_only)
         so = dict(storage_options) if storage_options else None
         # OneLake with no caller-supplied token: acquire one (Fabric / env / azure-identity) so both
-        # the DuckDB read secret and delta-rs writes can authenticate.
-        if remote.is_abfss(root) and not secret.bearer_token(so):
-            so = dict(so or {})
-            so["bearer_token"] = auth.get_onelake_token()
+        # the DuckDB read secret and delta-rs writes can authenticate. Shared with the dbt path via
+        # secret.with_onelake_token, so the two surfaces can't drift.
+        so = secret.with_onelake_token(root, so)
         # The Azure secret must be minted before any delta_scan/glob. No-op without a bearer token.
         try:
             if primary:
