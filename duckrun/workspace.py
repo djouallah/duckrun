@@ -31,6 +31,7 @@ from .fabric_remote import (
     _FABRIC_API,
     RemoteRunError,
     _http_request,
+    _paged_values,
     _resolve_workspace_id,
     _workspace_display_name,
     _await_lro_item_id,
@@ -160,10 +161,9 @@ class Workspace:
         raise RemoteRunError(f"lakehouse {name!r} not found in workspace {self.id}; have: {have}")
 
     def _items(self, kind: str) -> List[Dict]:
-        """Every item of ``kind`` (e.g. ``"lakehouses"`` / ``"notebooks"`` / ``"semanticModels"``)."""
-        resp = _http_request("GET", f"{_FABRIC_API}/workspaces/{self.id}/{kind}", token=self._token)
-        resp.raise_for_status()
-        return resp.json().get("value", [])
+        """Every item of ``kind`` (e.g. ``"lakehouses"`` / ``"notebooks"`` / ``"semanticModels"``),
+        across all result pages."""
+        return _paged_values(f"{_FABRIC_API}/workspaces/{self.id}/{kind}", token=self._token)
 
     def list_lakehouses(self) -> List[Dict]:
         """Every lakehouse in the workspace as ``[{"displayName": ..., "id": ...}, ...]``."""

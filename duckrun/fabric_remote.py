@@ -413,14 +413,48 @@ def _http_request(method: str, url: str, *, token: str, params: Optional[dict] =
     return resp
 
 
+def _fresh_token(current: str, acquire) -> str:
+    """``current``, unless it is a JWT near expiry — then re-acquire from the live source. A remote
+    job can legally poll for up to ``_POLL_TIMEOUT`` (an hour) on one ~1h token, so the calls made
+    *after* the wait (result read, teardown, refresh polling) would otherwise 401 near the cap.
+    Best-effort: a failed re-acquire keeps the old token; a non-JWT (test stub) is never churned."""
+    try:
+        if auth.token_is_expiring(current):
+            return acquire() or current
+    except Exception:
+        pass
+    return current
+
+
+def _paged_values(url: str, *, token: str, params: Optional[dict] = None) -> List[Dict]:
+    """Every item across all pages of a Fabric list endpoint (``GET`` returning ``{"value": […]}``).
+    Fabric caps each response and points at the rest via ``continuationUri``/``continuationToken``;
+    reading only ``value`` silently returns page one, so name→id resolution in a big tenant or
+    workspace reports "not found" for items that exist. The DFS data plane already pages
+    (``remote.py`` follows ``x-ms-continuation``) — this is the control-plane counterpart."""
+    out: List[Dict] = []
+    while True:
+        resp = _http_request("GET", url, token=token, params=params)
+        resp.raise_for_status()
+        body = resp.json()
+        out.extend(body.get("value", []))
+        next_uri = body.get("continuationUri")
+        next_tok = body.get("continuationToken")
+        if next_uri:
+            url, params = next_uri, None
+        elif next_tok:
+            params = dict(params or {})
+            params["continuationToken"] = next_tok
+        else:
+            return out
+
+
 def _resolve_workspace_id(token: str, workspace: str) -> str:
     """A workspace GUID for ``workspace`` (a name or an already-GUID). Names are resolved via
     ``GET /workspaces``; a value that already looks like a GUID is returned unchanged."""
     if _looks_like_guid(workspace):
         return workspace
-    resp = _http_request("GET", f"{_FABRIC_API}/workspaces", token=token)
-    resp.raise_for_status()
-    for ws in resp.json().get("value", []):
+    for ws in _paged_values(f"{_FABRIC_API}/workspaces", token=token):
         if ws.get("displayName") == workspace:
             return ws["id"]
     raise RemoteRunError(f"workspace {workspace!r} not found (or token can't see it)")
@@ -573,6 +607,8 @@ def _refresh_semantic_model(pbi_token: str, ws_id: str, item_id: str) -> None:
     propagating (~5 min), so the first reframe can transiently fail with 'artifact not found'."""
     base = f"{_POWERBI_API}/groups/{ws_id}/datasets/{item_id}/refreshes"
     for attempt in range(_REFRESH_RETRIES):
+        # Each attempt can poll for up to an hour; don't let the whole loop ride one ~1h token.
+        pbi_token = _fresh_token(pbi_token, auth.get_powerbi_token)
         resp = _http_request("POST", base, token=pbi_token, json_body={})
         if resp.status_code not in (200, 202):
             resp.raise_for_status()
@@ -843,9 +879,10 @@ class RemoteRunner:
         item_id = _create_notebook(fabric_token, ws_id, f"duckrun-remote-{runid}", notebook)
         try:
             _run_job_and_wait(fabric_token, ws_id, item_id)
-            result = read_result_json(result_path, storage_token)
+            # The wait can consume most of the tokens' ~1h life — re-check before the post-wait reads.
+            result = read_result_json(result_path, _fresh_token(storage_token, auth.get_onelake_token))
         finally:
-            _delete_item(fabric_token, ws_id, item_id)
+            _delete_item(_fresh_token(fabric_token, auth.get_fabric_token), ws_id, item_id)
 
         log_text = result.get("log", "")
         if log_text:

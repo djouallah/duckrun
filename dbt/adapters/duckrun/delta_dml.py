@@ -1526,8 +1526,9 @@ class _DeltaDML:
         derived = f"(values {body})"
         # Can DuckDB self-type the VALUES columns? Probe on a THROWAWAY connection: the tuples are pure
         # literals (no table refs), and a binder error would otherwise abort self.cursor's transaction.
+        probe = duckdb.connect()
         try:
-            duckdb.connect().sql(f"select * from {derived} limit 0")
+            probe.sql(f"select * from {derived} limit 0")
         except duckdb.NotImplementedException:
             # A column mixes literal types DuckDB won't self-combine across rows (e.g. 'inf' next to
             # 0.0 → "Cannot combine types VARCHAR and DECIMAL") — exactly what a native INSERT resolves
@@ -1536,6 +1537,8 @@ class _DeltaDML:
             # (The clean-typing fast path below keeps the lossy-numeric-narrowing guard intact.)
             self._insert_values_via_typed_temp(loc, provided, body)
             return
+        finally:
+            probe.close()
         self._append_projected(loc, provided, derived)
 
     def _insert_values_via_typed_temp(self, loc, provided, body: str) -> None:

@@ -1,8 +1,8 @@
 """Shared quote-aware SQL scanning primitives.
 
 The DML router (``delta_dml``) and the write plugin (``delta_plugin``) both need to inspect or
-rewrite raw SQL *outside* string literals, quoted identifiers, and dollar-quoted bodies — never a
-regex over the raw text, which fires inside literals and corrupts them. These primitives are the one
+rewrite raw SQL *outside* string literals, quoted identifiers, dollar-quoted bodies, and SQL
+comments — never a regex over the raw text, which fires inside literals and corrupts them. These primitives are the one
 shared implementation; ``delta_dml`` re-exports ``_dollar_quote_end`` so its existing scanners and
 ``session.py`` keep importing it from there.
 """
@@ -32,7 +32,8 @@ def _dollar_quote_end(s: str, i: int) -> Optional[int]:
 
 
 def _rewrite_outside_quotes(s: str, cb: Callable[[str, int], Optional[Tuple[str, int]]]) -> str:
-    """Scan ``s`` copying it verbatim, skipping ``'…'`` / ``"…"`` and ``$tag$…$tag$`` runs. At each
+    """Scan ``s`` copying it verbatim, skipping ``'…'`` / ``"…"``, ``$tag$…$tag$`` runs, ``--`` line
+    comments, and ``/* … */`` block comments (nested, as Postgres/DuckDB nest them). At each
     position that begins an identifier boundary (the previous char is not part of an identifier and
     not a ``.`` qualifier dot), call ``cb(s, i)``: if it returns ``(replacement, new_i)`` the span
     ``s[i:new_i]`` is replaced by ``replacement`` and scanning resumes at ``new_i``; if it returns
@@ -50,6 +51,24 @@ def _rewrite_outside_quotes(s: str, cb: Callable[[str, int], Optional[Tuple[str,
             quote = ch
             out.append(ch)
             i += 1
+            continue
+        if ch == "-" and s.startswith("--", i):
+            nl = s.find("\n", i)
+            end = n if nl == -1 else nl + 1
+            out.append(s[i:end])  # comment text is not SQL — copy verbatim, rewrite nothing inside
+            i = end
+            continue
+        if ch == "/" and s.startswith("/*", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if s.startswith("/*", j):
+                    depth, j = depth + 1, j + 2
+                elif s.startswith("*/", j):
+                    depth, j = depth - 1, j + 2
+                else:
+                    j += 1
+            out.append(s[i:j])
+            i = j
             continue
         if ch == "$":
             de = _dollar_quote_end(s, i)

@@ -168,6 +168,28 @@ def refreshed(storage_options: Optional[Dict[str, str]]) -> Optional[Dict[str, s
     return out
 
 
+def _execute_secret_sql(conn, sql: str, token: str) -> None:
+    """Run a ``CREATE SECRET`` statement without ever letting the bearer token escape into the
+    raised error. DuckDB echoes the offending statement into exception text (``LINE N: <sql>``),
+    which would land the token in the caller's error message and logs. Re-raise the same exception
+    type with the token redacted, and drop the original (token-bearing) exception from the chain."""
+    redacted = None
+    try:
+        conn.execute(sql)
+    except Exception as exc:
+        # Redact both the escaped form (as embedded in the SQL) and the raw token.
+        msg = str(exc).replace(token.replace("'", "''"), "<redacted>").replace(token, "<redacted>")
+        try:
+            redacted = type(exc)(msg)
+        except Exception:
+            redacted = RuntimeError(msg)
+    # Raised OUTSIDE the handler: `raise … from None` inside it would only suppress the display of
+    # the original (token-bearing) exception, which stays reachable via __context__ for any log
+    # framework that walks the chain. Out here no context is attached at all.
+    if redacted is not None:
+        raise redacted
+
+
 def ensure_azure_secret(conn, storage_options: Optional[Dict[str, str]]) -> bool:
     """Mint the DuckDB Azure secret from a bearer token in ``storage_options`` on ``conn``.
 
@@ -186,9 +208,11 @@ def ensure_azure_secret(conn, storage_options: Optional[Dict[str, str]]) -> bool
     _set_azure_transport(conn)
     # Escape single quotes so a token containing one can't break out of the SQL string literal.
     token_sql = token.replace("'", "''")
-    conn.execute(
+    _execute_secret_sql(
+        conn,
         f"CREATE OR REPLACE SECRET {SECRET_NAME} "
-        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}')"
+        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}')",
+        token,
     )
     return True
 
@@ -209,9 +233,11 @@ def mint_scoped_secret(conn, secret_name: str, root: str,
     _set_azure_transport(conn)
     token_sql = token.replace("'", "''")
     scope_sql = str(root).replace("'", "''")
-    conn.execute(
+    _execute_secret_sql(
+        conn,
         f"CREATE OR REPLACE SECRET {secret_name} "
-        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}', SCOPE '{scope_sql}')"
+        f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}', SCOPE '{scope_sql}')",
+        token,
     )
     return True
 

@@ -6,7 +6,7 @@ Pure-Python unit tests for the small, self-contained fixes — the ones that don
 import duckdb
 import pytest
 
-from dbt.adapters.duckrun import delta_dml, engine, sqlscan
+from dbt.adapters.duckrun import delta_dml, engine, policy, secret, sqlscan
 from dbt.adapters.duckrun.credentials import DuckrunCredentials
 from dbt.adapters.duckrun.delta_plugin import Plugin
 from duckrun.session import _is_multi_statement
@@ -257,3 +257,148 @@ def test_identity_token_no_browser_without_tty(monkeypatch):
     # No InteractiveBrowserCredential is imported/used; returns None after CLI fails.
     assert auth._azure_identity_token(interactive=True) is None
     assert calls == ["cli"]
+
+
+# ------------------------------------------------------- 2026-07 full review: P1 fixes
+
+# --- token never leaks into a CREATE SECRET failure (secret._execute_secret_sql)
+
+class _SecretEchoConn:
+    """A conn whose CREATE SECRET fails the way DuckDB does: echoing the statement text."""
+
+    def execute(self, sql):
+        if "ACCESS_TOKEN" in sql and sql.startswith("CREATE OR REPLACE SECRET"):
+            raise RuntimeError(f"Parser Error: something broke\nLINE 1: {sql}\n   ^")
+        return None  # INSTALL/LOAD/SET are no-ops
+
+
+def test_secret_mint_failure_redacts_token():
+    tok = "eyJfake'TOKEN-SECRET-VALUE"
+    with pytest.raises(RuntimeError) as exc:
+        secret.ensure_azure_secret(_SecretEchoConn(), {"bearer_token": tok})
+    msg = str(exc.value)
+    assert tok not in msg and tok.replace("'", "''") not in msg
+    assert "<redacted>" in msg
+    # The original (token-bearing) exception must not ride along on the chain either.
+    assert exc.value.__cause__ is None and exc.value.__context__ is None
+
+
+def test_scoped_secret_mint_failure_redacts_token():
+    tok = "eyJfakeSCOPED-SECRET-VALUE"
+    with pytest.raises(RuntimeError) as exc:
+        secret.mint_scoped_secret(_SecretEchoConn(), "duckrun_cat_x", "abfss://w@host/l/Tables", {"token": tok})
+    assert tok not in str(exc.value)
+
+
+def test_secret_mint_success_still_returns_true():
+    class _OkConn:
+        def __init__(self):
+            self.sqls = []
+
+        def execute(self, sql):
+            self.sqls.append(sql)
+
+    con = _OkConn()
+    assert secret.ensure_azure_secret(con, {"bearer_token": "tok"}) is True
+    assert any("CREATE OR REPLACE SECRET" in s for s in con.sqls)
+
+
+# --- sqlscan skips SQL comments (line, block, nested block)
+
+def test_qualify_identifiers_skips_line_comment():
+    got = sqlscan.qualify_identifiers("amount > 5 -- amount is checked\n and amount < 9", ["amount"])
+    assert got == "target.amount > 5 -- amount is checked\n and target.amount < 9"
+
+
+def test_qualify_identifiers_skips_block_comment():
+    got = sqlscan.qualify_identifiers("/* amount */ amount > 5", ["amount"])
+    assert got == "/* amount */ target.amount > 5"
+
+
+def test_qualify_identifiers_skips_nested_block_comment():
+    got = sqlscan.qualify_identifiers("/* outer /* amount */ still comment */ amount = 1", ["amount"])
+    assert got == "/* outer /* amount */ still comment */ target.amount = 1"
+
+
+def test_strip_qualifier_skips_comments():
+    got = sqlscan.strip_qualifier(
+        "DBT_INTERNAL_DEST.id = 1 -- DBT_INTERNAL_DEST.id stays\n", "DBT_INTERNAL_DEST")
+    assert got == "id = 1 -- DBT_INTERNAL_DEST.id stays\n"
+
+
+def test_unterminated_block_comment_swallows_rest():
+    # An unterminated /* runs to end-of-string, like in real SQL: nothing after it is rewritten.
+    got = sqlscan.qualify_identifiers("id = 1 /* trailing id", ["id"])
+    assert got == "target.id = 1 /* trailing id"
+
+
+# --- MaintenancePolicy decisions (previously untested pure logic)
+
+def _mb(n):
+    return n * 1024 * 1024
+
+
+def test_policy_compact_needs_count_and_bytes():
+    pol = policy.MaintenancePolicy(target_file_size=_mb(256))
+    small = _mb(64)
+    # 7 small files: count floor not met, even with plenty of bytes.
+    assert not pol.should_compact([small] * 7)
+    # 8 tiny files: count met, byte floor (2 x target = 512MB) not met.
+    assert not pol.should_compact([1024] * 8)
+    # 8 x 64MB = 512MB: both floors met.
+    assert pol.should_compact([small] * 8)
+    # Target-sized files never count as small, whatever their number.
+    assert not pol.should_compact([_mb(256)] * 100)
+
+
+def test_policy_small_file_threshold_is_half_target():
+    pol = policy.MaintenancePolicy(target_file_size=_mb(256))
+    assert pol.small_file_threshold == _mb(128)
+    # A file exactly at the threshold is NOT small (strict <).
+    assert not pol.should_compact([_mb(128)] * 100)
+
+
+def test_policy_partitions_to_compact_only_offending():
+    pol = policy.MaintenancePolicy(target_file_size=_mb(256))
+    parts = pol.partitions_to_compact([("p1", _mb(1)), ("p2", _mb(256)), ("p3", _mb(1))])
+    assert parts == {"p1", "p3"}
+
+
+def test_policy_vacuum_gated_on_compaction_and_age():
+    pol = policy.MaintenancePolicy(min_vacuum_interval_s=100)
+    assert not pol.should_vacuum(False, 1e9)     # no compaction -> never
+    assert not pol.should_vacuum(True, 99)       # too recent
+    assert pol.should_vacuum(True, 100)
+
+
+def test_policy_run_maintenance_swallows_lost_race_only():
+    from deltalake.exceptions import CommitFailedError as CFE
+    pol = policy.MaintenancePolicy()
+    ran = []
+    pol.run_maintenance(lambda: ran.append("c"), lambda: ran.append("v"), True)
+    assert ran == ["c", "v"]
+    pol.run_maintenance(lambda: ran.append("skipped"), lambda: None, False)
+    assert "skipped" not in ran
+    # A maintenance CommitFailedError is swallowed (the data commit already succeeded)...
+    pol.run_maintenance(lambda: (_ for _ in ()).throw(CFE("lost race")), lambda: None, True)
+    # ...but any other exception propagates: a real fault, not a lost race.
+    with pytest.raises(ValueError):
+        pol.run_maintenance(lambda: (_ for _ in ()).throw(ValueError("real")), lambda: None, True)
+
+
+# --- update_rows validates SET columns (SQL == DataFrame parity)
+
+def test_update_rows_rejects_unknown_column(tmp_path):
+    import pyarrow as pa
+    from deltalake import write_deltalake
+
+    p = str(tmp_path / "t")
+    write_deltalake(p, pa.table({"id": [1, 2], "v": [10, 20]}))
+    v = engine.table_version(p)
+    with pytest.raises(ValueError, match="unknown column"):
+        engine.update_rows(p, {"nope": "1"}, "id = 1", read_version=v)
+    # Fails loud with NO commit: the log did not advance.
+    assert engine.table_version(p) == v
+    # A valid column still updates (case-insensitive match, like the SQL path).
+    engine.update_rows(p, {"V": "99"}, "id = 1", read_version=v)
+    assert engine.table_version(p) == v + 1

@@ -1422,6 +1422,16 @@ def update_rows(
         )
     dt = _delta_table(path, storage_options)
     dt.load_as_version(read_version)
+    # Validate SET targets against the real schema BEFORE dt.update(): delta_rs silently accepts an
+    # unknown column, writing a no-op commit that advances the log while changing nothing. Fail loud
+    # with no commit — the same guard the raw-SQL UPDATE path applies (SQL == DataFrame parity).
+    target_cols = [f.name for f in dt.schema().fields]
+    by_lower = {c.lower() for c in target_cols}
+    unknown = [c for c in updates if str(c).strip('"').lower() not in by_lower]
+    if unknown:
+        raise ValueError(
+            f"UPDATE on {path!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
+        )
     try:
         dt.update(updates=updates, predicate=predicate)
     except CommitFailedError as e:

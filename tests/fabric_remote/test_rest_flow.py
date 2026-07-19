@@ -160,3 +160,52 @@ def test_workspace_guid_skips_resolution(project, monkeypatch):
 
     _runner(project).invoke(["run", "--target", "fabric"])
     assert not any(m == "GET" and u.endswith("/workspaces") for m, u in fake_urls)
+
+
+# ------------------------------------------------------- control-plane pagination + token freshness
+
+def test_paged_values_follows_continuation(monkeypatch):
+    """Fabric caps list responses; _paged_values must follow continuationToken/Uri to the end —
+    reading only page one made name->id resolution report 'not found' for items that exist."""
+    calls = []
+
+    def fake(method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
+        calls.append((url, dict(params or {})))
+        if len(calls) == 1:
+            return FakeResp(200, {"value": [{"displayName": "A", "id": "a"}],
+                                  "continuationToken": "tok2"})
+        if len(calls) == 2:
+            assert params.get("continuationToken") == "tok2"
+            return FakeResp(200, {"value": [{"displayName": "B", "id": "b"}],
+                                  "continuationUri": fr._FABRIC_API + "/workspaces?ct=tok3"})
+        assert url.endswith("/workspaces?ct=tok3")
+        return FakeResp(200, {"value": [{"displayName": "C", "id": "c"}]})
+
+    monkeypatch.setattr(fr, "_http_request", fake)
+    got = fr._paged_values(fr._FABRIC_API + "/workspaces", token="T")
+    assert [w["id"] for w in got] == ["a", "b", "c"]
+
+
+def test_resolve_workspace_finds_item_on_later_page(monkeypatch):
+    def fake(method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
+        if params and params.get("continuationToken") == "next":
+            return FakeResp(200, {"value": [{"displayName": "Deep", "id": "deep-guid"}]})
+        return FakeResp(200, {"value": [{"displayName": "First", "id": "first-guid"}],
+                              "continuationToken": "next"})
+
+    monkeypatch.setattr(fr, "_http_request", fake)
+    assert fr._resolve_workspace_id("T", "Deep") == "deep-guid"
+
+
+def test_fresh_token_churns_only_near_expiry(monkeypatch):
+    # A non-JWT (test stub) is never churned.
+    assert fr._fresh_token("STORE-TOKEN", lambda: "NEW") == "STORE-TOKEN"
+    # Near expiry: re-acquire from the live source.
+    monkeypatch.setattr(fr.auth, "token_is_expiring", lambda t: True)
+    assert fr._fresh_token("old", lambda: "NEW") == "NEW"
+    # A failed re-acquire keeps the old token rather than raising mid-teardown.
+    def boom():
+        raise RuntimeError("no source")
+    assert fr._fresh_token("old", boom) == "old"
+    # An empty re-acquire also keeps the old token.
+    assert fr._fresh_token("old", lambda: None) == "old"

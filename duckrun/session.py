@@ -443,7 +443,19 @@ class DuckSession:
         self._catalogs[name] = _CatEntry(name, root, so, schema_filter, ro)
         if primary:
             self._primary_catalog = name
-        schemas = self._refresh_catalog(name, quiet=quiet)
+        try:
+            schemas = self._refresh_catalog(name, quiet=quiet)
+        except Exception:
+            # Roll back the half-built catalog. Otherwise a failed secondary attach() (e.g. the
+            # case-collision error) leaves the DuckDB ATTACH and the registry entry behind:
+            # refresh() would iterate a broken catalog, and re-attaching the corrected name/root
+            # would die on "already attached".
+            self._catalogs.pop(name, None)
+            try:
+                self.con.execute(f"DETACH {_qid(name)}")
+            except Exception:
+                pass
+            raise
         if primary:
             # Make the primary the current catalog (+ a sensible default schema) via DuckDB's own USE —
             # the ONE place "current" is set; every reader derives it back from current_database().

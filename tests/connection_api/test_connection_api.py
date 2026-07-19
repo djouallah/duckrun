@@ -1680,3 +1680,37 @@ def test_rg_for_clamps():
 # PARTITIONED BY / SORTED BY AUTO). optimize / replaceWhere / the append_if_unchanged verb still have
 # no DuckDB-SQL surface and are gaps for now — their engine capabilities remain covered by
 # tests/adapter and tests/correctness.
+
+
+def test_failed_attach_rolls_back_cleanly(tmp_path, monkeypatch):
+    """A secondary attach() whose discovery fails must not leave a phantom catalog behind: the
+    DuckDB ATTACH and the registry entry are rolled back, so refresh() keeps working and the
+    corrected re-attach succeeds instead of dying on "already attached"."""
+    conn = duckrun.connect(str(tmp_path / "wh"), schema="dbo", read_only=False)
+    conn.sql("CREATE OR REPLACE TABLE src AS select 1 as id")
+    other = duckrun.connect(str(tmp_path / "wh2"), schema="dbo", read_only=False)
+    other.sql("CREATE OR REPLACE TABLE only_there AS select 99 as n")
+    other.close()
+
+    orig = session_mod.DuckSession._refresh_catalog
+
+    def boom(self, name, quiet=True):
+        if name == "sales":
+            raise RuntimeError("discovery blew up")
+        return orig(self, name, quiet=quiet)
+
+    monkeypatch.setattr(session_mod.DuckSession, "_refresh_catalog", boom)
+    with pytest.raises(RuntimeError, match="discovery blew up"):
+        conn.attach(str(tmp_path / "wh2"), name="sales")
+    monkeypatch.undo()
+
+    # No phantom: registry clean, DuckDB catalog detached, refresh() unaffected.
+    assert "sales" not in conn._catalogs
+    dbs = {r[0] for r in conn.sql("select database_name from duckdb_databases()").fetchall()}
+    assert "sales" not in dbs
+    assert conn.refresh() is conn
+
+    # The same name/root attaches fine now that the half-built catalog is gone.
+    conn.attach(str(tmp_path / "wh2"), name="sales")
+    assert conn.sql("select n from sales.dbo.only_there").fetchone()[0] == 99
+    conn.close()
