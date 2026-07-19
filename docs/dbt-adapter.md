@@ -40,6 +40,20 @@ upstream `duckdb-delta` read bug ("No files in log segment") that is **already f
 still rolling out to production OneLake**. Friendly-name paths will work again once the fix finishes
 deploying.
 
+### OneLake authentication — tokens are optional
+
+On OneLake, `storage_options` can be left out entirely: when no `bearer_token` is supplied, duckrun
+self-acquires one (`azure-identity` ships as a core dependency) and mints the matching DuckDB Azure
+secret, so writes **and** `delta_scan` reads — including `dbt test` / `dbt show` /
+`dbt docs generate` — work with no credential in the profile. Acquisition order: Fabric notebook
+(`notebookutils`) → an `AZURE_STORAGE_TOKEN` env var → GitHub Actions OIDC workload-identity
+federation (`AZURE_CLIENT_ID` + `AZURE_TENANT_ID` env vars and `id-token: write` job permission — no
+client secret) → Azure CLI → interactive browser. Tokens are cached per scope and re-acquired near
+expiry.
+
+An explicit `storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }` still works and
+takes precedence — use it when you want to pin exactly which identity writes.
+
 ### Fabric Lakehouse without a schema
 
 A schema-less Lakehouse (tables straight under `Tables/`, no `Tables/<schema>/` grouping) is a **bad
@@ -209,7 +223,11 @@ whatever the previous attempt already loaded.
 | `unique_key`            | column(s) to merge on.                                                       |
 | `merge_update_columns`  | merge: update only these columns on match (others untouched).               |
 | `merge_exclude_columns` | merge: update all columns **except** these on match.                        |
+| `merge_update_condition` / `merge_insert_condition` | merge: extra predicate AND-ed onto the matched-update / not-matched-insert clause (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). |
+| `merge_clauses` / `merge_update_set_expressions` | merge: dbt-duckdb-style custom clause list / per-column `SET` expressions — translated to delta_rs's full TableMerger clause list. The only merge config duckrun refuses is `merge_on_using_columns` (no delta_rs equivalent). |
 | `merge_max_spill_size`  | merge: memory ceiling in **bytes** for delta_rs's merge pool (not a disk budget). Defaults to ~60% of the **effective** limit — `min(physical RAM, container/cgroup limit, currently-free RAM)` — beyond which delta_rs spills the merge join to disk (like DuckDB's `memory_limit`). The other big consumer, DuckDB itself, is separately pinned to ~30% of the same effective limit on the merge path (it produces the merge source in the same process), so the two budgets sum under the cgroup cap; both log their chosen value at run start. Set `0` to disable. It bounds the merge pool, *not* the whole process (the Arrow source, read buffers, and spill-file page cache sit outside it), so on a tight container with a huge source the total can still exceed the cap — lower it if needed. A cap below the join's minimum (~hundreds of MB) makes the merge raise `Resources exhausted` instead of spilling. Requires deltalake 1.5.0 (pinned). |
+| `merge_max_temp_directory_size` | merge: disk cap in bytes for delta_rs's merge spill files (default ~80% of free disk). |
+| `merge_streamed_exec`   | merge: `true` streams a huge merge **source** instead of collecting it into memory — needed for very large sources (especially `WHEN NOT MATCHED BY SOURCE` custom clauses), at the cost of losing target-file pruning. Default `false` suits the normal small-batch-into-big-table case. |
 | `incremental_predicates`| merge: extra predicates AND-ed into the merge condition (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). |
 | `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. (`sync_all_columns` only *adds* — delta_rs can't drop columns.) |
 | `partition_by`          | Delta partition column(s).                                                   |

@@ -129,5 +129,5 @@ The return is a **log and status, never table data**.
 ## Requirements
 
 - The temp notebook installs `duckrun` from PyPI, so your models run on the released adapter.
-- `requests` (a duckrun dependency) for the REST calls; `azure-identity` (the `duckrun[local]` extra)
-  only if you rely on `az login` to mint tokens.
+- `requests` and `azure-identity` are both core duckrun dependencies — nothing extra to install,
+  whether tokens come from `az login`, GitHub OIDC, or a Fabric notebook.

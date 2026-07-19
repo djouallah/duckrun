@@ -13,12 +13,13 @@ convert cost, and the 22 query times are DuckDB reading Delta with no second eng
 against — so read them as "the whole schema loads and all 22 queries run at this scale", not a
 "duckrun is fast" claim. (We measured rewriting sorted with fine row groups and a native DuckDB file
 too; zero-rewrite convert was cheapest to load and fastest to query, so it's the arm kept.)
+Every run also appends one line to the [full run history](tpch-benchmark-history.md).
 
 <!-- TPCH:START -->
 
 ## 🐤 TPC-H benchmark — duckrun on Delta Lake
 
-**What this checks:** duckrun registers the full TPC-H schema (8 tables) as Delta in place via `DeltaTable.convertToDelta` (zero-copy — writes only the `_delta_log`), then runs the 22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is the (near-free) convert; the **query** times are DuckDB reading Delta — there is no second engine to race here, so read them as "the whole schema loads and all 22 queries run at this scale", not a *duckrun is fast* claim.
+**What this checks:** duckrun registers the full TPC-H schema (8 tables) as Delta in place via `conn.convert_to_delta` (zero-copy — writes only the `_delta_log`), then runs the 22 TPC-H queries through `conn.sql` over `delta_scan`. The **ingestion** time is the (near-free) convert; the **query** times are DuckDB reading Delta — there is no second engine to race here, so read them as "the whole schema loads and all 22 queries run at this scale", not a *duckrun is fast* claim.
 
 > **Ingest 8 tables in 657.3s** &middot; **run 22 queries in 449.8s** &middot; SF 100 &middot; 866.0M rows &middot; 4 cores
 
@@ -29,7 +30,7 @@ too; zero-rewrite convert was cheapest to load and fastest to query, so it's the
 | Scale factor | **100** |
 | Runner | GitHub-hosted &middot; 4 cores |
 
-### Ingestion — Parquet → Delta (zero-copy convertToDelta)
+### Ingestion — Parquet → Delta (zero-copy convert_to_delta)
 | Table | Rows | Convert (s) |
 |---|---:|---:|
 | `nation` | 25 | 0.81 |

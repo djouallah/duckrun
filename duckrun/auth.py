@@ -7,8 +7,8 @@ Only used for ``abfss://`` (OneLake) stores when the caller didn't already suppl
 Acquisition order, cheapest first:
   1. inside a Microsoft Fabric notebook → ``notebookutils.credentials.getToken`` (no extra deps);
   2. an existing ``AZURE_STORAGE_TOKEN`` in the environment;
-  3. ``azure-identity`` (Azure CLI, then interactive browser) — the optional ``duckrun[local]``
-     extra, for use on a laptop.
+  3. ``azure-identity`` (Azure CLI, then interactive browser) — a core dependency, for use on a
+     laptop.
 
 This is a hard-trimmed descendant of the legacy duckrun ``auth.py``: no device-code / Colab /
 Fabric-API-token branches — just what a storage read/write needs.

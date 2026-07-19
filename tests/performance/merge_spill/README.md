@@ -4,7 +4,7 @@ A stress test of duckrun MERGEing incremental batches into a large Delta **fact*
 (TPCH `lineitem`) through the **connection API** (`duckrun.connect()` + `conn.sql(...)`) — no dbt.
 It builds a chain of Delta tables and runs the full delta-rs MERGE clause set against them (mixed
 upsert, insert-only, update-only, idempotent re-merge, CDC delete+update+insert, full-sync by-source
-delete, expression update), plus a plain `append` / `append_if_unchanged` / `overwrite` of the same batch for
+delete, expression update), plus plain `append`s / an `overwrite` of the same batch for
 comparison — verifying every UPDATE/INSERT/DELETE lands correctly while staying within the runner's
 RAM (the per-merge DuckDB `memory_limit` pin + delta_rs `max_spill_size`).
 
@@ -17,10 +17,11 @@ so it's now plain SQL driven by a small Python harness.
   `_batch` TEMP table (so a random sample is evaluated exactly once) and then applies the op:
   a `MERGE` (`USING _batch`), an `INSERT … SELECT` (append), or a `CREATE OR REPLACE TABLE … AS`
   (overwrite). `{schema}` is substituted by the runner. `full_sync.sql` only builds its big ~50% source
-  (`_src`) — the runner applies the by-source MERGE via the DataFrame builder with `streamed_exec=True`
-  (no raw-SQL way to set it, and a by-source source must be streamed, not collected whole into a
-  non-spillable hash); `append_if_unchanged_only.sql` likewise only builds the batch (no raw-SQL append_if_unchanged —
-  the runner appends it via `.write.mode("append_if_unchanged")`).
+  (`_src`) — the runner then issues a raw-SQL by-source `MERGE … USING _src`, which the router
+  auto-streams (a by-source source must be streamed, not collected whole into a non-spillable hash);
+  `append_if_unchanged_only.sql` likewise only builds the batch, which the runner appends with a plain
+  `INSERT … SELECT` (the version-guard verb is gone; a read-modify-append on the same table is
+  auto-fenced instead).
 - The runner — [`merge_tpch_bench.py`](merge_tpch_bench.py) — generates the
   TPCH `lineitem` parquet with `tpchgen-cli`, seeds each op's table from the previous one
   (`CREATE OR REPLACE TABLE … AS SELECT * FROM <prev>`), runs each `sql/<op>.sql`, and verifies the

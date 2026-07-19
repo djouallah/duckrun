@@ -10,13 +10,14 @@ duckrun's shipping memory defaults (per-merge DuckDB `memory_limit` + delta_rs `
 + target pruning). It runs on a standard **GitHub-hosted runner (~16 GB RAM)** — no beefy
 hardware — proving the merges stay within that RAM and apply every UPDATE/INSERT/DELETE
 correctly, and lets you compare a MERGE's cost against a plain write of the same batch. It gates
-every release; the latest scorecard is rendered live below.
+every release; the latest scorecard is rendered live below. Every run also appends one line to the
+[full run history](merge-benchmark-history.md).
 
 <!-- MERGE:START -->
 
 ## 🔀 Incremental MERGE test — duckrun on Delta Lake (via the connection API)
 
-**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table **through the connection API** — a chain of `conn.sql(...)` MERGEs (the delta_rs spill cap + the per-merge DuckDB memory pin) — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same shape compares against a plain `append` / `append_if_unchanged` / `overwrite` (which never scan the target).
+**What this checks:** that duckrun MERGEs incremental batches into a large Delta *fact* table **through the connection API** — a chain of `conn.sql(...)` MERGEs (the delta_rs spill cap + the per-merge DuckDB memory pin) — applying UPDATEs and INSERTs correctly without being OOM-killed, and how the same shape compares against a plain `append` / `overwrite` (which never scan the target).
 
 ### Setup (the inputs)
 | | |

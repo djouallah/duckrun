@@ -118,7 +118,7 @@ across three Fabric Lakehouses). `ref()` and joins resolve across them:
 select ...
 ```
 
-Profiles, materializations, incremental strategies (incl. `append_if_unchanged`), sources, and
+Profiles, materializations, incremental strategies (merge, insert, append, delete+insert, microbatch), sources, and
 automatic compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
 
 See it on real projects: [aemo](tests/integration_tests/aemo) and [coffee](tests/integration_tests/coffee) are

@@ -500,7 +500,7 @@ def _build_card(setup, results, final_rows, peak, all_ok) -> str:
              "*fact* table **through the connection API** — a chain of `conn.sql(...)` MERGEs (the "
              "delta_rs spill cap + the per-merge DuckDB memory pin) — applying UPDATEs and INSERTs "
              "correctly without being OOM-killed, and how the same shape compares against a plain "
-             "`append` / `append_if_unchanged` / `overwrite` (which never scan the target).")
+             "`append` / `overwrite` (which never scan the target).")
     L += ["", "### Setup (the inputs)", "| | |", "|---|---|"]
     L.append(f"| Engine | duckrun &middot; DuckDB {setup['duckdb_ver']} &middot; delta_rs {setup['deltalake_ver']} |")
     L.append(f"| Target fact table | TPCH `lineitem`, scale factor **{setup['sf']}** → **{setup['target_rows']:,} rows** |")
