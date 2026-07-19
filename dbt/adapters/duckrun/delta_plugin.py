@@ -13,6 +13,7 @@ from typing import Any, Optional
 from dbt.adapters.duckdb.plugins import BasePlugin
 from dbt.adapters.duckdb.utils import SourceConfig, TargetConfig
 
+from . import delta_dml
 from . import engine
 from . import secret
 from . import sqlscan
@@ -182,7 +183,18 @@ class Plugin(BasePlugin):
         else:
             data = cur.sql(f"SELECT * FROM {name}")
 
-        exists = engine.table_exists(path, storage_options)
+        dt0 = engine.open_if_exists(path, storage_options)
+        exists = dt0 is not None
+
+        # A duckrun drop-tombstone (the notebook API's `drop table` overwrites the table to a
+        # one-column marker; nothing is deleted) IS a real Delta table, so `exists` alone would
+        # send an incremental model down the merge branch — merging into the marker's schema and
+        # dying on "no field named target.<key>". Discovery already HIDES tombstones from dbt's
+        # relation cache; mirror that here at store time: the next build of a dropped table is
+        # CREATE-after-DROP, a full overwrite. `exists` stays True so the overwrite branch takes
+        # schema_mode="overwrite" and replaces the marker schema with the model's real one.
+        if exists and delta_dml.is_dropped_dt(dt0):
+            incremental = False
 
         # Contradiction guard (closes a silent data-loss window). dbt resolved this model as
         # incremental because run-start disk discovery saw the table, so the model SQL already

@@ -1,0 +1,102 @@
+"""dbt-side disk-discovery behavior, through REAL `dbt run` / `docs generate`.
+
+Two things only the adapter's discovery path (impl.list_relations_without_caching /
+_with_delta_stats) provides, and that the connection-API suites cannot cover:
+
+  * Drop-tombstone hiding. dbt itself has no DROP — but the notebook API does
+    (`conn.sql("drop table x")` overwrites the table to a one-column marker, deleting nothing),
+    and both surfaces share one lakehouse. If discovery surfaced the tombstone, a model with the
+    dropped table's name would resolve is_incremental() == true on its next run and merge into
+    the marker instead of rebuilding from scratch. Hiding it makes drop-then-dbt behave like
+    CREATE-after-DROP.
+
+  * The docs Stats panel. `dbt docs generate` enriches the catalog with stats:* columns read
+    from the Delta log (_with_delta_stats); a shape regression only shows up as a silently
+    empty panel, so pin it here.
+"""
+import json
+import os
+from pathlib import Path
+
+import duckrun
+import pytest
+
+from dbt.cli.main import dbtRunner
+
+
+MODEL_SQL = """{{ config(materialized='incremental', unique_key='id') }}
+select 1 as id, 'a' as name
+{% if is_incremental() %}
+union all select 2 as id, 'b' as name
+{% endif %}
+"""
+
+
+@pytest.fixture
+def project(tmp_path):
+    """A one-model incremental project on a fresh local lakehouse root. The model emits row 1 on a
+    first (full) build and rows 1+2 on an incremental build — so which branch ran is readable
+    straight off the table contents."""
+    proj = tmp_path / "proj"
+    (proj / "models").mkdir(parents=True)
+    (proj / "dbt_project.yml").write_text(
+        "name: disco\nversion: '1.0'\nconfig-version: 2\nprofile: disco\n"
+        "model-paths: [models]\n", encoding="utf-8")
+    (proj / "profiles.yml").write_text(
+        "disco:\n  target: dev\n  outputs:\n    dev:\n"
+        "      type: duckrun\n      root_path: \"{{ env_var('DISCO_PATH') }}\"\n",
+        encoding="utf-8")
+    (proj / "models" / "events.sql").write_text(MODEL_SQL, encoding="utf-8")
+    root = (tmp_path / "wh").as_posix()
+    os.environ["DISCO_PATH"] = root
+    return proj, root
+
+
+def _dbt(proj: Path, *args: str):
+    return dbtRunner().invoke([*args, "--project-dir", str(proj), "--profiles-dir", str(proj)])
+
+
+def _rows(root):
+    con = duckrun.connect(root, schema="main", read_only=True)
+    return dict(con.sql("select id, name from events order by id").fetchall())
+
+
+def test_dropped_table_rebuilds_instead_of_merging(project):
+    proj, root = project
+    # Run 1 (full build) then run 2 (incremental): discovery found the table, so the merge branch
+    # ran and added row 2 — the baseline the tombstone must reset.
+    assert _dbt(proj, "run").success
+    assert _rows(root) == {1: "a"}
+    assert _dbt(proj, "run").success
+    assert _rows(root) == {1: "a", 2: "b"}
+
+    # Drop via the notebook surface: a one-column tombstone marker, files untouched on disk.
+    duckrun.connect(root, schema="main", read_only=False).sql("drop table events")
+    assert (Path(root) / "main" / "events" / "_delta_log").is_dir()  # nothing was deleted
+
+    # Run 3: discovery must HIDE the tombstone, so this is a first-run full build again — row 1
+    # only, real schema. If the tombstone leaked through, is_incremental() would be true and the
+    # run would merge {1,2} into the marker (failure or a marker column in the result).
+    assert _dbt(proj, "run").success
+    assert _rows(root) == {1: "a"}
+    cols = {r[0] for r in duckrun.connect(root, schema="main")
+            .sql("describe events").fetchall()}
+    assert cols == {"id", "name"}  # no __duckrun_deleted__ marker resurrected
+
+
+def test_docs_stats_panel_reads_the_delta_log(project):
+    proj, root = project
+    assert _dbt(proj, "run").success
+    assert _dbt(proj, "run").success          # table now holds 2 rows
+    assert _dbt(proj, "docs", "generate").success
+
+    catalog = json.loads((proj / "target" / "catalog.json").read_text(encoding="utf-8"))
+    node = catalog["nodes"]["model.disco.events"]
+    stats = node["stats"]
+    # The three Delta-log-sourced stats are present and included, with the real row count.
+    assert stats["num_rows"]["include"] is True
+    assert int(stats["num_rows"]["value"]) == 2
+    assert stats["bytes"]["include"] is True and int(stats["bytes"]["value"]) > 0
+    assert stats["last_modified"]["include"] is True
+    # And the relation itself is reported as a table (the delta_scan view classification).
+    assert node["metadata"]["type"] == "BASE TABLE"

@@ -15,9 +15,9 @@ Ported from the Fabric/OneLake multi-engine notebook. Differences:
   * Results are saved as a Delta table via plain SQL (CREATE TABLE + INSERT),
     not pandas write_deltalake.
 
-The end-to-end flow is :func:`run_tpch_benchmark`, parameterized by scale factor. ``test_tpch_local``
-drives it as an offline CI smoke (generation needs ``tpchgen-cli``; the cores job runs SF=10); run the
-file directly to drive it by hand:
+The end-to-end flow is :func:`run_tpch_benchmark`, parameterized by scale factor. In CI it is
+driven by ``tpch_card.py`` — cores' tpch-smoke job at SF=1, local_stress_tests' tpch-stress gate
+at SF=10 (SF=100 on a manual dispatch); run the file directly to drive it by hand:
 
     TPCH_SF=10 python tests/performance/tpch/test_tpch.py
 """
@@ -841,16 +841,6 @@ def run_tpch_benchmark(sf=1, base_path=None, timings_out=None):
 
     print(f"Total: {sum(r['dur'] for r in results):.2f}s across {len(results)} queries")
     return results
-
-
-def test_tpch_local(tmp_path):
-    """Offline CI smoke: the whole benchmark lands 22 timed queries and a `result` Delta table.
-    SF defaults to 1 for a fast local `pytest`; CI sets TPCH_SF (the cores job runs SF=10).
-    Generation shells out to tpchgen-cli (installed by the workflow)."""
-    sf = int(os.environ.get("TPCH_SF", "1"))
-    results = run_tpch_benchmark(sf=sf, base_path=str(tmp_path / "wh"))
-    assert [r["query"] for r in results] == list(range(1, 23))
-    assert all(r["dur"] >= 0 for r in results)
 
 
 if __name__ == "__main__":

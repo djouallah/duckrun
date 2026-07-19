@@ -111,8 +111,10 @@ def test_store_refuses_overwrite_when_table_vanishes_midrun(tmp_path, monkeypatc
     con.execute("create view increment as select 99 as id")
     plugin = _store_plugin(con)
 
-    # Simulate the transient storage error the fix stops swallowing.
-    monkeypatch.setattr(engine, "table_exists", lambda *a, **k: (_ for _ in ()).throw(OSError("503")))
+    # Simulate the transient storage error the fix stops swallowing. store()'s existence check is
+    # engine.open_if_exists (it keeps the handle for the drop-tombstone check); same fail-loud
+    # contract as table_exists, which delegates to it.
+    monkeypatch.setattr(engine, "open_if_exists", lambda *a, **k: (_ for _ in ()).throw(OSError("503")))
 
     tc = _fake_target_config(
         path, "increment",
