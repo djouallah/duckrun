@@ -571,14 +571,29 @@ class MultiDeployFabric:
     """Scripts a whole-folder deploy: serves every item collection (+ lakehouses and the Power BI
     refresh), tracks creates so later name lookups see earlier items, and records every call."""
 
-    def __init__(self, *, existing=None, lakehouses=None):
+    def __init__(self, *, existing=None, lakehouses=None, definitions=None, lro_defs=()):
         self.existing = existing or {}      # collection -> [{"displayName", "id"}]
         self.lakehouses = lakehouses if lakehouses is not None else [{"displayName": "bronze", "id": "lh-1"}]
+        self.definitions = definitions or {}  # item id -> [part dicts] served by getDefinition
+        self.lro_defs = set(lro_defs)         # item ids whose getDefinition goes the 202 route
+        self._pending = None                  # parts awaiting the LRO /result fetch
         self.counter = 0
         self.calls = []                     # (method, url, json_body)
+        self.get_defs = []                  # (url, params) of every getDefinition POST
 
     def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
         self.calls.append((method, url, json_body))
+        if method == "POST" and url.endswith("/getDefinition"):
+            self.get_defs.append((url, params))
+            item_id = url.rsplit("/", 2)[1]
+            if item_id in self.lro_defs:
+                self._pending = self.definitions[item_id]
+                return FakeResp(202, headers={"Location": "u/def-lro"})
+            return FakeResp(200, {"definition": {"parts": self.definitions[item_id]}})
+        if method == "GET" and url == "u/def-lro":
+            return FakeResp(200, {"status": "Succeeded"})
+        if method == "GET" and url == "u/def-lro/result":
+            return FakeResp(200, {"definition": {"parts": self._pending}})
         if method == "GET" and url.endswith("/workspaces"):
             return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
         if method == "GET" and url.endswith("/workspaces/ws-guid/lakehouses"):
@@ -745,3 +760,115 @@ def test_deploy_folder_py_notebook_raises_with_hint(_patch, tmp_path):
     _write_item(root, "run.Notebook", "Notebook", "run", {"notebook-content.py": "# code"})
     with pytest.raises(fr.RemoteRunError, match="ipynb-format"):
         _ws().deploy(str(root))
+
+
+# --- download (the mirror of folder deploy) -------------------------------------------------------
+
+def _platform_json(item_type, name):
+    return json.dumps({"metadata": {"type": item_type, "displayName": name},
+                       "config": {"version": "2.0", "logicalId": "0000"}})
+
+
+def _def_parts(item_type, name):
+    """The definition parts Fabric would return for one item of ``item_type`` named ``name``."""
+    primary = {"Notebook": ("notebook-content.ipynb", _NB_JSON),
+               "SemanticModel": ("model.bim", _directlake_bim()),
+               "DataPipeline": ("pipeline-content.json", _PIPE_WITH_NB),
+               "VariableLibrary": ("variables.json", json.dumps({"variables": [
+                   {"name": "lakehouse_name", "type": "String", "value": "bronze"}]}))}[item_type]
+    return [fr._b64_part(primary[0], primary[1]),
+            fr._b64_part(".platform", _platform_json(item_type, name))]
+
+
+def _download_fabric(**kw):
+    """A fake workspace holding one item of each supported type, definitions included."""
+    existing = {"variableLibraries": [{"displayName": "deploy_config", "id": "vl-1"}],
+                "notebooks": [{"displayName": "run", "id": "nb-1"}],
+                "semanticModels": [{"displayName": "aemo_electricity", "id": "sm-1"}],
+                "dataPipelines": [{"displayName": "run_pipeline", "id": "pl-1"}]}
+    definitions = {"vl-1": _def_parts("VariableLibrary", "deploy_config"),
+                   "nb-1": _def_parts("Notebook", "run"),
+                   "sm-1": _def_parts("SemanticModel", "aemo_electricity"),
+                   "pl-1": _def_parts("DataPipeline", "run_pipeline")}
+    return MultiDeployFabric(existing=existing, definitions=definitions, **kw)
+
+
+def test_download_writes_git_layout(_patch, tmp_path):
+    _patch(_download_fabric())
+    out = _ws().download(str(tmp_path))
+    assert set(out) == {"deploy_config", "run", "aemo_electricity", "run_pipeline"}
+    nb = tmp_path / "run.Notebook"
+    assert (nb / "notebook-content.ipynb").read_text(encoding="utf-8") == _NB_JSON   # decoded
+    assert json.loads((nb / ".platform").read_text(encoding="utf-8"))["metadata"]["type"] == "Notebook"
+    assert (tmp_path / "aemo_electricity.SemanticModel" / "model.bim").is_file()
+    assert (tmp_path / "run_pipeline.DataPipeline" / "pipeline-content.json").is_file()
+    assert (tmp_path / "deploy_config.VariableLibrary" / "variables.json").is_file()
+
+
+def test_download_roundtrips_through_deploy_scan(_patch, tmp_path):
+    # What download writes, the folder-deploy scanner must accept unchanged.
+    _patch(_download_fabric())
+    _ws().download(str(tmp_path))
+    items = wsmod._scan_item_folders(str(tmp_path))
+    assert [(it["type"], it["name"]) for it in items] == [
+        ("VariableLibrary", "deploy_config"), ("Notebook", "run"),
+        ("SemanticModel", "aemo_electricity"), ("DataPipeline", "run_pipeline")]
+
+
+def test_download_asks_roundtrip_formats(_patch, tmp_path):
+    # Notebooks come back as ipynb and semantic models as TMSL — the formats deploy consumes.
+    fake = _patch(_download_fabric())
+    _ws().download(str(tmp_path))
+    fmts = {url.rsplit("/", 2)[1]: (params or {}).get("format") for url, params in fake.get_defs}
+    assert fmts == {"vl-1": None, "nb-1": "ipynb", "sm-1": "TMSL", "pl-1": None}
+
+
+def test_download_single_item_by_name(_patch, tmp_path):
+    fake = _patch(_download_fabric())
+    out = _ws().download(str(tmp_path), name="run")
+    assert out == {"run": str(tmp_path / "run.Notebook")}
+    assert len(fake.get_defs) == 1                       # only that item's definition fetched
+    assert not (tmp_path / "run_pipeline.DataPipeline").exists()
+
+
+def test_download_unknown_name_raises_listing_items(_patch, tmp_path):
+    _patch(_download_fabric())
+    with pytest.raises(fr.RemoteRunError, match="no item named 'nope'.*deploy_config"):
+        _ws().download(str(tmp_path), name="nope")
+
+
+def test_download_ambiguous_name_raises(_patch, tmp_path):
+    fake = _download_fabric()
+    fake.existing["dataPipelines"].append({"displayName": "run", "id": "pl-2"})
+    _patch(fake)
+    with pytest.raises(fr.RemoteRunError, match="matches multiple items"):
+        _ws().download(str(tmp_path), name="run")
+
+
+def test_download_skips_existing_folder_unless_overwrite(_patch, tmp_path):
+    fake = _patch(_download_fabric())
+    target = tmp_path / "run.Notebook"
+    target.mkdir()
+    (target / "notebook-content.ipynb").write_text("LOCAL EDITS", encoding="utf-8")
+    _ws().download(str(tmp_path), name="run")
+    assert (target / "notebook-content.ipynb").read_text(encoding="utf-8") == "LOCAL EDITS"
+    assert fake.get_defs == []                           # skipped before any fetch
+    _ws().download(str(tmp_path), name="run", overwrite=True)
+    assert (target / "notebook-content.ipynb").read_text(encoding="utf-8") == _NB_JSON
+
+
+def test_download_lro_definition(_patch, tmp_path):
+    # A 202 getDefinition is polled to Succeeded and the parts come from the /result fetch.
+    fake = _patch(_download_fabric(lro_defs={"nb-1"}))
+    _ws().download(str(tmp_path), name="run")
+    assert any(m == "GET" and u == "u/def-lro/result" for m, u, _ in fake.calls)
+    assert (tmp_path / "run.Notebook" / "notebook-content.ipynb").read_text(encoding="utf-8") == _NB_JSON
+
+
+def test_download_rejects_escaping_part_path(_patch, tmp_path):
+    fake = _download_fabric()
+    fake.definitions["nb-1"].append(fr._b64_part("../evil.txt", "boom"))
+    _patch(fake)
+    with pytest.raises(fr.RemoteRunError, match="refusing to write"):
+        _ws().download(str(tmp_path), name="run")
+    assert not (tmp_path / "evil.txt").exists()

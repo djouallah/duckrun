@@ -11,6 +11,11 @@ All notable changes to this project will be documented in this file.
   `{displayName: item id}`. Names come from each item's `.platform`; a pipeline's notebook
   activities are auto-pointed at the folder's sole notebook; `lakehouse=` / `variables=` /
   `overwrite=` apply per item exactly as in a single-file deploy.
+- **Workspace download**: `ws.download(folder)` is the mirror — it exports the workspace's
+  deployable items (variable libraries, notebooks as ipynb, semantic models as TMSL, pipelines)
+  to disk in the same git-integration layout, `.platform` files included, so a downloaded folder
+  redeploys unchanged. `name=` grabs one item; existing local item folders are skipped unless
+  `overwrite=True`.
 
 ### Fixed
 - **A failed `CREATE SECRET` can no longer leak the OneLake bearer token into error messages or

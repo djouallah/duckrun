@@ -79,6 +79,22 @@ Folder mode returns a `{displayName: item id}` dict instead of a single id. Supp
 VariableLibrary, Notebook (ipynb format), SemanticModel, and DataPipeline; anything else in the
 folder raises rather than half-deploying.
 
+**`download(folder=".", name=None, overwrite=False)`** is the mirror: it exports the workspace's
+items **to** disk in the same layout, so you can build a workspace by hand once, download it,
+commit the folder, and redeploy it anywhere:
+
+```python
+ws.download("fabric_items")                  # export every item → fabric_items/name.ItemType/...
+ws.download("fabric_items", name="run")      # just one item
+duckrun.workspace("Prod").deploy("fabric_items", overwrite=True)   # round-trip
+```
+
+Notebooks are fetched in ipynb format and semantic models as TMSL (`model.bim`) — exactly the
+formats `deploy` consumes — and each item folder gets its `.platform` file as Fabric returns it,
+so a downloaded folder always redeploys unchanged. The item types are the same deployable four.
+An item folder that already exists locally is **skipped** unless `overwrite=True` (your local
+edits are never clobbered by default). Returns `{displayName: item folder path}`.
+
 `deploy` does create + refresh, and for Direct Lake that's the whole story: a Direct Lake model reads
 the Delta files straight from OneLake with the caller's own identity, so there's no gateway or stored
 data-source credential to bind — the reframe just works once the model is deployed.

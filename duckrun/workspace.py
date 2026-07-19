@@ -11,10 +11,12 @@ rather than on the :class:`~duckrun.session.DuckSession` that ``connect()`` retu
     ws.deploy("etl.ipynb")                            # deploy a file artifact (a notebook)
     ws.deploy("model.bim")                            # deploy + refresh a semantic model
     ws.deploy("fabric_items")                         # deploy a whole folder of items at once
+    ws.download("fabric_items")                       # the mirror: export the items to disk
 
 The Fabric REST plumbing (auth, retry, workspace resolution, LRO polling, item create, refresh) is
 reused as-is from :mod:`duckrun.fabric_remote`.
 """
+import base64
 import datetime
 import json
 import os
@@ -36,6 +38,7 @@ from .fabric_remote import (
     _resolve_workspace_id,
     _workspace_display_name,
     _await_lro_item_id,
+    _get_definition,
     _create_notebook,
     _create_semantic_model,
     _refresh_semantic_model,
@@ -94,6 +97,16 @@ _ITEM_PRIMARY = {
     "SemanticModel": "model.bim",
     "DataPipeline": "pipeline-content.json",
 }
+# The REST collection for each type, and the getDefinition format ``download`` asks for — ipynb /
+# TMSL are exactly what the deploy path consumes (notebook-content.ipynb / model.bim), so a
+# downloaded folder always round-trips through ``deploy``.
+_ITEM_ENDPOINT = {
+    "VariableLibrary": "variableLibraries",
+    "Notebook": "notebooks",
+    "SemanticModel": "semanticModels",
+    "DataPipeline": "dataPipelines",
+}
+_DOWNLOAD_FMT = {"Notebook": "ipynb", "SemanticModel": "TMSL"}
 
 # Item collections that ``run`` can execute, and the Fabric job type for each.
 _RUNNABLE = {"notebooks": "RunNotebook", "dataPipelines": "Pipeline"}
@@ -353,6 +366,54 @@ class Workspace:
             ids[it["name"]] = self.deploy(it["primary"], lakehouse=lakehouse, variables=variables,
                                           name=it["name"], overwrite=overwrite, notebook=nb)
         return ids
+
+    def download(self, folder: str = ".", name: Optional[str] = None,
+                 overwrite: bool = False) -> Dict[str, str]:
+        """Download the workspace's items into ``folder`` in the Fabric git-integration layout —
+        the mirror of a folder ``deploy``; return ``{displayName: item folder path}``.
+
+        Each item becomes a ``displayName.ItemType/`` subfolder holding its definition parts
+        exactly as Fabric returns them (``.platform`` included), so the folder can be committed
+        and redeployed anywhere with ``deploy(folder)``. Notebooks are fetched in ipynb format
+        and semantic models as TMSL (``model.bim``) — the formats ``deploy`` consumes. The item
+        types are the deployable four: variable libraries, notebooks, semantic models, data
+        pipelines. ``name=`` downloads just that item; an existing item folder is skipped unless
+        ``overwrite=True``.
+        """
+        wanted = []
+        for item_type in _DEPLOY_ORDER:
+            for it in self._items(_ITEM_ENDPOINT[item_type]):
+                wanted.append((item_type, it["displayName"], it["id"]))
+        if name is not None:
+            hits = [w for w in wanted if w[1] == name]
+            if not hits:
+                have = ", ".join(sorted(w[1] for w in wanted)) or "(none)"
+                raise RemoteRunError(f"no item named {name!r} in workspace {self.id}; have: {have}")
+            if len(hits) > 1:
+                raise RemoteRunError(f"{name!r} matches multiple items "
+                                     f"({', '.join(w[0] for w in hits)}); can't tell which")
+            wanted = hits
+        out: Dict[str, str] = {}
+        for item_type, display_name, item_id in wanted:
+            target = os.path.join(folder, f"{display_name}.{item_type}")
+            if os.path.exists(target) and not overwrite:
+                print(f"  ⏭ exists: {target}")
+                out[display_name] = target
+                continue
+            parts = _get_definition(self._token, self.id, _ITEM_ENDPOINT[item_type], item_id,
+                                    fmt=_DOWNLOAD_FMT.get(item_type))
+            for part in parts:
+                rel = part["path"]
+                # Part paths come from the service; never let one escape the item folder.
+                if os.path.isabs(rel) or ".." in rel.replace("\\", "/").split("/"):
+                    raise RemoteRunError(f"refusing to write definition part {rel!r} "
+                                         f"outside {target!r}")
+                dest = os.path.join(target, *rel.replace("\\", "/").split("/"))
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(base64.b64decode(part["payload"]))
+            out[display_name] = target
+        return out
 
     def _json_artifact(self, source: str, content: bytes, variables: Optional[Dict],
                        notebook: Optional[str] = None):

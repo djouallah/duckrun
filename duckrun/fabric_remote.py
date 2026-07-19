@@ -631,6 +631,47 @@ def _refresh_semantic_model(pbi_token: str, ws_id: str, item_id: str) -> None:
         raise RemoteRunError(f"semantic model refresh {status}: {entry}")
 
 
+def _get_definition(token: str, ws_id: str, endpoint: str, item_id: str,
+                    fmt: Optional[str] = None) -> List[dict]:
+    """The item's definition parts (``[{"path", "payload", "payloadType"}, ...]``) — the read twin
+    of :func:`_create_item`. ``fmt`` is the definition ``format`` when the type has one to ask for
+    (notebooks: ``"ipynb"``; semantic models: ``"TMSL"``, i.e. a ``model.bim``). Handles the
+    synchronous 200 and the long-running 202 (poll, then fetch the operation result)."""
+    resp = _http_request(
+        "POST", f"{_FABRIC_API}/workspaces/{ws_id}/{endpoint}/{item_id}/getDefinition",
+        token=token, params={"format": fmt} if fmt else None,
+    )
+    if resp.status_code == 200:
+        body = resp.json()
+    elif resp.status_code == 202:
+        body = _await_lro_result(token, resp)
+    else:
+        raise RemoteRunError(
+            f"could not read {endpoint} {item_id} definition (HTTP {resp.status_code}): {resp.text[:300]}")
+    return body["definition"]["parts"]
+
+
+def _await_lro_result(token: str, resp) -> dict:
+    """Poll a long-running operation to ``Succeeded`` and return its ``/result`` body (for
+    operations whose payload is the result document, e.g. ``getDefinition``)."""
+    location = resp.headers.get("Location")
+    if not location:
+        raise RemoteRunError("operation returned no Location to poll")
+    deadline_polls = _POLL_TIMEOUT // max(_POLL_INTERVAL, 1)
+    for _ in range(int(deadline_polls) + 1):
+        _sleep(_POLL_INTERVAL)
+        r = _http_request("GET", location, token=token)
+        r.raise_for_status()
+        status = r.json().get("status")
+        if status == "Succeeded":
+            rr = _http_request("GET", location.rstrip("/") + "/result", token=token)
+            rr.raise_for_status()
+            return rr.json()
+        if status in ("Failed", "Undetermined"):
+            raise RemoteRunError(f"operation failed: {r.json()}")
+    raise RemoteRunError("timed out waiting for operation result")
+
+
 def _await_lro_item_id(token: str, resp) -> str:
     """Poll a create long-running-operation to completion and return the created item id."""
     location = resp.headers.get("Location")
