@@ -28,7 +28,7 @@
 
 ## duckrun workspace API — Fabric artifact deploy
 
-🗂️ **10 public methods** · deploy · run · schedule
+🗂️ **11 public methods** · deploy · run · schedule
 
 > Introspected from the shipped classes — the exact public surface of `duckrun.workspace()` and the `Workspace` handle it returns, signatures and all, not a hand-maintained list. It drives Microsoft Fabric (create lakehouses, deploy notebooks / semantic models / pipelines / variable libraries, run and schedule them) — see the [Workspace (Fabric)](workspace.md) page. Exercised by the manual deploy demo ([`tests/deploy_testing`](../tests/deploy_testing)).
 
@@ -38,6 +38,7 @@
 | `Workspace` | `create_lakehouse` | `name, schemas=True` |
 | `Workspace` | `deploy` | `source, lakehouse=None, variables=None, name=None, overwrite=False, notebook=None` |
 | `Workspace` | `display_name` | *property* |
+| `Workspace` | `download` | `folder='.', name=None, overwrite=False` |
 | `Workspace` | `id` | *accessor* |
 | `Workspace` | `lakehouse_id` | `name` |
 | `Workspace` | `list_lakehouses` | *(none)* |
