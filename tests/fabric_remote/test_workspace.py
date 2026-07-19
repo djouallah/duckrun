@@ -563,3 +563,185 @@ def test_deploy_unsupported_extension_raises(_patch, tmp_path):
     src = _write(tmp_path, "data.csv", "x")
     with pytest.raises(fr.RemoteRunError, match="unsupported"):
         _ws().deploy(src)
+
+
+# --- folder deploy (Fabric git-integration layout) ------------------------------------------------
+
+class MultiDeployFabric:
+    """Scripts a whole-folder deploy: serves every item collection (+ lakehouses and the Power BI
+    refresh), tracks creates so later name lookups see earlier items, and records every call."""
+
+    def __init__(self, *, existing=None, lakehouses=None):
+        self.existing = existing or {}      # collection -> [{"displayName", "id"}]
+        self.lakehouses = lakehouses if lakehouses is not None else [{"displayName": "bronze", "id": "lh-1"}]
+        self.counter = 0
+        self.calls = []                     # (method, url, json_body)
+
+    def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
+        self.calls.append((method, url, json_body))
+        if method == "GET" and url.endswith("/workspaces"):
+            return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/lakehouses"):
+            return FakeResp(200, {"value": self.lakehouses})
+        for coll in ("notebooks", "semanticModels", "dataPipelines", "variableLibraries"):
+            if url.endswith(f"/workspaces/ws-guid/{coll}"):
+                if method == "GET":
+                    return FakeResp(200, {"value": self.existing.get(coll, [])})
+                self.counter += 1
+                item = {"displayName": json_body["displayName"], "id": f"item-{self.counter}"}
+                self.existing.setdefault(coll, []).append(item)
+                return FakeResp(201, {"id": item["id"]})
+        if method == "POST" and url.endswith("/updateDefinition"):
+            return FakeResp(200)
+        if method == "POST" and url.endswith("/refreshes"):
+            return FakeResp(202)
+        if method == "GET" and "/refreshes" in url:
+            return FakeResp(200, {"value": [{"status": "Completed"}]})
+        raise AssertionError(f"unexpected call {method} {url}")
+
+    def created(self):
+        """Collections POSTed to (creates only), in call order."""
+        return [u.rsplit("/", 1)[1] for m, u, _ in self.calls
+                if m == "POST" and "/workspaces/ws-guid/" in u
+                and not u.endswith(("/updateDefinition", "/refreshes"))]
+
+    def post_body(self, endpoint):
+        return next(c[2] for c in self.calls if c[0] == "POST" and c[1].endswith(endpoint))
+
+
+def _write_item(root, folder_name, item_type, display_name, files):
+    d = root / folder_name
+    d.mkdir(parents=True)
+    (d / ".platform").write_text(json.dumps(
+        {"metadata": {"type": item_type, "displayName": display_name},
+         "config": {"version": "2.0", "logicalId": "0000"}}), encoding="utf-8")
+    for fname, text in files.items():
+        (d / fname).write_text(text, encoding="utf-8")
+    return d
+
+
+_NB_JSON = json.dumps({"nbformat": 4, "cells": [], "metadata": {}})
+_PIPE_WITH_NB = json.dumps({"properties": {"activities": [
+    {"type": "TridentNotebook", "typeProperties": {"notebookId": "SRC-NB", "workspaceId": "SRC-WS"}}]}})
+
+
+def _fabric_items(tmp_path):
+    """A folder mirroring the reference repo layout: varlib + notebook + Direct Lake model + a
+    pipeline whose notebook activity still carries its source-workspace GUIDs."""
+    root = tmp_path / "fabric_items"
+    root.mkdir()
+    _write_item(root, "deploy_config.VariableLibrary", "VariableLibrary", "deploy_config",
+                {"variables.json": json.dumps({"variables": [
+                    {"name": "lakehouse_name", "type": "String", "value": "OLD"}]}),
+                 "settings.json": "{}"})
+    _write_item(root, "run.Notebook", "Notebook", "run", {"notebook-content.ipynb": _NB_JSON})
+    _write_item(root, "aemo.SemanticModel", "SemanticModel", "aemo_electricity",
+                {"model.bim": _directlake_bim(), "definition.pbism": "{}"})
+    _write_item(root, "run_pipeline.DataPipeline", "DataPipeline", "run_pipeline",
+                {"pipeline-content.json": _PIPE_WITH_NB})
+    return str(root)
+
+
+def _decoded_part(fake, endpoint, path):
+    import base64
+    parts = {p["path"]: p for p in fake.post_body(endpoint)["definition"]["parts"]}
+    return base64.b64decode(parts[path]["payload"]).decode()
+
+
+def test_deploy_folder_all_items_in_dependency_order(_patch, monkeypatch, tmp_path):
+    fake = _patch(MultiDeployFabric())
+    monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
+    ids = _ws().deploy(_fabric_items(tmp_path))
+    # every item deployed, named by its .platform displayName (not the folder stem "aemo")
+    assert ids == {"deploy_config": "item-1", "run": "item-2",
+                   "aemo_electricity": "item-3", "run_pipeline": "item-4"}
+    # varlib and notebook before the model, pipeline last (it references the notebook)
+    assert fake.created() == ["variableLibraries", "notebooks", "semanticModels", "dataPipelines"]
+    # the model was refreshed, like any single-file .bim deploy
+    assert any(m == "POST" and u.endswith("/refreshes") for m, u, _ in fake.calls)
+
+
+def test_deploy_folder_repoints_pipeline_at_folder_notebook(_patch, monkeypatch, tmp_path):
+    # The automagic: with exactly one notebook in the folder, the pipeline's TridentNotebook
+    # activity is rewritten to that just-deployed notebook's id + this workspace — no notebook= arg.
+    fake = _patch(MultiDeployFabric())
+    monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
+    _ws().deploy(_fabric_items(tmp_path))
+    out = json.loads(_decoded_part(fake, "/workspaces/ws-guid/dataPipelines", "pipeline-content.json"))
+    tp = out["properties"]["activities"][0]["typeProperties"]
+    nb_id = next(it["id"] for it in fake.existing["notebooks"] if it["displayName"] == "run")
+    assert tp == {"notebookId": nb_id, "workspaceId": "ws-guid"}
+
+
+def test_deploy_folder_pipeline_verbatim_without_notebook(_patch, tmp_path):
+    # No notebook in the folder → nothing to point at; the pipeline JSON ships untouched.
+    fake = _patch(MultiDeployFabric())
+    root = tmp_path / "items"
+    _write_item(root, "p.DataPipeline", "DataPipeline", "p", {"pipeline-content.json": _PIPE_WITH_NB})
+    _ws().deploy(str(root))
+    out = json.loads(_decoded_part(fake, "/workspaces/ws-guid/dataPipelines", "pipeline-content.json"))
+    assert out["properties"]["activities"][0]["typeProperties"]["notebookId"] == "SRC-NB"
+
+
+def test_deploy_folder_variables_injected(_patch, tmp_path):
+    fake = _patch(MultiDeployFabric())
+    root = tmp_path / "items"
+    _write_item(root, "cfg.VariableLibrary", "VariableLibrary", "cfg",
+                {"variables.json": json.dumps({"variables": [
+                    {"name": "lakehouse_name", "type": "String", "value": "OLD"}]})})
+    _ws().deploy(str(root), variables={"lakehouse_name": "bronze"})
+    out = json.loads(_decoded_part(fake, "/workspaces/ws-guid/variableLibraries", "variables.json"))
+    assert out["variables"][0]["value"] == "bronze"
+
+
+def test_deploy_item_folder_directly(_patch, tmp_path):
+    # Pointing at one name.ItemType folder (rather than its parent) deploys that single item.
+    fake = _patch(MultiDeployFabric())
+    d = _write_item(tmp_path, "run.Notebook", "Notebook", "run", {"notebook-content.ipynb": _NB_JSON})
+    assert _ws().deploy(str(d)) == {"run": "item-1"}
+    assert fake.post_body("/workspaces/ws-guid/notebooks")["displayName"] == "run"
+
+
+def test_deploy_folder_overwrite_forwarded(_patch, tmp_path):
+    fake = _patch(MultiDeployFabric(existing={"notebooks": [{"displayName": "run", "id": "old-nb"}]}))
+    root = tmp_path / "items"
+    _write_item(root, "run.Notebook", "Notebook", "run", {"notebook-content.ipynb": _NB_JSON})
+    with pytest.raises(fr.RemoteRunError, match="already exists"):
+        _ws().deploy(str(root))
+    assert _ws().deploy(str(root), overwrite=True) == {"run": "old-nb"}   # updated in place
+    assert any(m == "POST" and u.endswith("/notebooks/old-nb/updateDefinition")
+               for m, u, _ in fake.calls)
+    assert fake.created() == []                                           # never a fresh create
+
+
+def test_deploy_folder_unknown_type_raises(_patch, tmp_path):
+    fake = _patch(MultiDeployFabric())
+    root = tmp_path / "items"
+    _write_item(root, "sales.Report", "Report", "sales", {"definition.pbir": "{}"})
+    with pytest.raises(fr.RemoteRunError, match="unsupported item type 'Report'"):
+        _ws().deploy(str(root))
+    assert not any(m == "POST" for m, _, _ in fake.calls)   # rejected before any create
+
+
+def test_deploy_folder_name_kwarg_raises(_patch, tmp_path):
+    _patch(MultiDeployFabric())
+    root = tmp_path / "items"
+    _write_item(root, "run.Notebook", "Notebook", "run", {"notebook-content.ipynb": _NB_JSON})
+    with pytest.raises(fr.RemoteRunError, match="name="):
+        _ws().deploy(str(root), name="x")
+
+
+def test_deploy_empty_folder_raises(_patch, tmp_path):
+    _patch(MultiDeployFabric())
+    root = tmp_path / "empty"
+    root.mkdir()
+    with pytest.raises(fr.RemoteRunError, match="no Fabric items"):
+        _ws().deploy(str(root))
+
+
+def test_deploy_folder_py_notebook_raises_with_hint(_patch, tmp_path):
+    _patch(MultiDeployFabric())
+    root = tmp_path / "items"
+    _write_item(root, "run.Notebook", "Notebook", "run", {"notebook-content.py": "# code"})
+    with pytest.raises(fr.RemoteRunError, match="ipynb-format"):
+        _ws().deploy(str(root))

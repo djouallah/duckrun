@@ -29,7 +29,7 @@ re-created), so it's safe to call before every run. Pass `schemas=False` for a n
 lakehouse. It raises on a real API failure rather than returning a sentinel.
 
 **`deploy(source, name=None, overwrite=False)`** pushes a file artifact to the workspace. `source` is
-a local file path or an `http(s)` URL (e.g. a GitHub raw URL). The item type comes from the
+a local file path, an `http(s)` URL (e.g. a GitHub raw URL), or a **folder** of items (see below). The item type comes from the
 extension — `.ipynb` → notebook, `.bim` → semantic model, `.json` → data pipeline — and the name
 defaults to the filename stem (override with `name=`). A `.bim` is also **refreshed** after deploy (a
 *reframe* onto the latest Delta data for Direct Lake), so `deploy` returns only once the model is
@@ -54,6 +54,30 @@ ws.deploy("model.bim")                        # workspace has one lakehouse → 
 The lakehouse is **inferred** when the model already targets one that exists in this workspace, or
 the workspace has exactly one; with several you must name it (otherwise `deploy` raises, listing
 them). A wrong name raises with the available names. `lakehouse=` is ignored for `.ipynb` / `.json`.
+
+**Deploying a whole folder of items.** Point `deploy` at a **folder** in the Fabric
+git-integration layout — one `name.ItemType/` subfolder per item, each with its `.platform` file —
+and every item in it is deployed in one call:
+
+```
+fabric_items/
+├── deploy_config.VariableLibrary/    .platform, settings.json, variables.json
+├── run.Notebook/                     .platform, notebook-content.ipynb
+├── model.SemanticModel/              .platform, definition.pbism, model.bim
+└── run_pipeline.DataPipeline/        .platform, pipeline-content.json
+
+ws.deploy("fabric_items", overwrite=True)   # → {"deploy_config": id, "run": id, ...}
+```
+
+Items deploy in **dependency order** — variable libraries, notebooks, semantic models, then
+pipelines — and each behaves exactly like its single-file deploy: names come from the `.platform`
+`displayName`, the `.bim` is repointed (`lakehouse=`) and refreshed, `variables=` fills the variable
+library, `overwrite` applies per item. The automagic bit: when the folder has exactly **one**
+notebook, a pipeline's notebook activities are automatically pointed at it — the just-deployed
+notebook, in this workspace, no GUID surgery (with several notebooks, pick one via `notebook=`).
+Folder mode returns a `{displayName: item id}` dict instead of a single id. Supported item types are
+VariableLibrary, Notebook (ipynb format), SemanticModel, and DataPipeline; anything else in the
+folder raises rather than half-deploying.
 
 `deploy` does create + refresh, and for Direct Lake that's the whole story: a Direct Lake model reads
 the Delta files straight from OneLake with the caller's own identity, so there's no gateway or stored

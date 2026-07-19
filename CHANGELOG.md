@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Folder deploy**: `ws.deploy("fabric_items")` now accepts a folder in the Fabric
+  git-integration layout (`name.ItemType/` subfolders with `.platform` files) and deploys every
+  item in it — variable libraries, notebooks, semantic models, then pipelines — returning
+  `{displayName: item id}`. Names come from each item's `.platform`; a pipeline's notebook
+  activities are auto-pointed at the folder's sole notebook; `lakehouse=` / `variables=` /
+  `overwrite=` apply per item exactly as in a single-file deploy.
+
 ### Fixed
 - **A failed `CREATE SECRET` can no longer leak the OneLake bearer token into error messages or
   logs** — the statement text DuckDB echoes into the exception is redacted, and the original
