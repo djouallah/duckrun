@@ -325,6 +325,28 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         f"PROJECT_B64 = {project_b64!r}\n"
         "PROJ = os.path.join(_SCRATCH, 'duckrun_proj', RUNID)\n"
         "_buf = io.StringIO()\n"
+        # Live log: a daemon thread flushes the captured dbt output to a .log beside the result
+        # JSON every ~15s, so the runner can TAIL the build as it happens instead of printing
+        # opaque 'InProgress' heartbeats for an hour. Best-effort: a failed flush never touches
+        # the build, and the full log still travels in the result JSON at the end.
+        "LOG_PATH = RESULT_PATH[:-5] + '.log'\n"
+        "import threading as _th\n"
+        "_log_done = _th.Event()\n"
+        "def _flush_log():\n"
+        "    import notebookutils as _nb\n"
+        "    _last = -1\n"
+        "    while True:\n"
+        "        _stop = _log_done.wait(15)\n"
+        "        _v = _buf.getvalue()\n"
+        "        if len(_v) != _last:\n"
+        "            _last = len(_v)\n"
+        "            try:\n"
+        "                _nb.fs.put(LOG_PATH, _v, overwrite=True)\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "        if _stop:\n"
+        "            return\n"
+        "_th.Thread(target=_flush_log, daemon=True).start()\n"
         # Log the actual scratch disk the job landed on — DuckDB caps its temp spill at the free space
         # of this drive (temp_directory defaults to cwd, which is under _SCRATCH), so this is the real
         # spill ceiling. Printed to _buf so it reaches the runner's log even when the build then fails.
@@ -363,6 +385,7 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
         "# one result per command even if setup blew up before the loop\n"
         "for _cmd in COMMANDS[len(results):]:\n"
         "    results.append({'command': _cmd, 'success': False, 'nodes': [], 'error': 'setup failed'})\n"
+        "_log_done.set()\n"
         "_payload = json.dumps({'runid': RUNID, 'results': results, 'log': _buf.getvalue()})\n"
         "import notebookutils\n"
         "try:\n"
@@ -696,12 +719,16 @@ def _await_lro_item_id(token: str, resp) -> str:
     raise RemoteRunError("timed out creating item")
 
 
-def _run_job_and_wait(token: str, ws_id: str, item_id: str, job_type: str = "RunNotebook") -> str:
+def _run_job_and_wait(token: str, ws_id: str, item_id: str, job_type: str = "RunNotebook",
+                      tail=None) -> str:
     """Start an on-demand job for the item and poll the instance to a terminal state. Returns the
     terminal status; raises ``RemoteRunError`` on a non-Completed terminal state or timeout.
     ``job_type`` is the Fabric job kind — ``"RunNotebook"`` for a notebook, ``"Pipeline"`` for a data
     pipeline. Compute size (vCores) is carried by the notebook's ``%%configure`` cell, which API runs
-    honor."""
+    honor. ``tail`` (optional zero-arg callable) is invoked once per poll — the hook the runner uses
+    to stream the remote dbt log live; its failures are swallowed (tailing must never kill a run).
+    Status lines are only printed on TRANSITIONS so the tailed log is the heartbeat, not
+    'InProgress' spam."""
     resp = _http_request(
         "POST", f"{_FABRIC_API}/workspaces/{ws_id}/items/{item_id}/jobs/instances",
         token=token, params={"jobType": job_type},
@@ -714,7 +741,7 @@ def _run_job_and_wait(token: str, ws_id: str, item_id: str, job_type: str = "Run
         raise RemoteRunError("job start returned no instance Location to poll")
 
     deadline_polls = _POLL_TIMEOUT // max(_POLL_INTERVAL, 1)
-    status = "Unknown"
+    status, last_logged = "Unknown", None
     for _ in range(int(deadline_polls) + 1):
         _sleep(_POLL_INTERVAL)
         # A long remote job (a multi-hour dbt batch) outlives the ~1h control-plane token the
@@ -725,7 +752,14 @@ def _run_job_and_wait(token: str, ws_id: str, item_id: str, job_type: str = "Run
         r.raise_for_status()
         body = r.json()
         status = body.get("status", "Unknown")
-        _log(f"job {body.get('id', '')} status: {status}")
+        if status != last_logged:
+            _log(f"job {body.get('id', '')} status: {status}")
+            last_logged = status
+        if tail is not None:
+            try:
+                tail()
+            except Exception:  # noqa: BLE001 — tailing is best-effort by contract
+                pass
         if status in _JOB_DONE:
             if status != "Completed":
                 reason = body.get("failureReason") or body
@@ -797,6 +831,19 @@ def _dfs_get(abfss_url: str, storage_token: str) -> str:
     )
     resp.raise_for_status()
     return resp.text
+
+
+def _dfs_delete(abfss_url: str, storage_token: str) -> None:
+    """Best-effort DFS DELETE (the live-tail .log teardown) — absence or failure is fine."""
+    filesystem, host, path = _remote._parse_abfss(abfss_url)
+    try:
+        _remote.retry_request(
+            "DELETE", f"https://{host}/{filesystem}/{path}",
+            headers={"Authorization": f"Bearer {storage_token}", "x-ms-version": _DFS_API_VERSION},
+            timeout=60,
+        )
+    except Exception:  # noqa: BLE001 — cleanup only
+        pass
 
 
 def _log(message: str) -> None:
@@ -915,16 +962,35 @@ class RemoteRunner:
         ws_id = _resolve_workspace_id(fabric_token, workspace)
         _log(f"creating temp notebook duckrun-remote-{runid} in workspace {workspace}")
         item_id = _create_notebook(fabric_token, ws_id, f"duckrun-remote-{runid}", notebook)
+
+        # Live tail: the notebook flushes its captured dbt output to <runid>.log every ~15s;
+        # each poll prints whatever is new, so the dbt build streams into THIS process's stdout
+        # as it happens. Absence of the file (job still booting) is normal and silent.
+        log_path = f"{files_base}/duckrun_remote/{runid}.log"
+        streamed = {"chars": 0, "token": storage_token}
+
+        def _tail() -> None:
+            streamed["token"] = _fresh_token(streamed["token"], auth.get_onelake_token)
+            text = _dfs_get(log_path, streamed["token"])
+            new = text[streamed["chars"]:]
+            if new:
+                streamed["chars"] = len(text)
+                for line in new.splitlines():
+                    print(f"[remote] {line}")
+
         try:
-            _run_job_and_wait(fabric_token, ws_id, item_id)
+            _run_job_and_wait(fabric_token, ws_id, item_id, tail=_tail)
             # The wait can consume most of the tokens' ~1h life — re-check before the post-wait reads.
             result = read_result_json(result_path, _fresh_token(storage_token, auth.get_onelake_token))
         finally:
             _delete_item(_fresh_token(fabric_token, auth.get_fabric_token), ws_id, item_id)
+            _dfs_delete(log_path, _fresh_token(streamed["token"], auth.get_onelake_token))
 
+        # Print whatever the tail didn't catch (the .log flush is periodic; the result JSON is
+        # authoritative). When nothing streamed — e.g. a fast job — this is the whole log.
         log_text = result.get("log", "")
-        if log_text:
-            _print_remote_log(log_text)
+        if len(log_text) > streamed["chars"]:
+            _print_remote_log(log_text[streamed["chars"]:])
         return result.get("results", [])
 
 
