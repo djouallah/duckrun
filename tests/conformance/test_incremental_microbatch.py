@@ -177,6 +177,29 @@ models__microbatch_lookback = """
 select id, event_time, version from {{ ref('microbatch_lookback_input') }}
 """
 
+# The input deliberately has NO event_time config, so dbt-core applies no ref filter — the window
+# filtering runs entirely through duckrun's plugin (DuckDB re-filter) + replace_window predicate
+# (datafusion), pinning identifier quoting of a reserved-word event_time in BOTH engines.
+models__microbatch_reserved_input = """
+{{ config(materialized='table') }}
+
+select 1 as id, '2025-01-01 00:00:00'::timestamp as "order"
+union all
+select 2 as id, '2025-01-02 00:00:00'::timestamp as "order"
+"""
+
+models__microbatch_reserved = """
+{{ config(
+    materialized='incremental',
+    incremental_strategy='microbatch',
+    event_time='order',
+    batch_size='day',
+    begin=modules.datetime.datetime(2025, 1, 1, 0, 0, 0)
+) }}
+
+select id, "order" from {{ ref('microbatch_reserved_input') }}
+"""
+
 
 @pytest.mark.skipif(not MICROBATCH_AVAILABLE, reason="Microbatch tests require dbt-core >= 1.9")
 class TestMicrobatch(BaseMicrobatch):
@@ -289,6 +312,8 @@ class TestMicrobatchScenarios:
             "microbatch_reprocess.sql": models__microbatch_reprocess,
             "microbatch_lookback_input.sql": models__microbatch_lookback_input,
             "microbatch_lookback.sql": models__microbatch_lookback,
+            "microbatch_reserved_input.sql": models__microbatch_reserved_input,
+            "microbatch_reserved.sql": models__microbatch_reserved,
         }
 
     def _run_with_bounds(
@@ -304,6 +329,17 @@ class TestMicrobatchScenarios:
         if full_refresh:
             args.append("--full-refresh")
         run_dbt(args, expect_pass=expect_pass)
+
+    def test_microbatch_reserved_word_event_time(self, project):
+        self._run_with_bounds(
+            "microbatch_reserved_input microbatch_reserved", project,
+            expect_pass=True, full_refresh=True, end="2025-01-03",
+        )
+        relation = relation_from_name(project.adapter, "microbatch_reserved")
+        count = project.run_sql(
+            f"SELECT COUNT(*) as count FROM {relation}", fetch="one"
+        )
+        assert count[0] == 2
 
     def test_microbatch_runs_twice_without_changes(self, project):
         self._run_with_bounds(

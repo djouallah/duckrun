@@ -1169,9 +1169,10 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) 
             _last_cleanup_version[path] = dt.version()
             # Bound the per-process marker dict (a long-lived notebook touching many tables would
             # grow it forever). Evicting the oldest entry only means that table's next maintenance
-            # re-runs an idempotent cleanup_metadata a bit early — cheap and harmless.
+            # re-runs an idempotent cleanup_metadata a bit early — cheap and harmless. The pop
+            # default absorbs two threads racing to evict the same key (the dict is module-global).
             while len(_last_cleanup_version) > 512:
-                _last_cleanup_version.pop(next(iter(_last_cleanup_version)))
+                _last_cleanup_version.pop(next(iter(_last_cleanup_version)), None)
     except CommitFailedError as e:
         logger.warning(f"post-write metadata cleanup skipped (data commit already succeeded): {e}")
 
@@ -1423,7 +1424,8 @@ def replace_window(
     :func:`replace_where` with the window predicate; ``read_version`` pins/fences the commit."""
     # CAST-free window predicate — see replace_where. delta_rs coerces the string literals to the
     # column's type, so this works whether event_time is a DATE or a TIMESTAMP.
-    predicate = f"{column} >= '{start}' AND {column} < '{end}'"
+    _col = quote_ident(column)
+    predicate = f"{_col} >= '{start}' AND {_col} < '{end}'"
     replace_where(
         path, data, predicate,
         read_version=read_version, partition_by=partition_by,

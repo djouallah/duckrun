@@ -1,17 +1,23 @@
-"""OneLake bearer-token acquisition for the duckrun connection API.
+"""Bearer-token acquisition for the duckrun connection API — one audience per entry point:
+OneLake storage (``get_onelake_token``), the Fabric control plane (``get_fabric_token``, used by
+``RemoteRunner``), and the Power BI REST API (``get_powerbi_token``, semantic-model refresh).
 
-Only used for ``abfss://`` (OneLake) stores when the caller didn't already supply a token in
-``storage_options``. Every other backend (local / s3 / gcs / az://) authenticates through
-``storage_options`` / DuckDB secrets / the environment, and never calls in here.
+Storage tokens are only minted for ``abfss://`` (OneLake) stores when the caller didn't already
+supply one in ``storage_options``. Every other backend (local / s3 / gcs / az://) authenticates
+through ``storage_options`` / DuckDB secrets / the environment, and never calls in here.
 
-Acquisition order, cheapest first:
+Acquisition order (``get_onelake_token``), cheapest first:
   1. inside a Microsoft Fabric notebook → ``notebookutils.credentials.getToken`` (no extra deps);
-  2. an existing ``AZURE_STORAGE_TOKEN`` in the environment;
-  3. ``azure-identity`` (Azure CLI, then interactive browser) — a core dependency, for use on a
-     laptop.
+  2. GitHub Actions workload-identity federation — exchanges a FRESH OIDC JWT per acquisition,
+     the one source that still works after a ~1h token expires mid-build on a CI runner;
+  3. an existing ``AZURE_STORAGE_TOKEN`` in the environment;
+  4. ``azure-identity`` (Azure CLI, then interactive browser when on a TTY) — a core dependency,
+     for use on a laptop.
 
-This is a hard-trimmed descendant of the legacy duckrun ``auth.py``: no device-code / Colab /
-Fabric-API-token branches — just what a storage read/write needs.
+The Fabric / Power BI entry points follow the same order with their own audiences and env vars
+(``FABRIC_TOKEN`` / ``POWERBI_TOKEN``). Tokens are cached per (tenant, scope) and re-acquired near
+expiry. This is a hard-trimmed descendant of the legacy duckrun ``auth.py``: no device-code /
+Colab branches — just what the connection API needs.
 """
 import base64
 import json

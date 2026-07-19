@@ -141,20 +141,36 @@
        the yaml contract) is the standard dbt check; reusing get_assert_columns_equivalent keeps
        the error formatting identical. NOT NULL is enforced at write time in the plugin (a guard
        query on the staged rows), so collect the not-null column names and thread them through.
-       check / primary_key / foreign_key constraints are not enforceable against a delta_scan
-       view and are documented as structural gaps in the README scorecard (no fixture-override of
-       behavioral check tests). --#}
+       check / primary_key / foreign_key / unique constraints are not enforceable in a delta_rs
+       write (no constraint DDL), so — per dbt's NOT_ENFORCED convention (the standard adapter
+       fixtures declare pk/check on every contract model and expect a green run) — they emit a
+       warning instead of silently passing, unless the constraint opts out via
+       warn_unenforced/warn_unsupported: false. --#}
   {%- set contract_config = config.get('contract') -%}
   {%- set not_null_columns = [] -%}
+  {%- set unenforced_constraints = [] -%}
   {%- if contract_config and contract_config.enforced and language != 'python' -%}
     {{ get_assert_columns_equivalent(model_sql) }}
     {%- for _cname, _col in (model.get('columns') or {}).items() -%}
       {%- for _c in (_col.get('constraints') or []) -%}
         {%- if _c.get('type') == 'not_null' -%}
           {%- do not_null_columns.append(_col['name']) -%}
+        {%- elif _c.get('warn_unenforced', true) and _c.get('warn_unsupported', true) -%}
+          {%- do unenforced_constraints.append(_c.get('type') ~ ' on ' ~ _col['name']) -%}
         {%- endif -%}
       {%- endfor -%}
     {%- endfor -%}
+    {%- for _c in (model.get('constraints') or []) -%}
+      {%- if _c.get('warn_unenforced', true) and _c.get('warn_unsupported', true) -%}
+        {%- do unenforced_constraints.append('model-level ' ~ _c.get('type')) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if unenforced_constraints -%}
+      {%- do exceptions.warn("duckrun enforces this contract's column shape and not_null, but cannot enforce: "
+          ~ (unenforced_constraints | join(', '))
+          ~ ". These stay metadata-only (delta_rs has no constraint DDL); enforce them as dbt tests, "
+          ~ "or set warn_unenforced: false on the constraint to silence this warning.") -%}
+    {%- endif -%}
   {%- endif -%}
 
   {#-- 1. Stage the model SQL as a DuckDB view so the plugin can read it as Arrow.

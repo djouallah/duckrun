@@ -56,6 +56,16 @@ def test_merge_on_predicate_strips_user_quotes():
     assert pred == 'target."id" = source."id"'
 
 
+def test_replace_window_quotes_event_time_column(monkeypatch):
+    # A reserved-word / mixed-case event_time must reach delta_rs quoted, like merge keys do.
+    captured = {}
+    monkeypatch.setattr(engine, "replace_where",
+                        lambda path, data, predicate, **kw: captured.update(predicate=predicate))
+    engine.replace_window("p", None, column="order",
+                          start="2025-01-01 00:00:00", end="2025-01-02 00:00:00", read_version=0)
+    assert captured["predicate"] == '"order" >= \'2025-01-01 00:00:00\' AND "order" < \'2025-01-02 00:00:00\''
+
+
 # ------------------------------------------------------- #17 trailing-slash normalization
 
 def test_root_path_trailing_slash_stripped():

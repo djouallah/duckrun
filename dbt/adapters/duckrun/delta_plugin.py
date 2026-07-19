@@ -440,10 +440,11 @@ class Plugin(BasePlugin):
 
         # Re-filter the staged rows to this batch's window (dbt also filters the model's
         # inputs, but this keeps the delete and the insert covering exactly the same range).
+        _etime = engine.quote_ident(event_time)
         window = cur.sql(
             f"SELECT * FROM {name} WHERE "
-            f"CAST({event_time} AS TIMESTAMP) >= CAST('{start}' AS TIMESTAMP) "
-            f"AND CAST({event_time} AS TIMESTAMP) < CAST('{end}' AS TIMESTAMP)"
+            f"CAST({_etime} AS TIMESTAMP) >= CAST('{start}' AS TIMESTAMP) "
+            f"AND CAST({_etime} AS TIMESTAMP) < CAST('{end}' AS TIMESTAMP)"
         )
 
         # First batch of a --full-refresh run truncates; later batches (and every batch of a

@@ -1,5 +1,6 @@
 import pytest
 
+from dbt.tests.util import run_dbt_and_capture
 from dbt.tests.adapter.constraints.test_constraints import (
     BaseTableConstraintsColumnsEqual,
     BaseViewConstraintsColumnsEqual,
@@ -118,3 +119,62 @@ class TestModelConstraintsRuntimeEnforcement(
     @pytest.fixture(scope="class")
     def expected_sql(self):
         return _DUCKRUN_VIEW_DDL
+
+
+# duckrun enforces a contract's column shape + not_null for real, but check/pk/fk/unique have no
+# delta_rs equivalent. Per dbt's NOT_ENFORCED convention the run stays green and WARNS (silent
+# acceptance would be the same divergence class as an ignored merge config); warn_unenforced: false
+# opts a constraint out of the warning. Regression for the silent-pass gap found in review.
+_unenforced_warn_model = """
+{{ config(materialized='table') }}
+select 1 as id
+"""
+
+_unenforced_silent_model = """
+{{ config(materialized='table') }}
+select 1 as id
+"""
+
+_unenforced_schema_yml = """
+version: 2
+models:
+  - name: warn_model
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: id
+        data_type: int
+        constraints:
+          - type: not_null
+          - type: check
+            expression: id > 0
+  - name: silent_model
+    config:
+      contract:
+        enforced: true
+    columns:
+      - name: id
+        data_type: int
+        constraints:
+          - type: primary_key
+            warn_unenforced: false
+"""
+
+
+class TestUnenforcedConstraintWarns:
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {
+            "warn_model.sql": _unenforced_warn_model,
+            "silent_model.sql": _unenforced_silent_model,
+            "schema.yml": _unenforced_schema_yml,
+        }
+
+    def test_check_constraint_warns_but_passes(self, project):
+        _, logs = run_dbt_and_capture(["run", "--select", "warn_model"], expect_pass=True)
+        assert "cannot enforce: check on id" in logs
+
+    def test_warn_unenforced_false_is_silent(self, project):
+        _, logs = run_dbt_and_capture(["run", "--select", "silent_model"], expect_pass=True)
+        assert "cannot enforce" not in logs

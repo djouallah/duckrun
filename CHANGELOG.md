@@ -18,6 +18,17 @@ All notable changes to this project will be documented in this file.
   `overwrite=True`.
 
 ### Fixed
+- **A contract's unenforceable constraints now warn instead of passing silently.** With
+  `contract.enforced: true`, `check` / `primary_key` / `foreign_key` / `unique` constraints have
+  no Delta-write equivalent; the run previously stayed green with no signal. It still passes
+  (dbt's NOT_ENFORCED convention) but now emits a warning naming each unenforced constraint;
+  `warn_unenforced: false` on a constraint silences it. Column shape and `not_null` are enforced
+  as before.
+- **A reserved-word or mixed-case `event_time` no longer breaks microbatch.** The column is now
+  quoted in both the batch-window re-filter and the `replaceWhere` predicate, matching the
+  identifier quoting merge keys already had.
+- **A rare crash evicting from the per-process maintenance marker cache under concurrent writers
+  is closed** (two threads racing to evict the same entry).
 - **A dropped table is rebuilt, not merged into.** `conn.sql("drop table x")` tombstones the
   table (a one-column marker; nothing deleted), but a dbt incremental model with that name still
   found "a table" at write time and merged into the marker, dying on its schema. The store path
