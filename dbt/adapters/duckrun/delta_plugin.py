@@ -239,25 +239,8 @@ class Plugin(BasePlugin):
         # Table-like (non-incremental) models always overwrite. Incremental models
         # overwrite on first run / full-refresh, then apply the incremental strategy.
         if not incremental or full_refresh or not exists:
-            # This branch is a CREATE OR REPLACE: a table model, a --full-refresh, or a first run.
-            # When we are REPLACING an existing table (exists), allow delta_rs to replace the schema
-            # wholesale (schema_mode="overwrite") — the model SQL defines the new schema, exactly as
-            # `CREATE OR REPLACE TABLE` does on every other warehouse. Without it, delta_rs's strict
-            # overwrite keeps the OLD schema/protocol and so can't change a column's type or write a
-            # column needing a new writer feature the old table lacks (e.g. retyping to ::timestamp /
-            # timestampNtz). This is scoped to the full-rebuild replace ONLY — NOT append, merge, or
-            # microbatch, which must keep their strict, schema-stable writes. A fresh create
-            # (not exists) doesn't need it. A user's explicit merge_schema still wins.
-            overwrite_schema = exists and not merge_schema
-            with engine.mem_profile("overwrite", con=cur):
-                engine.write_delta(
-                    path, data, "overwrite",
-                    partition_by=partition_by,
-                    merge_schema=merge_schema,
-                    overwrite_schema=overwrite_schema,
-                    storage_options=storage_options,
-                    cur=cur,
-                )
+            self._store_overwrite(path, cur, data, partition_by, merge_schema, exists,
+                                  storage_options)
             return
 
         # Resolve the incremental strategy: default to merge when a unique_key is given, else append.
@@ -280,102 +263,135 @@ class Plugin(BasePlugin):
             return
 
         if strategy in ("merge", "insert"):
-            # Validate the merge config shape FIRST — before any Delta access, memory tuning, or
-            # write — so an invalid config fails fast and cleanly (no partial/late delta_rs
-            # "Schema error" after the log has moved). Messages mirror dbt-duckdb's
-            # validate_merge_config so the behavior is portable.
-            self._validate_merge_config(cfg)
-            if not unique_key:
-                raise ValueError(
-                    f"incremental_strategy='{strategy}' requires a unique_key."
-                )
-            # NOTE: a duplicate-key source is rejected downstream in engine.merge_delta_clauses (the
-            # shared chokepoint for the dbt merge/insert strategies AND the DataFrame/SQL merge API),
-            # so the cardinality rule is enforced identically across every merge path.
-            # on_schema_change: detect added/removed columns vs the existing table and
-            # decide whether to let delta_rs evolve the schema (or fail). Default 'ignore'.
-            on_schema_change = (cfg.get("on_schema_change") or "ignore").lower()
-            evolve_schema = self._resolve_schema_change(
-                on_schema_change, path, data, storage_options
-            )
-            # Merge is the only path where DuckDB and the delta_rs pool peak together: tighten
-            # DuckDB to its share so the two fit. (write/append above left it at the baseline.)
-            engine.set_merge_memory_limit(cur)
-            # streamed_exec: default False so delta_rs collects the source and uses its stats to
-            # prune the target (right for small incremental deltas into a large table). A model
-            # whose source is itself huge can set merge_streamed_exec=true to stream it instead.
-            sx = cfg.get("merge_streamed_exec")
-            # merge_clauses / merge_update_set_expressions need delta_rs's full ordered clause list
-            # (matched-delete, multiple matched clauses, custom SET expressions) — divert to the
-            # clause-core. Everything else stays on the byte-identical flat-kwarg merge_delta path.
-            clause_specs = self._custom_merge_clauses(cfg, data.columns, unique_key)
-            with engine.mem_profile("merge", con=cur):
-                if clause_specs is not None:
-                    engine.merge_delta_clauses(
-                        path, data,
-                        self._merge_on_predicate(unique_key, cfg, data.columns),
-                        clause_specs,
-                        merge_schema=evolve_schema,
-                        max_spill_size=cfg.get("merge_max_spill_size"),
-                        max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
-                        streamed_exec=(False if sx is None else bool(sx)),
-                        read_version=cfg.get("read_version"),
-                        storage_options=storage_options,
-                        cur=cur,
-                    )
-                else:
-                    engine.merge_delta(
-                        path, data, unique_key,
-                        insert_only=(strategy == "insert"),
-                        update_columns=cfg.get("merge_update_columns"),
-                        exclude_columns=cfg.get("merge_exclude_columns"),
-                        predicates=self._merge_predicates(cfg, data.columns),
-                        update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
-                        insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
-                        merge_schema=evolve_schema,
-                        max_spill_size=cfg.get("merge_max_spill_size"),
-                        max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
-                        streamed_exec=(False if sx is None else bool(sx)),
-                        # Pin the merge target to the version the model read (vB, captured before it
-                        # read {{ this }}), so OCC validates (vB, HEAD] — read and commit are one snapshot.
-                        read_version=cfg.get("read_version"),
-                        storage_options=storage_options,
-                        cur=cur,
-                    )
-            if src_tmp is not None:
-                cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")  # #14: release the materialized source
+            self._store_merge(path, cur, data, cfg, unique_key, strategy, storage_options, src_tmp)
         elif strategy == "append":
-            # A read-modify-append on the SAME table — the model read {{ this }} (e.g. an incremental
-            # append whose watermark is `max(ts) from {{ this }}`) — is fenced to the version the
-            # model read (vB, captured before it read {{ this }}): a concurrent commit any time during
-            # the build makes it fail loudly (CommitFailedError) instead of appending a duplicate. This
-            # is the automatic append_if_unchanged behavior — no strategy to pick. A plain append of
-            # NEW data (no {{ this }} read) is unfenced (last-writer-wins / additive). CAS via delta_rs
-            # max_commit_retries=0 (engine). No dedup — that's the SQL's job.
-            rv = cfg.get("read_version") if cfg.get("reads_self") else None
-            with engine.mem_profile("append", con=cur):
-                if rv is not None:
-                    engine.append_if_unchanged(
-                        path, data,
-                        read_version=rv,
-                        partition_by=partition_by,
-                        merge_schema=merge_schema,
-                        storage_options=storage_options,
-                        cur=cur,
-                    )
-                else:
-                    engine.write_delta(
-                        path, data, "append",
-                        partition_by=partition_by,
-                        merge_schema=merge_schema,
-                        storage_options=storage_options,
-                        cur=cur,
-                    )
+            self._store_append(path, cur, data, cfg, partition_by, merge_schema, storage_options)
         else:
             raise ValueError(
                 f"Unknown incremental_strategy '{strategy}'. "
                 "Use 'merge', 'insert', 'delete+insert', 'append', or 'microbatch'."
             )
+
+    def _store_overwrite(self, path, cur, data, partition_by, merge_schema, exists,
+                         storage_options) -> None:
+        """The CREATE OR REPLACE branch: a table model, a --full-refresh, or a first run.
+        When we are REPLACING an existing table (exists), allow delta_rs to replace the schema
+        wholesale (schema_mode="overwrite") — the model SQL defines the new schema, exactly as
+        `CREATE OR REPLACE TABLE` does on every other warehouse. Without it, delta_rs's strict
+        overwrite keeps the OLD schema/protocol and so can't change a column's type or write a
+        column needing a new writer feature the old table lacks (e.g. retyping to ::timestamp /
+        timestampNtz). This is scoped to the full-rebuild replace ONLY — NOT append, merge, or
+        microbatch, which must keep their strict, schema-stable writes. A fresh create
+        (not exists) doesn't need it. A user's explicit merge_schema still wins."""
+        overwrite_schema = exists and not merge_schema
+        with engine.mem_profile("overwrite", con=cur):
+            engine.write_delta(
+                path, data, "overwrite",
+                partition_by=partition_by,
+                merge_schema=merge_schema,
+                overwrite_schema=overwrite_schema,
+                storage_options=storage_options,
+                cur=cur,
+            )
+
+    def _store_merge(self, path, cur, data, cfg, unique_key, strategy, storage_options,
+                     src_tmp) -> None:
+        """The merge / insert strategies: validate config, resolve on_schema_change, tighten the
+        DuckDB memory share, and dispatch to the clause-core (merge_clauses /
+        merge_update_set_expressions) or the flat-kwarg merge_delta path."""
+        # Validate the merge config shape FIRST — before any Delta access, memory tuning, or
+        # write — so an invalid config fails fast and cleanly (no partial/late delta_rs
+        # "Schema error" after the log has moved). Messages mirror dbt-duckdb's
+        # validate_merge_config so the behavior is portable.
+        self._validate_merge_config(cfg)
+        if not unique_key:
+            raise ValueError(
+                f"incremental_strategy='{strategy}' requires a unique_key."
+            )
+        # NOTE: a duplicate-key source is rejected downstream in engine.merge_delta_clauses (the
+        # shared chokepoint for the dbt merge/insert strategies AND the DataFrame/SQL merge API),
+        # so the cardinality rule is enforced identically across every merge path.
+        # on_schema_change: detect added/removed columns vs the existing table and
+        # decide whether to let delta_rs evolve the schema (or fail). Default 'ignore'.
+        on_schema_change = (cfg.get("on_schema_change") or "ignore").lower()
+        evolve_schema = self._resolve_schema_change(
+            on_schema_change, path, data, storage_options
+        )
+        # Merge is the only path where DuckDB and the delta_rs pool peak together: tighten
+        # DuckDB to its share so the two fit. (write/append left it at the baseline.)
+        engine.set_merge_memory_limit(cur)
+        # streamed_exec: default False so delta_rs collects the source and uses its stats to
+        # prune the target (right for small incremental deltas into a large table). A model
+        # whose source is itself huge can set merge_streamed_exec=true to stream it instead.
+        sx = cfg.get("merge_streamed_exec")
+        # merge_clauses / merge_update_set_expressions need delta_rs's full ordered clause list
+        # (matched-delete, multiple matched clauses, custom SET expressions) — divert to the
+        # clause-core. Everything else stays on the byte-identical flat-kwarg merge_delta path.
+        clause_specs = self._custom_merge_clauses(cfg, data.columns, unique_key)
+        with engine.mem_profile("merge", con=cur):
+            if clause_specs is not None:
+                engine.merge_delta_clauses(
+                    path, data,
+                    self._merge_on_predicate(unique_key, cfg, data.columns),
+                    clause_specs,
+                    merge_schema=evolve_schema,
+                    max_spill_size=cfg.get("merge_max_spill_size"),
+                    max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
+                    streamed_exec=(False if sx is None else bool(sx)),
+                    read_version=cfg.get("read_version"),
+                    storage_options=storage_options,
+                    cur=cur,
+                )
+            else:
+                engine.merge_delta(
+                    path, data, unique_key,
+                    insert_only=(strategy == "insert"),
+                    update_columns=cfg.get("merge_update_columns"),
+                    exclude_columns=cfg.get("merge_exclude_columns"),
+                    predicates=self._merge_predicates(cfg, data.columns),
+                    update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
+                    insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
+                    merge_schema=evolve_schema,
+                    max_spill_size=cfg.get("merge_max_spill_size"),
+                    max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
+                    streamed_exec=(False if sx is None else bool(sx)),
+                    # Pin the merge target to the version the model read (vB, captured before it
+                    # read {{ this }}), so OCC validates (vB, HEAD] — read and commit are one snapshot.
+                    read_version=cfg.get("read_version"),
+                    storage_options=storage_options,
+                    cur=cur,
+                )
+        if src_tmp is not None:
+            cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")  # #14: release the materialized source
+
+    def _store_append(self, path, cur, data, cfg, partition_by, merge_schema,
+                      storage_options) -> None:
+        """The append strategy. A read-modify-append on the SAME table — the model read {{ this }}
+        (e.g. an incremental append whose watermark is `max(ts) from {{ this }}`) — is fenced to the
+        version the model read (vB, captured before it read {{ this }}): a concurrent commit any time
+        during the build makes it fail loudly (CommitFailedError) instead of appending a duplicate.
+        This is the automatic append_if_unchanged behavior — no strategy to pick. A plain append of
+        NEW data (no {{ this }} read) is unfenced (last-writer-wins / additive). CAS via delta_rs
+        max_commit_retries=0 (engine). No dedup — that's the SQL's job."""
+        rv = cfg.get("read_version") if cfg.get("reads_self") else None
+        with engine.mem_profile("append", con=cur):
+            if rv is not None:
+                engine.append_if_unchanged(
+                    path, data,
+                    read_version=rv,
+                    partition_by=partition_by,
+                    merge_schema=merge_schema,
+                    storage_options=storage_options,
+                    cur=cur,
+                )
+            else:
+                engine.write_delta(
+                    path, data, "append",
+                    partition_by=partition_by,
+                    merge_schema=merge_schema,
+                    storage_options=storage_options,
+                    cur=cur,
+                )
 
     def _store_microbatch(
         self, path, cur, name, cfg, storage_options, exists, full_refresh,

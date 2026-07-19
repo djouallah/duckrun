@@ -1750,33 +1750,11 @@ def _merge_source_keys(predicate: str) -> List[str]:
     return out
 
 
-def merge_delta_clauses(
-    path: str,
-    data,
-    predicate: str,
-    clauses: List[dict],
-    *,
-    read_version: Optional[int] = None,
-    merge_schema: bool = False,
-    streamed_exec: bool = False,
-    max_spill_size: Optional[int] = None,
-    max_temp_directory_size: Optional[int] = None,
-    storage_options: Optional[Dict[str, str]] = None,
-    cur=None,
-) -> None:
-    """Run a MERGE described by an ORDERED list of clause dicts — the full delta-rs ``TableMerger``
-    surface. Each clause is ``{"clause": "matched"|"not_matched"|"not_matched_by_source",
-    "action": "update"|"update_all"|"delete"|"insert"|"insert_all", "predicate": str|None,
-    "updates": {col: expr}|None, "except_cols": [..]|None}`` and is applied in order (delta-rs
-    evaluates them top-to-bottom). ``predicate`` is the full ON condition, referencing the literal
-    ``target``/``source`` aliases.
-
-    This is the shared core for every merge path: ``merge_delta`` (dbt incremental — builds a fixed
-    clause list) and the ``conn.sql`` / raw-SQL ``MERGE INTO`` handler. The
-    spill cap, target pruning, the REQUIRED ``read_version`` snapshot pin (OCC over (vB, HEAD]), and
-    the post-merge maintenance are identical for every clause shape, so the single-snapshot and
-    concurrency-safety guarantees hold for all of them. See ``merge_delta`` for the parameter
-    semantics (spill / streamed_exec / read_version / maintenance)."""
+def _merge_spill_caps(max_spill_size, max_temp_directory_size, streamed_exec):
+    """Resolve + log the merge's two spill caps: the in-memory ``max_spill_size`` (a share of the
+    effective RAM limit) and the on-disk ``max_temp_directory_size`` (a share of the spill disk's
+    free space, overriding delta_rs/DataFusion's flat 100 GB default). Returns the kwarg dicts to
+    forward — empty when a cap is undetectable or opted out (0), preserving delta_rs defaults."""
     # Sample the effective limit ONCE so the cap we apply and the cap we log can't disagree:
     # free RAM is read live on every call, so two separate reads would drift on a busy box.
     eff_limit = _effective_mem_limit_bytes()
@@ -1787,11 +1765,6 @@ def merge_delta_clauses(
     # (e.g. RAM undetectable, or caller explicitly passed 0 to opt out).
     spill_kwargs = {"max_spill_size": max_spill_size} if max_spill_size else {}
 
-    # On-disk spill cap (SEPARATE from the in-memory max_spill_size above). delta_rs/DataFusion
-    # otherwise hard-caps disk spill at a flat 100 GB regardless of disk size, aborting a wide merge
-    # on the ~1.9 TiB Fabric work disk. Default to ~80% of the spill disk's FREE space so the cap
-    # tracks the actual disk instead of a constant. Only forwarded when we have a positive value —
-    # None leaves delta_rs on its 100 GB default (same as omitting it before this existed).
     if max_temp_directory_size is None:
         max_temp_directory_size = _default_merge_temp_dir_size()
     temp_dir_kwargs = (
@@ -1821,6 +1794,159 @@ def merge_delta_clauses(
         + ("on (source stats derive an early filter)" if not streamed_exec
            else "off (streamed_exec=True — source streamed, whole target scanned)")
     )
+    return spill_kwargs, temp_dir_kwargs
+
+
+def _merge_cardinality_guard(data, predicate: str, clauses: List[dict], streamed_exec: bool) -> None:
+    """Cardinality guard — applied to EVERY merge path (the dbt materialization and the conn.sql
+    MERGE INTO handler all land here), so a keyed upsert behaves identically across them. A
+    keyed merge/insert cannot resolve two source rows for one target row: Spark/Snowflake/BigQuery
+    raise, but delta_rs silently produces duplicate rows. So when the merge has an update/insert
+    clause keyed on an equality predicate, require the source to be unique on that key. Skipped when
+    streamed_exec is set (the caller has a huge source it explicitly does NOT want collected) or when
+    the predicate isn't a plain AND-of-equalities (OR / non-equality / by-source-only — no key to check)."""
+    has_upsert = any(
+        c.get("clause") in ("matched", "not_matched")
+        and c.get("action") in ("update", "update_all", "insert", "insert_all")
+        for c in clauses
+    )
+    if not has_upsert or streamed_exec or not hasattr(data, "query"):
+        return
+    src_keys = _merge_source_keys(predicate)
+    if not src_keys:
+        return
+    keycols = ", ".join('"' + k.replace('"', '""') + '"' for k in src_keys)
+    try:
+        dup = data.query(
+            "__merge_src",
+            f"SELECT {keycols}, count(*) AS __n FROM __merge_src "
+            f"GROUP BY {keycols} HAVING count(*) > 1 LIMIT 1",
+        ).fetchone()
+    except Exception as e:  # never let the guard ITSELF break a valid merge; surface and proceed
+        logger.warning(f"merge duplicate-key guard could not run ({e!r}); proceeding")
+        dup = None
+    if dup is not None:
+        keyval = ", ".join(f"{k}={v!r}" for k, v in zip(src_keys, dup[:-1]))
+        raise ValueError(
+            f"MERGE source is not unique on the join key ({', '.join(src_keys)}): "
+            f"{dup[-1]} rows for {keyval}. A keyed merge/insert cannot resolve duplicate "
+            f"source keys — Spark, Snowflake and BigQuery raise the same error, and delta_rs "
+            f"would silently produce duplicate rows. Deduplicate the source, e.g. "
+            f"qualify row_number() over (partition by {keycols} order by <tiebreak>) = 1."
+        )
+
+
+def _merge_evolve_schema(path, data, storage_options, read_version: int, merge_schema: bool) -> int:
+    """Schema evolution, DECOUPLED from the merge (never pass merge_schema to the merger): delta_rs,
+    evolving mid-merge, back-fills a newly added column onto matched rows from the source — which is
+    wrong for a narrow matched-update (a snapshot's close-row updates ONLY dbt_valid_to, so the new
+    column must read NULL on the already-closed version, not the current source value). Instead, when
+    new columns are present, add them as a metadata-only commit FIRST — existing rows (including every
+    closed SCD2 version) then read NULL — and merge with the schema already in place. This keeps the
+    merger byte-identical whether or not evolution happened; the update clause is never
+    schema-dependent. Returns the version the merge must pin to (vB, or vB+1 after the add-columns
+    commit — so the full (vB, HEAD] OCC window stays covered: (vB, vB+1] by this CAS, (vB+1, HEAD]
+    by the merge)."""
+    if not merge_schema:
+        return read_version
+    existing = {c.lower() for c in delta_columns(path, storage_options)}
+    added = [c for c in data.columns if c.lower() not in existing]
+    if not added:
+        return read_version
+    # Compare-and-swap add-columns pinned to read_version (same primitive as append_if_unchanged):
+    # a zero-row append with schema_mode="merge" adds only the new columns (delta_rs derives their
+    # types from the source's Arrow stream) and commits nothing else.
+    evo_args = build_write_deltalake_args(
+        path, data.limit(0), "append",
+        schema_mode="merge",
+        storage_options=storage_options,
+    )
+    _fenced_write(evo_args, path, storage_options, read_version,
+                  refusal_prefix="schema evolution",
+                  refusal_suffix="; the on_schema_change add-columns commit was "
+                                 "refused before the merge. Re-read and retry.")
+    return read_version + 1
+
+
+def _merge_partition_prune(dt: DeltaTable, data, predicate: str, streamed_exec: bool) -> str:
+    """Explicit partition-set pruning. delta_rs's auto early_filter (try_construct_early_filter) is
+    fragile: it silently returns None — degrading to a FULL target scan — on multi-key predicates
+    (delta-rs #3636) and whenever source min/max stats are unavailable. For each PARTITION column
+    joined as `target.p = source.p`, collect the source's DISTINCT values and fold a CONSTANT
+    `target.p IN (<vals>)` into the ON predicate. This is RESULT-NEUTRAL — any target row that can
+    match `source.p` already carries one of those values — but hands delta_rs a plan-time literal it
+    can push down to skip partition files deterministically, which is exactly what its own docs
+    recommend doing by hand. IN (not BETWEEN min/max): a source that unions two feeds (e.g. an old
+    backfill + a current stream) is BIMODAL, so min/max would smear the bound across the whole table
+    while the true set is a handful of partitions. Numeric partition cols only, capped at
+    _PART_PRUNE_MAX distinct values (beyond that the IN list stops helping and we let delta_rs be);
+    skipped for by-source merges (streamed_exec, which can't prune anyway). Best-effort: never break
+    a merge."""
+    if streamed_exec or not hasattr(data, "query"):
+        return predicate
+    try:
+        part_cols = list(dt.metadata().partition_columns or [])
+    except Exception:
+        part_cols = []
+    conds = []
+    for pcol in part_cols:
+        if not re.search(rf'target\."?{re.escape(pcol)}"?\s*=\s*source\."?{re.escape(pcol)}"?',
+                         predicate, re.I):
+            continue
+        q = '"' + pcol.replace('"', '""') + '"'
+        try:
+            rows = data.query(
+                "__mp",
+                f"SELECT DISTINCT {q} FROM __mp WHERE {q} IS NOT NULL LIMIT {_PART_PRUNE_MAX + 1}",
+            ).fetchall()
+        except Exception as e:
+            logger.warning(f"merge partition-set pruning: could not collect {pcol!r} values "
+                           f"({e!r}); skipping")
+            continue
+        vals = [r[0] for r in rows]
+        if not vals or len(vals) > _PART_PRUNE_MAX:
+            continue
+        if any(v is None or isinstance(v, bool) or not isinstance(v, (int, float)) for v in vals):
+            continue
+        tq = "target." + q
+        lst = ", ".join(str(v) for v in sorted(vals))
+        conds.append(f"{tq} IN ({lst})")
+        logger.info(f"merge partition-set pruning: injected {tq} IN ({lst})")
+    if conds:
+        return f"({predicate}) AND " + " AND ".join(conds)
+    return predicate
+
+
+def merge_delta_clauses(
+    path: str,
+    data,
+    predicate: str,
+    clauses: List[dict],
+    *,
+    read_version: Optional[int] = None,
+    merge_schema: bool = False,
+    streamed_exec: bool = False,
+    max_spill_size: Optional[int] = None,
+    max_temp_directory_size: Optional[int] = None,
+    storage_options: Optional[Dict[str, str]] = None,
+    cur=None,
+) -> None:
+    """Run a MERGE described by an ORDERED list of clause dicts — the full delta-rs ``TableMerger``
+    surface. Each clause is ``{"clause": "matched"|"not_matched"|"not_matched_by_source",
+    "action": "update"|"update_all"|"delete"|"insert"|"insert_all", "predicate": str|None,
+    "updates": {col: expr}|None, "except_cols": [..]|None}`` and is applied in order (delta-rs
+    evaluates them top-to-bottom). ``predicate`` is the full ON condition, referencing the literal
+    ``target``/``source`` aliases.
+
+    This is the shared core for every merge path: ``merge_delta`` (dbt incremental — builds a fixed
+    clause list) and the ``conn.sql`` / raw-SQL ``MERGE INTO`` handler. The
+    spill cap, target pruning, the REQUIRED ``read_version`` snapshot pin (OCC over (vB, HEAD]), and
+    the post-merge maintenance are identical for every clause shape, so the single-snapshot and
+    concurrency-safety guarantees hold for all of them. See ``merge_delta`` for the parameter
+    semantics (spill / streamed_exec / read_version / maintenance)."""
+    spill_kwargs, temp_dir_kwargs = _merge_spill_caps(
+        max_spill_size, max_temp_directory_size, streamed_exec
+    )
 
     # A merge always has an existing target (a brand-new table is created, never merged into), so
     # the caller (the dbt materialization / conn.sql MERGE INTO) always pins the version it read.
@@ -1833,120 +1959,15 @@ def merge_delta_clauses(
     if not clauses:
         raise ValueError("merge has no clauses")
 
-    # Cardinality guard — applied to EVERY merge path (the dbt materialization and the conn.sql
-    # MERGE INTO handler all land here), so a keyed upsert behaves identically across them. A
-    # keyed merge/insert cannot resolve two source rows for one target row: Spark/Snowflake/BigQuery
-    # raise, but delta_rs silently produces duplicate rows. So when the merge has an update/insert
-    # clause keyed on an equality predicate, require the source to be unique on that key. Skipped when
-    # streamed_exec is set (the caller has a huge source it explicitly does NOT want collected) or when
-    # the predicate isn't a plain AND-of-equalities (OR / non-equality / by-source-only — no key to check).
-    _has_upsert = any(
-        c.get("clause") in ("matched", "not_matched")
-        and c.get("action") in ("update", "update_all", "insert", "insert_all")
-        for c in clauses
-    )
-    if _has_upsert and not streamed_exec and hasattr(data, "query"):
-        src_keys = _merge_source_keys(predicate)
-        if src_keys:
-            keycols = ", ".join('"' + k.replace('"', '""') + '"' for k in src_keys)
-            try:
-                dup = data.query(
-                    "__merge_src",
-                    f"SELECT {keycols}, count(*) AS __n FROM __merge_src "
-                    f"GROUP BY {keycols} HAVING count(*) > 1 LIMIT 1",
-                ).fetchone()
-            except Exception as e:  # never let the guard ITSELF break a valid merge; surface and proceed
-                logger.warning(f"merge duplicate-key guard could not run ({e!r}); proceeding")
-                dup = None
-            if dup is not None:
-                keyval = ", ".join(f"{k}={v!r}" for k, v in zip(src_keys, dup[:-1]))
-                raise ValueError(
-                    f"MERGE source is not unique on the join key ({', '.join(src_keys)}): "
-                    f"{dup[-1]} rows for {keyval}. A keyed merge/insert cannot resolve duplicate "
-                    f"source keys — Spark, Snowflake and BigQuery raise the same error, and delta_rs "
-                    f"would silently produce duplicate rows. Deduplicate the source, e.g. "
-                    f"qualify row_number() over (partition by {keycols} order by <tiebreak>) = 1."
-                )
-
-    # Schema evolution is DECOUPLED from the merge: never pass merge_schema to the merger. delta_rs,
-    # evolving mid-merge, back-fills a newly added column onto matched rows from the source — which is
-    # wrong for a narrow matched-update (a snapshot's close-row updates ONLY dbt_valid_to, so the new
-    # column must read NULL on the already-closed version, not the current source value). Instead, when
-    # new columns are present, add them as a metadata-only commit FIRST — existing rows (including every
-    # closed SCD2 version) then read NULL — and merge with the schema already in place. This keeps the
-    # merger byte-identical whether or not evolution happened; the update clause is never schema-dependent.
-    effective_version = read_version
-    if merge_schema:
-        existing = {c.lower() for c in delta_columns(path, storage_options)}
-        added = [c for c in data.columns if c.lower() not in existing]
-        if added:
-            # Compare-and-swap add-columns pinned to read_version (same primitive as
-            # append_if_unchanged): a zero-row append with schema_mode="merge" adds only the new columns
-            # (delta_rs derives their types from the source's Arrow stream) and commits nothing else.
-            # max_commit_retries=0 + load_as_version make it a CAS — a concurrent writer that moved HEAD
-            # since vB fails the evolution loud, preserving the merge's concurrency guarantee. On success
-            # it lands deterministically at read_version+1, which the merge then pins to (so the full
-            # (vB, HEAD] OCC window is still covered: (vB, vB+1] by this CAS, (vB+1, HEAD] by the merge).
-            evo_args = build_write_deltalake_args(
-                path, data.limit(0), "append",
-                schema_mode="merge",
-                storage_options=storage_options,
-            )
-            _fenced_write(evo_args, path, storage_options, read_version,
-                          refusal_prefix="schema evolution",
-                          refusal_suffix="; the on_schema_change add-columns commit was "
-                                         "refused before the merge. Re-read and retry.")
-            effective_version = read_version + 1
+    _merge_cardinality_guard(data, predicate, clauses, streamed_exec)
+    effective_version = _merge_evolve_schema(path, data, storage_options, read_version, merge_schema)
 
     dt = _delta_table(path, storage_options)
     # Pin the target to the snapshot the model read (vB, or vB+1 after a decoupled add-columns commit)
     # so OCC validates (effective_version, HEAD] — one snapshot for both the read and the commit.
     dt.load_as_version(effective_version)
 
-    # Explicit partition-set pruning. delta_rs's auto early_filter (try_construct_early_filter) is
-    # fragile: it silently returns None — degrading to a FULL target scan — on multi-key predicates
-    # (delta-rs #3636) and whenever source min/max stats are unavailable. For each PARTITION column
-    # joined as `target.p = source.p`, collect the source's DISTINCT values here and fold a CONSTANT
-    # `target.p IN (<vals>)` into the ON predicate. This is RESULT-NEUTRAL — any target row that can
-    # match `source.p` already carries one of those values — but hands delta_rs a plan-time literal it
-    # can push down to skip partition files deterministically, which is exactly what its own docs
-    # recommend doing by hand. IN (not BETWEEN min/max): a source that unions two feeds (e.g. an old
-    # backfill + a current stream) is BIMODAL, so min/max would smear the bound across the whole table
-    # while the true set is a handful of partitions. Numeric partition cols only, capped at
-    # _PART_PRUNE_MAX distinct values (beyond that the IN list stops helping and we let delta_rs be);
-    # skipped for by-source merges (streamed_exec, which can't prune anyway). Best-effort: never break
-    # a merge.
-    if not streamed_exec and hasattr(data, "query"):
-        try:
-            part_cols = list(dt.metadata().partition_columns or [])
-        except Exception:
-            part_cols = []
-        _conds = []
-        for _pcol in part_cols:
-            if not re.search(rf'target\."?{re.escape(_pcol)}"?\s*=\s*source\."?{re.escape(_pcol)}"?',
-                             predicate, re.I):
-                continue
-            _q = '"' + _pcol.replace('"', '""') + '"'
-            try:
-                _rows = data.query(
-                    "__mp",
-                    f"SELECT DISTINCT {_q} FROM __mp WHERE {_q} IS NOT NULL LIMIT {_PART_PRUNE_MAX + 1}",
-                ).fetchall()
-            except Exception as e:
-                logger.warning(f"merge partition-set pruning: could not collect {_pcol!r} values "
-                               f"({e!r}); skipping")
-                continue
-            _vals = [r[0] for r in _rows]
-            if not _vals or len(_vals) > _PART_PRUNE_MAX:
-                continue
-            if any(v is None or isinstance(v, bool) or not isinstance(v, (int, float)) for v in _vals):
-                continue
-            _tq = "target." + _q
-            _lst = ", ".join(str(v) for v in sorted(_vals))
-            _conds.append(f"{_tq} IN ({_lst})")
-            logger.info(f"merge partition-set pruning: injected {_tq} IN ({_lst})")
-        if _conds:
-            predicate = f"({predicate}) AND " + " AND ".join(_conds)
+    predicate = _merge_partition_prune(dt, data, predicate, streamed_exec)
 
     merger = dt.merge(
         source=data,
