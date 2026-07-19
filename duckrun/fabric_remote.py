@@ -37,6 +37,7 @@ import uuid
 import zipfile
 from typing import Dict, List, Optional
 
+from dbt.adapters.duckrun import remote as _remote
 from dbt.adapters.duckrun.secret import TOKEN_KEYS as _TOKEN_KEYS
 
 from . import auth
@@ -55,8 +56,8 @@ _ZIP_EXCLUDE_DIRS = {"target", "dbt_packages", "logs", ".git", "__pycache__", ".
 # Terminal Fabric job-instance states.
 _JOB_DONE = {"Completed", "Failed", "Cancelled", "Deduped"}
 
-_RETRY_STATUS = {429, 500, 502, 503, 504}
-_MAX_ATTEMPTS = 3
+# Retry status/attempt policy lives in dbt.adapters.duckrun.remote (retry_request) — shared with
+# the DFS side so the two REST layers can't drift.
 # Overall wall-clock cap on a single remote run, and the poll cadence (seconds).
 _POLL_TIMEOUT = 60 * 60
 _POLL_INTERVAL = 10
@@ -167,10 +168,8 @@ def onelake_parts(root_path: str):
     workspace/lakehouse may be friendly names or GUIDs."""
     if not root_path or not root_path.startswith("abfss://"):
         raise RemoteRunError(f"RemoteRunner needs an abfss:// (OneLake) root_path; got {root_path!r}")
-    rest = root_path[len("abfss://"):]
-    fs_host, _, path = rest.partition("/")
-    workspace, _, host = fs_host.partition("@")
-    lakehouse = path.strip("/").split("/", 1)[0]
+    workspace, host, path = _remote._parse_abfss(root_path)
+    lakehouse = path.split("/", 1)[0] if path else ""
     if not (workspace and host and lakehouse):
         raise RemoteRunError(f"could not parse workspace/lakehouse from root_path {root_path!r}")
     files_base = f"abfss://{workspace}@{host}/{lakehouse}/Files"
@@ -392,25 +391,17 @@ def _sleep(seconds: float) -> None:
 
 def _http_request(method: str, url: str, *, token: str, params: Optional[dict] = None,
                   json_body: Optional[dict] = None, headers: Optional[dict] = None, timeout: int = 60):
-    """A bounded-retry HTTP call (mirrors remote._dfs_request): retries transient 429/5xx honoring
-    ``Retry-After``; everything else is returned as-is for the caller's own status handling. All the
-    higher-level control-plane calls funnel through here, so tests script the whole REST sequence by
-    monkeypatching this one function."""
-    import requests
+    """A bounded-retry HTTP call — bearer-header assembly here, the retry loop shared with the DFS
+    side (``remote.retry_request``), so 429/5xx/Retry-After handling can't drift between the two REST
+    layers. All the higher-level control-plane calls funnel through here, so tests script the whole
+    REST sequence by monkeypatching this one function."""
     hdrs = {"Authorization": f"Bearer {token}"}
     if json_body is not None:
         hdrs["Content-Type"] = "application/json"
     if headers:
         hdrs.update(headers)
-    resp = None
-    for attempt in range(_MAX_ATTEMPTS):
-        resp = requests.request(method, url, params=params, json=json_body, headers=hdrs, timeout=timeout)
-        if resp.status_code not in _RETRY_STATUS:
-            return resp
-        if attempt < _MAX_ATTEMPTS - 1:
-            ra = resp.headers.get("Retry-After")
-            _sleep(float(ra) if ra and str(ra).strip().isdigit() else float(2 ** attempt))
-    return resp
+    return _remote.retry_request(method, url, headers=hdrs, params=params, json_body=json_body,
+                                 timeout=timeout)
 
 
 def _fresh_token(current: str, acquire) -> str:
@@ -469,8 +460,11 @@ def _workspace_display_name(token: str, ws_id: str) -> str:
 
 
 def _looks_like_guid(value: str) -> bool:
-    parts = value.split("-")
-    return len(parts) == 5 and all(c in "0123456789abcdefABCDEF" for c in "".join(parts))
+    """Strict full-GUID test, shared with the dbt adapter (``remote.looks_like_guid``). The looser
+    5-dash-separated-hex check this replaced accepted strings like ``1-2-3-4-5``, classifying the
+    same value differently from ``session``'s strict ``_GUID`` — a real name that merely looks
+    dashed now correctly goes through name→id resolution."""
+    return _remote.looks_like_guid(value)
 
 
 def _platform_part(name: str, item_type: str = "Notebook") -> dict:
@@ -749,20 +743,12 @@ def read_result_json(files_url: str, storage_token: str) -> dict:
 
 
 def _dfs_get(abfss_url: str, storage_token: str) -> str:
-    rest = abfss_url[len("abfss://"):]
-    fs_host, _, path = rest.partition("/")
-    filesystem, _, host = fs_host.partition("@")
-    url = f"https://{host}/{filesystem}/{path}"
-    headers = {"Authorization": f"Bearer {storage_token}", "x-ms-version": _DFS_API_VERSION}
-    import requests
-    for attempt in range(_MAX_ATTEMPTS):
-        resp = requests.get(url, headers=headers, timeout=60)
-        if resp.status_code not in _RETRY_STATUS:
-            resp.raise_for_status()
-            return resp.text
-        if attempt < _MAX_ATTEMPTS - 1:
-            ra = resp.headers.get("Retry-After")
-            _sleep(float(ra) if ra and str(ra).strip().isdigit() else float(2 ** attempt))
+    filesystem, host, path = _remote._parse_abfss(abfss_url)
+    resp = _remote.retry_request(
+        "GET", f"https://{host}/{filesystem}/{path}",
+        headers={"Authorization": f"Bearer {storage_token}", "x-ms-version": _DFS_API_VERSION},
+        timeout=60,
+    )
     resp.raise_for_status()
     return resp.text
 

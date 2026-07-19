@@ -8,12 +8,23 @@ list the schema's table directories with the ADLS Gen2 / OneLake DFS "List Paths
 instead, using the same bearer token that authenticates the Delta reads/writes. Local and
 ``az://`` stores keep using DuckDB ``glob`` (which works there).
 """
+import re
 from typing import List, Optional, Tuple
 
 from .secret import bearer_token
 
 # OneLake / ADLS Gen2 data-plane REST API version (List Paths).
 _DFS_API_VERSION = "2023-11-03"
+
+# Strict 8-4-4-4-12 hex GUID. THE one GUID shape test for both surfaces (the dbt adapter and the
+# connect/remote package): the looser validators it replaced disagreed with each other (one accepted
+# `1-2-3-4-5`), so the same string classified differently between the two stacks.
+_GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def looks_like_guid(value) -> bool:
+    """True when ``value`` is a full GUID (so a OneLake segment is an id, not a friendly name)."""
+    return bool(_GUID.match(str(value or "")))
 
 
 class OneLakeAccessError(RuntimeError):
@@ -80,23 +91,37 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
-def _dfs_request(method: str, url: str, headers: dict, params: Optional[dict] = None,
-                 timeout: int = 30):
-    """A DFS GET/HEAD with bounded retry for transient throttles/5xx (see ``_RETRY_STATUS``),
-    honoring ``Retry-After``. Non-retryable responses (including 404) are returned as-is for the
-    caller's own status handling; after the last attempt the final (still-transient) response is
-    returned so the caller's ``raise_for_status`` fails loud."""
+def retry_request(method: str, url: str, *, headers: dict, params: Optional[dict] = None,
+                  json_body: Optional[dict] = None, timeout: int = 30):
+    """A bounded-retry HTTP call — THE one retry loop for every OneLake/Fabric REST call (DFS data
+    plane here, Fabric control plane via ``fabric_remote``): retries transient 429/5xx (see
+    ``_RETRY_STATUS``) honoring a numeric ``Retry-After``, else exponential backoff. Non-retryable
+    responses (including 404) are returned as-is for the caller's own status handling; after the
+    last attempt the final (still-transient) response is returned so the caller's
+    ``raise_for_status`` fails loud."""
     import requests  # dbt dependency; imported lazily so non-remote paths don't need it
 
-    fn = requests.head if method == "HEAD" else requests.get
+    # Dispatch via the module-level helpers (requests.get/head/post/…), not requests.request:
+    # tests stub exactly those, and the two are behaviorally identical. `json` is only passed when
+    # there IS a body, so GET/HEAD keep their original (url, params, headers, timeout) call shape.
+    fn = getattr(requests, method.lower())
+    kwargs = {"params": params, "headers": headers, "timeout": timeout}
+    if json_body is not None:
+        kwargs["json"] = json_body
     resp = None
     for attempt in range(_MAX_ATTEMPTS):
-        resp = fn(url, params=params, headers=headers, timeout=timeout)
+        resp = fn(url, **kwargs)
         if resp.status_code not in _RETRY_STATUS:
             return resp
         if attempt < _MAX_ATTEMPTS - 1:
             _sleep(_retry_delay(resp, attempt))
     return resp
+
+
+def _dfs_request(method: str, url: str, headers: dict, params: Optional[dict] = None,
+                 timeout: int = 30):
+    """A DFS GET/HEAD through :func:`retry_request` (kept as the DFS-side entry point)."""
+    return retry_request(method, url, headers=headers, params=params, timeout=timeout)
 
 
 def _parse_abfss(root_path: str) -> Tuple[str, str, str]:

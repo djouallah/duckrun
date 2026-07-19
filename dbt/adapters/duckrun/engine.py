@@ -743,6 +743,55 @@ def _delta_table(path: str, storage_options: Optional[Dict[str, str]]) -> DeltaT
     return DeltaTable(path)
 
 
+def quote_ident(name) -> str:
+    """A double-quoted SQL identifier from a possibly already-quoted, possibly padded name: strip
+    whitespace and any quotes the caller put on, then quote and escape embedded quotes. Accepted by
+    both DuckDB and datafusion — the one quoting shape for join keys / sort columns."""
+    return '"' + str(name).strip().strip('"').replace('"', '""') + '"'
+
+
+def merge_on_predicate(unique_key, predicates: Optional[List[str]] = None) -> str:
+    """The canonical MERGE ``ON`` predicate: ``target."k" = source."k" [AND …]`` for each join key,
+    plus any extra predicates. THE one builder for both merge surfaces — :func:`merge_delta` and the
+    dbt incremental plugin's clause-core path — so the two cannot drift on quoting or shape. Keys are
+    quoted (mixed case / reserved word / spaces would otherwise emit invalid datafusion SQL)."""
+    keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
+    conditions = [f"target.{quote_ident(k)} = source.{quote_ident(k)}" for k in keys]
+    if predicates:
+        conditions.extend(p for p in predicates if p)
+    return " AND ".join(conditions)
+
+
+def _fenced_write(args: Dict[str, Any], path: str, storage_options: Optional[Dict[str, str]],
+                  read_version: int, *, refusal_prefix: str, refusal_suffix: str,
+                  record_read_version: bool = False) -> None:
+    """The single fenced (compare-and-swap) write primitive behind every pinned write: load the
+    snapshot the caller read, hand ``write_deltalake`` the pinned ``DeltaTable`` (dropping the
+    ``storage_options`` kwarg — they live on the table), and disable rebasing
+    (``max_commit_retries=0``) so any commit that landed since ``read_version`` already took our
+    target version and this write fails LOUDLY instead of silently landing on top of it.
+
+    ``record_read_version`` stamps ``duckrun.readVersion`` into commitInfo so the fence is
+    observable in the log. The refusal message is
+    ``"<prefix>: table '<path>' changed since version <vB> (a concurrent write committed)<suffix>"``.
+    """
+    dt = _delta_table(path, storage_options)
+    dt.load_as_version(read_version)
+    args["table_or_uri"] = dt
+    args.pop("storage_options", None)
+    kwargs: Dict[str, Any] = {"max_commit_retries": 0}
+    if record_read_version:
+        kwargs["custom_metadata"] = {"duckrun.readVersion": str(read_version)}
+    args["commit_properties"] = CommitProperties(**kwargs)
+    try:
+        write_deltalake(**args)
+    except CommitFailedError as e:
+        raise CommitFailedError(
+            f"{refusal_prefix}: table '{path}' changed since version {read_version} "
+            f"(a concurrent write committed){refusal_suffix}"
+        ) from e
+
+
 def table_exists(path: str, storage_options: Optional[Dict[str, str]] = None) -> bool:
     """Return True if a Delta table already exists at ``path``.
 
@@ -1152,31 +1201,15 @@ def write_delta(
     if read_version is None:
         write_deltalake(**args)
     else:
-        # Fenced (compare-and-swap): pin to the snapshot the caller read and disable rebasing
-        # (max_commit_retries=0), so any commit that landed since ``read_version`` already took our
-        # target version and this write fails loudly instead of silently landing on top of it. Keeping
-        # the actual write_deltalake here — not in the fenced wrappers — makes this the single seam a
-        # streamed mid-write race is observable at.
-        #
-        # Record the pinned version in commitInfo so the fence is OBSERVABLE: a fenced append (the
-        # self-reading `insert into t select … from t`, or safeappend) carries duckrun.readVersion,
-        # which a blind last-writer-wins append does not — so a concurrent writer / external reader
-        # can tell a read-modify-append from a plain append in the log.
-        dt = _delta_table(path, storage_options)
-        dt.load_as_version(read_version)
-        args["table_or_uri"] = dt
-        args.pop("storage_options", None)
-        args["commit_properties"] = CommitProperties(
-            max_commit_retries=0,
-            custom_metadata={"duckrun.readVersion": str(read_version)},
-        )
-        try:
-            write_deltalake(**args)
-        except CommitFailedError as e:
-            raise CommitFailedError(
-                f"{mode} refused: table '{path}' changed since version {read_version} "
-                f"(a concurrent write committed). Re-read and retry."
-            ) from e
+        # Fenced (compare-and-swap) via the one _fenced_write primitive. Kept here — not in the
+        # fenced wrappers — so this stays the single seam a streamed mid-write race is observable at.
+        # duckrun.readVersion is recorded in commitInfo so the fence is OBSERVABLE: a fenced append
+        # (the self-reading `insert into t select … from t`, or safeappend) carries it, a blind
+        # last-writer-wins append does not — a concurrent writer / external reader can tell them
+        # apart in the log.
+        _fenced_write(args, path, storage_options, read_version,
+                      refusal_prefix=f"{mode} refused", refusal_suffix=". Re-read and retry.",
+                      record_read_version=True)
 
     if mode == "overwrite":
         dt = _delta_table(path, storage_options)
@@ -1317,21 +1350,10 @@ def replace_where(
         path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
     )
     args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
-    # Pin to the read snapshot and disable rebasing, so a concurrent commit since vB fails this
-    # overwrite (CAS) instead of landing on top of it. storage_options live on the DeltaTable
-    # already, so drop the kwarg form (mirrors append_if_unchanged).
-    dt = _delta_table(path, storage_options)
-    dt.load_as_version(read_version)
-    args["table_or_uri"] = dt
-    args.pop("storage_options", None)
-    args["commit_properties"] = CommitProperties(max_commit_retries=0)
-    try:
-        write_deltalake(**args)
-    except CommitFailedError as e:
-        raise CommitFailedError(
-            f"replaceWhere: table '{path}' changed since version {read_version} "
-            f"(a concurrent write committed); replace refused. Re-run."
-        ) from e
+    # Pin to the read snapshot and disable rebasing (CAS), so a concurrent commit since vB fails
+    # this overwrite instead of landing on top of it.
+    _fenced_write(args, path, storage_options, read_version,
+                  refusal_prefix="replaceWhere", refusal_suffix="; replace refused. Re-run.")
 
     # Maintenance ALWAYS at a fresh HEAD — never the pinned snapshot (a stale file list would
     # compact/vacuum files live versions still reference and corrupt the table).
@@ -1593,17 +1615,8 @@ def merge_delta(
     versions (safe 7-day default retention), and clean up expired log entries. Without this an
     incremental table that is merged on every run grows old files forever.
     """
-    keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
-    # Quote the join keys: a unique_key that needs quoting (mixed case on a case-sensitive path, a
-    # reserved word, spaces) would otherwise emit an invalid datafusion predicate. Strip any quotes
-    # the user already put on, then double-quote and escape — datafusion accepts "…" identifiers.
-    def _q(k):
-        return '"' + str(k).strip().strip('"').replace('"', '""') + '"'
-    conditions = [f"target.{_q(k)} = source.{_q(k)}" for k in keys]
-    if predicates:
-        extra = predicates if isinstance(predicates, (list, tuple)) else [predicates]
-        conditions.extend(p for p in extra if p)
-    predicate = " AND ".join(conditions)
+    extra = (predicates if isinstance(predicates, (list, tuple)) else [predicates]) if predicates else None
+    predicate = merge_on_predicate(unique_key, extra)
 
     # Build the fixed clause shape this convenience wrapper has always produced, then hand it to the
     # ordered clause-core. dbt merge_update_condition / merge_insert_condition gate which matched rows
@@ -1838,24 +1851,15 @@ def merge_delta_clauses(
             # since vB fails the evolution loud, preserving the merge's concurrency guarantee. On success
             # it lands deterministically at read_version+1, which the merge then pins to (so the full
             # (vB, HEAD] OCC window is still covered: (vB, vB+1] by this CAS, (vB+1, HEAD] by the merge).
-            dt0 = _delta_table(path, storage_options)
-            dt0.load_as_version(read_version)
             evo_args = build_write_deltalake_args(
                 path, data.limit(0), "append",
                 schema_mode="merge",
                 storage_options=storage_options,
             )
-            evo_args["table_or_uri"] = dt0
-            evo_args.pop("storage_options", None)
-            evo_args["commit_properties"] = CommitProperties(max_commit_retries=0)
-            try:
-                write_deltalake(**evo_args)
-            except CommitFailedError as e:
-                raise CommitFailedError(
-                    f"schema evolution: table '{path}' changed since version {read_version} "
-                    f"(a concurrent write committed); the on_schema_change add-columns commit was "
-                    f"refused before the merge. Re-read and retry."
-                ) from e
+            _fenced_write(evo_args, path, storage_options, read_version,
+                          refusal_prefix="schema evolution",
+                          refusal_suffix="; the on_schema_change add-columns commit was "
+                                         "refused before the merge. Re-read and retry.")
             effective_version = read_version + 1
 
     dt = _delta_table(path, storage_options)

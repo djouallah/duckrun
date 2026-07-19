@@ -177,7 +177,7 @@ class Plugin(BasePlugin):
         sort_by = cfg.get("sort_by")
         if sort_by:
             cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
-            order = ", ".join('"' + str(c).strip().strip('"').replace('"', '""') + '"' for c in cols)
+            order = ", ".join(engine.quote_ident(c) for c in cols)
             data = cur.sql(f"SELECT * FROM {name} ORDER BY {order}")
         else:
             data = cur.sql(f"SELECT * FROM {name}")
@@ -744,22 +744,11 @@ class Plugin(BasePlugin):
 
     @classmethod
     def _merge_on_predicate(cls, unique_key, cfg: dict, columns=None) -> str:
-        """The full MERGE ``ON`` predicate ``target.k = source.k [AND …]`` — the same string
-        ``merge_delta`` builds internally from ``unique_key`` + ``incremental_predicates``. Used by
-        the clause-core path (merge_clauses / merge_update_set_expressions), which takes the predicate
-        directly rather than a unique_key."""
-        keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
-        # Quote the join keys (mixed case / reserved word / spaces produce invalid datafusion SQL
-        # otherwise); strip any quotes the user already added, then double-quote and escape. Mirrors
-        # engine.merge_delta so both merge paths emit the same ON predicate.
-        conditions = [
-            f'target.{q} = source.{q}'
-            for q in ('"' + str(k).strip().strip('"').replace('"', '""') + '"' for k in keys)
-        ]
-        preds = cls._merge_predicates(cfg, columns)
-        if preds:
-            conditions.extend(p for p in preds if p)
-        return " AND ".join(conditions)
+        """The full MERGE ``ON`` predicate ``target.k = source.k [AND …]`` — literally the same
+        builder ``merge_delta`` uses (``engine.merge_on_predicate``), so the clause-core path
+        (merge_clauses / merge_update_set_expressions) and the flat-kwarg path cannot drift on
+        quoting or shape."""
+        return engine.merge_on_predicate(unique_key, cls._merge_predicates(cfg, columns))
 
     @classmethod
     def _custom_merge_clauses(cls, cfg: dict, columns, unique_key):

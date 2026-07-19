@@ -259,7 +259,8 @@ def _strip_query_context(msg: str) -> str:
     return msg[:idx].rstrip() if idx != -1 else msg
 
 
-_GUID = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+# The one strict GUID shape test, shared with the dbt adapter and fabric_remote (see remote.py).
+_GUID = remote._GUID
 
 
 def _onelake_guid_hint(root_path: str) -> Optional[str]:

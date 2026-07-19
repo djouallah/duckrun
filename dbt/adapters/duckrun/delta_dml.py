@@ -1352,6 +1352,38 @@ class _DeltaDML:
         self._refresh_view(rel, schema, loc)
         return True
 
+    def _rewrite_overwrite(self, loc: str, projection: str, *, alias: str = "",
+                           with_prefix: str = "", tail: str = "",
+                           materialize_tag: Optional[str] = None) -> None:
+        """The one read→rewrite→fenced-overwrite skeleton behind the DELETE/UPDATE subquery
+        fallbacks and the three ALTER rewrites: pin the ``delta_scan`` to the version read at
+        statement start (vB), evaluate ``select {projection} from <pinned scan>{tail}`` on the
+        cursor, and commit it via ``overwrite_if_unchanged(read_version=vB, overwrite_schema=True)``
+        — so a writer that commits during the (potentially long) rewrite fails the run loudly
+        instead of being silently clobbered.
+
+        ``alias`` aliases the scan to the target's name so self-qualified references bind.
+        ``materialize_tag`` routes the read through a native temp table first — DELETE/UPDATE use it
+        because their expressions (CTEs/subqueries) must be evaluated fully detached from the Delta
+        table being replaced; the ALTER rewrites stream directly."""
+        vB = engine.table_version(loc, self.so)
+        loc_sql = loc.replace("'", "''")
+        scan = f"delta_scan('{loc_sql}', version => {vB})" + (f' as "{alias}"' if alias else "")
+        sql = f"{with_prefix}select {projection} from {scan}{tail}"
+        if materialize_tag is None:
+            data = self.cursor.sql(sql)
+            engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
+                                          storage_options=self.so)
+            return
+        tmp = f"__duckrun_{materialize_tag}_{abs(hash(loc)) & 0xFFFFFFFF}"
+        self.cursor.execute(f'create or replace temp table "{tmp}" as {sql}')
+        try:
+            data = self.cursor.sql(f'select * from "{tmp}"')
+            engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
+                                          storage_options=self.so)
+        finally:
+            self.cursor.execute(f'drop table if exists "{tmp}"')
+
     def _delete(self, m, rel, schema, loc) -> None:
         where = m.group("where")
         where = where.strip() if where else None
@@ -1374,23 +1406,8 @@ class _DeltaDML:
                 f"duckrun: DELETE predicate on {loc!r} references a subquery; delta_rs can't "
                 "evaluate it, falling back to a DuckDB-filtered full overwrite (slower)."
             )
-            # Fence the read-modify-write to the version read at statement start (pin the delta_scan to
-            # vB, commit via overwrite_if_unchanged) so a writer that commits during this rewrite fails
-            # the run loudly instead of being silently clobbered — same CAS as the simple-predicate path.
-            vB = engine.table_version(loc, self.so)
-            loc_sql = loc.replace("'", "''")
-            tmp = f"__duckrun_del_{abs(hash(loc)) & 0xFFFFFFFF}"
-            scan = f"delta_scan('{loc_sql}', version => {vB})" + (f' as "{tname}"' if tname else "")
-            self.cursor.execute(
-                f'create or replace temp table "{tmp}" as {with_prefix}'
-                f"select * from {scan} where ({where}) is not true"
-            )
-            try:
-                keep = self.cursor.sql(f'select * from "{tmp}"')
-                engine.overwrite_if_unchanged(loc, keep, read_version=vB, overwrite_schema=True,
-                                              storage_options=self.so)
-            finally:
-                self.cursor.execute(f'drop table if exists "{tmp}"')
+            self._rewrite_overwrite(loc, "*", alias=tname, with_prefix=with_prefix,
+                                    tail=f" where ({where}) is not true", materialize_tag="del")
             return
         # Fast path (no subquery): delta_rs binds bare columns, so drop any self-qualifier.
         if tname and where:
@@ -1458,26 +1475,15 @@ class _DeltaDML:
                 f"duckrun: UPDATE on {loc!r} references a subquery (predicate or SET expr); delta_rs "
                 "can't evaluate it, falling back to a DuckDB-evaluated fenced full overwrite (slower)."
             )
-            vB = engine.table_version(loc, self.so)
             replaces = ", ".join(
                 (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
                  else f'({expr}) AS "{col}"')
                 for col, expr in updates.items()
             )
-            tmp = f"__duckrun_upd_{abs(hash(loc)) & 0xFFFFFFFF}"
-            # Alias the scan to the target's name so a self-qualified reference (`sales.cat`, incl. one
-            # inside a correlated subquery) binds to it; unqualified columns still resolve.
-            scan = f"delta_scan('{loc_sql}', version => {vB})" + (f' as "{tname}"' if tname else "")
-            self.cursor.execute(
-                f'create or replace temp table "{tmp}" as {with_prefix}'
-                f"select * replace ({replaces}) from {scan}"
-            )
-            try:
-                new = self.cursor.sql(f'select * from "{tmp}"')
-                engine.overwrite_if_unchanged(loc, new, read_version=vB, overwrite_schema=True,
-                                              storage_options=self.so)
-            finally:
-                self.cursor.execute(f'drop table if exists "{tmp}"')
+            # The scan is aliased to the target's name so a self-qualified reference (`sales.cat`,
+            # incl. one inside a correlated subquery) binds to it; unqualified columns still resolve.
+            self._rewrite_overwrite(loc, f"* replace ({replaces})", alias=tname,
+                                    with_prefix=with_prefix, materialize_tag="upd")
             return
         # Fast path (no subquery): delta_rs binds bare columns, so drop any self-qualifier the user
         # wrote (`sales.cat` → `cat`) from the SET expressions and the predicate.
@@ -1699,39 +1705,21 @@ class _DeltaDML:
         deftext = m.group("def")
         tidx = _find_top_level(deftext, _ALTER_TAIL)
         coltype = (deftext if tidx == -1 else deftext[:tidx]).strip() or "VARCHAR"
-        # Fence this full rewrite to the version read at statement start: a writer that commits
-        # during the (potentially long) rewrite must fail the run loudly, not be silently clobbered.
-        vB = engine.table_version(loc, self.so)
-        loc_sql = loc.replace("'", "''")
-        data = self.cursor.sql(
-            f'select *, cast(null as {coltype}) as "{col}" from delta_scan(\'{loc_sql}\', version => {vB})'
-        )
-        engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
-                                      storage_options=self.so)
+        self._rewrite_overwrite(loc, f'*, cast(null as {coltype}) as "{col}"')
 
     def _alter_drop(self, m, rel, schema, loc) -> None:
         """`alter table <t> drop column <c>`: delta_rs has no in-place column drop, so rewrite the
         table WITHOUT the column (DuckDB ``SELECT * EXCLUDE``) under overwrite_schema, fenced to the
         version read — the same mechanism as ADD COLUMN."""
         col = m.group("col").strip().strip('"')
-        vB = engine.table_version(loc, self.so)
-        loc_sql = loc.replace("'", "''")
-        data = self.cursor.sql(
-            f'select * exclude ("{col}") from delta_scan(\'{loc_sql}\', version => {vB})')
-        engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
-                                      storage_options=self.so)
+        self._rewrite_overwrite(loc, f'* exclude ("{col}")')
 
     def _alter_rename(self, m, rel, schema, loc) -> None:
         """`alter table <t> rename column <old> to <new>`: rewrite with the column renamed (DuckDB
         ``SELECT * RENAME``) under overwrite_schema, fenced to the version read."""
         old = m.group("old").strip().strip('"')
         new = m.group("new").strip().strip('"')
-        vB = engine.table_version(loc, self.so)
-        loc_sql = loc.replace("'", "''")
-        data = self.cursor.sql(
-            f'select * rename ("{old}" as "{new}") from delta_scan(\'{loc_sql}\', version => {vB})')
-        engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
-                                      storage_options=self.so)
+        self._rewrite_overwrite(loc, f'* rename ("{old}" as "{new}")')
 
     def _insert_schema_evolution(self, m, rel, schema, loc) -> None:
         """`insert with schema evolution into <t> <select|values>` (Spark/Delta spelling): append with
