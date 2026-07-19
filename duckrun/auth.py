@@ -276,4 +276,10 @@ def refresh_storage_token() -> Optional[str]:
 
     Non-interactive only: ``_azure_identity_token(interactive=False)`` so a mid-run refresh (called
     from the per-statement cursor guard) can never pop a browser and hang a headless build."""
-    return _fabric_token() or _github_oidc_token() or _azure_identity_token(interactive=False)
+    token = _fabric_token() or _github_oidc_token() or _azure_identity_token(interactive=False)
+    if token:
+        # Keep the per-scope cache in sync: the next get_onelake_token() then reuses this fresh
+        # token instead of finding the near-expiry one and re-acquiring on its own — two callers,
+        # one notion of "current token".
+        _TOKEN_CACHE[_STORAGE_SCOPE] = token
+    return token

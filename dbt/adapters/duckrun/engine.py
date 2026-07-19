@@ -399,10 +399,13 @@ def _duckdb_mem_bytes(con):
         return None
     try:
         cur = con.cursor()  # duckdb's cursor() is a new connection on the same instance
-        row = cur.execute(
-            "SELECT coalesce(sum(memory_usage_bytes), 0), "
-            "coalesce(sum(temporary_storage_bytes), 0) FROM duckdb_memory()"
-        ).fetchone()
+        try:
+            row = cur.execute(
+                "SELECT coalesce(sum(memory_usage_bytes), 0), "
+                "coalesce(sum(temporary_storage_bytes), 0) FROM duckdb_memory()"
+            ).fetchone()
+        finally:
+            cur.close()  # sampled every 0.1s while a profile runs — don't pile up cursors
         return (int(row[0]), int(row[1]))
     except Exception:
         return None
@@ -816,7 +819,8 @@ def open_if_exists(path: str, storage_options: Optional[Dict[str, str]] = None) 
         return None
 
 
-def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None):
+def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None,
+                dt: Optional[DeltaTable] = None):
     """Cheap table statistics for ``dbt docs generate``, read from the Delta **log** (no data scan).
 
     ``DeltaTable.get_add_actions()`` carries per-file ``num_records`` / ``size_bytes`` /
@@ -827,9 +831,11 @@ def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None
     Returns ``{"num_rows", "bytes", "last_modified"}`` (last_modified = epoch milliseconds), or
     ``None`` on ANY failure (a drop-tombstone, a missing table, an unreachable/credential-less remote
     store). Best-effort by design: a statless catalog is fine, but a docs build must never break.
+    ``dt`` reuses an already-opened handle instead of a fresh log open.
     """
     try:
-        add_actions = _delta_table(path, storage_options).get_add_actions()  # noqa: F841 (replacement scan)
+        dtx = dt if dt is not None else _delta_table(path, storage_options)
+        add_actions = dtx.get_add_actions()  # noqa: F841 (replacement scan)
         row = cur.sql(
             "select coalesce(sum(num_records), 0)::bigint, "
             "coalesce(sum(size_bytes), 0)::bigint, "
@@ -978,6 +984,13 @@ def read_delta_docs(
         dt = _delta_table(path, storage_options)
     except Exception:  # best-effort: no table / unreadable -> no docs to restore
         return None, {}
+    return docs_from_dt(dt)
+
+
+def docs_from_dt(dt):
+    """(relation_description, {column: description}) from an already-opened ``DeltaTable`` — the
+    handle-reusing core of :func:`read_delta_docs`, so discovery can serve the tombstone check and
+    the docs read from ONE log open per relation. Best-effort throughout."""
     try:
         relation_docs = dt.metadata().description or None
     except Exception:  # best-effort
@@ -1026,10 +1039,15 @@ def delta_columns(path: str, storage_options: Optional[Dict[str, str]] = None) -
     return [f.name for f in _delta_table(path, storage_options).schema().fields]
 
 
-def table_version(path: str, storage_options: Optional[Dict[str, str]] = None) -> int:
+def table_version(path: str, storage_options: Optional[Dict[str, str]] = None,
+                  dt: Optional[DeltaTable] = None) -> int:
     """Current (HEAD) Delta version of the table at ``path``. The ``vB`` a caller captures before
-    reading a source, to pin a later merge/replace to the same snapshot (single-snapshot MERGE semantics)."""
-    return _delta_table(path, storage_options).version()
+    reading a source, to pin a later merge/replace to the same snapshot (single-snapshot MERGE
+    semantics). ``dt`` reuses an already-opened handle instead of a fresh log open — but every
+    version capture still goes THROUGH this function: it is the seam the correctness suite uses to
+    inject a stale read (monkeypatching it to a past vB), so callers must not read ``dt.version()``
+    directly."""
+    return (dt if dt is not None else _delta_table(path, storage_options)).version()
 
 
 def table_history(path: str, storage_options: Optional[Dict[str, str]] = None,
@@ -1139,6 +1157,11 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) 
         if _cleanup_due(path, dt):
             dt.cleanup_metadata()
             _last_cleanup_version[path] = dt.version()
+            # Bound the per-process marker dict (a long-lived notebook touching many tables would
+            # grow it forever). Evicting the oldest entry only means that table's next maintenance
+            # re-runs an idempotent cleanup_metadata a bit early — cheap and harmless.
+            while len(_last_cleanup_version) > 512:
+                _last_cleanup_version.pop(next(iter(_last_cleanup_version)))
     except CommitFailedError as e:
         logger.warning(f"post-write metadata cleanup skipped (data commit already succeeded): {e}")
 

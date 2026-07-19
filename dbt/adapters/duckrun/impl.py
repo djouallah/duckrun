@@ -139,13 +139,17 @@ class DuckrunAdapter(DuckDBAdapter):
         except Exception as exc:  # best-effort: docs persistence must not fail the build
             logger.debug(f"duckrun: could not persist Delta docs at {location!r}: {exc}")
 
-    def _apply_delta_comments(self, cursor, relation, location):
+    def _apply_delta_comments(self, cursor, relation, location, dt=None):
         """Re-apply persisted Delta docs (relation + column descriptions) as COMMENT ON statements
         on a freshly (re-)registered delta_scan view, so catalog queries (``dbt docs generate``)
-        return non-null comments even in a process that never ran the model. Best-effort."""
+        return non-null comments even in a process that never ran the model. Best-effort.
+        ``dt`` reuses discovery's already-opened handle instead of a second log open."""
         from . import engine
-        so = self.config.credentials.storage_options_for_location(location)
-        relation_docs, column_docs = engine.read_delta_docs(location, so)
+        if dt is not None:
+            relation_docs, column_docs = engine.docs_from_dt(dt)
+        else:
+            so = self.config.credentials.storage_options_for_location(location)
+            relation_docs, column_docs = engine.read_delta_docs(location, so)
         if not relation_docs and not column_docs:
             return
         # The physical object is a view, so COMMENT ON VIEW (DuckDB reports it under the view's
@@ -257,7 +261,7 @@ class DuckrunAdapter(DuckDBAdapter):
         self._ensure_remote_secret(cursor)
         return remote.list_delta_tables_via_glob(cursor, root_path, schema)
 
-    def _register_delta_view(self, relation):
+    def _register_delta_view(self, relation, dt=None):
         """Create the ``delta_scan`` view for a discovered Delta relation on the live
         connection so read-only commands (``dbt test``, ``dbt show``, ``dbt docs``) that
         never materialize anything can still query the model.
@@ -265,7 +269,8 @@ class DuckrunAdapter(DuckDBAdapter):
         ``dbt run``/``build`` create this same view in the materialization (step 4); doing it
         here too is harmless — the materialization's ``create or replace`` just supersedes it.
         But for a command that runs no models, this is the only place the physical view gets
-        created from the Delta tables discovered on disk.
+        created from the Delta tables discovered on disk. ``dt`` is discovery's already-opened
+        handle, reused for the docs read.
         """
         root_path, _ = self.config.credentials.root_for(relation.database)
         if not root_path:
@@ -285,7 +290,7 @@ class DuckrunAdapter(DuckDBAdapter):
             )
             # Re-apply persisted docs as COMMENT ON so a docs/test/show process (which rebuilt
             # this view from disk and so lost any in-run comment) still reports them.
-            self._apply_delta_comments(cursor, relation, location)
+            self._apply_delta_comments(cursor, relation, location, dt=dt)
         except Exception as exc:
             # A table mid-write or an unreadable log shouldn't abort cache population;
             # the materialization re-creates the view on the next run regardless. Log at
@@ -305,6 +310,10 @@ class DuckrunAdapter(DuckDBAdapter):
         # Hide drop-tombstones: a `drop table` overwrites the table to a one-column marker (no data
         # deleted). Such a table must not surface as a relation. Check before registering. Every
         # discovered relation shares this schema_relation's catalog, so resolve its root/token once.
+        # ONE delta-rs open per relation serves BOTH the tombstone check and the persisted-docs read
+        # that view registration re-applies — this path runs for every manifest schema on every dbt
+        # command, so on OneLake the per-relation log replays it saves are the dominant startup cost.
+        from . import engine
         root_path, so = self.config.credentials.root_for(schema_relation.database)
         root_path = root_path or ""
         cur = self._cursor()
@@ -312,17 +321,28 @@ class DuckrunAdapter(DuckDBAdapter):
         for rel in discovered:
             loc = (root_path.rstrip("/") + "/" + str(rel.schema).strip('"')
                    + "/" + str(rel.identifier).strip('"'))
-            if delta_dml.is_dropped(cur, loc, so):
+            try:
+                dt = engine._delta_table(loc, so)
+            except Exception as exc:
+                logger.debug(f"duckrun: discovery could not open {loc!r} via delta-rs: {exc}")
+                dt = None
+            if dt is not None:
+                if delta_dml.is_dropped_dt(dt):
+                    continue
+            # delta-rs couldn't open it (e.g. an az:// store whose credential lives only in the
+            # DuckDB `secrets:` block) — fall back to the original DuckDB-side probe so a
+            # tombstone there is still hidden, exactly as before.
+            elif delta_dml.is_dropped(cur, loc, so):
                 continue
-            live.append(rel)
-        discovered = live
+            live.append((rel, dt))
+        discovered = [rel for rel, _ in live]
         if not discovered:
             return in_memory
 
         # Physically register each discovered Delta table as a delta_scan view so read-only
         # commands (dbt test/show/docs) can query models without a prior in-process run.
-        for rel in discovered:
-            self._register_delta_view(rel)
+        for rel, dt in live:
+            self._register_delta_view(rel, dt=dt)
 
         # A Delta table on disk is the source of truth, so disk discovery WINS over the
         # in-memory catalog. This matters when several dbt runs share one process (dbt's test
@@ -389,8 +409,18 @@ class DuckrunAdapter(DuckDBAdapter):
                     return None
                 loc = (root_path.rstrip("/") + "/" + str(schema).strip('"')
                        + "/" + str(name).strip('"'))
-                cache[key] = (None if delta_dml.is_dropped(cur, loc, so)
-                              else engine.delta_stats(cur, loc, so))
+                # One open serves the tombstone check and the stats read (was two per relation).
+                try:
+                    dt = engine._delta_table(loc, so)
+                except Exception:
+                    dt = None
+                if dt is not None:
+                    cache[key] = (None if delta_dml.is_dropped_dt(dt)
+                                  else engine.delta_stats(cur, loc, so, dt=dt))
+                else:
+                    # delta-rs couldn't open it — original DuckDB-side path, exactly as before.
+                    cache[key] = (None if delta_dml.is_dropped(cur, loc, so)
+                                  else engine.delta_stats(cur, loc, so))
             return cache[key]
 
         cols = list(table.column_names)

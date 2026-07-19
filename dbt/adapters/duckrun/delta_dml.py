@@ -104,6 +104,17 @@ def is_dropped(con, location: str, storage_options=None) -> bool:
         logger.debug(f"duckrun: is_dropped could not scan {location!r}, treating as live: {exc}")
         return False
 
+
+def is_dropped_dt(dt) -> bool:
+    """:func:`is_dropped` from an already-opened ``DeltaTable`` — same tombstone rule (single marker
+    column), same best-effort contract (unreadable schema → 'live'), but no extra log open. Used by
+    adapter discovery, whose one delta-rs open per relation also serves the persisted-docs read."""
+    try:
+        return _columns_are_tombstone([f.name for f in dt.schema().fields])
+    except Exception as exc:  # best-effort: treat unreadable as 'not a tombstone'
+        logger.debug(f"duckrun: is_dropped_dt could not read schema, treating as live: {exc}")
+        return False
+
 # --- statement matchers (leading-anchored, DOTALL so multi-line bodies match) ----------------
 # `create [or replace] table [if not exists] <rel> as <query>`. The body is ANY query text (a bare
 # `select …`, a `with … select …` CTE, or a parenthesised `(select …)`); it's handed to DuckDB
@@ -1187,8 +1198,10 @@ class _DeltaDML:
         return engine._delta_table(loc, self.so)
 
     def _vB(self, loc: str) -> int:
-        """The statement's pinned read version for ``loc`` (one log open per statement)."""
-        return self._pinned(loc).version()
+        """The statement's pinned read version for ``loc`` (one log open per statement). Routed
+        through ``engine.table_version`` — the version-capture seam the correctness suite injects
+        stale reads into — never ``dt.version()`` directly."""
+        return engine.table_version(loc, self.so, dt=self._pinned(loc))
 
     def _refresh_view(self, rel: str, schema: str, loc: str) -> None:
         loc_sql = loc.replace("'", "''")
