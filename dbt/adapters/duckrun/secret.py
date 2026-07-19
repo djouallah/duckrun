@@ -214,3 +214,33 @@ def mint_scoped_secret(conn, secret_name: str, root: str,
         f"(TYPE AZURE, PROVIDER ACCESS_TOKEN, ACCESS_TOKEN '{token_sql}', SCOPE '{scope_sql}')"
     )
     return True
+
+
+def refresh_catalog_secret(cursor, catalog_name: str,
+                           storage_options: Optional[Dict[str, str]], *,
+                           is_default: bool, root: Optional[str]) -> Optional[Dict[str, str]]:
+    """Refresh a near-expiry OneLake token in ``storage_options`` and re-mint its DuckDB secret on
+    ``cursor``, so a session/build outliving the token's ~1h life doesn't 401 mid-run. The default
+    catalog re-mints the unscoped :func:`ensure_azure_secret`; an attached catalog re-mints its
+    path-scoped :func:`mint_scoped_secret` (needs ``root`` for the SCOPE).
+
+    Returns the (possibly new) ``storage_options`` — the SAME object when nothing changed (no token,
+    not a JWT, not expiring, or no live source), so callers can identity-check whether to persist it.
+    Best-effort: a re-mint failure keeps the old secret but still returns the refreshed options. Used
+    by both the dbt cursor guard and the connect() session so the two can't drift."""
+    if not bearer_token(storage_options):
+        return storage_options
+    fresh = refreshed(storage_options)
+    if fresh is storage_options:
+        return storage_options  # token still valid (the common path) — nothing to do
+    try:
+        if is_default:
+            ensure_azure_secret(cursor, fresh)
+        else:
+            mint_scoped_secret(cursor, scoped_secret_name(catalog_name), root, fresh)
+        if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+            print(f"[duckrun-auth] re-minted DuckDB secret for catalog {catalog_name!r}", flush=True)
+    except Exception as e:  # best-effort: a transient refresh failure keeps the old secret
+        if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+            print(f"[duckrun-auth] re-mint failed for {catalog_name!r}: {e!r}", flush=True)
+    return fresh

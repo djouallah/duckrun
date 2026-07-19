@@ -75,25 +75,12 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
                               setter=lambda so, c=cfg: c.__setitem__("storage_options", so))
 
     def _refresh_one(self, so, catalog, is_default, setter) -> None:
-        if not secret.bearer_token(so):
-            return
-        fresh = secret.refreshed(so)
-        if fresh is so:
-            return  # token still valid (the common path) — nothing to do
-        setter(fresh)  # keep the live copy DML/discovery read from in sync
-        try:
-            if is_default:
-                secret.ensure_azure_secret(self._cursor, fresh)
-            else:
-                root = (self._duckrun_creds.catalogs.get(catalog) or {}).get("root_path")
-                secret.mint_scoped_secret(
-                    self._cursor, secret.scoped_secret_name(catalog), root, fresh
-                )
-            if os.environ.get("DUCKRUN_AUTH_DEBUG"):
-                print(f"[duckrun-auth] execute: re-minted DuckDB secret for catalog {catalog!r}", flush=True)
-        except Exception as e:  # best-effort: a transient refresh failure keeps the old secret
-            if os.environ.get("DUCKRUN_AUTH_DEBUG"):
-                print(f"[duckrun-auth] execute: re-mint failed for {catalog!r}: {e!r}", flush=True)
+        root = None if is_default else (self._duckrun_creds.catalogs.get(catalog) or {}).get("root_path")
+        fresh = secret.refresh_catalog_secret(
+            self._cursor, catalog, so, is_default=is_default, root=root
+        )
+        if fresh is not so:
+            setter(fresh)  # keep the live copy DML/discovery read from in sync
 
 
 class DuckrunEnvironment(LocalEnvironment):

@@ -168,6 +168,15 @@ def _is_restore(query: str) -> bool:
     return bool(_RESTORE_RE.match(_strip_leading(query)))
 
 
+_MERGE_RE = re.compile(r"(?is)^\s*merge\s+into\b")
+
+
+def _is_merge(query: str) -> bool:
+    """True if ``query`` is a ``MERGE INTO …`` — the write that shares the process with delta_rs's own
+    merge pool, so DuckDB's memory_limit is tightened to its split share (not just the write share)."""
+    return bool(_MERGE_RE.match(_strip_leading(query)))
+
+
 def _delta_write_message(query: str) -> str:
     """The error for a raw-SQL write conn.sql() can't route to delta_rs. For an INSERT/UPDATE/DELETE
     whose target isn't a discovered Delta table — the common cause being a typo or a table written
@@ -349,12 +358,19 @@ class DuckSession:
 
         self.con = duckdb.connect()
         engine.configure_duckdb_session(self.con)
+        # DuckDB's memory_limit as configured (its host-RAM default; configure_duckdb_session leaves it
+        # alone). A Delta write clamps DOWN from this and restores to it — so a write can't OOM on a
+        # container's host-RAM default while interactive reads keep full memory. Mirrors the dbt path.
+        self._baseline_memory_limit: Optional[str] = engine.read_memory_limit(self.con)
 
         # The catalog registry: name -> _CatEntry (root / creds / read-only). "Which catalog & schema
         # is current" is NOT tracked here — DuckDB owns it (current_database() / current_schema(),
         # surfaced by the _current_catalog / _current_database properties), so a user's `USE` steers
         # reads AND write-routing with no parallel state to drift.
         self._catalogs: Dict[str, _CatEntry] = {}
+        # The primary catalog keeps the unscoped OneLake secret (attached ones are path-scoped); the
+        # token-refresh guard needs to know which is which to re-mint the right secret.
+        self._primary_catalog: Optional[str] = None
 
         root, schema_filter = _split_root_schema(path, schema)
         # Catalog is first-class, so single- and multi-catalog sessions share one code path
@@ -425,6 +441,8 @@ class DuckSession:
 
         self.con.execute(f"ATTACH ':memory:' AS {_qid(name)}")
         self._catalogs[name] = _CatEntry(name, root, so, schema_filter, ro)
+        if primary:
+            self._primary_catalog = name
         schemas = self._refresh_catalog(name, quiet=quiet)
         if primary:
             # Make the primary the current catalog (+ a sensible default schema) via DuckDB's own USE —
@@ -656,6 +674,37 @@ class DuckSession:
         self.refresh(quiet=True)  # re-discover schema folders first
         return dbName in self._cat_databases()
 
+    def _refresh_tokens(self) -> None:
+        """Refresh each catalog's near-expiry OneLake token and re-mint its DuckDB secret, so a
+        long-lived session's reads/writes don't 401 past the token's ~1h life. The primary keeps the
+        unscoped secret; attached catalogs re-mint their path-scoped secret. Shared with the dbt cursor
+        guard via secret.refresh_catalog_secret. No-op unless a token is genuinely near expiry, and for
+        local / token-less catalogs."""
+        for name, entry in list(self._catalogs.items()):
+            fresh = secret.refresh_catalog_secret(
+                self.con, name, entry.storage_options,
+                is_default=(name == self._primary_catalog), root=entry.root_path,
+            )
+            if fresh is not entry.storage_options:
+                self._catalogs[name] = entry._replace(storage_options=fresh)
+
+    def _handle_delta_write(self, entry, query: str) -> bool:
+        """Route a Delta write through ``delta_dml.handle`` with the DuckDB ``memory_limit`` clamped to
+        the write-path share (and tightened to the merge split for a ``MERGE``, which shares the process
+        with delta_rs's merge pool), then restored to the baseline. Without this the write inherits
+        DuckDB's host-physical-RAM default and OOM-kills the session on a container — the same clamp the
+        dbt path applies in ``store()``, reusing the same engine helpers so the two can't drift. The
+        restore keeps interactive reads at full memory once the write is done."""
+        baseline = self._baseline_memory_limit
+        engine.set_write_memory_limit(self.con, baseline)
+        if _is_merge(query):
+            engine.set_merge_memory_limit(self.con)
+        try:
+            return delta_dml.handle(self.con, entry.root_path, entry.storage_options,
+                                    query, default_schema=self._current_database)
+        finally:
+            engine.restore_memory_limit(self.con, baseline)
+
     def sql(self, query: str) -> duckdb.DuckDBPyRelation:
         """Run a query and return DuckDB's native ``DuckDBPyRelation`` — unwrapped, with all of its
         own methods (``.show()``, ``.df()``, ``.arrow()``, ``.pl()``, ``.fetchall()``, ``.filter()``,
@@ -697,6 +746,12 @@ class DuckSession:
         ``to timestamp as of '…'``) rolls the table back — a new commit on top of history, itself
         revertible.
         """
+        # OneLake token freshness — the universal guard, mirroring the dbt cursor wrapper. A session
+        # outliving the token's ~1h life would otherwise 401 on the next delta_scan (read) or delta-rs
+        # write. EVERY statement funnels through here, so this is the one place that covers them all.
+        # Cheap: refresh_catalog_secret only parses the JWT expiry and re-mints at most once per token
+        # lifetime, and is a no-op for local / token-less catalogs.
+        self._refresh_tokens()
         # One statement in, one relation out — for EVERY statement, not just DML. Routing keys off the
         # leading verb, so a `;`-batch led by a read (`select 1; create table foo as select 2`) would
         # otherwise slip past the DML router into raw DuckDB and silently make an ephemeral native table.
@@ -750,8 +805,16 @@ class DuckSession:
         if unsupported:
             raise ValueError(unsupported)
         query = self._resolve_auto_sort(query)
-        if entry is not None and delta_dml.handle(self.con, entry.root_path, entry.storage_options,
-                                                  query, default_schema=self._current_database):
+        # A Delta write is routed with the DuckDB memory_limit clamped (and restored after); a read runs
+        # handle() unwrapped — it returns False for non-DML and falls through to DuckDB below. is_write
+        # implies entry is not None here (the None case raised above).
+        if entry is not None:
+            handled = (self._handle_delta_write(entry, query) if is_write else
+                       delta_dml.handle(self.con, entry.root_path, entry.storage_options,
+                                        query, default_schema=self._current_database))
+        else:
+            handled = False
+        if handled:
             self.refresh(quiet=True, catalog=write_cat)
             return self.con.sql("SELECT 'ok' AS status")
         if _is_delta_write(query):
