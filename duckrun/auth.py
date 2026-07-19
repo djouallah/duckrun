@@ -50,16 +50,24 @@ def _sleep(seconds: float) -> None:
 _TOKEN_CACHE: dict = {}
 
 
+def _cache_key(scope: str):
+    """Cache key = (tenant, scope). The scope string is identical across Azure tenants, so a
+    scope-only key would hand tenant A's cached token to a request meant for tenant B when the
+    process switches AZURE_TENANT_ID (notebooks, tests). Single-tenant behavior is unchanged."""
+    return (os.environ.get("AZURE_TENANT_ID") or "", scope)
+
+
 def _cached_token(scope: str, acquire):
     """Return a cached token for ``scope`` if it's still comfortably valid, else acquire + cache one.
     ``acquire`` is a zero-arg callable returning a token or None. A non-JWT token (can't read expiry)
     is cached for the process — the same lifetime the caller would otherwise re-fetch it at."""
-    cached = _TOKEN_CACHE.get(scope)
+    key = _cache_key(scope)
+    cached = _TOKEN_CACHE.get(key)
     if cached and not token_is_expiring(cached):
         return cached
     token = acquire()
     if token:
-        _TOKEN_CACHE[scope] = token
+        _TOKEN_CACHE[key] = token
     return token
 
 
@@ -281,5 +289,5 @@ def refresh_storage_token() -> Optional[str]:
         # Keep the per-scope cache in sync: the next get_onelake_token() then reuses this fresh
         # token instead of finding the near-expiry one and re-acquiring on its own — two callers,
         # one notion of "current token".
-        _TOKEN_CACHE[_STORAGE_SCOPE] = token
+        _TOKEN_CACHE[_cache_key(_STORAGE_SCOPE)] = token
     return token

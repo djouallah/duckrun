@@ -815,6 +815,12 @@ class RemoteRunner:
                  env: Optional[Dict[str, str]] = None, forward_env: bool = True,
                  pip_spec: Optional[str] = None, duckrun_version: Optional[str] = None,
                  fabric_token: Optional[str] = None, storage_token: Optional[str] = None):
+        # Fail fast on a size Fabric will reject anyway — the late error is an opaque job failure.
+        if cores is not None and cores not in (4, 8, 16, 32, 64):
+            raise RemoteRunError(
+                f"cores={cores!r} is not a Fabric Python-notebook size; use 4, 8, 16, 32 or 64 "
+                "(or omit it for the workspace default)."
+            )
         self.cores = cores
         self.target = target
         self.profiles_dir = profiles_dir

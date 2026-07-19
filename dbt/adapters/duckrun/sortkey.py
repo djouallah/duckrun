@@ -67,7 +67,10 @@ def _qid(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
 
 
-_DECIMAL_RE = re.compile(r"DECIMAL\(\s*(\d+)\s*,\s*(\d+)\s*\)", re.IGNORECASE)
+# Accepts the NUMERIC alias and a scale-less DECIMAL(p) (scale 0) besides the canonical
+# DECIMAL(p,s) — DuckDB's DESCRIBE normalizes to the latter, but type strings from user config
+# or a Delta schema arrive in any of the three spellings.
+_DECIMAL_RE = re.compile(r"(?:DECIMAL|NUMERIC)\(\s*(\d+)\s*(?:,\s*(\d+)\s*)?\)", re.IGNORECASE)
 # DECIMAL(p, s) with p <= 18 fits INT64; p > 18 forces a 16-byte FIXED_LEN_BYTE_ARRAY, which
 # arrow-rs (the delta-rs writer) NEVER dictionary-encodes — such a column is written PLAIN even
 # when its value domain is tiny. Narrowing precision back to 18 (scale unchanged) restores INT64,
@@ -89,7 +92,7 @@ def decimal_narrow_target(type_str, max_abs):
     m = _DECIMAL_RE.fullmatch(str(type_str).strip())
     if not m:
         return None
-    p, s = int(m.group(1)), int(m.group(2))
+    p, s = int(m.group(1)), int(m.group(2) or 0)
     if p <= _DECIMAL_NARROW_PRECISION or s > _DECIMAL_NARROW_PRECISION - 1:
         return None
     if max_abs is not None and abs(max_abs) >= 10 ** (_DECIMAL_NARROW_PRECISION - s):

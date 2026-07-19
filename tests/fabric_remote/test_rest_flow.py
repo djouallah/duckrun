@@ -209,3 +209,13 @@ def test_fresh_token_churns_only_near_expiry(monkeypatch):
     assert fr._fresh_token("old", boom) == "old"
     # An empty re-acquire also keeps the old token.
     assert fr._fresh_token("old", lambda: None) == "old"
+
+
+def test_invalid_cores_rejected_at_construction(project):
+    with pytest.raises(fr.RemoteRunError, match="not a Fabric Python-notebook size"):
+        RemoteRunner(cores=3, project_dir=str(project), fabric_token="F", storage_token="S")
+
+
+def test_valid_cores_accepted(project):
+    for c in (4, 8, 16, 32, 64, None):
+        RemoteRunner(cores=c, project_dir=str(project), fabric_token="F", storage_token="S")

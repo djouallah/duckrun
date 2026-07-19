@@ -872,3 +872,13 @@ def test_download_rejects_escaping_part_path(_patch, tmp_path):
     with pytest.raises(fr.RemoteRunError, match="refusing to write"):
         _ws().download(str(tmp_path), name="run")
     assert not (tmp_path / "evil.txt").exists()
+
+
+def test_schedule_rejects_bad_time(_patch):
+    """A malformed HH:MM fails fast with a clear message instead of an opaque Fabric API error."""
+    fake = _patch(ScheduleFabric(pipelines=[{"displayName": "load", "id": "pl-1"}]))
+    with pytest.raises(fr.RemoteRunError, match="invalid schedule time"):
+        _ws().schedule("load.json", daily="6am")
+    with pytest.raises(fr.RemoteRunError, match="invalid schedule time"):
+        _ws().schedule("load.json", weekly=["Mon"], at="25:00")
+    _ws().schedule("load.json", daily="06:30")  # sane time still accepted

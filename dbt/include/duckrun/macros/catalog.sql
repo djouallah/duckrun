@@ -31,7 +31,11 @@
       , v.database_name
       , v.schema_name
       -- A delta_scan view is a Delta table surfaced for reads; report it as a table, not a view.
-      , case when v.sql ilike '%delta_scan(%' then 'BASE TABLE' else 'VIEW' end as table_type
+      -- Structural match on the exact shape duckrun registers (`... as select * from delta_scan('...`),
+      -- not a bare substring test — a genuine `view` model that merely MENTIONS delta_scan in a
+      -- string literal or comment must stay a VIEW.
+      , case when regexp_matches(v.sql, 'as\s+select\s+\*\s+from\s+delta_scan\s*\(', 'i')
+             then 'BASE TABLE' else 'VIEW' end as table_type
       , v.comment as table_comment
       from duckdb_views() v
       WHERE v.database_name = '{{ database }}'

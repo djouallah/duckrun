@@ -273,3 +273,9 @@ def test_decimal_narrow_target():
     # non-decimal / unparseable → None.
     assert f("BIGINT", 5) is None
     assert f("VARCHAR", None) is None
+    # NUMERIC alias and scale-less DECIMAL(p) (scale 0) are the same type in other spellings —
+    # they narrow identically instead of silently never matching.
+    assert f("NUMERIC(38,4)", 100) == "DECIMAL(18,4)"
+    assert f("DECIMAL(38)", 100) == "DECIMAL(18,0)"
+    assert f("NUMERIC(38)", 10 ** 18) is None                  # same exact-fit rule applies
+    assert f("NUMERIC(18,2)", 5) is None                       # p <= 18 still nothing to narrow

@@ -402,3 +402,58 @@ def test_update_rows_rejects_unknown_column(tmp_path):
     # A valid column still updates (case-insensitive match, like the SQL path).
     engine.update_rows(p, {"V": "99"}, "id = 1", read_version=v)
     assert engine.table_version(p) == v + 1
+
+
+# --- token cache is keyed by (tenant, scope), not scope alone
+
+def test_token_cache_is_tenant_scoped(monkeypatch):
+    """The scope string is identical across Azure tenants, so a scope-only cache key would hand
+    tenant A's token to a request made after the process switched AZURE_TENANT_ID."""
+    import os
+    minted = []
+
+    def acquire():
+        minted.append(os.environ.get("AZURE_TENANT_ID"))
+        return f"TOKEN-{os.environ.get('AZURE_TENANT_ID')}"
+
+    monkeypatch.setattr(auth, "_fabric_token", lambda: None)
+    monkeypatch.setattr(auth, "_github_oidc_token", lambda scope=auth._STORAGE_SCOPE: acquire())
+    monkeypatch.setattr(auth, "_azure_identity_token", lambda interactive=True: None)
+    monkeypatch.delenv("AZURE_STORAGE_TOKEN", raising=False)
+
+    monkeypatch.setenv("AZURE_TENANT_ID", "tenant-a")
+    assert auth.get_onelake_token() == "TOKEN-tenant-a"
+    monkeypatch.setenv("AZURE_TENANT_ID", "tenant-b")
+    assert auth.get_onelake_token() == "TOKEN-tenant-b"   # NOT tenant-a's cached token
+    monkeypatch.setenv("AZURE_TENANT_ID", "tenant-a")
+    assert auth.get_onelake_token() == "TOKEN-tenant-a"   # each tenant keeps its own cache slot
+    assert minted == ["tenant-a", "tenant-b"]             # third call was a cache hit
+
+
+# --- catalog delta_scan-view detection is structural, not a substring test
+
+CATALOG_VIEW_TYPE_SQL = (
+    "select case when regexp_matches(sql, 'as\s+select\s+\*\s+from\s+delta_scan\s*\(', 'i') "
+    "then 'BASE TABLE' else 'VIEW' end from duckdb_views() where view_name = ?"
+)
+
+
+def test_catalog_view_detection_is_structural(tmp_path):
+    """Pins the regexp the catalog macro uses (a literal copy — keep in sync with catalog.sql):
+    duckrun's registered passthrough views report BASE TABLE, but a genuine view that merely
+    MENTIONS delta_scan in a string literal stays a VIEW. The delta_scan views are created over a
+    REAL delta table (DuckDB binds the scan at CREATE VIEW), so the assertion runs against the
+    exact SQL text duckdb_views() stores."""
+    import pyarrow as pa
+    from deltalake import write_deltalake
+
+    t = str(tmp_path / "t").replace("'", "''").replace("\\", "/")
+    write_deltalake(str(tmp_path / "t"), pa.table({"id": [1]}))
+    con = duckdb.connect()
+    con.execute("install delta; load delta")
+    con.execute(f"create view real_delta as select * from delta_scan('{t}')")
+    con.execute(f"create view versioned as select * from delta_scan('{t}', version => 0)")
+    con.execute("create view mentions as select 'delta_scan(x)' as s, 1 as n")
+    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["real_delta"]).fetchone()[0] == "BASE TABLE"
+    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["versioned"]).fetchone()[0] == "BASE TABLE"
+    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["mentions"]).fetchone()[0] == "VIEW"

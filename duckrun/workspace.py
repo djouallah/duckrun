@@ -64,6 +64,19 @@ def _times(v) -> List[str]:
     return [v] if isinstance(v, str) else list(v)
 
 
+_TIME_RE = re.compile(r"^([01]?\d|2[0-3]):[0-5]\d$")
+
+
+def _clock_times(v) -> List[str]:
+    """Normalize + validate schedule times: each must be a 24h ``HH:MM``. Fabric would otherwise
+    reject the schedule with an opaque API error long after the deploy call."""
+    out = _times(v)
+    for t in out:
+        if not _TIME_RE.match(str(t).strip()):
+            raise RemoteRunError(f"invalid schedule time {t!r}; use 24h 'HH:MM' (e.g. '06:30')")
+    return out
+
+
 def _schedule_config(every, daily, weekly, at, tz) -> dict:
     """A Fabric schedule ``configuration`` from one cadence knob. Fabric's scheduler is interval /
     daily / weekly (not free-form cron); pass exactly one of ``every`` / ``daily`` / ``weekly`` — none
@@ -78,8 +91,8 @@ def _schedule_config(every, daily, weekly, at, tz) -> dict:
         days = [_WEEKDAYS.get(str(d)[:3].lower()) for d in _times(weekly)]
         if None in days:
             raise RemoteRunError(f"invalid weekday in {weekly!r}; use Mon..Sun")
-        return {**base, "type": "Weekly", "weekdays": days, "times": _times(at or "00:00")}
-    return {**base, "type": "Daily", "times": _times(daily or "00:00")}
+        return {**base, "type": "Weekly", "weekdays": days, "times": _clock_times(at or "00:00")}
+    return {**base, "type": "Daily", "times": _clock_times(daily or "00:00")}
 
 # Source extensions deploy handles (a ``.json`` is a pipeline or a variable library, told apart by
 # its content — see ``_json_artifact``).
