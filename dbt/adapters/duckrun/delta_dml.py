@@ -1152,6 +1152,7 @@ class _DeltaDML:
         self.so = storage_options
         self.default_schema = default_schema
         self._with_clause = ""  # a leading `WITH …` preceding an INSERT, prepended to the body
+        self._opened = None     # (loc, DeltaTable) from this statement's _exists check — see _pinned
 
     def _loc(self, schema: str, identifier: str) -> str:
         return f"{self.root_path}/{schema}/{identifier}"
@@ -1169,7 +1170,25 @@ class _DeltaDML:
         return schema, identifier, self._loc(schema, identifier)
 
     def _exists(self, loc: str) -> bool:
-        return engine.table_exists(loc, self.so)
+        """Existence check that KEEPS the opened handle (see :meth:`_pinned`): every statement form
+        guards on ``_exists`` first, so its one log open also serves the statement's read-version
+        pin and (for delete/update) the operation itself. On OneLake each open is log-listing
+        round trips — a raw-SQL DELETE used to pay for four."""
+        dt = engine.open_if_exists(loc, self.so)
+        self._opened = (loc, dt) if dt is not None else None
+        return dt is not None
+
+    def _pinned(self, loc: str):
+        """The DeltaTable handle this statement's ``_exists(loc)`` opened, or a fresh open on a
+        cache miss. Reusing it pins the read version at the existence check — slightly EARLIER
+        than a per-op open, which only tightens the CAS fence (an interleaved commit fails loud)."""
+        if self._opened and self._opened[0] == loc:
+            return self._opened[1]
+        return engine._delta_table(loc, self.so)
+
+    def _vB(self, loc: str) -> int:
+        """The statement's pinned read version for ``loc`` (one log open per statement)."""
+        return self._pinned(loc).version()
 
     def _refresh_view(self, rel: str, schema: str, loc: str) -> None:
         loc_sql = loc.replace("'", "''")
@@ -1366,7 +1385,7 @@ class _DeltaDML:
         ``materialize_tag`` routes the read through a native temp table first — DELETE/UPDATE use it
         because their expressions (CTEs/subqueries) must be evaluated fully detached from the Delta
         table being replaced; the ALTER rewrites stream directly."""
-        vB = engine.table_version(loc, self.so)
+        vB = self._vB(loc)
         loc_sql = loc.replace("'", "''")
         scan = f"delta_scan('{loc_sql}', version => {vB})" + (f' as "{alias}"' if alias else "")
         sql = f"{with_prefix}select {projection} from {scan}{tail}"
@@ -1418,9 +1437,10 @@ class _DeltaDML:
         # pin and the maintenance.
         engine.delete_rows(
             loc, where,
-            read_version=engine.table_version(loc, self.so),
+            read_version=self._vB(loc),
             storage_options=self.so,
             cur=self.cursor,
+            dt=self._pinned(loc),
         )
 
     def _update(self, m, rel, schema, loc) -> None:
@@ -1493,9 +1513,10 @@ class _DeltaDML:
         # Same snapshot-fenced path (read_version → OCC) every duckrun mutation uses.
         engine.update_rows(
             loc, updates, where,
-            read_version=engine.table_version(loc, self.so),
+            read_version=self._vB(loc),
             storage_options=self.so,
             cur=self.cursor,
+            dt=self._pinned(loc),
         )
 
     def _insert_select(self, m, rel, schema, loc) -> None:
@@ -1633,8 +1654,7 @@ class _DeltaDML:
         # version read — the automatic append_if_unchanged — so a concurrent commit fails loud
         # instead of appending stale-derived rows. A plain append of new data (a VALUES list, or a
         # SELECT over other tables) references nothing of the target and stays unfenced.
-        read_version = (engine.table_version(loc, self.so)
-                        if self._reads_target(derived, loc) else None)
+        read_version = self._vB(loc) if self._reads_target(derived, loc) else None
         engine.write_delta(loc, data, "append", storage_options=self.so, cur=self.cursor,
                            read_version=read_version)
 
@@ -1728,7 +1748,7 @@ class _DeltaDML:
         (which silently drops unknown columns). Auto-fenced when the body reads the target."""
         body = m.group("body")
         data = self.cursor.sql(body)
-        read_version = engine.table_version(loc, self.so) if self._reads_target(body, loc) else None
+        read_version = self._vB(loc) if self._reads_target(body, loc) else None
         engine.write_delta(loc, data, "append", merge_schema=True, read_version=read_version,
                            storage_options=self.so, cur=self.cursor)
 
@@ -1811,9 +1831,9 @@ class _DeltaDML:
             source,
             cond,
             clauses,
-            # Pin the target to the version we read now (single statement) — same as the builder's
-            # .merge(), which captures the version at call time.
-            read_version=engine.table_version(loc, self.so),
+            # Pin the target to the version read at statement start (single statement) — same as
+            # the builder's .merge(), which captures the version at call time.
+            read_version=self._vB(loc),
             streamed_exec=by_source,
             storage_options=self.so,
             cur=self.cursor,
@@ -1838,7 +1858,7 @@ class _DeltaDML:
         # Fence the tombstone write to the version observed at drop time: a drop racing a live writer
         # should fail loud (the writer's commit lands first → CommitFailedError), not silently
         # tombstone over it.
-        vB = engine.table_version(loc, self.so)
+        vB = self._vB(loc)
         tombstone = self.cursor.sql(f"select true as {TOMBSTONE_COLUMN}")
         engine.overwrite_if_unchanged(loc, tombstone, read_version=vB, overwrite_schema=True,
                                       storage_options=self.so)
@@ -1900,12 +1920,12 @@ class _DeltaDML:
         # (SELECT 501, 2, 'x') that a plain INSERT accepts. Same projection contract as the append.
         data = self._project_onto_schema(loc, None, f"({body})")
         try:
-            pcols = list(engine._delta_table(loc, self.so).metadata().partition_columns or [])
+            pcols = list(self._pinned(loc).metadata().partition_columns or [])
         except Exception:
             pcols = []
         engine.replace_where(
             loc, data, predicate,
-            read_version=engine.table_version(loc, self.so),
+            read_version=self._vB(loc),
             partition_by=(pcols or None),
             storage_options=self.so, cur=self.cursor)
         self._refresh_view(rel, schema, loc)

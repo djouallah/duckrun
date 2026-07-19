@@ -33,9 +33,6 @@ _FABRIC_SCOPE = "https://api.fabric.microsoft.com/.default"
 # token covers it, so only the local azure-identity path needs this distinct scope.
 _POWERBI_SCOPE = "https://analysis.windows.net/powerbi/api/.default"
 
-# Azure CLI's well-known public client id, used for the interactive/CLI fallbacks.
-_AZURE_CLI_CLIENT_ID = "04b07795-8ddb-461a-bbee-02f9e1bf7b46"
-
 # GitHub-OIDC token exchange retries: the assertion fetch + AAD exchange is a short network hop that
 # intermittently times out inside a busy dbt process (see issue #10). A single 15s timeout must not
 # lose the whole token, so retry a couple of times with exponential backoff before giving up.

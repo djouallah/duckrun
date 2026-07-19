@@ -91,7 +91,6 @@ def test_zip_strips_token_and_cruft_keeps_project(project):
 def test_normalize_command_drops_dir_flags():
     got = fr._normalize_command(
         ["run", "--select", "foo", "--project-dir", "/x", "--profiles-dir", ".", "--target", "fabric"],
-        "PROJ",
     )
     assert got == ["run", "--select", "foo", "--target", "fabric"]
 

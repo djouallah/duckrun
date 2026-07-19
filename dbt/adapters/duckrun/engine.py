@@ -801,11 +801,19 @@ def table_exists(path: str, storage_options: Optional[Dict[str, str]] = None) ->
     incremental (already row-filtered) write fall into the overwrite branch, replacing the table
     with just the increment. A real error must fail the run loudly, not look like "no table".
     """
+    return open_if_exists(path, storage_options) is not None
+
+
+def open_if_exists(path: str, storage_options: Optional[Dict[str, str]] = None) -> Optional[DeltaTable]:
+    """The opened ``DeltaTable`` at ``path``, or None when the table genuinely isn't there — the
+    same fail-loud contract as :func:`table_exists` (ONLY ``TableNotFoundError`` → None; transient/
+    credential errors re-raise). Returning the handle lets a caller reuse ONE log open for the
+    existence check, the read-version pin, and the operation itself — on OneLake every open is
+    log-listing round trips, so a raw-SQL DELETE was paying for four."""
     try:
-        _delta_table(path, storage_options)
-        return True
+        return _delta_table(path, storage_options)
     except TableNotFoundError:
-        return False
+        return None
 
 
 def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None):
@@ -1394,9 +1402,12 @@ def delete_rows(
     read_version: Optional[int],
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
+    dt: Optional[DeltaTable] = None,
 ) -> None:
     """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
     when ``predicate`` is None. The Delta-native ``DELETE FROM`` for the connection API.
+    ``dt`` reuses an already-opened handle (e.g. the statement's existence check) instead of a
+    fresh log open.
 
     A delete is a read-modify-write, so it is pinned to ``read_version`` (the version the caller
     read) with ``load_as_version`` and committed under delta-rs native OCC — exactly like merge:
@@ -1409,7 +1420,7 @@ def delete_rows(
             "read-modify-write and must be pinned to its snapshot — pass the version you read "
             "(engine.table_version(path, storage_options) captures the current HEAD)."
         )
-    dt = _delta_table(path, storage_options)
+    dt = dt if dt is not None else _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     try:
         dt.delete(predicate)
@@ -1429,20 +1440,22 @@ def update_rows(
     read_version: Optional[int],
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
+    dt: Optional[DeltaTable] = None,
 ) -> None:
     """Update ``{column: expression}`` for rows matching ``predicate`` (delta_rs/datafusion SQL),
     or every row when ``predicate`` is None. The Delta-native ``UPDATE`` for the connection API.
 
     Like :func:`delete_rows`, an update is a read-modify-write: pinned to ``read_version`` with
     ``load_as_version`` and committed under delta-rs native OCC over ``(read_version, HEAD]``
-    (conflict → fail, like merge). ``read_version`` is REQUIRED. Then maintenance at a fresh HEAD."""
+    (conflict → fail, like merge). ``read_version`` is REQUIRED. Then maintenance at a fresh HEAD.
+    ``dt`` reuses an already-opened handle instead of a fresh log open."""
     if read_version is None:
         raise ValueError(
             "update_rows requires read_version (the version the caller read). An update is a "
             "read-modify-write and must be pinned to its snapshot — pass the version you read "
             "(engine.table_version(path, storage_options) captures the current HEAD)."
         )
-    dt = _delta_table(path, storage_options)
+    dt = dt if dt is not None else _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     # Validate SET targets against the real schema BEFORE dt.update(): delta_rs silently accepts an
     # unknown column, writing a no-op commit that advances the log while changing nothing. Fail loud

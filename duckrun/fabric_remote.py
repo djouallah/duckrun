@@ -141,7 +141,6 @@ def _scrub_profiles_yaml(project_dir: str, profiles_dir: Optional[str]) -> str:
     ``storage_options`` — the remote notebook re-acquires a token from its Fabric runtime. Non-token
     storage_options (account names, etc.) are preserved."""
     import yaml
-    proj = _load_yaml(os.path.join(project_dir, "dbt_project.yml"))
     pdir = profiles_dir or os.environ.get("DBT_PROFILES_DIR") or project_dir
     profiles = _load_yaml(os.path.join(pdir, "profiles.yml"))
     for prof in profiles.values():
@@ -229,7 +228,7 @@ def _scan_env_var_names(project_dir: str):
     return names
 
 
-def _normalize_command(args: List[str], proj_var: str) -> List[str]:
+def _normalize_command(args: List[str]) -> List[str]:
     """Drop any user ``--project-dir``/``--profiles-dir`` (they point at laptop paths) so the remote
     cell can force both to the unpacked project dir; keep everything else (verb, --select, --target,
     --target-path, ...) verbatim."""
@@ -282,7 +281,7 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
     ``install_target`` is the exact pip requirement (``duckrun==<v>`` or a ``git+…`` spec). ``env`` is
     the non-secret config to export before dbt runs (the project's own ``env_var`` names — never a
     token). ``cores`` sets the Python-notebook compute via a ``%%configure`` cell."""
-    commands = [_normalize_command(c, "PROJ") for c in commands]
+    commands = [_normalize_command(c) for c in commands]
     env = env or {}
 
     # First cell: set the single-node compute size (Fabric honors %%configure vCores on API-triggered
