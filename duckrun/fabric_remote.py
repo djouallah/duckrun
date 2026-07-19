@@ -58,8 +58,10 @@ _JOB_DONE = {"Completed", "Failed", "Cancelled", "Deduped"}
 
 # Retry status/attempt policy lives in dbt.adapters.duckrun.remote (retry_request) — shared with
 # the DFS side so the two REST layers can't drift.
-# Overall wall-clock cap on a single remote run, and the poll cadence (seconds).
-_POLL_TIMEOUT = 60 * 60
+# Overall wall-clock cap on a single remote run, and the poll cadence (seconds). Big remote jobs
+# are the point of this module — a multi-hour dbt batch at high scale factors is normal — so the
+# cap defaults to 6h and is env-overridable (the poll re-mints its token as needed either way).
+_POLL_TIMEOUT = int(os.environ.get("DUCKRUN_POLL_TIMEOUT", str(6 * 60 * 60)))
 _POLL_INTERVAL = 10
 
 
@@ -715,6 +717,10 @@ def _run_job_and_wait(token: str, ws_id: str, item_id: str, job_type: str = "Run
     status = "Unknown"
     for _ in range(int(deadline_polls) + 1):
         _sleep(_POLL_INTERVAL)
+        # A long remote job (a multi-hour dbt batch) outlives the ~1h control-plane token the
+        # poll started with — re-acquire near expiry or the poll itself dies with a 401 while
+        # the remote job keeps running.
+        token = _fresh_token(token, auth.get_fabric_token)
         r = _http_request("GET", instance_url, token=token)
         r.raise_for_status()
         body = r.json()
