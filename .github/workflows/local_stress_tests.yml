@@ -52,14 +52,9 @@ jobs:
       DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-duckrun
         with:
-          python-version: '3.11'
-
-      - name: Install duckrun + tpchgen-cli
-        run: |
-          pip install -e ".[test]"
-          pip install tpchgen-cli
+          extra-packages: tpchgen-cli
 
       - name: Show RAM / disk / deltalake version (must be 1.5.0)
         run: |
@@ -101,22 +96,13 @@ jobs:
         # own run summary but must NOT overwrite the release card in the docs.
         if: always() && hashFiles('docs/merge_card.md') != '' && github.event_name != 'workflow_dispatch'
         continue-on-error: true
-        run: |
-          git fetch origin main
-          git checkout -B main origin/main
-          python tests/tools/inject_readme.py docs/merge-benchmark.md docs/merge_card.md MERGE
-          if git diff --quiet -- docs/merge-benchmark.md; then
-            echo "docs MERGE card unchanged."
-            exit 0
-          fi
-          git config user.name "djouallah"
-          git config user.email "mimoune.djouallah@gmail.com"
-          git add docs/merge-benchmark.md
-          git commit -m "docs: update MERGE scorecard [skip ci]"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            sleep 3
-          done
+        uses: ./.github/actions/commit-docs
+        with:
+          checkout-main: 'true'   # the release runs on a tag ref; the gitignored card survives the checkout
+          prepare: |
+            python tests/tools/inject_readme.py docs/merge-benchmark.md docs/merge_card.md MERGE
+          paths: docs/merge-benchmark.md
+          message: "docs: update MERGE scorecard [skip ci]"
 
       - name: Append this run's result to the benchmark history
         # Unlike the canonical card above (release-only), EVERY run — release gate AND manual
@@ -125,19 +111,13 @@ jobs:
         # history against a fresh origin/main. Never fail the run on a git hiccup; [skip ci].
         if: always() && hashFiles('docs/merge_history_row.md') != ''
         continue-on-error: true
-        run: |
-          row="$(cat docs/merge_history_row.md)"
-          git fetch origin main
-          git checkout -B main origin/main
-          printf '%s\n' "$row" >> docs/merge-benchmark-history.md
-          git config user.name "djouallah"
-          git config user.email "mimoune.djouallah@gmail.com"
-          git add docs/merge-benchmark-history.md
-          git commit -m "docs: record MERGE benchmark result [skip ci]"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            sleep 3
-          done
+        uses: ./.github/actions/commit-docs
+        with:
+          checkout-main: 'true'   # the gitignored history-row file survives the checkout
+          prepare: |
+            cat docs/merge_history_row.md >> docs/merge-benchmark-history.md
+          paths: docs/merge-benchmark-history.md
+          message: "docs: record MERGE benchmark result [skip ci]"
 
   tpch-stress:
     # The full TPC-H benchmark (ingest the 8 tables Parquet → Delta, run the 22 queries, render the
@@ -155,14 +135,9 @@ jobs:
       DIR: /mnt/tpch
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-duckrun
         with:
-          python-version: '3.11'
-
-      - name: Install duckrun + tpchgen-cli
-        run: |
-          pip install -e ".[test]"
-          pip install tpchgen-cli
+          extra-packages: tpchgen-cli
 
       - name: Prepare big disk dir + show specs
         run: |
@@ -193,22 +168,13 @@ jobs:
         # bench died first.
         if: always() && hashFiles('docs/tpch_card.md') != '' && github.event_name == 'workflow_dispatch' && env.TPCH_SF == '100'
         continue-on-error: true
-        run: |
-          git fetch origin main
-          git checkout -B main origin/main
-          python tests/tools/inject_readme.py docs/tpch.md docs/tpch_card.md TPCH
-          if git diff --quiet -- docs/tpch.md; then
-            echo "docs TPCH card unchanged."
-            exit 0
-          fi
-          git config user.name "djouallah"
-          git config user.email "mimoune.djouallah@gmail.com"
-          git add docs/tpch.md
-          git commit -m "docs: update TPCH scorecard [skip ci]"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            sleep 3
-          done
+        uses: ./.github/actions/commit-docs
+        with:
+          checkout-main: 'true'
+          prepare: |
+            python tests/tools/inject_readme.py docs/tpch.md docs/tpch_card.md TPCH
+          paths: docs/tpch.md
+          message: "docs: update TPCH scorecard [skip ci]"
 
       - name: Append this run's result to the benchmark history
         # Every run — the SF=10 release gate AND a manual SF=100 dispatch — leaves one permanent row
@@ -217,16 +183,10 @@ jobs:
         # (gitignored); append it to the tracked history. Never fail on a git hiccup; [skip ci].
         if: always() && hashFiles('docs/tpch_history_row.md') != ''
         continue-on-error: true
-        run: |
-          row="$(cat docs/tpch_history_row.md)"
-          git fetch origin main
-          git checkout -B main origin/main
-          printf '%s\n' "$row" >> docs/tpch-benchmark-history.md
-          git config user.name "djouallah"
-          git config user.email "mimoune.djouallah@gmail.com"
-          git add docs/tpch-benchmark-history.md
-          git commit -m "docs: record TPCH benchmark result [skip ci]"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            sleep 3
-          done
+        uses: ./.github/actions/commit-docs
+        with:
+          checkout-main: 'true'
+          prepare: |
+            cat docs/tpch_history_row.md >> docs/tpch-benchmark-history.md
+          paths: docs/tpch-benchmark-history.md
+          message: "docs: record TPCH benchmark result [skip ci]"

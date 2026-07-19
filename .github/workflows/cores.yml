@@ -59,6 +59,7 @@ on:
       - '!tests/deploy_testing/**'                          # deploy_to_fabric.yml (manual)
       - 'pyproject.toml'      # dependency / version changes
       - '.github/workflows/cores.yml'
+      - '.github/actions/**'  # shared composite actions the jobs below use
   pull_request:
     paths:
       - 'dbt/**'
@@ -75,6 +76,7 @@ on:
       - '!tests/deploy_testing/**'
       - 'pyproject.toml'
       - '.github/workflows/cores.yml'
+      - '.github/actions/**'
   # Callable as a release gate from publish.yml (runs unfiltered there).
   workflow_call:
 
@@ -88,9 +90,9 @@ jobs:
   adapter:
     # duckrun's core public surfaces (dbt adapter internals + the duckrun.connect() API),
     # tested on a local-filesystem Delta warehouse. Run on every supported Python the package
-    # advertises a regression for (pyproject says 3.9–3.12) — 3.12 is the one we actively care
-    # about beyond the 3.11 baseline. (Conformance stays single-version: its gate is a
-    # 3.11-derived baseline that a second Python would spuriously trip.)
+    # advertises (pyproject requires-python >= 3.11, i.e. 3.11 + 3.12). (Conformance stays
+    # single-version: its gate is a 3.11-derived baseline that a second Python would
+    # spuriously trip.)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -104,12 +106,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-duckrun
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Install duckrun + test deps (dbt-duckdb + duckdb + deltalake + pytest + pyarrow)
-        run: pip install -e ".[test]"
 
       - name: Adapter unit tests + connection-API offline tests
         # Run the WHOLE tests/connection_api directory — the per-method matrix + local-fs contract +
@@ -199,34 +198,13 @@ jobs:
       # The conformance result is a property of the code, not the docs. If a change touches nothing
       # but Markdown, skip the (multi-minute) install + suite and report green — the required check
       # is still satisfied and a docs change can't regress conformance. Any non-.md change runs it.
-      - name: Detect whether code changed (vs docs-only)
-        id: changes
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
-          else
-            base="${{ github.event.before }}"
-            head="${{ github.sha }}"
-          fi
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "Docs-only change — skipping the conformance suite."
-          fi
+      - id: changes
+        uses: ./.github/actions/docs-only-check
 
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-duckrun
         if: steps.changes.outputs.code == 'true'
         with:
-          python-version: '3.11'
-
-      - name: Install duckrun + conformance deps (dbt-tests-adapter)
-        if: steps.changes.outputs.code == 'true'
-        run: pip install -e ".[conformance]"
+          extras: conformance
 
       - name: Run official dbt adapter conformance suite
         if: steps.changes.outputs.code == 'true'
@@ -262,21 +240,13 @@ jobs:
       - name: Refresh baseline + render card into docs and commit (main only)
         if: steps.changes.outputs.code == 'true' && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
-        run: |
-          python tests/tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml
-          python tests/tools/inject_readme.py docs/conformance.md docs/conformance_card.md CONFORMANCE
-          if git diff --quiet -- docs/conformance.md tests/conformance/passing_baseline.txt; then
-            echo "Conformance card + baseline unchanged."
-            exit 0
-          fi
-          git config user.name "djouallah"
-          git config user.email "mimoune.djouallah@gmail.com"
-          git add docs/conformance.md tests/conformance/passing_baseline.txt
-          git commit -m "docs: refresh conformance card + baseline [skip ci]"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            sleep 3
-          done
+        uses: ./.github/actions/commit-docs
+        with:
+          prepare: |
+            python tests/tools/conformance_baseline.py update tests/conformance/passing_baseline.txt conformance.xml
+            python tests/tools/inject_readme.py docs/conformance.md docs/conformance_card.md CONFORMANCE
+          paths: docs/conformance.md tests/conformance/passing_baseline.txt
+          message: "docs: refresh conformance card + baseline [skip ci]"
 
   connection-card:
     # The duckrun.connect() per-method scorecard. Unlike conformance (which tolerates known failures
@@ -293,12 +263,7 @@ jobs:
         with:
           fetch-depth: 0   # need history to commit the card back to main
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + test deps
-        run: pip install -e ".[test]"
+      - uses: ./.github/actions/setup-duckrun
 
       - name: Run the connection-API method matrix
         # The matrix is the per-method Test* classes in the merged suite; -k selects ONLY those so
@@ -329,21 +294,13 @@ jobs:
       - name: Inject card into docs and commit (main only)
         if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
-        run: |
-          python tests/tools/inject_readme.py docs/api-reference.md docs/connection_card.md CONNECTION_API
-          python tests/tools/inject_readme.py docs/api-reference.md docs/workspace_card.md WORKSPACE_API
-          if git diff --quiet -- docs/api-reference.md; then
-            echo "API-reference cards unchanged."
-            exit 0
-          fi
-          git config user.name "djouallah"
-          git config user.email "mimoune.djouallah@gmail.com"
-          git add docs/api-reference.md
-          git commit -m "docs: refresh connection + workspace API scorecards [skip ci]"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            sleep 3
-          done
+        uses: ./.github/actions/commit-docs
+        with:
+          prepare: |
+            python tests/tools/inject_readme.py docs/api-reference.md docs/connection_card.md CONNECTION_API
+            python tests/tools/inject_readme.py docs/api-reference.md docs/workspace_card.md WORKSPACE_API
+          paths: docs/api-reference.md
+          message: "docs: refresh connection + workspace API scorecards [skip ci]"
 
       - name: Gate — every connection-API method must pass
         run: python tests/tools/connection_summary.py connection.xml --check
@@ -367,36 +324,11 @@ jobs:
       # Concurrency correctness is a property of the code, not the docs. If a change touches
       # nothing but Markdown, skip the (multi-minute) install + repro and just report green —
       # the required check is still satisfied. Any non-.md change runs the full proof.
-      - name: Detect whether code changed (vs docs-only)
-        id: changes
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
-          else
-            base="${{ github.event.before }}"
-            head="${{ github.sha }}"
-          fi
-          # First push to a new branch (or unknown base) -> run the full proof to be safe.
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "Docs-only change — skipping the concurrency-correctness proof."
-          fi
+      - id: changes
+        uses: ./.github/actions/docs-only-check
 
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-duckrun
         if: steps.changes.outputs.code == 'true'
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + test deps (duckdb + deltalake + pyarrow)
-        if: steps.changes.outputs.code == 'true'
-        run: pip install -e ".[test]"
 
       - name: Prove concurrency correctness (merge snapshot safety + append_if_unchanged)
         if: steps.changes.outputs.code == 'true'
@@ -423,34 +355,11 @@ jobs:
 
       # The chaos harness proves a property of the code, not the docs. A Markdown-only change can't
       # regress it, so skip the (multi-minute) install + run and report green. Any non-.md change runs it.
-      - name: Detect whether code changed (vs docs-only)
-        id: changes
-        run: |
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            base="${{ github.event.pull_request.base.sha }}"
-            head="${{ github.event.pull_request.head.sha }}"
-          else
-            base="${{ github.event.before }}"
-            head="${{ github.sha }}"
-          fi
-          if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
-            echo "code=true" >> "$GITHUB_OUTPUT"; exit 0
-          fi
-          if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
-            echo "code=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "code=false" >> "$GITHUB_OUTPUT"
-            echo "Docs-only change — skipping the chaos breaker."
-          fi
+      - id: changes
+        uses: ./.github/actions/docs-only-check
 
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-duckrun
         if: steps.changes.outputs.code == 'true'
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + test deps (duckdb + deltalake + pyarrow)
-        if: steps.changes.outputs.code == 'true'
-        run: pip install -e ".[test]"
 
       - name: Phase A — contention (no kills)
         # Pure OCC contention: workers race on one table, no SIGKILL. Exit non-zero = an invariant
@@ -499,12 +408,7 @@ jobs:
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Install duckrun + test deps
-        run: pip install -e ".[test]"
+      - uses: ./.github/actions/setup-duckrun
 
       - name: Render the snapshot-pin scorecard (also writes the run summary)
         # Exit 0 = the demonstration holds (unpinned loses the update, pinned preserves it).
@@ -516,20 +420,12 @@ jobs:
         # their own run summary. Never fail the run on a commit hiccup. [skip ci] avoids re-trigger.
         if: github.ref == 'refs/heads/main' && github.event_name == 'push' && hashFiles('docs/snapshot_pin_card.md') != ''
         continue-on-error: true
-        run: |
-          python tests/tools/inject_readme.py docs/snapshot-pin.md docs/snapshot_pin_card.md SNAPSHOT-PIN
-          if git diff --quiet -- docs/snapshot-pin.md; then
-            echo "docs snapshot-pin card unchanged."
-            exit 0
-          fi
-          git config user.name "djouallah"
-          git config user.email "mimoune.djouallah@gmail.com"
-          git add docs/snapshot-pin.md
-          git commit -m "docs: update snapshot-pin scorecard [skip ci]"
-          for i in 1 2 3; do
-            git pull --rebase origin main && git push origin main && break
-            sleep 3
-          done
+        uses: ./.github/actions/commit-docs
+        with:
+          prepare: |
+            python tests/tools/inject_readme.py docs/snapshot-pin.md docs/snapshot_pin_card.md SNAPSHOT-PIN
+          paths: docs/snapshot-pin.md
+          message: "docs: update snapshot-pin scorecard [skip ci]"
 
   tpch-smoke:
     # A fast SF=1 smoke of the connection-API TPCH benchmark (duckrun.connect): generate →
@@ -543,15 +439,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-duckrun
         with:
-          python-version: '3.11'
-
-      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
-        run: pip install -e ".[test]"
-
-      - name: Install tpchgen-cli (the scenario shells out to it to generate the data)
-        run: pip install tpchgen-cli
+          extra-packages: tpchgen-cli   # the scenario shells out to it to generate the data
 
       - name: Run the TPCH benchmark (SF=1) as the guard
         # Runs the full benchmark; exit non-zero = the read/write surface or the 22-query run
@@ -572,15 +462,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/setup-duckrun
         with:
-          python-version: '3.11'
-
-      - name: Install duckrun + pytest (dbt-duckdb + duckdb + deltalake come with it)
-        run: pip install -e ".[test]"
-
-      - name: Install tpchgen-cli (the bench shells out to it to generate lineitem)
-        run: pip install tpchgen-cli
+          extra-packages: tpchgen-cli   # the bench shells out to it to generate lineitem
 
       - name: Run the incremental-MERGE chain (SF=1) as the guard
         # Local warehouse under the runner's temp dir; the bench writes docs/merge_card.md (gitignored)

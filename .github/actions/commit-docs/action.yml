@@ -1,0 +1,45 @@
+name: commit-docs
+description: >
+  Commit rendered docs/cards back to main with the standard retry loop (rebase + push, x3).
+  Optionally checks out main first (for runs on a tag ref) and runs a `prepare` script that
+  mutates the files (inject_readme / history append) — gitignored card files survive the
+  checkout, so prepare can read them after it. No-op when the paths show no diff. Callers keep
+  `continue-on-error: true` so a commit hiccup never fails the run.
+inputs:
+  paths:
+    description: Space-separated paths to git add (also the diff no-op check)
+    required: true
+  message:
+    description: Commit message (use [skip ci] to avoid re-triggering)
+    required: true
+  prepare:
+    description: Optional bash to run (after the optional main checkout) that mutates the files
+    required: false
+    default: ''
+  checkout-main:
+    description: "'true' to git fetch + checkout -B main origin/main first (tag-ref runs)"
+    required: false
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - name: Commit to main (retrying past concurrent card commits)
+      shell: bash
+      run: |
+        if [ "${{ inputs.checkout-main }}" = "true" ]; then
+          git fetch origin main
+          git checkout -B main origin/main
+        fi
+        ${{ inputs.prepare }}
+        if git diff --quiet -- ${{ inputs.paths }}; then
+          echo "Nothing changed under: ${{ inputs.paths }}"
+          exit 0
+        fi
+        git config user.name "djouallah"
+        git config user.email "mimoune.djouallah@gmail.com"
+        git add ${{ inputs.paths }}
+        git commit -m "${{ inputs.message }}"
+        for i in 1 2 3; do
+          git pull --rebase origin main && git push origin main && break
+          sleep 3
+        done

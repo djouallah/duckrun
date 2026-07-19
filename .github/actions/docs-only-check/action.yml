@@ -1,0 +1,34 @@
+name: docs-only-check
+description: >
+  Output code=true unless the change touches only Markdown. The expensive proof/suite steps
+  self-skip on docs-only changes while the (required) check still reports green. Requires a
+  checkout with fetch-depth 0 (needs the base commit to diff against).
+outputs:
+  code:
+    description: "'true' when any non-.md file changed (or the base is unknown), else 'false'"
+    value: ${{ steps.changes.outputs.code }}
+runs:
+  using: composite
+  steps:
+    - name: Detect whether code changed (vs docs-only)
+      id: changes
+      shell: bash
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+        else
+          base="${{ github.event.before }}"
+          head="${{ github.sha }}"
+        fi
+        # First push to a new branch (or unknown base) -> treat as code so the full run happens.
+        if [ -z "$base" ] || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+          echo "code=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        if git diff --name-only "$base" "$head" | grep -qvE '\.md$'; then
+          echo "code=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "code=false" >> "$GITHUB_OUTPUT"
+          echo "Docs-only change — skipping the expensive steps."
+        fi
