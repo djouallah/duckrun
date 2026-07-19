@@ -18,9 +18,23 @@ All notable changes to this project will be documented in this file.
   `overwrite=True`.
 
 ### Fixed
+- **A dropped table is rebuilt, not merged into.** `conn.sql("drop table x")` tombstones the
+  table (a one-column marker; nothing deleted), but a dbt incremental model with that name still
+  found "a table" at write time and merged into the marker, dying on its schema. The store path
+  now detects the tombstone and takes the full-rebuild branch — drop in the notebook, rebuild
+  with dbt, like CREATE after DROP.
 - **A failed `CREATE SECRET` can no longer leak the OneLake bearer token into error messages or
   logs** — the statement text DuckDB echoes into the exception is redacted, and the original
   (token-bearing) exception is dropped from the chain.
+- **The token cache is tenant-scoped** — a process that switches `AZURE_TENANT_ID` no longer
+  reuses the previous tenant's cached token; single-tenant behavior is unchanged.
+- **`dbt docs` no longer misreports a genuine view that mentions `delta_scan` in a string
+  literal as a table** — the catalog matches the exact passthrough-view shape duckrun registers,
+  not a substring.
+- **`RemoteRunner(cores=)` and `ws.schedule(...)` validate their inputs up front** (Fabric
+  notebook sizes 4/8/16/32/64; 24h `HH:MM` times) instead of failing later with an opaque
+  Fabric API error. Decimal narrowing at `SORTED BY AUTO` now also recognizes the `NUMERIC`
+  alias and scale-less `DECIMAL(p)`.
 - **Fabric control-plane list calls now follow pagination** (`continuationToken`/`continuationUri`).
   A workspace or tenant with more items than one page previously resolved names against page one
   only, so `lakehouse_id` / workspace resolution could report "not found" for items that exist.
@@ -46,6 +60,10 @@ All notable changes to this project will be documented in this file.
   rewrite-overwrite skeleton behind DELETE/UPDATE fallbacks and the ALTER rewrites, one HTTP
   retry loop shared by the DFS and Fabric REST layers, and shared dbt macros for catalog
   reporting, Delta location resolution, and persist-docs.
+- **Fewer Delta-log opens per operation** (each is network round trips on OneLake): a raw-SQL
+  DML statement reuses one opened handle for existence + version pin + the operation (a DELETE
+  drops from 4 opens to 2), and dbt's run-start discovery serves the tombstone check and the
+  persisted-docs read from one open per relation (docs stats likewise).
 
 ## [0.4.23]
 
