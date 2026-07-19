@@ -4,6 +4,36 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **A failed `CREATE SECRET` can no longer leak the OneLake bearer token into error messages or
+  logs** — the statement text DuckDB echoes into the exception is redacted, and the original
+  (token-bearing) exception is dropped from the chain.
+- **Fabric control-plane list calls now follow pagination** (`continuationToken`/`continuationUri`).
+  A workspace or tenant with more items than one page previously resolved names against page one
+  only, so `lakehouse_id` / workspace resolution could report "not found" for items that exist.
+- **Long remote runs no longer 401 at the finish line**: the result read, notebook teardown, and
+  semantic-model refresh loop re-acquire a near-expiry token after waits that can consume the
+  token's ~1h life.
+- **A failed secondary `attach()` rolls back cleanly** (DuckDB `DETACH` + registry removal) instead
+  of leaving a phantom half-registered catalog that broke `refresh()` and blocked re-attaching.
+- **DataFrame `update()` now rejects unknown SET columns loudly with no commit**, matching the
+  raw-SQL `UPDATE` guard (delta-rs silently writes a no-op commit for a typo'd column).
+- **Predicate rewriting is now comment-aware**: identifiers inside `--` and `/* … */` comments in
+  merge/incremental predicates are no longer qualified or stripped.
+- The `INSERT … VALUES` self-typing probe no longer leaks a DuckDB connection per statement.
+- The workspace/remote GUID check is now strict (8-4-4-4-12); a dashed non-GUID string like
+  `1-2-3-4-5` is treated as a name and resolved, instead of being classified differently by the
+  two surfaces.
+
+### Changed
+- **Packaging honesty**: `requires-python >= 3.11` (matching the versions CI actually tests),
+  `dbt-duckdb` capped `< 2.0` (the adapter subclasses its internals), `obstore` floored at `>= 0.5`.
+- Internal dedup, no behavior change: one fenced compare-and-swap write primitive, one MERGE `ON`
+  predicate builder shared by both merge surfaces, one identifier-quoting helper, one
+  rewrite-overwrite skeleton behind DELETE/UPDATE fallbacks and the ALTER rewrites, one HTTP
+  retry loop shared by the DFS and Fabric REST layers, and shared dbt macros for catalog
+  reporting, Delta location resolution, and persist-docs.
+
 ## [0.4.23]
 
 ### Fixed

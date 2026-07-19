@@ -11,11 +11,10 @@ license = {text = "MIT"}
 authors = [
     {name = "mim"}
 ]
-requires-python = ">=3.9"
+# 3.11/3.12 are the versions CI actually tests (cores.yml adapter matrix); the claim matches.
+requires-python = ">=3.11"
 classifiers = [
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "License :: OSI Approved :: MIT License",
@@ -24,7 +23,10 @@ classifiers = [
     "Topic :: Database",
 ]
 dependencies = [
-    "dbt-duckdb>=1.8",
+    # Capped below 2.0 like dbt-core: the adapter subclasses DuckDBAdapter/DuckDBConnectionManager
+    # and reaches into dbt-duckdb internals (environments._ENV/_LOCK — see impl.py), so an uncapped
+    # 2.0 could satisfy `>=1.8` while breaking those privates even though dbt-core itself is capped.
+    "dbt-duckdb>=1.8,<2.0",
     # Cap dbt-core below 2.0: it's a breaking change (restructured packaging — `dbt.cli` moves,
     # the dbtRunner import path changes) that the adapter has not been ported to. Without this
     # direct pin, `pip install --pre` (or any pre-release resolution) pulls dbt-core 2.0 alphas
@@ -59,7 +61,9 @@ dependencies = [
     # Uploads stream from a file handle (multipart PUT), which the old DuckDB read_blob/COPY BLOB path
     # couldn't — it buffered each file whole in memory and OOM'd on multi-GB files. A single prebuilt
     # Rust wheel (~7 MB); a distinct compile from deltalake's object_store, so no shared-ABI pin risk.
-    "obstore",
+    # Floor at the API generation the transfer code is written against: obstore is pre-1.0, where
+    # minor releases can reshape the API — an old cached 0.x must not resolve.
+    "obstore>=0.5",
 ]
 
 [project.optional-dependencies]

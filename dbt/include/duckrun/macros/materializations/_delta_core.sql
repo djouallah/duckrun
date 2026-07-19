@@ -9,10 +9,56 @@
   (list_relations_without_caching rebuilds these views from disk).
 
   Python models: dbt's `submit_python_job` may only be called directly from a
-  materialization macro (depth-2 guard), so python staging is done in the materialization
-  wrappers (table/incremental/delta.sql) via `duckrun__stage_python()`, and this macro
-  skips its own staging for python.
+  materialization macro (depth-2 guard), so python staging is INLINED in each materialization
+  wrapper (table/incremental/delta.sql) — a shared helper would add a macro-stack level and
+  trip the guard — and this macro skips its own staging for python.
 #}
+
+{#-- Resolve the Delta write location for `relation`: config(location=...) wins, else the write
+     root by the relation's database (the default catalog uses target.root_path, a `+database:
+     <alias>` naming a declared catalog uses that catalog's root) + /<schema>/<identifier>.
+     Shared by duckrun__delta_paths and the seed materialization so the resolution can't drift. --#}
+{% macro duckrun__delta_location(relation) %}
+  {%- set location = config.get('location') -%}
+  {%- if not location -%}
+    {%- set _db = relation.database -%}
+    {%- set _catalogs = target.catalog_locations or {} -%}
+    {%- if _db and _db != target.database and _db in _catalogs -%}
+      {%- set root_path = _catalogs[_db] -%}
+    {%- else -%}
+      {%- set root_path = target.root_path -%}
+    {%- endif -%}
+    {%- if not root_path -%}
+      {{ exceptions.raise_compiler_error(
+          "duckrun: '" ~ model.name ~ "' needs config(location=...), a 'root_path' in the profile, or a matching entry in the profile's 'catalogs:' for database '" ~ _db ~ "'.") }}
+    {%- endif -%}
+    {%- set location = root_path ~ '/' ~ relation.schema ~ '/' ~ relation.identifier -%}
+  {%- endif -%}
+  {{ return(location) }}
+{% endmacro %}
+
+
+{#-- persist_docs: COMMENT ON the in-run DuckDB view (dbt-duckdb macros), then ALSO write the
+     descriptions into the Delta table's own metadata so they survive a later `dbt docs generate`
+     (a fresh process rebuilds the views from disk via list_relations_without_caching, which
+     re-applies these as COMMENT ON — see impl._apply_delta_comments). Shared by the Delta core
+     and the seed materialization. --#}
+{% macro _duckrun__persist_docs(target_relation, location) %}
+  {% do persist_docs(target_relation, model) %}
+  {%- set _relation_docs = model.description if (config.persist_relation_docs() and model.description) else none -%}
+  {%- set _column_docs = {} -%}
+  {%- if config.persist_column_docs() and model.columns -%}
+    {%- for _cn, _col in model.columns.items() -%}
+      {%- if _col.description -%}
+        {%- do _column_docs.update({_col.name: _col.description}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if _relation_docs or _column_docs -%}
+    {% do adapter.persist_delta_docs(location, _relation_docs, _column_docs) %}
+  {%- endif -%}
+{% endmacro %}
+
 
 {#-- Compute the relations/location used by both the materialization wrappers (python
      staging) and duckrun__build_delta. Deterministic; returns values only (no SQL). --#}
@@ -24,23 +70,7 @@
         schema=target_relation.schema,
         identifier=target_relation.identifier ~ '__duckrun_tmp',
         type=('table' if is_py else 'view')) -%}
-  {%- set location = config.get('location') -%}
-  {%- if not location -%}
-    {#-- Resolve the write root by the model's database: the default catalog uses target.root_path,
-         a `+database: <alias>` that names a declared catalog uses that catalog's root. --#}
-    {%- set _db = target_relation.database -%}
-    {%- set _catalogs = target.catalog_locations or {} -%}
-    {%- if _db and _db != target.database and _db in _catalogs -%}
-      {%- set root_path = _catalogs[_db] -%}
-    {%- else -%}
-      {%- set root_path = target.root_path -%}
-    {%- endif -%}
-    {%- if not root_path -%}
-      {{ exceptions.raise_compiler_error(
-          "duckrun: model '" ~ model.name ~ "' needs config(location=...), a 'root_path' in the profile, or a matching entry in the profile's 'catalogs:' for database '" ~ _db ~ "'.") }}
-    {%- endif -%}
-    {%- set location = root_path ~ '/' ~ target_relation.schema ~ '/' ~ target_relation.identifier -%}
-  {%- endif -%}
+  {%- set location = duckrun__delta_location(target_relation) -%}
   {{ return({'target': target_relation, 'tmp': tmp_relation, 'location': location}) }}
 {% endmacro %}
 
@@ -197,23 +227,7 @@
   {{ adapter.commit() }}
   {{ run_hooks(post_hooks, inside_transaction=False) }}
 
-  {#-- persist_docs: COMMENT ON the in-run DuckDB view (dbt-duckdb macros), then ALSO write the
-       descriptions into the Delta table's own metadata so they survive a later `dbt docs generate`
-       (a fresh process rebuilds the views from disk via list_relations_without_caching, which
-       re-applies these as COMMENT ON — see impl._apply_delta_comments). --#}
-  {% do persist_docs(target_relation, model) %}
-  {%- set _relation_docs = model.description if (config.persist_relation_docs() and model.description) else none -%}
-  {%- set _column_docs = {} -%}
-  {%- if config.persist_column_docs() and model.columns -%}
-    {%- for _cn, _col in model.columns.items() -%}
-      {%- if _col.description -%}
-        {%- do _column_docs.update({_col.name: _col.description}) -%}
-      {%- endif -%}
-    {%- endfor -%}
-  {%- endif -%}
-  {%- if _relation_docs or _column_docs -%}
-    {% do adapter.persist_delta_docs(location, _relation_docs, _column_docs) %}
-  {%- endif -%}
+  {% do _duckrun__persist_docs(target_relation, location) %}
 
   {{ return({'relations': [target_relation]}) }}
 

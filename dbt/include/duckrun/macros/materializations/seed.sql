@@ -29,25 +29,10 @@
         identifier=target_relation.identifier ~ '__duckrun_tmp',
         type='table') -%}
 
-  {#-- Delta location: config(location=...) wins, else root_path/<schema>/<seed> (same as a model).
-        Resolve the write root by the seed's database exactly like duckrun__delta_paths: a
-        `+database: <alias>` naming a declared catalog uses that catalog's root, else target.root_path.
-        Without this a seed with +database silently landed in the default catalog. --#}
-  {%- set location = config.get('location') -%}
-  {%- if not location -%}
-    {%- set _db = target_relation.database -%}
-    {%- set _catalogs = target.catalog_locations or {} -%}
-    {%- if _db and _db != target.database and _db in _catalogs -%}
-      {%- set root_path = _catalogs[_db] -%}
-    {%- else -%}
-      {%- set root_path = target.root_path -%}
-    {%- endif -%}
-    {%- if not root_path -%}
-      {{ exceptions.raise_compiler_error(
-          "duckrun: seed '" ~ model.name ~ "' needs config(location=...) or a 'root_path' in the profile.") }}
-    {%- endif -%}
-    {%- set location = root_path ~ '/' ~ target_relation.schema ~ '/' ~ target_relation.identifier -%}
-  {%- endif -%}
+  {#-- Delta location: config(location=...) wins, else root_path/<schema>/<seed> — resolved by the
+        SAME shared macro every model uses (duckrun__delta_location), so a seed with `+database:`
+        naming a declared catalog lands in that catalog's root, not silently in the default. --#}
+  {%- set location = duckrun__delta_location(target_relation) -%}
 
   {{ run_hooks(pre_hooks, inside_transaction=False) }}
   {%- do adapter.create_schema(target_relation) -%}
@@ -104,22 +89,8 @@
   {{ adapter.commit() }}
   {{ run_hooks(post_hooks, inside_transaction=False) }}
 
-  {#-- persist_docs: COMMENT ON the in-run view (dbt-duckdb macros) + write descriptions into the
-        Delta metadata so a later docs-generate (a fresh process that rebuilds the view from disk)
-        still reports them — see impl._apply_delta_comments. Mirrors _delta_core. --#}
-  {% do persist_docs(target_relation, model) %}
-  {%- set _relation_docs = model.description if (config.persist_relation_docs() and model.description) else none -%}
-  {%- set _column_docs = {} -%}
-  {%- if config.persist_column_docs() and model.columns -%}
-    {%- for _cn, _col in model.columns.items() -%}
-      {%- if _col.description -%}
-        {%- do _column_docs.update({_col.name: _col.description}) -%}
-      {%- endif -%}
-    {%- endfor -%}
-  {%- endif -%}
-  {%- if _relation_docs or _column_docs -%}
-    {% do adapter.persist_delta_docs(location, _relation_docs, _column_docs) %}
-  {%- endif -%}
+  {#-- Same shared persist_docs flow as _delta_core (COMMENT ON + Delta metadata). --#}
+  {% do _duckrun__persist_docs(target_relation, location) %}
 
   {{ return({'relations': [target_relation]}) }}
 
