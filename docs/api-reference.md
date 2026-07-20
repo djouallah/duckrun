@@ -28,15 +28,16 @@
 
 ## duckrun workspace API — Fabric artifact deploy
 
-🗂️ **12 public methods** · deploy · run · schedule
+🗂️ **14 public methods** · deploy · run · schedule
 
 > Introspected from the shipped classes — the exact public surface of `duckrun.workspace()` and the `Workspace` handle it returns, signatures and all, not a hand-maintained list. It drives Microsoft Fabric (create lakehouses, deploy notebooks / semantic models / pipelines / variable libraries, run and schedule them) — see the [Workspace (Fabric)](workspace.md) page. Exercised by the manual deploy demo ([`tests/deploy_testing`](../tests/deploy_testing)).
 
 | Surface | Method | Parameters |
 | --- | --- | --- |
 | `duckrun` | `workspace` | `workspace, token=None` |
-| `Workspace` | `create_lakehouse` | `name, schemas=True` |
-| `Workspace` | `deploy` | `source, lakehouse=None, variables=None, name=None, overwrite=False, notebook=None, folder=None` |
+| `Workspace` | `create_lakehouse` | `name, schemas=True, folder=None` |
+| `Workspace` | `create_warehouse` | `name, folder=None` |
+| `Workspace` | `deploy` | `source, lakehouse=None, variables=None, name=None, overwrite=False, notebook=None, warehouse=None, folder=None` |
 | `Workspace` | `display_name` | *property* |
 | `Workspace` | `download` | `folder='.', name=None, overwrite=False` |
 | `Workspace` | `id` | *accessor* |
@@ -46,6 +47,7 @@
 | `Workspace` | `run` | `name` |
 | `Workspace` | `run_python` | `script, *, lakehouse=None, args=None, env=None, cores=None, pip=None, setup=None, entry=None, name=None, attempts=3, keep_notebook=False` |
 | `Workspace` | `schedule` | `name, every=None, daily=None, weekly=None, at=None, tz='UTC'` |
+| `Workspace` | `sql_endpoint` | `warehouse=None` |
 
 <!-- WORKSPACE_API:END -->
 
