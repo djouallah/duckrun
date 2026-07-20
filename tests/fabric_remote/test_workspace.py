@@ -104,6 +104,68 @@ def test_lro_202_resolves_item_id(_patch):
     assert _ws().create_lakehouse("bronze") == "lh-lro"
 
 
+class FakeWarehouseFabric(FakeFabric):
+    """The warehouse counterpart of FakeFabric: serves the warehouses collection + create."""
+
+    def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
+        self.calls.append((method, url, json_body))
+        if method == "GET" and url.endswith("/workspaces"):
+            return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/warehouses"):
+            return FakeResp(200, {"value": self.existing})
+        if method == "POST" and url.endswith("/workspaces/ws-guid/warehouses"):
+            return self.create
+        if method == "GET" and url == "u/lro":
+            return FakeResp(200, {"status": "Succeeded", "id": "wh-lro"})
+        raise AssertionError(f"unexpected call {method} {url}")
+
+
+def test_create_warehouse_new_returns_id(_patch):
+    fake = _patch(FakeWarehouseFabric(existing=[], create=FakeResp(201, {"id": "wh-new"})))
+    assert _ws().create_warehouse("gold_dwh") == "wh-new"
+    (_, _, body), = fake.posts()
+    assert body == {"displayName": "gold_dwh"}          # no creationPayload for a warehouse
+
+
+def test_create_warehouse_idempotent(_patch):
+    fake = _patch(FakeWarehouseFabric(existing=[{"displayName": "gold_dwh", "id": "wh-exist"}]))
+    assert _ws().create_warehouse("gold_dwh") == "wh-exist"
+    assert fake.posts() == []                            # no create issued
+
+
+def test_create_lakehouse_folder_placement(_patch):
+    class FolderFabric(FakeFabric):
+        def __call__(self, method, url, **kw):
+            if url.endswith("/workspaces/ws-guid/folders"):
+                self.calls.append((method, url, kw.get("json_body")))
+                return FakeResp(200, {"value": []} if method == "GET" else {"id": "fld-1"})
+            return super().__call__(method, url, **kw)
+
+    fake = _patch(FolderFabric(existing=[], create=FakeResp(201, {"id": "lh-new"})))
+    assert _ws().create_lakehouse("bronze", folder="data") == "lh-new"
+    body = next(b for m, u, b in fake.calls if m == "POST" and u.endswith("/lakehouses"))
+    assert body["folderId"] == "fld-1"
+
+
+def test_create_warehouse_folder_placement(_patch):
+    class FolderWarehouseFabric(FakeWarehouseFabric):
+        def __call__(self, method, url, **kw):
+            if url.endswith("/workspaces/ws-guid/folders"):
+                self.calls.append((method, url, kw.get("json_body")))
+                return FakeResp(200, {"value": []} if method == "GET" else {"id": "fld-1"})
+            return super().__call__(method, url, **kw)
+
+    fake = _patch(FolderWarehouseFabric(existing=[], create=FakeResp(201, {"id": "wh-new"})))
+    assert _ws().create_warehouse("gold_dwh", folder="data") == "wh-new"
+    body = next(b for m, u, b in fake.calls if m == "POST" and u.endswith("/warehouses"))
+    assert body["folderId"] == "fld-1"
+
+
+def test_create_warehouse_lro_202(_patch):
+    _patch(FakeWarehouseFabric(existing=[], create=FakeResp(202, headers={"Location": "u/lro"})))
+    assert _ws().create_warehouse("gold_dwh") == "wh-lro"
+
+
 def test_list_lakehouses_shape(_patch):
     _patch(FakeFabric(existing=[{"displayName": "a", "id": "1"}, {"displayName": "b", "id": "2"}]))
     got = _ws().list_lakehouses()
@@ -153,11 +215,12 @@ class DeployFabric:
     """Scripts the deploy sequence (list/create/delete + a Power BI refresh) and records every call."""
 
     def __init__(self, *, kind="notebooks", existing=None, refresh_status="Completed", lakehouses=None,
-                 update_resp=None):
+                 warehouses=None, update_resp=None):
         self.kind = kind                    # "notebooks" | "semanticModels" | "dataPipelines"
         self.existing = existing or []
         self.refresh_status = refresh_status
         self.lakehouses = lakehouses or []  # for the Direct Lake .bim repoint
+        self.warehouses = warehouses or []  # for the DirectQuery .bim repoint / sql_endpoint
         self.update_resp = update_resp      # overwrite-path updateDefinition response (default 200 sync)
         self.calls = []                     # (method, url, json_body)
 
@@ -167,6 +230,12 @@ class DeployFabric:
             return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
         if method == "GET" and url.endswith("/workspaces/ws-guid/lakehouses"):
             return FakeResp(200, {"value": self.lakehouses})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/warehouses"):
+            return FakeResp(200, {"value": self.warehouses})
+        for w in self.warehouses:
+            if method == "GET" and url.endswith(f"/workspaces/ws-guid/warehouses/{w['id']}"):
+                return FakeResp(200, {"id": w["id"], "properties": {
+                    "connectionString": "new-endpoint.datawarehouse.fabric.microsoft.com"}})
         if method == "GET" and url.endswith(f"/workspaces/ws-guid/{self.kind}"):
             return FakeResp(200, {"value": self.existing})
         if method == "POST" and url.endswith("/updateDefinition"):  # overwrite → update in place
@@ -221,11 +290,12 @@ def test_deploy_from_url(_patch, monkeypatch):
 
 
 def test_deploy_bim_creates_and_refreshes(_patch, monkeypatch, tmp_path):
-    fake = _patch(DeployFabric(kind="semanticModels"))
+    # A Direct Lake bim (OneLake reference) is created with the TMSL parts, then reframed.
+    fake = _patch(DeployFabric(kind="semanticModels",
+                               lakehouses=[{"displayName": "only", "id": "lh-only"}]))
     monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
-    src = _write(tmp_path, "model.bim", json.dumps({"compatibilityLevel": 1702, "model": {}}))
+    src = _write(tmp_path, "model.bim", _directlake_bim())
     assert _ws().deploy(src) == "item-new"
-    # created the model with the TMSL parts, then fired a refresh and polled it
     parts = {p["path"] for p in fake.post_body("/workspaces/ws-guid/semanticModels")["definition"]["parts"]}
     assert parts == {"model.bim", "definition.pbism"}
     assert any(m == "POST" and u.endswith("/refreshes") for m, u, _ in fake.calls)
@@ -233,11 +303,21 @@ def test_deploy_bim_creates_and_refreshes(_patch, monkeypatch, tmp_path):
 
 
 def test_deploy_bim_failed_refresh_raises(_patch, monkeypatch, tmp_path):
-    _patch(DeployFabric(kind="semanticModels", refresh_status="Failed"))
+    _patch(DeployFabric(kind="semanticModels", refresh_status="Failed",
+                        lakehouses=[{"displayName": "only", "id": "lh-only"}]))
     monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
-    src = _write(tmp_path, "model.bim", "{}")
+    src = _write(tmp_path, "model.bim", _directlake_bim())
     with pytest.raises(fr.RemoteRunError, match="refresh"):
         _ws().deploy(src)
+
+
+def test_deploy_non_directlake_bim_skips_refresh(_patch, monkeypatch, tmp_path):
+    # No OneLake reference → nothing to reframe: the model is created but never refreshed.
+    fake = _patch(DeployFabric(kind="semanticModels"))
+    monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
+    src = _write(tmp_path, "model.bim", json.dumps({"compatibilityLevel": 1702, "model": {}}))
+    assert _ws().deploy(src) == "item-new"
+    assert not any(m == "POST" and u.endswith("/refreshes") for m, u, _ in fake.calls)
 
 
 # --- Direct Lake .bim repoint (OneLake workspace/lakehouse GUID rewrite) --------------------------
@@ -301,6 +381,99 @@ def test_deploy_lakehouse_arg_ignored_for_notebook(_patch, tmp_path):
     src = _write(tmp_path, "etl.ipynb", json.dumps({"nbformat": 4, "cells": [], "metadata": {}}))
     _ws().deploy(src, lakehouse="whatever")                 # ignored — no lakehouse lookup for a notebook
     assert not any(u.endswith("/lakehouses") for _, u, _ in fake.calls)
+
+
+# --- DirectQuery .bim repoint (Sql.Database server/db rewrite) + sql_endpoint ---------------------
+
+def _directquery_bim(db="tpch_dwh"):
+    """A minimal DirectQuery model.bim: partitions carry M expressions with
+    Sql.Database("<server>", "<db>") — quotes escaped in the raw JSON, as TMSL really is."""
+    expression = [
+        "let",
+        f'    Source = Sql.Database("old-endpoint.datawarehouse.fabric.microsoft.com", "{db}"),',
+        '    t = Source{[Schema="tpch",Item="dim_date"]}[Data]',
+        "in",
+        "    t",
+    ]
+    return json.dumps({"model": {"tables": [{"partitions": [
+        {"mode": "directQuery", "source": {"type": "m", "expression": expression}}]}]}})
+
+
+def _dq_fabric(_patch, monkeypatch, warehouses):
+    fake = _patch(DeployFabric(kind="semanticModels", warehouses=warehouses))
+    monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
+    return fake
+
+
+def test_deploy_bim_repoints_to_named_warehouse(_patch, monkeypatch, tmp_path):
+    fake = _dq_fabric(_patch, monkeypatch, [{"displayName": "tpch_dwh", "id": "wh-1"},
+                                            {"displayName": "other_dwh", "id": "wh-2"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="stale_dwh"))
+    _ws().deploy(src, warehouse="tpch_dwh")
+    out = _deployed_bim(fake)
+    assert "old-endpoint.datawarehouse" not in out
+    assert "new-endpoint.datawarehouse.fabric.microsoft.com" in out   # server rewritten
+    assert "stale_dwh" not in out and "tpch_dwh" in out                # db rewritten to the named wh
+
+
+def test_deploy_bim_infers_warehouse_from_referenced_db(_patch, monkeypatch, tmp_path):
+    # The bim already references a warehouse that exists here → keep it, just fix the server.
+    fake = _dq_fabric(_patch, monkeypatch, [{"displayName": "tpch_dwh", "id": "wh-1"},
+                                            {"displayName": "other_dwh", "id": "wh-2"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="tpch_dwh"))
+    _ws().deploy(src)                                       # no warehouse= needed
+    out = _deployed_bim(fake)
+    assert "new-endpoint.datawarehouse.fabric.microsoft.com" in out
+    assert "tpch_dwh" in out
+
+
+def test_deploy_bim_infers_sole_warehouse(_patch, monkeypatch, tmp_path):
+    fake = _dq_fabric(_patch, monkeypatch, [{"displayName": "only_dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="stale_dwh"))
+    _ws().deploy(src)
+    out = _deployed_bim(fake)
+    assert "stale_dwh" not in out and "only_dwh" in out
+
+
+def test_deploy_bim_unknown_warehouse_raises(_patch, monkeypatch, tmp_path):
+    _dq_fabric(_patch, monkeypatch, [{"displayName": "tpch_dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim())
+    with pytest.raises(fr.RemoteRunError, match="'typo_dwh' not found"):
+        _ws().deploy(src, warehouse="typo_dwh")
+
+
+def test_deploy_bim_warehouse_without_sql_ref_raises(_patch, monkeypatch, tmp_path):
+    # Explicit warehouse= on a model with no Sql.Database reference — nothing to point.
+    _dq_fabric(_patch, monkeypatch, [{"displayName": "tpch_dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", json.dumps({"model": {}}))
+    with pytest.raises(fr.RemoteRunError, match="no Sql.Database"):
+        _ws().deploy(src, warehouse="tpch_dwh")
+
+
+def test_sql_endpoint_from_warehouse(_patch):
+    _patch(DeployFabric(warehouses=[{"displayName": "tpch_dwh", "id": "wh-1"}]))
+    assert _ws().sql_endpoint() == "new-endpoint.datawarehouse.fabric.microsoft.com"
+    assert _ws().sql_endpoint("tpch_dwh") == "new-endpoint.datawarehouse.fabric.microsoft.com"
+
+
+def test_sql_endpoint_unknown_warehouse_raises(_patch):
+    _patch(DeployFabric(warehouses=[{"displayName": "tpch_dwh", "id": "wh-1"}]))
+    with pytest.raises(fr.RemoteRunError, match="'nope' not found.*tpch_dwh"):
+        _ws().sql_endpoint("nope")
+
+
+def test_sql_endpoint_lakehouse_fallback(_patch):
+    # No warehouse in the workspace → a lakehouse's SQL analytics endpoint serves the hostname.
+    class LhDetailFabric(DeployFabric):
+        def __call__(self, method, url, **kw):
+            if method == "GET" and url.endswith("/lakehouses/lh-1"):
+                self.calls.append((method, url, None))
+                return FakeResp(200, {"id": "lh-1", "properties": {"sqlEndpointProperties": {
+                    "connectionString": "new-endpoint.datawarehouse.fabric.microsoft.com"}}})
+            return super().__call__(method, url, **kw)
+
+    _patch(LhDetailFabric(lakehouses=[{"displayName": "bronze", "id": "lh-1"}]))
+    assert _ws().sql_endpoint() == "new-endpoint.datawarehouse.fabric.microsoft.com"
 
 
 # --- run -----------------------------------------------------------------------------------------
@@ -468,6 +641,27 @@ def test_repoint_pipeline_points_notebook_by_name(_patch):
     assert acts[1] == {"type": "Wait", "typeProperties": {"waitTimeInSeconds": 1}}   # untouched
 
 
+def test_repoint_pipeline_reaches_nested_activities(_patch):
+    # A notebook activity buried in containers (ForEach sweep, If branch) is repointed too — the
+    # walk recurses through typeProperties.activities / ifTrueActivities / ifFalseActivities /
+    # Switch cases, not just the top level.
+    _patch(DeployFabric(kind="notebooks", existing=[{"displayName": "run", "id": "nb-123"}]))
+    ws = _ws()
+    pipeline = json.dumps({"properties": {"activities": [
+        {"type": "ForEach", "typeProperties": {"isSequential": True, "activities": [
+            {"type": "TridentNotebook", "typeProperties": {"notebookId": "SRC-NB", "workspaceId": "SRC-WS"}},
+        ]}},
+        {"type": "If", "typeProperties": {"ifTrueActivities": [
+            {"type": "TridentNotebook", "typeProperties": {"notebookId": "SRC-NB2", "workspaceId": "SRC-WS"}},
+        ]}},
+    ]}}).encode()
+    acts = json.loads(ws._repoint_pipeline(pipeline, "run"))["properties"]["activities"]
+    inner = acts[0]["typeProperties"]["activities"][0]["typeProperties"]
+    branch = acts[1]["typeProperties"]["ifTrueActivities"][0]["typeProperties"]
+    assert inner == {"notebookId": "nb-123", "workspaceId": "ws-guid"}
+    assert branch == {"notebookId": "nb-123", "workspaceId": "ws-guid"}
+
+
 def test_repoint_pipeline_none_is_verbatim(_patch):
     _patch(DeployFabric(kind="notebooks"))
     content = json.dumps({"properties": {"activities": []}}).encode()
@@ -571,9 +765,10 @@ class MultiDeployFabric:
     """Scripts a whole-folder deploy: serves every item collection (+ lakehouses and the Power BI
     refresh), tracks creates so later name lookups see earlier items, and records every call."""
 
-    def __init__(self, *, existing=None, lakehouses=None, definitions=None, lro_defs=()):
+    def __init__(self, *, existing=None, lakehouses=None, warehouses=None, definitions=None, lro_defs=()):
         self.existing = existing or {}      # collection -> [{"displayName", "id"}]
         self.lakehouses = lakehouses if lakehouses is not None else [{"displayName": "bronze", "id": "lh-1"}]
+        self.warehouses = warehouses or []  # for the DirectQuery .bim repoint
         self.definitions = definitions or {}  # item id -> [part dicts] served by getDefinition
         self.lro_defs = set(lro_defs)         # item ids whose getDefinition goes the 202 route
         self._pending = None                  # parts awaiting the LRO /result fetch
@@ -598,6 +793,12 @@ class MultiDeployFabric:
             return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
         if method == "GET" and url.endswith("/workspaces/ws-guid/lakehouses"):
             return FakeResp(200, {"value": self.lakehouses})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/warehouses"):
+            return FakeResp(200, {"value": self.warehouses})
+        for w in self.warehouses:
+            if method == "GET" and url.endswith(f"/workspaces/ws-guid/warehouses/{w['id']}"):
+                return FakeResp(200, {"id": w["id"], "properties": {
+                    "connectionString": "new-endpoint.datawarehouse.fabric.microsoft.com"}})
         for coll in ("notebooks", "semanticModels", "dataPipelines", "variableLibraries"):
             if url.endswith(f"/workspaces/ws-guid/{coll}"):
                 if method == "GET":
@@ -727,6 +928,67 @@ def test_deploy_folder_overwrite_forwarded(_patch, tmp_path):
     assert any(m == "POST" and u.endswith("/notebooks/old-nb/updateDefinition")
                for m, u, _ in fake.calls)
     assert fake.created() == []                                           # never a fresh create
+
+
+def test_deploy_loose_folder_by_extension(_patch, monkeypatch, tmp_path):
+    # A plain folder — no .platform layout, just files — deploys each loose .ipynb/.bim/.json by
+    # extension, named by stem, in dependency order; the pipeline's NESTED notebook activity is
+    # automagically pointed at the folder's sole notebook.
+    fake = _patch(MultiDeployFabric())
+    root = tmp_path / "notebooks"
+    root.mkdir()
+    (root / "etl.ipynb").write_text(_NB_JSON, encoding="utf-8")
+    (root / "sweep.json").write_text(json.dumps({"properties": {"activities": [
+        {"type": "ForEach", "typeProperties": {"activities": [
+            {"type": "TridentNotebook", "typeProperties": {"notebookId": "SRC-NB", "workspaceId": "SRC-WS"}},
+        ]}}]}}), encoding="utf-8")
+    ids = _ws().deploy(str(root))
+    assert ids == {"etl": "item-1", "sweep": "item-2"}
+    assert fake.created() == ["notebooks", "dataPipelines"]      # notebook first, pipeline last
+    out = json.loads(_decoded_part(fake, "/workspaces/ws-guid/dataPipelines", "pipeline-content.json"))
+    inner = out["properties"]["activities"][0]["typeProperties"]["activities"][0]["typeProperties"]
+    assert inner == {"notebookId": "item-1", "workspaceId": "ws-guid"}
+
+
+def test_deploy_mixed_bim_folder_with_lakehouse_and_warehouse(_patch, monkeypatch, tmp_path):
+    # A folder holding a Direct Lake bim AND a DirectQuery bim, deployed with BOTH lakehouse= and
+    # warehouse=: each model gets only the rewrite that applies to it, nothing raises, and only
+    # the Direct Lake model is refreshed.
+    import base64 as b64
+    fake = _patch(MultiDeployFabric(warehouses=[{"displayName": "tpch_dwh", "id": "wh-1"}]))
+    monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
+    root = tmp_path / "semantic_models"
+    root.mkdir()
+    (root / "dl.bim").write_text(_directlake_bim(), encoding="utf-8")
+    (root / "dq.bim").write_text(_directquery_bim(db="stale_dwh"), encoding="utf-8")
+    ids = _ws().deploy(str(root), lakehouse="bronze", warehouse="tpch_dwh", overwrite=True)
+    assert set(ids) == {"dl", "dq"}
+    deployed = {}
+    for m, u, body in fake.calls:
+        if m == "POST" and u.endswith("/workspaces/ws-guid/semanticModels"):
+            parts = {p["path"]: p for p in body["definition"]["parts"]}
+            deployed[body["displayName"]] = b64.b64decode(parts["model.bim"]["payload"]).decode()
+    assert "lh-1" in deployed["dl"] and "ws-guid" in deployed["dl"]         # DL: OneLake GUIDs
+    assert "new-endpoint.datawarehouse" in deployed["dq"]                    # DQ: server rewritten
+    assert "stale_dwh" not in deployed["dq"] and "tpch_dwh" in deployed["dq"]
+    refreshes = [u for m, u, _ in fake.calls if m == "POST" and u.endswith("/refreshes")]
+    assert len(refreshes) == 1                                               # DL only, DQ skipped
+
+
+def test_deploy_loose_folder_ignores_unsupported_files(_patch, tmp_path):
+    # Unsupported loose files are skipped, not errors; a folder with ONLY unsupported files still
+    # raises the no-items error.
+    fake = _patch(MultiDeployFabric())
+    root = tmp_path / "notebooks"
+    root.mkdir()
+    (root / "etl.ipynb").write_text(_NB_JSON, encoding="utf-8")
+    (root / "readme.md").write_text("# notes", encoding="utf-8")
+    assert _ws().deploy(str(root)) == {"etl": "item-1"}
+    junk = tmp_path / "junk"
+    junk.mkdir()
+    (junk / "data.csv").write_text("x", encoding="utf-8")
+    with pytest.raises(fr.RemoteRunError, match="no Fabric items"):
+        _ws().deploy(str(junk))
 
 
 def test_deploy_folder_unknown_type_raises(_patch, tmp_path):

@@ -8,6 +8,7 @@ rather than on the :class:`~duckrun.session.DuckSession` that ``connect()`` retu
     import duckrun
     ws = duckrun.workspace("My Workspace")            # name or GUID
     ws.create_lakehouse("bronze")                     # provision an empty container (by name)
+    ws.create_warehouse("gold_dwh")                   # same, for a warehouse
     ws.deploy("etl.ipynb")                            # deploy a file artifact (a notebook)
     ws.deploy("model.bim")                            # deploy + refresh a semantic model
     ws.deploy("fabric_items")                         # deploy a whole folder of items at once
@@ -28,6 +29,13 @@ from urllib.parse import urlsplit
 # workspace + lakehouse GUIDs, e.g. onelake.dfs.fabric.microsoft.com/<ws-guid>/<lakehouse-guid>/...
 _ONELAKE_REF = re.compile(
     r"onelake\.dfs\.fabric\.microsoft\.com/([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})")
+
+# A DirectQuery-on-warehouse model.bim references its warehouse through M expressions like
+# Sql.Database("<endpoint>.datawarehouse.fabric.microsoft.com", "<warehouse>"). The bim is JSON,
+# so in the raw text the quotes appear escaped (\") — the pattern tolerates both forms.
+_SQL_DATABASE_REF = re.compile(
+    r'Sql\.Database\(\\?"(?P<server>[^"\\]+\.datawarehouse\.fabric\.microsoft\.com)\\?",'
+    r'\s*\\?"(?P<db>[^"\\]+)\\?"')
 
 from .auth import get_fabric_token, get_onelake_token, get_powerbi_token
 from .fabric_remote import (
@@ -133,11 +141,33 @@ _RUNNABLE = {"notebooks": "RunNotebook", "dataPipelines": "Pipeline"}
 _RUN_EXT = {".ipynb": ["notebooks"], ".json": ["dataPipelines"]}
 
 
+def _is_directlake_bim(content: bytes) -> bool:
+    """Whether a ``model.bim`` is Direct Lake — it declares a ``directLake`` partition mode, or
+    carries a OneLake table reference. Checked on the ORIGINAL bytes, before any repoint rewrites
+    the ids. A Direct Lake model is reframed after deploy; a DirectQuery-only one is not."""
+    text = content.decode("utf-8")
+    return "directLake" in text or bool(_ONELAKE_REF.search(text))
+
+
 def _is_pipeline_json(obj) -> bool:
     """Whether ``obj`` (parsed JSON) is a Fabric data-pipeline definition — a ``pipeline-content.json``
     is ``{"properties": {"activities": [...]}}``."""
     return isinstance(obj, dict) and isinstance(obj.get("properties"), dict) \
         and "activities" in obj["properties"]
+
+
+def _walk_activities(activities):
+    """Every activity in ``activities``, recursing into container activities — ForEach/Until carry
+    nested ``typeProperties.activities``, If ``ifTrueActivities``/``ifFalseActivities``, Switch
+    ``cases[].activities`` + ``defaultActivities`` — so a notebook activity is found wherever it
+    sits, not only at the top level."""
+    for act in activities or []:
+        yield act
+        tp = act.get("typeProperties") or {}
+        for key in ("activities", "ifTrueActivities", "ifFalseActivities", "defaultActivities"):
+            yield from _walk_activities(tp.get(key))
+        for case in tp.get("cases") or []:
+            yield from _walk_activities(case.get("activities"))
 
 
 def _is_variable_library_json(obj) -> bool:
@@ -175,22 +205,64 @@ def _read_source(source: str) -> bytes:
         return f.read()
 
 
+def _scan_loose_files(folder: str) -> List[Dict]:
+    """The deployable loose files directly under ``folder`` — a plain directory of ``.ipynb`` /
+    ``.bim`` / ``.json`` sources with no git-integration layout (e.g. a repo's ``notebooks/``).
+    Each file is typed by its extension (a ``.json`` by sniffing pipeline vs variable library,
+    exactly like the single-file deploy) and named by its stem; returned in dependency order.
+    Not recursive: only the folder's own files, so a nested project tree isn't swept up by
+    accident."""
+    items = []
+    for fname in sorted(os.listdir(folder)):
+        path = os.path.join(folder, fname)
+        stem, ext = os.path.splitext(fname)
+        ext = ext.lower()
+        if not os.path.isfile(path) or ext not in _DEPLOY_EXT:
+            continue
+        if ext == ".ipynb":
+            item_type = "Notebook"
+        elif ext == ".bim":
+            item_type = "SemanticModel"
+        else:
+            try:
+                with open(path, "rb") as f:
+                    obj = json.load(f)
+            except ValueError as exc:
+                raise RemoteRunError(f"{path!r} is not valid JSON: {exc}")
+            if _is_pipeline_json(obj):
+                item_type = "DataPipeline"
+            elif _is_variable_library_json(obj):
+                item_type = "VariableLibrary"
+            else:
+                raise RemoteRunError(
+                    f"{path!r} is neither a Fabric data pipeline (properties.activities) nor a "
+                    "variable library (variables)")
+        items.append({"type": item_type, "name": stem, "primary": path})
+    items.sort(key=lambda it: _DEPLOY_ORDER.index(it["type"]))
+    return items
+
+
 def _scan_item_folders(folder: str) -> List[Dict]:
     """The Fabric items under ``folder`` (git-integration layout: one ``name.ItemType`` subfolder
     per item, each holding a ``.platform`` metadata file). Returns, in dependency order, one
     ``{"type", "name", "primary"}`` per item — ``name`` is the ``.platform`` displayName and
     ``primary`` the definition file the single-file deploy path consumes. Pointing at an item
-    folder itself (``.../run.Notebook``) yields just that item. Unknown types and malformed
-    folders raise rather than skip: a partial deploy that looked complete is worse than a loud
-    failure."""
+    folder itself (``.../run.Notebook``) yields just that item. A folder with no ``.platform``
+    items falls back to its loose deployable files (``_scan_loose_files``). Unknown types and
+    malformed folders raise rather than skip: a partial deploy that looked complete is worse
+    than a loud failure."""
     if os.path.isfile(os.path.join(folder, ".platform")):
         dirs = [folder]                     # an item folder itself, not a folder of items
     else:
         dirs = sorted(os.path.join(folder, d) for d in os.listdir(folder)
                       if os.path.isfile(os.path.join(folder, d, ".platform")))
     if not dirs:
+        loose = _scan_loose_files(folder)
+        if loose:
+            return loose
         raise RemoteRunError(
-            f"no Fabric items under {folder!r} (no subfolder has a .platform file)")
+            f"no Fabric items under {folder!r} (no subfolder has a .platform file, and no "
+            f"loose {'/'.join(_DEPLOY_EXT)} files)")
     items = []
     for d in dirs:
         platform = os.path.join(d, ".platform")
@@ -217,12 +289,13 @@ def _scan_item_folders(folder: str) -> List[Dict]:
 
 
 def _has_notebook_activity(primary: str) -> bool:
-    """Whether a ``pipeline-content.json`` has a ``TridentNotebook`` activity — i.e. anything a
-    notebook repoint could rewrite (``_repoint_pipeline`` raises on a pipeline without one)."""
+    """Whether a ``pipeline-content.json`` has a ``TridentNotebook`` activity — however deeply
+    nested — i.e. anything a notebook repoint could rewrite (``_repoint_pipeline`` raises on a
+    pipeline without one)."""
     with open(primary, "rb") as f:
         obj = json.load(f)
     activities = (obj.get("properties") or {}).get("activities") or []
-    return any(act.get("type") == "TridentNotebook" for act in activities)
+    return any(act.get("type") == "TridentNotebook" for act in _walk_activities(activities))
 
 
 class ScriptResult:
@@ -279,11 +352,15 @@ class Workspace:
         """Every lakehouse in the workspace as ``[{"displayName": ..., "id": ...}, ...]``."""
         return self._items("lakehouses")
 
-    def create_lakehouse(self, name: str, schemas: bool = True) -> str:
+    def create_lakehouse(self, name: str, schemas: bool = True,
+                         folder: Optional[str] = None) -> str:
         """Ensure a lakehouse named ``name`` exists; return its item id.
 
-        Idempotent: if one already exists it is returned unchanged (no create). ``schemas=True``
-        makes it schema-enabled. Raises :class:`RemoteRunError` on a real API failure.
+        Idempotent: if one already exists it is returned unchanged (no create) — and left where
+        it already lives, so ``folder`` only places a lakehouse this call CREATES. ``schemas=True``
+        makes it schema-enabled. ``folder`` names a workspace folder (created at the root if
+        absent), the same placement ``deploy(folder=...)`` does. Raises :class:`RemoteRunError` on
+        a real API failure.
         """
         for lh in self._items("lakehouses"):
             if lh.get("displayName") == name:
@@ -291,6 +368,8 @@ class Workspace:
         body: Dict = {"displayName": name}
         if schemas:
             body["creationPayload"] = {"enableSchemas": True}
+        if folder:
+            body["folderId"] = _ensure_folder(self._token, self.id, folder, required=True)
         resp = _http_request(
             "POST", f"{_FABRIC_API}/workspaces/{self.id}/lakehouses", token=self._token, json_body=body
         )
@@ -301,9 +380,34 @@ class Workspace:
         resp.raise_for_status()
         raise RemoteRunError(f"unexpected status {resp.status_code} creating lakehouse: {resp.text[:200]}")
 
+    def create_warehouse(self, name: str, folder: Optional[str] = None) -> str:
+        """Ensure a warehouse named ``name`` exists; return its item id.
+
+        The warehouse sibling of :meth:`create_lakehouse` — idempotent (an existing one is returned
+        unchanged, no create, and stays where it lives), 202-aware (a create is a long-running
+        operation, polled to completion), and ``folder`` places one it CREATES in that workspace
+        folder. Its SQL endpoint is :meth:`sql_endpoint`. Raises :class:`RemoteRunError` on a real
+        API failure.
+        """
+        for wh in self._items("warehouses"):
+            if wh.get("displayName") == name:
+                return wh["id"]
+        body: Dict = {"displayName": name}
+        if folder:
+            body["folderId"] = _ensure_folder(self._token, self.id, folder, required=True)
+        resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{self.id}/warehouses",
+                             token=self._token, json_body=body)
+        if resp.status_code in (200, 201):
+            return resp.json()["id"]
+        if resp.status_code == 202:
+            return _await_lro_item_id(self._token, resp)
+        resp.raise_for_status()
+        raise RemoteRunError(f"unexpected status {resp.status_code} creating warehouse: {resp.text[:200]}")
+
     def deploy(self, source: str, lakehouse: Optional[str] = None, variables: Optional[Dict] = None,
                name: Optional[str] = None, overwrite: bool = False,
                notebook: Optional[str] = None,
+               warehouse: Optional[str] = None,
                folder: Optional[str] = None) -> Union[str, Dict[str, str]]:
         """Deploy a file artifact — or a whole folder of items — to the workspace.
 
@@ -313,7 +417,10 @@ class Workspace:
         ``{displayName: item id}``. Names come from each item's ``.platform``; a pipeline's
         notebook activities are automatically pointed at the folder's notebook when it has exactly
         one (``notebook=`` picks one otherwise). Each item honours ``lakehouse`` / ``variables`` /
-        ``overwrite`` exactly as a single-file deploy of that item would.
+        ``overwrite`` exactly as a single-file deploy of that item would. A **plain folder** with
+        no ``.platform`` items works too: its loose ``.ipynb`` / ``.bim`` / ``.json`` files (top
+        level only) deploy the same way, each named by its filename stem — so
+        ``ws.deploy("notebooks", overwrite=True)`` ships a repo's whole notebook directory.
 
         A **file** ``source`` is a local path or an ``http(s)`` URL (a raw file URL), and the item
         id is returned. The item type is keyed off the extension — ``.ipynb`` → notebook, ``.bim`` → semantic model, ``.json`` → a data
@@ -326,6 +433,14 @@ class Workspace:
         connects to the right place — no GUIDs or connection strings to edit by hand. It is inferred
         when the model already targets a lakehouse in this workspace, or the workspace has exactly one;
         with several you must name it.
+
+        ``warehouse`` (a warehouse name in this workspace) is the sibling for a **DirectQuery** ``.bim``:
+        duckrun rewrites every ``Sql.Database("<endpoint>.datawarehouse.fabric.microsoft.com", "<db>")``
+        reference to this workspace's SQL endpoint (:meth:`sql_endpoint`) and that warehouse — so the
+        model connects to the right warehouse by NAME, wherever the bim was authored. Inferred when
+        the referenced database name matches a warehouse here, or the workspace has exactly one. A
+        Direct Lake model is refreshed after deploy; a DirectQuery-only model is NOT (nothing to
+        reframe — it queries live).
 
         ``notebook`` (a notebook name in this workspace) points a **data pipeline**'s notebook
         activities at that notebook: duckrun rewrites the ``notebookId`` / ``workspaceId`` GUIDs baked
@@ -344,13 +459,13 @@ class Workspace:
         notebooks' best-effort temp parking, an explicitly requested ``folder`` raises if it
         cannot be resolved.
 
-        ``lakehouse`` / ``notebook`` / ``variables`` are ignored for artifact types they don't apply
-        to. Not idempotent: if an item of that name already exists it is replaced only when
-        ``overwrite=True``, otherwise this raises.
+        ``lakehouse`` / ``warehouse`` / ``notebook`` / ``variables`` are ignored for artifact types
+        they don't apply to. Not idempotent: if an item of that name already exists it is replaced
+        only when ``overwrite=True``, otherwise this raises.
         """
         if os.path.isdir(source):
             return self._deploy_folder(source, lakehouse, variables, name, overwrite, notebook,
-                                       folder)
+                                       warehouse, folder)
         stem, ext = os.path.splitext(_basename(source))
         ext = ext.lower()
         if ext not in _DEPLOY_EXT:
@@ -363,7 +478,9 @@ class Workspace:
             endpoint = "notebooks"
         elif ext == ".bim":
             endpoint = "semanticModels"
+            directlake = _is_directlake_bim(content)                  # before ids are rewritten
             content = self._repoint_bim(content, lakehouse, source)   # resolve before any delete
+            content = self._repoint_dq_bim(content, warehouse, source)
         else:                                                          # .json → pipeline or variable library
             endpoint, content = self._json_artifact(source, content, variables, notebook)
 
@@ -386,20 +503,27 @@ class Workspace:
         if endpoint == "variableLibraries":
             return _create_variable_library(self._token, self.id, name, content, item_id=item_id,
                                             folder_id=folder_id)
-        # semanticModels → create/update, then refresh/reframe so it is live.
+        # semanticModels → create/update; a Direct Lake model is then refreshed (a reframe onto the
+        # latest Delta data) so it is live. A DirectQuery-only model has nothing to reframe — it
+        # queries live — so no refresh.
         item_id = _create_semantic_model(self._token, self.id, name, content, item_id=item_id,
                                          folder_id=folder_id)
-        _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
+        if directlake:
+            _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
 
     def _deploy_folder(self, folder: str, lakehouse: Optional[str], variables: Optional[Dict],
                        name: Optional[str], overwrite: bool, notebook: Optional[str],
+                       warehouse: Optional[str] = None,
                        ws_folder: Optional[str] = None) -> Dict[str, str]:
         """Deploy every Fabric item under ``folder`` in dependency order; return
         ``{displayName: item id}``. Each item recurses through the single-file ``deploy``, so the
-        Direct Lake repoint, variable injection, semantic-model refresh and ``overwrite`` semantics
-        are all the single-file behavior. A pipeline is pointed at the folder's sole notebook when
-        it has a notebook activity and no explicit ``notebook=`` was given."""
+        Direct Lake / warehouse repoints, variable injection, semantic-model refresh and
+        ``overwrite`` semantics are all the single-file behavior. A pipeline is pointed at the
+        folder's sole notebook when it has a notebook activity and no explicit ``notebook=`` was
+        given. ``lakehouse`` / ``warehouse`` are forwarded to each ``.bim`` only when the model
+        actually carries that kind of reference — so a mixed folder (Direct Lake + DirectQuery
+        models) deploys with both named, each bim getting the rewrite that applies to it."""
         if name is not None:
             raise RemoteRunError("name= applies to a single-file deploy; folder items are named "
                                  "by their .platform displayName")
@@ -408,12 +532,20 @@ class Workspace:
         ids: Dict[str, str] = {}
         for it in items:
             nb = notebook
+            lh, wh = lakehouse, warehouse
             if it["type"] == "DataPipeline" and nb is None and len(notebooks) == 1 \
                     and _has_notebook_activity(it["primary"]):
                 nb = notebooks[0]
-            ids[it["name"]] = self.deploy(it["primary"], lakehouse=lakehouse, variables=variables,
+            if it["type"] == "SemanticModel" and (lh is not None or wh is not None):
+                with open(it["primary"], encoding="utf-8") as f:
+                    text = f.read()
+                if lh is not None and not _ONELAKE_REF.search(text):
+                    lh = None               # not Direct Lake — lakehouse= doesn't apply to this bim
+                if wh is not None and not _SQL_DATABASE_REF.search(text):
+                    wh = None               # no warehouse reference — warehouse= doesn't apply
+            ids[it["name"]] = self.deploy(it["primary"], lakehouse=lh, variables=variables,
                                           name=it["name"], overwrite=overwrite, notebook=nb,
-                                          folder=ws_folder)
+                                          warehouse=wh, folder=ws_folder)
         return ids
 
     def download(self, folder: str = ".", name: Optional[str] = None,
@@ -596,7 +728,7 @@ class Workspace:
         obj = json.loads(content)
         activities = (obj.get("properties") or {}).get("activities") or []
         repointed = 0
-        for act in activities:
+        for act in _walk_activities(activities):
             if act.get("type") == "TridentNotebook":
                 tp = act.setdefault("typeProperties", {})
                 tp["notebookId"] = nb_id
@@ -615,6 +747,83 @@ class Workspace:
             return match["id"]
         have = ", ".join(sorted(it.get("displayName", "?") for it in self._items("notebooks"))) or "(none)"
         raise RemoteRunError(f"notebook {name!r} not found in workspace {self.id}; have: {have}")
+
+    def sql_endpoint(self, warehouse: Optional[str] = None) -> str:
+        """The workspace's SQL/TDS endpoint hostname — e.g.
+        ``xxxx-yyyy.datawarehouse.fabric.microsoft.com`` — what a connection string's ``Server=``
+        takes and what a DirectQuery bim's ``Sql.Database()`` references. The hostname is
+        workspace-scoped: every warehouse and lakehouse SQL analytics endpoint in the workspace
+        shares it. ``warehouse`` names the warehouse to read it from (raises listing the real names
+        on a miss); omitted, any warehouse serves, falling back to a lakehouse's SQL analytics
+        endpoint when the workspace has no warehouse at all."""
+        warehouses = self._items("warehouses")
+        if warehouse is not None:
+            match = next((w for w in warehouses if w.get("displayName") == warehouse), None)
+            if not match:
+                have = ", ".join(sorted(w.get("displayName", "?") for w in warehouses)) or "(none)"
+                raise RemoteRunError(
+                    f"warehouse {warehouse!r} not found in workspace {self.id}; have: {have}")
+            warehouses = [match]
+        for w in warehouses:
+            resp = _http_request("GET", f"{_FABRIC_API}/workspaces/{self.id}/warehouses/{w['id']}",
+                                 token=self._token)
+            resp.raise_for_status()
+            endpoint = (resp.json().get("properties") or {}).get("connectionString")
+            if endpoint:
+                return endpoint
+        for lh in self._items("lakehouses"):
+            resp = _http_request("GET", f"{_FABRIC_API}/workspaces/{self.id}/lakehouses/{lh['id']}",
+                                 token=self._token)
+            resp.raise_for_status()
+            endpoint = ((resp.json().get("properties") or {})
+                        .get("sqlEndpointProperties") or {}).get("connectionString")
+            if endpoint:
+                return endpoint
+        raise RemoteRunError(f"no SQL endpoint found in workspace {self.id} "
+                             "(no warehouse or lakehouse exposes a connectionString)")
+
+    def _repoint_dq_bim(self, content: bytes, warehouse: Optional[str], source: str) -> bytes:
+        """Rewrite a DirectQuery ``model.bim``'s ``Sql.Database(server, db)`` references to this
+        workspace's SQL endpoint and the chosen warehouse — the warehouse sibling of
+        ``_repoint_bim``. If the model carries no warehouse reference it isn't
+        DirectQuery-on-warehouse, so it's returned unchanged (and an explicit ``warehouse=`` then
+        raises — nothing to point)."""
+        text = content.decode("utf-8")
+        m = _SQL_DATABASE_REF.search(text)
+        if not m:
+            if warehouse is not None:
+                raise RemoteRunError(
+                    f"{source!r} has no Sql.Database(...datawarehouse.fabric.microsoft.com) "
+                    f"reference to point at warehouse {warehouse!r} "
+                    "(is it a DirectQuery-on-warehouse model?)")
+            return content
+        target = self._resolve_warehouse(warehouse, m.group("db"))
+        server = self.sql_endpoint(target)
+
+        def _swap(match):
+            call = match.group(0)
+            call = call.replace(match.group("server"), server)
+            return call.replace(match.group("db"), target)
+
+        return _SQL_DATABASE_REF.sub(_swap, text).encode("utf-8")
+
+    def _resolve_warehouse(self, warehouse: Optional[str], source_db: str) -> str:
+        """The target warehouse NAME for a DirectQuery repoint. Named → verified to exist (raise
+        listing the real names). Unnamed → the warehouse the model already references if it lives
+        here, else the sole warehouse, else raise asking which one."""
+        warehouses = self._items("warehouses")
+        names = [w.get("displayName") for w in warehouses]
+        if warehouse is not None:
+            if warehouse not in names:
+                raise RemoteRunError(f"warehouse {warehouse!r} not found in workspace; have: {names}")
+            return warehouse
+        if source_db in names:
+            return source_db                # already references a warehouse here — keep it
+        if len(warehouses) == 1:
+            return names[0]
+        if not warehouses:
+            raise RemoteRunError("no warehouse in this workspace to point the model at")
+        raise RemoteRunError(f"which warehouse should the model use? pass warehouse=; have: {names}")
 
     def _repoint_bim(self, content: bytes, lakehouse: Optional[str], source: str) -> bytes:
         """Rewrite a Direct-Lake ``model.bim``'s OneLake workspace/lakehouse GUIDs to this workspace
