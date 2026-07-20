@@ -104,6 +104,40 @@ def test_lro_202_resolves_item_id(_patch):
     assert _ws().create_lakehouse("bronze") == "lh-lro"
 
 
+class FakeWarehouseFabric(FakeFabric):
+    """The warehouse counterpart of FakeFabric: serves the warehouses collection + create."""
+
+    def __call__(self, method, url, *, token, params=None, json_body=None, headers=None, timeout=60):
+        self.calls.append((method, url, json_body))
+        if method == "GET" and url.endswith("/workspaces"):
+            return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/warehouses"):
+            return FakeResp(200, {"value": self.existing})
+        if method == "POST" and url.endswith("/workspaces/ws-guid/warehouses"):
+            return self.create
+        if method == "GET" and url == "u/lro":
+            return FakeResp(200, {"status": "Succeeded", "id": "wh-lro"})
+        raise AssertionError(f"unexpected call {method} {url}")
+
+
+def test_create_warehouse_new_returns_id(_patch):
+    fake = _patch(FakeWarehouseFabric(existing=[], create=FakeResp(201, {"id": "wh-new"})))
+    assert _ws().create_warehouse("gold_dwh") == "wh-new"
+    (_, _, body), = fake.posts()
+    assert body == {"displayName": "gold_dwh"}          # no creationPayload for a warehouse
+
+
+def test_create_warehouse_idempotent(_patch):
+    fake = _patch(FakeWarehouseFabric(existing=[{"displayName": "gold_dwh", "id": "wh-exist"}]))
+    assert _ws().create_warehouse("gold_dwh") == "wh-exist"
+    assert fake.posts() == []                            # no create issued
+
+
+def test_create_warehouse_lro_202(_patch):
+    _patch(FakeWarehouseFabric(existing=[], create=FakeResp(202, headers={"Location": "u/lro"})))
+    assert _ws().create_warehouse("gold_dwh") == "wh-lro"
+
+
 def test_list_lakehouses_shape(_patch):
     _patch(FakeFabric(existing=[{"displayName": "a", "id": "1"}, {"displayName": "b", "id": "2"}]))
     got = _ws().list_lakehouses()

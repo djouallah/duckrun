@@ -8,6 +8,7 @@ rather than on the :class:`~duckrun.session.DuckSession` that ``connect()`` retu
     import duckrun
     ws = duckrun.workspace("My Workspace")            # name or GUID
     ws.create_lakehouse("bronze")                     # provision an empty container (by name)
+    ws.create_warehouse("gold_dwh")                   # same, for a warehouse
     ws.deploy("etl.ipynb")                            # deploy a file artifact (a notebook)
     ws.deploy("model.bim")                            # deploy + refresh a semantic model
     ws.deploy("fabric_items")                         # deploy a whole folder of items at once
@@ -138,6 +139,14 @@ _DOWNLOAD_FMT = {"Notebook": "ipynb", "SemanticModel": "TMSL"}
 _RUNNABLE = {"notebooks": "RunNotebook", "dataPipelines": "Pipeline"}
 # Which collections to look in for a given source extension when running by file name.
 _RUN_EXT = {".ipynb": ["notebooks"], ".json": ["dataPipelines"]}
+
+
+def _is_directlake_bim(content: bytes) -> bool:
+    """Whether a ``model.bim`` is Direct Lake — it declares a ``directLake`` partition mode, or
+    carries a OneLake table reference. Checked on the ORIGINAL bytes, before any repoint rewrites
+    the ids. A Direct Lake model is reframed after deploy; a DirectQuery-only one is not."""
+    text = content.decode("utf-8")
+    return "directLake" in text or bool(_ONELAKE_REF.search(text))
 
 
 def _is_pipeline_json(obj) -> bool:
@@ -365,6 +374,26 @@ class Workspace:
         resp.raise_for_status()
         raise RemoteRunError(f"unexpected status {resp.status_code} creating lakehouse: {resp.text[:200]}")
 
+    def create_warehouse(self, name: str) -> str:
+        """Ensure a warehouse named ``name`` exists; return its item id.
+
+        The warehouse sibling of :meth:`create_lakehouse` — idempotent (an existing one is returned
+        unchanged, no create), 202-aware (a create is a long-running operation, polled to
+        completion). Its SQL endpoint is :meth:`sql_endpoint`. Raises :class:`RemoteRunError` on a
+        real API failure.
+        """
+        for wh in self._items("warehouses"):
+            if wh.get("displayName") == name:
+                return wh["id"]
+        resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{self.id}/warehouses",
+                             token=self._token, json_body={"displayName": name})
+        if resp.status_code in (200, 201):
+            return resp.json()["id"]
+        if resp.status_code == 202:
+            return _await_lro_item_id(self._token, resp)
+        resp.raise_for_status()
+        raise RemoteRunError(f"unexpected status {resp.status_code} creating warehouse: {resp.text[:200]}")
+
     def deploy(self, source: str, lakehouse: Optional[str] = None, variables: Optional[Dict] = None,
                name: Optional[str] = None, overwrite: bool = False,
                notebook: Optional[str] = None,
@@ -439,6 +468,7 @@ class Workspace:
             endpoint = "notebooks"
         elif ext == ".bim":
             endpoint = "semanticModels"
+            directlake = _is_directlake_bim(content)                  # before ids are rewritten
             content = self._repoint_bim(content, lakehouse, source)   # resolve before any delete
             content = self._repoint_dq_bim(content, warehouse, source)
         else:                                                          # .json → pipeline or variable library
@@ -468,7 +498,7 @@ class Workspace:
         # queries live — so no refresh.
         item_id = _create_semantic_model(self._token, self.id, name, content, item_id=item_id,
                                          folder_id=folder_id)
-        if _ONELAKE_REF.search(content.decode("utf-8")):
+        if directlake:
             _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
 
