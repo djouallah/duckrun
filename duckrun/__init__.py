@@ -15,7 +15,7 @@ from importlib.metadata import PackageNotFoundError, version as _pkg_version
 
 from .session import connect, DuckSession
 from .fabric_remote import RemoteRunner, RemoteResult
-from .workspace import workspace, Workspace
+from .workspace import workspace, Workspace, ScriptResult
 
 try:
     # Single source of truth: the installed distribution's version (built from pyproject.toml).
@@ -26,4 +26,4 @@ except PackageNotFoundError:  # running from a source tree that was never instal
     __version__ = "0+unknown"
 
 __all__ = ["connect", "DuckSession", "RemoteRunner", "RemoteResult",
-           "workspace", "Workspace", "__version__"]
+           "workspace", "Workspace", "ScriptResult", "__version__"]
