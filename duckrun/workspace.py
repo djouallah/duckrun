@@ -352,11 +352,15 @@ class Workspace:
         """Every lakehouse in the workspace as ``[{"displayName": ..., "id": ...}, ...]``."""
         return self._items("lakehouses")
 
-    def create_lakehouse(self, name: str, schemas: bool = True) -> str:
+    def create_lakehouse(self, name: str, schemas: bool = True,
+                         folder: Optional[str] = None) -> str:
         """Ensure a lakehouse named ``name`` exists; return its item id.
 
-        Idempotent: if one already exists it is returned unchanged (no create). ``schemas=True``
-        makes it schema-enabled. Raises :class:`RemoteRunError` on a real API failure.
+        Idempotent: if one already exists it is returned unchanged (no create) — and left where
+        it already lives, so ``folder`` only places a lakehouse this call CREATES. ``schemas=True``
+        makes it schema-enabled. ``folder`` names a workspace folder (created at the root if
+        absent), the same placement ``deploy(folder=...)`` does. Raises :class:`RemoteRunError` on
+        a real API failure.
         """
         for lh in self._items("lakehouses"):
             if lh.get("displayName") == name:
@@ -364,6 +368,8 @@ class Workspace:
         body: Dict = {"displayName": name}
         if schemas:
             body["creationPayload"] = {"enableSchemas": True}
+        if folder:
+            body["folderId"] = _ensure_folder(self._token, self.id, folder, required=True)
         resp = _http_request(
             "POST", f"{_FABRIC_API}/workspaces/{self.id}/lakehouses", token=self._token, json_body=body
         )
@@ -374,19 +380,23 @@ class Workspace:
         resp.raise_for_status()
         raise RemoteRunError(f"unexpected status {resp.status_code} creating lakehouse: {resp.text[:200]}")
 
-    def create_warehouse(self, name: str) -> str:
+    def create_warehouse(self, name: str, folder: Optional[str] = None) -> str:
         """Ensure a warehouse named ``name`` exists; return its item id.
 
         The warehouse sibling of :meth:`create_lakehouse` — idempotent (an existing one is returned
-        unchanged, no create), 202-aware (a create is a long-running operation, polled to
-        completion). Its SQL endpoint is :meth:`sql_endpoint`. Raises :class:`RemoteRunError` on a
-        real API failure.
+        unchanged, no create, and stays where it lives), 202-aware (a create is a long-running
+        operation, polled to completion), and ``folder`` places one it CREATES in that workspace
+        folder. Its SQL endpoint is :meth:`sql_endpoint`. Raises :class:`RemoteRunError` on a real
+        API failure.
         """
         for wh in self._items("warehouses"):
             if wh.get("displayName") == name:
                 return wh["id"]
+        body: Dict = {"displayName": name}
+        if folder:
+            body["folderId"] = _ensure_folder(self._token, self.id, folder, required=True)
         resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{self.id}/warehouses",
-                             token=self._token, json_body={"displayName": name})
+                             token=self._token, json_body=body)
         if resp.status_code in (200, 201):
             return resp.json()["id"]
         if resp.status_code == 202:

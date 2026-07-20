@@ -133,6 +133,34 @@ def test_create_warehouse_idempotent(_patch):
     assert fake.posts() == []                            # no create issued
 
 
+def test_create_lakehouse_folder_placement(_patch):
+    class FolderFabric(FakeFabric):
+        def __call__(self, method, url, **kw):
+            if url.endswith("/workspaces/ws-guid/folders"):
+                self.calls.append((method, url, kw.get("json_body")))
+                return FakeResp(200, {"value": []} if method == "GET" else {"id": "fld-1"})
+            return super().__call__(method, url, **kw)
+
+    fake = _patch(FolderFabric(existing=[], create=FakeResp(201, {"id": "lh-new"})))
+    assert _ws().create_lakehouse("bronze", folder="data") == "lh-new"
+    body = next(b for m, u, b in fake.calls if m == "POST" and u.endswith("/lakehouses"))
+    assert body["folderId"] == "fld-1"
+
+
+def test_create_warehouse_folder_placement(_patch):
+    class FolderWarehouseFabric(FakeWarehouseFabric):
+        def __call__(self, method, url, **kw):
+            if url.endswith("/workspaces/ws-guid/folders"):
+                self.calls.append((method, url, kw.get("json_body")))
+                return FakeResp(200, {"value": []} if method == "GET" else {"id": "fld-1"})
+            return super().__call__(method, url, **kw)
+
+    fake = _patch(FolderWarehouseFabric(existing=[], create=FakeResp(201, {"id": "wh-new"})))
+    assert _ws().create_warehouse("gold_dwh", folder="data") == "wh-new"
+    body = next(b for m, u, b in fake.calls if m == "POST" and u.endswith("/warehouses"))
+    assert body["folderId"] == "fld-1"
+
+
 def test_create_warehouse_lro_202(_patch):
     _patch(FakeWarehouseFabric(existing=[], create=FakeResp(202, headers={"Location": "u/lro"})))
     assert _ws().create_warehouse("gold_dwh") == "wh-lro"
