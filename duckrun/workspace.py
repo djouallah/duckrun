@@ -140,6 +140,20 @@ def _is_pipeline_json(obj) -> bool:
         and "activities" in obj["properties"]
 
 
+def _walk_activities(activities):
+    """Every activity in ``activities``, recursing into container activities — ForEach/Until carry
+    nested ``typeProperties.activities``, If ``ifTrueActivities``/``ifFalseActivities``, Switch
+    ``cases[].activities`` + ``defaultActivities`` — so a notebook activity is found wherever it
+    sits, not only at the top level."""
+    for act in activities or []:
+        yield act
+        tp = act.get("typeProperties") or {}
+        for key in ("activities", "ifTrueActivities", "ifFalseActivities", "defaultActivities"):
+            yield from _walk_activities(tp.get(key))
+        for case in tp.get("cases") or []:
+            yield from _walk_activities(case.get("activities"))
+
+
 def _is_variable_library_json(obj) -> bool:
     """Whether ``obj`` (parsed JSON) is a variable-library ``variables.json`` — ``{"variables": [...]}``."""
     return isinstance(obj, dict) and isinstance(obj.get("variables"), list)
@@ -175,22 +189,64 @@ def _read_source(source: str) -> bytes:
         return f.read()
 
 
+def _scan_loose_files(folder: str) -> List[Dict]:
+    """The deployable loose files directly under ``folder`` — a plain directory of ``.ipynb`` /
+    ``.bim`` / ``.json`` sources with no git-integration layout (e.g. a repo's ``notebooks/``).
+    Each file is typed by its extension (a ``.json`` by sniffing pipeline vs variable library,
+    exactly like the single-file deploy) and named by its stem; returned in dependency order.
+    Not recursive: only the folder's own files, so a nested project tree isn't swept up by
+    accident."""
+    items = []
+    for fname in sorted(os.listdir(folder)):
+        path = os.path.join(folder, fname)
+        stem, ext = os.path.splitext(fname)
+        ext = ext.lower()
+        if not os.path.isfile(path) or ext not in _DEPLOY_EXT:
+            continue
+        if ext == ".ipynb":
+            item_type = "Notebook"
+        elif ext == ".bim":
+            item_type = "SemanticModel"
+        else:
+            try:
+                with open(path, "rb") as f:
+                    obj = json.load(f)
+            except ValueError as exc:
+                raise RemoteRunError(f"{path!r} is not valid JSON: {exc}")
+            if _is_pipeline_json(obj):
+                item_type = "DataPipeline"
+            elif _is_variable_library_json(obj):
+                item_type = "VariableLibrary"
+            else:
+                raise RemoteRunError(
+                    f"{path!r} is neither a Fabric data pipeline (properties.activities) nor a "
+                    "variable library (variables)")
+        items.append({"type": item_type, "name": stem, "primary": path})
+    items.sort(key=lambda it: _DEPLOY_ORDER.index(it["type"]))
+    return items
+
+
 def _scan_item_folders(folder: str) -> List[Dict]:
     """The Fabric items under ``folder`` (git-integration layout: one ``name.ItemType`` subfolder
     per item, each holding a ``.platform`` metadata file). Returns, in dependency order, one
     ``{"type", "name", "primary"}`` per item — ``name`` is the ``.platform`` displayName and
     ``primary`` the definition file the single-file deploy path consumes. Pointing at an item
-    folder itself (``.../run.Notebook``) yields just that item. Unknown types and malformed
-    folders raise rather than skip: a partial deploy that looked complete is worse than a loud
-    failure."""
+    folder itself (``.../run.Notebook``) yields just that item. A folder with no ``.platform``
+    items falls back to its loose deployable files (``_scan_loose_files``). Unknown types and
+    malformed folders raise rather than skip: a partial deploy that looked complete is worse
+    than a loud failure."""
     if os.path.isfile(os.path.join(folder, ".platform")):
         dirs = [folder]                     # an item folder itself, not a folder of items
     else:
         dirs = sorted(os.path.join(folder, d) for d in os.listdir(folder)
                       if os.path.isfile(os.path.join(folder, d, ".platform")))
     if not dirs:
+        loose = _scan_loose_files(folder)
+        if loose:
+            return loose
         raise RemoteRunError(
-            f"no Fabric items under {folder!r} (no subfolder has a .platform file)")
+            f"no Fabric items under {folder!r} (no subfolder has a .platform file, and no "
+            f"loose {'/'.join(_DEPLOY_EXT)} files)")
     items = []
     for d in dirs:
         platform = os.path.join(d, ".platform")
@@ -217,12 +273,13 @@ def _scan_item_folders(folder: str) -> List[Dict]:
 
 
 def _has_notebook_activity(primary: str) -> bool:
-    """Whether a ``pipeline-content.json`` has a ``TridentNotebook`` activity — i.e. anything a
-    notebook repoint could rewrite (``_repoint_pipeline`` raises on a pipeline without one)."""
+    """Whether a ``pipeline-content.json`` has a ``TridentNotebook`` activity — however deeply
+    nested — i.e. anything a notebook repoint could rewrite (``_repoint_pipeline`` raises on a
+    pipeline without one)."""
     with open(primary, "rb") as f:
         obj = json.load(f)
     activities = (obj.get("properties") or {}).get("activities") or []
-    return any(act.get("type") == "TridentNotebook" for act in activities)
+    return any(act.get("type") == "TridentNotebook" for act in _walk_activities(activities))
 
 
 class ScriptResult:
@@ -313,7 +370,10 @@ class Workspace:
         ``{displayName: item id}``. Names come from each item's ``.platform``; a pipeline's
         notebook activities are automatically pointed at the folder's notebook when it has exactly
         one (``notebook=`` picks one otherwise). Each item honours ``lakehouse`` / ``variables`` /
-        ``overwrite`` exactly as a single-file deploy of that item would.
+        ``overwrite`` exactly as a single-file deploy of that item would. A **plain folder** with
+        no ``.platform`` items works too: its loose ``.ipynb`` / ``.bim`` / ``.json`` files (top
+        level only) deploy the same way, each named by its filename stem — so
+        ``ws.deploy("notebooks", overwrite=True)`` ships a repo's whole notebook directory.
 
         A **file** ``source`` is a local path or an ``http(s)`` URL (a raw file URL), and the item
         id is returned. The item type is keyed off the extension — ``.ipynb`` → notebook, ``.bim`` → semantic model, ``.json`` → a data
@@ -596,7 +656,7 @@ class Workspace:
         obj = json.loads(content)
         activities = (obj.get("properties") or {}).get("activities") or []
         repointed = 0
-        for act in activities:
+        for act in _walk_activities(activities):
             if act.get("type") == "TridentNotebook":
                 tp = act.setdefault("typeProperties", {})
                 tp["notebookId"] = nb_id

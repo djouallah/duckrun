@@ -468,6 +468,27 @@ def test_repoint_pipeline_points_notebook_by_name(_patch):
     assert acts[1] == {"type": "Wait", "typeProperties": {"waitTimeInSeconds": 1}}   # untouched
 
 
+def test_repoint_pipeline_reaches_nested_activities(_patch):
+    # A notebook activity buried in containers (ForEach sweep, If branch) is repointed too — the
+    # walk recurses through typeProperties.activities / ifTrueActivities / ifFalseActivities /
+    # Switch cases, not just the top level.
+    _patch(DeployFabric(kind="notebooks", existing=[{"displayName": "run", "id": "nb-123"}]))
+    ws = _ws()
+    pipeline = json.dumps({"properties": {"activities": [
+        {"type": "ForEach", "typeProperties": {"isSequential": True, "activities": [
+            {"type": "TridentNotebook", "typeProperties": {"notebookId": "SRC-NB", "workspaceId": "SRC-WS"}},
+        ]}},
+        {"type": "If", "typeProperties": {"ifTrueActivities": [
+            {"type": "TridentNotebook", "typeProperties": {"notebookId": "SRC-NB2", "workspaceId": "SRC-WS"}},
+        ]}},
+    ]}}).encode()
+    acts = json.loads(ws._repoint_pipeline(pipeline, "run"))["properties"]["activities"]
+    inner = acts[0]["typeProperties"]["activities"][0]["typeProperties"]
+    branch = acts[1]["typeProperties"]["ifTrueActivities"][0]["typeProperties"]
+    assert inner == {"notebookId": "nb-123", "workspaceId": "ws-guid"}
+    assert branch == {"notebookId": "nb-123", "workspaceId": "ws-guid"}
+
+
 def test_repoint_pipeline_none_is_verbatim(_patch):
     _patch(DeployFabric(kind="notebooks"))
     content = json.dumps({"properties": {"activities": []}}).encode()
@@ -727,6 +748,42 @@ def test_deploy_folder_overwrite_forwarded(_patch, tmp_path):
     assert any(m == "POST" and u.endswith("/notebooks/old-nb/updateDefinition")
                for m, u, _ in fake.calls)
     assert fake.created() == []                                           # never a fresh create
+
+
+def test_deploy_loose_folder_by_extension(_patch, monkeypatch, tmp_path):
+    # A plain folder — no .platform layout, just files — deploys each loose .ipynb/.bim/.json by
+    # extension, named by stem, in dependency order; the pipeline's NESTED notebook activity is
+    # automagically pointed at the folder's sole notebook.
+    fake = _patch(MultiDeployFabric())
+    root = tmp_path / "notebooks"
+    root.mkdir()
+    (root / "etl.ipynb").write_text(_NB_JSON, encoding="utf-8")
+    (root / "sweep.json").write_text(json.dumps({"properties": {"activities": [
+        {"type": "ForEach", "typeProperties": {"activities": [
+            {"type": "TridentNotebook", "typeProperties": {"notebookId": "SRC-NB", "workspaceId": "SRC-WS"}},
+        ]}}]}}), encoding="utf-8")
+    ids = _ws().deploy(str(root))
+    assert ids == {"etl": "item-1", "sweep": "item-2"}
+    assert fake.created() == ["notebooks", "dataPipelines"]      # notebook first, pipeline last
+    out = json.loads(_decoded_part(fake, "/workspaces/ws-guid/dataPipelines", "pipeline-content.json"))
+    inner = out["properties"]["activities"][0]["typeProperties"]["activities"][0]["typeProperties"]
+    assert inner == {"notebookId": "item-1", "workspaceId": "ws-guid"}
+
+
+def test_deploy_loose_folder_ignores_unsupported_files(_patch, tmp_path):
+    # Unsupported loose files are skipped, not errors; a folder with ONLY unsupported files still
+    # raises the no-items error.
+    fake = _patch(MultiDeployFabric())
+    root = tmp_path / "notebooks"
+    root.mkdir()
+    (root / "etl.ipynb").write_text(_NB_JSON, encoding="utf-8")
+    (root / "readme.md").write_text("# notes", encoding="utf-8")
+    assert _ws().deploy(str(root)) == {"etl": "item-1"}
+    junk = tmp_path / "junk"
+    junk.mkdir()
+    (junk / "data.csv").write_text("x", encoding="utf-8")
+    with pytest.raises(fr.RemoteRunError, match="no Fabric items"):
+        _ws().deploy(str(junk))
 
 
 def test_deploy_folder_unknown_type_raises(_patch, tmp_path):
