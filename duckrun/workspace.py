@@ -29,7 +29,7 @@ from urllib.parse import urlsplit
 _ONELAKE_REF = re.compile(
     r"onelake\.dfs\.fabric\.microsoft\.com/([0-9a-fA-F-]{36})/([0-9a-fA-F-]{36})")
 
-from .auth import get_fabric_token, get_powerbi_token
+from .auth import get_fabric_token, get_onelake_token, get_powerbi_token
 from .fabric_remote import (
     _FABRIC_API,
     RemoteRunError,
@@ -46,6 +46,12 @@ from .fabric_remote import (
     _create_variable_library,
     _run_job_and_wait,
     _schedule_item,
+    _ensure_folder,
+    _execute_notebook,
+    _looks_like_guid,
+    _print_remote_log,
+    _zip_payload,
+    build_script_notebook,
 )
 
 _WEEKDAYS = {d[:3].lower(): d for d in
@@ -219,6 +225,20 @@ def _has_notebook_activity(primary: str) -> bool:
     return any(act.get("type") == "TridentNotebook" for act in activities)
 
 
+class ScriptResult:
+    """What :meth:`Workspace.run_python` hands back: ``success`` (returncode == 0),
+    ``returncode`` (the remote script's exit status; -1 = it never ran), and ``log``
+    (the full captured stdout/stderr — already streamed live during the run)."""
+
+    def __init__(self, returncode: int, log: str):
+        self.returncode = int(returncode)
+        self.success = self.returncode == 0
+        self.log = log
+
+    def __repr__(self) -> str:
+        return f"ScriptResult(success={self.success}, returncode={self.returncode}, log=<{len(self.log)} chars>)"
+
+
 class Workspace:
     """A Fabric control-plane handle scoped to one workspace.
 
@@ -283,7 +303,8 @@ class Workspace:
 
     def deploy(self, source: str, lakehouse: Optional[str] = None, variables: Optional[Dict] = None,
                name: Optional[str] = None, overwrite: bool = False,
-               notebook: Optional[str] = None) -> Union[str, Dict[str, str]]:
+               notebook: Optional[str] = None,
+               folder: Optional[str] = None) -> Union[str, Dict[str, str]]:
         """Deploy a file artifact — or a whole folder of items — to the workspace.
 
         A **folder** ``source`` (the Fabric git-integration layout: one ``name.ItemType`` subfolder
@@ -316,12 +337,20 @@ class Workspace:
         (``{"lakehouse_name": "bronze", "workspace_id": ws.id, ...}``) — the environment-specific
         injection, without editing the file. An unknown variable name raises.
 
+        ``folder`` names a WORKSPACE folder to deploy into (created at the root if absent) —
+        keeps deployed items grouped instead of landing loose in the workspace. Placement
+        applies when the item is CREATED; an ``overwrite`` of an existing item updates its
+        definition in place and leaves it wherever it already lives. Unlike the throwaway run
+        notebooks' best-effort temp parking, an explicitly requested ``folder`` raises if it
+        cannot be resolved.
+
         ``lakehouse`` / ``notebook`` / ``variables`` are ignored for artifact types they don't apply
         to. Not idempotent: if an item of that name already exists it is replaced only when
         ``overwrite=True``, otherwise this raises.
         """
         if os.path.isdir(source):
-            return self._deploy_folder(source, lakehouse, variables, name, overwrite, notebook)
+            return self._deploy_folder(source, lakehouse, variables, name, overwrite, notebook,
+                                       folder)
         stem, ext = os.path.splitext(_basename(source))
         ext = ext.lower()
         if ext not in _DEPLOY_EXT:
@@ -345,21 +374,27 @@ class Workspace:
         # delete-then-recreate: the item id and its schedules survive, there is no async-delete name
         # race, and a stuck/undeletable item can't block a redeploy. None → a fresh create.
         item_id = existing["id"] if existing else None
+        # Explicitly requested placement is required (raise on failure), applies to fresh creates.
+        folder_id = _ensure_folder(self._token, self.id, folder, required=True) if folder else None
 
         if endpoint == "notebooks":
-            return _create_notebook(self._token, self.id, name, json.loads(content), item_id=item_id)
+            return _create_notebook(self._token, self.id, name, json.loads(content),
+                                    item_id=item_id, folder_id=folder_id)
         if endpoint == "dataPipelines":
-            return _create_pipeline(self._token, self.id, name, content, item_id=item_id)
+            return _create_pipeline(self._token, self.id, name, content, item_id=item_id,
+                                    folder_id=folder_id)
         if endpoint == "variableLibraries":
-            return _create_variable_library(self._token, self.id, name, content, item_id=item_id)
+            return _create_variable_library(self._token, self.id, name, content, item_id=item_id,
+                                            folder_id=folder_id)
         # semanticModels → create/update, then refresh/reframe so it is live.
-        item_id = _create_semantic_model(self._token, self.id, name, content, item_id=item_id)
+        item_id = _create_semantic_model(self._token, self.id, name, content, item_id=item_id,
+                                         folder_id=folder_id)
         _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
 
     def _deploy_folder(self, folder: str, lakehouse: Optional[str], variables: Optional[Dict],
-                       name: Optional[str], overwrite: bool,
-                       notebook: Optional[str]) -> Dict[str, str]:
+                       name: Optional[str], overwrite: bool, notebook: Optional[str],
+                       ws_folder: Optional[str] = None) -> Dict[str, str]:
         """Deploy every Fabric item under ``folder`` in dependency order; return
         ``{displayName: item id}``. Each item recurses through the single-file ``deploy``, so the
         Direct Lake repoint, variable injection, semantic-model refresh and ``overwrite`` semantics
@@ -377,7 +412,8 @@ class Workspace:
                     and _has_notebook_activity(it["primary"]):
                 nb = notebooks[0]
             ids[it["name"]] = self.deploy(it["primary"], lakehouse=lakehouse, variables=variables,
-                                          name=it["name"], overwrite=overwrite, notebook=nb)
+                                          name=it["name"], overwrite=overwrite, notebook=nb,
+                                          folder=ws_folder)
         return ids
 
     def download(self, folder: str = ".", name: Optional[str] = None,
@@ -454,6 +490,71 @@ class Workspace:
         """
         kind, item_id = self._resolve_runnable(name)
         return _run_job_and_wait(self._token, self.id, item_id, job_type=_RUNNABLE[kind])
+
+    def run_python(self, script: str, *, lakehouse: Optional[str] = None,
+                   args: Optional[List[str]] = None, env: Optional[Dict[str, str]] = None,
+                   cores: Optional[int] = None, pip: Optional[List[str]] = None,
+                   setup: Optional[str] = None, entry: Optional[str] = None,
+                   name: Optional[str] = None, attempts: int = 3,
+                   keep_notebook: bool = False) -> "ScriptResult":
+        """Run an arbitrary local Python script on Fabric compute and wait for it.
+
+        ``script`` is a local ``.py`` file, or a folder shipped whole (build/vcs cruft excluded)
+        with ``entry='relative/script.py'`` naming what to execute. The script runs as a
+        SUBPROCESS of a throwaway Fabric Python notebook — a fresh interpreter on the ~135 GiB
+        work disk, data-local to OneLake — with its stdout/stderr streamed back live as
+        ``[remote] …`` lines while it runs, exactly like ``RemoteRunner`` streams dbt.
+
+        ``lakehouse`` (name or id; inferred when the workspace has exactly one) hosts the tiny
+        result/log round-trip files under ``Files/duckrun_remote/``. ``cores`` sizes the
+        notebook (Fabric sizes 4/8/16/32/64; None = workspace default; memory scales with it).
+        ``env`` is exported to the script — pass config, never tokens: the remote side
+        self-acquires through its Fabric runtime. ``pip`` packages are installed in the
+        notebook before the script runs (the harness itself needs nothing). ``setup`` is an
+        optional Python snippet exec'd first in the harness namespace (``say``/``tee``/``WORK``
+        available) — the hook for odd prerequisites like a portable JDK.
+
+        Session-level failures (the job dies before the script ran — capacity throttling or
+        contention) are retried up to ``attempts`` with growing backoff; a script that ran and
+        exited non-zero is NOT retried. Returns a :class:`ScriptResult` (``success`` /
+        ``returncode`` / ``log``); the throwaway notebook is deleted afterwards unless
+        ``keep_notebook``.
+        """
+        if cores is not None and cores not in (4, 8, 16, 32, 64):
+            raise RemoteRunError(
+                f"cores={cores!r} is not a Fabric Python-notebook size; use 4, 8, 16, 32 or 64 "
+                "(or omit it for the workspace default).")
+        if lakehouse is None:
+            lhs = self.list_lakehouses()
+            if len(lhs) != 1:
+                have = ", ".join(sorted(lh.get("displayName", "?") for lh in lhs)) or "(none)"
+                raise RemoteRunError(
+                    f"run_python needs lakehouse= when the workspace doesn't have exactly one; "
+                    f"have: {have}")
+            lh_id = lhs[0]["id"]
+        else:
+            lh_id = lakehouse if _looks_like_guid(lakehouse) else self.lakehouse_id(lakehouse)
+
+        import uuid as _uuid
+        runid = _uuid.uuid4().hex[:12]
+        payload, entry_rel = _zip_payload(script, entry=entry)
+        result_path = (f"abfss://{self.id}@onelake.dfs.fabric.microsoft.com/{lh_id}"
+                       f"/Files/duckrun_remote/{runid}.json")
+        notebook = build_script_notebook(runid, base64.b64encode(payload).decode("ascii"),
+                                         entry_rel, list(args or []), result_path,
+                                         pip, env, cores, setup)
+        nb_name = name or f"duckrun-py-{runid}"
+        print(f"[duckrun.remote] running {entry_rel} on Fabric as {nb_name} "
+              f"(vCores={cores or 'workspace default'})", flush=True)
+        result = _execute_notebook(fabric_token=self._token, storage_token=get_onelake_token(),
+                                   ws_id=self.id, name=nb_name, notebook=notebook,
+                                   result_path=result_path, attempts=attempts,
+                                   keep_notebook=keep_notebook)
+        streamed = result.pop("_streamed_chars", 0)
+        log_text = result.get("log", "")
+        if len(log_text) > streamed:
+            _print_remote_log(log_text[streamed:])
+        return ScriptResult(result.get("returncode", -1), log_text)
 
     def schedule(self, name: str, every=None, daily=None, weekly=None, at=None, tz: str = "UTC") -> str:
         """Schedule a deployed notebook or pipeline to run on Fabric; return the schedule id.

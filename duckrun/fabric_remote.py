@@ -56,6 +56,11 @@ _ZIP_EXCLUDE_DIRS = {"target", "dbt_packages", "logs", ".git", "__pycache__", ".
 # Terminal Fabric job-instance states.
 _JOB_DONE = {"Completed", "Failed", "Cancelled", "Deduped"}
 
+# Workspace folder the throwaway run notebooks are parked in (created on first use) so they
+# never clutter the workspace root for other users. Cosmetic: created best-effort, root fallback.
+# 0_ prefix sorts it to the top of the item list, visibly "not your stuff".
+_TEMP_FOLDER = "0_temp"
+
 # Retry status/attempt policy lives in dbt.adapters.duckrun.remote (retry_request) — shared with
 # the DFS side so the two REST layers can't drift.
 # Overall wall-clock cap on a single remote run, and the poll cadence (seconds). Big remote jobs
@@ -198,6 +203,37 @@ def zip_project(project_dir: str, profiles_dir: Optional[str] = None) -> bytes:
                 zf.writestr(arc, _read_bytes(full))
         zf.writestr("profiles.yml", _scrub_profiles_yaml(project_dir, profiles_dir))
     return buf.getvalue()
+
+
+def _zip_payload(source: str, entry: Optional[str] = None):
+    """Zip an arbitrary Python payload for :meth:`Workspace.run_python` — a single ``.py`` file,
+    or a folder (minus the same build/vcs cruft ``zip_project`` excludes). Returns
+    ``(zip_bytes, entry_rel)`` where ``entry_rel`` is the archive-relative script to execute:
+    the file itself for a file payload; for a folder, ``entry`` names it (relative to the
+    folder) and is validated against the archive."""
+    source = os.path.abspath(source)
+    buf = io.BytesIO()
+    if os.path.isfile(source):
+        entry_rel = os.path.basename(source)
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(entry_rel, _read_bytes(source))
+        return buf.getvalue(), entry_rel
+    if not os.path.isdir(source):
+        raise RemoteRunError(f"run_python payload not found: {source!r}")
+    if not entry:
+        raise RemoteRunError("run_python needs entry='relative/script.py' when the payload is a folder")
+    entry_rel = entry.replace(os.sep, "/")
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, dirs, files in os.walk(source):
+            dirs[:] = [d for d in dirs if d not in _ZIP_EXCLUDE_DIRS]
+            for name in files:
+                full = os.path.join(root, name)
+                arc = os.path.relpath(full, source).replace(os.sep, "/")
+                zf.writestr(arc, _read_bytes(full))
+    with zipfile.ZipFile(io.BytesIO(buf.getvalue())) as zf:
+        if entry_rel not in zf.namelist():
+            raise RemoteRunError(f"entry {entry_rel!r} not found in payload folder {source!r}")
+    return buf.getvalue(), entry_rel
 
 
 def _read_bytes(path: str) -> bytes:
@@ -403,6 +439,105 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
     return nb
 
 
+def build_script_notebook(runid: str, payload_b64: str, entry: str, args: List[str],
+                          result_path: str, pip: Optional[List[str]], env: Optional[Dict[str, str]],
+                          cores: Optional[int], setup: Optional[str] = None) -> dict:
+    """The :meth:`Workspace.run_python` notebook: unzip an arbitrary Python payload and run its
+    ``entry`` script as a SUBPROCESS of the kernel (a fresh interpreter — the runtime's
+    preinstalled duckdb/deltalake natives can never be stale in it, so no restartPython dance),
+    tee'ing its output to the live ``.log`` beside the result JSON. Pure: no network, no Fabric.
+
+    All config is embedded as PYTHON literals (``repr``) — never ``json.dumps``, whose
+    ``false``/``true`` are NameErrors in a Python cell. ``pip`` packages (if any) are installed
+    before the script; ``setup`` is an optional Python snippet exec'd in the harness namespace
+    first (``say``/``tee``/``WORK`` available) — the hook for e.g. installing a portable JDK.
+    The harness itself needs nothing installed: ``notebookutils`` ships with the runtime.
+
+    Like ``build_notebook``, the whole body is wrapped so ANY failure lands, with its traceback
+    and log, in the result JSON — the cell always exits cleanly and the runner judges success
+    from ``returncode``, not the Fabric job state."""
+    cfg = {"runid": runid, "entry": entry, "args": [str(a) for a in (args or [])],
+           "result": result_path, "pip": list(pip or []), "env": dict(env or {}),
+           "setup": setup or ""}
+    configure = None
+    if cores:
+        configure = "%%configure -f\n" + json.dumps({"vCores": int(cores)})
+
+    work = (
+        "import base64, io, json, os, subprocess, sys, threading, traceback, zipfile\n"
+        f"CFG = {cfg!r}\n"
+        f"PAYLOAD_B64 = {payload_b64!r}\n"
+        # Same scratch policy as build_notebook: the ~135 GiB work disk, not the cramped overlay.
+        "_SCRATCH = '/home/trusted-service-user/work' if os.path.isdir('/home/trusted-service-user/work') else '/tmp'\n"
+        "_TMPDIR = os.path.join(_SCRATCH, 'duckrun_tmp')\n"
+        "os.makedirs(_TMPDIR, exist_ok=True)\n"
+        "os.environ['TMPDIR'] = _TMPDIR\n"
+        "WORK = os.path.join(_SCRATCH, 'duckrun_py', CFG['runid'])\n"
+        "_buf = io.StringIO()\n"
+        # Live log: identical flusher to build_notebook's — the runner tails LOG_PATH.
+        "LOG_PATH = CFG['result'][:-5] + '.log'\n"
+        "_log_done = threading.Event()\n"
+        "def _flush_log():\n"
+        "    import notebookutils as _nb\n"
+        "    _last = -1\n"
+        "    while True:\n"
+        "        _stop = _log_done.wait(15)\n"
+        "        _v = _buf.getvalue()\n"
+        "        if len(_v) != _last:\n"
+        "            _last = len(_v)\n"
+        "            try:\n"
+        "                _nb.fs.put(LOG_PATH, _v, overwrite=True)\n"
+        "            except Exception:\n"
+        "                pass\n"
+        "        if _stop:\n"
+        "            return\n"
+        "threading.Thread(target=_flush_log, daemon=True).start()\n"
+        "def say(msg):\n"
+        "    print(msg, flush=True)\n"
+        "    _buf.write(str(msg) + '\\n')\n"
+        "def tee(cmd, env=None, cwd=None):\n"
+        "    say('$ ' + ' '.join(cmd))\n"
+        "    _p = subprocess.Popen(cmd, env=env, cwd=cwd, text=True,\n"
+        "                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT)\n"
+        "    for _line in _p.stdout:\n"
+        "        say(_line.rstrip('\\n'))\n"
+        "    return _p.wait()\n"
+        "rc = -1\n"
+        "try:\n"
+        "    os.makedirs(WORK, exist_ok=True)\n"
+        "    with zipfile.ZipFile(io.BytesIO(base64.b64decode(PAYLOAD_B64))) as _z:\n"
+        "        _z.extractall(WORK)\n"
+        "    os.chdir(WORK)\n"
+        "    if CFG['pip']:\n"
+        "        if tee([sys.executable, '-m', 'pip', 'install', '-q'] + CFG['pip']) != 0:\n"
+        "            raise RuntimeError('pip install failed: %s' % CFG['pip'])\n"
+        "    if CFG['setup']:\n"
+        "        exec(CFG['setup'])\n"
+        "    _env = dict(os.environ)\n"
+        "    _env.update(CFG['env'])\n"
+        "    rc = tee([sys.executable, os.path.join(WORK, CFG['entry'])] + CFG['args'],\n"
+        "             env=_env, cwd=WORK)\n"
+        "except BaseException:\n"
+        "    _buf.write('\\n' + traceback.format_exc())\n"
+        "    print(traceback.format_exc(), flush=True)\n"
+        "_log_done.set()\n"
+        "_payload = json.dumps({'runid': CFG['runid'], 'returncode': rc, 'success': rc == 0,\n"
+        "                       'log': _buf.getvalue()[-400000:]})\n"
+        "import notebookutils\n"
+        "try:\n"
+        "    notebookutils.fs.put(CFG['result'], _payload, overwrite=True)\n"
+        "except Exception:\n"
+        "    pass\n"
+        "notebookutils.notebook.exit(json.dumps({'runid': CFG['runid'], 'returncode': rc}))\n"
+    )
+
+    cells = [_python_code_cell(configure)] if configure else []
+    cells += [_python_code_cell(work)]
+    nb = _python_notebook(cells)
+    nb["metadata"]["duckrun"] = {"cores": cores, "runid": runid}
+    return nb
+
+
 # --------------------------------------------------------------------------------------------------
 # REST plumbing (control plane + a small data-plane read for the result file)
 # --------------------------------------------------------------------------------------------------
@@ -514,8 +649,37 @@ def _b64_part(path: str, content) -> dict:
     return {"path": path, "payload": base64.b64encode(raw).decode("ascii"), "payloadType": "InlineBase64"}
 
 
+def _ensure_folder(token: str, ws_id: str, name: str, required: bool = False) -> Optional[str]:
+    """The id of the root-level workspace folder called ``name``, creating it if absent.
+
+    Two contracts: the implicit temp parking of throwaway run notebooks passes
+    ``required=False`` — folders are cosmetic there, so ANY failure (tenant without the folders
+    API, permissions, transient error) returns None and the item lands at the workspace root
+    rather than failing the run. An EXPLICIT ``deploy(folder=...)`` passes ``required=True`` —
+    the user asked for that placement, so failure raises instead of silently ignoring them."""
+    try:
+        for f in _paged_values(f"{_FABRIC_API}/workspaces/{ws_id}/folders", token=token):
+            if f.get("displayName") == name and not f.get("parentFolderId"):
+                return f["id"]
+        resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{ws_id}/folders",
+                             token=token, json_body={"displayName": name})
+        if resp.status_code in (200, 201):
+            return resp.json()["id"]
+        if required:
+            raise RemoteRunError(
+                f"could not create workspace folder {name!r} (HTTP {resp.status_code}): "
+                f"{resp.text[:200]}")
+    except RemoteRunError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — cosmetic unless required
+        if required:
+            raise RemoteRunError(f"could not resolve workspace folder {name!r}: {exc}") from exc
+    return None
+
+
 def _create_item(token: str, ws_id: str, endpoint: str, name: str, parts: List[dict],
-                 fmt: Optional[str] = None, item_id: Optional[str] = None) -> str:
+                 fmt: Optional[str] = None, item_id: Optional[str] = None,
+                 folder_id: Optional[str] = None) -> str:
     """Create a Fabric item from an inline base64 definition, or — when ``item_id`` is given — UPDATE
     that existing item's definition in place; return the item id. Handles both the synchronous 200/201
     and the long-running-operation 202 (poll to done). ``endpoint`` is the item collection (e.g.
@@ -540,6 +704,8 @@ def _create_item(token: str, ws_id: str, endpoint: str, name: str, parts: List[d
         raise RemoteRunError(
             f"could not update {endpoint} {item_id} (HTTP {resp.status_code}): {resp.text[:300]}")
     body = {"displayName": name, "definition": definition}
+    if folder_id:
+        body["folderId"] = folder_id
     resp = _http_request("POST", f"{_FABRIC_API}/workspaces/{ws_id}/{endpoint}", token=token, json_body=body)
     if resp.status_code in (200, 201):
         return resp.json()["id"]
@@ -550,14 +716,15 @@ def _create_item(token: str, ws_id: str, endpoint: str, name: str, parts: List[d
 
 
 def _create_notebook(token: str, ws_id: str, name: str, notebook: dict,
-                     item_id: Optional[str] = None) -> str:
+                     item_id: Optional[str] = None, folder_id: Optional[str] = None) -> str:
     """Create a notebook item from an inline base64 ipynb definition (or update ``item_id`` in place);
-    return its item id."""
+    return its item id. ``folder_id`` parks it inside a workspace folder instead of the root."""
     parts = [
         _b64_part("notebook-content.ipynb", notebook),
         _b64_part(".platform", _platform_part(name, "Notebook")),
     ]
-    return _create_item(token, ws_id, "notebooks", name, parts, fmt="ipynb", item_id=item_id)
+    return _create_item(token, ws_id, "notebooks", name, parts, fmt="ipynb", item_id=item_id,
+                        folder_id=folder_id)
 
 
 # Fabric requires this small settings part alongside a TMSL model.bim; supplied internally.
@@ -573,22 +740,24 @@ _REFRESH_DONE = {"Completed", "Failed", "Cancelled", "Disabled"}
 
 
 def _create_semantic_model(token: str, ws_id: str, name: str, model_bim: bytes,
-                           item_id: Optional[str] = None) -> str:
+                           item_id: Optional[str] = None, folder_id: Optional[str] = None) -> str:
     """Create a semantic model from a TMSL ``model.bim`` (raw file bytes), or update ``item_id`` in
     place; return its item id."""
     parts = [_b64_part("model.bim", model_bim), _b64_part("definition.pbism", _PBISM)]
-    return _create_item(token, ws_id, "semanticModels", name, parts, item_id=item_id)
+    return _create_item(token, ws_id, "semanticModels", name, parts, item_id=item_id,
+                        folder_id=folder_id)
 
 
 def _create_pipeline(token: str, ws_id: str, name: str, pipeline_json: bytes,
-                     item_id: Optional[str] = None) -> str:
+                     item_id: Optional[str] = None, folder_id: Optional[str] = None) -> str:
     """Create a data pipeline from a ``pipeline-content.json`` (raw file bytes), or update ``item_id``
     in place; return its item id. The JSON is shipped verbatim — no id/reference rewriting."""
     parts = [
         _b64_part("pipeline-content.json", pipeline_json),
         _b64_part(".platform", _platform_part(name, "DataPipeline")),
     ]
-    return _create_item(token, ws_id, "dataPipelines", name, parts, item_id=item_id)
+    return _create_item(token, ws_id, "dataPipelines", name, parts, item_id=item_id,
+                        folder_id=folder_id)
 
 
 # Fabric requires a settings part alongside variables.json; supplied internally (no value sets).
@@ -599,14 +768,15 @@ _VARLIB_SETTINGS = {
 
 
 def _create_variable_library(token: str, ws_id: str, name: str, variables_json: bytes,
-                             item_id: Optional[str] = None) -> str:
+                             item_id: Optional[str] = None, folder_id: Optional[str] = None) -> str:
     """Create a variable library from a ``variables.json`` (raw file bytes), or update ``item_id`` in
     place; return its item id."""
     parts = [
         _b64_part("variables.json", variables_json),
         _b64_part("settings.json", _VARLIB_SETTINGS),
     ]
-    return _create_item(token, ws_id, "variableLibraries", name, parts, item_id=item_id)
+    return _create_item(token, ws_id, "variableLibraries", name, parts, item_id=item_id,
+                        folder_id=folder_id)
 
 
 # A freshly created Direct Lake model's OneLake read permission propagates asynchronously — Microsoft
@@ -850,6 +1020,70 @@ def _log(message: str) -> None:
     print(f"[duckrun.remote] {message}")
 
 
+def _execute_notebook(*, fabric_token: str, storage_token: str, ws_id: str, name: str,
+                      notebook: dict, result_path: str, attempts: int = 1,
+                      backoffs=(180, 600), keep_notebook: bool = False) -> dict:
+    """THE shared notebook executor — create the item, run it while live-tailing its ``.log``
+    (each new chunk printed as ``[remote] …``), read the result JSON back, tear down. Both
+    ``RemoteRunner`` (dbt) and :meth:`Workspace.run_python` (arbitrary scripts) run through
+    here, so transport fixes land once.
+
+    Session-level failures — the job dies WITHOUT writing the result JSON, i.e. the payload
+    never ran (typically capacity throttling right after another heavy job, or contention) —
+    are retried up to ``attempts`` with growing ``backoffs``. A result whose payload ran and
+    failed is returned as-is, never retried. The previous result object is deleted up front so
+    a stale success can never masquerade as this run's.
+
+    Returns the result dict with ``_streamed_chars`` added (how much of ``log`` the live tail
+    already printed — callers print only the remainder). Raises the job error when no attempt
+    produced a result. The notebook is deleted on the way out unless ``keep_notebook``."""
+    log_path = result_path[:-5] + ".log"
+    streamed = {"chars": 0, "token": storage_token}
+
+    def _tail() -> None:
+        streamed["token"] = _fresh_token(streamed["token"], auth.get_onelake_token)
+        text = _dfs_get(log_path, streamed["token"])
+        new = text[streamed["chars"]:]
+        if new:
+            streamed["chars"] = len(text)
+            for line in new.splitlines():
+                print(f"[remote] {line}")
+
+    _dfs_delete(result_path, _fresh_token(storage_token, auth.get_onelake_token))
+    item_id = _create_notebook(fabric_token, ws_id, name, notebook,
+                               folder_id=_ensure_folder(fabric_token, ws_id, _TEMP_FOLDER))
+    job_err: Optional[Exception] = None
+    result: Optional[dict] = None
+    try:
+        for attempt in range(1, attempts + 1):
+            job_err = None
+            try:
+                fabric_token = _fresh_token(fabric_token, auth.get_fabric_token)
+                _run_job_and_wait(fabric_token, ws_id, item_id, tail=_tail)
+            except Exception as exc:  # noqa: BLE001 — result read decides, not the job state
+                job_err = exc
+            try:
+                # The wait can consume most of the tokens' ~1h life — re-check before the read.
+                result = read_result_json(result_path,
+                                          _fresh_token(storage_token, auth.get_onelake_token))
+            except Exception:  # noqa: BLE001 — absent result = the payload never ran
+                result = None
+            if result is not None:
+                result["_streamed_chars"] = streamed["chars"]
+                return result
+            if attempt < attempts:
+                delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
+                _log(f"job died before the payload ran ({job_err}); retrying in {delay}s")
+                _sleep(delay)
+    finally:
+        if not keep_notebook:
+            _delete_item(_fresh_token(fabric_token, auth.get_fabric_token), ws_id, item_id)
+        _dfs_delete(log_path, _fresh_token(streamed["token"], auth.get_onelake_token))
+    if job_err is not None:
+        raise job_err
+    raise RemoteRunError("remote job finished but produced no result JSON")
+
+
 # --------------------------------------------------------------------------------------------------
 # The runner
 # --------------------------------------------------------------------------------------------------
@@ -961,36 +1195,16 @@ class RemoteRunner:
 
         ws_id = _resolve_workspace_id(fabric_token, workspace)
         _log(f"creating temp notebook duckrun-remote-{runid} in workspace {workspace}")
-        item_id = _create_notebook(fabric_token, ws_id, f"duckrun-remote-{runid}", notebook)
+        result = _execute_notebook(fabric_token=fabric_token, storage_token=storage_token,
+                                   ws_id=ws_id, name=f"duckrun-remote-{runid}",
+                                   notebook=notebook, result_path=result_path)
 
-        # Live tail: the notebook flushes its captured dbt output to <runid>.log every ~15s;
-        # each poll prints whatever is new, so the dbt build streams into THIS process's stdout
-        # as it happens. Absence of the file (job still booting) is normal and silent.
-        log_path = f"{files_base}/duckrun_remote/{runid}.log"
-        streamed = {"chars": 0, "token": storage_token}
-
-        def _tail() -> None:
-            streamed["token"] = _fresh_token(streamed["token"], auth.get_onelake_token)
-            text = _dfs_get(log_path, streamed["token"])
-            new = text[streamed["chars"]:]
-            if new:
-                streamed["chars"] = len(text)
-                for line in new.splitlines():
-                    print(f"[remote] {line}")
-
-        try:
-            _run_job_and_wait(fabric_token, ws_id, item_id, tail=_tail)
-            # The wait can consume most of the tokens' ~1h life — re-check before the post-wait reads.
-            result = read_result_json(result_path, _fresh_token(storage_token, auth.get_onelake_token))
-        finally:
-            _delete_item(_fresh_token(fabric_token, auth.get_fabric_token), ws_id, item_id)
-            _dfs_delete(log_path, _fresh_token(streamed["token"], auth.get_onelake_token))
-
-        # Print whatever the tail didn't catch (the .log flush is periodic; the result JSON is
-        # authoritative). When nothing streamed — e.g. a fast job — this is the whole log.
+        # Print whatever the live tail didn't catch (the .log flush is periodic; the result JSON
+        # is authoritative). When nothing streamed — e.g. a fast job — this is the whole log.
+        streamed = result.pop("_streamed_chars", 0)
         log_text = result.get("log", "")
-        if len(log_text) > streamed["chars"]:
-            _print_remote_log(log_text[streamed["chars"]:])
+        if len(log_text) > streamed:
+            _print_remote_log(log_text[streamed:])
         return result.get("results", [])
 
 

@@ -93,7 +93,9 @@ def test_invoke_runs_full_sequence_and_populates_result(project, monkeypatch):
     assert res.result == [{"node": "m", "status": "success"}]
 
     seq = [m for m, _, _ in fake.calls]
-    assert seq == ["GET", "POST", "POST", "GET", "DELETE"]  # workspaces, create, run, poll, delete
+    # workspaces, folders (best-effort park attempt; this fake rejects it -> root fallback),
+    # create, run, poll, delete
+    assert seq == ["GET", "GET", "POST", "POST", "GET", "DELETE"]
     assert fake.deleted is True
     # control-plane calls carry the FABRIC token, never the storage token
     assert all(tok == "FAB-TOKEN" for _, _, tok in fake.calls)
