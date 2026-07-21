@@ -170,6 +170,21 @@ def test_iceberg_profile_expands_to_one_attachment():
     assert c.settings.get("preserve_insertion_order") is False
 
 
+def test_iceberg_profile_pins_azure_transport(monkeypatch):
+    """The expansion pins the azure transport in `settings:` — this profile hands secret-minting to
+    dbt-duckdb, so nothing else runs _set_azure_transport on the connection, and a Linux runner's
+    `default` transport dies with "Problem with the SSL CA cert" (first live iceberg CI run)."""
+    monkeypatch.setattr(secret, "_resolve_azure_transport", lambda: "curl")
+    assert _iceberg_creds().settings.get("azure_transport_option_type") == "curl"
+
+
+def test_iceberg_profile_leaves_transport_where_default_works(monkeypatch):
+    """Where the platform wants DuckDB's default transport (Windows / Fabric notebook), the
+    expansion must NOT pin anything — forcing curl there is the #16 Windows regression."""
+    monkeypatch.setattr(secret, "_resolve_azure_transport", lambda: None)
+    assert "azure_transport_option_type" not in _iceberg_creds().settings
+
+
 def test_iceberg_schema_and_alias_from_path():
     c = _iceberg_creds(root_path="ws/sales.Lakehouse/mart", database="ice")
     assert c.database == "ice"
