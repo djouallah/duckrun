@@ -16,9 +16,9 @@ notebookutils.session.restartPython()
 ```python
 import duckrun
 
-conn = duckrun.connect("abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables/dbo", read_only=False)
+conn = duckrun.connect("<ws>/<lakehouse>.Lakehouse/dbo", read_only=False)
 
-conn.attach("abfss://<ws>@onelake.dfs.fabric.microsoft.com/<warehouse>.Warehouse/Tables", name="wh", read_only=True)
+conn.attach("<ws>/<warehouse>.Warehouse", name="wh", read_only=True)
 
 # write a Delta table with plain SQL — CREATE TABLE AS SELECT routes to delta-rs
 conn.sql("""
