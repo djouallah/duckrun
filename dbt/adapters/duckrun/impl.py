@@ -289,7 +289,7 @@ class DuckrunAdapter(DuckDBAdapter):
         from . import engine
         return engine.open_delta_tables(targets)
 
-    def _register_delta_view(self, relation, dt=None):
+    def _register_delta_view(self, relation, dt=None, cursor=None):
         """Create the ``delta_scan`` view for a discovered Delta relation on the live
         connection so read-only commands (``dbt test``, ``dbt show``, ``dbt docs``) that
         never materialize anything can still query the model.
@@ -298,8 +298,9 @@ class DuckrunAdapter(DuckDBAdapter):
         here too is harmless — the materialization's ``create or replace`` just supersedes it.
         But for a command that runs no models, this is the only place the physical view gets
         created from the Delta tables discovered on disk. ``dt`` is discovery's already-opened
-        handle, reused for the docs read. The caller has already created the schema (once, not
-        per relation).
+        handle, reused for the docs read. ``cursor`` lets a concurrent caller
+        (:meth:`_register_delta_views`) supply a per-worker cursor; default is the shared one.
+        The caller has already created the schema (once, not per relation).
         """
         root_path, _ = self.config.credentials.root_for(relation.database)
         if not root_path:
@@ -310,7 +311,8 @@ class DuckrunAdapter(DuckDBAdapter):
             + "/" + str(relation.identifier).strip('"')
         )
         try:
-            cursor = self._cursor()
+            if cursor is None:
+                cursor = self._cursor()
             loc_sql = location.replace("'", "''")  # escape quotes in the delta_scan path literal
             cursor.execute(
                 f"create or replace view {relation.render()} as "
@@ -325,11 +327,151 @@ class DuckrunAdapter(DuckDBAdapter):
             # debug so a systematic failure (e.g. a missing secret) is still diagnosable.
             logger.debug(f"duckrun: could not register delta_scan view for {location!r}: {exc}")
 
+    def _register_delta_views(self, pairs):
+        """Register the ``delta_scan`` views for ``[(relation, dt), …]``, concurrently.
+
+        ``CREATE VIEW … AS SELECT * FROM delta_scan(…)`` binds at creation — DuckDB's delta
+        extension replays the table's log over the network to resolve the view's types, and it
+        shares no metadata cache with the delta-rs opens that preceded it. Registered serially,
+        those binds were the residual startup tax of issue #16 after the delta-rs opens went
+        concurrent (several seconds per schema on OneLake from a high-latency connection).
+
+        Each worker gets its own raw child cursor of the shared DuckDB database — the catalog,
+        attached databases and (temporary) secrets are all instance-global, and concurrent DDL
+        on distinct view names doesn't conflict — so the wrapped shared cursor never crosses a
+        thread. Falls back to serial registration on the shared cursor when the raw connection
+        isn't reachable (remote/MotherDuck environments) or there's only one view to make.
+        Per-view failures stay best-effort inside :meth:`_register_delta_view`, so one broken
+        table can't sink the batch."""
+        from . import engine
+
+        if not pairs:
+            return
+        conn = None
+        try:
+            conn = getattr(DuckDBConnectionManager.env(), "conn", None)
+        except Exception:  # no environment yet (bare-adapter harness) → serial fallback
+            conn = None
+        if conn is None or len(pairs) == 1:
+            for rel, dt in pairs:
+                self._register_delta_view(rel, dt=dt)
+            return
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _work(pair):
+            rel, dt = pair
+            cursor = conn.cursor()
+            try:
+                self._register_delta_view(rel, dt=dt, cursor=cursor)
+            finally:
+                try:
+                    cursor.close()
+                except Exception:  # pragma: no cover - close is best-effort
+                    pass
+
+        with ThreadPoolExecutor(max_workers=min(engine.POOL_WORKERS, len(pairs))) as pool:
+            list(pool.map(_work, pairs))
+
+    # ------------------------------------------------------------ bulk discovery prefetch
+    # dbt populates its relation cache at task start by listing EVERY manifest schema, and
+    # duckrun pins the run to one thread (Delta write safety), so those listings run serially.
+    # The per-schema work is remote-latency-bound (delta-rs log opens + delta_scan view binds),
+    # so paying it schema-by-schema left a multi-schema project with most of issue #16's tax
+    # even after the per-schema opens went concurrent. _relations_cache_for_schemas is the one
+    # place dbt announces the whole burst up front — so prefetch there: list every schema, then
+    # open ALL tables' logs in one cross-schema pool, then bind all views in another, and let
+    # each list_relations_without_caching call consume its precomputed slice. The prefetch dies
+    # with the burst (cleared in `finally`), so nothing is ever served stale to a later call.
+    _prefetched = None
+
+    @staticmethod
+    def _prefetch_key(schema_relation):
+        return (
+            str(schema_relation.database).strip('"').lower(),
+            str(schema_relation.schema).strip('"').lower(),
+        )
+
+    def _relations_cache_for_schemas(self, relation_configs, cache_schemas=None):
+        if not cache_schemas:
+            cache_schemas = self._get_cache_schemas(relation_configs)
+        try:
+            self._prefetched = self._prefetch_discovery(cache_schemas)
+        except remote.OneLakeAccessError:
+            raise  # a real access failure stays loud, exactly as in per-schema discovery
+        except Exception as exc:  # best-effort: fall back to the per-schema path unchanged
+            logger.debug(f"duckrun: bulk discovery prefetch failed, using per-schema path: {exc}")
+            self._prefetched = None
+        try:
+            super()._relations_cache_for_schemas(relation_configs, cache_schemas)
+        finally:
+            self._prefetched = None
+
+    def _prefetch_discovery(self, cache_schemas):
+        """Discover, tombstone-filter and view-register every schema's Delta tables in one
+        cross-schema pass; returns ``{(db, schema): [relations]}`` for
+        list_relations_without_caching to consume. Semantics per schema are identical to the
+        per-schema path — same listing, same tombstone contract, same best-effort registration —
+        only the batching differs."""
+        schemas, listed = {}, {}
+        for schema_relation in cache_schemas:
+            key = self._prefetch_key(schema_relation)
+            if key in schemas:  # two quotings of the same schema → one discovery
+                continue
+            schemas[key] = schema_relation
+            listed[key] = self._discover_delta_relations(schema_relation)
+
+        plan = []  # (key, relation, location, storage_options)
+        for key, discovered in listed.items():
+            if not discovered:
+                continue
+            root_path, so = self.config.credentials.root_for(schemas[key].database)
+            root_path = (root_path or "").rstrip("/")
+            for rel in discovered:
+                loc = (root_path + "/" + str(rel.schema).strip('"')
+                       + "/" + str(rel.identifier).strip('"'))
+                plan.append((key, rel, loc, so))
+
+        # ONE concurrent open pool across all schemas (tombstone check + persisted-docs read),
+        # then the tombstone filter — same contract as the per-schema path (see
+        # list_relations_without_caching for the fallback-probe rationale).
+        dts = self._open_delta_tables([(loc, so) for _, _, loc, so in plan])
+        cur = self._cursor()
+        live = {key: [] for key in listed}
+        for (key, rel, loc, so), dt in zip(plan, dts):
+            if dt is not None:
+                if delta_dml.is_dropped_dt(dt):
+                    continue
+            elif delta_dml.is_dropped(cur, loc, so):
+                continue
+            live[key].append((rel, dt))
+
+        # Schemas first (views need them; once per schema), then ONE concurrent bind pool
+        # across all schemas' views.
+        pairs = []
+        for key, rels in live.items():
+            if not rels:
+                continue
+            try:
+                self.create_schema(schemas[key])
+            except Exception as exc:  # best-effort, same contract as view registration
+                logger.debug(f"duckrun: could not create schema for {schemas[key]}: {exc}")
+            pairs.extend(rels)
+        self._register_delta_views(pairs)
+        return {key: [rel for rel, _ in rels] for key, rels in live.items()}
+
     def list_relations_without_caching(self, schema_relation):
         try:
             in_memory = list(super().list_relations_without_caching(schema_relation))
         except Exception:  # best-effort: a missing/empty in-memory schema still allows disk discovery
             in_memory = []
+
+        # Inside a cache-population burst everything (listing, tombstone filter, view
+        # registration) already happened in the cross-schema prefetch — just merge.
+        if self._prefetched is not None:
+            discovered = self._prefetched.get(self._prefetch_key(schema_relation))
+            if discovered is not None:
+                return self._merge_discovered(in_memory, discovered)
 
         discovered = self._discover_delta_relations(schema_relation)
         if not discovered:
@@ -371,17 +513,25 @@ class DuckrunAdapter(DuckDBAdapter):
             self.create_schema(schema_relation)
         except Exception as exc:  # best-effort, same contract as view registration below
             logger.debug(f"duckrun: could not create schema for {schema_relation}: {exc}")
-        for rel, dt in live:
-            self._register_delta_view(rel, dt=dt)
+        self._register_delta_views(live)
 
-        # A Delta table on disk is the source of truth, so disk discovery WINS over the
-        # in-memory catalog. This matters when several dbt runs share one process (dbt's test
-        # harness, a notebook, a long-lived runner): run 1 leaves a `delta_scan` *view* (type
-        # view) in the in-memory DuckDB, and if that stale view shadowed the disk table here,
-        # the relation would be reported as a view and is_incremental() would be false on run
-        # 2 — making the model clobber instead of merge. Reporting the discovered table (type
-        # table) instead makes a shared process behave exactly like a fresh one. Non-Delta
-        # relations (native `view`/`seed`) aren't discovered, so they pass through untouched.
+        return self._merge_discovered(in_memory, discovered)
+
+    @staticmethod
+    def _merge_discovered(in_memory, discovered):
+        """Merge disk-discovered relations over the in-memory catalog's.
+
+        A Delta table on disk is the source of truth, so disk discovery WINS over the
+        in-memory catalog. This matters when several dbt runs share one process (dbt's test
+        harness, a notebook, a long-lived runner): run 1 leaves a `delta_scan` *view* (type
+        view) in the in-memory DuckDB, and if that stale view shadowed the disk table here,
+        the relation would be reported as a view and is_incremental() would be false on run
+        2 — making the model clobber instead of merge. Reporting the discovered table (type
+        table) instead makes a shared process behave exactly like a fresh one. Non-Delta
+        relations (native `view`/`seed`) aren't discovered, so they pass through untouched.
+        """
+        if not discovered:
+            return in_memory
         discovered_names = {str(r.identifier).strip('"').lower() for r in discovered}
         merged = [
             r for r in in_memory

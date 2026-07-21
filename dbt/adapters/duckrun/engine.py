@@ -747,6 +747,15 @@ def _delta_table(path: str, storage_options: Optional[Dict[str, str]]) -> DeltaT
     return DeltaTable(path)
 
 
+# Worker cap for the discovery pools (delta-rs log opens here, delta_scan view binds in the
+# adapter). The work is latency-bound, not CPU-bound — each unit is a handful of sequential
+# HTTPS round trips at 30-100ms+ from outside Azure — so the cap sets how many waves a
+# project-wide discovery pays: ~80 tables at 8 workers was 10 waves, at 32 it's 3 (#16).
+# 32 concurrent requests is still modest for OneLake; throttling (429) is retried inside
+# delta-rs / the DFS layer anyway.
+POOL_WORKERS = 32
+
+
 def open_delta_tables(targets):
     """One :class:`DeltaTable` (or None on failure) per ``(location, storage_options)`` in
     ``targets``, in order. Opens run concurrently: each is a Delta-log replay — several network
@@ -767,7 +776,7 @@ def open_delta_tables(targets):
 
     if len(targets) <= 1:
         return [_open(t) for t in targets]
-    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+    with ThreadPoolExecutor(max_workers=min(POOL_WORKERS, len(targets))) as pool:
         return list(pool.map(_open, targets))
 
 

@@ -121,6 +121,54 @@ def test_show_discovery_opens_concurrently_and_creates_schema_once(project, monk
     assert len(schema_creates) == 1
 
 
+def test_show_discovery_batches_across_schemas_and_binds_views_concurrently(project, monkeypatch):
+    """Issue #16, round 2: after the per-schema delta-rs opens went concurrent, a multi-schema
+    project still paid the tax schema-by-schema (dbt lists every manifest schema serially on
+    duckrun's single thread), and the delta_scan view registrations — whose CREATE binds by
+    replaying the Delta log a second time — stayed serial. Pin the batching fix through the real
+    command: ONE cross-schema open pool for the whole cache population, and every view bind off
+    the main thread (the concurrent registration pool)."""
+    proj, root = project
+    # A second model in a custom schema so the manifest spans two physical schemas.
+    (proj / "models" / "other.sql").write_text(
+        "{{ config(materialized='table', schema='x2') }}\nselect 42 as answer",
+        encoding="utf-8")
+    assert _dbt(proj, "run").success
+
+    # More tables in the default schema so the view-registration batch is a real pool (>1).
+    con = duckrun.connect(root, schema="main", read_only=False)
+    for i in range(2):
+        con.sql(f"create table t{i} as select {i} as id")
+
+    from dbt.adapters.duckrun import engine as dr_engine
+    from dbt.adapters.duckrun.impl import DuckrunAdapter
+
+    main_id = threading.get_ident()
+    open_batches, view_regs = [], []
+    real_open = dr_engine.open_delta_tables
+    real_reg = DuckrunAdapter._register_delta_view
+    monkeypatch.setattr(dr_engine, "open_delta_tables", lambda targets: (
+        open_batches.append([loc for loc, _ in targets]), real_open(targets))[1])
+    monkeypatch.setattr(DuckrunAdapter, "_register_delta_view", lambda self, relation, dt=None,
+                        cursor=None: (view_regs.append((str(relation), threading.get_ident())),
+                                      real_reg(self, relation, dt=dt, cursor=cursor))[1])
+
+    assert _dbt(proj, "show", "-s", "events").success
+
+    # The whole cache population opened its Delta logs in ONE cross-schema batch that spans
+    # both physical schemas — not one pool per schema.
+    non_empty = [b for b in open_batches if b]
+    assert len(non_empty) == 1
+    schemas_in_batch = {Path(loc).parent.name for loc in non_empty[0]}
+    assert schemas_in_batch == {"main", "main_x2"}
+    # Every discovered table's view got registered, and every bind ran off the main thread —
+    # serial binds on the shared cursor were the residual per-schema cost.
+    assert {name for name, _ in view_regs} >= {'"memory"."main"."events"',
+                                               '"memory"."main"."t0"', '"memory"."main"."t1"',
+                                               '"memory"."main_x2"."other"'}
+    assert all(tid != main_id for _, tid in view_regs)
+
+
 def test_docs_stats_panel_reads_the_delta_log(project):
     proj, root = project
     assert _dbt(proj, "run").success
