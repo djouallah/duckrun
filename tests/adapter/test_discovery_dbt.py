@@ -16,6 +16,7 @@ _with_delta_stats) provides, and that the connection-API suites cannot cover:
 """
 import json
 import os
+import threading
 from pathlib import Path
 
 import duckrun
@@ -82,6 +83,42 @@ def test_dropped_table_rebuilds_instead_of_merging(project):
     cols = {r[0] for r in duckrun.connect(root, schema="main")
             .sql("describe events").fetchall()}
     assert cols == {"id", "name"}  # no __duckrun_deleted__ marker resurrected
+
+
+def test_show_discovery_opens_concurrently_and_creates_schema_once(project, monkeypatch):
+    """Issue #16: `dbt show` of a trivial model took ~30s because discovery replayed each
+    table's Delta log serially (one delta-rs open per relation) and re-created the schema once
+    per relation. Pin the fix through the real command: the per-relation opens run off the main
+    thread (the concurrent pool), the schema is created once per schema, and discovery still
+    hides tombstones and registers views (a multi-table schema with a drop in it works)."""
+    proj, root = project
+    assert _dbt(proj, "run").success  # materialize `events` so discovery has it too
+
+    # More tables via the notebook surface, plus one tombstone among them.
+    con = duckrun.connect(root, schema="main", read_only=False)
+    for i in range(4):
+        con.sql(f"create table t{i} as select {i} as id")
+    con.sql("drop table t3")
+
+    from dbt.adapters.duckrun import engine as dr_engine
+    from dbt.adapters.duckrun.impl import DuckrunAdapter
+
+    main_id = threading.get_ident()
+    opens, schema_creates = [], []
+    real_open = dr_engine._delta_table
+    real_cs = DuckrunAdapter.create_schema
+    monkeypatch.setattr(dr_engine, "_delta_table", lambda path, so: (
+        opens.append((Path(str(path)).name, threading.get_ident())), real_open(path, so))[1])
+    monkeypatch.setattr(DuckrunAdapter, "create_schema", lambda self, relation: (
+        schema_creates.append(str(relation)), real_cs(self, relation))[1])
+
+    assert _dbt(proj, "show", "-s", "events").success
+
+    # Every discovered table's log open happened off the main thread — the concurrent pool.
+    off_main = {name for name, tid in opens if tid != main_id}
+    assert off_main >= {"events", "t0", "t1", "t2", "t3"}
+    # One schema in the project → exactly one create_schema, not one per relation.
+    assert len(schema_creates) == 1
 
 
 def test_docs_stats_panel_reads_the_delta_log(project):

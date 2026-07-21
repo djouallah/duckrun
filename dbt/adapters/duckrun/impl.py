@@ -261,6 +261,30 @@ class DuckrunAdapter(DuckDBAdapter):
         self._ensure_remote_secret(cursor)
         return remote.list_delta_tables_via_glob(cursor, root_path, schema)
 
+    def _open_delta_tables(self, targets):
+        """One ``DeltaTable`` (or None on failure) per ``(location, storage_options)`` in
+        ``targets``, in order. Opens run concurrently: each is a Delta-log replay — several
+        network round trips on a remote store — and discovery/docs do one per relation, so
+        serialized they were the dominant startup cost of read-only commands on OneLake
+        (issue #16). Workers only construct the DeltaTable (a read-only delta-rs open); all
+        DuckDB cursor work stays on the caller's thread — the write path is what isn't
+        thread-safe, and it never runs here."""
+        from concurrent.futures import ThreadPoolExecutor
+        from . import engine
+
+        def _open(target):
+            loc, so = target
+            try:
+                return engine._delta_table(loc, so)
+            except Exception as exc:
+                logger.debug(f"duckrun: could not open {loc!r} via delta-rs: {exc}")
+                return None
+
+        if len(targets) <= 1:
+            return [_open(t) for t in targets]
+        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+            return list(pool.map(_open, targets))
+
     def _register_delta_view(self, relation, dt=None):
         """Create the ``delta_scan`` view for a discovered Delta relation on the live
         connection so read-only commands (``dbt test``, ``dbt show``, ``dbt docs``) that
@@ -270,7 +294,8 @@ class DuckrunAdapter(DuckDBAdapter):
         here too is harmless — the materialization's ``create or replace`` just supersedes it.
         But for a command that runs no models, this is the only place the physical view gets
         created from the Delta tables discovered on disk. ``dt`` is discovery's already-opened
-        handle, reused for the docs read.
+        handle, reused for the docs read. The caller has already created the schema (once, not
+        per relation).
         """
         root_path, _ = self.config.credentials.root_for(relation.database)
         if not root_path:
@@ -281,7 +306,6 @@ class DuckrunAdapter(DuckDBAdapter):
             + "/" + str(relation.identifier).strip('"')
         )
         try:
-            self.create_schema(relation)
             cursor = self._cursor()
             loc_sql = location.replace("'", "''")  # escape quotes in the delta_scan path literal
             cursor.execute(
@@ -312,20 +336,16 @@ class DuckrunAdapter(DuckDBAdapter):
         # discovered relation shares this schema_relation's catalog, so resolve its root/token once.
         # ONE delta-rs open per relation serves BOTH the tombstone check and the persisted-docs read
         # that view registration re-applies — this path runs for every manifest schema on every dbt
-        # command, so on OneLake the per-relation log replays it saves are the dominant startup cost.
-        from . import engine
+        # command, and the opens run concurrently (_open_delta_tables) because serialized log
+        # replays over OneLake were a ~30s startup tax on `dbt show` (issue #16).
         root_path, so = self.config.credentials.root_for(schema_relation.database)
         root_path = root_path or ""
         cur = self._cursor()
+        locs = [(root_path.rstrip("/") + "/" + str(rel.schema).strip('"')
+                 + "/" + str(rel.identifier).strip('"')) for rel in discovered]
+        dts = self._open_delta_tables([(loc, so) for loc in locs])
         live = []
-        for rel in discovered:
-            loc = (root_path.rstrip("/") + "/" + str(rel.schema).strip('"')
-                   + "/" + str(rel.identifier).strip('"'))
-            try:
-                dt = engine._delta_table(loc, so)
-            except Exception as exc:
-                logger.debug(f"duckrun: discovery could not open {loc!r} via delta-rs: {exc}")
-                dt = None
+        for rel, loc, dt in zip(discovered, locs, dts):
             if dt is not None:
                 if delta_dml.is_dropped_dt(dt):
                     continue
@@ -340,7 +360,13 @@ class DuckrunAdapter(DuckDBAdapter):
             return in_memory
 
         # Physically register each discovered Delta table as a delta_scan view so read-only
-        # commands (dbt test/show/docs) can query models without a prior in-process run.
+        # commands (dbt test/show/docs) can query models without a prior in-process run. The
+        # schema is created once here, not per relation — every relation shares it, and the
+        # repeated probe+create pairs were pure log noise (issue #16).
+        try:
+            self.create_schema(schema_relation)
+        except Exception as exc:  # best-effort, same contract as view registration below
+            logger.debug(f"duckrun: could not create schema for {schema_relation}: {exc}")
         for rel, dt in live:
             self._register_delta_view(rel, dt=dt)
 
@@ -397,23 +423,33 @@ class DuckrunAdapter(DuckDBAdapter):
         cur = self._cursor()
 
         cache = {}
+        cols = list(table.column_names)
+
+        # Pre-open every distinct relation's Delta log concurrently (same serial-log-replay tax
+        # as discovery, issue #16); the row loop below stays serial — it does DuckDB cursor work.
+        # Each row carries its catalog (table_database); resolve that catalog's root/token so
+        # stats for a `+database: <alias>` model come from the right Lakehouse.
+        targets = {}
+        for r in table.rows:
+            d = dict(zip(cols, r))
+            key = (d.get("table_database"), d.get("table_schema"), d.get("table_name"))
+            if key in targets:
+                continue
+            root_path, so = creds.root_for(key[0])
+            if root_path:
+                targets[key] = (root_path.rstrip("/") + "/" + str(key[1]).strip('"')
+                                + "/" + str(key[2]).strip('"'), so)
+        opened = dict(zip(targets, self._open_delta_tables(list(targets.values()))))
 
         def stats_for(database, schema, name):
             key = (database, schema, name)
             if key not in cache:
-                # Each row carries its catalog (table_database); resolve that catalog's root/token
-                # so stats for a `+database: <alias>` model come from the right Lakehouse.
-                root_path, so = creds.root_for(database)
-                if not root_path:
+                if key not in targets:  # no root for this catalog
                     cache[key] = None
                     return None
-                loc = (root_path.rstrip("/") + "/" + str(schema).strip('"')
-                       + "/" + str(name).strip('"'))
+                loc, so = targets[key]
                 # One open serves the tombstone check and the stats read (was two per relation).
-                try:
-                    dt = engine._delta_table(loc, so)
-                except Exception:
-                    dt = None
+                dt = opened.get(key)
                 if dt is not None:
                     cache[key] = (None if delta_dml.is_dropped_dt(dt)
                                   else engine.delta_stats(cur, loc, so, dt=dt))
@@ -423,7 +459,6 @@ class DuckrunAdapter(DuckDBAdapter):
                                   else engine.delta_stats(cur, loc, so))
             return cache[key]
 
-        cols = list(table.column_names)
         stat_cols = [f"stats:{k}:{p}" for k, _, _ in self._STATS_SPEC
                      for p in ("label", "value", "description", "include")]
         rows = []
