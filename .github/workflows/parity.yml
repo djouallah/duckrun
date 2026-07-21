@@ -47,6 +47,8 @@ jobs:
   jaffle_shop:
     # Fast (~30s): clone jaffle_shop, build it on dbt-duckdb (oracle) AND duckrun (→ OneLake), diff
     # every persisted table (EXCEPT ALL both ways). The full differential — the strongest parity check.
+    # Also the ONE parity project that builds a second leg against the lakehouse's Iceberg REST
+    # catalog (format: iceberg) and diffs those tables against the oracle too (PARITY_ICEBERG below).
     runs-on: ubuntu-latest
     concurrency:
       group: parity-jaffle-onelake
@@ -57,6 +59,10 @@ jobs:
       # a real Fabric table. (A subfolder in the path instead would nest a level too deep → "Unidentified".)
       WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
       DBT_SCHEMA: parity_jaffle
+      # Second leg: the same models built to the SAME lakehouse's Iceberg REST catalog and diffed
+      # against the oracle (run_parity.py's Iceberg leg — jaffle only).
+      PARITY_ICEBERG: "1"
+      DBT_SCHEMA_ICEBERG: parity_jaffle_ice
       # The only Azure input: the OIDC federated identity. duckrun mints the OneLake token itself
       # (auth._github_oidc_token) and picks the curl transport — no azure/login, no az token step.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
