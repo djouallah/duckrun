@@ -155,10 +155,12 @@ class TestSession:
 
         env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
         env.pop("PYTHONUTF8", None)
+        # No text=True: the child's stdout is cp1252 by construction, and decoding it as the
+        # parent's UTF-8 (Linux CI) crashes the harness on the very bytes the fix produces.
         res = subprocess.run(
             [sys.executable, "-c", "import duckrun; print('\\U0001f4c1 caf\\u00e9')"],
-            env=env, capture_output=True, text=True)
-        assert res.returncode == 0, res.stderr
+            env=env, capture_output=True)
+        assert res.returncode == 0, res.stderr.decode(errors="replace")
 
     def test_list_files(self, conn, tmp_path):
         # list the files copy() lands, as relative paths; the extension filter is honoured.
