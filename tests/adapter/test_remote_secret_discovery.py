@@ -172,13 +172,27 @@ def _transport_set(conn):
 
 
 def test_transport_defaults_to_curl_outside_fabric(monkeypatch):
-    # Off a Fabric notebook and with no override, duckrun picks curl (system CA bundle) so the
-    # OneLake TLS handshake works on a laptop / CI runner without any env spoon-feeding.
+    # Off a Fabric notebook, not on Windows, and with no override, duckrun picks curl (system CA
+    # bundle) so the OneLake TLS handshake works on a laptop / CI runner without env spoon-feeding.
     monkeypatch.delenv("AZURE_TRANSPORT_OPTION_TYPE", raising=False)
     monkeypatch.setattr(secret, "_in_fabric_notebook", lambda: False)
+    monkeypatch.setattr(secret, "_IS_WINDOWS", False)
     conn = _RecordingConn()
     secret.ensure_azure_secret(conn, {"bearer_token": "TOK"})
     assert _transport_set(conn) == "curl"
+
+
+def test_transport_untouched_on_windows(monkeypatch):
+    # On Windows the extension's libcurl has no CA bundle, so forcing curl breaks EVERY handshake
+    # ("SSL peer certificate or SSH remote key was not OK" — issue #16 regression report). Leave
+    # DuckDB's default (WinHTTP), which trusts the system cert store.
+    monkeypatch.delenv("AZURE_TRANSPORT_OPTION_TYPE", raising=False)
+    monkeypatch.setattr(secret, "_in_fabric_notebook", lambda: False)
+    monkeypatch.setattr(secret, "_IS_WINDOWS", True)
+    conn = _RecordingConn()
+    secret.ensure_azure_secret(conn, {"bearer_token": "TOK"})
+    assert _transport_set(conn) is None            # no SET issued
+    assert any("create or replace secret" in s.lower() for s in conn.sql)  # secret still minted
 
 
 def test_transport_untouched_in_fabric_notebook(monkeypatch):

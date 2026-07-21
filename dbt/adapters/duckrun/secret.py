@@ -62,18 +62,26 @@ def _in_fabric_notebook() -> bool:
     return _IN_FABRIC
 
 
+_IS_WINDOWS = os.name == "nt"
+
+
 def _resolve_azure_transport() -> Optional[str]:
     """The DuckDB ``azure_transport_option_type`` to set, or None to leave DuckDB's default.
 
-    An explicit ``AZURE_TRANSPORT_OPTION_TYPE`` env var always wins. Otherwise: outside Fabric (a
-    laptop or CI runner) the azure extension's ``default`` transport can fail the OneLake TLS handshake
-    ("Problem with the SSL CA cert") — ``curl`` respects the system CA bundle, so default to it. Inside
-    a Fabric notebook the ``default`` transport already works, so return None and change nothing there.
+    An explicit ``AZURE_TRANSPORT_OPTION_TYPE`` env var always wins. Otherwise: on a non-Windows
+    machine outside Fabric (a laptop or CI runner) the azure extension's ``default`` transport can
+    fail the OneLake TLS handshake ("Problem with the SSL CA cert") — ``curl`` respects the system
+    CA bundle, so default to it. On Windows it's the other way around: the extension's libcurl has
+    no CA bundle, so ``curl`` fails every handshake with "SSL peer certificate or SSH remote key
+    was not OK" (issue #16 regression report), while ``default`` (WinHTTP) trusts the system cert
+    store — leave DuckDB's default. Inside a Fabric notebook ``default`` already works too.
     """
     env = os.environ.get("AZURE_TRANSPORT_OPTION_TYPE")
     if env:
         return env
-    return None if _in_fabric_notebook() else "curl"
+    if _IS_WINDOWS or _in_fabric_notebook():
+        return None
+    return "curl"
 
 
 def _set_azure_transport(conn) -> None:
