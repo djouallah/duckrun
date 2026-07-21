@@ -847,7 +847,11 @@ class DuckSession:
         else:
             handled = False
         if handled:
-            self.refresh(quiet=True, catalog=write_cat)
+            # No catalog rescan here: the DML router already registered/dropped the one view this
+            # statement touched (_refresh_view/_drop), exactly like the dbt surface, and no peer
+            # (dbt's cache, Spark's metastore) re-lists after a write. Other processes' new tables
+            # surface at connect() or an explicit refresh() — the same visibility points as dbt's
+            # run-start discovery. (Dropped: a full re-list + per-table probe per statement.)
             return self.con.sql("SELECT 'ok' AS status")
         if _is_delta_write(query):
             raise ValueError(_delta_write_message(query))
