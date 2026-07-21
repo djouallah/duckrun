@@ -145,36 +145,10 @@ other dbt adapters). For **Claude Code**:
 Other assistants read the [`AGENTS.md`](AGENTS.md) at the repo root, which points to the full guide.
 None of this is required to use duckrun.
 
-## How it works
-
-Two engines, split cleanly: DuckDB runs every query and reads Delta through `delta_scan` views,
-delta-rs handles every write, an Arrow C-stream bridges them, and dbt orchestrates on top.
-
-![duckrun architecture: DuckDB executes SQL and reads Delta via delta_scan; an Arrow C-stream bridges to delta-rs, which handles every write and commits against the read version (OCC); dbt orchestrates on top](https://raw.githubusercontent.com/djouallah/duckrun/main/docs/architecture.png)
-
-Writes are snapshot-pinned: the read is fixed at `delta_scan(…, version => N)` and the write commits
-against `N`, so a concurrent commit is rejected with `CommitFailedError` instead of silently
-overwriting a lost update.
-
-![Two writers race on one table: Writer A reads v5 and computes; Writer B commits v6 in between; A's commit against v5 is rejected with CommitFailedError instead of silently overwriting B](https://raw.githubusercontent.com/djouallah/duckrun/main/docs/snapshot-timeline.png)
-
-More on the design: [Design document](docs/design_document.md) ·
-[Snapshot isolation](docs/snapshot-isolation.md).
-
 ## Docs
 
-Browse the rendered docs site at **[djouallah.github.io/duckrun](https://djouallah.github.io/duckrun/)**
-— or read the markdown here:
-
-| Doc | What's in it |
-|---|---|
-| [Connection API](docs/connection-api.md) | The `duckrun.connect()` notebook API + examples. |
-| [API reference](docs/api-reference.md) | The exact public method contract, introspected from the code. |
-| [dbt adapter](docs/dbt-adapter.md) | Profiles, materializations, incremental strategies, sources, maintenance, limitations. |
-| [Design document](docs/design_document.md) | Why delta-rs (not DuckDB's native Delta writer), why Delta (not Iceberg), why a separate adapter. |
-| [Snapshot isolation](docs/snapshot-isolation.md) | How a read-modify-write is fenced to the version you read, and how it compares to delta-rs/Spark/SQL Server. |
-| [dbt adapter conformance](docs/conformance.md) | Official `dbt-tests-adapter` results, regenerated on every push to `main`. |
-| [Incremental MERGE benchmark](docs/merge-benchmark.md) | ~60M-row TPCH merge / append / overwrite scorecard — the release gate. |
+Everything else — architecture, snapshot isolation, conformance results, benchmarks — lives on the
+docs site: **[djouallah.github.io/duckrun](https://djouallah.github.io/duckrun/)**.
 
 ## License
 
