@@ -153,6 +153,42 @@ See the full runnable walkthrough in
 [`integration_tests/multicatalog/demo_multicatalog.py`](../tests/integration_tests/multicatalog/demo_multicatalog.py)
 (published as a [live report](https://djouallah.github.io/duckrun/multicatalog.html)).
 
+## Iceberg — `format="iceberg"`
+
+Everything above is the **default `format="delta"`** path. Iceberg is opt-in: you get it only by
+passing `format="iceberg"` explicitly.
+
+A Fabric lakehouse is also reachable through its **Iceberg REST catalog**, and there DuckDB is the
+entire engine: it lists the catalog, resolves schemas and tables, reads, and writes. duckrun's job
+shrinks to the credentials and the `ATTACH` — the OneLake token (Fabric notebook → GitHub OIDC → env
+→ `az login`), the Azure secret DuckDB writes the parquet files with, the endpoint, and Fabric's
+ATTACH flags:
+
+```python
+conn = duckrun.connect("ws/sales.Lakehouse", format="iceberg", read_only=False)
+conn.sql("CREATE SCHEMA IF NOT EXISTS dbo")
+conn.sql("CREATE TABLE dbo.orders AS SELECT * FROM read_csv_auto('orders.csv')")
+conn.sql("SELECT count(*) FROM dbo.orders").show()
+
+conn.attach("ws/reference.Lakehouse", name="ref")        # more Iceberg catalogs
+conn.sql("SELECT * FROM ref.dbo.lookup").show()
+```
+
+`conn.sql()` here is a **pass-through**: the statement reaches DuckDB verbatim. Nothing is parsed,
+rewritten or routed to delta_rs, and `read_only` is DuckDB's own `ATTACH … READ_ONLY` flag rather
+than a rule duckrun applies to your SQL. Consequently none of the Delta-specific features on this
+page exist in an Iceberg session — no `SORTED BY AUTO`, no `VACUUM`/compaction, no `describe detail` /
+`describe history`, no `restore table`, no `get_stats`, no `refresh()`. What the catalog supports is
+what you get.
+
+The path takes the same OneLake shorthand (`ws/lh.Lakehouse`, `<ws-guid>/<item-guid>`, optionally
+`…/<schema>`; an `abfss://` URL is accepted and converted). `conn.attach(path, format="iceberg")`
+also works from a normal Delta session, mixing an Iceberg catalog in beside Delta ones.
+
+Fabric's Iceberg endpoint is in **private preview** and DuckDB's write semantics apply
+(merge-on-read `UPDATE`/`DELETE`, and the catalog token fixed at attach time) — see
+[Iceberg limitations](limitations.md#iceberg-formaticeberg).
+
 ## Raw SQL DML through `conn.sql`
 
 `conn.sql` doesn't only read — raw SQL DML against a discovered (Delta-backed) table is intercepted

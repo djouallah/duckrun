@@ -6,6 +6,7 @@ truth every write/read/discovery path routes through), the DML catalog matcher, 
 minting, and the plugin's write-token precedence.
 """
 import types
+from unittest import mock
 
 import duckdb
 import pytest
@@ -134,3 +135,81 @@ def test_store_single_catalog_uses_default():
     p = _plugin({}, {"bearer_token": "SILVER"})
     assert p._catalog_storage_options("silver") == {"bearer_token": "SILVER"}
     assert p._catalog_storage_options("lh_bronze") == {"bearer_token": "SILVER"}
+
+
+# ------------------------------------------------- format: iceberg -> stock attach:/secrets:
+
+def _iceberg_creds(**kw):
+    """Build credentials from a `format: iceberg` profile with the token acquisition stubbed —
+    resolving it for real would reach OneLake, which CI can't do."""
+    data = {"type": "duckrun", "format": "iceberg", "root_path": "ws/sales.Lakehouse",
+            "schema": "mart", "threads": 1}
+    data.update(kw)
+    with mock.patch.object(secret, "with_onelake_token", return_value={"bearer_token": "TOK"}):
+        return DuckrunCredentials.from_dict(data)
+
+
+def test_iceberg_profile_expands_to_one_attachment():
+    """The whole point: `format: iceberg` + the lakehouse renders the ATTACH a user would otherwise
+    hand-write (endpoint, token, Fabric's flags, default schema) — no root_path left behind."""
+    c = _iceberg_creds()
+    assert c.root_path is None and c.database == "sales"
+    assert len(c.attach) == 1
+    sql = c.attach[0].to_sql()
+    assert "'ws/sales.Lakehouse'" in sql and "AS sales" in sql
+    assert "TYPE iceberg" in sql
+    assert "ENDPOINT 'https://onelake.table.fabric.microsoft.com/iceberg'" in sql
+    assert "TOKEN 'TOK'" in sql
+    assert "DEFAULT_SCHEMA 'dbo'" in sql
+    # Booleans must survive as options: dbt-duckdb DROPS an option whose value is Python False.
+    assert "STAGE_CREATE_TABLES 'false'" in sql
+    assert "SKIP_CREATE_TABLE_METADATA_UPDATES 'true'" in sql
+    assert "ACCESS_DELEGATION_MODE 'none'" in sql
+    # The storage credential DuckDB writes the data files with, from the same token.
+    assert any("CREATE OR REPLACE SECRET duckrun_onelake" in s for s in c.secrets_sql())
+    assert c.settings.get("preserve_insertion_order") is False
+
+
+def test_iceberg_schema_and_alias_from_path():
+    c = _iceberg_creds(root_path="ws/sales.Lakehouse/mart", database="ice")
+    assert c.database == "ice"
+    assert "DEFAULT_SCHEMA 'mart'" in c.attach[0].to_sql()
+    assert "AS ice" in c.attach[0].to_sql()
+
+
+def test_iceberg_native_catalog_has_no_delta_root():
+    """The regression guard: an unknown database falls back to the DEFAULT root, so without this a
+    natively-attached catalog's CREATE TABLE AS would be written as Delta into the wrong lakehouse."""
+    c = _iceberg_creds()
+    assert c.native_catalogs() == {"sales"}
+    assert c.native_catalog_names == ["sales"]
+    assert c.root_for("sales") == (None, None)
+    assert c.root_for() == (None, None)
+    # A hand-written attach: entry is native too, even next to a Delta root.
+    from dbt.adapters.duckdb.credentials import Attachment
+    d = _creds(attach=[Attachment(path="./ice.duckdb", alias="ice")])
+    assert d.root_for("ice") == (None, None)
+    assert d.root_for("silver") == ("/lh/silver", {"bearer_token": "SILVER"})
+
+
+def test_iceberg_expansion_is_idempotent():
+    """dbt deserializes a profile more than once and the expansion consumes root_path — a second
+    pass must recognize its own output instead of erroring on the missing lakehouse."""
+    data = {"type": "duckrun", "format": "iceberg", "root_path": "ws/sales.Lakehouse"}
+    with mock.patch.object(secret, "with_onelake_token", return_value={"bearer_token": "TOK"}):
+        once = DuckrunCredentials.__pre_deserialize__(dict(data))
+        twice = DuckrunCredentials.__pre_deserialize__(dict(once))
+    assert len(twice["attach"]) == 1
+
+
+def test_unknown_format_fails_loud():
+    with pytest.raises(Exception, match="unknown format"):
+        DuckrunCredentials.from_dict({"type": "duckrun", "format": "hudi", "path": ":memory:"})
+
+
+def test_no_format_is_zero_change():
+    """A Delta profile (no `format`) keeps every existing behavior — no attach, no secrets."""
+    c = _creds()
+    assert c.format is None and c.attach in (None, [])
+    assert c.native_catalogs() == set() and c.native_catalog_names is None
+    assert c.root_for("anything") == ("/lh/silver", {"bearer_token": "SILVER"})

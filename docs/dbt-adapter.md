@@ -48,6 +48,43 @@ It works for each entry under `catalogs:` and for a source's `location` / `delta
 `.Lakehouse`/`.Warehouse` suffix, or a workspace-GUID/item-GUID pair — a suffix-less `warehouse/tables`
 is still an ordinary local relative path.
 
+### `format: iceberg` — target the lakehouse's Iceberg REST catalog
+
+**Delta is the default** — a profile with no `format:` behaves exactly as documented above, and
+nothing here applies to it. Iceberg is opt-in.
+
+A Fabric lakehouse also serves an Iceberg REST catalog, and DuckDB can read *and write* it natively.
+Set `format: iceberg` and duckrun expands the profile into the blocks dbt-duckdb already executes —
+one `attach:` entry (endpoint, token, Fabric's ATTACH flags, default schema) and the `secrets:` entry
+DuckDB writes the parquet files with:
+
+```yaml
+    dev:
+      type: duckrun
+      format: iceberg
+      root_path: ws/sales.Lakehouse      # or "<workspace-guid>/<lakehouse-guid>"; the shorthand above
+      schema: mart
+```
+
+That is the whole profile: the OneLake token is self-acquired (same chain as the Delta path — no
+`ONELAKE_TOKEN` env var), `database` defaults to the lakehouse name, and `preserve_insertion_order`
+is set for you. Models are then materialized by **dbt-duckdb's own** `table` / `incremental` /
+`seed` / `snapshot` macros — plain DuckDB SQL against the catalog. Nothing goes through delta-rs, so
+none of duckrun's Delta-specific features apply here: no `SORTED BY AUTO`, no automatic
+compaction/vacuum, no delta-rs `merge`, no time travel via `delta_scan`. Whatever dbt-duckdb supports
+on an attached catalog is exactly what you get, including its limits — e.g. a *second* `snapshot` run
+against an attached catalog fails with DuckDB's "a single transaction can only write to a single
+attached database", identically under `type: duckdb`.
+
+The same applies to a hand-written `attach:` entry: any attached catalog is DuckDB's, so duckrun
+never routes DML for it to delta-rs and never looks for Delta tables under it. Delta models and an
+Iceberg catalog can coexist in one project — give the Iceberg one an alias and send models to it
+with `+database: <alias>`.
+
+For notebooks the same switch is `duckrun.connect(path, format="iceberg")`. Read the
+[Iceberg limitations](limitations.md#iceberg-formaticeberg) before committing to it — Fabric's
+endpoint is in private preview and DuckDB's own write semantics apply (merge-on-read deletes, etc.).
+
 ### OneLake: use GUID paths for now
 
 Address OneLake tables by **workspace GUID + lakehouse GUID**, not friendly names —

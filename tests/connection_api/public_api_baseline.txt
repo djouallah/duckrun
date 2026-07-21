@@ -2,7 +2,7 @@
 # Introspected from the code; DO NOT hand-edit. Regenerate intentionally with:
 #     python tests/tools/public_api.py --write
 # A diff here means a public API was added or removed — a removal is a breaking change.
-DuckSession.attach(path, name=None, storage_options=None, schema=None, read_only=None)
+DuckSession.attach(path, name=None, storage_options=None, schema=None, read_only=None, format='delta')
 DuckSession.close()
 DuckSession.convert_to_delta(identifier, partition_schema=None)
 DuckSession.copy(local_folder, remote_folder, file_extensions=None, overwrite=False)
@@ -13,9 +13,10 @@ DuckSession.refresh(quiet=False, catalog=None)
 DuckSession.register(name, obj)
 DuckSession.sql(query)
 duckrun.DuckSession (class)
+duckrun.IcebergSession (class)
 duckrun.RemoteResult (class)
 duckrun.RemoteRunner (class)
 duckrun.ScriptResult (class)
 duckrun.Workspace (class)
-duckrun.connect(path, storage_options=None, schema=None, read_only=True, name=None)
+duckrun.connect(path, storage_options=None, schema=None, read_only=True, name=None, format='delta')
 duckrun.workspace(workspace, token=None)

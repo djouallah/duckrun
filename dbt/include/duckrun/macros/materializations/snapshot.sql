@@ -23,6 +23,10 @@
       default__snapshot_merge_sql exactly with the merge controls delta_rs can express.
 #}
 {% materialization snapshot, adapter='duckrun' %}
+  {%- if duckrun__is_native_catalog(this.database) -%}
+    {#-- dbt-duckdb ships no snapshot materialization of its own; the default one is the engine here. --#}
+    {{ return(materialization_snapshot_default()) }}
+  {%- endif -%}
 
   {%- set strategy_name = config.get('strategy') -%}
   {%- set unique_key = config.get('unique_key') -%}

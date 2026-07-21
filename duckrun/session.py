@@ -18,6 +18,7 @@ from typing import Dict, List, Optional
 import duckdb
 
 from dbt.adapters.duckrun import delta_dml, engine, objectstore, remote, secret, sortkey
+from . import iceberg as _iceberg
 from ._runtime import check_runtime_versions
 
 
@@ -323,7 +324,22 @@ def _split_root_schema(path: str, schema: Optional[str]):
 # attach() adds more. `schema_filter` mirrors connect's `schema=` (restrict discovery to one schema);
 # `read_only` is per-catalog so a read-only reference store (e.g. a Fabric Warehouse) can sit next to
 # a writable lakehouse in one session.
-_CatEntry = namedtuple("_CatEntry", ["name", "root_path", "storage_options", "schema_filter", "read_only"])
+_CatEntry = namedtuple("_CatEntry", ["name", "root_path", "storage_options", "schema_filter",
+                                    "read_only", "kind"])
+_CatEntry.__new__.__defaults__ = ("delta",)   # kind: "delta" (delta_scan views) | "iceberg" (native)
+
+
+def _normalize_format(fmt: Optional[str]) -> str:
+    """Validate the ``format=`` argument of :func:`connect` / :meth:`DuckSession.attach`.
+
+    ``'delta'`` (the default) is duckrun's Delta-over-object-store path; ``'iceberg'`` is Fabric's
+    Iceberg REST catalog, which DuckDB drives natively. Anything else fails loud rather than
+    silently falling back to Delta."""
+    f = str(fmt or "delta").strip().lower()
+    if f not in ("delta", "iceberg"):
+        raise ValueError(f"unknown format '{fmt}'; duckrun supports format='delta' (default) "
+                         f"or format='iceberg'.")
+    return f
 
 
 def _derive_catalog_name(root_path: str) -> Optional[str]:
@@ -419,13 +435,27 @@ class DuckSession:
         return self.con.execute("SELECT current_schema()").fetchone()[0]
 
     def _attach_catalog(self, name: str, root: str, storage_options, schema_filter,
-                        primary: bool = False, quiet: bool = True, read_only=None):
+                        primary: bool = False, quiet: bool = True, read_only=None,
+                        kind: str = "delta"):
         """Register a lakehouse root as a named DuckDB catalog, mint its read secret, discover its
         tables. The primary keeps the original unscoped OneLake secret; attached catalogs get a
         path-scoped secret so two different OneLake tokens can coexist in one connection. ``read_only``
-        defaults to the session default (the primary's mode) when None."""
+        defaults to the session default (the primary's mode) when None.
+
+        ``kind='iceberg'`` attaches Fabric's Iceberg REST catalog instead: DuckDB owns the catalog
+        (listing, schemas, reads AND writes), so there is nothing to discover or register here."""
         root = root.replace("\\", "/").rstrip("/")
         ro = self.read_only if read_only is None else bool(read_only)
+        if kind == "iceberg":
+            so, schema = _iceberg.attach_iceberg_catalog(self.con, name, root, schema_filter,
+                                                         storage_options, ro)
+            self._catalogs[name] = _CatEntry(name, root, so, schema, ro, "iceberg")
+            if primary:
+                self._primary_catalog = name
+                self._use(name, schema)
+            if not quiet:
+                print(f"Connected to {root} (catalog '{name}', iceberg)")
+            return
         so = dict(storage_options) if storage_options else None
         # OneLake with no caller-supplied token: acquire one (Fabric / env / azure-identity) so both
         # the DuckDB read secret and delta-rs writes can authenticate. Shared with the dbt path via
@@ -476,9 +506,14 @@ class DuckSession:
 
     def attach(self, path: str, name: Optional[str] = None,
                storage_options: Optional[Dict[str, str]] = None,
-               schema: Optional[str] = None, read_only: Optional[bool] = None) -> "DuckSession":
+               schema: Optional[str] = None, read_only: Optional[bool] = None,
+               format: str = "delta") -> "DuckSession":
         """Attach a second+ lakehouse as a named catalog, so ``catalog.schema.table`` resolves across
         lakehouses.
+
+        ``format='iceberg'`` attaches the lakehouse's Iceberg REST catalog instead of its Delta
+        tables — DuckDB owns that catalog end to end, so its relations are native tables rather than
+        ``delta_scan`` views and statements against it are never routed through delta-rs.
 
         ``name`` is derived from a friendly path when omitted, but is **mandatory** for a GUID-only
         OneLake path (raises, since there is no readable name to derive). The mapping is bijective:
@@ -504,7 +539,7 @@ class DuckSession:
             if entry.root_path == root:
                 raise ValueError(f"that lakehouse is already attached as catalog '{entry.name}'.")
         self._attach_catalog(name, root, storage_options, schema_filter, primary=False, quiet=False,
-                             read_only=read_only)
+                             read_only=read_only, kind=_normalize_format(format))
         return self
 
     # ---- discovery -------------------------------------------------------------------------
@@ -552,6 +587,9 @@ class DuckSession:
 
     def _refresh_catalog(self, name: str, quiet: bool = True):
         entry = self._catalogs[name]
+        if entry.kind == "iceberg":
+            # DuckDB's own catalog — always live, nothing to re-discover or re-register.
+            return [entry.schema_filter] if entry.schema_filter else []
         root, so = entry.root_path, entry.storage_options
         if entry.schema_filter is not None:
             mapping = {entry.schema_filter: self._list_tables(root, entry.schema_filter, so)}
@@ -713,12 +751,32 @@ class DuckSession:
         guard via secret.refresh_catalog_secret. No-op unless a token is genuinely near expiry, and for
         local / token-less catalogs."""
         for name, entry in list(self._catalogs.items()):
+            if entry.kind == "iceberg":
+                self._refresh_iceberg_catalog(name, entry)
+                continue
             fresh = secret.refresh_catalog_secret(
                 self.con, name, entry.storage_options,
                 is_default=(name == self._primary_catalog), root=entry.root_path,
             )
             if fresh is not entry.storage_options:
                 self._catalogs[name] = entry._replace(storage_options=fresh)
+
+    def _refresh_iceberg_catalog(self, name: str, entry) -> None:
+        """Re-ATTACH an Iceberg catalog whose token is near expiry. The catalog's ``TOKEN`` is baked
+        in at ATTACH time (unlike a Delta catalog's secret, which can be re-minted in place), so the
+        only way to hand DuckDB a fresh one is to attach again — ``ATTACH OR REPLACE`` does that
+        without a DETACH. Best-effort: a failed re-attach warns and leaves the working catalog
+        alone rather than sinking the session."""
+        fresh = secret.refreshed(entry.storage_options)
+        if fresh is entry.storage_options:
+            return
+        try:
+            so, _schema = _iceberg.attach_iceberg_catalog(
+                self.con, name, entry.root_path, entry.schema_filter, fresh, entry.read_only)
+        except Exception as exc:
+            print(f"[warn] could not refresh the token of iceberg catalog '{name}': {exc}")
+            return
+        self._catalogs[name] = entry._replace(storage_options=so)
 
     def _handle_delta_write(self, entry, query: str) -> bool:
         """Route a Delta write through ``delta_dml.handle`` with the DuckDB ``memory_limit`` clamped to
@@ -816,6 +874,12 @@ class DuckSession:
         # The current catalog is DuckDB's own current_database() (the _current_catalog property), so a
         # bare `USE cat.schema` steers write routing exactly as it steers reads — no parallel state.
         write_cat = target_cat if target_cat is not None else self._current_catalog
+        # An Iceberg catalog is DuckDB's end to end: it owns the tables, the writes and the
+        # read-only flag (ATTACH … READ_ONLY). Nothing below applies — hand the statement over
+        # untouched rather than parsing it against Delta's rules.
+        cat_entry = self._catalogs.get(write_cat)
+        if cat_entry is not None and cat_entry.kind == "iceberg":
+            return self.con.sql(query)
         is_write = _is_delta_write(query) or _is_vacuum(query) or _is_restore(query)
         # A Delta write auto-commits via delta_rs, so it can't participate in an open explicit
         # transaction — reject it loud rather than let a later ROLLBACK silently fail to undo it.
@@ -1416,7 +1480,8 @@ class DuckSession:
 
 def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
             schema: Optional[str] = None,
-            read_only: bool = True, name: Optional[str] = None) -> DuckSession:
+            read_only: bool = True, name: Optional[str] = None,
+            format: str = "delta"):
     """Open a storage-neutral, SQL-only session over a Delta lakehouse.
 
     The session binds to this one lakehouse root as the primary catalog. Catalog is first-class:
@@ -1441,6 +1506,12 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
             lakehouse name, or the local folder name); when nothing can be derived (a GUID-only
             OneLake path) it falls back to ``"data"`` — a non-reserved word, so ``data.schema.table``
             works bare. Pass one to address the catalog explicitly as ``<name>.schema.table``.
+        format: **``'delta'`` is the default** — duckrun is a Delta tool and everything else in this
+            docstring describes that path. ``'iceberg'`` is opt-in and must be asked for: it opens
+            the lakehouse's **Iceberg REST catalog** instead (Fabric) and returns an
+            :class:`~duckrun.iceberg.IcebergSession`: DuckDB drives that catalog natively — listing,
+            schemas, reads and writes — so duckrun contributes only the token, the storage secret
+            and the ATTACH, and ``sql()`` passes every statement through untouched.
 
     Example:
         >>> conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/sales.Lakehouse/Tables")
@@ -1450,6 +1521,9 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
         >>> lh = duckrun.connect("…/<guid>/Tables", name="lakehouse")   # name a GUID-path catalog
         >>> s = duckrun.connect("ws/sales.Lakehouse/dbo")           # OneLake shorthand, catalog 'sales'
         >>> g = duckrun.connect("<ws-guid>/<lakehouse-guid>")       # GUID shorthand, catalog 'data'
+        >>> i = duckrun.connect("ws/sales.Lakehouse", format="iceberg")   # Iceberg REST catalog
     """
     check_runtime_versions()  # fail loud if Fabric's stale duckdb/deltalake are still loaded
+    if _normalize_format(format) == "iceberg":
+        return _iceberg.IcebergSession(path, storage_options, schema, read_only, name)
     return DuckSession(path, storage_options, schema, read_only, name)

@@ -126,6 +126,38 @@ the default catalog keys on it internally.
 End-to-end reference project (Fabric + OneLake + Direct Lake + scheduled CI):
 https://github.com/djouallah/dbt_fabric_python_delta
 
+### Iceberg instead of Delta (`format: iceberg`)
+
+**Delta is the default — never add `format:` unless the user explicitly asks for Iceberg.**
+
+A Fabric lakehouse also serves an **Iceberg REST catalog**, which DuckDB reads *and writes*
+natively. `format: iceberg` points the target at it; duckrun expands the profile into the
+`attach:` + `secrets:` blocks dbt-duckdb already executes (endpoint, ATTACH flags, and a
+self-acquired OneLake token — no `ONELAKE_TOKEN`):
+
+```yaml
+fabric_iceberg:
+  type: duckrun
+  format: iceberg
+  root_path: ws/sales.Lakehouse      # or "<workspace-guid>/<lakehouse-guid>"
+  schema: mart
+```
+
+That is the whole profile — `database` defaults to the lakehouse name and
+`preserve_insertion_order` is set for you. Models are then materialized by **dbt-duckdb's own**
+macros, not delta-rs, so nothing on this page that is Delta-specific applies: no `SORTED BY
+AUTO`, no automatic compaction/vacuum, no delta-rs merge strategies, no time travel. Use the
+plain dbt-duckdb incremental strategies there. Same rule for a hand-written `attach:` entry:
+any attached catalog is DuckDB's, and duckrun never routes its DML to delta-rs.
+
+Limitations to state up front if a user asks for Iceberg (DuckDB 1.5.4): Fabric's endpoint is in
+**private preview** and Azure/OneLake is outside the REST-catalog storage list DuckDB documents
+(S3/S3 Tables/GCS); `UPDATE`/`DELETE` are **merge-on-read only** (positional deletes, no
+copy-on-write); the catalog token is fixed at ATTACH time, so a dbt build running past ~1h can
+fail; and a **second** `snapshot` run against an attached catalog fails with DuckDB's "a single
+transaction can only write to a single attached database" — stock dbt-duckdb behavior, identical
+under `type: duckdb`.
+
 ## Running in a Fabric Python notebook
 
 The reference project's `run.Notebook` is the canonical shape. Reproduce its cell
@@ -447,6 +479,12 @@ conn.sql("SELECT * FROM orders_copy").show()
   `INSERT INTO t REPLACE WHERE <pred> SELECT …`, `INSERT WITH SCHEMA EVOLUTION`,
   `DESCRIBE DETAIL` / `DESCRIBE HISTORY`, `RESTORE TABLE t TO VERSION AS OF n`, and
   time travel via `delta_scan('<location>', version => N)`.
+
+- Iceberg (opt-in; the default is Delta): `duckrun.connect(path, format="iceberg")` opens the
+  lakehouse's Iceberg REST catalog instead. There DuckDB is the whole engine — `conn.sql()` is a
+  pass-through (nothing parsed or routed to delta-rs), `read_only` is DuckDB's own
+  `ATTACH … READ_ONLY` flag, and none of the Delta extras above exist.
+  `conn.attach(path, format="iceberg")` mixes one into a Delta session.
 
 There is no `INSERT OVERWRITE`, no `CALL` maintenance verbs, and no DataFrame writer —
 SQL is the whole surface. Full DML matrix and walkthroughs:

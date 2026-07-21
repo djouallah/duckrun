@@ -248,3 +248,12 @@
   {{ return({'relations': [target_relation]}) }}
 
 {% endmacro %}
+
+
+{#-- True when `db` names a catalog DuckDB owns natively (a profile `attach:` entry, or the one
+     synthesized from `format: iceberg`). Those catalogs hold real DuckDB/Iceberg tables, not Delta
+     directories, so duckrun's materializations step aside and let dbt-duckdb's own — the engine that
+     already knows how to write them — run instead. --#}
+{% macro duckrun__is_native_catalog(db) %}
+  {{ return(db is not none and db in (target.native_catalog_names or [])) }}
+{% endmacro %}

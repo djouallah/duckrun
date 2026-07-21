@@ -23,6 +23,7 @@ stay covered by tests/adapter and tests/correctness.
 All local, network-free, serial (duckrun's write path is single-writer). No DAT, no external engine.
 """
 import os
+import types
 from pathlib import Path
 
 import duckdb
@@ -31,6 +32,7 @@ import pytest
 from deltalake.exceptions import CommitFailedError
 
 import duckrun
+import duckrun.iceberg as iceberg_mod
 import duckrun.session as session_mod
 from duckrun.delta_table import _parse_parquet_identifier
 from dbt.adapters.duckrun import engine
@@ -1801,3 +1803,93 @@ def test_failed_attach_rolls_back_cleanly(tmp_path, monkeypatch):
     conn.attach(str(tmp_path / "wh2"), name="sales")
     assert conn.sql("select n from sales.dbo.only_there").fetchone()[0] == 99
     conn.close()
+
+
+# --------------------------------------------------------------------- format='iceberg'
+#
+# A Fabric lakehouse's Iceberg REST catalog is DuckDB's end to end — duckrun contributes only the
+# token, the storage secret and the ATTACH. There is no live endpoint in CI, so these assert the
+# generated SQL (and that sql() adds nothing to it); the endpoint itself is exercised by hand.
+
+class _RecordingCon:
+    """Stands in for a DuckDB connection: records SQL instead of running it."""
+
+    def __init__(self):
+        self.sql_log = []
+
+    def execute(self, sql, *args):
+        self.sql_log.append(sql)
+        return self
+
+
+@pytest.mark.parametrize("path,expected", [
+    ("ws/lh.Lakehouse", ("ws", "lh.Lakehouse", "dbo")),
+    ("ws/lh.Lakehouse/mart", ("ws", "lh.Lakehouse", "mart")),
+    ("ws/lh.Lakehouse/Tables/mart", ("ws", "lh.Lakehouse", "mart")),
+    ("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo",
+     ("ws", "lh.Lakehouse", "dbo")),
+    ("11111111-2222-3333-4444-555555555555/66666666-7777-8888-9999-000000000000",
+     ("11111111-2222-3333-4444-555555555555", "66666666-7777-8888-9999-000000000000", "dbo")),
+])
+def test_iceberg_parse_target(path, expected):
+    assert iceberg_mod.parse_iceberg_target(path) == expected
+
+
+def test_iceberg_parse_target_rejects_non_lakehouse():
+    with pytest.raises(ValueError, match="not a lakehouse"):
+        iceberg_mod.parse_iceberg_target("just-a-name")
+
+
+def test_iceberg_catalog_name_falls_back_for_guid():
+    assert iceberg_mod.catalog_name_for("sales.Lakehouse") == "sales"
+    assert iceberg_mod.catalog_name_for("66666666-7777-8888-9999-000000000000") == "data"
+
+
+def test_iceberg_attach_sql():
+    """The ATTACH duckrun writes for the user: endpoint, token, Fabric's flags, default schema."""
+    con = _RecordingCon()
+    so, schema = iceberg_mod.attach_iceberg_catalog(
+        con, "ice", "ws/sales.Lakehouse", None, {"bearer_token": "TOK"}, read_only=True)
+    assert schema == "dbo" and so["bearer_token"] == "TOK"
+    attach = [s for s in con.sql_log if s.startswith("ATTACH")][0]
+    assert attach.startswith("ATTACH OR REPLACE 'ws/sales.Lakehouse' AS \"ice\"")
+    assert "TYPE ICEBERG" in attach
+    assert f"ENDPOINT '{iceberg_mod.ICEBERG_ENDPOINT}'" in attach
+    assert "TOKEN 'TOK'" in attach
+    assert "ACCESS_DELEGATION_MODE 'none'" in attach
+    assert "STAGE_CREATE_TABLES 'false'" in attach
+    assert "SKIP_CREATE_TABLE_METADATA_UPDATES 'true'" in attach
+    assert "DEFAULT_SCHEMA 'dbo'" in attach
+    # read-only is DuckDB's own ATTACH flag — duckrun never inspects statements to enforce it.
+    assert attach.rstrip(")").endswith("READ_ONLY")
+    # The storage credential DuckDB writes the parquet data files with (the catalog TOKEN above
+    # only authenticates the REST API), and the extensions both need.
+    assert any("CREATE OR REPLACE SECRET" in s for s in con.sql_log)
+    assert "INSTALL iceberg; LOAD iceberg;" in con.sql_log
+
+
+def test_iceberg_attach_sql_writable_has_no_read_only():
+    con = _RecordingCon()
+    iceberg_mod.attach_iceberg_catalog(con, "ice", "ws/sales.Lakehouse", "mart",
+                                       {"bearer_token": "TOK"}, read_only=False)
+    attach = [s for s in con.sql_log if s.startswith("ATTACH")][0]
+    assert "READ_ONLY" not in attach
+    assert "DEFAULT_SCHEMA 'mart'" in attach
+
+
+def test_iceberg_sql_is_a_passthrough():
+    """sql() parses nothing: whatever the caller wrote reaches DuckDB verbatim. (Contrast the Delta
+    session, which routes write DML to delta_rs and gates it.)"""
+    sess = iceberg_mod.IcebergSession.__new__(iceberg_mod.IcebergSession)
+    seen = []
+    sess.con = types.SimpleNamespace(sql=lambda q: seen.append(q) or "REL")
+    for stmt in ("select 1", "CREATE TABLE t AS SELECT 1", "insert into t values (1)",
+                 "drop table t", "merge into t using s on target.id = source.id"):
+        assert sess.sql(stmt) == "REL"
+    assert seen == ["select 1", "CREATE TABLE t AS SELECT 1", "insert into t values (1)",
+                    "drop table t", "merge into t using s on target.id = source.id"]
+
+
+def test_connect_rejects_unknown_format(tmp_path):
+    with pytest.raises(ValueError, match="unknown format"):
+        duckrun.connect(str(tmp_path), format="hudi")

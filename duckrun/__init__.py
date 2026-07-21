@@ -8,6 +8,12 @@
     w = duckrun.connect("abfss://…/Tables/dbo", read_only=False)
     w.sql("CREATE OR REPLACE TABLE orders_copy AS SELECT * FROM orders")
 
+A Fabric lakehouse can also be opened through its Iceberg REST catalog, which DuckDB drives
+natively (listing, schemas, reads and writes) — duckrun only supplies the token and the ATTACH:
+
+    conn = duckrun.connect("ws/sales.Lakehouse", format="iceberg", read_only=False)
+    conn.sql("CREATE TABLE dbo.t AS SELECT 1")
+
 `conn.sql()` returns DuckDB's native relation; writes are ordinary SQL DML routed to delta-rs.
 Works the same against a local path, ``s3://``, ``gs://``, ``az://``, or OneLake ``abfss://``.
 This is the interactive/notebook API; the dbt adapter lives under ``dbt.adapters.duckrun``.
@@ -27,6 +33,7 @@ for _s in (sys.stdout, sys.stderr):
 del _s
 
 from .session import connect, DuckSession
+from .iceberg import IcebergSession
 from .fabric_remote import RemoteRunner, RemoteResult
 from .workspace import workspace, Workspace, ScriptResult
 
@@ -38,5 +45,5 @@ try:
 except PackageNotFoundError:  # running from a source tree that was never installed
     __version__ = "0+unknown"
 
-__all__ = ["connect", "DuckSession", "RemoteRunner", "RemoteResult",
+__all__ = ["connect", "DuckSession", "IcebergSession", "RemoteRunner", "RemoteResult",
            "workspace", "Workspace", "ScriptResult", "__version__"]

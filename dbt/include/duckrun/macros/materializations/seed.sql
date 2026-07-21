@@ -17,6 +17,10 @@
   python-model staging.
 #}
 {% materialization seed, adapter='duckrun' %}
+  {%- if duckrun__is_native_catalog(this.database) -%}
+    {#-- dbt-duckdb ships no seed materialization of its own; the default one is the engine here. --#}
+    {{ return(materialization_seed_default()) }}
+  {%- endif -%}
 
   {%- set agate_table = load_agate_table() -%}
   {#-- dbt reads this back (e.g. `dbt show`, logging of seed rows). --#}
