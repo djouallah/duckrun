@@ -24,7 +24,7 @@ import json
 import os
 import sys
 import time
-from typing import Optional
+from typing import Dict, Optional
 
 # OneLake storage scope; the resource notebookutils issues a "pbi"/"storage" token for.
 _STORAGE_SCOPE = "https://storage.azure.com/.default"
@@ -259,15 +259,26 @@ def get_powerbi_token() -> str:
     )
 
 
+_EXPIRY_CACHE: Dict[str, Optional[float]] = {}
+
+
 def _token_expiry_epoch(token: str) -> Optional[float]:
     """The ``exp`` (epoch seconds) of a JWT bearer token, or None if it isn't a decodable JWT.
-    No signature check — we only read the expiry to know when to refresh."""
+    No signature check — we only read the expiry to know when to refresh. Memoized per token
+    string: the freshness guard decodes on EVERY statement per catalog, and a token's ``exp``
+    is immutable; the cache is cleared on insert so it never holds more than the live tokens."""
+    if token in _EXPIRY_CACHE:
+        return _EXPIRY_CACHE[token]
     try:
         seg = token.split(".")[1]
         seg += "=" * (-len(seg) % 4)  # restore base64url padding
-        return float(json.loads(base64.urlsafe_b64decode(seg.encode())).get("exp"))
+        exp = float(json.loads(base64.urlsafe_b64decode(seg.encode())).get("exp"))
     except Exception:
-        return None
+        exp = None
+    if len(_EXPIRY_CACHE) >= 16:  # a session holds a handful of live tokens, not a stream
+        _EXPIRY_CACHE.clear()
+    _EXPIRY_CACHE[token] = exp
+    return exp
 
 
 def token_is_expiring(token: Optional[str], margin_seconds: int = 600) -> bool:

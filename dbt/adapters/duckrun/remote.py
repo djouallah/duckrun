@@ -135,6 +135,20 @@ def _sleep(seconds: float) -> None:
     time.sleep(seconds)
 
 
+_SESSION = None
+
+
+def _session():
+    """The shared ``requests.Session`` for all DFS calls. ``requests.get()`` builds and tears
+    down a Session (and its TLS connection) per call; discovery makes one DFS call per schema
+    plus pagination, so keep-alive to onelake.dfs.fabric.microsoft.com is worth holding."""
+    global _SESSION
+    if _SESSION is None:
+        import requests
+        _SESSION = requests.Session()
+    return _SESSION
+
+
 def retry_request(method: str, url: str, *, headers: dict, params: Optional[dict] = None,
                   json_body: Optional[dict] = None, timeout: int = 30):
     """A bounded-retry HTTP call — THE one retry loop for every OneLake/Fabric REST call (DFS data
@@ -145,10 +159,13 @@ def retry_request(method: str, url: str, *, headers: dict, params: Optional[dict
     ``raise_for_status`` fails loud."""
     import requests  # dbt dependency; imported lazily so non-remote paths don't need it
 
-    # Dispatch via the module-level helpers (requests.get/head/post/…), not requests.request:
-    # tests stub exactly those, and the two are behaviorally identical. `json` is only passed when
-    # there IS a body, so GET/HEAD keep their original (url, params, headers, timeout) call shape.
+    # Dispatch via the module-level helpers (requests.get/head/post/…) when they're patched —
+    # tests stub exactly those — else via the shared Session (same call shape, plus connection
+    # pooling). `json` is only passed when there IS a body, so GET/HEAD keep their original
+    # (url, params, headers, timeout) call shape.
     fn = getattr(requests, method.lower())
+    if fn is getattr(requests.api, method.lower(), None):  # unpatched → pooled session
+        fn = getattr(_session(), method.lower())
     kwargs = {"params": params, "headers": headers, "timeout": timeout}
     if json_body is not None:
         kwargs["json"] = json_body

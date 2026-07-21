@@ -747,6 +747,30 @@ def _delta_table(path: str, storage_options: Optional[Dict[str, str]]) -> DeltaT
     return DeltaTable(path)
 
 
+def open_delta_tables(targets):
+    """One :class:`DeltaTable` (or None on failure) per ``(location, storage_options)`` in
+    ``targets``, in order. Opens run concurrently: each is a Delta-log replay — several network
+    round trips on a remote store — and discovery does one per relation, so serialized they were
+    the dominant startup cost of read-only commands on OneLake (issue #16). Workers only
+    construct the DeltaTable (a read-only delta-rs open); callers keep all DuckDB cursor work on
+    their own thread. THE one concurrent-open helper for both the dbt adapter's discovery and
+    the connection API's catalog refresh, so the two can't drift."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _open(target):
+        loc, so = target
+        try:
+            return _delta_table(loc, so)
+        except Exception as exc:
+            logger.debug(f"duckrun: could not open {loc!r} via delta-rs: {exc}")
+            return None
+
+    if len(targets) <= 1:
+        return [_open(t) for t in targets]
+    with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
+        return list(pool.map(_open, targets))
+
+
 def tmp_name(tag: str, key) -> str:
     """A deterministic temp-relation name for ``key`` (a table location or identifier tuple): a
     12-hex-digit SHA-1 prefix, replacing the earlier 32-bit-truncated ``hash()`` whose collision
@@ -1604,6 +1628,7 @@ def merge_delta(
     update_condition: Optional[str] = None,
     insert_condition: Optional[str] = None,
     merge_schema: bool = False,
+    existing_columns: Optional[List[str]] = None,
     max_spill_size: Optional[int] = None,
     max_temp_directory_size: Optional[int] = None,
     streamed_exec: bool = False,
@@ -1703,6 +1728,7 @@ def merge_delta(
         path, data, predicate, clauses,
         read_version=read_version,
         merge_schema=merge_schema,
+        existing_columns=existing_columns,
         streamed_exec=streamed_exec,
         max_spill_size=max_spill_size,
         max_temp_directory_size=max_temp_directory_size,
@@ -1851,7 +1877,8 @@ def _merge_cardinality_guard(data, predicate: str, clauses: List[dict], streamed
         )
 
 
-def _merge_evolve_schema(path, data, storage_options, read_version: int, merge_schema: bool) -> int:
+def _merge_evolve_schema(path, data, storage_options, read_version: int, merge_schema: bool,
+                         existing_columns: Optional[List[str]] = None) -> int:
     """Schema evolution, DECOUPLED from the merge (never pass merge_schema to the merger): delta_rs,
     evolving mid-merge, back-fills a newly added column onto matched rows from the source — which is
     wrong for a narrow matched-update (a snapshot's close-row updates ONLY dbt_valid_to, so the new
@@ -1864,7 +1891,10 @@ def _merge_evolve_schema(path, data, storage_options, read_version: int, merge_s
     by the merge)."""
     if not merge_schema:
         return read_version
-    existing = {c.lower() for c in delta_columns(path, storage_options)}
+    # `existing_columns` is the list the caller read while deciding merge_schema (same immutable
+    # snapshot — no write happens in between), so don't re-open the log for the identical answer.
+    existing = {c.lower() for c in (existing_columns if existing_columns is not None
+                                    else delta_columns(path, storage_options))}
     added = [c for c in data.columns if c.lower() not in existing]
     if not added:
         return read_version
@@ -1940,6 +1970,7 @@ def merge_delta_clauses(
     *,
     read_version: Optional[int] = None,
     merge_schema: bool = False,
+    existing_columns: Optional[List[str]] = None,
     streamed_exec: bool = False,
     max_spill_size: Optional[int] = None,
     max_temp_directory_size: Optional[int] = None,
@@ -1975,7 +2006,8 @@ def merge_delta_clauses(
         raise ValueError("merge has no clauses")
 
     _merge_cardinality_guard(data, predicate, clauses, streamed_exec)
-    effective_version = _merge_evolve_schema(path, data, storage_options, read_version, merge_schema)
+    effective_version = _merge_evolve_schema(path, data, storage_options, read_version,
+                                             merge_schema, existing_columns=existing_columns)
 
     dt = _delta_table(path, storage_options)
     # Pin the target to the snapshot the model read (vB, or vB+1 after a decoupled add-columns commit)

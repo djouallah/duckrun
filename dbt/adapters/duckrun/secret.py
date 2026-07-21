@@ -45,13 +45,21 @@ def bearer_token(storage_options: Optional[Dict[str, str]]) -> Optional[str]:
     return None
 
 
+_IN_FABRIC: Optional[bool] = None
+
+
 def _in_fabric_notebook() -> bool:
-    """True when running inside a Microsoft Fabric notebook (``notebookutils`` importable)."""
-    try:
-        import notebookutils  # type: ignore  # noqa: F401
-        return True
-    except ImportError:
-        return False
+    """True when running inside a Microsoft Fabric notebook (``notebookutils`` importable).
+    Cached: a FAILED import is not cached by Python, so without the memo every secret mint
+    re-runs the full sys.path scan off-Fabric — and this runs per statement via handle()."""
+    global _IN_FABRIC
+    if _IN_FABRIC is None:
+        try:
+            import notebookutils  # type: ignore  # noqa: F401
+            _IN_FABRIC = True
+        except ImportError:
+            _IN_FABRIC = False
+    return _IN_FABRIC
 
 
 def _resolve_azure_transport() -> Optional[str]:

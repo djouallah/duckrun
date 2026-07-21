@@ -1285,7 +1285,8 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
-        live = self._exists(loc) and not is_dropped(self.cursor, loc, self.so)
+        # is_dropped_dt reads the schema off the handle _exists just pinned — no second log open.
+        live = self._exists(loc) and not is_dropped_dt(self._pinned(loc))
         # dbt/cursor path (no default_schema): keep the ORIGINAL narrow interception — only a plain
         # `create table … as select …` routes to Delta. A CTE or parenthesised body stays native so
         # dbt keeps owning the relation (dbt-internal CTAS like store_failures' `create table … as
@@ -1349,7 +1350,7 @@ class _DeltaDML:
         if not loc:
             return False
         existed = self._exists(loc)                       # ONE check — also picks the create mode below
-        live = existed and not is_dropped(self.cursor, loc, self.so)
+        live = existed and not is_dropped_dt(self._pinned(loc))  # reuses _exists's pinned handle
         if m.group("ine") and live:                       # IF NOT EXISTS over a live table → no-op
             self._refresh_view(rel, schema, loc)
             return True
@@ -1864,7 +1865,7 @@ class _DeltaDML:
         # isn't a duckrun-managed Delta table, fall through and let DuckDB drop the native table.
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
-        if not loc or not self._exists(loc) or is_dropped(self.cursor, loc, self.so):
+        if not loc or not self._exists(loc) or is_dropped_dt(self._pinned(loc)):
             # Not a LIVE duckrun table (never existed, native, or already tombstoned) → pass through so
             # DuckDB applies plain DROP / DROP IF EXISTS semantics: a plain `DROP TABLE <gone>` raises
             # (the delta_scan view was already unregistered on the first drop), IF EXISTS is a no-op.

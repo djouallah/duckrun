@@ -105,11 +105,20 @@ class DuckrunEnvironment(LocalEnvironment):
         the default root through ``_with_token``, which self-acquires for an abfss:// root the same way
         the write path does — so reads and writes can't drift. No-op for local/az:// roots or when a
         token is already present; a genuine abfss root with no acquirable token raises (fail loud —
-        better than a later opaque ``Unauthorized``)."""
+        better than a later opaque ``Unauthorized``).
+
+        Guarded on (connection, token) identity like ``_attach_catalogs``: ``handle()`` runs per
+        statement and secrets are database-global, so re-minting an unchanged token is pure waste;
+        a rebuilt connection or a rotated token still re-mints."""
         if self.conn is None:
             return
         _, so = self.creds.root_for()   # self-acquires for an abfss:// default root
-        secret.ensure_azure_secret(self.conn, so)
+        token = secret.bearer_token(so)
+        if token and getattr(self, "_secret_conn", None) is self.conn \
+                and getattr(self, "_secret_token", None) == token:
+            return
+        if secret.ensure_azure_secret(self.conn, so):
+            self._secret_conn, self._secret_token = self.conn, token
 
     def _attach_catalogs(self) -> None:
         """ATTACH each declared (non-default) catalog as an in-memory DuckDB catalog and mint its

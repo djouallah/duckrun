@@ -39,6 +39,41 @@ class _RecordingConn:
         pass
 
 
+def test_retry_request_uses_shared_session_when_unpatched(monkeypatch):
+    # The DFS retry loop pools connections through ONE module-level Session on the production
+    # path (requests.get builds and tears down a Session — a fresh TLS handshake — per call);
+    # a monkeypatched requests.get (every other test in this file) still wins over the pool.
+    sess = remote._session()
+    assert sess is remote._session()  # lazy singleton
+    calls = []
+    ok = type("_Ok", (), {"status_code": 200})()
+    monkeypatch.setattr(sess, "get", lambda url, **kw: calls.append(url) or ok)
+    resp = remote.retry_request("get", "https://example.invalid/x", headers={})
+    assert resp is ok and calls == ["https://example.invalid/x"]
+
+
+def test_default_secret_minted_once_per_connection_and_token(monkeypatch):
+    # handle() runs per statement and secrets are database-global: an unchanged (connection,
+    # token) pair must not re-run INSTALL/LOAD + CREATE SECRET, but a rebuilt connection must.
+    from dbt.adapters.duckrun.credentials import DuckrunCredentials
+    from dbt.adapters.duckrun.environment import DuckrunEnvironment
+
+    monkeypatch.setattr("duckrun.auth.get_onelake_token", lambda: "OIDCTOK")
+    creds = DuckrunCredentials(
+        database="db", schema="mart", path=":memory:",
+        root_path="abfss://ws@onelake.dfs.fabric.microsoft.com/lh/Tables",
+        storage_options=None)
+    env = DuckrunEnvironment(creds)
+    env.conn = _RecordingConn()
+    env._ensure_default_secret()
+    env._ensure_default_secret()  # same connection + token → guarded no-op
+    joined = "\n".join(env.conn.sql).lower()
+    assert joined.count("create or replace secret duckrun_onelake") == 1
+    env.conn = _RecordingConn()   # rebuilt connection → the secret is gone, must re-mint
+    env._ensure_default_secret()
+    assert "create or replace secret duckrun_onelake" in "\n".join(env.conn.sql).lower()
+
+
 def test_ensure_azure_secret_mints_secret_from_bearer_token():
     conn = _RecordingConn()
     created = secret.ensure_azure_secret(conn, {"bearer_token": "TOK123"})

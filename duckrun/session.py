@@ -571,11 +571,21 @@ class DuckSession:
             if not tables:
                 continue
             self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(name)}.{_qid(schema)}")
+            # Open every table's Delta log concurrently for the tombstone checks — serialized
+            # per-table opens were the dominant connect()/refresh() cost on OneLake (the twin of
+            # the adapter's issue-#16 discovery fix). View registration stays serial on the
+            # shared connection.
+            dts = engine.open_delta_tables([(f"{root}/{schema}/{t}", so) for t in tables])
             live = []
-            for table in tables:
+            for table, dt in zip(tables, dts):
                 # Hide drop-tombstones (a `drop table` overwrites the table to a one-column marker;
                 # no data is deleted, the files persist, but the table must not surface).
-                if delta_dml.is_dropped(self.con, f"{root}/{schema}/{table}", so):
+                if dt is not None:
+                    if delta_dml.is_dropped_dt(dt):
+                        continue
+                # delta-rs couldn't open it (a plain folder, or a credential only DuckDB holds) —
+                # fall back to the original DuckDB-side probe so a tombstone there is still hidden.
+                elif delta_dml.is_dropped(self.con, f"{root}/{schema}/{table}", so):
                     continue
                 if self._register_view(name, schema, table):
                     live.append(table)

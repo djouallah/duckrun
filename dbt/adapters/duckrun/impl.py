@@ -164,6 +164,28 @@ class DuckrunAdapter(DuckDBAdapter):
     def _cursor(self):
         return self.connections.get_thread_connection().handle.cursor()
 
+    def _mint_secret_guarded(self, cursor, storage_options):
+        """``secret.ensure_azure_secret``, skipped when this run's connection already holds this
+        exact token's secret. Discovery mints per schema and secrets are database-global, so
+        every repeat with an unchanged token was pure waste (INSTALL/LOAD + CREATE SECRET per
+        schema per command). Guarded on the live thread handle via a weakref — a rebuilt
+        connection or a rotated token still re-mints; a non-weakreffable handle just mints
+        every time (the old behavior)."""
+        import weakref
+        token = secret.bearer_token(storage_options)
+        try:
+            handle = self.connections.get_thread_connection().handle
+        except Exception:  # no thread connection (bare-adapter harness) → just mint, unguarded
+            handle = None
+        prev = getattr(self, "_minted_secret", None)
+        if token and handle is not None and prev and prev[0]() is handle and prev[1] == token:
+            return
+        if secret.ensure_azure_secret(cursor, storage_options) and token and handle is not None:
+            try:
+                self._minted_secret = (weakref.ref(handle), token)
+            except TypeError:  # pragma: no cover - handle type without weakref support
+                pass
+
     def _ensure_remote_secret(self, cursor):
         """Mint the DuckDB Azure secret from a ``bearer_token`` in ``storage_options`` on
         this connection, before discovery globs the store.
@@ -173,11 +195,11 @@ class DuckrunAdapter(DuckDBAdapter):
         connection-open). Read-only commands materialize nothing, so without this the very
         first thing that touches the store is the discovery glob below — which throws on
         ``abfss://`` with no secret, making every table look absent ("schema does not exist").
-        Idempotent and cheap to repeat; a no-op when no token is configured (local/az://).
+        A no-op when no token is configured (local/az://).
         """
         so = getattr(self.config.credentials, "storage_options", None)
         try:
-            secret.ensure_azure_secret(cursor, so)
+            self._mint_secret_guarded(cursor, so)
         except Exception as exc:  # pragma: no cover - logged, then discovery proceeds
             logger.debug(f"duckrun: could not create Azure secret before Delta discovery: {exc}")
 
@@ -224,7 +246,7 @@ class DuckrunAdapter(DuckDBAdapter):
             # Mint the DuckDB Azure secret from that token so the delta_scan views we're about to
             # register are actually queryable by read-only commands.
             try:
-                secret.ensure_azure_secret(self._cursor(), storage_options)
+                self._mint_secret_guarded(self._cursor(), storage_options)
             except Exception as exc:  # pragma: no cover - logged, then discovery proceeds
                 logger.debug(f"duckrun: could not mint Azure secret before abfss discovery: {exc}")
             names = self._discover_via_rest(root_path, schema, storage_options)
@@ -262,28 +284,10 @@ class DuckrunAdapter(DuckDBAdapter):
         return remote.list_delta_tables_via_glob(cursor, root_path, schema)
 
     def _open_delta_tables(self, targets):
-        """One ``DeltaTable`` (or None on failure) per ``(location, storage_options)`` in
-        ``targets``, in order. Opens run concurrently: each is a Delta-log replay — several
-        network round trips on a remote store — and discovery/docs do one per relation, so
-        serialized they were the dominant startup cost of read-only commands on OneLake
-        (issue #16). Workers only construct the DeltaTable (a read-only delta-rs open); all
-        DuckDB cursor work stays on the caller's thread — the write path is what isn't
-        thread-safe, and it never runs here."""
-        from concurrent.futures import ThreadPoolExecutor
+        """Concurrent Delta-log opens for discovery — see :func:`engine.open_delta_tables`
+        (shared with the connection API's catalog refresh)."""
         from . import engine
-
-        def _open(target):
-            loc, so = target
-            try:
-                return engine._delta_table(loc, so)
-            except Exception as exc:
-                logger.debug(f"duckrun: could not open {loc!r} via delta-rs: {exc}")
-                return None
-
-        if len(targets) <= 1:
-            return [_open(t) for t in targets]
-        with ThreadPoolExecutor(max_workers=min(8, len(targets))) as pool:
-            return list(pool.map(_open, targets))
+        return engine.open_delta_tables(targets)
 
     def _register_delta_view(self, relation, dt=None):
         """Create the ``delta_scan`` view for a discovered Delta relation on the live

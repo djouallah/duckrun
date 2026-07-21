@@ -326,7 +326,7 @@ class Plugin(BasePlugin):
         # on_schema_change: detect added/removed columns vs the existing table and
         # decide whether to let delta_rs evolve the schema (or fail). Default 'ignore'.
         on_schema_change = (cfg.get("on_schema_change") or "ignore").lower()
-        evolve_schema = self._resolve_schema_change(
+        evolve_schema, existing_cols = self._resolve_schema_change(
             on_schema_change, path, data, storage_options
         )
         # Merge is the only path where DuckDB and the delta_rs pool peak together: tighten
@@ -347,6 +347,7 @@ class Plugin(BasePlugin):
                     self._merge_on_predicate(unique_key, cfg, data.columns),
                     clause_specs,
                     merge_schema=evolve_schema,
+                    existing_columns=existing_cols,
                     max_spill_size=cfg.get("merge_max_spill_size"),
                     max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                     streamed_exec=(False if sx is None else bool(sx)),
@@ -364,6 +365,7 @@ class Plugin(BasePlugin):
                     update_condition=self._rewrite_merge_aliases(cfg.get("merge_update_condition")),
                     insert_condition=self._rewrite_merge_aliases(cfg.get("merge_insert_condition")),
                     merge_schema=evolve_schema,
+                    existing_columns=existing_cols,
                     max_spill_size=cfg.get("merge_max_spill_size"),
                     max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                     streamed_exec=(False if sx is None else bool(sx)),
@@ -903,17 +905,22 @@ class Plugin(BasePlugin):
         return specs
 
     @staticmethod
-    def _resolve_schema_change(on_schema_change, path, data, storage_options) -> bool:
+    def _resolve_schema_change(on_schema_change, path, data, storage_options):
         """Handle dbt ``on_schema_change`` for the merge path.
 
-        Returns whether delta_rs should evolve the table schema (``merge_schema``).
+        Returns ``(evolve, existing_columns)``: whether delta_rs should evolve the table schema
+        (``merge_schema``), plus the target's column list read while deciding — threaded into the
+        merge (``existing_columns=``) so the evolve step doesn't re-open the same immutable
+        snapshot's log for the identical answer. ``existing_columns`` is None on the ignore path
+        (nothing was read).
         - ignore (default): no evolution.
         - append_new_columns / sync_all_columns: evolve so new columns are added.
         - fail: raise if the incoming columns differ from the table's.
         """
         if on_schema_change in ("ignore", "", None):
-            return False
-        existing = [c.lower() for c in engine.delta_columns(path, storage_options)]
+            return False, None
+        columns = engine.delta_columns(path, storage_options)
+        existing = [c.lower() for c in columns]
         incoming = [c.lower() for c in data.columns]
         added = [c for c in incoming if c not in existing]
         removed = [c for c in existing if c not in incoming]
@@ -925,7 +932,7 @@ class Plugin(BasePlugin):
             )
         # append_new_columns / sync_all_columns: let delta_rs union in the new columns.
         # (delta_rs can add but not drop columns, so sync_all_columns is add-only here.)
-        return bool(added) or on_schema_change == "sync_all_columns"
+        return bool(added) or on_schema_change == "sync_all_columns", columns
 
     # ------------------------------------------------------------------- read
     @staticmethod
