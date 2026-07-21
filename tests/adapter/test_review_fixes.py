@@ -98,7 +98,9 @@ def test_root_path_accepts_onelake_shorthand():
     assert c.catalog_locations["gold"] == (
         "abfss://11111111-1111-1111-1111-111111111111@onelake.dfs.fabric.microsoft.com/"
         "22222222-2222-2222-2222-222222222222/Tables")
-    assert c.root_for("gold")[0] == c.catalog_locations["gold"]
+    # NB: don't assert through root_for() here — it self-acquires a OneLake token for an abfss root,
+    # which is a live network call. catalog_roots() is the same registry without the auth side trip.
+    assert c.catalog_roots()["gold"][0] == c.catalog_locations["gold"]
 
 
 def test_root_path_local_relative_not_mistaken_for_shorthand():
