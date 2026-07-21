@@ -170,19 +170,46 @@ def test_iceberg_profile_expands_to_one_attachment():
     assert c.settings.get("preserve_insertion_order") is False
 
 
-def test_iceberg_profile_pins_azure_transport(monkeypatch):
-    """The expansion pins the azure transport in `settings:` — this profile hands secret-minting to
-    dbt-duckdb, so nothing else runs _set_azure_transport on the connection, and a Linux runner's
-    `default` transport dies with "Problem with the SSL CA cert" (first live iceberg CI run)."""
+class _RecConn:
+    """Minimal recording stand-in for a DuckDB connection."""
+    def __init__(self):
+        self.sql = []
+
+    def execute(self, q, *a):
+        self.sql.append(q)
+        return self
+
+
+def _iceberg_plugin(creds):
+    p = Plugin.__new__(Plugin)
+    p.creds = creds
+    p.initialize({})
+    return p
+
+
+def test_iceberg_connection_pins_global_transport(monkeypatch):
+    """The plugin pins the transport with SET GLOBAL on the PARENT connection for an iceberg
+    profile: the secret mint no-ops (no bearer token in storage_options) and a `settings:` entry
+    is applied per cursor — which the azure extension's connection threads never see, so every
+    live storage read died with "Problem with the SSL CA cert" (first integration_tests_iceberg
+    runs, Linux runner)."""
     monkeypatch.setattr(secret, "_resolve_azure_transport", lambda: "curl")
-    assert _iceberg_creds().settings.get("azure_transport_option_type") == "curl"
+    conn = _RecConn()
+    _iceberg_plugin(_iceberg_creds()).configure_connection(conn)
+    joined = "\n".join(conn.sql).lower()
+    assert "install azure; load azure;" in joined
+    assert "set global azure_transport_option_type = 'curl'" in joined
 
 
-def test_iceberg_profile_leaves_transport_where_default_works(monkeypatch):
-    """Where the platform wants DuckDB's default transport (Windows / Fabric notebook), the
-    expansion must NOT pin anything — forcing curl there is the #16 Windows regression."""
-    monkeypatch.setattr(secret, "_resolve_azure_transport", lambda: None)
-    assert "azure_transport_option_type" not in _iceberg_creds().settings
+def test_non_iceberg_connection_never_installs_azure(monkeypatch):
+    """No iceberg attach -> no INSTALL azure and no transport SET at connection open: a plain
+    local/Delta profile must stay runnable offline (the Delta path handles its own transport
+    inside ensure_azure_secret, token-gated)."""
+    monkeypatch.setattr(secret, "_resolve_azure_transport", lambda: "curl")
+    conn = _RecConn()
+    _iceberg_plugin(_creds()).configure_connection(conn)
+    joined = "\n".join(conn.sql).lower()
+    assert "azure" not in joined
 
 
 def test_iceberg_schema_and_alias_from_path():

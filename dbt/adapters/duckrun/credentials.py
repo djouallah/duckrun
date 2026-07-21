@@ -199,14 +199,10 @@ class DuckrunCredentials(DuckDBCredentials):
 
         settings = dict(data.get("settings") or {})
         settings.setdefault("preserve_insertion_order", False)
-        # The azure transport must be pinned HERE: on the Delta path ensure_azure_secret() sets it,
-        # but this profile hands secret-minting to dbt-duckdb's `secrets:` block, so nothing else
-        # touches the connection — and on a Linux runner the extension's `default` transport dies
-        # with "Problem with the SSL CA cert" the moment DuckDB reads a data file it just wrote.
-        # Same platform logic as everywhere: curl off-Fabric except Windows, env override wins.
-        transport = secret._resolve_azure_transport()
-        if transport:
-            settings.setdefault("azure_transport_option_type", transport)
+        # NOTE the azure transport is deliberately NOT pinned via `settings:` — dbt-duckdb applies
+        # settings per CURSOR, and a cursor-scoped SET never reaches the azure extension's
+        # connection threads. The delta plugin's configure_connection pins it with SET GLOBAL on
+        # the parent connection instead (before the ATTACHes run).
         data["settings"] = settings
         return data
 
