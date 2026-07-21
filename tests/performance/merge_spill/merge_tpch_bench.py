@@ -555,11 +555,16 @@ def main():
     ap.add_argument("--dir", required=True)
     ap.add_argument("--sf", type=float, default=10.0, help="target fact table scale factor")
     ap.add_argument("--warehouse", default=None,
-                    help="Delta warehouse root. An abfss://… path runs the whole chain against "
-                         "OneLake (the small-N integration job); default is the local <dir>/warehouse "
-                         "the heavy SF=10 gate uses.")
+                    help="Delta warehouse root. A OneLake path — the `<workspace>/<lakehouse>` "
+                         "shorthand or the full abfss://… URL — runs the whole chain against OneLake "
+                         "(the small-N integration job); default is the local <dir>/warehouse the "
+                         "heavy SF=10 gate uses.")
     ap.set_defaults(func=run)
     args = ap.parse_args()
+    # Normalize the OneLake shorthand up front so the abfss checks downstream (local-vs-remote,
+    # the clean-warehouse rmtree) see one spelling.
+    from dbt.adapters.duckrun.remote import expand_onelake_shorthand
+    args.warehouse = expand_onelake_shorthand(args.warehouse)
     args.func(args)
 
 

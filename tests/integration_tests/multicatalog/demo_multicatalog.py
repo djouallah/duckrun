@@ -19,8 +19,11 @@ Emits a standalone HTML report when ``DUCKRUN_MULTICAT_PAGE`` is set (CI publish
 
 OneLake — tokens are acquired automatically (Fabric notebook, env, or `az login`), so set only paths:
 
-    WAREHOUSE_PATH       abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables   (writable lakehouse)
-    WAREHOUSE_RO_PATH    abfss://<ws>@onelake.dfs.fabric.microsoft.com/<warehouse>/Tables   (read-only warehouse)
+    WAREHOUSE_PATH       <ws>/<lakehouse>   (writable lakehouse)
+    WAREHOUSE_RO_PATH    <ws>/<warehouse>   (read-only warehouse)
+
+The OneLake shorthand above and the full abfss://<ws>@onelake.dfs.fabric.microsoft.com/<item>/Tables
+URL are interchangeable everywhere.
 
 Knobs:
     DUCKRUN_MULTICAT_SCHEMA   schema the mart is written into (default: multicatalog_demo)
@@ -36,14 +39,17 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import duckrun
+from dbt.adapters.duckrun.remote import expand_onelake_shorthand
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 
-WAREHOUSE_PATH = os.environ.get("WAREHOUSE_PATH")          # the writable OneLake lakehouse (primary)
-WAREHOUSE_RO_PATH = os.environ.get("WAREHOUSE_RO_PATH")    # the read-only Fabric Warehouse
+# Either spelling is accepted in the env — the full abfss URL or the `<workspace>/<item>` shorthand
+# duckrun.connect/attach also take. Expand once here so the abfss-shaped checks below stay valid.
+WAREHOUSE_PATH = expand_onelake_shorthand(os.environ.get("WAREHOUSE_PATH"))      # writable lakehouse (primary)
+WAREHOUSE_RO_PATH = expand_onelake_shorthand(os.environ.get("WAREHOUSE_RO_PATH"))  # read-only Fabric Warehouse
 SCHEMA = os.environ.get("DUCKRUN_MULTICAT_SCHEMA", "multicatalog_demo")
 # Both remote catalogs are scoped to the `mart` schema: it keeps discovery fast and shows the SAME
 # tables in the warehouse and the lakehouse — driving home that they're the same thing, one locked.

@@ -30,7 +30,8 @@ its actual result, top to bottom — when ``DUCKRUN_TAXI_PAGE`` is set (CI publi
 
 OneLake only (this is what "the sample lakehouse" means here) — set, with no Azure ids in code:
 
-    WAREHOUSE_PATH   abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables
+    WAREHOUSE_PATH   <workspace>/<lakehouse>   (the OneLake shorthand; the full
+                     abfss://<workspace>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables works too)
     ONELAKE_TOKEN    storage bearer token (resource https://storage.azure.com/)
 
 Knobs (all env-overridable):
@@ -49,6 +50,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 
 import duckrun
+from dbt.adapters.duckrun.remote import expand_onelake_shorthand
 
 # The scenario prints box-drawing chars and ✅/❌; force utf-8 so a Windows cp1252 console doesn't
 # crash when watching the demo.
@@ -60,7 +62,10 @@ except Exception:
 CF = "https://d37ci6vzurychx.cloudfront.net"
 ZONE_CSV = f"{CF}/misc/taxi_zone_lookup.csv"
 
-WAREHOUSE_PATH = os.environ.get("WAREHOUSE_PATH")
+# The env may carry either spelling — the full abfss URL or the `<workspace>/<item>` shorthand
+# duckrun.connect also accepts. Expand once here so everything below (the abfss checks, the path
+# concatenation) keeps working on one normalized form.
+WAREHOUSE_PATH = expand_onelake_shorthand(os.environ.get("WAREHOUSE_PATH"))
 ONELAKE_TOKEN = os.environ.get("ONELAKE_TOKEN") or os.environ.get("AZURE_STORAGE_TOKEN")
 # No token in the env: self-acquire from the OIDC identity (same source duckrun.connect uses) so the
 # demo runs instead of printing "OneLake not configured".

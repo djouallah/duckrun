@@ -34,7 +34,11 @@ FROM (
 
 
 def main() -> None:
-    root = os.environ.get("WAREHOUSE_PATH", "/tmp").rstrip("/")
+    # WAREHOUSE_PATH may be the `<ws>/<lakehouse>` OneLake shorthand; expand before appending the
+    # table sub-path (delta-rs itself only understands the full URL).
+    from dbt.adapters.duckrun.remote import expand_onelake_shorthand
+
+    root = expand_onelake_shorthand(os.environ.get("WAREHOUSE_PATH", "/tmp")).rstrip("/")
     path = f"{root}/sources/dim_calendar"
 
     storage_options = None

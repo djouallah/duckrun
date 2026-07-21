@@ -64,8 +64,13 @@ def count_pending() -> dict:
     Returns {(fact, source_type): backlog_count}; {} when nothing has been downloaded yet."""
     import duckrun
 
+    # WAREHOUSE_PATH accepts either OneLake spelling — the full abfss URL or the `<ws>/<item>`
+    # shorthand — so expand before concatenating the fact sub-paths onto it. FILES_PATH stays a full
+    # URL: sources.yml pastes it straight into read_csv_auto(), which never sees the expander.
+    from dbt.adapters.duckrun.remote import expand_onelake_shorthand
+
     files_path = os.environ["FILES_PATH"].rstrip("/")
-    warehouse_path = os.environ["WAREHOUSE_PATH"].rstrip("/")
+    warehouse_path = expand_onelake_shorthand(os.environ["WAREHOUSE_PATH"]).rstrip("/")
     # No token passed: for an abfss:// path duckrun.connect self-acquires the OneLake token itself
     # (GitHub OIDC / azure-identity). One read-only session (one OneLake azure secret) reads BOTH the
     # log parquet under Files and the fact Delta tables under Tables — sibling paths on the same account.

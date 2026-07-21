@@ -9,7 +9,8 @@ Runs `dbt run` against `integration_tests/multicatalog/dbt`, then reads each lay
 Lakehouse root and writes a standalone report when `DUCKRUN_MULTICAT_DBT_PAGE` is set (CI publishes it
 as multicatalog_dbt.html).
 
-Env — three Lakehouse roots (three `abfss://` on OneLake, or three folders locally):
+Env — three Lakehouse roots (on OneLake: `<ws>/<lakehouse>` shorthand or the full `abfss://` URL;
+locally: three folders):
     LH_BRONZE_PATH   raw layer          LH_SILVER_PATH   cleaned (default catalog)   LH_GOLD_PATH  serving
     ONELAKE_TOKEN    OneLake bearer token (blank for local)   DBT_SCHEMA  schema to write into (default main)
     DUCKRUN_MULTICAT_DBT_PAGE   write the HTML report here (optional)
@@ -22,6 +23,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import duckrun
+from dbt.adapters.duckrun.remote import expand_onelake_shorthand
 from dbt.cli.main import dbtRunner
 
 try:
@@ -61,7 +63,10 @@ def _readback(root, table):
 
 
 def main():
-    roots = {env: os.environ.get(env) for _, _, _, env in LAYERS}
+    # Roots may be spelled either way — full abfss URL or the `<workspace>/<item>` OneLake shorthand.
+    # Expand for this script's own display/readback; dbt gets the raw env and expands it in the
+    # profile (DuckrunCredentials), through the very same function.
+    roots = {env: expand_onelake_shorthand(os.environ.get(env)) for _, _, _, env in LAYERS}
     missing = [e for e, v in roots.items() if not v]
     if missing:
         # Local convenience: default any unset root to a temp folder so the demo still runs offline.

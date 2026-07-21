@@ -53,9 +53,10 @@ duckrun.connect("<workspace-guid>/<lakehouse-guid>")  # catalog "data" (pass nam
 
 Only two shapes are shorthand: an item with a `.Lakehouse`/`.Warehouse` suffix, or a
 **workspace-GUID/item-GUID** pair. Anything else — including a suffix-less `ws/lh` — is still an
-ordinary local relative path, so nothing that works today changes meaning. `conn.attach()` takes the
-same shorthand. Prefer the GUID form on OneLake: friendly names can trip a `delta_scan` bug
-(duckdb-delta#307).
+ordinary local relative path, so nothing that works today changes meaning. Spell `Files` to address
+the file side instead (`ws/lh.Lakehouse/Files/raw`); `Tables` is only the default when you name
+neither. `conn.attach()` and the dbt profile's `root_path` take the same shorthand. Prefer the GUID
+form on OneLake: friendly names can trip a `delta_scan` bug (duckdb-delta#307).
 
 ## It's just DuckDB SQL (plus three Delta bits)
 

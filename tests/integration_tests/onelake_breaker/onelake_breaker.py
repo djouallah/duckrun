@@ -774,9 +774,13 @@ def _run_workers(root, scratch, schema, n_workers, ops, batch, seed, rng,
 def _resolve_target(args):
     """Pin down the warehouse root + schema + scratch dir, and validate OneLake creds. `root` is the
     Delta warehouse (abfss:// or local); `scratch` is a LOCAL dir for ledgers/coordination."""
-    root = args.root or os.environ.get("WAREHOUSE_PATH")
+    # Either OneLake spelling is accepted (full abfss URL or the `<ws>/<item>` shorthand); expand
+    # once here so the abfss checks below and every worker see one normalized root.
+    from dbt.adapters.duckrun.remote import expand_onelake_shorthand
+    root = expand_onelake_shorthand(args.root or os.environ.get("WAREHOUSE_PATH"))
     if not root:
-        sys.exit("no target: set WAREHOUSE_PATH=abfss://…/Tables (OneLake) or pass --root <local dir>")
+        sys.exit("no target: set WAREHOUSE_PATH=<ws>/<lakehouse> or abfss://…/Tables (OneLake), "
+                 "or pass --root <local dir>")
     if str(root).startswith("abfss://") and not _storage_options(root):
         sys.exit("OneLake target but no token: set ONELAKE_TOKEN (or AZURE_STORAGE_TOKEN)")
     scratch = args.scratch or tempfile.mkdtemp(prefix="duckrun_onelake_breaker_")

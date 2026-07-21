@@ -84,6 +84,29 @@ def test_root_path_without_slash_unchanged():
     assert c.root_path == "./warehouse"
 
 
+# ------------------------------------------------------- OneLake <ws>/<item> shorthand in profiles
+
+def test_root_path_accepts_onelake_shorthand():
+    # A profile root_path takes the same shorthand duckrun.connect() does — expanded once here, so
+    # every consumer downstream (write path, discovery, stats) still sees a plain abfss:// URL.
+    c = DuckrunCredentials(
+        database="db", schema="main", root_path="ws/lh.Lakehouse",
+        catalogs={"gold": {"root_path": "11111111-1111-1111-1111-111111111111/"
+                                        "22222222-2222-2222-2222-222222222222"}},
+    )
+    assert c.root_path == "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables"
+    assert c.catalog_locations["gold"] == (
+        "abfss://11111111-1111-1111-1111-111111111111@onelake.dfs.fabric.microsoft.com/"
+        "22222222-2222-2222-2222-222222222222/Tables")
+    assert c.root_for("gold")[0] == c.catalog_locations["gold"]
+
+
+def test_root_path_local_relative_not_mistaken_for_shorthand():
+    # The ambiguity guard on the dbt side: a suffix-less two-segment root stays a local path.
+    c = DuckrunCredentials(database="db", schema="main", root_path="warehouse/tables")
+    assert c.root_path == "warehouse/tables"
+
+
 # ------------------------------------------------------- #22 dollar-quote multi-statement
 
 def test_multi_statement_skips_dollar_quote():

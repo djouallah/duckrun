@@ -285,39 +285,9 @@ def _onelake_guid_hint(root_path: str) -> Optional[str]:
     )
 
 
-# OneLake's data-plane host — the constant half of every abfss lakehouse URL.
-_ONELAKE_HOST = "onelake.dfs.fabric.microsoft.com"
-
-
-def _expand_onelake_shorthand(path: str) -> str:
-    """Expand the OneLake shorthand ``<workspace>/<item>[/…]`` into a full ``abfss://`` URL.
-
-    Two shapes qualify, and ONLY these two — everything else (a real URL, an absolute path, a bare
-    two-segment relative path like ``data/lh``) is returned verbatim, so no existing path changes
-    meaning:
-
-    * the item segment carries a Fabric item suffix — ``ws/sales.Lakehouse``, ``ws/ref.Warehouse``;
-    * both segments are GUIDs — ``<ws-guid>/<item-guid>`` (the form we recommend on OneLake anyway,
-      see :func:`_onelake_guid_hint`).
-
-    Segments after the item are kept as-is under ``…/Tables`` (a leading ``Tables`` of the caller's
-    own is not doubled), so ``ws/lh.Lakehouse/dbo`` and ``ws/lh.Lakehouse/Tables/dbo`` are the same
-    thing and `_split_root_schema` reads the schema off either.
-    """
-    if not path or "://" in path:
-        return path
-    if path[0] in "/\\" or os.path.splitdrive(path)[0]:
-        return path                                   # absolute / drive / UNC → a real local path
-    parts = [p for p in path.replace("\\", "/").rstrip("/").split("/")]
-    if len(parts) < 2 or any(p in ("", ".", "..") for p in parts):
-        return path
-    workspace, item, rest = parts[0], parts[1], parts[2:]
-    if not (item.lower().endswith((".lakehouse", ".warehouse"))
-            or (_GUID.match(workspace) and _GUID.match(item))):
-        return path
-    if rest and rest[0].lower() == "tables":
-        rest = rest[1:]
-    return "/".join([f"abfss://{workspace}@{_ONELAKE_HOST}/{item}/Tables", *rest])
+# The OneLake `<workspace>/<item>` shorthand expander lives in ``remote`` (next to the other abfss
+# parsing) so this session and the dbt adapter's root_path resolve it identically.
+_expand_onelake_shorthand = remote.expand_onelake_shorthand
 
 
 def _split_root_schema(path: str, schema: Optional[str]):

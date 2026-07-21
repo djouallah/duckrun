@@ -14,7 +14,8 @@ Two knobs, both env-overridable so a CI job can crank them:
   COFFEE_ONELAKE_ROWS   OneLake fact rows (default 2,000)
 
 OneLake target (no Azure ids hardcoded — same convention as the `aemo` workflow):
-  WAREHOUSE_PATH   abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>/Tables
+  WAREHOUSE_PATH   <ws>/<lh>  (OneLake shorthand; the full
+                   abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lh>/Tables works too)
   ONELAKE_TOKEN    storage bearer token (resource https://storage.azure.com/)
 
 Dimensions come from Josue Bogran's coffeeshopdatageneratorv2 CSVs, vendored under data/ (MIT — see
@@ -32,6 +33,7 @@ from contextlib import contextmanager
 import pytest
 
 import duckrun
+from dbt.adapters.duckrun.remote import expand_onelake_shorthand
 
 # The scenario (and session.refresh) print Unicode; force utf-8 so a Windows cp1252 console doesn't
 # crash on it when watching the run with `pytest -s`.
@@ -59,7 +61,9 @@ def _step(n, label):
 LOCAL_ROWS = int(os.environ.get("COFFEE_LOCAL_ROWS", "1000000"))
 ONELAKE_ROWS = int(os.environ.get("COFFEE_ONELAKE_ROWS", "2000"))
 
-WAREHOUSE_PATH = os.environ.get("WAREHOUSE_PATH")
+# The env may carry either spelling — the full abfss URL or the `<workspace>/<item>` shorthand
+# duckrun.connect also accepts. Expand once here so the abfss-shaped checks below stay valid.
+WAREHOUSE_PATH = expand_onelake_shorthand(os.environ.get("WAREHOUSE_PATH"))
 ONELAKE_TOKEN = os.environ.get("ONELAKE_TOKEN") or os.environ.get("AZURE_STORAGE_TOKEN")
 # No token in the env (CI no longer mints one): self-acquire it from the OIDC identity, the same source
 # duckrun.connect() uses. Keeps these live OneLake gates running instead of silently skipping.
@@ -271,6 +275,42 @@ def test_onelake_files_copy_download_roundtrip(tmp_path):
     assert (dst / "a.csv").read_bytes() == a
     assert (dst / "sub" / "b.parquet").read_bytes() == b
     assert not (dst / "skip.txt").exists()  # extension filter carried through
+
+
+def _shorthand(abfss_path):
+    """``abfss://<ws>@onelake…/<item>/Tables[/<tail>]`` → the ``<ws>/<item>[/<tail>]`` shorthand.
+    Reuses the adapter's own abfss parser so the two spellings can't drift."""
+    from dbt.adapters.duckrun import remote
+
+    workspace, _host, path = remote._parse_abfss(abfss_path.rstrip("/"))
+    return f"{workspace}/{path}"
+
+
+@pytest.mark.skipif(
+    not (WAREHOUSE_PATH and WAREHOUSE_PATH.startswith("abfss://") and ONELAKE_TOKEN),
+    reason="OneLake not configured (set WAREHOUSE_PATH=abfss://…/Tables and ONELAKE_TOKEN)",
+)
+def test_onelake_shorthand_connect_reaches_same_lakehouse():
+    """The live gate for the ``<workspace>/<item>`` connect shorthand: connecting by GUID pair must
+    land on the very same OneLake root as the full abfss URL, with the same tables — the offline
+    suite only proves the string expansion, not that OneLake accepts what we build."""
+    short = _shorthand(WAREHOUSE_PATH)                       # "<ws-guid>/<lh-guid>/Tables"
+    print(f"\nshorthand: {short}", flush=True)
+    full = duckrun.connect(WAREHOUSE_PATH, storage_options={"bearer_token": ONELAKE_TOKEN},
+                           schema=ONELAKE_SCHEMA)
+    conn = duckrun.connect(short, storage_options={"bearer_token": ONELAKE_TOKEN},
+                           schema=ONELAKE_SCHEMA)
+    assert conn.root_path == full.root_path == WAREHOUSE_PATH.rstrip("/")
+    assert conn._current_catalog == "data"                   # GUID pair derives no name → fallback
+    assert sorted(r[0] for r in conn.sql("SHOW TABLES").fetchall()) == \
+           sorted(r[0] for r in full.sql("SHOW TABLES").fetchall())
+    # the schema can also ride in the shorthand itself, instead of schema=
+    tail = duckrun.connect(f"{short.rstrip('/')}/{ONELAKE_SCHEMA}",
+                           storage_options={"bearer_token": ONELAKE_TOKEN})
+    assert tail.root_path == conn.root_path
+    assert tail._current_database == ONELAKE_SCHEMA
+    for c in (full, conn, tail):
+        c.close()
 
 
 # A friendly-name abfss path (workspace/lakehouse names instead of GUIDs) over the SAME lakehouse.

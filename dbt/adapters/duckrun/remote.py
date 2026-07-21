@@ -8,6 +8,7 @@ list the schema's table directories with the ADLS Gen2 / OneLake DFS "List Paths
 instead, using the same bearer token that authenticates the Delta reads/writes. Local and
 ``az://`` stores keep using DuckDB ``glob`` (which works there).
 """
+import os
 import re
 from typing import List, Optional, Tuple
 
@@ -36,6 +37,49 @@ class OneLakeAccessError(RuntimeError):
 
 def is_abfss(root_path: Optional[str]) -> bool:
     return bool(root_path) and root_path.startswith("abfss://")
+
+
+# OneLake's data-plane host — the constant half of every abfss lakehouse URL.
+ONELAKE_HOST = "onelake.dfs.fabric.microsoft.com"
+# Fabric item-type suffixes that make a path segment unambiguously a OneLake item, not a folder.
+_ITEM_SUFFIXES = (".lakehouse", ".warehouse")
+
+
+def expand_onelake_shorthand(path: Optional[str]) -> Optional[str]:
+    """Expand the OneLake shorthand ``<workspace>/<item>[/…]`` into a full ``abfss://`` URL.
+
+    Two shapes qualify, and ONLY these two — everything else (a real URL, an absolute path, a bare
+    two-segment relative path like ``data/lh``) is returned verbatim, so no existing path changes
+    meaning:
+
+    * the item segment carries a Fabric item suffix — ``ws/sales.Lakehouse``, ``ws/ref.Warehouse``;
+    * both segments are GUIDs — ``<ws-guid>/<item-guid>`` (the form we recommend on OneLake anyway,
+      since friendly names can trip delta_scan — duckdb-delta#307).
+
+    Segments after the item are kept as-is under ``…/Tables``, so ``ws/lh.Lakehouse/dbo`` and
+    ``ws/lh.Lakehouse/Tables/dbo`` are the same thing. Spell ``Files`` explicitly
+    (``ws/lh.Lakehouse/Files/raw``) to address the lakehouse's file side instead — the ``Tables``
+    default is only applied when the caller named neither section.
+
+    Both entry points route through here — ``duckrun.connect``/``attach`` (via
+    ``session._split_root_schema``) and the dbt profile's ``root_path`` (via
+    ``DuckrunCredentials.__post_init__``) — so the two surfaces can't drift.
+    """
+    if not path or "://" in path:
+        return path
+    if path[0] in "/\\" or os.path.splitdrive(path)[0]:
+        return path                                   # absolute / drive / UNC → a real local path
+    parts = path.replace("\\", "/").rstrip("/").split("/")
+    if len(parts) < 2 or any(p in ("", ".", "..") for p in parts):
+        return path
+    workspace, item, rest = parts[0], parts[1], parts[2:]
+    if not (item.lower().endswith(_ITEM_SUFFIXES)
+            or (_GUID.match(workspace) and _GUID.match(item))):
+        return path
+    section = "Tables"
+    if rest and rest[0].lower() in ("tables", "files"):
+        section, rest = rest[0], rest[1:]      # keep the caller's spelling; don't double it
+    return "/".join([f"abfss://{workspace}@{ONELAKE_HOST}/{item}/{section}", *rest])
 
 
 # A 404 from the DFS API is only benign when the *directory itself* is absent (a schema / folder not

@@ -101,11 +101,16 @@ class DuckrunCredentials(DuckDBCredentials):
         # The write-path macros concatenate ``root ~ '/' ~ schema ~ '/' ~ id`` while discovery / DML /
         # stats all rstrip('/'), so a profile root_path ending in '/' produced a distinct ``root//…``
         # key on an object store — a location discovery never lists. Strip it at the source instead.
+        # Each root also accepts the OneLake `<workspace>/<item>` shorthand ("ws/lh.Lakehouse",
+        # "<ws-guid>/<lh-guid>") — expanded here, at the one place a root enters the adapter, so
+        # every consumer downstream still sees a plain abfss:// URL. Same expander duckrun.connect
+        # uses, so a profile and a notebook read a path identically.
+        from .remote import expand_onelake_shorthand
         if self.root_path:
-            self.root_path = self.root_path.rstrip("/")
+            self.root_path = expand_onelake_shorthand(self.root_path).rstrip("/")
         for cfg in (self.catalogs or {}).values():
             if cfg and cfg.get("root_path"):
-                cfg["root_path"] = cfg["root_path"].rstrip("/")
+                cfg["root_path"] = expand_onelake_shorthand(cfg["root_path"]).rstrip("/")
         # Token-free alias -> root_path map for the Jinja target (see catalog_locations).
         self.catalog_locations = {
             alias: (cfg or {}).get("root_path") for alias, cfg in (self.catalogs or {}).items()

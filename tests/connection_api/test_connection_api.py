@@ -582,6 +582,9 @@ def test_onelake_shorthand_expansion():
     assert _split_root_schema("ws/lh.Lakehouse", "sales") == (tables, "sales")
     # deeper tails ride along under Tables (the first segment is then the schema)
     assert _split_root_schema("ws/lh.Lakehouse/dbo/extra", None) == (tables, "dbo")
+    # the Files side is addressable too — spell it, and Tables is not forced on
+    assert _split_root_schema("ws/lh.Lakehouse/Files/raw", None) == (
+        "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Files/raw", None)
     # the friendly form derives its catalog name; the GUID pair derives nothing → "data" fallback
     assert _derive_catalog_name(_split_root_schema("ws/sales.Lakehouse", None)[0]) == "sales"
     ws, lh = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"

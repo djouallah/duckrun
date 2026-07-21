@@ -51,6 +51,22 @@ def test_format_inferred_from_extension(path, call):
     assert scan(location=path) == f"SELECT * FROM {call}"
 
 
+# ----------------------------------------------------------------- OneLake shorthand
+def test_onelake_shorthand_source_path_expanded():
+    # `{{ env_var('WAREHOUSE_PATH') }}/sources/dim_calendar` with the env holding the short form.
+    assert scan(delta_table_path="ws/lh.Lakehouse/sources/dim_calendar") == (
+        "SELECT * FROM delta_scan('abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/"
+        "sources/dim_calendar')")
+    # the Files side keeps its section, and the extension still drives the reader
+    assert scan(location="ws/lh.Lakehouse/Files/csv/duid.csv") == (
+        "SELECT * FROM read_csv_auto('abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/"
+        "Files/csv/duid.csv')")
+
+
+def test_local_source_path_not_mistaken_for_shorthand():
+    assert scan(location="data/lake/codes.csv") == "SELECT * FROM read_csv_auto('data/lake/codes.csv')"
+
+
 # ----------------------------------------------------------------- errors / safety
 def test_unknown_format_is_a_hard_error():
     with pytest.raises(ValueError, match="Unsupported duckrun source format"):

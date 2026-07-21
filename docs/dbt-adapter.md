@@ -32,6 +32,22 @@ my_project:
 Persisted models are written to `<root_path>/<schema>/<model>` (e.g. `.../Tables/dbo/orders`), or to
 an explicit `config(location=...)`.
 
+### OneLake shorthand for `root_path`
+
+On OneLake you can drop the `abfss://…@onelake.dfs.fabric.microsoft.com/…/Tables` boilerplate and
+write `workspace/item` — the same shorthand `duckrun.connect()` accepts, expanded when the profile
+loads:
+
+```yaml
+      root_path: "<workspace_id>/<lakehouse_id>"        # → abfss://…/<lakehouse_id>/Tables
+      # or by name: root_path: "my_workspace/sales.Lakehouse"
+```
+
+It works for each entry under `catalogs:` and for a source's `location` / `delta_table_path` too
+(spell `…/Files/…` explicitly to reach the file side). Only two shapes are shorthand: an item with a
+`.Lakehouse`/`.Warehouse` suffix, or a workspace-GUID/item-GUID pair — a suffix-less `warehouse/tables`
+is still an ordinary local relative path.
+
 ### OneLake: use GUID paths for now
 
 Address OneLake tables by **workspace GUID + lakehouse GUID**, not friendly names —

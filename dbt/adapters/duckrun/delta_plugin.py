@@ -948,6 +948,12 @@ class Plugin(BasePlugin):
                 "duckrun source requires 'delta_table_path', 'location', or 'path' in meta."
             )
 
+        # A source path may be spelled with the OneLake `<workspace>/<item>` shorthand too (typically
+        # `{{ env_var('WAREHOUSE_PATH') }}/<schema>/<table>` where the env holds the short form) —
+        # expand it to the abfss:// URL the scan functions understand. Same expander as root_path.
+        from .remote import expand_onelake_shorthand
+        path = expand_onelake_shorthand(str(path))
+
         fmt = (source_config.get("format") or "").strip().lower()
         if delta_path:
             fmt = "delta"

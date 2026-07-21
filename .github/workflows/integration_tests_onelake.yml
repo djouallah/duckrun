@@ -116,7 +116,7 @@ jobs:
         # (local_stress_tests.yml). So keep the fact tiny (--sf 0.1) to cut the OneLake round-trip time.
         # DBT_SCHEMA isolates it from aemo.
         env:
-          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          WAREHOUSE_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
           DBT_SCHEMA: merge_spill_it
         run: >-
           python tests/performance/merge_spill/merge_tpch_bench.py
@@ -140,7 +140,7 @@ jobs:
       # duckrun self-acquires the OneLake token from the OIDC identity — no bearer_token in the profile.
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-      WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+      WAREHOUSE_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -208,6 +208,13 @@ jobs:
         # lakehouse's Files scratch (never Tables).
         run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_onelake_files_copy_download_roundtrip -q -s -p no:cacheprovider
 
+      - name: Connect by the <workspace>/<item> shorthand (live expansion gate)
+        # duckrun.connect("<ws-guid>/<lh-guid>") must reach the same lakehouse as the full abfss URL.
+        # The offline suite only proves the string expansion — this proves OneLake accepts it.
+        env:
+          DUCKRUN_IT_SCHEMA: duckrun_conn_it
+        run: python -m pytest tests/integration_tests/coffee/test_coffee.py::test_onelake_shorthand_connect_reaches_same_lakehouse -q -s -p no:cacheprovider
+
       - name: Connect over a FRIENDLY-name OneLake path (delta-kernel #307 error-hygiene gate)
         # Same lakehouse as above, addressed by friendly workspace/lakehouse names instead of GUIDs.
         # OneLake's delta_scan can't read a valid table's _delta_log via friendly names — so this
@@ -241,7 +248,7 @@ jobs:
         run: pip install -e .
       - name: NYC taxi live demo (SQL-first connection-API showcase, OneLake)
         env:
-          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          WAREHOUSE_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
           DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
           DUCKRUN_TAXI_PAGE: taxi_run.html   # the demo writes its full SQL+results HTML report here
         run: python tests/integration_tests/taxi/demo_taxi.py
@@ -250,7 +257,7 @@ jobs:
         # Dogfood of the SQL-only auto-key sort rewrite on the demo fact table: connect writable, run
         # CREATE TABLE trips SORTED BY AUTO, and print the before/after layout to the CI log.
         env:
-          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
+          WAREHOUSE_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
           DUCKRUN_TAXI_SCHEMA: duckrun_taxi_demo
         run: |
           python - <<'PY'
@@ -317,9 +324,9 @@ jobs:
           # Three real OneLake Lakehouse roots — the dbt project writes one medallion layer to each,
           # into an isolated schema so nothing else in the lakehouse is touched. Swap the GUIDs to
           # retarget. duckrun self-acquires one token that authenticates all three (same storage resource).
-          LH_SILVER_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
-          LH_BRONZE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/6d4c75af-b240-449c-909e-e5b0c3ad241a/Tables
-          LH_GOLD_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/4fb792e8-b2e6-431c-b2d3-36727410bea8/Tables
+          LH_SILVER_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
+          LH_BRONZE_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/6d4c75af-b240-449c-909e-e5b0c3ad241a
+          LH_GOLD_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/4fb792e8-b2e6-431c-b2d3-36727410bea8
           DBT_SCHEMA: multicatalog_dbt_demo
           DUCKRUN_MULTICAT_DBT_PAGE: multicatalog_dbt_run.html
         run: python tests/integration_tests/multicatalog/demo_multicatalog_dbt.py
@@ -333,8 +340,8 @@ jobs:
       - name: Multi-catalog live demo (lakehouse + read-only warehouse + local scratch)
         env:
           # writable aemo lakehouse (the shared sample lakehouse) + the read-only Fabric Warehouse.
-          WAREHOUSE_PATH: abfss://1c52481c-0523-4a5a-bbde-fdc932bd77c2@onelake.dfs.fabric.microsoft.com/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff/Tables
-          WAREHOUSE_RO_PATH: abfss://d5f25039-7f33-4668-b909-2c397b2626fb@onelake.dfs.fabric.microsoft.com/61bf56ea-a4d5-4895-a90e-a6daa6e02d04/Tables
+          WAREHOUSE_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
+          WAREHOUSE_RO_PATH: d5f25039-7f33-4668-b909-2c397b2626fb/61bf56ea-a4d5-4895-a90e-a6daa6e02d04
           DUCKRUN_MULTICAT_SCHEMA: multicatalog_demo
           DUCKRUN_MULTICAT_PAGE: multicatalog_run.html   # the demo writes its full HTML report here
         run: python tests/integration_tests/multicatalog/demo_multicatalog.py
@@ -417,7 +424,7 @@ jobs:
             echo "lakehouse '$LH_NAME' was not visible after creation"; exit 1
           fi
           # No OneLake token minted here — onelake_breaker.py self-acquires it (auth.get_onelake_token).
-          echo "WAREHOUSE_PATH=abfss://$WS_ID@onelake.dfs.fabric.microsoft.com/$LH_ID/Tables" >> "$GITHUB_ENV"
+          echo "WAREHOUSE_PATH=$WS_ID/$LH_ID" >> "$GITHUB_ENV"   # OneLake <workspace>/<item> shorthand
           echo "lakehouse '$LH_NAME' = $LH_ID"
       - name: Chaos + compaction concurrency + QPS against the dedicated lakehouse
         # Contention only (no SIGKILL): writers hammer one Delta table while the compactor races them,
