@@ -4,6 +4,83 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.29]
+
+### Added
+- **Opt-in Iceberg REST catalog target.** A Fabric lakehouse also serves an Iceberg REST
+  catalog, and there DuckDB is the whole engine — listing, schemas, reads and writes. duckrun
+  contributes the OneLake token, the Azure storage secret and the `ATTACH`, then stays out of
+  the way (no `delta_scan` views, no delta-rs routing). Delta stays the default; Iceberg must
+  be asked for: `duckrun.connect(path, format='iceberg')` / `conn.attach(path,
+  format='iceberg')` on the connection API, `format: iceberg` on a dbt profile catalog —
+  models on such a catalog are materialized by dbt-duckdb's own macros.
+
+### Fixed
+- **Windows regression (since 0.4.22): OneLake reads failed with "SSL peer certificate or SSH
+  remote key was not OK".** Off a Fabric notebook duckrun forced DuckDB's azure transport to
+  `curl` (a fix for Linux runners), but on Windows the azure extension's libcurl has no CA
+  bundle, so every TLS handshake failed — `dbt show`/snapshots/any `delta_scan` read over
+  abfss. Windows now keeps DuckDB's default transport (WinHTTP, which trusts the system cert
+  store); curl remains the off-Fabric default elsewhere and `AZURE_TRANSPORT_OPTION_TYPE`
+  still overrides. (#16 regression report)
+
+### CI
+- A `windows-latest` job in the OneLake integration suite runs the full coffee scenario
+  (Delta writes + `delta_scan` reads) against live OneLake, so the Windows transport path
+  can't silently regress again.
+- The parity suite is opt-in: it auto-runs only when the parity harness itself changes,
+  no longer on every adapter/macro commit.
+
+## [0.4.28]
+
+### Performance
+- **`dbt show` / read-only startup on a multi-catalog OneLake project: ~30s → a few seconds**
+  (#16). dbt populates its relation cache for every schema before any command; discovery did
+  one serial Delta-log replay per table plus a create-schema per relation. The log opens now
+  run concurrently through a small thread pool and the schema is created once per schema.
+- Cross-surface redundancy pass: OneLake DFS calls pool one shared HTTP session; the Azure
+  secret mint is guarded per (connection, token) instead of re-minted per statement; JWT
+  expiry is decoded once per token; `conn.sql()` writes no longer re-run full catalog
+  discovery after every statement (other processes' tables surface at `connect()` or
+  `conn.refresh()`).
+
+### Fixed
+- Progress prints are ASCII-safe and streams are hardened against cp1252 Windows consoles
+  (#15).
+
+## [0.4.27]
+
+### Added
+- **OneLake shorthand everywhere**: `<workspace>/<item>` (names or GUIDs, e.g.
+  `myws/mylh.Lakehouse`) is accepted wherever a full `abfss://` URL was —
+  `duckrun.connect()` / `conn.attach()`, dbt `root_path` and plugin sources, and
+  `RemoteRunner` profiles + forwarded env.
+
+## [0.4.26]
+
+### Added
+- `ws.create_warehouse()`, and `folder=` placement on `create_lakehouse` /
+  `create_warehouse`.
+- `deploy()`: `warehouse=` repoints DirectQuery semantic models (with `sql_endpoint()` to
+  resolve the target), nested pipeline activities are reached, and a plain folder of loose
+  files deploys without the git-integration layout.
+
+### Fixed
+- Direct Lake detection for the post-deploy refresh (DirectQuery models no longer get a
+  spurious reframe).
+
+## [0.4.25]
+
+### Added
+- `ws.run_python(script)` — run an arbitrary Python script on Fabric compute, with workspace
+  folder support (`ScriptResult` in the public API).
+- The remote dbt log streams live during `RemoteRunner` jobs instead of `InProgress`
+  heartbeats.
+
+### Fixed
+- Remote job polling outlives the ~1h token and the 1h poll cap (long remote builds no
+  longer die mid-poll).
+
 ## [0.4.24]
 
 ### Added
