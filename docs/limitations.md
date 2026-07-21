@@ -16,41 +16,6 @@ by deliberate caution. Most come with a "do this instead." Deeper detail lives i
   `vacuum` and other multi-file deletes fail against OneLake. This is a major reason duckrun pins
   `deltalake == 1.5.0`. See [delta-rs #4401](https://github.com/delta-io/delta-rs/issues/4401).
 
-## Iceberg (`format='iceberg'`)
-
-**Delta is the default and the format duckrun is built around.** Iceberg is opt-in — you get it only
-by explicitly passing `format="iceberg"` to `duckrun.connect()` / `conn.attach()`, or setting
-`format: iceberg` in a dbt profile. Nothing changes for existing projects.
-
-When you do opt in, duckrun contributes only the OneLake token, the Azure storage secret and the
-`ATTACH`; DuckDB's `iceberg` extension is the engine. So its limits are yours (verified against
-DuckDB **1.5.4**):
-
-- **Fabric's Iceberg REST catalog is in private preview**, and DuckDB documents its own REST-catalog
-  storage support as *"S3, S3 Tables, and Google Cloud Storage (GCS). Support for other storage
-  backends is not yet available."* OneLake works — that is why duckrun passes
-  `ACCESS_DELEGATION_MODE 'none'` and mints its own Azure secret rather than relying on the catalog
-  vending credentials — but it is outside the combination upstream lists as supported. Treat it as
-  preview, not production.
-- **`UPDATE`/`DELETE` are merge-on-read only.** DuckDB writes positional deletes; copy-on-write is not
-  supported, and the operation fails outright if the table sets `write.update.mode` /
-  `write.delete.mode` to anything else.
-- **None of duckrun's Delta features exist there.** No `SORTED BY AUTO`, no automatic
-  compaction/`VACUUM`, no `DESCRIBE DETAIL`/`DESCRIBE HISTORY`, no `RESTORE TABLE`, no `get_stats()`,
-  no `refresh()`, no delta-rs snapshot-pinned MERGE. `conn.sql()` is a pass-through — duckrun does not
-  parse, rewrite or fence your statements — so concurrency and correctness are between you, DuckDB and
-  the catalog.
-- **`read_only` is DuckDB's `ATTACH … READ_ONLY` flag**, not a duckrun gate. Whether a given catalog
-  honors it is the extension's business; duckrun will not second-guess it by inspecting SQL.
-- **The catalog token is fixed at `ATTACH` time.** A notebook session re-attaches automatically when
-  the OneLake token nears expiry; a dbt run captures the token when the profile loads, so a build
-  running past the token's ~1h life can fail on the Iceberg catalog.
-- **dbt: a second `snapshot` run against an attached catalog fails** with DuckDB's *"a single
-  transaction can only write to a single attached database"*. This is stock dbt-duckdb behavior —
-  identical under `type: duckdb` — not something duckrun's delegation introduces.
-- **`write.target-file-size-bytes` / `write.parquet.row-group-size-bytes` are ignored on partitioned
-  tables** (upstream).
-
 ## SQL DML (`conn.sql`)
 
 - **`UPDATE … FROM` and `DELETE … USING` are rejected** → rewrite as a correlated subquery.

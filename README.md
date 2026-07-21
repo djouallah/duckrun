@@ -79,11 +79,6 @@ conn.attach("/data/reference", name="local")
 conn.sql("select * from warehouse.mart.facts f join local.dbo.lookup l on l.id = f.id").show()
 ```
 
-**Iceberg (opt-in)** — Delta is the default; `duckrun.connect(path, format="iceberg")` opens a Fabric
-lakehouse's Iceberg REST catalog instead. See
-[Connection API](docs/connection-api.md#iceberg--formaticeberg) and its
-[limitations](docs/limitations.md#iceberg-formaticeberg).
-
 Works the same against a local path, `s3://`, `gs://`, or `az://`. Full method map:
 **[Connection API](docs/connection-api.md)** · **[API reference](docs/api-reference.md)** ·
 [live multi-catalog demo](https://djouallah.github.io/duckrun/multicatalog.html).
@@ -124,9 +119,7 @@ select ...
 ```
 
 Profiles, materializations, incremental strategies (merge, insert, append, delete+insert, microbatch), sources,
-automatic compaction/vacuum, and the opt-in
-[`format: iceberg`](docs/dbt-adapter.md#format-iceberg--target-the-lakehouses-iceberg-rest-catalog)
-target are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
+and automatic compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
 
 See it on real projects: [aemo](tests/integration_tests/aemo) and [coffee](tests/integration_tests/coffee) are
 runnable starters, and [parity_tests/](tests/parity_tests) runs real `type: duckdb` projects (jaffle_shop,

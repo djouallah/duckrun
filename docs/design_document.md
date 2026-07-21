@@ -43,15 +43,6 @@ is confined to reads and model logic.
 
 Iceberg writers still need time to mature. A POC was built and table maintenance is a blocker.
 
-That verdict is about *duckrun writing Iceberg*. Where a catalog already exists — Fabric now serves
-every lakehouse over an Iceberg REST catalog — DuckDB itself is the writer, and duckrun neither can
-nor should improve on it. So `format: iceberg` (`duckrun.connect(..., format='iceberg')`, or the
-profile key) adds no engine at all: it acquires the OneLake token, mints the storage secret, issues
-the `ATTACH … (TYPE ICEBERG, …)`, and then gets out of the way. Statements are handed to DuckDB
-verbatim — no delta_scan views, no delta_rs routing, no SQL parsing, and read-only is DuckDB's own
-`ATTACH … READ_ONLY` flag rather than anything duckrun infers from your SQL. Delta remains the
-format duckrun *writes*; Iceberg is a catalog it *plugs into*.
-
 ### Why a separate adapter, not a dbt-duckdb PR
 
 Writing Delta with delta_rs needs the `deltalake` package. dbt-duckdb deliberately keeps a
