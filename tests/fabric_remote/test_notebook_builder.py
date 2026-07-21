@@ -177,6 +177,29 @@ def test_resolve_env_forwards_config_excludes_secrets(project, monkeypatch):
     assert "ONELAKE_TOKEN" not in env  # secret excluded, even though referenced
 
 
+def test_onelake_shorthand_resolved_and_forwarded_expanded(project, monkeypatch):
+    """A profile/env spelled with the OneLake `<ws>/<item>` shorthand must reach RemoteRunner as a
+    full abfss:// URL: onelake_parts() only understands that form, and the notebook installs duckrun
+    from PyPI, which may predate the shorthand — so the value has to travel expanded."""
+    (project / "profiles.yml").write_text(
+        "demo:\n  target: fabric\n  outputs:\n    fabric:\n      type: duckrun\n"
+        f"      root_path: \"{{{{ env_var('WAREHOUSE_PATH') }}}}\"\n",
+        encoding="utf-8",
+    )
+    ws, lh = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+    monkeypatch.setenv("WAREHOUSE_PATH", f"{ws}/{lh}")
+
+    cfg = fr.resolve_target(str(project), str(project), None)
+    expected = f"abfss://{ws}@onelake.dfs.fabric.microsoft.com/{lh}/Tables"
+    assert cfg["root_path"] == expected
+    workspace, lakehouse, _host, files_base = fr.onelake_parts(cfg["root_path"])
+    assert (workspace, lakehouse) == (ws, lh)
+    assert files_base.endswith(f"/{lh}/Files")
+    # …and the value forwarded into the notebook env is expanded too, not the shorthand.
+    runner = fr.RemoteRunner(cores=8, project_dir=str(project))
+    assert runner._resolve_env(str(project))["WAREHOUSE_PATH"] == expected
+
+
 def test_scan_env_var_names(project):
     (project / "models" / "m.sql").write_text(
         "select '{{ env_var(\"FOO\") }}' as a, '{{ env_var('BAR', 'x') }}' as b\n", encoding="utf-8")

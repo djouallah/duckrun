@@ -139,7 +139,10 @@ def resolve_target(project_dir: str, profiles_dir: Optional[str], target: Option
     if tgt not in outputs:
         raise RemoteRunError(f"target {tgt!r} not found under profile {profile_name!r}")
     out = dict(outputs[tgt])
-    out["root_path"] = _render_env_var(out.get("root_path"))
+    # Render env_var, then expand the OneLake `<workspace>/<item>` shorthand — this reader stands in
+    # for DuckrunCredentials (which would otherwise do it), so onelake_parts below always sees a
+    # full abfss:// URL no matter which spelling the profile uses.
+    out["root_path"] = _remote.expand_onelake_shorthand(_render_env_var(out.get("root_path")))
     return out
 
 
@@ -1141,7 +1144,11 @@ class RemoteRunner:
                 if name in os.environ and not _SECRET_RE.search(name):
                     forwarded[name] = os.environ[name]
         forwarded.update(self.env)
-        return forwarded
+        # Expand any OneLake `<workspace>/<item>` shorthand before it travels. The notebook installs
+        # duckrun from PyPI, which may predate the shorthand; shipping the full abfss:// URL keeps the
+        # remote run working on any version. A no-op for every other value (the shorthand shapes —
+        # a `.Lakehouse`/`.Warehouse` item or a GUID pair — are never a plain config string).
+        return {k: _remote.expand_onelake_shorthand(v) for k, v in forwarded.items()}
 
     def __enter__(self):
         self._queue = []
