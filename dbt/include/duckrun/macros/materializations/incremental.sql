@@ -20,9 +20,6 @@
     - microbatch: delete+insert the model's event_time window per dbt-driven batch
 #}
 {% materialization incremental, adapter='duckrun', supported_languages=['sql', 'python'] %}
-  {%- if duckrun__is_native_catalog(this.database) -%}
-    {{ return(materialization_incremental_duckdb()) }}
-  {%- endif -%}
   {%- if model['language'] == 'python' -%}
     {#-- Stage the python model here (not in a helper) so dbt's submit_python_job
          depth-2 macro guard (materialization -> statement) is satisfied. --#}

@@ -8,9 +8,3 @@ model-paths: ["models"]
 models:
   multi_catalog:
     +materialized: table
-
-seeds:
-  multi_catalog:
-    # Seeds land in the natively-attached catalog — the local guard for the format: iceberg seed
-    # path (temp-stage + CTAS; the default seed's COPY doesn't work on an Iceberg catalog).
-    +database: nat

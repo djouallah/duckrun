@@ -17,50 +17,6 @@
   python-model staging.
 #}
 {% materialization seed, adapter='duckrun' %}
-  {%- if duckrun__is_native_catalog(this.database) -%}
-    {#-- A natively-attached catalog (e.g. format: iceberg). dbt-core's default seed COPYs the CSV
-         straight into the catalog table, but DuckDB's Iceberg writes are CTAS / INSERT / DROP —
-         that COPY dies with "Table ... does not exist" (jaffle parity, first live run). So stage
-         the CSV in DuckDB's TEMP catalog with the same typed CREATE + COPY the fast seed path
-         uses (column_types/delimiter/quote_columns behave identically), then CTAS into the
-         catalog — the exact write shape every native-catalog table model already uses. The temp
-         stage resolves to no Delta location, so delta_dml passes every statement through. --#}
-    {%- set agate_table = load_agate_table() -%}
-    {%- do store_result('agate_table', response='OK', agate_table=agate_table) -%}
-    {%- set target_relation = this.incorporate(type='table') -%}
-    {%- set stage_id = (this.identifier ~ '__duckrun_seed_stage') | replace('"', '""') -%}
-    {{ run_hooks(pre_hooks, inside_transaction=False) }}
-    {%- do adapter.create_schema(target_relation) -%}
-    {{ run_hooks(pre_hooks, inside_transaction=True) }}
-    {%- set column_override = config.get('column_types', {}) -%}
-    {%- set quote_seed_column = config.get('quote_columns', None) -%}
-    {%- set delimiter = config.get('delimiter', ',') -%}
-    {% call statement('create_seed_stage') -%}
-      create or replace temp table "{{ stage_id }}" (
-        {%- for col_name in agate_table.column_names -%}
-          {%- set inferred_type = adapter.convert_type(agate_table, loop.index0) -%}
-          {%- set col_type = column_override.get(col_name, inferred_type) -%}
-          {{ adapter.quote_seed_column(col_name, quote_seed_column) }} {{ col_type }}{%- if not loop.last -%}, {%- endif -%}
-        {%- endfor -%}
-      )
-    {%- endcall %}
-    {% call statement('load_seed_stage') -%}
-      copy temp.main."{{ stage_id }}" from '{{ adapter.get_seed_file_path(model) }}' (format csv, header true, delimiter '{{ delimiter }}')
-    {%- endcall %}
-    {% call statement('drop_seed_target') -%}
-      drop table if exists {{ target_relation }}
-    {%- endcall %}
-    {% call statement('main') -%}
-      create table {{ target_relation }} as select * from temp.main."{{ stage_id }}"
-    {%- endcall %}
-    {% call statement('drop_seed_stage') -%}
-      drop table if exists temp.main."{{ stage_id }}"
-    {%- endcall %}
-    {{ run_hooks(post_hooks, inside_transaction=True) }}
-    {{ adapter.commit() }}
-    {{ run_hooks(post_hooks, inside_transaction=False) }}
-    {{ return({'relations': [target_relation]}) }}
-  {%- endif -%}
 
   {%- set agate_table = load_agate_table() -%}
   {#-- dbt reads this back (e.g. `dbt show`, logging of seed rows). --#}

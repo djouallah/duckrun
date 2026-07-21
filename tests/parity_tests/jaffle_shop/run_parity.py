@@ -30,11 +30,6 @@ DUCKRUN_WH = os.environ.get("WAREHOUSE_PATH") or ("C:/tmp/js_wh" if os.name == "
 # how the integration suite isolates projects. Local default 'main'.
 DUCKRUN_SCHEMA = os.environ.get("DBT_SCHEMA", "main")
 _REMOTE = "://" in DUCKRUN_WH
-# Opt-in second leg: build the same project against the SAME lakehouse's Iceberg REST catalog
-# (profile target 'iceberg') and diff those tables against the oracle too. OneLake-only — the
-# Iceberg REST endpoint is Fabric's.
-ICEBERG = _REMOTE and bool(os.environ.get("PARITY_ICEBERG"))
-ICEBERG_SCHEMA = os.environ.get("DBT_SCHEMA_ICEBERG", "parity_jaffle_ice")
 
 
 def sh(cmd, cwd=None, env=None):
@@ -81,84 +76,39 @@ def _present(c, schema, t) -> bool:
     return Path(DUCKRUN_WH, schema, t).is_dir()
 
 
-def _oracle_tables(c):
-    """The oracle's BASE TABLE names — the compare list for every leg. Assumes 'o' is attached."""
-    return [r[0] for r in c.execute(
-        "select table_name from duckdb_tables() "
-        f"where database_name='o' and schema_name='{ORACLE_SCHEMA}' order by 1").fetchall()]
-
-
-def _compare(c, t, d_from, label) -> bool:
-    """Row-multiset compare (EXCEPT ALL both ways) of oracle table ``t`` against the duckrun-side
-    relation ``d_from`` (a FROM-clause expression). Prints one scorecard line; True = identical."""
-    cols = [r[0] for r in c.execute(
-        "select column_name from duckdb_columns() "
-        f"where database_name='o' and schema_name='{ORACLE_SCHEMA}' and table_name='{t}' "
-        "order by column_index").fetchall()]
-    sel = ", ".join('"' + x + '"' for x in cols)
-    o_sel = f'select {sel} from o.{ORACLE_SCHEMA}."{t}"'
-    d_sel = f"select {sel} from {d_from}"
-    no = c.execute(f'select count(*) from o.{ORACLE_SCHEMA}."{t}"').fetchone()[0]
-    nd = c.execute(f"select count(*) from {d_from}").fetchone()[0]
-    only_o = c.execute(f"select count(*) from (({o_sel}) except all ({d_sel}))").fetchone()[0]
-    only_d = c.execute(f"select count(*) from (({d_sel}) except all ({o_sel}))").fetchone()[0]
-    ok = only_o == 0 and only_d == 0
-    print(f"{t:16} oracle={no:<6} {label}={nd:<6} only_oracle={only_o} only_{label}={only_d}"
-          f"  -> {'MATCH' if ok else 'MISMATCH'}")
-    return ok
-
-
 def diff() -> bool:
-    """Compare every oracle BASE TABLE against the duckrun Delta table of the same name. Views
-    aren't persisted by duckrun, so they're skipped."""
+    """Row-multiset compare every oracle BASE TABLE against the duckrun Delta table of the same
+    name (EXCEPT ALL both ways). Views aren't persisted by duckrun, so they're skipped."""
     c = duckdb.connect()
     c.execute("install delta; load delta")  # delta_scan needs the extension (fresh CI duckdb)
     if _REMOTE:  # OneLake: mint the Azure secret so delta_scan can read abfss:// (same path the adapter uses)
         from dbt.adapters.duckrun import secret
         secret.ensure_azure_secret(c, secret.with_onelake_token(DUCKRUN_WH, {}))
     c.execute(f"attach '{ORACLE_DB.as_posix()}' as o (read_only)")
+    tabs = [r[0] for r in c.execute(
+        "select table_name from duckdb_tables() "
+        f"where database_name='o' and schema_name='{ORACLE_SCHEMA}' order by 1").fetchall()]
     all_ok = True
-    for t in _oracle_tables(c):
+    for t in tabs:
         if not _present(c, DUCKRUN_SCHEMA, t):
             print(f"{t:16} SKIP (not persisted by duckrun — e.g. a view)")
             continue
-        all_ok = _compare(c, t, f"delta_scan('{_duckrun_uri(DUCKRUN_SCHEMA, t)}')",
-                          "duckrun") and all_ok
-    return all_ok
-
-
-def build_iceberg():
-    """dbt build the same project against the lakehouse's Iceberg REST catalog (profile target
-    'iceberg'). DuckDB is the whole engine there — dbt-duckdb's own macros materialize; duckrun
-    contributes the token, the storage secret and the ATTACH."""
-    env = {**os.environ,
-           "DBT_PROFILES_DIR": str(HERE),
-           "WAREHOUSE_PATH": DUCKRUN_WH,
-           "DBT_SCHEMA_ICEBERG": ICEBERG_SCHEMA}
-    sh(["dbt", "build", "--no-partial-parse", "--target", "iceberg",
-        "--target-path", "target_iceberg"], cwd=CLONE_DIR, env=env)
-
-
-def diff_iceberg() -> bool:
-    """Compare every oracle BASE TABLE against the Iceberg catalog table of the same name, read
-    back through duckrun.connect(format='iceberg') — DuckDB's native Iceberg read. dbt-duckdb
-    persists views only in the catalog's information schema, not as tables; absent names skip."""
-    import duckrun
-    from duckrun import iceberg as ice
-    cat = ice.catalog_name_for(ice.parse_iceberg_target(DUCKRUN_WH)[1])
-    conn = duckrun.connect(DUCKRUN_WH, format="iceberg", schema=ICEBERG_SCHEMA)  # read-only
-    c = conn._connection
-    c.execute(f"attach '{ORACLE_DB.as_posix()}' as o (read_only)")
-    all_ok = True
-    for t in _oracle_tables(c):
-        ref = f'"{cat}"."{ICEBERG_SCHEMA}"."{t}"'
-        try:
-            c.execute(f"select 1 from {ref} limit 1")
-        except Exception:
-            print(f"{t:16} SKIP (not a table in the Iceberg catalog — e.g. a view)")
-            continue
-        all_ok = _compare(c, t, ref, "iceberg") and all_ok
-    conn.close()
+        uri = _duckrun_uri(DUCKRUN_SCHEMA, t)
+        cols = [r[0] for r in c.execute(
+            "select column_name from duckdb_columns() "
+            f"where database_name='o' and schema_name='{ORACLE_SCHEMA}' and table_name='{t}' "
+            "order by column_index").fetchall()]
+        sel = ", ".join('"' + x + '"' for x in cols)
+        o_sel = f'select {sel} from o.{ORACLE_SCHEMA}."{t}"'
+        d_sel = f"select {sel} from delta_scan('{uri}')"
+        no = c.execute(f'select count(*) from o.{ORACLE_SCHEMA}."{t}"').fetchone()[0]
+        nd = c.execute(f"select count(*) from delta_scan('{uri}')").fetchone()[0]
+        only_o = c.execute(f"select count(*) from (({o_sel}) except all ({d_sel}))").fetchone()[0]
+        only_d = c.execute(f"select count(*) from (({d_sel}) except all ({o_sel}))").fetchone()[0]
+        ok = only_o == 0 and only_d == 0
+        all_ok = all_ok and ok
+        print(f"{t:16} oracle={no:<6} duckrun={nd:<6} only_oracle={only_o} only_duckrun={only_d}"
+              f"  -> {'MATCH' if ok else 'MISMATCH'}")
     return all_ok
 
 
@@ -169,10 +119,6 @@ def main():
     build_duckrun()
     print("\n=== parity diff (duckrun Delta vs duckdb oracle) ===")
     ok = diff()
-    if ICEBERG:
-        build_iceberg()
-        print("\n=== parity diff (duckrun Iceberg vs duckdb oracle) ===")
-        ok = diff_iceberg() and ok
     print("\nPARITY:", "PASS — duckrun == dbt-duckdb on every persisted table" if ok else "FAIL")
     sys.exit(0 if ok else 1)
 

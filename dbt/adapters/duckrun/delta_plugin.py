@@ -73,22 +73,6 @@ class Plugin(BasePlugin):
             secret.ensure_azure_secret(conn, self._storage_options)
         except Exception:  # best-effort: no token (local/notebook) -> no secret needed, a no-op
             pass
-        # A natively-attached Iceberg catalog (`format: iceberg`) carries no bearer token in
-        # storage_options, so the mint above no-ops without ever pinning the azure transport — and
-        # a `settings:` entry can't do it either: dbt-duckdb applies settings per CURSOR, and a
-        # cursor-scoped SET never reaches the azure extension's connection threads (proven live:
-        # every storage read died with "Problem with the SSL CA cert" on a Linux runner, and a
-        # local cursor-level SET measurably leaves the default transport in place). Pin it here on
-        # the PARENT connection — configure_connection runs before dbt-duckdb executes the
-        # ATTACHes. Gated on an iceberg attach so plain local/Delta profiles never INSTALL azure.
-        try:
-            attaches = getattr(self.creds, "attach", None) or []
-            if any(str(getattr(a, "type", "") or "").lower() == "iceberg" for a in attaches):
-                conn.execute("INSTALL azure; LOAD azure;")
-                secret._set_azure_transport(conn)
-        except Exception:  # best-effort: matches the transport setter's never-hard-fail contract
-            pass
-
     def configure_cursor(self, cursor) -> None:
         # dbt creates a fresh child cursor per model connection (see dbt-duckdb's
         # initialize_cursor) and runs that model's pre-hooks / staged-model DDL on it.

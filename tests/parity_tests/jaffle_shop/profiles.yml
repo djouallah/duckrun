@@ -11,12 +11,3 @@ jaffle_shop:
       root_path: "{{ env_var('WAREHOUSE_PATH', './warehouse') }}"
       # Local fs by default. Point WAREHOUSE_PATH at an abfss:// Tables path to materialize to Microsoft
       # Fabric OneLake (what the parity CI does) — duckrun acquires the OneLake token itself.
-    iceberg:
-      # The SAME project against the SAME lakehouse's Iceberg REST catalog (format: iceberg —
-      # DuckDB is the whole engine there; duckrun contributes token + ATTACH). Only exercised when
-      # run_parity.py runs the Iceberg leg (PARITY_ICEBERG=1 on OneLake); jaffle_shop is the one
-      # parity project that does.
-      type: duckrun
-      format: iceberg
-      schema: "{{ env_var('DBT_SCHEMA_ICEBERG', 'parity_jaffle_ice') }}"
-      root_path: "{{ env_var('WAREHOUSE_PATH', '') }}"

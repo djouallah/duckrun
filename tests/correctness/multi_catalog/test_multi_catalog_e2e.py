@@ -112,37 +112,3 @@ def test_docs_generate_lists_both_catalogs(tmp_path):
     # The aliased model is reported under its catalog; the default model under the default catalog.
     assert by_model["bronze_raw"] == "lh_bronze"
     assert by_model["silver_clean"] != "lh_bronze"
-
-
-def test_seed_lands_in_native_catalog(tmp_path):
-    """A seed with ``+database`` naming a natively-attached catalog (the ``format: iceberg`` shape)
-    lands as a real native table via the temp-stage + CTAS path — dbt-core's default seed COPYs the
-    CSV straight into the catalog table, which DuckDB's Iceberg writes reject (jaffle parity, first
-    live run). A second run must drop + recreate, not error."""
-    import duckdb
-
-    silver, bronze = _roots(tmp_path)
-    native = (tmp_path / "native.duckdb").as_posix()
-    os.environ["NATIVE_DB"] = native
-    try:
-        assert _dbt(silver, bronze, "seed").success
-        assert _dbt(silver, bronze, "seed").success   # re-run: rebuild, not "already exists"
-    finally:
-        os.environ.pop("NATIVE_DB", None)
-
-    # The in-process dbtRunner's cached connection still holds the file. Cycling the profile back
-    # to the ':memory:' attach makes dbt-duckdb rebuild (and release) it, so the readback can open
-    # the file — a same-process harness artifact, not a duckrun behavior.
-    import gc
-    assert _dbt(silver, bronze, "seed").success
-    gc.collect()
-
-    con = duckdb.connect(native)
-    try:
-        rows = con.sql('select id, amount from main.native_seed order by id').fetchall()
-    finally:
-        con.close()
-    assert rows == [(1, 10.5), (2, 20.0)]
-    # ...and nothing leaked into the Delta roots — the seed belongs to the native catalog alone.
-    assert not (Path(silver) / "main" / "native_seed").exists()
-    assert not (Path(bronze) / "main" / "native_seed").exists()
