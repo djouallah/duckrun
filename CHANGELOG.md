@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Performance
+- **Read-only startup on a multi-schema OneLake project, round 2 (#16): ~28s → ~8s wall clock
+  (`dbt show` of one small model, ~80 tables over 8 schemas, residential connection; most of
+  the remainder is dbt parse + connection open).** 0.4.28 made the per-schema delta-rs opens
+  concurrent, but a multi-schema project still paid discovery schema-by-schema (dbt lists every
+  manifest schema serially on duckrun's single thread), and the `delta_scan` view registrations
+  stayed serial — each `CREATE VIEW` binds at creation, replaying the table's Delta log a second
+  time through DuckDB's delta extension (no metadata cache shared with delta-rs). Discovery now
+  prefetches the whole cache-population burst in one cross-schema pass
+  (`_relations_cache_for_schemas`): all listings, then ONE concurrent open pool for every
+  table's log, then ONE concurrent pool for the view binds (each worker on its own raw child
+  cursor — catalog and secrets are instance-global). The discovery pools also grew from 8 to 32
+  workers (the work is latency-bound, not CPU-bound). Per-schema semantics are unchanged:
+  same tombstone hiding, same persisted-docs re-apply, `OneLakeAccessError` still fails loud,
+  and the prefetch dies with the burst — a later `list_relations` call is never served stale.
+
 ## [0.4.29]
 
 ### Added
