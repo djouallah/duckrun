@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.30]
+
 ### Performance
 - **Read-only startup on a multi-schema OneLake project, round 2 (#16): ~28s → ~8s wall clock
   (`dbt show` of one small model, ~80 tables over 8 schemas, residential connection; most of
