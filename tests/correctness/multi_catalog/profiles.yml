@@ -12,3 +12,9 @@ multi_catalog:
           root_path: "{{ env_var('BRONZE_PATH') }}"
         lh_gold:
           root_path: "{{ env_var('GOLD_PATH') }}"
+      # A natively-attached catalog (the local stand-in for `format: iceberg`'s ATTACH): DuckDB owns
+      # it, duckrun's materializations step aside. The seed test points NATIVE_DB at a real file;
+      # every other test attaches a throwaway in-memory db under the alias.
+      attach:
+        - path: "{{ env_var('NATIVE_DB', ':memory:') }}"
+          alias: nat

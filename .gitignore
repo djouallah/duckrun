@@ -67,6 +67,8 @@ conformance.xml
 !tests/connection_api/**/*.csv
 # ...and the native-unit-test project's seeds (raw_customers / raw_orders / top_level_email_domains)
 !tests/dbt_unit_tests/**/*.csv
+# ...and the multi-catalog e2e project's native-catalog seed fixture
+!tests/correctness/multi_catalog/seeds/*.csv
 
 # Keep the Claude Code plugin marketplace manifests (the *.json rule above ignores them)
 !.claude-plugin/marketplace.json
