@@ -17,21 +17,19 @@ name: parity
 # on Linux but copies (recursively, hitting MAX_PATH) on Windows. The adapter behaves the same on both
 # — only the dbt-deps file plumbing differs — so CI is the right home for the heavier projects.
 #
-# Standalone + path-filtered: NOT a release gate (publish.yml gates on cores + local_stress_tests), so
-# a failure here never blocks a release.
+# Standalone + OPT-IN: NOT a release gate (publish.yml gates on cores + local_stress_tests), so a
+# failure here never blocks a release. Adapter/macro changes do NOT fire it (they used to, making
+# every adapter commit run four OneLake builds) — it auto-runs only when the parity harness itself
+# changes; for an adapter change, dispatch it manually when parity coverage is actually wanted.
 on:
   push:
     branches: ["**"]   # any branch, but NOT a tag push (v*) — that is publish.yml's job
     paths:
       - 'tests/parity_tests/**'
-      - 'dbt/adapters/duckrun/**'
-      - 'dbt/include/duckrun/**'
       - '.github/workflows/parity.yml'
   pull_request:
     paths:
       - 'tests/parity_tests/**'
-      - 'dbt/adapters/duckrun/**'
-      - 'dbt/include/duckrun/**'
       - '.github/workflows/parity.yml'
   workflow_dispatch:
     inputs:
