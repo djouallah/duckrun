@@ -12,7 +12,19 @@
 Works the same against a local path, ``s3://``, ``gs://``, ``az://``, or OneLake ``abfss://``.
 This is the interactive/notebook API; the dbt adapter lives under ``dbt.adapters.duckrun``.
 """
+import sys
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
+
+# A progress print must never abort real work: on a stock Windows console (cp1252), a
+# non-encodable character in a table/path name raises UnicodeEncodeError out of print()
+# (issue #15 — a deploy died mid-provisioning over a progress line). Degrade to `?` instead.
+for _s in (sys.stdout, sys.stderr):
+    if hasattr(_s, "reconfigure"):
+        try:
+            _s.reconfigure(errors="replace")
+        except Exception:
+            pass
+del _s
 
 from .session import connect, DuckSession
 from .fabric_remote import RemoteRunner, RemoteResult

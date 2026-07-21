@@ -446,7 +446,7 @@ class DuckSession:
                 raise RuntimeError(
                     f"could not mint OneLake secret for catalog '{name}': {exc}"
                 ) from exc
-            print(f"⚠️  could not mint OneLake secret for catalog '{name}': {exc}")
+            print(f"[warn] could not mint OneLake secret for catalog '{name}': {exc}")
 
         self.con.execute(f"ATTACH ':memory:' AS {_qid(name)}")
         self._catalogs[name] = _CatEntry(name, root, so, schema_filter, ro)
@@ -586,7 +586,7 @@ class DuckSession:
 
         if not quiet:
             lh = root.rstrip("/").rsplit("/", 1)[-1]
-            print(f"Connected to {lh} (catalog '{name}') — discovered {len(registered)} table(s)"
+            print(f"Connected to {lh} (catalog '{name}') - discovered {len(registered)} table(s)"
                   + (": " + ", ".join(registered) if registered else ""))
         return list(mapping.keys())
 
@@ -911,10 +911,10 @@ class DuckSession:
             if target:
                 repl.append(f"CAST({_qid(col)} AS {target}) AS {_qid(col)}")
                 mv = max_abs[col]
-                print(f"  {col} {typ} → {target} "
+                print(f"  {col} {typ} -> {target} "
                       f"(max {mv if mv is not None else 'NULL'}; FLBA has no dictionary in arrow-rs)")
             else:
-                print(f"  {col} {typ} kept: max too large to narrow — no dictionary encoding")
+                print(f"  {col} {typ} kept: max too large to narrow - no dictionary encoding")
         if not repl:
             return body
         return f"SELECT * REPLACE ({', '.join(repl)}) FROM ({body}) _n"
@@ -1009,18 +1009,18 @@ class DuckSession:
                 rel = os.path.relpath(local_path, local_folder).replace("\\", "/")
                 pairs.append((local_path, rel))
         if not pairs:
-            print(f"⚠️  no files to upload from '{local_folder}'"
+            print(f"[warn] no files to upload from '{local_folder}'"
                   + (f" (filtered by {file_extensions})" if exts else ""))
             return True
-        print(f"📁 Uploading {len(pairs)} file(s) to '{base}'...")
+        print(f"Uploading {len(pairs)} file(s) to '{base}'...")
         store = objectstore.build_store(base, secret.refreshed(self.storage_options))
         for local_path, rel in pairs:
             if not overwrite and objectstore.exists(store, rel):
-                print(f"  ⏭ exists: {base}/{rel}")
+                print(f"  [skip] exists: {base}/{rel}")
                 continue
             objectstore.upload(store, rel, local_path)
-            print(f"  ✓ {local_path} → {base}/{rel}")
-        print("✅ upload complete")
+            print(f"  [ok] {local_path} -> {base}/{rel}")
+        print("upload complete")
         return True
 
     def download(self, remote_folder: str = "", local_folder: str = "./downloaded_files",
@@ -1037,17 +1037,17 @@ class DuckSession:
                  for key in objectstore.list_keys(store)
                  if not exts or os.path.splitext(key)[1].lower() in exts]
         if not pairs:
-            print(f"⚠️  no files to download from '{base}'"
+            print(f"[warn] no files to download from '{base}'"
                   + (f" (filtered by {file_extensions})" if file_extensions else ""))
             return True
-        print(f"📁 Downloading {len(pairs)} file(s) to '{local_folder}'...")
+        print(f"Downloading {len(pairs)} file(s) to '{local_folder}'...")
         for key, local_path in pairs:
             if not overwrite and os.path.exists(local_path):
-                print(f"  ⏭ exists: {local_path}")
+                print(f"  [skip] exists: {local_path}")
                 continue
             objectstore.download(store, key, local_path)
-            print(f"  ✓ {base}/{key} → {local_path}")
-        print("✅ download complete")
+            print(f"  [ok] {base}/{key} -> {local_path}")
+        print("download complete")
         return True
 
     def list_files(self, remote_folder: str = "",

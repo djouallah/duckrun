@@ -133,6 +133,33 @@ class TestSession:
         conn.download("remote", str(dst))  # skips existing
         assert (dst / "x.bin").read_bytes() == b"changed"
 
+    def test_progress_prints_survive_cp1252_console(self):
+        """Issue #15: on a stock Windows console (cp1252) the emoji progress prints raised
+        UnicodeEncodeError out of copy()/download(), aborting the caller mid-deploy. Two-part
+        guard: every print() in the shipped packages is plain ASCII, and importing duckrun
+        hardens the streams (errors='replace') so non-ASCII *data* in a path or table name
+        degrades to '?' instead of raising."""
+        import ast
+        import os
+        import subprocess
+        import sys
+        import dbt.adapters.duckrun as _adapter
+        for pkg in (duckrun, _adapter):
+            for py in Path(pkg.__file__).parent.rglob("*.py"):
+                src = py.read_text(encoding="utf-8")
+                for node in ast.walk(ast.parse(src)):
+                    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                            and node.func.id == "print"):
+                        seg = ast.get_source_segment(src, node) or ""
+                        assert seg.isascii(), f"non-ASCII print at {py}:{node.lineno}: {seg[:80]}"
+
+        env = {**os.environ, "PYTHONIOENCODING": "cp1252"}
+        env.pop("PYTHONUTF8", None)
+        res = subprocess.run(
+            [sys.executable, "-c", "import duckrun; print('\\U0001f4c1 caf\\u00e9')"],
+            env=env, capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+
     def test_list_files(self, conn, tmp_path):
         # list the files copy() lands, as relative paths; the extension filter is honoured.
         src = tmp_path / "src"

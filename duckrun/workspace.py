@@ -578,7 +578,7 @@ class Workspace:
         for item_type, display_name, item_id in wanted:
             target = os.path.join(folder, f"{display_name}.{item_type}")
             if os.path.exists(target) and not overwrite:
-                print(f"  ⏭ exists: {target}")
+                print(f"  [skip] exists: {target}")
                 out[display_name] = target
                 continue
             parts = _get_definition(self._token, self.id, _ITEM_ENDPOINT[item_type], item_id,
