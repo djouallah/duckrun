@@ -564,6 +564,61 @@ def test_onelake_guid_hint():
     assert _onelake_guid_hint("./wh") is None          # non-abfss -> no hint
 
 
+def test_onelake_shorthand_expansion():
+    """``<workspace>/<item>`` shorthand → the full abfss URL, through the one seam connect() and
+    attach() share (_split_root_schema)."""
+    from duckrun.session import _split_root_schema, _derive_catalog_name
+
+    tables = "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables"
+    assert _split_root_schema("ws/lh.Lakehouse", None) == (tables, None)
+    assert _split_root_schema("ws/lh.Lakehouse/", None) == (tables, None)
+    # a trailing segment is the schema, spelled with or without the Tables level (never doubled)
+    assert _split_root_schema("ws/lh.Lakehouse/dbo", None) == (tables, "dbo")
+    assert _split_root_schema("ws/lh.Lakehouse/Tables/dbo", None) == (tables, "dbo")
+    # case-insensitive suffix, and .Warehouse too
+    assert _split_root_schema("ws/LH.lakehouse", None)[0].endswith("/LH.lakehouse/Tables")
+    assert _split_root_schema("ws/ref.Warehouse", None)[0].endswith("/ref.Warehouse/Tables")
+    # explicit schema= still wins, and the root is still expanded
+    assert _split_root_schema("ws/lh.Lakehouse", "sales") == (tables, "sales")
+    # deeper tails ride along under Tables (the first segment is then the schema)
+    assert _split_root_schema("ws/lh.Lakehouse/dbo/extra", None) == (tables, "dbo")
+    # the friendly form derives its catalog name; the GUID pair derives nothing → "data" fallback
+    assert _derive_catalog_name(_split_root_schema("ws/sales.Lakehouse", None)[0]) == "sales"
+    ws, lh = "11111111-1111-1111-1111-111111111111", "22222222-2222-2222-2222-222222222222"
+    guid_root = _split_root_schema(f"{ws}/{lh}", None)[0]
+    assert guid_root == f"abfss://{ws}@onelake.dfs.fabric.microsoft.com/{lh}/Tables"
+    assert _derive_catalog_name(guid_root) is None
+
+
+@pytest.mark.parametrize("path", [
+    "ws/lh",                       # no item suffix, not a GUID pair → a local relative path
+    "ws",                          # single segment
+    "./data/lh.Lakehouse",         # a relative path the caller spelled explicitly
+    "../lh.Lakehouse",
+    "C:/x/lh.Lakehouse",           # drive-absolute
+    "/mnt/lh.Lakehouse",           # posix-absolute
+    "//server/share/lh.Lakehouse",  # UNC
+    "s3://bucket/lh.Lakehouse",    # a real URL
+    "abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables",
+])
+def test_onelake_shorthand_leaves_everything_else_alone(path):
+    """The shorthand is additive: only ``<ws>/<item.Lakehouse>`` and a GUID pair are rewritten."""
+    from duckrun.session import _expand_onelake_shorthand
+
+    assert _expand_onelake_shorthand(path) == path
+
+
+def test_local_relative_two_segment_path_still_local(tmp_path, monkeypatch):
+    """The ambiguity guard, end to end: a two-segment relative path with no item suffix opens the
+    local lakehouse, it is not silently redirected to OneLake."""
+    _write_table(str(tmp_path / "ws" / "lh" / "dbo" / "t"), "select 1 as id")
+    monkeypatch.chdir(tmp_path)
+    conn = duckrun.connect("ws/lh")
+    assert conn._current_catalog == "lh"
+    assert conn.sql("select count(*) from dbo.t").fetchone()[0] == 1
+    conn.close()
+
+
 def test_discovery_and_catalog(wh):
     conn = duckrun.connect(wh, schema="dbo")
     assert set(conn._cat_tables()) == {"t1", "t2"}

@@ -2,6 +2,7 @@
 
     import duckrun
     conn = duckrun.connect("abfss://ws@onelake.dfs.fabric.microsoft.com/lh.Lakehouse/Tables/dbo")
+    conn = duckrun.connect("ws/lh.Lakehouse/dbo")   # same thing — OneLake shorthand
     conn.sql("SHOW TABLES").show()
     # connect() is read-only by default; pass read_only=False to enable writes:
     w = duckrun.connect("abfss://…/Tables/dbo", read_only=False)

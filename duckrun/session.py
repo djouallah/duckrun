@@ -285,6 +285,41 @@ def _onelake_guid_hint(root_path: str) -> Optional[str]:
     )
 
 
+# OneLake's data-plane host — the constant half of every abfss lakehouse URL.
+_ONELAKE_HOST = "onelake.dfs.fabric.microsoft.com"
+
+
+def _expand_onelake_shorthand(path: str) -> str:
+    """Expand the OneLake shorthand ``<workspace>/<item>[/…]`` into a full ``abfss://`` URL.
+
+    Two shapes qualify, and ONLY these two — everything else (a real URL, an absolute path, a bare
+    two-segment relative path like ``data/lh``) is returned verbatim, so no existing path changes
+    meaning:
+
+    * the item segment carries a Fabric item suffix — ``ws/sales.Lakehouse``, ``ws/ref.Warehouse``;
+    * both segments are GUIDs — ``<ws-guid>/<item-guid>`` (the form we recommend on OneLake anyway,
+      see :func:`_onelake_guid_hint`).
+
+    Segments after the item are kept as-is under ``…/Tables`` (a leading ``Tables`` of the caller's
+    own is not doubled), so ``ws/lh.Lakehouse/dbo`` and ``ws/lh.Lakehouse/Tables/dbo`` are the same
+    thing and `_split_root_schema` reads the schema off either.
+    """
+    if not path or "://" in path:
+        return path
+    if path[0] in "/\\" or os.path.splitdrive(path)[0]:
+        return path                                   # absolute / drive / UNC → a real local path
+    parts = [p for p in path.replace("\\", "/").rstrip("/").split("/")]
+    if len(parts) < 2 or any(p in ("", ".", "..") for p in parts):
+        return path
+    workspace, item, rest = parts[0], parts[1], parts[2:]
+    if not (item.lower().endswith((".lakehouse", ".warehouse"))
+            or (_GUID.match(workspace) and _GUID.match(item))):
+        return path
+    if rest and rest[0].lower() == "tables":
+        rest = rest[1:]
+    return "/".join([f"abfss://{workspace}@{_ONELAKE_HOST}/{item}/Tables", *rest])
+
+
 def _split_root_schema(path: str, schema: Optional[str]):
     """Normalize ``path`` into ``(root_path, schema)``.
 
@@ -294,8 +329,11 @@ def _split_root_schema(path: str, schema: Optional[str]):
     ``…/Tables/<schema>`` convention — the segment after ``Tables`` (if any) becomes the schema and
     the root is truncated to ``…/Tables``. For every other store an omitted schema means
     "discover all schema folders under ``path``".
+
+    The OneLake shorthand (``ws/lh.Lakehouse``, ``<ws-guid>/<item-guid>``) is expanded first, so
+    both :func:`connect` and :meth:`DuckSession.attach` accept it through this one seam.
     """
-    p = path.rstrip("/")
+    p = _expand_onelake_shorthand(path).rstrip("/")
     if schema is not None:
         return p, schema
     if remote.is_abfss(p):
@@ -475,7 +513,8 @@ class DuckSession:
         ``name`` is derived from a friendly path when omitted, but is **mandatory** for a GUID-only
         OneLake path (raises, since there is no readable name to derive). The mapping is bijective:
         re-attaching a URL (under any name), or reusing a name, raises. ``schema`` restricts discovery
-        to a single schema, exactly as in :func:`connect`. ``read_only`` fences writes to *this* catalog
+        to a single schema, exactly as in :func:`connect`, and ``path`` takes the same OneLake
+        shorthand (``ws/lh.Lakehouse``, ``<ws-guid>/<item-guid>``). ``read_only`` fences writes to *this* catalog
         independently of the session (default: inherit the session's mode) — so a read-only reference
         store (e.g. a Fabric Warehouse) can sit next to a writable lakehouse. Returns ``self`` so it
         chains.
@@ -1403,7 +1442,10 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
 
     Args:
         path: the lakehouse root, or (OneLake) ``…/Tables`` or ``…/Tables/<schema>``. Works with a
-            local path, ``s3://``, ``gs://``, ``az://``, or OneLake ``abfss://``.
+            local path, ``s3://``, ``gs://``, ``az://``, or OneLake ``abfss://``. OneLake also takes
+            the shorthand ``<workspace>/<item>[/<schema>]`` — ``"ws/sales.Lakehouse"`` or
+            ``"<ws-guid>/<lakehouse-guid>"`` — expanded to the full ``abfss://…/Tables`` URL. Only
+            those two shapes are shorthand: a suffix-less ``"ws/lh"`` is still a local relative path.
         storage_options: forwarded to delta-rs (and used to mint DuckDB secrets). For OneLake you
             can omit it inside a Fabric notebook — a token is acquired automatically.
         schema: restrict to a single schema. Omit to discover every schema folder.
@@ -1422,6 +1464,8 @@ def connect(path: str, storage_options: Optional[Dict[str, str]] = None,
         >>> w = duckrun.connect("…/Tables/dbo", read_only=False)   # opt in to write
         >>> w.sql("CREATE OR REPLACE TABLE orders_copy AS SELECT * FROM orders")
         >>> lh = duckrun.connect("…/<guid>/Tables", name="lakehouse")   # name a GUID-path catalog
+        >>> s = duckrun.connect("ws/sales.Lakehouse/dbo")           # OneLake shorthand, catalog 'sales'
+        >>> g = duckrun.connect("<ws-guid>/<lakehouse-guid>")       # GUID shorthand, catalog 'data'
     """
     check_runtime_versions()  # fail loud if Fabric's stale duckdb/deltalake are still loaded
     return DuckSession(path, storage_options, schema, read_only, name)

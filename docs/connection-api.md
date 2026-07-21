@@ -40,6 +40,23 @@ conn.sql("CREATE OR REPLACE TABLE orders_copy AS SELECT * FROM orders")
 conn.sql("SELECT * FROM orders_copy").show()
 ```
 
+### OneLake shorthand
+
+On OneLake you can drop the `abfss://…@onelake.dfs.fabric.microsoft.com/…/Tables` boilerplate and
+pass `workspace/item[/schema]`:
+
+```python
+duckrun.connect("ws/lh.Lakehouse")                    # → abfss://ws@…/lh.Lakehouse/Tables
+duckrun.connect("ws/lh.Lakehouse/dbo")                # …/Tables/dbo  (catalog "lh")
+duckrun.connect("<workspace-guid>/<lakehouse-guid>")  # catalog "data" (pass name= to rename)
+```
+
+Only two shapes are shorthand: an item with a `.Lakehouse`/`.Warehouse` suffix, or a
+**workspace-GUID/item-GUID** pair. Anything else — including a suffix-less `ws/lh` — is still an
+ordinary local relative path, so nothing that works today changes meaning. `conn.attach()` takes the
+same shorthand. Prefer the GUID form on OneLake: friendly names can trip a `delta_scan` bug
+(duckdb-delta#307).
+
 ## It's just DuckDB SQL (plus three Delta bits)
 
 Everything you run through `conn.sql()` is **standard DuckDB SQL, parsed and executed by DuckDB** —

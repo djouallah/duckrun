@@ -17,6 +17,9 @@ import duckrun
 # Read-only by default — safe to explore, no accidental writes.
 conn = duckrun.connect("./lakehouse/Tables")
 # OneLake: duckrun.connect("abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables/dbo")
+# OneLake shorthand for the same thing: duckrun.connect("<ws>/<lakehouse>.Lakehouse/dbo")
+#   — also takes GUIDs: duckrun.connect("<ws-guid>/<lakehouse-guid>")
+#   — a suffix-less "ws/lh" stays a local relative path
 
 # Opt into writes:
 conn = duckrun.connect("./lakehouse/Tables", read_only=False)
