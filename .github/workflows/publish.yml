@@ -24,12 +24,30 @@ concurrency:
 # and so is prone to transient infra failures that would needlessly block a publish. It still runs on
 # its own.
 jobs:
+  # Fail in seconds, not after the 20+ minute gates: the tag names the release, but the wheel is
+  # named from pyproject's `version`. Tagging v0.4.27 without bumping it built a 0.4.26 wheel that
+  # PyPI rejected as already-uploaded — at the very last step, gates already spent.
+  version-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag must match the pyproject version
+        run: |
+          v=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if [ "$GITHUB_REF_NAME" != "v$v" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $v — bump pyproject.toml and re-tag."
+            exit 1
+          fi
+          echo "tag $GITHUB_REF_NAME matches pyproject version $v"
+
   cores:
+    needs: version-check
     permissions:
       contents: write
     uses: ./.github/workflows/cores.yml
 
   local-stress:
+    needs: version-check
     permissions:
       contents: write
     uses: ./.github/workflows/local_stress_tests.yml
