@@ -10,3 +10,11 @@ coffee_shop:
       # OneLake token itself (Fabric notebook runtime / GitHub OIDC / az login), so no bearer_token is
       # needed here.
       root_path: "{{ env_var('WAREHOUSE_PATH') }}"
+    iceberg:
+      # The SAME project against a lakehouse's Iceberg REST catalog (format: iceberg — DuckDB is
+      # the whole engine; duckrun contributes token + ATTACH). integration_tests_iceberg.yml runs
+      # this against the dedicated 'duckrun_iceberg' lakehouse.
+      type: duckrun
+      format: iceberg
+      schema: "{{ env_var('DBT_SCHEMA', 'dbo') }}"
+      root_path: "{{ env_var('WAREHOUSE_PATH') }}"
