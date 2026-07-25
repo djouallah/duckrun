@@ -1092,20 +1092,19 @@ class DuckSession:
             return True
         print(f"Uploading {len(pairs)} file(s) to '{base}'...")
         store = objectstore.build_store(base, secret.refreshed(self.storage_options))
-        # obstore overwrites by default (put mode="overwrite") — that's not the problem. OneLake is:
-        # it rejects a multipart block-commit (Put Block) over an already-committed blob (409
-        # BlobOperationNotSupported), and obstore streams anything over ~5 MB as multipart. Rather
-        # than force a single Put Blob (use_multipart=False buffers the whole file in RAM, losing the
-        # multi-GB streaming this path is built for), delete first so the streaming upload writes a
-        # fresh blob. The delete is a no-op when the key is absent.
-        replace_via_delete = overwrite and remote.is_abfss(base)
+        # obstore overwrites by default (put mode="overwrite"), but on OneLake neither streaming path
+        # can replace an *existing* blob: the default multipart commit stages blocks (Put Block) that
+        # OneLake rejects over a committed blob (409 BlobOperationNotSupported), and delete-then-put is
+        # out because obstore's delete is upstream-broken on OneLake (arrow-rs object_store #701: the
+        # bulk-delete batch URL drops the artifact id → 400). So on OneLake an overwrite goes as a
+        # single Put Blob (single_shot) — the one path OneLake honors as an atomic replace. It buffers
+        # the file in memory, the price of replacing on OneLake; fresh keys still stream as multipart.
+        single_shot = overwrite and remote.is_abfss(base)
         for local_path, rel in pairs:
             if not overwrite and objectstore.exists(store, rel):
                 print(f"  [skip] exists: {base}/{rel}")
                 continue
-            if replace_via_delete:
-                objectstore.delete(store, rel)
-            objectstore.upload(store, rel, local_path)
+            objectstore.upload(store, rel, local_path, single_shot=single_shot)
             print(f"  [ok] {local_path} -> {base}/{rel}")
         print("upload complete")
         return True

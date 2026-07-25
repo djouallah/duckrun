@@ -60,28 +60,26 @@ def list_keys(store) -> List[str]:
     return keys
 
 
-def delete(store, key: str) -> None:
-    """Remove ``key`` from ``store``; a missing key is not an error. Backs the OneLake ``overwrite``
-    path — but note this is NOT an obstore limitation: obstore's ``put`` defaults to ``mode="overwrite"``
-    and replaces happily. It's OneLake that rejects the *multipart* commit obstore uses for files over
-    ~5 MB — staged blocks (``comp=block``) over an *already-committed* blob get ``409
-    BlobOperationNotSupported`` — so an existing object is deleted first, letting the streaming
-    multipart upload write a fresh blob (rather than buffering the whole file for one Put Blob)."""
-    import obstore
-
-    try:
-        obstore.delete(store, key)
-    except FileNotFoundError:
-        pass
-
-
-def upload(store, key: str, local_path: str) -> None:
+def upload(store, key: str, local_path: str, single_shot: bool = False) -> None:
     """Stream ``local_path`` to ``key`` in ``store``. The open file handle lets obstore do a
-    multipart PUT for large files rather than buffering the whole file in memory."""
+    multipart PUT for large files rather than buffering the whole file in memory.
+
+    ``single_shot=True`` forces one non-multipart PUT (obstore ``use_multipart=False``) — the whole
+    file is buffered in memory and written as a single request. This is the OneLake **overwrite**
+    path. obstore replaces happily by default (``put`` is ``mode="overwrite"``), but on OneLake
+    neither of the streaming paths can replace an *existing* blob: the default multipart commit stages
+    blocks (``Put Block``) that OneLake rejects over an already-committed blob (409
+    ``BlobOperationNotSupported``), and delete-then-put is out because obstore's delete routes through
+    a bulk batch endpoint that is broken on OneLake upstream (arrow-rs object_store #701 — the batch
+    URL drops the artifact id, 400 ``WorkspaceId or ArtifactId are missing``). A single ``Put Blob``,
+    which OneLake *does* honor as an atomic replace, is the one path that overwrites there."""
     import obstore
 
     with open(local_path, "rb") as f:
-        obstore.put(store, key, f)
+        if single_shot:
+            obstore.put(store, key, f, use_multipart=False)
+        else:
+            obstore.put(store, key, f)
 
 
 def download(store, key: str, local_path: str) -> None:

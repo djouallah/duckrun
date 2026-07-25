@@ -276,9 +276,11 @@ def test_onelake_files_copy_download_roundtrip(tmp_path):
     assert (dst / "sub" / "b.parquet").read_bytes() == b
     assert not (dst / "skip.txt").exists()  # extension filter carried through
 
-    # overwrite=True over an *already-present* key: on OneLake a plain multipart PUT 409s
-    # (BlobOperationNotSupported) committing blocks over a committed blob, so copy must delete-then-put
-    # and truly replace. Sized past the ~5 MiB multipart threshold so the block-commit path is taken.
+    # overwrite=True over an *already-present* key: on OneLake obstore's default multipart PUT 409s
+    # (BlobOperationNotSupported) committing blocks over a committed blob, and delete-then-put is out
+    # (obstore's bulk delete is broken on OneLake upstream, arrow-rs object_store #701), so copy must
+    # replace via a single Put Blob (use_multipart=False). Sized past the ~5 MiB multipart threshold so
+    # the default path would go multipart — proving the single-shot override actually replaces.
     big = os.urandom(6 * 1024 * 1024)
     (src / "a.csv").write_bytes(big)
     conn.copy(str(src), scratch, file_extensions=[".csv"], overwrite=True)
