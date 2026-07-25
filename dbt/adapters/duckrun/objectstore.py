@@ -62,9 +62,11 @@ def list_keys(store) -> List[str]:
 
 def delete(store, key: str) -> None:
     """Remove ``key`` from ``store``; a missing key is not an error. Backs the OneLake ``overwrite``
-    path: obstore's multipart PUT commits blocks (``comp=block``) which the OneLake blob endpoint
-    rejects with ``409 BlobOperationNotSupported`` over an *already-committed* blob, so an existing
-    object is deleted before the replacement is streamed in."""
+    path — but note this is NOT an obstore limitation: obstore's ``put`` defaults to ``mode="overwrite"``
+    and replaces happily. It's OneLake that rejects the *multipart* commit obstore uses for files over
+    ~5 MB — staged blocks (``comp=block``) over an *already-committed* blob get ``409
+    BlobOperationNotSupported`` — so an existing object is deleted first, letting the streaming
+    multipart upload write a fresh blob (rather than buffering the whole file for one Put Blob)."""
     import obstore
 
     try:
