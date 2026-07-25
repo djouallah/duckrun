@@ -276,6 +276,16 @@ def test_onelake_files_copy_download_roundtrip(tmp_path):
     assert (dst / "sub" / "b.parquet").read_bytes() == b
     assert not (dst / "skip.txt").exists()  # extension filter carried through
 
+    # overwrite=True over an *already-present* key: on OneLake a plain multipart PUT 409s
+    # (BlobOperationNotSupported) committing blocks over a committed blob, so copy must delete-then-put
+    # and truly replace. Sized past the ~5 MiB multipart threshold so the block-commit path is taken.
+    big = os.urandom(6 * 1024 * 1024)
+    (src / "a.csv").write_bytes(big)
+    conn.copy(str(src), scratch, file_extensions=[".csv"], overwrite=True)
+    dst2 = tmp_path / "dl2"
+    conn.download(scratch, str(dst2), file_extensions=[".csv"], overwrite=True)
+    assert (dst2 / "a.csv").read_bytes() == big
+
 
 def _shorthand(abfss_path):
     """``abfss://<ws>@onelake…/<item>/Tables[/<tail>]`` → the ``<ws>/<item>[/<tail>]`` shorthand.

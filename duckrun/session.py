@@ -1092,10 +1092,16 @@ class DuckSession:
             return True
         print(f"Uploading {len(pairs)} file(s) to '{base}'...")
         store = objectstore.build_store(base, secret.refreshed(self.storage_options))
+        # OneLake rejects a multipart block-commit over an already-committed blob (409
+        # BlobOperationNotSupported), so an overwrite there must be delete-then-put — a plain PUT never
+        # performs the replace. The delete is a no-op when the key is absent.
+        replace_via_delete = overwrite and remote.is_abfss(base)
         for local_path, rel in pairs:
             if not overwrite and objectstore.exists(store, rel):
                 print(f"  [skip] exists: {base}/{rel}")
                 continue
+            if replace_via_delete:
+                objectstore.delete(store, rel)
             objectstore.upload(store, rel, local_path)
             print(f"  [ok] {local_path} -> {base}/{rel}")
         print("upload complete")

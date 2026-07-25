@@ -60,6 +60,19 @@ def list_keys(store) -> List[str]:
     return keys
 
 
+def delete(store, key: str) -> None:
+    """Remove ``key`` from ``store``; a missing key is not an error. Backs the OneLake ``overwrite``
+    path: obstore's multipart PUT commits blocks (``comp=block``) which the OneLake blob endpoint
+    rejects with ``409 BlobOperationNotSupported`` over an *already-committed* blob, so an existing
+    object is deleted before the replacement is streamed in."""
+    import obstore
+
+    try:
+        obstore.delete(store, key)
+    except FileNotFoundError:
+        pass
+
+
 def upload(store, key: str, local_path: str) -> None:
     """Stream ``local_path`` to ``key`` in ``store``. The open file handle lets obstore do a
     multipart PUT for large files rather than buffering the whole file in memory."""
