@@ -289,6 +289,61 @@ class DuckrunAdapter(DuckDBAdapter):
         from . import engine
         return engine.open_delta_tables(targets)
 
+    def _live_relations(self, plan, cursor):
+        """``[(relation, dt)]`` for the discovered relations that must actually surface, given
+        ``plan = [(relation, location, storage_options, dt)]``.
+
+        THE one filter for both discovery paths (per-schema and the cross-schema prefetch), so
+        the two can't drift. Two things are hidden:
+
+        * **Drop-tombstones.** A duckrun ``drop table`` overwrites the table to a one-column
+          marker (no data deleted); such a table must not be reported as existing.
+        * **Non-Delta directories** (issue #19). OneLake can't be globbed, so the REST listing
+          returns directory NAMES — it can't tell a Delta table from a plain folder of parquet
+          (an interrupted write). Claiming such a directory exists makes ``is_incremental()``
+          true for a table that has no queryable view, and the model then dies with a catalog
+          error pointing at its own SQL. Confirm the ``_delta_log`` before believing it, exactly
+          as :meth:`duckrun.session.DuckSession._register_view` does.
+
+        The ``_delta_log`` probe only runs for a relation delta-rs already *failed* to open, so a
+        healthy schema pays no extra round trip. A relation is only dropped on a positive "no
+        log" answer: no token to probe with, or a probe that errors, keeps it (best-effort — a
+        relation wrongly dropped would flip ``is_incremental()`` off and clobber the table).
+        """
+        live = []
+        for rel, loc, so, dt in plan:
+            if dt is not None:
+                if delta_dml.is_dropped_dt(dt):
+                    continue
+            else:
+                # delta-rs couldn't open it. On OneLake that's the signal to settle whether the
+                # directory is a Delta table at all (issue #19) — but only when we hold a token to
+                # ask with, since has_delta_log() reports False for a missing one.
+                if remote.is_abfss(loc) and secret.bearer_token(so) and not self._has_delta_log(loc, so):
+                    continue
+                # Otherwise (or once the log is confirmed): the original DuckDB-side tombstone
+                # probe, so a tombstone on a store whose credential lives only in the DuckDB
+                # `secrets:` block is still hidden, exactly as before.
+                if delta_dml.is_dropped(cursor, loc, so):
+                    continue
+            live.append((rel, dt))
+        return live
+
+    @staticmethod
+    def _has_delta_log(location, storage_options) -> bool:
+        """``remote.has_delta_log`` for discovery: False ONLY on a positive "no ``_delta_log``"
+        answer. A probe that errors returns True (keep the relation) — a relation wrongly dropped
+        would flip ``is_incremental()`` off and have the model clobber the table, which is worse
+        than the catalog error this check exists to prevent."""
+        try:
+            if remote.has_delta_log(location, storage_options):
+                return True
+        except Exception as exc:  # transient probe failure -> keep the relation
+            logger.debug(f"duckrun: could not confirm _delta_log for {location!r}: {exc}")
+            return True
+        logger.debug(f"duckrun: skipping {location!r}: no _delta_log (not a Delta table)")
+        return False
+
     def _register_delta_view(self, relation, dt=None, cursor=None):
         """Create the ``delta_scan`` view for a discovered Delta relation on the live
         connection so read-only commands (``dbt test``, ``dbt show``, ``dbt docs``) that
@@ -433,18 +488,13 @@ class DuckrunAdapter(DuckDBAdapter):
                 plan.append((key, rel, loc, so))
 
         # ONE concurrent open pool across all schemas (tombstone check + persisted-docs read),
-        # then the tombstone filter — same contract as the per-schema path (see
-        # list_relations_without_caching for the fallback-probe rationale).
+        # then the shared live filter — same contract as the per-schema path (:meth:`_live_relations`).
         dts = self._open_delta_tables([(loc, so) for _, _, loc, so in plan])
         cur = self._cursor()
-        live = {key: [] for key in listed}
+        by_key = {key: [] for key in listed}
         for (key, rel, loc, so), dt in zip(plan, dts):
-            if dt is not None:
-                if delta_dml.is_dropped_dt(dt):
-                    continue
-            elif delta_dml.is_dropped(cur, loc, so):
-                continue
-            live[key].append((rel, dt))
+            by_key[key].append((rel, loc, so, dt))
+        live = {key: self._live_relations(items, cur) for key, items in by_key.items()}
 
         # Schemas first (views need them; once per schema), then ONE concurrent bind pool
         # across all schemas' views.
@@ -477,10 +527,10 @@ class DuckrunAdapter(DuckDBAdapter):
         if not discovered:
             return in_memory
 
-        # Hide drop-tombstones: a `drop table` overwrites the table to a one-column marker (no data
-        # deleted). Such a table must not surface as a relation. Check before registering. Every
+        # Filter to the relations that must actually surface — drop-tombstones and (on OneLake)
+        # directories that aren't Delta tables at all; see :meth:`_live_relations`. Every
         # discovered relation shares this schema_relation's catalog, so resolve its root/token once.
-        # ONE delta-rs open per relation serves BOTH the tombstone check and the persisted-docs read
+        # ONE delta-rs open per relation serves BOTH that filter and the persisted-docs read
         # that view registration re-applies — this path runs for every manifest schema on every dbt
         # command, and the opens run concurrently (_open_delta_tables) because serialized log
         # replays over OneLake were a ~30s startup tax on `dbt show` (issue #16).
@@ -490,17 +540,9 @@ class DuckrunAdapter(DuckDBAdapter):
         locs = [(root_path.rstrip("/") + "/" + str(rel.schema).strip('"')
                  + "/" + str(rel.identifier).strip('"')) for rel in discovered]
         dts = self._open_delta_tables([(loc, so) for loc in locs])
-        live = []
-        for rel, loc, dt in zip(discovered, locs, dts):
-            if dt is not None:
-                if delta_dml.is_dropped_dt(dt):
-                    continue
-            # delta-rs couldn't open it (e.g. an az:// store whose credential lives only in the
-            # DuckDB `secrets:` block) — fall back to the original DuckDB-side probe so a
-            # tombstone there is still hidden, exactly as before.
-            elif delta_dml.is_dropped(cur, loc, so):
-                continue
-            live.append((rel, dt))
+        live = self._live_relations(
+            [(rel, loc, so, dt) for rel, loc, dt in zip(discovered, locs, dts)], cur
+        )
         discovered = [rel for rel, _ in live]
         if not discovered:
             return in_memory

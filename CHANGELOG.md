@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **OneLake discovery no longer claims a non-Delta directory is a table (#19).** `abfss://`
+  can't be globbed, so discovery lists directory *names* over REST — and a directory holding
+  parquet but no `_delta_log` (an interrupted write) was cached as an existing relation. That
+  made `is_incremental()` true for a table with no queryable view, and the model failed with
+  `Catalog Error: Table with name X does not exist!` pointing at its own compiled SQL rather
+  than at discovery; `duckrun.connect()`, which confirms the log, disagreed about the same store
+  in the same job. Both discovery paths (per-schema and the cross-schema prefetch) now share one
+  filter that confirms the `_delta_log` — only for a directory delta-rs already failed to open,
+  so a healthy schema pays no extra round trip, and only a positive "no log" answer drops a
+  relation (no token, or a probe that errors, keeps it: a relation wrongly dropped would flip
+  `is_incremental()` off and clobber the table).
+
 ## [0.4.30]
 
 ### Performance

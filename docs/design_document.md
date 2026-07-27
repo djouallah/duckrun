@@ -101,7 +101,15 @@ the manifest (even on a fresh in-memory DuckDB). For each call:
      on `/_delta_log/` to get the table name (last segment before the marker).
    - **OneLake / `abfss://`** — DuckDB cannot glob `abfss://` (duckdb-azure#174), so the
      table directories are listed with the OneLake DFS REST API instead (`_discover_via_rest`).
-     Same result — a set of table names — by a different path.
+     Same result — a set of table names — by a different path, with one caveat: the REST listing
+     returns directory *names*, so unlike the glob it can name a directory that holds parquet but
+     no `_delta_log` (an interrupted write). `_live_relations` therefore confirms the log with
+     `remote.has_delta_log` before such a name becomes a relation — but only for a directory
+     delta-rs already failed to open, so a healthy schema pays no extra round trip. Without that
+     confirmation the relation is cached, `is_incremental()` goes true, and the model dies with
+     `Catalog Error: Table with name X does not exist!` (issue #19). Only a positive "no log"
+     answer drops a relation: no token, or a probe that errors, keeps it — a relation wrongly
+     dropped would flip `is_incremental()` off and clobber the table.
 3. Return relations built with `self.Relation.create(database=<db>, schema=<schema>,
    identifier=<name>, type=RelationType.Table)` merged (de-duped) with `super()`'s result.
 

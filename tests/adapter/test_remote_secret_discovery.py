@@ -402,6 +402,103 @@ def test_discovery_propagates_access_error(monkeypatch):
         adapter._discover_delta_relations(_SchemaRelation())
 
 
+# --------------------------------------------- issue #19: a listed dir that isn't a Delta table
+# On OneLake the REST listing returns directory NAMES (abfss can't be globbed), so a folder of
+# parquet with no `_delta_log` — an interrupted write — used to be cached as an existing table.
+# is_incremental() then went true and the model died with "Catalog Error: Table with name X does
+# not exist!", pointing at its own SQL rather than at discovery. duckrun.connect() got this right
+# (Session._register_view confirms the log), so the two surfaces disagreed about one store.
+
+class _FakeDT:
+    """A delta-rs handle stand-in — discovery only reads its schema (the tombstone check)."""
+    def schema(self):
+        field = lambda n: type("_F", (), {"name": n})()
+        return type("_S", (), {"fields": [field("id"), field("name")]})()
+
+
+def _discovery_adapter(monkeypatch, names, openable, creds=None):
+    """A bare adapter whose REST listing returns ``names`` and whose delta-rs opens succeed only
+    for the names in ``openable`` (the rest come back None, as a non-Delta directory does)."""
+    from dbt.adapters.duckrun import engine as dr_engine
+
+    # Never let the offline test reach for a real OneLake token (the tokenless-creds case would
+    # otherwise try OIDC/azure-identity): discovery's freshen step is a no-op here.
+    monkeypatch.setattr(secret, "with_onelake_token", lambda root, so: so)
+    monkeypatch.setattr(remote, "list_delta_tables", lambda root, schema, so: list(names))
+    monkeypatch.setattr(
+        dr_engine, "open_delta_tables",
+        lambda targets: [_FakeDT() if loc.rsplit("/", 1)[-1] in openable else None
+                         for loc, _so in targets],
+    )
+    adapter = object.__new__(DuckrunAdapter)
+    adapter.config = type("_Cfg", (), {"credentials": creds or _Creds()})()
+    adapter._cursor = lambda: _RecordingConn()
+    adapter.create_schema = lambda relation: None
+    adapter._register_delta_views = lambda pairs: None
+    return adapter
+
+
+def _identifiers(relations):
+    return sorted(str(r.identifier).strip('"') for r in relations)
+
+
+def test_discovery_skips_listed_dir_with_no_delta_log(monkeypatch):
+    # THE bug: fct_scada is a parquet-only directory. It must not reach dbt's relation cache.
+    probed = []
+    monkeypatch.setattr(remote, "has_delta_log",
+                        lambda loc, so: probed.append(loc) or loc.endswith("fct_price"))
+    adapter = _discovery_adapter(monkeypatch, ["fct_price", "fct_scada"], openable=set())
+    rels = adapter.list_relations_without_caching(_SchemaRelation())
+    assert _identifiers(rels) == ["fct_price"]
+    assert [p.rsplit("/", 1)[-1] for p in probed] == ["fct_price", "fct_scada"]
+
+
+def test_discovery_keeps_real_table_delta_rs_could_not_open(monkeypatch):
+    # A genuine table delta-rs blipped on still HAS a _delta_log -> it must stay. Dropping it
+    # would flip is_incremental() off and have the model clobber the table.
+    monkeypatch.setattr(remote, "has_delta_log", lambda loc, so: True)
+    adapter = _discovery_adapter(monkeypatch, ["fct_price", "fct_scada"], openable={"fct_price"})
+    assert _identifiers(adapter.list_relations_without_caching(_SchemaRelation())) == \
+        ["fct_price", "fct_scada"]
+
+
+def test_discovery_keeps_relation_when_delta_log_probe_fails(monkeypatch):
+    # Same best-effort contract for a transient probe failure: keep it, don't lose the table.
+    def boom(loc, so):
+        raise RuntimeError("503 Service Unavailable")
+    monkeypatch.setattr(remote, "has_delta_log", boom)
+    adapter = _discovery_adapter(monkeypatch, ["fct_scada"], openable=set())
+    assert _identifiers(adapter.list_relations_without_caching(_SchemaRelation())) == ["fct_scada"]
+
+
+def test_discovery_does_not_probe_delta_log_without_a_token(monkeypatch):
+    # has_delta_log() reports False when there's no bearer token, so probing tokenless would
+    # delete every relation from the cache. Don't ask — keep them.
+    monkeypatch.setattr(remote, "has_delta_log",
+                        lambda loc, so: pytest.fail("must not probe without a token"))
+    adapter = _discovery_adapter(monkeypatch, ["fct_scada"], openable=set(),
+                                 creds=_CredsNoToken())
+    assert _identifiers(adapter.list_relations_without_caching(_SchemaRelation())) == ["fct_scada"]
+
+
+def test_discovery_does_not_probe_delta_log_when_opens_succeed(monkeypatch):
+    # The probe costs a round trip, so a healthy schema must never pay it: delta-rs opening the
+    # table already proves the log is there.
+    monkeypatch.setattr(remote, "has_delta_log",
+                        lambda loc, so: pytest.fail("must not probe an openable table"))
+    adapter = _discovery_adapter(monkeypatch, ["a", "b"], openable={"a", "b"})
+    assert _identifiers(adapter.list_relations_without_caching(_SchemaRelation())) == ["a", "b"]
+
+
+def test_prefetch_discovery_skips_dir_with_no_delta_log(monkeypatch):
+    # The cross-schema prefetch (the path a real dbt run takes when populating its cache) shares
+    # the same filter — pin it too, or the fix only holds for the per-schema path.
+    monkeypatch.setattr(remote, "has_delta_log", lambda loc, so: loc.endswith("fct_price"))
+    adapter = _discovery_adapter(monkeypatch, ["fct_price", "fct_scada"], openable=set())
+    prefetched = adapter._prefetch_discovery([_SchemaRelation()])
+    assert [_identifiers(rels) for rels in prefetched.values()] == [["fct_price"]]
+
+
 # ------------------------------------ notebookutils token fallback (Fabric, no profile token)
 # Inside a Fabric notebook the profile carries NO bearer token — the notebook has its own via
 # notebookutils. The adapter must acquire it so read-only discovery (the REST list) and the
