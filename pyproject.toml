@@ -67,9 +67,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Back-compat no-op: OneLake auth (azure-identity) is now a core dependency, so `duckrun[local]` is
-# just `duckrun`. Kept so existing installs/docs that reference the extra don't error.
-local = []
+# There is deliberately NO auth/"local" extra: OneLake auth (azure-identity) is a core dependency,
+# so plain `pip install duckrun` already signs in on a laptop. An empty back-compat extra used to
+# live here and was removed — its mere presence kept the `pip install duckrun[...]` advice alive in
+# docs and in tooling that reads this file. Don't re-add one; an unknown extra only warns anyway.
 # Test-only. pyarrow builds reusable Arrow fixtures; pandas is required by the DataFrame.toPandas()
 # test (DuckDB .df() materializes a pandas DataFrame, so it needs pandas+numpy). Production duckrun
 # stays pyarrow-/pandas-free — it streams DuckDB relations straight to deltalake.

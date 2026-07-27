@@ -187,11 +187,11 @@ def get_onelake_token() -> str:
     if token:
         return token
     raise RuntimeError(
-        "Could not acquire a OneLake token. Inside a Fabric notebook this is automatic; "
-        "elsewhere set AZURE_STORAGE_TOKEN, or install the optional dependency "
-        "(`pip install duckrun[local]`) and run `az login --scope "
-        "https://storage.azure.com/.default`, or pass storage_options={'bearer_token': '...'} "
-        "to connect()."
+        "Could not acquire a OneLake token. Inside a Fabric notebook this is automatic; on a "
+        "laptop duckrun signs you in through the browser when it's run from a terminal (nothing "
+        "to install — azure-identity is a core dependency). If that didn't happen, set "
+        "AZURE_STORAGE_TOKEN, pass storage_options={'bearer_token': '...'} to connect(), or run "
+        "`az login --scope https://storage.azure.com/.default`."
     )
 
 
@@ -213,10 +213,10 @@ def get_fabric_token() -> str:
     if token:
         return token
     raise RuntimeError(
-        "Could not acquire a Fabric API token. Inside a Fabric notebook this is automatic; "
-        "elsewhere set FABRIC_TOKEN, or install the optional dependency "
-        "(`pip install duckrun[local]`) and run "
-        "`az login --scope https://api.fabric.microsoft.com/.default`."
+        "Could not acquire a Fabric API token. Inside a Fabric notebook this is automatic; on a "
+        "laptop duckrun signs you in through the browser when it's run from a terminal (nothing "
+        "to install — azure-identity is a core dependency). If that didn't happen, set "
+        "FABRIC_TOKEN, or run `az login --scope https://api.fabric.microsoft.com/.default`."
     )
 
 
@@ -253,8 +253,9 @@ def get_powerbi_token() -> str:
         return token
     raise RuntimeError(
         "Could not acquire a Power BI token (needed to refresh the deployed semantic model). "
-        "Inside a Fabric notebook this is automatic; elsewhere set POWERBI_TOKEN, or install the "
-        "optional dependency (`pip install duckrun[local]`) and run "
+        "Inside a Fabric notebook this is automatic; on a laptop duckrun signs you in through the "
+        "browser when it's run from a terminal (nothing to install — azure-identity is a core "
+        "dependency). If that didn't happen, set POWERBI_TOKEN, or run "
         "`az login --scope https://analysis.windows.net/powerbi/api/.default`."
     )
 
