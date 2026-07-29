@@ -4,6 +4,65 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Performance
+- **`incremental_strategy='insert'` is now computed in DuckDB and committed as a plain append —
+  no delta-rs MERGE, no data file rewritten.** Insert-only is the one incremental shape that
+  never *removes* a row, so it never needed a MERGE: duckrun now anti-joins the batch against
+  the target's KEY columns in DuckDB (projection pushdown, spills like any other DuckDB query)
+  and hands delta-rs a commit containing `add` actions only. A delta-rs MERGE, even an
+  insert-only one, plans a join against the whole pinned target, so its cost scales with the
+  target's *partition span* rather than the size of the batch and its join state is not fully
+  spillable — the shape that OOM-**kills** a run on a large fact table even on a very large
+  machine. The new path also keeps the full write memory share instead of DuckDB's 30% merge
+  split, since nothing runs a delta-rs merge pool alongside it.
+
+  Measured on a 20M-row × 14-column table across 12 monthly partitions, inserting a 200k-row batch
+  of which 100k keys are new (post-write maintenance excluded from both, since both inherit it):
+
+  | | wall | process RSS growth |
+  |---|---:|---:|
+  | DuckDB anti-join + append | **0.9s** | **+84 MB** |
+  | delta-rs insert-only MERGE | 6.7s | +8,397 MB |
+
+  Identical rows out of both. The memory column is the point: delta-rs grew the process by ~8.4 GB
+  to insert 100k rows into a 20M-row table, and that growth tracks the target, not the batch.
+
+  Row-for-row identical to delta-rs's `when_not_matched_insert_all`, NULL keys included
+  (`target.k = source.k` is NULL, never TRUE, so a NULL-keyed source row inserts — the SQL `IN`
+  rule). The duplicate-source-key cardinality guard, `on_schema_change`, the contract NOT NULL
+  guard and the column-mismatch guard all still apply.
+
+  Declaring the partition equality alongside the key —
+  `incremental_predicates=['target.month_key = source.month_key']` — folds the batch's
+  **literal** partition values into the target probe (`"month_key" IN (202601, 202602)`), which
+  the Delta reader pushes down to skip partition files at plan time. A column-to-column
+  comparison cannot be pushed down that way; this is result-neutral, because the join already
+  requires the two to be equal.
+
+  One caveat, unchanged from the plain `append` strategy this now shares a write path with: the
+  append leaves one small file per partition, and the shared post-write maintenance will compact
+  them when the table's byte debt trips its gate (≥8 files under 128 MB *and* ≥512 MB of them) —
+  rewriting files that the insert itself did not. A delta-rs merge, which rewrites the files it
+  touches to target size, tends not to trip that gate afterwards. On a table whose files are already
+  at target size the gate does not fire and the insert really does write nothing but the new rows;
+  on a table of small files, expect the same compaction `append` already pays.
+
+  Falls back to delta-rs for the advanced clause surface (`merge_clauses`,
+  `merge_update_set_expressions`), which has no anti-join form — so
+  `merge_clauses={'when_not_matched': [{'action': 'insert'}]}` spells the same insert-only
+  operation on the old path if it is ever needed. `merge` is deliberately unchanged: a true
+  upsert must remove old row versions, which forces file rewrites and so can never be an append.
+
+### Changed
+- **An `insert` batch that adds nothing now writes no commit at all** — the Delta version does
+  not move, where a delta-rs MERGE committed a no-op version. Re-running an already-loaded
+  backlog leaves no log churn. The operation recorded in history is `WRITE`, not `MERGE`.
+- **The `insert` append is always fenced.** The anti-join reads the target, making this a
+  read-modify-append: it commits only if the table version is unchanged since the model started,
+  and raises `CommitFailedError` otherwise. A writer that committed in between would have made
+  the anti-join stale and let a duplicate through. This does not depend on the `reads_self`
+  heuristic that gates the plain `append` strategy.
+
 ### Fixed
 - **OneLake discovery no longer claims a non-Delta directory is a table (#19).** `abfss://`
   can't be globbed, so discovery lists directory *names* over REST — and a directory holding

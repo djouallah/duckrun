@@ -78,7 +78,17 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
 
 - **Two engines share one machine's memory.** DuckDB and delta-rs each keep their own pool in the same
   process; heavy merges split the budget, and that split is fragile (delta-rs's merge spill-to-disk is
-  itself flaky). Background in the [Design document](design_document.md).
+  itself flaky). Background in the [Design document](design_document.md). This applies to the `merge`
+  strategy and the raw `MERGE INTO` verb. `insert`, `delete+insert`, `append`, `microbatch` and
+  `overwrite` do not run a delta-rs merge pool at all, so DuckDB keeps the full write budget there.
+- **`merge` is the write path most likely to run out of memory, and the ceiling is not duckrun's.**
+  A delta-rs `MERGE` plans a join against the whole pinned target, so its cost scales with the
+  target's *partition span*, not the size of the batch — a batch straddling many monthly partitions
+  can exhaust a very large machine. If your model only ever needs to add rows it has never seen (a
+  key-level idempotent append), use `incremental_strategy='insert'`: duckrun computes that as a
+  DuckDB anti-join and commits a plain append, with no delta-rs merge and no file rewritten. For a
+  genuine upsert there is no way around removing old row versions, which means rewriting files — keep
+  each batch inside as few partitions as possible.
 - **delta-rs hard-codes a 100 GB merge disk-spill ceiling — arguably a bug.** A wide MERGE (one that
   rewrites many partitions) spills to disk, and the DataFusion `DiskManager` under delta-rs caps that
   spill at a **flat 100 GB regardless of how big the disk is** — so a merge aborts with *"Resources

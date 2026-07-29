@@ -230,19 +230,56 @@ select * from {{ ref('stg_orders') }}
 
 | Strategy | Behavior | Requires | Pick it when |
 |---|---|---|---|
-| `merge` (default with `unique_key`) | upsert: update matched, insert new | `unique_key` | Rows change after first load |
-| `insert` | insert only keys not present | `unique_key` | Append-only data but you want key-level idempotency |
+| `merge` (default with `unique_key`) | upsert: update matched, insert new (delta-rs MERGE) | `unique_key` | Rows change after first load |
+| `insert` | insert only keys not present — DuckDB anti-join, committed as a **plain append**, no file rewritten | `unique_key` | Append-only data but you want key-level idempotency |
 | `append` (default without `unique_key`) | append; auto-fenced (compare-and-swap) when the model reads `{{ this }}`, blind otherwise | — | Event streams; or your SQL already dedups against `{{ this }}` |
 | `delete+insert` | delete target rows whose key appears in the batch, then insert EVERY incoming row (duplicates preserved) | `unique_key` | dbt-duckdb `delete+insert` semantics; duplicate-key sources a `merge` would reject |
 | `microbatch` | delete+insert per `event_time` window | `event_time` config; rejects `unique_key` | dbt-driven backfills by time window |
 
 First run, `--full-refresh`, or a missing table always overwrites.
 
-**Steer big tables toward plain `append` with SQL dedup.** A `merge` scans the target and joins on the
-key — expensive on a large fact table, and the merge path splits the memory budget
-between DuckDB and delta-rs. If the model SQL already excludes rows present in
-`{{ this }}` (the classic "load only files not yet seen" pattern), that join is pure
-waste. `append` does no target scan and keeps the full DuckDB memory budget — and
+**On a big table, only `merge` is genuinely expensive — and only because it must remove
+rows.** A delta-rs MERGE plans a join against the whole pinned target, so its cost scales
+with the target's *partition span*, not the batch size, and it splits the memory budget
+between DuckDB and delta-rs. `insert` does not: insert-only never removes a row, so
+duckrun computes it as a DuckDB anti-join over the target's KEY columns and commits a
+plain append — `add` actions only, no existing file rewritten, no delta-rs merge pool,
+DuckDB keeps the full write budget. A batch that adds nothing writes no commit at all
+(the version does not move). The append is always fenced to the version the anti-join
+read, so a concurrent writer fails the run instead of letting a duplicate through.
+
+**So: if the model only ever needs to add rows it has never seen, use `insert`, not
+`merge`.** This is the `WHEN MATCHED THEN DO NOTHING` shape other engines spell with a
+merge clause; on duckrun it is `incremental_strategy='insert'`. Give it the partition
+equality alongside the key so the target probe skips files instead of reading every
+partition:
+
+```sql
+{{ config(
+    materialized='incremental', incremental_strategy='insert',
+    unique_key=['file', 'DUID', 'SETTLEMENTDATE'],
+    partition_by=['month_key'],
+    incremental_predicates=['target.month_key = source.month_key'],
+) }}
+```
+
+duckrun folds the batch's **literal** partition values into the probe
+(`"month_key" IN (202601, 202602)`), which the Delta reader pushes down to skip whole
+partition directories — something a column-to-column comparison cannot do. Without the
+declared equality it will not prune on that column, because that would no longer be
+result-neutral. High-cardinality key columns get the batch's min/max instead
+(`"id" >= lo AND "id" <= hi`), automatically. Measured on a 20M-row / 12-partition table
+inserting a 200k batch: **0.9s and +84 MB RSS, versus 6.7s and +8.4 GB** for the
+equivalent delta-rs merge — the memory column is why merges get OOM-killed at scale.
+One inherited caveat: the append leaves a small file per partition, so the shared
+post-write compaction may still rewrite files once the table's byte debt trips its gate
+(no different from plain `append`). (Escape hatch back to the delta-rs merge, if ever
+needed: `merge_clauses={'when_not_matched': [{'action': 'insert'}]}`.)
+
+**Plain `append` with SQL dedup is still the cheapest of all** — it reads nothing from the
+target at all. If the model SQL already excludes rows present in
+`{{ this }}` (the classic "load only files not yet seen" pattern), even the anti-join is
+redundant. `append` does no target scan and keeps the full DuckDB memory budget — and
 because the model reads `{{ this }}`, duckrun **automatically** adds a compare-and-swap
 fence: the append commits only if the table version is unchanged since the model
 started — captured BEFORE the model read `{{ this }}` — so a concurrent writer makes it
@@ -262,12 +299,14 @@ select * from read_csv(getvariable('new_files'))
 ```
 
 **Concurrency expectations to set with the user:** merge/insert are safe — a
-conflicting concurrent write makes the run fail loudly (never silently wrong), and
-delta-rs is strict: ANY concurrent write to the same table aborts a merge, even
-unrelated rows. So overlapping schedules or external writers on a merged table mean
-retries, not corruption — design schedules accordingly. `append` is fenced only when the
-model reads `{{ this }}`; a blind append of genuinely new data has no guard, by design.
-`delete+insert` commits as a fenced full-table overwrite (same compare-and-swap).
+conflicting concurrent write makes the run fail loudly (never silently wrong), and both
+are strict: ANY concurrent write to the same table aborts them, even to unrelated rows
+(delta-rs's own OCC for `merge`, a compare-and-swap on the version for `insert`, whose
+anti-join would otherwise go stale). So overlapping schedules or external writers on such
+a table mean retries, not corruption — design schedules accordingly. `append` is fenced
+only when the model reads `{{ this }}`; a blind append of genuinely new data has no guard,
+by design. `delete+insert` commits as a fenced full-table overwrite (same
+compare-and-swap).
 Microbatch's per-window delete+insert is not protected against concurrent writers —
 don't run other writers against a microbatch table during its window.
 
@@ -382,10 +421,14 @@ OPTIMIZE for these tables", the answer is: you don't, it's built in.
   refusing to overwrite a whole table with one increment after a transient storage
   error or a mid-run delete. Re-run; pass `--full-refresh` only if the table was
   deliberately deleted.
-- **Merge OOM / slow on a big target**: add `incremental_predicates` on the partition
-  column to prune; check the logged "merge spill cap" line; lower
-  `merge_max_spill_size` in a tight container; consider whether the model qualifies for
-  a dedup-in-SQL `append` instead.
+- **Merge OOM / slow on a big target**: first ask whether the model actually needs to
+  UPDATE anything. If matched rows should be left alone, switch `merge` → `insert`: that
+  becomes a DuckDB anti-join plus a plain append, with no delta-rs merge pool and no file
+  rewritten — the single biggest win available here. Otherwise add `incremental_predicates`
+  on the partition column to prune; check the logged "merge spill cap" line; lower
+  `merge_max_spill_size` in a tight container; consider whether the model qualifies for a
+  dedup-in-SQL `append` instead. A `merge` whose batch straddles many partitions is the
+  worst case — its cost is the partition span, not the row count.
 - **Huge merge SOURCE (not target)**: set `merge_streamed_exec: true` so the source
   streams instead of being collected.
 - **NULLs in `unique_key`**: SQL `NULL != NULL` — merge cannot match null keys and you

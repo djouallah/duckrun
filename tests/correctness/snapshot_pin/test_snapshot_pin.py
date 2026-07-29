@@ -250,10 +250,14 @@ def test_insert_content(tmp_path):
 
 
 def test_insert_race_is_fenced(tmp_path):
-    """insert-only routes through the fenced merge_delta. Even though the batch only INSERTs a
-    disjoint new key (id=11), delta-rs's OCC still refuses the commit when a foreign writer landed
-    since vB ("a concurrent transactions added new data") — so the run fails loud, no lost update."""
-    res, rows = _race(tmp_path, "events_insert", ["merge_delta"])
+    """insert-only is a read-modify-append: duckrun anti-joins the batch against the target read at
+    vB and appends only the unmatched rows, so the append must be fenced to vB — a foreign writer
+    that commits in between makes the anti-join stale. Even though the batch only INSERTs a disjoint
+    new key (id=11), the run fails loud, no lost update. We patch the fenced primitive used today
+    (append_if_unchanged), the unfenced one (write_delta), and the delta-rs merge this strategy used
+    before it was computed in DuckDB — so a revert to any of them still fires the race."""
+    res, rows = _race(tmp_path, "events_insert",
+                      ["append_if_unchanged", "write_delta", "merge_delta"])
     assert not res.success                          # OCC conflict — the run failed
     assert rows == {**_seed_rows(), 1: 999}         # writer's 999 stands; batch (id=11) never landed
 

@@ -186,8 +186,70 @@ The first run (or `--full-refresh`, or a missing table) overwrites. Later runs a
 | `incremental_strategy`             | behavior                                  | requires     |
 |------------------------------------|-------------------------------------------|--------------|
 | `merge` (default with `unique_key`) | upsert — update matched, insert new       | `unique_key` |
-| `insert`                           | insert only new keys (idempotent append)  | `unique_key` |
+| `insert`                           | insert only new keys (idempotent append) — computed in DuckDB, committed as a **plain append** | `unique_key` |
+| `delete+insert`                    | delete the batch's keys, insert the whole batch (duplicates preserved) | `unique_key` |
 | `append` (default without `unique_key`) | append; **auto-fenced** when the model reads `{{ this }}`, else a blind append | — |
+| `microbatch`                       | `replaceWhere` per dbt-driven `event_time` window | `event_time` |
+
+### `insert` — insert-only, computed in DuckDB
+
+Insert-only is the one incremental shape that never *removes* a row, so it is genuinely a single
+Delta append: duckrun computes "batch rows whose `unique_key` is not already present" as a DuckDB
+anti-join and hands delta_rs a commit containing `add` actions only. **No existing data file is ever
+rewritten**, and the target read is projected down to the key columns.
+
+This matters on a large fact table. A delta_rs `MERGE` — even an insert-only one — plans a join
+against the whole pinned target, so its cost scales with the target's partition span rather than the
+size of the batch, and its join state is not fully spillable. The DuckDB anti-join spills, keeps the
+full write memory share (the 30/60 merge split is not applied), and writes nothing but the new rows.
+
+It is row-for-row the same table delta_rs's `when_not_matched_insert_all` produces, NULL keys
+included: `target.k = source.k` is NULL for a NULL key, never TRUE, so the row counts as unmatched
+and inserts — the same rule SQL `IN` follows.
+
+Two consequences worth knowing:
+
+- **A batch that adds nothing writes no commit at all.** The Delta version does not move, where a
+  delta_rs `MERGE` commits a no-op version. Re-running an already-loaded backlog is free and leaves
+  no log churn. History records the write as `WRITE`, not `MERGE`.
+- **The append is always fenced.** The anti-join reads the target, so this is a read-modify-append:
+  it commits only if the table version is unchanged since the model started, and fails with
+  `CommitFailedError` otherwise. A concurrent writer that landed in between would have made the
+  anti-join stale and let a duplicate through.
+
+The probe does not scan blindly. For every column it joins on, duckrun folds a **constant** filter
+into the read of the target: the batch's `min`/`max` for a high-cardinality key
+(`"id" >= 19900000 AND "id" <= 20099999`), so the reader skips files whose Delta stats put them
+outside the batch's range — the same early filter a delta-rs merge derives from source statistics.
+Both are result-neutral, because the join already requires equality.
+
+For a partition column you get something better — the exact value set — but only if you declare the
+equality, the same predicate you would give a merge:
+
+```sql
+{{ config(
+    materialized='incremental',
+    incremental_strategy='insert',
+    unique_key=['file', 'DUID', 'SETTLEMENTDATE'],
+    partition_by=['month_key'],
+    incremental_predicates=['target.month_key = source.month_key'],
+) }}
+```
+
+That gets `"month_key" IN (202601, 202602)` — the batch's actual partitions, so whole partition
+directories are skipped. An `IN` set beats a range here: a source that unions an old backfill with the
+current feed is bimodal, and a `min`/`max` bound would smear across every partition in between.
+Without the declared equality duckrun will not prune on `month_key` at all, since doing so would no
+longer be result-neutral.
+
+One thing the append inherits from the plain `append` strategy: it leaves a small file per partition,
+and the shared post-write maintenance will compact them once the table's byte debt trips its gate,
+rewriting files the insert itself did not. On a table whose files are already at target size that gate
+does not fire.
+
+Need the old delta_rs path back? Spell insert-only as an explicit clause list —
+`merge_clauses={'when_not_matched': [{'action': 'insert'}]}` — which routes to delta_rs's ordered
+clause list as before.
 
 ### `append` that reads `{{ this }}` — the automatic fence
 
@@ -205,11 +267,11 @@ select * from read_csv(getvariable('new_files'))
 {% endif %}
 ```
 
-**Why, reason 1 — performance.** `merge` / `insert` scan the target and join on the key to find what's
-new — expensive on a large table. If the SQL above already excludes rows that are present, that work
-is redundant. A plain `append` does **no target data scan, no key join, and DuckDB keeps its full
-memory budget** (the merge memory split is never applied — same as `overwrite`). The only thing it
-reads from the target is one Delta log entry to get the version.
+**Why, reason 1 — performance.** `merge` / `insert` read the target and join on the key to find
+what's new. If the SQL above already excludes rows that are present, that work is redundant: a plain
+`append` does **no target data scan and no key join at all**, reading only one Delta log entry to get
+the version. (`insert` is far cheaper than it used to be — it is a DuckDB anti-join over the key
+columns now, not a delta_rs merge — but it still reads the target, and this reads nothing.)
 
 **Why, reason 2 — an automatic concurrency guard.** Because the dedup is done in SQL against
 `{{ this }}`, a naive append would be unsafe under concurrency: if another writer commits between your
@@ -239,12 +301,12 @@ whatever the previous attempt already loaded.
 | `unique_key`            | column(s) to merge on.                                                       |
 | `merge_update_columns`  | merge: update only these columns on match (others untouched).               |
 | `merge_exclude_columns` | merge: update all columns **except** these on match.                        |
-| `merge_update_condition` / `merge_insert_condition` | merge: extra predicate AND-ed onto the matched-update / not-matched-insert clause (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). |
+| `merge_update_condition` / `merge_insert_condition` | merge: extra predicate AND-ed onto the matched-update / not-matched-insert clause (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). `merge_insert_condition` also applies to `insert`, where it must reference only the source — an unmatched row has no target to read. |
 | `merge_clauses` / `merge_update_set_expressions` | merge: dbt-duckdb-style custom clause list / per-column `SET` expressions — translated to delta_rs's full TableMerger clause list. The only merge config duckrun refuses is `merge_on_using_columns` (no delta_rs equivalent). |
 | `merge_max_spill_size`  | merge: memory ceiling in **bytes** for delta_rs's merge pool (not a disk budget). Defaults to ~60% of the **effective** limit — `min(physical RAM, container/cgroup limit, currently-free RAM)` — beyond which delta_rs spills the merge join to disk (like DuckDB's `memory_limit`). The other big consumer, DuckDB itself, is separately pinned to ~30% of the same effective limit on the merge path (it produces the merge source in the same process), so the two budgets sum under the cgroup cap; both log their chosen value at run start. Set `0` to disable. It bounds the merge pool, *not* the whole process (the Arrow source, read buffers, and spill-file page cache sit outside it), so on a tight container with a huge source the total can still exceed the cap — lower it if needed. A cap below the join's minimum (~hundreds of MB) makes the merge raise `Resources exhausted` instead of spilling. Requires deltalake 1.5.0 (pinned). |
 | `merge_max_temp_directory_size` | merge: disk cap in bytes for delta_rs's merge spill files (default ~80% of free disk). |
 | `merge_streamed_exec`   | merge: `true` streams a huge merge **source** instead of collecting it into memory — needed for very large sources (especially `WHEN NOT MATCHED BY SOURCE` custom clauses), at the cost of losing target-file pruning. Default `false` suits the normal small-batch-into-big-table case. |
-| `incremental_predicates`| merge: extra predicates AND-ed into the merge condition (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). |
+| `incremental_predicates`| merge / insert: extra predicates AND-ed into the merge (or anti-join) condition (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). On `insert`, a `target.<part> = source.<part>` entry also unlocks literal partition pruning of the target probe. |
 | `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. (`sync_all_columns` only *adds* — delta_rs can't drop columns.) |
 | `partition_by`          | Delta partition column(s).                                                   |
 | `merge_schema`          | allow schema evolution on write.                                            |

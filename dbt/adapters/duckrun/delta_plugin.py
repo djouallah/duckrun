@@ -273,6 +273,38 @@ class Plugin(BasePlugin):
             )
             return
 
+        # insert (insert-only) is the one incremental shape that never removes a row, so it is a
+        # PURE APPEND — computed as a DuckDB anti-join and committed with `add` actions only, no
+        # target file rewritten. delta_rs's merge produces the same table at a cost that scales with
+        # the target's partition span instead of the batch. The advanced clause surface
+        # (merge_clauses / merge_update_set_expressions) has no anti-join form, so it still routes to
+        # delta_rs — which also makes `merge_clauses: {when_not_matched: [{action: insert}]}` (the
+        # same insert-only shape, spelled as an explicit clause list) the way back to the old path if
+        # this one ever misbehaves.
+        if (strategy == "insert"
+                and self._custom_merge_clauses(cfg, data.columns, unique_key) is None):
+            self._validate_merge_config(cfg)
+            if not unique_key:
+                raise ValueError("incremental_strategy='insert' requires a unique_key.")
+            evolve_schema, _ = self._resolve_schema_change(
+                (cfg.get("on_schema_change") or "ignore").lower(), path, data, storage_options
+            )
+            # No set_merge_memory_limit here: nothing runs a delta_rs merge pool alongside DuckDB, so
+            # DuckDB keeps the full write share store() already applied instead of the 0.3 merge share.
+            with engine.mem_profile("insert", con=cur):
+                self._store_insert(
+                    path, cur, name, data, unique_key, storage_options,
+                    read_version=cfg.get("read_version"),
+                    partition_by=partition_by,
+                    merge_schema=evolve_schema,
+                    incremental_predicates=cfg.get("incremental_predicates"),
+                    insert_condition=cfg.get("merge_insert_condition"),
+                    sort_by=sort_by,
+                )
+            if src_tmp is not None:
+                cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")
+            return
+
         if strategy in ("merge", "insert"):
             self._store_merge(path, cur, data, cfg, unique_key, strategy, storage_options, src_tmp)
         elif strategy == "append":
@@ -560,6 +592,233 @@ class Plugin(BasePlugin):
             )
         finally:
             cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
+
+    def _store_insert(
+        self, path, cur, name, data, unique_key, storage_options,
+        read_version=None, partition_by=None, merge_schema=False,
+        incremental_predicates=None, insert_condition=None, sort_by=None,
+    ) -> None:
+        """dbt ``incremental_strategy='insert'``: append only the batch rows whose ``unique_key`` is
+        not already in the target — an idempotent dedupe-append.
+
+        Computed in DuckDB and committed as a PLAIN APPEND. Insert-only is the one incremental shape
+        that never removes a row, so no target file is ever rewritten and the Delta commit carries
+        ``add`` actions only. delta_rs's MERGE produces the same table, but its cost scales with the
+        target's partition span rather than the batch and it holds non-spillable join state — the
+        shape that OOM-kills on a large fact table. DuckDB's anti-join reads only the target's KEY
+        columns (parquet projection pushdown) and spills to disk when it must.
+
+        Equivalent to delta_rs's ``when_not_matched_insert_all``: a source row is unmatched when no
+        target row satisfies the merge ON predicate, which is exactly what ``NOT EXISTS`` over the
+        same condition expresses — including NULL keys, where ``t.k = s.k`` is NULL (not TRUE) so the
+        row is inserted, matching SQL ``IN`` and delta_rs alike. Plain ``=``, never
+        ``IS NOT DISTINCT FROM`` — the same choice ``_store_delete_insert`` makes.
+
+        ALWAYS fenced: the anti-join READS the target, so this is a read-modify-append. The read and
+        the commit are pinned to ``vB`` (``append_if_unchanged``, CAS via ``max_commit_retries=0``) —
+        a writer committing in between would make the anti-join stale and let a duplicate through.
+        delta_rs got this from its own OCC; here it is not optional, and it does not depend on the
+        ``reads_self`` heuristic that gates the plain ``append`` strategy.
+
+        A batch that adds nothing writes NO commit at all (the Delta version does not move), where a
+        delta_rs MERGE commits a no-op version. Deliberate: a re-run of an already-loaded backlog
+        should not churn the log."""
+        keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
+        keys = [str(k).strip().strip('"') for k in keys]
+        # Empty batch → nothing to insert (an incremental no-op). Probe with LIMIT 1 rather than
+        # counting, exactly as the delete+insert path does.
+        if cur.sql(f"SELECT 1 FROM {name} LIMIT 1").fetchone() is None:
+            return
+        # The keyed-merge cardinality rule, shared with every delta_rs merge path (engine): a source
+        # with two rows for one key cannot be resolved against one target row.
+        engine.assert_source_unique(data, keys)
+
+        loc_sql = path.replace("'", "''")
+        # Reached only when the table exists (see store's dispatch). read_version is None only if a
+        # writer created it during this run — capture the current version and pin to that.
+        vB = read_version if read_version is not None else engine.table_version(path, storage_options)
+
+        target_cols = list(cur.sql(f"SELECT * FROM delta_scan('{loc_sql}', version => {vB}) LIMIT 0").columns)
+        batch_cols = list(cur.sql(f"SELECT * FROM {name} LIMIT 0").columns)
+        tset = {c.lower() for c in target_cols}
+        bmap = {c.lower(): c for c in batch_cols}
+        missing = [c for c in target_cols if c.lower() not in bmap]
+        added = [c for c in batch_cols if c.lower() not in tset]
+        # Loud failure on a column mismatch rather than a positional append silently shifting values
+        # — mirrors on_schema_change='fail' and the delete+insert guard. `added` is allowed only when
+        # on_schema_change resolved to an evolving mode (merge_schema).
+        if missing or (added and not merge_schema):
+            raise CompilationError(
+                "insert: the model's columns do not match the target table. "
+                + (f"Added: {sorted(added)}. " if added else "")
+                + (f"Missing: {sorted(missing)}. " if missing else "")
+                + "Reconcile the model SQL with the table (or use on_schema_change / --full-refresh)."
+            )
+        # Project onto the TARGET's column list, in the target's declared order and spelling, so a
+        # reordered model SELECT can never shift values between columns; new columns trail when the
+        # schema is evolving.
+        out_cols = [bmap[c.lower()] for c in target_cols] + (added if merge_schema else [])
+        proj = ", ".join(f's."{c}"' for c in out_cols)
+
+        # incremental_predicates in delta_rs form (dbt aliases rewritten, bare columns qualified to
+        # `target.`), which is ALSO what merge_on_predicate consumes — so the anti-join and a delta_rs
+        # merge of the same model are keyed identically.
+        preds_dr = self._merge_predicates(
+            {"incremental_predicates": incremental_predicates}, target_cols) or []
+        on_pred = engine.merge_on_predicate(unique_key, preds_dr)
+        conds = [f't."{k}" = s."{k}"' for k in keys]
+        conds += [self._to_antijoin_aliases(p) for p in preds_dr]
+        probe = self._probe_filters(cur, name, partition_by,
+                                    engine._merge_source_keys(on_pred))
+
+        where_t = (" WHERE " + " AND ".join(probe)) if probe else ""
+        outer = ""
+        if insert_condition:
+            cond = self._rewrite_merge_aliases(insert_condition)
+            if sqlscan.has_qualifier(cond, "target"):
+                raise CompilationError(
+                    "merge_insert_condition references the target on an insert-only strategy, but an "
+                    "unmatched row has no target to read. Reference only the source."
+                )
+            # `IS TRUE`, not bare truthiness: a NULL condition must not insert, matching delta_rs's
+            # filter semantics on a clause predicate.
+            outer = f" AND ({self._to_antijoin_aliases(cond)}) IS TRUE"
+
+        tmp = engine.tmp_name("ins", path)
+        cur.execute(
+            f'CREATE OR REPLACE TEMP TABLE "{tmp}" AS '
+            f"SELECT {proj} FROM {name} s WHERE NOT EXISTS ("
+            f"SELECT 1 FROM (SELECT * FROM delta_scan('{loc_sql}', version => {vB}){where_t}) t "
+            f"WHERE {' AND '.join(conds)})" + outer
+        )
+        try:
+            if cur.sql(f'SELECT 1 FROM "{tmp}" LIMIT 1').fetchone() is None:
+                return  # nothing new — no commit, the version stays put
+            order = ""
+            if sort_by:
+                cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
+                order = " ORDER BY " + ", ".join(engine.quote_ident(c) for c in cols)
+            engine.append_if_unchanged(
+                path, cur.sql(f'SELECT * FROM "{tmp}"{order}'),
+                read_version=vB,
+                partition_by=partition_by,
+                merge_schema=merge_schema,
+                storage_options=storage_options,
+                cur=cur,
+            )
+        finally:
+            cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
+
+    @classmethod
+    def _to_antijoin_aliases(cls, expr):
+        """Map a delta_rs-form predicate's ``target.``/``source.`` qualifiers onto the ``t``/``s``
+        aliases the DuckDB anti-join uses. Quote-aware (``sqlscan``), so a qualifier spelled inside a
+        string literal is left alone."""
+        return sqlscan.rename_qualifier(sqlscan.rename_qualifier(expr, "target", "t"), "source", "s")
+
+    @staticmethod
+    def _sql_literal(v):
+        """``v`` as a DuckDB SQL literal, or None when it has no rendering we trust. Deliberately
+        narrow: a partition value is a low-cardinality key (month keys, region codes, dates), and a
+        float or binary partition is not worth round-tripping through text."""
+        import datetime as _dt
+        from decimal import Decimal as _Decimal
+
+        if isinstance(v, bool):
+            return "TRUE" if v else "FALSE"
+        if isinstance(v, int):
+            return str(v)
+        if isinstance(v, _Decimal):
+            return str(v)
+        if isinstance(v, str):
+            return "'" + v.replace("'", "''") + "'"
+        if isinstance(v, _dt.datetime):
+            return "'" + v.isoformat(sep=" ") + "'"
+        if isinstance(v, _dt.date):
+            return "'" + v.isoformat() + "'"
+        return None
+
+    @classmethod
+    def _probe_filters(cls, cur, name, partition_by, join_keys) -> list:
+        """CONSTANT filters that let the anti-join's target probe skip files at plan time.
+
+        For every column equality-joined to the source (``unique_key``, plus any
+        ``incremental_predicates`` entry like ``target.month_key = source.month_key``):
+
+        * a PARTITION column with few enough distinct source values → ``"p" IN (v1, v2, …)``, the
+          exact set, so the reader skips whole partition directories;
+        * otherwise → ``"k" >= lo AND "k" <= hi`` from the source's min/max, so the reader skips
+          files whose Delta stats put them outside the batch's key range. This is the same early
+          filter delta_rs's merge derives from source statistics — the reason a delta_rs merge of a
+          contiguous batch can be fast — reproduced here so the DuckDB probe is not left scanning the
+          whole key column.
+
+        Applied directly on the ``delta_scan`` inside the derived table (hence unqualified — no alias
+        is bound there yet), which is where the reader can push them down.
+
+        RESULT-NEUTRAL: the EXISTS body already requires ``t.k = s.k``, so a target row whose ``k`` is
+        outside the source's value set — or outside its min/max range, or NULL — could never have
+        matched any source row. A NULL source key never matches either, so no NULL arm is needed.
+        Only ever derived from a declared equality, never from ``partition_by`` alone, which would not
+        be result-neutral. Best-effort throughout: any failure logs and skips that column's filter
+        rather than breaking a valid insert."""
+        if not join_keys:
+            return []
+        parts = {str(c).strip().strip('"').lower()
+                 for c in (partition_by if isinstance(partition_by, (list, tuple))
+                           else [partition_by] if partition_by else [])}
+        out = []
+        for key in join_keys:
+            c = str(key).strip().strip('"')
+            q = '"' + c.replace('"', '""') + '"'
+            # Partition column: prefer the exact value set (an IN list beats a range, and a source
+            # that unions an old backfill with a current feed is bimodal — min/max would smear the
+            # bound across every partition in between).
+            if c.lower() in parts:
+                lits = cls._distinct_literals(cur, name, q, c)
+                if lits:
+                    out.append(f"{q} IN ({', '.join(sorted(lits))})")
+                    continue
+            rng = cls._range_literals(cur, name, q, c)
+            if rng:
+                lo, hi = rng
+                out.append(f"{q} = {lo}" if lo == hi else f"{q} >= {lo} AND {q} <= {hi}")
+        return out
+
+    @classmethod
+    def _distinct_literals(cls, cur, name, q, col):
+        """The source's DISTINCT non-null values of ``q`` as SQL literals, or None when there are too
+        many (``engine._PART_PRUNE_MAX``, the cap the delta_rs hint uses) or any value has no literal
+        rendering we trust."""
+        try:
+            rows = cur.sql(
+                f"SELECT DISTINCT {q} FROM {name} WHERE {q} IS NOT NULL "
+                f"LIMIT {engine._PART_PRUNE_MAX + 1}"
+            ).fetchall()
+        except Exception as e:  # pragma: no cover - defensive
+            engine.logger.warning(
+                f"insert probe pruning: could not collect {col!r} values ({e!r}); skipping")
+            return None
+        vals = [r[0] for r in rows]
+        if not vals or len(vals) > engine._PART_PRUNE_MAX:
+            return None
+        lits = [cls._sql_literal(v) for v in vals]
+        return None if any(l is None for l in lits) else lits
+
+    @classmethod
+    def _range_literals(cls, cur, name, q, col):
+        """``(min, max)`` of ``q`` over the source as SQL literals, or None when the column is empty,
+        all-NULL, or has no literal rendering we trust."""
+        try:
+            row = cur.sql(f"SELECT min({q}), max({q}) FROM {name}").fetchone()
+        except Exception as e:  # pragma: no cover - defensive
+            engine.logger.warning(
+                f"insert probe pruning: could not bound {col!r} ({e!r}); skipping")
+            return None
+        if not row or row[0] is None or row[1] is None:
+            return None
+        lo, hi = cls._sql_literal(row[0]), cls._sql_literal(row[1])
+        return None if lo is None or hi is None else (lo, hi)
 
     @staticmethod
     def _delete_insert_predicates(incremental_predicates) -> list:

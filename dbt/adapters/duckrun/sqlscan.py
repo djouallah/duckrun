@@ -118,6 +118,36 @@ def qualify_identifiers(expr: str, columns, prefix: str = "target") -> str:
     return _rewrite_outside_quotes(expr, cb)
 
 
+def rename_qualifier(expr: str, alias: str, new_alias: str) -> str:
+    """Rewrite every ``<alias>.`` qualifier (case-insensitive) that sits outside quotes to
+    ``<new_alias>.`` — e.g. map delta_rs's ``target.``/``source.`` onto the ``t``/``s`` aliases a
+    DuckDB anti-join uses. The rename sibling of :func:`strip_qualifier`, and quote-aware for the
+    same reason: a regex would also fire inside a string literal."""
+    if not expr:
+        return expr
+    al = alias.lower()
+
+    def cb(s: str, i: int):
+        m = _IDENT.match(s, i)
+        if not m or m.group(0).lower() != al:
+            return None
+        end = m.end()
+        if end < len(s) and s[end] == ".":  # only rename when it is actually a qualifier
+            return new_alias + ".", end + 1
+        return None
+
+    return _rewrite_outside_quotes(expr, cb)
+
+
+def has_qualifier(expr: str, alias: str) -> bool:
+    """True when ``expr`` carries an ``<alias>.`` qualifier outside quotes/comments. Used to reject
+    a predicate that references a table the caller cannot bind."""
+    if not expr:
+        return False
+    sentinel = "\x00"
+    return sentinel in rename_qualifier(expr, alias, sentinel)
+
+
 def strip_qualifier(expr: str, alias: str) -> str:
     """Remove every ``<alias>.`` qualifier (case-insensitive) that sits outside quotes — e.g. drop
     dbt's ``DBT_INTERNAL_DEST.`` so a predicate evaluates against the target table directly. The

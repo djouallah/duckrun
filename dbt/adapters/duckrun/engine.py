@@ -1847,6 +1847,41 @@ def _merge_spill_caps(max_spill_size, max_temp_directory_size, streamed_exec):
     return spill_kwargs, temp_dir_kwargs
 
 
+def assert_source_unique(data, keys: List[str]) -> None:
+    """Raise unless ``data`` (a DuckDB relation) holds at most one row per ``keys`` tuple.
+
+    THE keyed-merge cardinality rule, shared by every path that resolves a source row against a
+    target row by key: delta_rs's merge (via :func:`_merge_cardinality_guard`) and the DuckDB
+    insert-only anti-join. Spark/Snowflake/BigQuery raise on a duplicate-key source; delta_rs
+    silently produces duplicate rows, so duckrun fails loud instead. One implementation so the
+    query and the message cannot drift between the two paths.
+
+    Best-effort on the probe itself: if the guard query cannot run, warn and proceed rather than
+    failing a valid write."""
+    if not keys or not hasattr(data, "query"):
+        return
+    keycols = ", ".join('"' + k.replace('"', '""') + '"' for k in keys)
+    try:
+        dup = data.query(
+            "__merge_src",
+            f"SELECT {keycols}, count(*) AS __n FROM __merge_src "
+            f"GROUP BY {keycols} HAVING count(*) > 1 LIMIT 1",
+        ).fetchone()
+    except Exception as e:  # never let the guard ITSELF break a valid merge; surface and proceed
+        logger.warning(f"merge duplicate-key guard could not run ({e!r}); proceeding")
+        return
+    if dup is None:
+        return
+    keyval = ", ".join(f"{k}={v!r}" for k, v in zip(keys, dup[:-1]))
+    raise ValueError(
+        f"MERGE source is not unique on the join key ({', '.join(keys)}): "
+        f"{dup[-1]} rows for {keyval}. A keyed merge/insert cannot resolve duplicate "
+        f"source keys — Spark, Snowflake and BigQuery raise the same error, and delta_rs "
+        f"would silently produce duplicate rows. Deduplicate the source, e.g. "
+        f"qualify row_number() over (partition by {keycols} order by <tiebreak>) = 1."
+    )
+
+
 def _merge_cardinality_guard(data, predicate: str, clauses: List[dict], streamed_exec: bool) -> None:
     """Cardinality guard — applied to EVERY merge path (the dbt materialization and the conn.sql
     MERGE INTO handler all land here), so a keyed upsert behaves identically across them. A
@@ -1860,30 +1895,9 @@ def _merge_cardinality_guard(data, predicate: str, clauses: List[dict], streamed
         and c.get("action") in ("update", "update_all", "insert", "insert_all")
         for c in clauses
     )
-    if not has_upsert or streamed_exec or not hasattr(data, "query"):
+    if not has_upsert or streamed_exec:
         return
-    src_keys = _merge_source_keys(predicate)
-    if not src_keys:
-        return
-    keycols = ", ".join('"' + k.replace('"', '""') + '"' for k in src_keys)
-    try:
-        dup = data.query(
-            "__merge_src",
-            f"SELECT {keycols}, count(*) AS __n FROM __merge_src "
-            f"GROUP BY {keycols} HAVING count(*) > 1 LIMIT 1",
-        ).fetchone()
-    except Exception as e:  # never let the guard ITSELF break a valid merge; surface and proceed
-        logger.warning(f"merge duplicate-key guard could not run ({e!r}); proceeding")
-        dup = None
-    if dup is not None:
-        keyval = ", ".join(f"{k}={v!r}" for k, v in zip(src_keys, dup[:-1]))
-        raise ValueError(
-            f"MERGE source is not unique on the join key ({', '.join(src_keys)}): "
-            f"{dup[-1]} rows for {keyval}. A keyed merge/insert cannot resolve duplicate "
-            f"source keys — Spark, Snowflake and BigQuery raise the same error, and delta_rs "
-            f"would silently produce duplicate rows. Deduplicate the source, e.g. "
-            f"qualify row_number() over (partition by {keycols} order by <tiebreak>) = 1."
-        )
+    assert_source_unique(data, _merge_source_keys(predicate))
 
 
 def _merge_evolve_schema(path, data, storage_options, read_version: int, merge_schema: bool,

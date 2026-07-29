@@ -13,6 +13,12 @@ correctly, and lets you compare a MERGE's cost against a plain write of the same
 every release; the latest scorecard is rendered live below. Every run also appends one line to the
 [full run history](merge-benchmark-history.md).
 
+Every row here measures the raw `MERGE INTO` verb, so every one of them runs on delta-rs. Note that
+the dbt **`insert` strategy is no longer one of these** — insert-only never removes a row, so duckrun
+computes it as a DuckDB anti-join and commits a plain append instead of a MERGE (see
+[the dbt adapter guide](dbt-adapter.md#insert--insert-only-computed-in-duckdb)). The `Insert-only`
+row below is therefore the *cost you avoid* by using that strategy rather than a merge clause.
+
 <!-- MERGE:START -->
 
 ## 🔀 Incremental MERGE test — duckrun on Delta Lake (via the connection API)
