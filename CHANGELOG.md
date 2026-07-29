@@ -47,11 +47,23 @@ All notable changes to this project will be documented in this file.
   at target size the gate does not fire and the insert really does write nothing but the new rows;
   on a table of small files, expect the same compaction `append` already pays.
 
-  Falls back to delta-rs for the advanced clause surface (`merge_clauses`,
-  `merge_update_set_expressions`), which has no anti-join form — so
-  `merge_clauses={'when_not_matched': [{'action': 'insert'}]}` spells the same insert-only
-  operation on the old path if it is ever needed. `merge` is deliberately unchanged: a true
-  upsert must remove old row versions, which forces file rewrites and so can never be an append.
+  **This applies to every surface that can express the operation, not just dbt.**
+  `conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED THEN INSERT *")` is the same operation
+  written differently, so it takes the same anti-join. The routing decision lives at the shared
+  engine seam (`engine.merge_delta_clauses`, which the dbt strategies and the raw-SQL `MERGE INTO`
+  handler both already funnel through), so a dbt model and the equivalent SQL cannot execute two
+  different ways.
+
+  Falls through to delta-rs when the anti-join cannot apply: any other clause shape (a matched
+  update or delete, a by-source clause, a partial `INSERT (cols)`); `streamed_exec` /
+  `merge_streamed_exec: true`, which is an explicit request for delta-rs's streaming source
+  handling and therefore also the way to force that path; a source that is not a DuckDB relation
+  (e.g. a pyarrow Table) or a call with no cursor to build the anti-join on; and a generated
+  statement DuckDB will not bind — a MERGE `ON` predicate is DataFusion SQL and may use something
+  DuckDB does not accept, so that case logs and runs delta-rs, with nothing committed beforehand.
+
+  `merge` is deliberately unchanged: a true upsert must remove old row versions, which forces file
+  rewrites and so can never be an append.
 
 ### Changed
 - **An `insert` batch that adds nothing now writes no commit at all** — the Delta version does

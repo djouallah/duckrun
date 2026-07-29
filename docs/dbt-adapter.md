@@ -247,9 +247,16 @@ and the shared post-write maintenance will compact them once the table's byte de
 rewriting files the insert itself did not. On a table whose files are already at target size that gate
 does not fire.
 
-Need the old delta_rs path back? Spell insert-only as an explicit clause list —
-`merge_clauses={'when_not_matched': [{'action': 'insert'}]}` — which routes to delta_rs's ordered
-clause list as before.
+**The notebook API gets the same treatment.** `conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED
+THEN INSERT *")` is the same operation written differently, so it routes to the same anti-join —
+duckrun decides this at the shared engine seam, not per surface, so a dbt model and the equivalent SQL
+cannot execute two different ways. Any other clause shape (a matched update or delete, a by-source
+clause, a partial `INSERT (cols)`) still runs on delta_rs, because removing or changing a row means
+rewriting files.
+
+Need delta_rs's merge for an insert-only shape anyway? Set `merge_streamed_exec: true` (or pass
+`streamed_exec` on the connection API) — an explicit request for delta_rs's streaming source handling
+forces that path.
 
 ### `append` that reads `{{ this }}` — the automatic fence
 

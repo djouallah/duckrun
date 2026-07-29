@@ -273,8 +273,14 @@ inserting a 200k batch: **0.9s and +84 MB RSS, versus 6.7s and +8.4 GB** for the
 equivalent delta-rs merge — the memory column is why merges get OOM-killed at scale.
 One inherited caveat: the append leaves a small file per partition, so the shared
 post-write compaction may still rewrite files once the table's byte debt trips its gate
-(no different from plain `append`). (Escape hatch back to the delta-rs merge, if ever
-needed: `merge_clauses={'when_not_matched': [{'action': 'insert'}]}`.)
+(no different from plain `append`).
+
+**Same on the notebook API:** `conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED THEN
+INSERT *")` is the same operation and takes the same anti-join — duckrun routes it at the
+shared engine seam, so dbt and SQL cannot execute it two different ways. Any other clause
+shape (matched update/delete, by-source, partial insert column list) stays on delta-rs,
+because changing or removing a row means rewriting files. To force delta-rs for an
+insert-only shape anyway, set `merge_streamed_exec: true`.
 
 **Plain `append` with SQL dedup is still the cheapest of all** — it reads nothing from the
 target at all. If the model SQL already excludes rows present in
