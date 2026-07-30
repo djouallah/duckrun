@@ -14,11 +14,12 @@ Every still-failing test in the card below falls into one of three categories:
   tests that swap a model's materialization `table → view` (`TestSimpleMaterializationsDuckDB::test_base`,
   `changing_relation_type`) have no durable home to land in. Satisfying them would mean rewriting
   Delta data on a mere materialization change — deliberately not done.
-- **deliberate rejection of silently-divergent merge configs** — `merge_clauses`,
-  `merge_update_set_expressions`, and `merge_on_using_columns` are dbt-duckdb-specific and have no
-  delta-rs equivalent. duckrun raises a clear error rather than accept them and quietly run a plain
-  upsert (a silent-divergence data bug), so `test_merge_with_set_expressions`,
-  `test_merge_custom_clauses`, and `test_ducklake_valid_single_update` stay red on purpose.
+- **deliberate rejection of silently-divergent merge configs** — `merge_on_using_columns` (and a
+  clause `action: error`) are dbt-duckdb-specific with no delta-rs equivalent. duckrun raises a clear
+  error rather than accept them and quietly run something else (a silent-divergence data bug), so
+  `test_ducklake_valid_single_update` stays red on purpose. `merge_clauses` and
+  `merge_update_set_expressions` ARE translated onto delta-rs's TableMerger clause list —
+  `test_merge_custom_clauses` and `test_merge_with_set_expressions` pass.
 - **delta-rs capability limit** — `on_schema_change='sync_all_columns'` requires *dropping* columns,
   which delta-rs can't do (it's add-only), so duckrun's schema evolution is add-only; and
   `QuotingFalse` expects a hard compile error for unquoted identifiers with spaces, which DuckDB and
@@ -77,7 +78,8 @@ Every still-failing test in the card below falls into one of three categories:
 | `on_schema_change='sync_all_columns'` | ⚠️ | **add-only** — delta_rs can't drop columns |
 | `delete+insert` | ✅ | true delete+insert (duplicate-tolerant): delete the matched keys, insert every incoming row, committed as one **fenced overwrite** pinned to the version read (delta_rs has no two-commit delete+insert) |
 | `microbatch` strategy | ✅ | per-batch **atomic replaceWhere** on the `event_time` window (single Delta commit, snapshot-pinned) |
-| `merge_clauses` / `merge_update_set_expressions` / `merge_on_using_columns` | ❌ | dbt-duckdb-specific, no delta_rs equivalent — **rejected** with a clear error, never silently ignored |
+| `merge_clauses` / `merge_update_set_expressions` | ✅ | translated onto delta_rs's full TableMerger clause list, dbt-duckdb spelling for spelling (`do_nothing`, the implicit clause defaults, `mode`, `by: source`, `insert: {columns, values}`) |
+| `merge_on_using_columns` / clause `action: error` | ❌ | dbt-duckdb-specific, no delta_rs equivalent — **rejected** with a clear error, never silently ignored |
 | model contracts — column name/type/count | ✅ | enforced via dbt's `assert_columns_equivalent` preflight before the write |
 | constraints — `not null` | ✅ | pre-write guard on the staged rows; a null fails the run and leaves the prior table intact |
 | constraints — `check` / `primary_key` / `foreign_key` | ❌ | not enforceable against a `delta_scan` view; declared but not checked |

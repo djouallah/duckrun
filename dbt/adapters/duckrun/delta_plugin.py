@@ -277,10 +277,10 @@ class Plugin(BasePlugin):
         # PURE APPEND — computed as a DuckDB anti-join and committed with `add` actions only, no
         # target file rewritten. delta_rs's merge produces the same table at a cost that scales with
         # the target's partition span instead of the batch. The advanced clause surface
-        # (merge_clauses / merge_update_set_expressions) has no anti-join form, so it still routes to
-        # delta_rs — which also makes `merge_clauses: {when_not_matched: [{action: insert}]}` (the
-        # same insert-only shape, spelled as an explicit clause list) the way back to the old path if
-        # this one ever misbehaves.
+        # (merge_clauses / merge_update_set_expressions) takes the _store_merge branch below instead,
+        # but lands at the SAME engine seam — so a clause list that IS insert-only (dbt-duckdb's
+        # `merge_clauses: {when_matched: [{action: do_nothing}]}`) gets the anti-join too. The
+        # documented way back to delta_rs, for either spelling, is `merge_streamed_exec: true`.
         if (strategy == "insert"
                 and self._custom_merge_clauses(cfg, data.columns, unique_key) is None):
             self._validate_merge_config(cfg)
@@ -341,7 +341,18 @@ class Plugin(BasePlugin):
                      src_tmp) -> None:
         """The merge / insert strategies: validate config, resolve on_schema_change, tighten the
         DuckDB memory share, and dispatch to the clause-core (merge_clauses /
-        merge_update_set_expressions) or the flat-kwarg merge_delta path."""
+        merge_update_set_expressions) or the flat-kwarg merge_delta path.
+
+        ``partition_by`` / ``sort_by`` are forwarded even though a merge writes into whatever
+        partitioning the table already has: an insert-only clause list is ROUTED to the anti-join +
+        plain append inside ``engine.merge_delta_clauses``, and that append needs them for the exact
+        partition ``IN`` probe filter (``engine.probe_filters``) and the write order. They are inert on
+        the delta_rs merge branch, which never reads them.
+
+        One accepted difference from ``incremental_strategy='insert'``: this path has already called
+        ``set_merge_memory_limit``, so a routed anti-join computes under DuckDB's 0.3 merge share rather
+        than the full write share. Correct, just more spill-prone — the routing decision lives in the
+        engine, so the plugin cannot know in advance that no delta_rs pool will run."""
         # Validate the merge config shape FIRST — before any Delta access, memory tuning, or
         # write — so an invalid config fails fast and cleanly (no partial/late delta_rs
         # "Schema error" after the log has moved). Messages mirror dbt-duckdb's
@@ -383,6 +394,8 @@ class Plugin(BasePlugin):
                     max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                     streamed_exec=(False if sx is None else bool(sx)),
                     read_version=cfg.get("read_version"),
+                    partition_by=cfg.get("partition_by"),
+                    sort_by=cfg.get("sort_by"),
                     storage_options=storage_options,
                     cur=cur,
                 )
@@ -923,6 +936,112 @@ class Plugin(BasePlugin):
         return [c for c in allcols if c.lower() not in keys]
 
     @classmethod
+    def _clause_condition(cls, cond):
+        """One clause's ``condition``, normalized to a single delta_rs predicate.
+
+        dbt-duckdb accepts a string OR a list of strings, AND-ing the list (``merge.sql``: ``AND
+        ({{ condition | join(') AND (') }})``). duckrun took the string only, so a list reached
+        ``_rewrite_merge_aliases`` and stringified into garbage SQL — accept both spellings."""
+        if isinstance(cond, (list, tuple)):
+            parts = [str(p) for p in cond if p]
+            if not parts:
+                return None
+            cond = parts[0] if len(parts) == 1 else " AND ".join(f"({p})" for p in parts)
+        return cls._rewrite_merge_aliases(cond)
+
+    @staticmethod
+    def _clause_mode(c: dict) -> str:
+        """A clause's ``mode``, defaulting to dbt-duckdb's ``by_name``.
+
+        Upstream's ``by_name`` / ``by_position`` / ``star`` all mean *every column*, which delta_rs
+        expresses as ``update_all`` / ``insert_all``; only ``explicit`` names columns. (by-name vs
+        by-position is a surface spelling, not a behavior duckrun can differ on — the source is
+        projected onto the target's columns by name either way.)"""
+        return (c.get("mode") or "by_name").lower()
+
+    @classmethod
+    def _explicit_updates(cls, spec, allcols, keys) -> dict:
+        """The ``{col: expr}`` map for an explicit-mode matched UPDATE: the columns named by
+        ``include``/``exclude`` copied from source, with ``set_expressions`` overriding — the same
+        shape ``merge_update_set_expressions`` produces (dbt-duckdb ``merge.sql`` explicit mode)."""
+        updates = {col: f"source.{col}" for col in cls._explicit_cols(spec, allcols, keys)}
+        for col, expr in ((spec if isinstance(spec, dict) else {}).get("set_expressions") or {}).items():
+            updates[str(col)] = cls._rewrite_merge_aliases(expr)
+        return updates
+
+    @classmethod
+    def _insert_updates(cls, spec, allcols, keys) -> dict:
+        """The ``{col: expr}`` map for an explicit-mode not-matched INSERT.
+
+        dbt-duckdb spells this ``insert: {'columns': [...], 'values': [...]}`` (rendered as
+        ``INSERT (cols) VALUES (vals)``), so the pairs come straight from those two lists. Without
+        ``columns`` it falls back to duckrun's ``include``/``exclude`` spelling, copying each named
+        column from source."""
+        spec = spec if isinstance(spec, dict) else {}
+        cols = spec.get("columns")
+        if cols:
+            vals = spec.get("values") or []
+            if len(vals) != len(cols):
+                raise CompilationError(
+                    f"merge_clauses insert lists {len(cols)} column(s) but {len(vals)} value(s); "
+                    "they must pair up one-to-one."
+                )
+            return {str(c).strip(): cls._rewrite_merge_aliases(v) for c, v in zip(cols, vals)}
+        return {col: f"source.{col}" for col in cls._explicit_cols(spec, allcols, keys)}
+
+    @classmethod
+    def _by_source_spec(cls, c: dict, cond, allcols, keys) -> dict:
+        """One ``WHEN NOT MATCHED BY SOURCE`` clause spec — reached from duckrun's
+        ``when_not_matched_by_source`` group and from dbt-duckdb's portable ``{'by': 'source'}``
+        entry inside ``when_not_matched``."""
+        action = (c.get("action") or "").lower()
+        if action == "do_nothing":
+            return {"clause": "not_matched_by_source", "action": "do_nothing", "predicate": cond}
+        if action == "delete":
+            return {"clause": "not_matched_by_source", "action": "delete", "predicate": cond}
+        if action == "update":
+            # by-source rows have no source row, so columns can't be copied from source — only an
+            # explicit expression map makes sense. Accept `set` (duckrun) or upstream's
+            # `set_expressions`, else require one.
+            set_map = (c.get("set") or c.get("set_expressions")
+                       or (c.get("update") or {}).get("set")
+                       or (c.get("update") or {}).get("set_expressions"))
+            if not set_map:
+                raise CompilationError(
+                    "merge_clauses.when_not_matched_by_source update requires a 'set' map "
+                    "(by-source rows have no source columns to copy)")
+            return {"clause": "not_matched_by_source", "action": "update",
+                    "updates": {k: cls._rewrite_merge_aliases(v) for k, v in set_map.items()},
+                    "predicate": cond}
+        raise cls._unsupported_action("when_not_matched_by_source", action,
+                                      "'update', 'delete' or 'do_nothing'")
+
+    @staticmethod
+    def _unsupported_action(group: str, action: str, expected: str) -> CompilationError:
+        """The rejection for an action duckrun cannot run — never silently ignored.
+
+        ``error`` is a real dbt-duckdb action (it makes DuckDB raise when such a row is found); delta_rs
+        has no ERROR clause, so it is refused at compile time rather than dropped."""
+        extra = ""
+        if action == "error":
+            extra = (" dbt-duckdb's 'error' action has no delta_rs equivalent (delta_rs cannot raise "
+                     "from a merge clause), so duckrun refuses it instead of ignoring it.")
+        return CompilationError(
+            f"unsupported merge_clauses.{group} action: {action!r} (expected {expected}).{extra}")
+
+    # dbt-duckdb's IMPLICIT clause defaults (``merge.sql`` + ``merge_defaults.sql``): a merge_clauses
+    # dict that omits a key still gets that key's default clause — ``when_matched`` -> UPDATE BY NAME,
+    # ``when_not_matched`` -> INSERT BY NAME. duckrun mirrors them so a config means the same thing on
+    # both adapters; without the not-matched default, `{'when_matched': [{'action': 'do_nothing'}]}`
+    # (dbt-duckdb's insert-only spelling, issue #20) would fold to ZERO clauses instead of an insert.
+    # Upstream's defaults carry merge_update_condition / merge_insert_condition, which
+    # _validate_merge_config already REJECTS alongside merge_clauses, so the predicate is always None.
+    _CLAUSE_DEFAULTS = {
+        "when_matched": ({"action": "update", "mode": "by_name"},),
+        "when_not_matched": ({"action": "insert", "mode": "by_name"},),
+    }
+
+    @classmethod
     def _specs_from_set_expressions(cls, cfg: dict, columns, unique_key) -> list:
         """``merge_update_set_expressions``: a matched UPDATE that copies every (non-key) column from
         source, with the named columns overridden by custom SQL expressions, plus the standard
@@ -950,69 +1069,77 @@ class Plugin(BasePlugin):
 
     @classmethod
     def _specs_from_merge_clauses(cls, merge_clauses: dict, columns, unique_key) -> list:
-        """Translate a dbt-duckdb ``merge_clauses`` dict into delta_rs clause specs (applied in
-        order). ``mode: by_name`` → UPDATE/INSERT all columns; ``mode: explicit`` → the columns named
-        by ``update``/``insert`` include/exclude; ``action: delete`` → delete. ``when_matched`` →
-        update/delete, ``when_not_matched`` → insert, ``when_not_matched_by_source`` → update/delete
-        (rows the source doesn't carry — full-sync semantics)."""
+        """Translate a dbt-duckdb ``merge_clauses`` dict into delta_rs clause specs (applied in order).
+
+        Mirrors dbt-duckdb's ``merge.sql`` spelling for spelling, so one config expresses the same
+        merge on both adapters (a project targeting both should not need a per-target branch):
+        ``when_matched`` → update / delete / do_nothing, ``when_not_matched`` → insert / do_nothing
+        (plus ``by: source``, upstream's portable form of the by-source clause),
+        ``when_not_matched_by_source`` → update / delete / do_nothing (rows the source doesn't carry —
+        full-sync semantics). ``mode`` by_name / by_position / star → all columns; ``explicit`` → the
+        columns named by ``update``/``insert``.
+
+        ``do_nothing`` has no delta_rs action; it becomes a marker ``engine.resolve_do_nothing`` folds
+        away at the merge seam (first-match-wins guards on later same-kind clauses), exactly like a raw
+        SQL ``THEN DO NOTHING``. Combined with the implicit defaults below, dbt-duckdb's insert-only
+        spelling ``{'when_matched': [{'action': 'do_nothing'}]}`` resolves to a single unconditional
+        ``WHEN NOT MATCHED THEN INSERT *`` — the shape ``engine.merge_delta_clauses`` routes to the
+        cheap DuckDB anti-join + plain append (issue #20)."""
         keys = cls._key_set(unique_key)
         allcols = [str(c) for c in columns]
+        # `when_not_matched_by_source` is duckrun's own extension — dbt-duckdb's merge_clauses has no
+        # such key, so there is no upstream default to match and a full-sync clause list stays fully
+        # EXPLICIT (silently adding an implicit upsert to a CDC config would be a nasty surprise). The
+        # portable way to get the defaults AND a by-source clause is upstream's `{'by': 'source'}` entry
+        # inside when_not_matched.
+        implicit = "when_not_matched_by_source" not in merge_clauses
+
+        def group(name):
+            if name in merge_clauses:
+                return merge_clauses.get(name) or []
+            return cls._CLAUSE_DEFAULTS.get(name, ()) if implicit else ()
+
         specs = []
-        for c in merge_clauses.get("when_matched", []) or []:
+        for c in group("when_matched"):
             action = (c.get("action") or "").lower()
-            cond = cls._rewrite_merge_aliases(c.get("condition"))
-            if action == "update":
-                if (c.get("mode") or "by_name").lower() == "by_name":
+            cond = cls._clause_condition(c.get("condition"))
+            if action == "do_nothing":
+                specs.append({"clause": "matched", "action": "do_nothing", "predicate": cond})
+            elif action == "update":
+                if cls._clause_mode(c) != "explicit":
                     specs.append({"clause": "matched", "action": "update_all", "predicate": cond})
                 else:
-                    cols = cls._explicit_cols(c.get("update"), allcols, keys)
                     specs.append({"clause": "matched", "action": "update",
-                                  "updates": {col: f"source.{col}" for col in cols},
+                                  "updates": cls._explicit_updates(c.get("update"), allcols, keys),
                                   "predicate": cond})
             elif action == "delete":
                 specs.append({"clause": "matched", "action": "delete", "predicate": cond})
             else:
-                raise CompilationError(
-                    f"unsupported merge_clauses.when_matched action: {action!r} "
-                    f"(expected 'update' or 'delete')")
-        for c in merge_clauses.get("when_not_matched", []) or []:
+                raise cls._unsupported_action("when_matched", action,
+                                              "'update', 'delete' or 'do_nothing'")
+        for c in group("when_not_matched"):
             action = (c.get("action") or "").lower()
-            cond = cls._rewrite_merge_aliases(c.get("condition"))
-            if action == "insert":
-                if (c.get("mode") or "by_name").lower() == "by_name":
+            cond = cls._clause_condition(c.get("condition"))
+            # dbt-duckdb writes the by-source clause as an entry here (`WHEN NOT MATCHED BY SOURCE`);
+            # `by: target` (or no `by`) is the plain not-matched clause.
+            if str(c.get("by") or "").lower() == "source":
+                specs.append(cls._by_source_spec(c, cond, allcols, keys))
+            elif action == "do_nothing":
+                specs.append({"clause": "not_matched", "action": "do_nothing", "predicate": cond})
+            elif action == "insert":
+                if cls._clause_mode(c) != "explicit":
                     specs.append({"clause": "not_matched", "action": "insert_all", "predicate": cond})
                 else:
-                    cols = cls._explicit_cols(c.get("insert") or c.get("update"), allcols, keys)
                     specs.append({"clause": "not_matched", "action": "insert",
-                                  "updates": {col: f"source.{col}" for col in cols},
+                                  "updates": cls._insert_updates(
+                                      c.get("insert") or c.get("update"), allcols, keys),
                                   "predicate": cond})
             else:
-                raise CompilationError(
-                    f"unsupported merge_clauses.when_not_matched action: {action!r} "
-                    f"(expected 'insert')")
+                raise cls._unsupported_action("when_not_matched", action,
+                                              "'insert' or 'do_nothing'")
         for c in merge_clauses.get("when_not_matched_by_source", []) or []:
-            action = (c.get("action") or "").lower()
-            cond = cls._rewrite_merge_aliases(c.get("condition"))
-            if action == "update":
-                cols = cls._explicit_cols(c.get("update"), allcols, keys)
-                # by-source rows have no source row, so columns can't be copied from source — only an
-                # explicit expression map makes sense. Support the common case (set literals/exprs)
-                # via merge_clauses' update.set, else require it.
-                set_map = c.get("set") or (c.get("update") or {}).get("set")
-                if set_map:
-                    specs.append({"clause": "not_matched_by_source", "action": "update",
-                                  "updates": {k: cls._rewrite_merge_aliases(v) for k, v in set_map.items()},
-                                  "predicate": cond})
-                else:
-                    raise CompilationError(
-                        "merge_clauses.when_not_matched_by_source update requires a 'set' map "
-                        "(by-source rows have no source columns to copy)")
-            elif action == "delete":
-                specs.append({"clause": "not_matched_by_source", "action": "delete", "predicate": cond})
-            else:
-                raise CompilationError(
-                    f"unsupported merge_clauses.when_not_matched_by_source action: {action!r} "
-                    f"(expected 'update' or 'delete')")
+            specs.append(cls._by_source_spec(
+                c, cls._clause_condition(c.get("condition")), allcols, keys))
         return specs
 
     @staticmethod

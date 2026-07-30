@@ -295,7 +295,7 @@ _M_INSERT_COLS = re.compile(
 # an explicit {col: expr} map, so the target schema fills in the names (see _parse_insert_values_positional).
 _M_INSERT_VALUES_ONLY = re.compile(r"\s*insert\s+values\s*\((?P<vals>.+)\)\s*", re.I | re.S)
 # `THEN DO NOTHING` — a valid no-op MERGE action (DuckDB/Spark). delta_rs has no skip action, so it is
-# folded away in _resolve_do_nothing rather than handed to the TableMerger.
+# folded away in engine.resolve_do_nothing rather than handed to the TableMerger.
 _M_DO_NOTHING = re.compile(r"\s*do\s+nothing\s*", re.I)
 # A VALUES tuple the self-typing probe in _insert_values can't handle on a throwaway connection, so
 # the list must instead be replayed through a real INSERT on the live cursor (the typed-temp path):
@@ -1082,7 +1082,7 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str,
     if pred is not None and cur is not None:
         _reject_unplannable_merge_value(pred, "MERGE WHEN predicate")
     # `THEN DO NOTHING` is a valid no-op action in any clause kind. delta_rs can't express a skip, so
-    # emit a marker _resolve_do_nothing folds away before the merge reaches delta_rs.
+    # emit a marker engine.resolve_do_nothing folds away before the merge reaches delta_rs.
     if _M_DO_NOTHING.fullmatch(action):
         return {"clause": _CLAUSE_NAME[kind], "action": "do_nothing", "predicate": pred}
     if kind == "matched":
@@ -1126,32 +1126,6 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str,
     raise ValueError(
         f"unsupported WHEN NOT MATCHED BY SOURCE action (expected UPDATE SET … / DELETE / DO NOTHING): "
         f"{action!r}")
-
-
-def _resolve_do_nothing(clauses: List[dict]) -> List[dict]:
-    """Fold ``WHEN … THEN DO NOTHING`` clauses into the delta_rs surface, which has no skip action.
-
-    A DO NOTHING clause's only observable effect is first-match-wins: for rows of its kind matching its
-    predicate it does nothing AND stops any LATER clause of the SAME kind from firing on them. delta_rs
-    already does nothing when no clause matches, so we drop the DO NOTHING clause and push its predicate
-    as a ``(<pred>) IS NOT TRUE`` guard onto every later same-kind clause — an unconditional DO NOTHING
-    claims all such rows, so those later clauses are dropped outright. Same row outcome, no skip action.
-    An all-DO-NOTHING merge folds to zero clauses: a pure no-op the caller skips. ``IS NOT TRUE`` (not
-    ``NOT``) keeps NULL predicates correct — a row DO NOTHING didn't claim still reaches later clauses."""
-    for idx, c in enumerate(clauses):
-        if c.get("action") != "do_nothing" or c.get("_dead"):
-            continue
-        kind, pred = c["clause"], c.get("predicate")
-        for later in clauses[idx + 1:]:
-            if later["clause"] != kind or later.get("_dead"):
-                continue
-            if pred is None:
-                later["_dead"] = True  # unconditional skip: no row of this kind reaches a later clause
-            else:
-                guard = f"({pred}) IS NOT TRUE"
-                lp = later.get("predicate")
-                later["predicate"] = f"({lp}) AND {guard}" if lp else guard
-    return [c for c in clauses if c.get("action") != "do_nothing" and not c.get("_dead")]
 
 
 class _DeltaDML:
@@ -1829,11 +1803,8 @@ class _DeltaDML:
         clauses = [_build_merge_clause(*_split_when_clause(c), target_cols=target_cols,
                                        cur=self.cursor)
                    for c in clause_strs]
-        # DO NOTHING has no delta_rs skip action — fold it into IS-NOT-TRUE guards on later same-kind
-        # clauses. An all-DO-NOTHING merge folds to nothing: skip the write, the statement is a no-op.
-        clauses = _resolve_do_nothing(clauses)
-        if not clauses:
-            return
+        # DO NOTHING markers travel to engine.merge_delta_clauses, which folds them (and no-ops an
+        # all-DO-NOTHING merge) for every surface — see engine.resolve_do_nothing.
 
         # Evaluate the whole USING operand (including any alias) so a bare name, an aliased name, and
         # a subquery with a column-renaming alias (`(values …) t(id, name)`) all work — delta_rs

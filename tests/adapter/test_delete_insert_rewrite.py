@@ -411,6 +411,30 @@ def test_merge_strategy_still_routes_to_delta_rs(tmp_path, monkeypatch):
     assert seen == ["delta_rs"]
 
 
+def test_clause_merge_forwards_partition_by_and_sort_by(tmp_path, monkeypatch):
+    """A merge_clauses list that is insert-only (dbt-duckdb's `when_matched: do_nothing`, #20) is
+    routed to the anti-join + plain append at the engine seam, and that append needs the model's
+    `partition_by` for the exact partition IN probe filter and `sort_by` for the write order. The
+    merge path used to drop both (a merge writes into whatever partitioning exists), which made the
+    portable spelling quietly prune worse than `incremental_strategy='insert'`. They are inert on the
+    delta_rs merge branch, which never reads them."""
+    path = (tmp_path / "t").as_posix()
+    write_deltalake(path, pa.table({"id": ["1"], "a": ["x"]}), partition_by=["id"])
+    con = duckdb.connect()
+    con.execute("create view increment as select '2' as id, 'y' as a")
+
+    seen = {}
+    monkeypatch.setattr(engine, "merge_delta_clauses", lambda *a, **k: seen.update(k))
+    _store_plugin(con).store(_store_target_config(path, "increment", {
+        "incremental": True, "full_refresh": False, "dbt_believes_exists": True,
+        "incremental_strategy": "merge", "unique_key": "id",
+        "partition_by": ["id"], "sort_by": ["a"],
+        "merge_clauses": {"when_matched": [{"action": "do_nothing"}]},
+        "read_version": DeltaTable(path).version(),
+    }))
+    assert seen.get("partition_by") == ["id"] and seen.get("sort_by") == ["a"]
+
+
 def test_probe_filters_fall_back_to_a_range_over_the_value_cap(cur):
     """Past the IN-list cap the exact set stops helping, but a min/max bound still does — so the
     column degrades to a range rather than contributing nothing."""

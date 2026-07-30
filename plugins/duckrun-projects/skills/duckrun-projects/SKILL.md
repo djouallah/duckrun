@@ -333,12 +333,27 @@ don't run other writers against a microbatch table during its window.
 | `merge_clauses` / `merge_update_set_expressions` | dbt-duckdb-style custom clause list / per-column SET expressions — translated to delta-rs's full TableMerger clause list |
 | `storage_options` | per-model override |
 
-duckrun validates merge config up front and **refuses** the one option it cannot honor —
-`merge_on_using_columns` (delta-rs has no equivalent) — rather than silently running a
-plain upsert. (`merge_returning_columns` is ignored: duckrun never surfaces a returned
-relation, so it changes no table state.) If a run fails with "duckrun cannot honor these
-merge configs", that is deliberate — rewrite the model with the supported controls
-above, don't look for a bypass.
+`merge_clauses` follows **dbt-duckdb's spelling exactly**, so a project that targets both
+adapters writes the config once: `action` `update` / `delete` / `insert` / `do_nothing`,
+`mode` `by_name` / `by_position` / `star` / `explicit`, a `condition` string or list,
+`insert: {columns, values}`, `update: {include, exclude, set_expressions}`, and
+`by: source`. An omitted `when_matched` / `when_not_matched` key gets dbt-duckdb's
+implicit default (update-by-name / insert-by-name), so
+`merge_clauses={'when_matched': [{'action': 'do_nothing'}]}` means insert-only — and it
+takes the same cheap DuckDB-anti-join-plus-append route as
+`incremental_strategy='insert'`, so prefer whichever spelling reads better; they run the
+same way. duckrun also accepts a duckrun-only top-level
+`when_not_matched_by_source` group (`update` with a `set` map / `delete` / `do_nothing`)
+for full-sync deletes; because dbt-duckdb has no such key, a dict that uses it opts OUT of
+the implicit defaults — use the portable `{'by': 'source', …}` entry inside
+`when_not_matched` to get both.
+
+duckrun validates merge config up front and **refuses** what it cannot honor —
+`merge_on_using_columns` and a clause `action: error` (delta-rs has no equivalent for
+either) — rather than silently running something else. (`merge_returning_columns` is
+ignored: duckrun never surfaces a returned relation, so it changes no table state.) If a
+run fails with "duckrun cannot honor these merge configs", that is deliberate — rewrite
+the model with the supported controls above, don't look for a bypass.
 
 ## Sources
 

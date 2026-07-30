@@ -249,6 +249,22 @@ def test_insert_content(tmp_path):
     assert _rows(path) == {**_seed_rows(), 11: 110}
 
 
+def test_insert_only_merge_clauses_match_the_insert_strategy(tmp_path):
+    """#20: dbt-duckdb's portable insert-only spelling — `incremental_strategy='merge'` with
+    `merge_clauses={'when_matched': [{'action': 'do_nothing'}]}` — through two real dbt runs.
+
+    It must land the SAME rows as `incremental_strategy='insert'` (test_insert_content) and take the
+    same cheap route: the clause list folds to one unconditional WHEN NOT MATCHED THEN INSERT *, which
+    the engine seam routes to the DuckDB anti-join committed as a plain append. So the last commit is a
+    `WRITE` (add actions only), not a `MERGE` — proving a project that targets both adapters gets
+    duckrun's fast path from the portable config, with no per-target branch."""
+    wh, path = _warehouse(tmp_path, "events_insert_clauses")
+    assert _dbt(wh, "events_insert_clauses").success          # seed ids 1..10
+    assert _dbt(wh, "events_insert_clauses").success          # batch: id=1 skipped, id=11 inserted
+    assert _rows(path) == {**_seed_rows(), 11: 110}
+    assert DeltaTable(path).history(1)[0]["operation"] == "WRITE"
+
+
 def test_insert_race_is_fenced(tmp_path):
     """insert-only is a read-modify-append: duckrun anti-joins the batch against the target read at
     vB and appends only the unmatched rows, so the append must be fenced to vB — a foreign writer

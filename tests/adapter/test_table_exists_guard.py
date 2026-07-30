@@ -192,6 +192,120 @@ def test_merge_clauses_translation_full_surface():
             {"when_not_matched_by_source": [{"action": "update"}]}, cols, "id")
 
 
+def test_merge_clauses_do_nothing_is_dbt_duckdbs_insert_only():
+    """#20: dbt-duckdb spells insert-only as `when_matched: [{'action': 'do_nothing'}]` — which duckrun
+    used to REJECT, forcing a project that targets both adapters to branch the strategy on
+    target.name. It now translates to the same thing duckrun's own `incremental_strategy='insert'`
+    produces: one unconditional WHEN NOT MATCHED THEN INSERT * (the matched clause folds away, the
+    omitted when_not_matched key takes dbt-duckdb's implicit insert default) — the shape the engine
+    routes to the cheap DuckDB anti-join."""
+    cols = ["id", "name", "amount"]
+    specs = engine.resolve_do_nothing(
+        Plugin._specs_from_merge_clauses({"when_matched": [{"action": "do_nothing"}]}, cols, "id"))
+    assert specs == [{"clause": "not_matched", "action": "insert_all", "predicate": None}]
+    assert engine._insert_only_shape(specs)
+
+    # A CONDITIONAL do_nothing is first-match-wins, not a dropped clause: it gates the later
+    # same-kind clause with `IS NOT TRUE` (same fold a raw SQL `THEN DO NOTHING` gets).
+    gated = engine.resolve_do_nothing(Plugin._specs_from_merge_clauses({
+        "when_matched": [{"action": "do_nothing", "condition": "DBT_INTERNAL_SOURCE.amount < 0"},
+                         {"action": "update"}],
+    }, cols, "id"))
+    assert gated[0] == {"clause": "matched", "action": "update_all",
+                        "predicate": "(source.amount < 0) IS NOT TRUE"}
+
+    # do_nothing everywhere folds to nothing at all — a no-op merge (engine.merge_delta_clauses
+    # commits nothing rather than raising "merge has no clauses").
+    assert engine.resolve_do_nothing(Plugin._specs_from_merge_clauses(
+        {"when_matched": [{"action": "do_nothing"}],
+         "when_not_matched": [{"action": "do_nothing"}]}, cols, "id")) == []
+
+
+def test_resolve_do_nothing_does_not_mutate_the_callers_clauses():
+    """The fold runs at the shared engine seam on clause dicts the CALLER still owns (the dbt
+    translator's spec list, the raw-SQL parser's), so it must copy rather than stamp guards onto them
+    — a mutated input would leak a stale predicate into a retry."""
+    clauses = [{"clause": "matched", "action": "do_nothing", "predicate": "source.a > 0"},
+               {"clause": "matched", "action": "update_all", "predicate": None}]
+    engine.resolve_do_nothing(clauses)
+    assert clauses[1]["predicate"] is None and "_dead" not in clauses[1]
+
+
+def test_merge_clauses_applies_dbt_duckdbs_implicit_clause_defaults():
+    """dbt-duckdb's merge macro defaults an OMITTED key to that key's clause (when_matched ->
+    UPDATE BY NAME, when_not_matched -> INSERT BY NAME), so a one-key merge_clauses dict is a full
+    upsert there. duckrun mirrors it: same config, same merge on both adapters."""
+    cols = ["id", "name", "amount"]
+    for one_key in ({"when_matched": [{"action": "update"}]},
+                    {"when_not_matched": [{"action": "insert"}]}):
+        assert Plugin._specs_from_merge_clauses(one_key, cols, "id") == [
+            {"clause": "matched", "action": "update_all", "predicate": None},
+            {"clause": "not_matched", "action": "insert_all", "predicate": None},
+        ]
+
+    # EXCEPTION: when_not_matched_by_source is duckrun's own extension (dbt-duckdb's merge_clauses has
+    # no such key), so there is no upstream default to mirror and a full-sync clause list stays
+    # explicit — no implicit upsert is bolted onto a CDC config.
+    assert Plugin._specs_from_merge_clauses(
+        {"when_matched": [{"action": "delete"}], "when_not_matched_by_source": [{"action": "delete"}]},
+        cols, "id") == [
+        {"clause": "matched", "action": "delete", "predicate": None},
+        {"clause": "not_matched_by_source", "action": "delete", "predicate": None},
+    ]
+
+
+def test_merge_clauses_accepts_the_remaining_dbt_duckdb_spellings():
+    """The rest of dbt-duckdb's clause surface, which duckrun previously mistranslated in silence."""
+    cols = ["id", "name", "amount"]
+
+    # A list `condition` is AND-ed (upstream joins with `) AND (`); duckrun used to stringify the list
+    # straight into the predicate.
+    assert Plugin._specs_from_merge_clauses({"when_matched": [
+        {"action": "update", "condition": ["DBT_INTERNAL_SOURCE.amount > 0",
+                                          "DBT_INTERNAL_DEST.amount < 5"]}]}, cols, "id"
+    )[0]["predicate"] == "(source.amount > 0) AND (target.amount < 5)"
+
+    # mode star / by_position mean "every column", like by_name — not an explicit column list (which
+    # would also have cost the insert-only routing).
+    for mode in ("star", "by_position"):
+        assert Plugin._specs_from_merge_clauses(
+            {"when_not_matched": [{"action": "insert", "mode": mode}]}, cols, "id"
+        )[1] == {"clause": "not_matched", "action": "insert_all", "predicate": None}
+
+    # Explicit INSERT is spelled insert: {columns, values} upstream; duckrun read include/exclude only,
+    # so it silently inserted every non-key column and left the key NULL.
+    assert Plugin._specs_from_merge_clauses({"when_not_matched": [
+        {"action": "insert", "mode": "explicit",
+         "insert": {"columns": ["id", "name"],
+                    "values": ["DBT_INTERNAL_SOURCE.id", "upper(DBT_INTERNAL_SOURCE.name)"]}}]},
+        cols, "id")[1]["updates"] == {"id": "source.id", "name": "upper(source.name)"}
+    with pytest.raises(CompilationError, match="pair up one-to-one"):
+        Plugin._specs_from_merge_clauses({"when_not_matched": [
+            {"action": "insert", "mode": "explicit",
+             "insert": {"columns": ["id", "name"], "values": ["DBT_INTERNAL_SOURCE.id"]}}]},
+            cols, "id")
+
+    # Explicit UPDATE honors set_expressions on top of include/exclude.
+    assert Plugin._specs_from_merge_clauses({"when_matched": [
+        {"action": "update", "mode": "explicit",
+         "update": {"include": ["name"],
+                    "set_expressions": {"amount": "DBT_INTERNAL_DEST.amount + 1"}}}]},
+        cols, "id")[0]["updates"] == {"name": "source.name", "amount": "target.amount + 1"}
+
+    # `by: source` inside when_not_matched is upstream's portable spelling of duckrun's by-source
+    # group — and being portable, it still gets the implicit matched default.
+    assert Plugin._specs_from_merge_clauses(
+        {"when_not_matched": [{"by": "source", "action": "delete"}]}, cols, "id") == [
+        {"clause": "matched", "action": "update_all", "predicate": None},
+        {"clause": "not_matched_by_source", "action": "delete", "predicate": None},
+    ]
+
+    # dbt-duckdb's `error` action has no delta_rs equivalent — refused loudly, never dropped.
+    with pytest.raises(CompilationError, match="no delta_rs equivalent"):
+        Plugin._specs_from_merge_clauses(
+            {"when_matched": [{"action": "error", "error_message": "nope"}]}, cols, "id")
+
+
 def test_validate_merge_allows_supported_conditions():
     """Conditions duckrun honors as delta_rs predicates must pass validation."""
     Plugin._validate_merge_config({

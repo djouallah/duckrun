@@ -2015,6 +2015,39 @@ def probe_filters(cur, source_name, partition_by, join_keys) -> List[str]:
     return out
 
 
+def resolve_do_nothing(clauses: List[dict]) -> List[dict]:
+    """Fold ``DO NOTHING`` clauses into the delta_rs surface, which has no skip action.
+
+    A DO NOTHING clause's only observable effect is first-match-wins: for rows of its kind matching its
+    predicate it does nothing AND stops any LATER clause of the SAME kind from firing on them. delta_rs
+    already does nothing when no clause matches, so we drop the DO NOTHING clause and push its predicate
+    as a ``(<pred>) IS NOT TRUE`` guard onto every later same-kind clause — an unconditional DO NOTHING
+    claims all such rows, so those later clauses are dropped outright. Same row outcome, no skip action.
+    An all-DO-NOTHING merge folds to zero clauses: a pure no-op the caller skips. ``IS NOT TRUE`` (not
+    ``NOT``) keeps NULL predicates correct — a row DO NOTHING didn't claim still reaches later clauses.
+
+    Lives HERE, at the shared merge seam, because both surfaces that can express the action reach it:
+    a raw SQL ``WHEN … THEN DO NOTHING`` (``delta_dml._build_merge_clause``) and dbt's
+    ``merge_clauses: {when_matched: [{action: do_nothing}]}`` (``delta_plugin._specs_from_merge_clauses``)
+    — one fold, so they cannot resolve to two different merges. Non-mutating: callers keep their own
+    spec dicts (only the copies carry the guard)."""
+    out = [dict(c) for c in clauses]
+    for idx, c in enumerate(out):
+        if c.get("action") != "do_nothing" or c.get("_dead"):
+            continue
+        kind, pred = c["clause"], c.get("predicate")
+        for later in out[idx + 1:]:
+            if later["clause"] != kind or later.get("_dead"):
+                continue
+            if pred is None:
+                later["_dead"] = True  # unconditional skip: no row of this kind reaches a later clause
+            else:
+                guard = f"({pred}) IS NOT TRUE"
+                lp = later.get("predicate")
+                later["predicate"] = f"({lp}) AND {guard}" if lp else guard
+    return [c for c in out if c.get("action") != "do_nothing" and not c.get("_dead")]
+
+
 def _insert_only_shape(clauses: List[dict]) -> bool:
     """True when ``clauses`` is EXACTLY one unconditional-shape ``WHEN NOT MATCHED THEN INSERT *`` —
     the only merge shape that removes no row and is therefore expressible as a plain append.
@@ -2277,6 +2310,16 @@ def merge_delta_clauses(
         )
     if not clauses:
         raise ValueError("merge has no clauses")
+
+    # DO NOTHING has no delta_rs skip action — fold it into IS-NOT-TRUE guards on later same-kind
+    # clauses (see resolve_do_nothing). Done HERE so raw SQL and dbt's merge_clauses resolve
+    # identically, and BEFORE the cardinality guard so the guard reflects the clauses that will
+    # actually run. A merge whose every clause is DO NOTHING folds to nothing: a no-op statement (the
+    # same outcome DuckDB/Spark give), so commit nothing — the table's version does not move.
+    clauses = resolve_do_nothing(clauses)
+    if not clauses:
+        logger.info("merge: every clause is DO NOTHING; nothing to do (no commit)")
+        return
 
     _merge_cardinality_guard(data, predicate, clauses, streamed_exec)
     effective_version = _merge_evolve_schema(path, data, storage_options, read_version,

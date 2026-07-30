@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`merge_clauses` now speaks dbt-duckdb's spelling exactly, so one config runs on both adapters**
+  (#20). A project targeting duckrun *and* dbt-duckdb previously had to branch on `target.name` to
+  express insert-only, because each adapter accepted only its own spelling: duckrun's
+  `incremental_strategy='insert'` doesn't exist upstream, and upstream's
+  `merge_clauses={'when_matched': [{'action': 'do_nothing'}]}` **raised** here. Now accepted, along
+  with the rest of the clause surface that duckrun previously mistranslated in silence:
+  - `action: do_nothing` in any clause group. delta-rs has no skip action, so it folds into
+    first-match-wins `IS NOT TRUE` guards on later same-kind clauses at the shared merge seam —
+    identical to a raw SQL `WHEN … THEN DO NOTHING`. A merge whose every clause does nothing commits
+    nothing (the table's version does not move) instead of failing.
+  - dbt-duckdb's **implicit clause defaults**: an omitted `when_matched` / `when_not_matched` key
+    gets update-by-name / insert-by-name. This is what makes the insert-only spelling above land as
+    an insert rather than folding to zero clauses.
+  - `mode: by_position` / `star` (all columns, like `by_name`), a `condition` given as a **list**
+    (AND-ed, as upstream renders it — a list used to stringify into invalid SQL),
+    `insert: {columns, values}` (upstream's explicit-insert spelling — duckrun read only
+    `include`/`exclude`, so it silently inserted the non-key columns and left the key NULL),
+    `update: {…, set_expressions}`, and `by: source` as the portable form of a
+    not-matched-by-source clause.
+
+  The insert-only spelling gets duckrun's cheap path for free: the clause list folds to one
+  unconditional `WHEN NOT MATCHED THEN INSERT *`, which the engine seam already routes to the DuckDB
+  anti-join committed as a plain append. `merge_clauses` merges now also forward `partition_by` /
+  `sort_by`, so a routed insert-only merge prunes the target with the exact partition `IN` list (it
+  fell back to a min/max range before) and writes in the model's sort order. What duckrun still
+  refuses, loudly, is what delta-rs cannot express: `merge_on_using_columns` and a clause
+  `action: error`.
+
+  **Behaviour change:** because upstream's defaults now apply,
+  `merge_clauses={'when_not_matched': [{'action': 'insert'}]}` is a full **upsert** (matched rows
+  update, as dbt-duckdb has always done with that config) where duckrun previously read it as
+  insert-only. If you relied on the old reading, spell it
+  `{'when_matched': [{'action': 'do_nothing'}]}` or use `incremental_strategy='insert'`. A dict that
+  uses the duckrun-only `when_not_matched_by_source` group is unaffected — upstream has no such key,
+  so those clause lists stay fully explicit and get no implicit defaults.
+
 ### Performance
 - **`incremental_strategy='insert'` is now computed in DuckDB and committed as a plain append —
   no delta-rs MERGE, no data file rewritten.** Insert-only is the one incremental shape that

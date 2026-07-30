@@ -29,9 +29,12 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   thread-safe, so models inside one dbt invocation don't parallelize. This is **not** a limit on
   concurrent writers — separate runs / notebooks / jobs writing the same tables at once is fully
   supported and safe (every write is snapshot-pinned and fails loud on a conflict).
-- **Some dbt merge configs are rejected, on purpose.** `merge_clauses`,
-  `merge_update_set_expressions`, and `merge_on_using_columns` are dbt-duckdb-specific with no
-  delta-rs equivalent, so duckrun raises a clear error rather than silently running a plain upsert.
+- **Two dbt merge configs are rejected, on purpose.** `merge_on_using_columns` and a clause
+  `action: error` are dbt-duckdb spellings with no delta-rs equivalent (delta-rs can't join on a
+  USING column list, and can't raise from a merge clause), so duckrun raises a clear error rather
+  than silently running something else. The rest of dbt-duckdb's merge surface — `merge_clauses`
+  (including `do_nothing` and its implicit clause defaults) and `merge_update_set_expressions` — is
+  translated and honored.
 
 ## Schema & constraints
 
