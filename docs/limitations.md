@@ -3,6 +3,35 @@
 An honest, consolidated list of what duckrun doesn't do — by design, by an upstream constraint, or
 by deliberate caution. Most come with a "do this instead." Deeper detail lives in the linked pages.
 
+## Gaps vs dbt-duckdb
+
+duckrun aims to be a **drop-in for dbt-duckdb** — same DuckDB SQL, same model and config spelling —
+and [parity](parity.md) proves that against real, unmodified `type: duckdb` projects diffed
+table-for-table against dbt-duckdb as the oracle. These are the places where it is *not* the same,
+in full:
+
+| gap | what happens | why |
+|---|---|---|
+| `type: duckrun` is its own adapter type | an existing project's **profile** must say `type: duckrun`; a `type: duckdb` profile cannot be rerouted | dbt selects the adapter from `type`. The project itself needs no edit — in dbt the profile lives outside it (that's how the parity runs work, via `--profiles-dir`) |
+| `materialized='view'` | runs, but is a connection-scoped DuckDB view — nothing on storage, gone next session; swapping a model `table` ⇄ `view` isn't supported | Delta defines no view ([below](#materializations)) |
+| `materialized='external'` | **errors** — duckrun doesn't ship it | materializations dispatch by adapter name, so there's no fallback to dbt-duckdb's. Every duckrun model is already an external table, just in Delta |
+| `materialized='table_function'` | **errors** — duckrun doesn't ship it | a DuckDB table macro is catalog-only state, and duckrun's DuckDB is in-memory, so it could only ever live for the length of one run |
+| `threads` | must be `1` | the in-process delta-rs write path isn't thread-safe ([below](#dbt-incremental)) |
+| `on_schema_change='sync_all_columns'` | only *adds* columns | delta-rs can't drop columns ([below](#schema-constraints)) |
+| `merge_on_using_columns`, clause `action: error` | rejected with a clear error | no delta-rs equivalent — refusing beats silently running something else ([below](#dbt-incremental)) |
+| `merge_returning_columns` | accepted and ignored | duckrun never surfaces a returned relation, so it changes no table state |
+
+Everything else carries over: `DuckrunCredentials` subclasses dbt-duckdb's, so the whole profile
+surface (`attach`, `secrets`, `settings`, `extensions`, `plugins`, `filesystems`, `remote`, `retries`,
+`external_root`, `module_paths`, `disable_transactions`, …) is the same object, not a reimplementation.
+Seeds, snapshots, native `unit_tests:`, data tests, exposures, python models, `external_location`
+sources, and the full merge-config surface (`merge_clauses` — including `do_nothing`, the implicit
+clause defaults, `mode`, `by: source`, `insert: {columns, values}` — and
+`merge_update_set_expressions`) all behave as they do upstream. duckrun's own additions
+(`incremental_strategy='insert'`, `partition_by`, `sort_by`, `location`, `catalogs`) are a superset:
+a dbt-duckdb project never has to use them. Test-by-test detail is in
+[Conformance](conformance.md).
+
 ## Setup & versions
 
 - **Needs `duckdb >= 1.5.4`.** Older builds — including Microsoft Fabric's bundled stable runtime —
