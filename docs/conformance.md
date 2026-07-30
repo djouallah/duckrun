@@ -78,8 +78,7 @@ Every still-failing test in the card below falls into one of three categories:
 | `on_schema_change='sync_all_columns'` | ⚠️ | **add-only** — delta_rs can't drop columns |
 | `delete+insert` | ✅ | true delete+insert (duplicate-tolerant): delete the matched keys, insert every incoming row, committed as one **fenced overwrite** pinned to the version read (delta_rs has no two-commit delete+insert) |
 | `microbatch` strategy | ✅ | per-batch **atomic replaceWhere** on the `event_time` window (single Delta commit, snapshot-pinned) |
-| `merge_clauses` / `merge_update_set_expressions` | ✅ | translated onto delta_rs's full TableMerger clause list, dbt-duckdb spelling for spelling (`do_nothing`, the implicit clause defaults, `mode`, `by: source`, `insert: {columns, values}`) |
-| `merge_on_using_columns` / clause `action: error` | ❌ | dbt-duckdb-specific, no delta_rs equivalent — **rejected** with a clear error, never silently ignored |
+| `merge_clauses` / `merge_update_set_expressions` / `merge_on_using_columns` | ❌ | dbt-duckdb-specific, no delta_rs equivalent — **rejected** with a clear error, never silently ignored |
 | model contracts — column name/type/count | ✅ | enforced via dbt's `assert_columns_equivalent` preflight before the write |
 | constraints — `not null` | ✅ | pre-write guard on the staged rows; a null fails the run and leaves the prior table intact |
 | constraints — `check` / `primary_key` / `foreign_key` | ❌ | not enforceable against a `delta_scan` view; declared but not checked |
