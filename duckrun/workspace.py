@@ -11,6 +11,7 @@ rather than on the :class:`~duckrun.session.DuckSession` that ``connect()`` retu
     ws.create_warehouse("gold_dwh")                   # same, for a warehouse
     ws.deploy("etl.ipynb")                            # deploy a file artifact (a notebook)
     ws.deploy("model.bim")                            # deploy + refresh a semantic model
+    ws.deploy("model.bim", mode="direct_lake")        # ...or force its storage mode first
     ws.deploy("fabric_items")                         # deploy a whole folder of items at once
     ws.download("fabric_items")                       # the mirror: export the items to disk
 
@@ -147,6 +148,87 @@ def _is_directlake_bim(content: bytes) -> bool:
     the ids. A Direct Lake model is reframed after deploy; a DirectQuery-only one is not."""
     text = content.decode("utf-8")
     return "directLake" in text or bool(_ONELAKE_REF.search(text))
+
+
+# The two storage modes ``deploy(mode=...)`` forces a semantic model into. Pure in both directions: a
+# Direct Lake model reads Delta straight off OneLake and never mentions a SQL endpoint (and carries
+# directLakeOnly, so a query it can't serve fails rather than quietly falling back to DirectQuery); a
+# DirectQuery model reads only through the SQL endpoint, with no Direct Lake artifact left behind.
+_MODES = {"directlake": "directLake", "directquery": "directQuery"}
+_DL_EXPRESSION = "DirectLake"      # name for a synthesized OneLake shared expression
+_DL_BEHAVIOR = "directLakeOnly"    # model.directLakeBehavior — no DirectQuery fallback
+_MIN_DL_COMPAT = 1604              # directLake partitions / directLakeBehavior need 1604+
+
+# A DirectQuery partition's table read — ``dbo_fact = Source{[Schema="dbo",Item="fact"]}[Data]`` — and
+# the ``in <step>`` the query returns. A plain read returns the navigation step itself; anything else
+# transforms the table in M, which has no Direct Lake equivalent.
+_M_TABLE_READ = re.compile(
+    r'(?P<step>[^\s=,]+)\s*=\s*Source\{\[Schema="(?P<schema>[^"]+)",\s*Item="(?P<item>[^"]+)"\]\}'
+    r'\[Data\]')
+_M_RETURN = re.compile(r'\bin\s+(?P<ret>\S+)\s*$')
+
+
+def _normalize_mode(mode: str) -> str:
+    """``"direct lake"`` / ``"direct_lake"`` / ``"DirectLake"`` → the TMSL spelling ``directLake``."""
+    key = re.sub(r"[\s_-]", "", str(mode)).lower()
+    if key not in _MODES:
+        raise RemoteRunError(f"unknown mode {mode!r}; use 'direct_lake' or 'direct_query'")
+    return _MODES[key]
+
+
+def _m_text(expression) -> str:
+    """A TMSL M expression's text — TMSL writes it either as a string or as a list of lines."""
+    if isinstance(expression, list):
+        return "\n".join(str(line) for line in expression)
+    return "" if expression is None else str(expression)
+
+
+def _onelake_m(ws_id: str, item_id: str) -> List[str]:
+    """The Direct-Lake-on-OneLake shared expression: hierarchical navigation over the source item's
+    OneLake root, which is what each entity partition resolves its table against."""
+    url = f"https://onelake.dfs.fabric.microsoft.com/{ws_id}/{item_id}"
+    return ["let",
+            f'    Source = AzureStorage.DataLake("{url}", [HierarchicalNavigation=true])',
+            "in",
+            "    Source"]
+
+
+def _sql_m(server: str, database: str, schema: str, table: str) -> List[str]:
+    """A DirectQuery partition's M: the workspace SQL endpoint, then one schema-qualified table read."""
+    step = f"{schema}_{table}"
+    return ["let",
+            f'    Source = Sql.Database("{server}", "{database}"),',
+            f'    {step} = Source{{[Schema="{schema}",Item="{table}"]}}[Data]',
+            "in",
+            f"    {step}"]
+
+
+_DATA_SOURCE_TYPES = ("entity", "m", "query")   # partition sources that read a table
+
+
+def _is_data_partition(part: Dict) -> bool:
+    """Whether a partition reads a SOURCE table — so a mode switch applies to it. A calculated table
+    or a calculation group is computed in the model itself and is left alone. TMSL may omit the source
+    ``type``, in which case an ``entityName`` / ``expression`` says which it is."""
+    src = part.get("source") or {}
+    kind = src.get("type")
+    if kind is None:
+        return bool(src.get("entityName") or src.get("expression"))
+    return kind in _DATA_SOURCE_TYPES
+
+
+def _partition_table(part: Dict, table_name: str):
+    """The ``(schema, table)`` a data partition reads — off a Direct Lake entity source, or out of a
+    DirectQuery partition's M table read. ``None`` when the partition isn't a plain table read (an M
+    query that transforms the table, say): there is nothing to restate in the other mode."""
+    src = part.get("source") or {}
+    if src.get("type") == "entity" or src.get("entityName"):
+        return src.get("schemaName") or "dbo", src.get("entityName") or table_name
+    text = _m_text(src.get("expression"))
+    read, returned = _M_TABLE_READ.search(text), _M_RETURN.search(text.strip())
+    if read and returned and returned.group("ret") == read.group("step"):
+        return read.group("schema"), read.group("item")
+    return None
 
 
 def _is_pipeline_json(obj) -> bool:
@@ -343,6 +425,15 @@ class Workspace:
         have = ", ".join(sorted(lh.get("displayName", "?") for lh in self._items("lakehouses"))) or "(none)"
         raise RemoteRunError(f"lakehouse {name!r} not found in workspace {self.id}; have: {have}")
 
+    def warehouse_id(self, name: str) -> str:
+        """The warehouse id for a warehouse named ``name`` in this workspace — the warehouse sibling
+        of :meth:`lakehouse_id`; raises listing the real names if there's no match."""
+        for wh in self._items("warehouses"):
+            if wh.get("displayName") == name:
+                return wh["id"]
+        have = ", ".join(sorted(wh.get("displayName", "?") for wh in self._items("warehouses"))) or "(none)"
+        raise RemoteRunError(f"warehouse {name!r} not found in workspace {self.id}; have: {have}")
+
     def _items(self, kind: str) -> List[Dict]:
         """Every item of ``kind`` (e.g. ``"lakehouses"`` / ``"notebooks"`` / ``"semanticModels"``),
         across all result pages."""
@@ -408,7 +499,8 @@ class Workspace:
                name: Optional[str] = None, overwrite: bool = False,
                notebook: Optional[str] = None,
                warehouse: Optional[str] = None,
-               folder: Optional[str] = None) -> Union[str, Dict[str, str]]:
+               folder: Optional[str] = None,
+               mode: Optional[str] = None) -> Union[str, Dict[str, str]]:
         """Deploy a file artifact — or a whole folder of items — to the workspace.
 
         A **folder** ``source`` (the Fabric git-integration layout: one ``name.ItemType`` subfolder
@@ -442,6 +534,22 @@ class Workspace:
         Direct Lake model is refreshed after deploy; a DirectQuery-only model is NOT (nothing to
         reframe — it queries live).
 
+        ``mode`` (``"direct_lake"`` / ``"direct_query"``) forces the **storage mode** of every data
+        table in a ``.bim`` at deploy time, so one authored model ships either way — and on a folder
+        deploy, every model in the folder. Omitted (the default), the model deploys exactly as
+        authored. Both directions are pure: ``"direct_lake"`` gives each table an entity partition
+        over a single ``AzureStorage.DataLake`` expression on the source item's OneLake root and sets
+        ``directLakeBehavior`` to ``directLakeOnly`` — no SQL endpoint anywhere, and a query Direct
+        Lake can't serve fails instead of silently falling back; ``"direct_query"`` gives each table
+        an M partition over ``Sql.Database(<workspace SQL endpoint>, <item>)`` and strips the Direct
+        Lake side. The item read is the ``lakehouse`` / ``warehouse`` named here (either kind serves
+        either mode — a lakehouse has a SQL analytics endpoint, a warehouse's tables are Delta in
+        OneLake), else the one the model already reads if it lives here, else the workspace's only
+        candidate. With BOTH named — a mixed folder — each model takes the one matching what it
+        already reads: OneLake → ``lakehouse``, ``Sql.Database`` → ``warehouse``. A table that reads
+        through a real M query rather than a plain schema/table read raises, naming the table, rather
+        than deploying a model with its transformation silently dropped.
+
         ``notebook`` (a notebook name in this workspace) points a **data pipeline**'s notebook
         activities at that notebook: duckrun rewrites the ``notebookId`` / ``workspaceId`` GUIDs baked
         into the pipeline JSON to that notebook's id and this workspace — so a pipeline authored
@@ -465,7 +573,7 @@ class Workspace:
         """
         if os.path.isdir(source):
             return self._deploy_folder(source, lakehouse, variables, name, overwrite, notebook,
-                                       warehouse, folder)
+                                       warehouse, folder, mode)
         stem, ext = os.path.splitext(_basename(source))
         ext = ext.lower()
         if ext not in _DEPLOY_EXT:
@@ -478,9 +586,17 @@ class Workspace:
             endpoint = "notebooks"
         elif ext == ".bim":
             endpoint = "semanticModels"
-            directlake = _is_directlake_bim(content)                  # before ids are rewritten
-            content = self._repoint_bim(content, lakehouse, source)   # resolve before any delete
-            content = self._repoint_dq_bim(content, warehouse, source)
+            if mode is not None:
+                # The conversion resolves the source item itself and writes the final ids / endpoint,
+                # so it stands in for both repoints — and it decides the mode, so DL-ness is read off
+                # the converted bim rather than the authored one.
+                content = self._force_bim_mode(content, _normalize_mode(mode), lakehouse, warehouse,
+                                               source)
+                directlake = _is_directlake_bim(content)
+            else:
+                directlake = _is_directlake_bim(content)              # before ids are rewritten
+                content = self._repoint_bim(content, lakehouse, source)   # resolve before any delete
+                content = self._repoint_dq_bim(content, warehouse, source)
         else:                                                          # .json → pipeline or variable library
             endpoint, content = self._json_artifact(source, content, variables, notebook)
 
@@ -515,7 +631,8 @@ class Workspace:
     def _deploy_folder(self, folder: str, lakehouse: Optional[str], variables: Optional[Dict],
                        name: Optional[str], overwrite: bool, notebook: Optional[str],
                        warehouse: Optional[str] = None,
-                       ws_folder: Optional[str] = None) -> Dict[str, str]:
+                       ws_folder: Optional[str] = None,
+                       mode: Optional[str] = None) -> Dict[str, str]:
         """Deploy every Fabric item under ``folder`` in dependency order; return
         ``{displayName: item id}``. Each item recurses through the single-file ``deploy``, so the
         Direct Lake / warehouse repoints, variable injection, semantic-model refresh and
@@ -523,7 +640,9 @@ class Workspace:
         folder's sole notebook when it has a notebook activity and no explicit ``notebook=`` was
         given. ``lakehouse`` / ``warehouse`` are forwarded to each ``.bim`` only when the model
         actually carries that kind of reference — so a mixed folder (Direct Lake + DirectQuery
-        models) deploys with both named, each bim getting the rewrite that applies to it."""
+        models) deploys with both named, each bim getting the rewrite that applies to it. Under
+        ``mode`` both go through untouched instead: the conversion repoints whichever it needs, and
+        a model is about to STOP carrying the reference it was filtered on."""
         if name is not None:
             raise RemoteRunError("name= applies to a single-file deploy; folder items are named "
                                  "by their .platform displayName")
@@ -536,7 +655,8 @@ class Workspace:
             if it["type"] == "DataPipeline" and nb is None and len(notebooks) == 1 \
                     and _has_notebook_activity(it["primary"]):
                 nb = notebooks[0]
-            if it["type"] == "SemanticModel" and (lh is not None or wh is not None):
+            if it["type"] == "SemanticModel" and mode is None \
+                    and (lh is not None or wh is not None):
                 with open(it["primary"], encoding="utf-8") as f:
                     text = f.read()
                 if lh is not None and not _ONELAKE_REF.search(text):
@@ -545,7 +665,7 @@ class Workspace:
                     wh = None               # no warehouse reference — warehouse= doesn't apply
             ids[it["name"]] = self.deploy(it["primary"], lakehouse=lh, variables=variables,
                                           name=it["name"], overwrite=overwrite, notebook=nb,
-                                          warehouse=wh, folder=ws_folder)
+                                          warehouse=wh, folder=ws_folder, mode=mode)
         return ids
 
     def download(self, folder: str = ".", name: Optional[str] = None,
@@ -781,6 +901,155 @@ class Workspace:
                 return endpoint
         raise RemoteRunError(f"no SQL endpoint found in workspace {self.id} "
                              "(no warehouse or lakehouse exposes a connectionString)")
+
+    def _force_bim_mode(self, content: bytes, mode: str, lakehouse: Optional[str],
+                        warehouse: Optional[str], source: str) -> bytes:
+        """Rewrite a ``model.bim`` so every data table reads in storage ``mode`` — the conversion
+        behind ``deploy(mode=...)``, and the alternative to the two repoints (it resolves the source
+        item and writes the final ids / endpoint itself).
+
+        The rewrite is total, so a converted model keeps no trace of the mode it left: ``directLake``
+        gives every table an entity partition over one ``AzureStorage.DataLake`` expression on the
+        source item's OneLake root, ``directQuery`` an M partition over
+        ``Sql.Database(<workspace SQL endpoint>, <item>)``, and expressions belonging to the other
+        mode are dropped once nothing references them. Only plain table reads convert — a partition
+        that transforms its table in M raises, naming the table, rather than deploying a model whose
+        transformation silently vanished."""
+        bim = json.loads(content)
+        model = bim.get("model")
+        if not isinstance(model, dict):
+            raise RemoteRunError(f"{source!r} is not a TMSL model.bim (no 'model' object)")
+        tables = model.get("tables") or []
+        kind, item_name, item_id = self._mode_source_item(content.decode("utf-8"), lakehouse,
+                                                          warehouse, source)
+        if mode == "directLake":
+            expr_name = self._set_onelake_expression(model, item_id)
+        else:
+            # The SQL endpoint hostname is workspace-scoped, so a warehouse source reads it from
+            # itself and a lakehouse source from whichever item exposes one.
+            server = self.sql_endpoint(item_name if kind == "warehouses" else None)
+
+        converted = 0
+        for table in tables:
+            tname = table.get("name", "?")
+            for part in table.get("partitions") or []:
+                if not _is_data_partition(part):
+                    continue            # a calculated table / calculation group, not a data table
+                read = _partition_table(part, tname)
+                if read is None:
+                    raise RemoteRunError(
+                        f"{source!r}: table {tname!r} reads through an M query, not a plain "
+                        f"schema/table read, so duckrun can't restate it as {mode} — deploy this "
+                        "model without mode=")
+                schema, entity = read
+                part.setdefault("name", tname)
+                if mode == "directLake":
+                    part["mode"] = "directLake"
+                    part["source"] = {"type": "entity", "entityName": entity, "schemaName": schema,
+                                      "expressionSource": expr_name}
+                else:
+                    part["mode"] = "directQuery"
+                    part["source"] = {"type": "m",
+                                      "expression": _sql_m(server, item_name, schema, entity)}
+                converted += 1
+        if not converted:
+            raise RemoteRunError(f"{source!r} has no data tables to switch to {mode}")
+
+        # Shared expressions of the mode we left, now unreferenced, would otherwise leave the model
+        # naming a source it no longer reads (and a stale OneLake reference reads as Direct Lake).
+        referenced = {(p.get("source") or {}).get("expressionSource")
+                      for t in tables for p in (t.get("partitions") or [])}
+        left_behind = "AzureStorage.DataLake" if mode == "directQuery" else "Sql.Database"
+        kept = [e for e in (model.get("expressions") or [])
+                if e.get("name") in referenced or left_behind not in _m_text(e.get("expression"))]
+        if kept:
+            model["expressions"] = kept
+        else:
+            model.pop("expressions", None)
+
+        if mode == "directLake":
+            if int(bim.get("compatibilityLevel") or 0) < _MIN_DL_COMPAT:
+                bim["compatibilityLevel"] = _MIN_DL_COMPAT
+            model["defaultPowerBIDataSourceVersion"] = "powerBI_V3"
+            model["directLakeBehavior"] = _DL_BEHAVIOR
+        else:
+            model.pop("directLakeBehavior", None)
+        return json.dumps(bim, indent=2).encode("utf-8")
+
+    def _set_onelake_expression(self, model: Dict, item_id: str) -> str:
+        """Point the model's OneLake shared expression at ``item_id`` in this workspace — adding one
+        when the model has none — and return its name for the entity partitions to reference."""
+        expressions = model.setdefault("expressions", [])
+        expr = next((e for e in expressions
+                     if "AzureStorage.DataLake" in _m_text(e.get("expression"))), None)
+        if expr is None:
+            expr = {"name": _DL_EXPRESSION}
+            expressions.append(expr)
+        expr.setdefault("name", _DL_EXPRESSION)
+        expr.setdefault("kind", "m")
+        expr["expression"] = _onelake_m(self.id, item_id)
+        return expr["name"]
+
+    def _mode_source_item(self, text: str, lakehouse: Optional[str], warehouse: Optional[str],
+                          source: str):
+        """The item a ``mode=`` conversion reads from, as ``(kind, name, id)`` with ``kind`` either
+        ``"lakehouses"`` or ``"warehouses"`` — either kind serves either mode. Named explicitly wins;
+        with BOTH named the model picks (what it reads today decides the kind); unnamed, it's the item
+        the model already reads if that lives here, else the workspace's only candidate — raising
+        rather than guessing between several."""
+        if lakehouse is not None and warehouse is not None:
+            kind = self._referenced_kind(text)
+            if kind is None:
+                raise RemoteRunError(
+                    f"{source!r} reads neither OneLake nor a SQL endpoint, and both lakehouse= and "
+                    "warehouse= were given — pass just one as the model's source")
+            lakehouse, warehouse = (lakehouse, None) if kind == "lakehouses" else (None, warehouse)
+        if lakehouse is not None:
+            return "lakehouses", lakehouse, self.lakehouse_id(lakehouse)
+        if warehouse is not None:
+            return "warehouses", warehouse, self.warehouse_id(warehouse)
+
+        already = self._already_read_item(text)
+        if already is not None:
+            return already
+        candidates = [("lakehouses", it) for it in self._items("lakehouses")] \
+            + [("warehouses", it) for it in self._items("warehouses")]
+        if len(candidates) == 1:
+            kind, item = candidates[0]
+            return kind, item.get("displayName"), item["id"]
+        if not candidates:
+            raise RemoteRunError("no lakehouse or warehouse in this workspace for the model to read")
+        have = ", ".join(sorted(str(it.get("displayName")) for _, it in candidates))
+        raise RemoteRunError("which lakehouse or warehouse should the model read? pass lakehouse= "
+                            f"or warehouse=; have: {have}")
+
+    @staticmethod
+    def _referenced_kind(text: str) -> Optional[str]:
+        """Which kind of source a ``model.bim`` reads TODAY: OneLake → a lakehouse, ``Sql.Database``
+        → a warehouse. Only consulted to break a tie when both were named (a mixed folder deploy)."""
+        if _ONELAKE_REF.search(text):
+            return "lakehouses"
+        if _SQL_DATABASE_REF.search(text):
+            return "warehouses"
+        return None
+
+    def _already_read_item(self, text: str):
+        """The item a ``model.bim`` already reads — its OneLake item GUID, or the database its
+        ``Sql.Database`` names — as ``(kind, name, id)``, when that item lives in this workspace.
+        ``None`` when the model names nothing resolvable here (authored against another workspace)."""
+        m = _ONELAKE_REF.search(text)
+        if m:
+            for kind in ("lakehouses", "warehouses"):
+                for it in self._items(kind):
+                    if it.get("id") == m.group(2):
+                        return kind, it.get("displayName"), it["id"]
+        m = _SQL_DATABASE_REF.search(text)
+        if m:
+            for kind in ("warehouses", "lakehouses"):
+                for it in self._items(kind):
+                    if it.get("displayName") == m.group("db"):
+                        return kind, it.get("displayName"), it["id"]
+        return None
 
     def _repoint_dq_bim(self, content: bytes, warehouse: Optional[str], source: str) -> bytes:
         """Rewrite a DirectQuery ``model.bim``'s ``Sql.Database(server, db)`` references to this

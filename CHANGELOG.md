@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`workspace.deploy(mode=...)` picks a semantic model's storage mode at deploy time**, so one
+  authored `model.bim` ships as either Direct Lake or DirectQuery instead of being fixed by however it
+  was authored — and on a folder deploy, every model in the folder lands in that mode. `lakehouse=` /
+  `warehouse=` name the item holding the tables, `mode=` says how it's read: either kind serves either
+  mode, a lakehouse having a SQL analytics endpoint and a warehouse's tables being Delta in OneLake
+  like any other. Both directions are pure, leaving no trace of the mode they left —
+  `mode="direct_lake"` gives every table an entity partition over one `AzureStorage.DataLake`
+  expression on the item's OneLake root and sets `directLakeBehavior: directLakeOnly`, so no SQL
+  endpoint is referenced at all and a query Direct Lake can't serve fails rather than silently falling
+  back; `mode="direct_query"` gives every table an M partition over the workspace SQL endpoint and
+  strips the Direct Lake side. Omitted (the default), a model deploys exactly as authored. Calculated
+  tables and calculation groups are left alone, and a table reading through a real M query raises by
+  name rather than deploying with its transformation silently dropped. Verified end-to-end against
+  Fabric — all four source × mode combinations deploy, reframe (Direct Lake), and answer DAX
+  ([tests/deploy_testing/mode_e2e.py](tests/deploy_testing/mode_e2e.py)). `warehouse_id(name)` is now
+  public too, the warehouse sibling of `lakehouse_id`.
 - **`merge_clauses` now speaks dbt-duckdb's spelling exactly, so one config runs on both adapters**
   (#20). A project targeting duckrun *and* dbt-duckdb previously had to branch on `target.name` to
   express insert-only, because each adapter accepted only its own spelling: duckrun's

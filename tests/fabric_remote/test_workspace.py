@@ -236,6 +236,10 @@ class DeployFabric:
             if method == "GET" and url.endswith(f"/workspaces/ws-guid/warehouses/{w['id']}"):
                 return FakeResp(200, {"id": w["id"], "properties": {
                     "connectionString": "new-endpoint.datawarehouse.fabric.microsoft.com"}})
+        for lh in self.lakehouses:      # a warehouse-less workspace serves the same hostname here
+            if method == "GET" and url.endswith(f"/workspaces/ws-guid/lakehouses/{lh['id']}"):
+                return FakeResp(200, {"id": lh["id"], "properties": {"sqlEndpointProperties": {
+                    "connectionString": "new-endpoint.datawarehouse.fabric.microsoft.com"}}})
         if method == "GET" and url.endswith(f"/workspaces/ws-guid/{self.kind}"):
             return FakeResp(200, {"value": self.existing})
         if method == "POST" and url.endswith("/updateDefinition"):  # overwrite → update in place
@@ -474,6 +478,170 @@ def test_sql_endpoint_lakehouse_fallback(_patch):
 
     _patch(LhDetailFabric(lakehouses=[{"displayName": "bronze", "id": "lh-1"}]))
     assert _ws().sql_endpoint() == "new-endpoint.datawarehouse.fabric.microsoft.com"
+
+
+# --- deploy(mode=) — forcing a model's storage mode ----------------------------------------------
+
+def _entity_directlake_bim(schema="tpch", table="dim_date"):
+    """A realistic Direct-Lake-on-OneLake model.bim: entity partitions over an AzureStorage.DataLake
+    shared expression carrying the source workspace + item GUIDs."""
+    url = f"https://onelake.dfs.fabric.microsoft.com/{_SRC_WS}/{_SRC_LH}"
+    return json.dumps({"compatibilityLevel": 1604, "model": {
+        "expressions": [{"name": "DirectLake", "kind": "m", "expression": [
+            "let",
+            f'    Source = AzureStorage.DataLake("{url}", [HierarchicalNavigation=true])',
+            "in",
+            "    Source"]}],
+        "directLakeBehavior": "automatic",
+        "tables": [{"name": table, "partitions": [
+            {"name": table, "mode": "directLake", "source": {
+                "type": "entity", "entityName": table, "schemaName": schema,
+                "expressionSource": "DirectLake"}}]}]}})
+
+
+def _mode_fabric(_patch, monkeypatch, lakehouses=(), warehouses=()):
+    fake = _patch(DeployFabric(kind="semanticModels", lakehouses=list(lakehouses),
+                               warehouses=list(warehouses)))
+    monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
+    return fake
+
+
+def _partition(fake, table=0):
+    return json.loads(_deployed_bim(fake))["model"]["tables"][table]["partitions"][0]
+
+
+def test_mode_direct_lake_from_directquery_bim(_patch, monkeypatch, tmp_path):
+    # A DirectQuery-on-warehouse bim forced to Direct Lake: entity partitions over the warehouse's
+    # OneLake root, no SQL endpoint left anywhere, no fallback, and reframed after deploy.
+    fake = _mode_fabric(_patch, monkeypatch, warehouses=[{"displayName": "gold_dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="gold_dwh"))
+    _ws().deploy(src, warehouse="gold_dwh", mode="direct_lake")
+    out = _deployed_bim(fake)
+    bim = json.loads(out)
+    assert _partition(fake) == {"name": "?", "mode": "directLake", "source": {
+        "type": "entity", "entityName": "dim_date", "schemaName": "tpch",
+        "expressionSource": "DirectLake"}}
+    assert "https://onelake.dfs.fabric.microsoft.com/ws-guid/wh-1" in out   # the warehouse's OneLake
+    assert "Sql.Database" not in out and "datawarehouse.fabric.microsoft.com" not in out
+    assert bim["model"]["directLakeBehavior"] == "directLakeOnly"           # no DirectQuery fallback
+    assert bim["compatibilityLevel"] == 1604
+    assert bim["model"]["defaultPowerBIDataSourceVersion"] == "powerBI_V3"
+    assert any(m == "POST" and u.endswith("/refreshes") for m, u, _ in fake.calls)
+
+
+def test_mode_direct_query_from_directlake_bim(_patch, monkeypatch, tmp_path):
+    # The mirror: a Direct Lake bim forced to DirectQuery over a LAKEHOUSE's SQL analytics endpoint —
+    # every Direct Lake artifact gone, and nothing to reframe so no refresh.
+    fake = _mode_fabric(_patch, monkeypatch, lakehouses=[{"displayName": "silver", "id": "lh-1"}],
+                        warehouses=[{"displayName": "gold_dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _entity_directlake_bim())
+    _ws().deploy(src, lakehouse="silver", mode="direct_query")
+    out = _deployed_bim(fake)
+    bim = json.loads(out)
+    part = _partition(fake)
+    assert part["mode"] == "directQuery" and part["source"]["type"] == "m"
+    m = "\n".join(part["source"]["expression"])
+    assert 'Sql.Database("new-endpoint.datawarehouse.fabric.microsoft.com", "silver")' in m
+    assert 'Source{[Schema="tpch",Item="dim_date"]}[Data]' in m
+    assert "AzureStorage.DataLake" not in out and "onelake.dfs" not in out
+    assert "expressions" not in bim["model"]              # the OneLake expression is dropped
+    assert "directLakeBehavior" not in bim["model"]
+    assert not any(m == "POST" and u.endswith("/refreshes") for m, u, _ in fake.calls)
+
+
+def test_mode_direct_lake_repoints_onelake_item(_patch, monkeypatch, tmp_path):
+    # Already Direct Lake: the conversion still repoints the OneLake GUIDs at the named lakehouse
+    # (it stands in for the lakehouse= repoint) and normalizes the fallback behavior.
+    fake = _mode_fabric(_patch, monkeypatch, lakehouses=[{"displayName": "silver", "id": "lh-1"},
+                                                        {"displayName": "gold", "id": "lh-2"}])
+    src = _write(tmp_path, "model.bim", _entity_directlake_bim())
+    _ws().deploy(src, lakehouse="gold", mode="direct_lake")
+    out = _deployed_bim(fake)
+    assert _SRC_WS not in out and _SRC_LH not in out
+    assert "https://onelake.dfs.fabric.microsoft.com/ws-guid/lh-2" in out
+    assert json.loads(out)["model"]["directLakeBehavior"] == "directLakeOnly"
+
+
+def test_mode_direct_query_over_warehouse(_patch, monkeypatch, tmp_path):
+    fake = _mode_fabric(_patch, monkeypatch, warehouses=[{"displayName": "gold_dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="stale_dwh"))
+    _ws().deploy(src, warehouse="gold_dwh", mode="direct_query")
+    m = "\n".join(_partition(fake)["source"]["expression"])
+    assert 'Sql.Database("new-endpoint.datawarehouse.fabric.microsoft.com", "gold_dwh")' in m
+    assert "stale_dwh" not in _deployed_bim(fake)
+
+
+@pytest.mark.parametrize("spelling", ["direct_lake", "directlake", "DirectLake", "direct lake"])
+def test_mode_spelling_normalized(_patch, monkeypatch, tmp_path, spelling):
+    fake = _mode_fabric(_patch, monkeypatch, lakehouses=[{"displayName": "silver", "id": "lh-1"}])
+    src = _write(tmp_path, "model.bim", _entity_directlake_bim())
+    _ws().deploy(src, lakehouse="silver", mode=spelling)
+    assert _partition(fake)["mode"] == "directLake"
+
+
+def test_mode_unknown_raises(_patch, monkeypatch, tmp_path):
+    _mode_fabric(_patch, monkeypatch, lakehouses=[{"displayName": "silver", "id": "lh-1"}])
+    src = _write(tmp_path, "model.bim", _entity_directlake_bim())
+    with pytest.raises(fr.RemoteRunError, match="unknown mode 'import'"):
+        _ws().deploy(src, lakehouse="silver", mode="import")
+
+
+def test_mode_m_transformation_raises_naming_the_table(_patch, monkeypatch, tmp_path):
+    # An M partition that transforms its table has no Direct Lake equivalent — refuse loudly rather
+    # than deploy a model whose transformation silently vanished.
+    _mode_fabric(_patch, monkeypatch, warehouses=[{"displayName": "gold_dwh", "id": "wh-1"}])
+    expression = [
+        "let",
+        '    Source = Sql.Database("old-endpoint.datawarehouse.fabric.microsoft.com", "gold_dwh"),',
+        '    t = Source{[Schema="tpch",Item="dim_date"]}[Data],',
+        '    filtered = Table.SelectRows(t, each [y] > 2020)',
+        "in",
+        "    filtered",
+    ]
+    src = _write(tmp_path, "model.bim", json.dumps({"model": {"tables": [
+        {"name": "dim_date", "partitions": [
+            {"mode": "directQuery", "source": {"type": "m", "expression": expression}}]}]}}))
+    with pytest.raises(fr.RemoteRunError, match="table 'dim_date' reads through an M query"):
+        _ws().deploy(src, warehouse="gold_dwh", mode="direct_lake")
+
+
+def test_mode_leaves_calculated_tables_alone(_patch, monkeypatch, tmp_path):
+    # A calculated table is computed in the model, not read from the source: not a mode's business.
+    fake = _mode_fabric(_patch, monkeypatch, lakehouses=[{"displayName": "silver", "id": "lh-1"}])
+    bim = json.loads(_entity_directlake_bim())
+    bim["model"]["tables"].append({"name": "calc", "partitions": [
+        {"name": "calc", "mode": "import",
+         "source": {"type": "calculated", "expression": "ROW(\"x\", 1)"}}]})
+    src = _write(tmp_path, "model.bim", json.dumps(bim))
+    _ws().deploy(src, lakehouse="silver", mode="direct_query")
+    assert _partition(fake, 0)["mode"] == "directQuery"
+    assert _partition(fake, 1) == {"name": "calc", "mode": "import",           # untouched
+                                   "source": {"type": "calculated", "expression": 'ROW("x", 1)'}}
+
+
+def test_mode_infers_sole_item_when_neither_named(_patch, monkeypatch, tmp_path):
+    fake = _mode_fabric(_patch, monkeypatch, warehouses=[{"displayName": "only_dwh", "id": "wh-9"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="stale_dwh"))
+    _ws().deploy(src, mode="direct_lake")
+    assert "https://onelake.dfs.fabric.microsoft.com/ws-guid/wh-9" in _deployed_bim(fake)
+
+
+def test_mode_ambiguous_source_raises(_patch, monkeypatch, tmp_path):
+    # Nothing named, the model reads nothing that lives here, several candidates → ask, don't guess.
+    _mode_fabric(_patch, monkeypatch, lakehouses=[{"displayName": "silver", "id": "lh-1"}],
+                 warehouses=[{"displayName": "gold_dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="elsewhere_dwh"))
+    with pytest.raises(fr.RemoteRunError, match="which lakehouse or warehouse.*gold_dwh, silver"):
+        _ws().deploy(src, mode="direct_lake")
+
+
+def test_mode_both_named_model_picks_its_kind(_patch, monkeypatch, tmp_path):
+    # Both named (a mixed folder): a OneLake-reading model takes lakehouse=, not warehouse=.
+    fake = _mode_fabric(_patch, monkeypatch, lakehouses=[{"displayName": "silver", "id": "lh-1"}],
+                        warehouses=[{"displayName": "gold_dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _entity_directlake_bim())
+    _ws().deploy(src, lakehouse="silver", warehouse="gold_dwh", mode="direct_lake")
+    assert "https://onelake.dfs.fabric.microsoft.com/ws-guid/lh-1" in _deployed_bim(fake)
 
 
 # --- run -----------------------------------------------------------------------------------------
@@ -973,6 +1141,39 @@ def test_deploy_mixed_bim_folder_with_lakehouse_and_warehouse(_patch, monkeypatc
     assert "stale_dwh" not in deployed["dq"] and "tpch_dwh" in deployed["dq"]
     refreshes = [u for m, u, _ in fake.calls if m == "POST" and u.endswith("/refreshes")]
     assert len(refreshes) == 1                                               # DL only, DQ skipped
+
+
+def test_deploy_folder_mode_applies_to_every_bim(_patch, monkeypatch, tmp_path):
+    # mode= on a folder deploy: EVERY model in it lands in that mode — the Direct Lake one and the
+    # DirectQuery one alike — each pointed at the item it reads, and each reframed.
+    import base64 as b64
+    fake = _patch(MultiDeployFabric(warehouses=[{"displayName": "tpch_dwh", "id": "wh-1"}]))
+    monkeypatch.setattr(wsmod, "get_powerbi_token", lambda: "PBI")
+    root = tmp_path / "semantic_models"
+    root.mkdir()
+    (root / "dl.bim").write_text(_entity_directlake_bim(), encoding="utf-8")
+    (root / "dq.bim").write_text(_directquery_bim(db="tpch_dwh"), encoding="utf-8")
+    _ws().deploy(str(root), lakehouse="bronze", warehouse="tpch_dwh", overwrite=True,
+                 mode="direct_lake")
+    deployed = {}
+    for m, u, body in fake.calls:
+        if m == "POST" and u.endswith("/workspaces/ws-guid/semanticModels"):
+            parts = {p["path"]: p for p in body["definition"]["parts"]}
+            deployed[body["displayName"]] = json.loads(
+                b64.b64decode(parts["model.bim"]["payload"]).decode())
+    for bim in deployed.values():
+        assert bim["model"]["tables"][0]["partitions"][0]["mode"] == "directLake"
+        assert bim["model"]["directLakeBehavior"] == "directLakeOnly"
+    assert "/ws-guid/lh-1" in _m_lines(deployed["dl"])        # OneLake model → lakehouse=
+    assert "/ws-guid/wh-1" in _m_lines(deployed["dq"])        # Sql.Database model → warehouse=
+    refreshes = [u for m, u, _ in fake.calls if m == "POST" and u.endswith("/refreshes")]
+    assert len(refreshes) == 2                                # both are Direct Lake now
+
+
+def _m_lines(bim):
+    """The text of a bim's shared expressions (TMSL writes M as a list of lines)."""
+    return "\n".join("\n".join(e["expression"]) if isinstance(e["expression"], list)
+                     else e["expression"] for e in bim["model"]["expressions"])
 
 
 def test_deploy_loose_folder_ignores_unsupported_files(_patch, tmp_path):

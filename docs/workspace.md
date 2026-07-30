@@ -55,6 +55,38 @@ The lakehouse is **inferred** when the model already targets one that exists in 
 the workspace has exactly one; with several you must name it (otherwise `deploy` raises, listing
 them). A wrong name raises with the available names. `lakehouse=` is ignored for `.ipynb` / `.json`.
 
+**Choosing a model's storage mode at deploy time.** `mode=` forces every data table in a `.bim` into
+one storage mode, so a single authored model ships either way — and on a folder deploy, every model in
+the folder:
+
+```python
+ws.deploy("model.bim", lakehouse="silver",   mode="direct_lake")    # Delta straight off OneLake
+ws.deploy("model.bim", lakehouse="silver",   mode="direct_query")   # via the SQL analytics endpoint
+ws.deploy("model.bim", warehouse="gold_dwh", mode="direct_lake")    # a warehouse's tables are Delta too
+ws.deploy("model.bim", warehouse="gold_dwh", mode="direct_query")
+ws.deploy("fabric_items", overwrite=True, mode="direct_lake")       # every model in the folder
+```
+
+`lakehouse=` / `warehouse=` name the item holding the tables, `mode=` how it's read — either kind
+serves either mode, since a lakehouse has a SQL analytics endpoint and a warehouse's tables are Delta
+in OneLake. Omit `mode` (the default) and the model deploys exactly as authored, with only the
+repoints above.
+
+Both directions are **pure**, so a converted model keeps no trace of the mode it left.
+`direct_lake` gives each table an entity partition over one `AzureStorage.DataLake` expression on the
+item's OneLake root and sets `directLakeBehavior` to `directLakeOnly` — no SQL endpoint anywhere, and
+a query Direct Lake can't serve **fails** instead of silently falling back to DirectQuery.
+`direct_query` gives each table an M partition over `Sql.Database(<workspace SQL endpoint>, <item>)`
+and strips the Direct Lake side. Direct Lake models are refreshed (reframed) after deploy; DirectQuery
+ones aren't, having nothing to reframe.
+
+The source item is inferred the same way as the repoints — the item the model already reads if it
+lives here, else the workspace's only candidate, else you name it. With **both** named (a mixed
+folder) each model takes the one matching what it reads today: OneLake → `lakehouse=`,
+`Sql.Database` → `warehouse=`. Calculated tables and calculation groups are left alone; a table that
+reads through a real M query rather than a plain schema/table read **raises**, naming the table,
+rather than deploying a model with its transformation silently dropped.
+
 **Deploying a whole folder of items.** Point `deploy` at a **folder** in the Fabric
 git-integration layout — one `name.ItemType/` subfolder per item, each with its `.platform` file —
 and every item in it is deployed in one call:
