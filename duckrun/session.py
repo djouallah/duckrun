@@ -1175,7 +1175,13 @@ class DuckSession:
         catalogs. Aggregated columns: ``catalog, schema, table,
         total_rows, num_files, num_row_groups, avg_row_group, size_mb, vorder, compression``. Reads the
         Delta log for the active file list + size + VORDER, then the parquet footers for row-group
-        shape — so it counts only live files (tombstoned ones are excluded)."""
+        shape — so it counts only live files (tombstoned ones are excluded).
+
+        ``total_rows`` is the **logical** row count, matching ``SELECT COUNT(*)``: a parquet footer
+        still counts rows that a deletion vector has since removed, so the DV total is subtracted
+        (see :func:`engine.deleted_row_count`). ``avg_row_group`` stays **physical** — it describes
+        the parquet layout, which is what it's read for — so on a table with deletion vectors
+        ``avg_row_group * num_row_groups`` exceeds ``total_rows`` by the deleted count."""
         targets = self._resolve_stats_targets(source)
         if not targets:
             raise ValueError(
@@ -1184,7 +1190,7 @@ class DuckSession:
         parts = []
         for cat, sch, tbl in targets:
             entry = self._catalogs[cat]
-            files, size_bytes, vorder = engine.delta_file_summary(
+            files, size_bytes, vorder, deleted = engine.delta_file_summary(
                 self.con, f"{entry.root_path}/{sch}/{tbl}", entry.storage_options)
             pre = (f"'{_qlit(cat)}' AS catalog, '{_qlit(sch)}' AS schema, "
                    f"'{_qlit(tbl)}' AS \"table\"")
@@ -1200,7 +1206,7 @@ class DuckSession:
             else:
                 parts.append(
                     f"SELECT {pre}, "
-                    f"SUM(fm.num_rows) AS total_rows, COUNT(*) AS num_files, "
+                    f"SUM(fm.num_rows) - {deleted} AS total_rows, COUNT(*) AS num_files, "
                     f"SUM(fm.num_row_groups) AS num_row_groups, "
                     f"ROUND(SUM(fm.num_rows)::DOUBLE / NULLIF(SUM(fm.num_row_groups), 0), 1) AS avg_row_group, "
                     f"ROUND({size_bytes} / 1048576.0, 2) AS size_mb, {str(vorder).lower()} AS vorder, "
@@ -1220,7 +1226,10 @@ class DuckSession:
         path = f"{entry.root_path}/{sch}/{tbl}"
         dt = engine._delta_table(path, entry.storage_options)
         md = dt.metadata()
-        files, size_bytes, _ = engine.delta_file_summary(self.con, path, entry.storage_options)
+        # count_deleted=False: `describe detail` reports files/bytes, no row count, so the
+        # deletion-vector read (the only expensive part) would buy nothing.
+        files, size_bytes, _, _ = engine.delta_file_summary(
+            self.con, path, entry.storage_options, count_deleted=False)
         parts = list(md.partition_columns or [])
         part_lit = "[" + ", ".join(f"'{_qlit(p)}'" for p in parts) + "]"
         return self.con.sql(

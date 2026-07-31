@@ -896,12 +896,36 @@ def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None
     }
 
 
-def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]] = None):
-    """Active-file list (absolute paths) + total size + VORDER flag for a Delta table — the Delta-log
-    half of ``get_stats`` (the parquet footers are read separately by the caller). ``file_uris()``
-    gives the live files (tombstoned ones excluded) as DuckDB-readable paths (bare local paths /
-    ``abfss://`` URIs); size comes from the ``add_actions`` replacement-scan as :func:`delta_stats`
-    (no pyarrow). VORDER is read from the table metadata property (see below)."""
+def deleted_row_count(cur, dt) -> int:
+    """Rows tombstoned by **deletion vectors** — still physically present in the parquet files, but
+    logically gone. A parquet footer's ``num_rows`` counts them, so any row total read from the
+    footers overstates the table by exactly this much (Fabric Warehouse and Spark write DVs on
+    UPDATE/DELETE/MERGE; delta-rs does not).
+
+    Only a table whose protocol declares the ``deletionVectors`` reader feature can have any, and
+    that check is free — so tables without DVs (the overwhelming majority) pay nothing, and only
+    those that can be affected pay for materialising the selection vectors. ``deletion_vectors()``
+    yields one row per file that HAS a DV, with a keep-mask; the deleted count is the count of
+    ``false`` in it, summed through the DuckDB cursor by replacement scan (no pyarrow)."""
+    if "deletionVectors" not in (dt.protocol().reader_features or []):
+        return 0
+    deletion_vectors = dt.deletion_vectors()  # noqa: F841 - DuckDB replacement scan by name
+    return int(cur.sql(
+        "select coalesce(sum(len(selection_vector) "
+        "  - coalesce(list_aggregate(selection_vector, 'sum'), 0)), 0)::bigint "
+        "from deletion_vectors").fetchone()[0])
+
+
+def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]] = None,
+                       count_deleted: bool = True):
+    """Active-file list (absolute paths) + total size + VORDER flag + deletion-vector row count for a
+    Delta table — the Delta-log half of ``get_stats`` (the parquet footers are read separately by the
+    caller). ``file_uris()`` gives the live files (tombstoned ones excluded) as DuckDB-readable paths
+    (bare local paths / ``abfss://`` URIs); size comes from the ``add_actions`` replacement-scan as
+    :func:`delta_stats` (no pyarrow). VORDER is read from the table metadata property (see below).
+    ``deleted`` is what :func:`deleted_row_count` finds — the caller must subtract it from any row
+    count taken off the parquet footers; ``count_deleted=False`` skips that read (returning ``0``)
+    for callers that report no row count at all."""
     dt = _delta_table(path, storage_options)
     files = list(dt.file_uris())
     add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
@@ -911,7 +935,7 @@ def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]]
     # read the property off the reconstructed metadata (survives checkpointing).
     config = dt.metadata().configuration or {}
     vorder = str(config.get("delta.parquet.vorder.enabled", "")).strip().lower() == "true"
-    return files, size, vorder
+    return files, size, vorder, deleted_row_count(cur, dt) if count_deleted else 0
 
 
 def _log_ndv_cap(cur, type_str: str, qmn: str, qmx: str):

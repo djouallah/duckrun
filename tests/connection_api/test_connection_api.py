@@ -1757,6 +1757,45 @@ def test_table_num_records_reads_the_log(conn):
     assert engine.table_num_records(None, dt) is None  # no cursor -> unknown -> caller keeps 16M
 
 
+def test_deleted_row_count_gates_on_the_protocol(conn):
+    # A parquet footer counts rows a deletion vector has since removed, so get_stats has to subtract
+    # them. delta-rs REWRITES files instead of writing DVs (it declares the feature but never emits
+    # one), so a real DV table can't be built here — the two halves are pinned separately:
+    #   1. the count itself, over a stubbed selection-vector reader (`false` = deleted), and
+    #   2. the protocol gate: no `deletionVectors` reader feature → no DV read at all, which is what
+    #      keeps get_stats free for the tables that can't have any.
+    from dbt.adapters.duckrun import engine
+    cur = conn._connection
+
+    class _Dt:
+        def __init__(self, features):
+            self.features = features
+
+        def protocol(self):
+            return types.SimpleNamespace(reader_features=self.features)
+
+        def deletion_vectors(self):
+            assert self.features, "read the DVs of a table whose protocol has no deletionVectors"
+            # one row per file that HAS a DV; the mask keeps True, drops False → 3 deleted
+            return cur.sql("select [true, false, true] as selection_vector "
+                           "union all select [false, true, false, true]")
+
+    assert engine.deleted_row_count(cur, _Dt(["deletionVectors"])) == 3
+    assert engine.deleted_row_count(cur, _Dt(None)) == 0        # no reader features at all
+    assert engine.deleted_row_count(cur, _Dt(["columnMapping"])) == 0
+
+
+def test_get_stats_subtracts_deletion_vector_rows(conn, monkeypatch):
+    # ...and get_stats reports the LOGICAL row count: footer rows minus the DV total. Verified end to
+    # end against a Fabric-written table (1005 physical / 1 deleted → total_rows == COUNT(*) == 1004).
+    from dbt.adapters.duckrun import engine
+    conn.sql("CREATE OR REPLACE TABLE dv_t AS select i from range(100) t(i)")
+    rows_of = lambda: conn.get_stats("dv_t").fetchall()[0][3]  # total_rows
+    assert rows_of() == 100
+    monkeypatch.setattr(engine, "deleted_row_count", lambda cur, dt: 7)
+    assert rows_of() == 93
+
+
 def test_rg_for_clamps():
     from dbt.adapters.duckrun import engine
     assert engine.rg_for(100) == engine._RG_MIN                       # tiny → floor
