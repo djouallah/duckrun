@@ -129,6 +129,17 @@ All notable changes to this project will be documented in this file.
   heuristic that gates the plain `append` strategy.
 
 ### Fixed
+- **`get_stats` no longer overstates `total_rows` on a table with deletion vectors.** A parquet
+  footer still counts rows a DV has logically removed, so summing `parquet_file_metadata.num_rows`
+  reported the *physical* row count — a Fabric Warehouse table read as 144,349,058 rows against a
+  real 143,876,534. `total_rows` is now the logical count, matching `SELECT COUNT(*)`. The DV total
+  is read only when the table's protocol declares the `deletionVectors` reader feature, so the
+  overwhelming majority of tables (delta-rs rewrites files rather than emitting a DV) pay nothing,
+  and `describe detail`, which reports no row count, opts out. Inline (`storageType:"i"`, the bitmap
+  base85-encoded in the log JSON) and file-based DVs both work. `avg_row_group` deliberately stays
+  *physical* — it describes the parquet layout — so on a DV table `avg_row_group * num_row_groups`
+  exceeds `total_rows` by the deleted count. Verified against three Fabric-written tables; the cost
+  of the DV read is a known [limitation](docs/limitations.md#microsoft-fabric--onelake).
 - **OneLake discovery no longer claims a non-Delta directory is a table (#19).** `abfss://`
   can't be globbed, so discovery lists directory *names* over REST — and a directory holding
   parquet but no `_delta_log` (an interrupted write) was cached as an existing relation. That

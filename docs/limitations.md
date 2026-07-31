@@ -45,6 +45,16 @@ a dbt-duckdb project never has to use them. Test-by-test detail is in
   `vacuum` and other multi-file deletes fail against OneLake. This is a major reason duckrun pins
   `deltalake == 1.5.0`. See [delta-rs #4401](https://github.com/delta-io/delta-rs/issues/4401).
 
+- **`get_stats` is slow on tables with deletion vectors.** A parquet footer counts rows a DV has
+  already removed, so `total_rows` subtracts the DV total to stay equal to `SELECT COUNT(*)` — and
+  the only delta-rs API for that total, `DeltaTable.deletion_vectors()`, expands each bitmap into
+  one boolean per row. That is ~10s on a 150M-row table, to recover a number the Delta log already
+  stores verbatim as `add.deletionVector.cardinality`; `get_add_actions()` just doesn't surface it.
+  **TODO:** read the cardinality from the log instead (needs handling parquet checkpoints too), or
+  get a `cardinality` column onto `get_add_actions` upstream. Only affects tables written by Fabric
+  Warehouse / Spark — delta-rs rewrites files rather than emitting a DV, and tables whose protocol
+  doesn't declare the `deletionVectors` reader feature skip the read entirely.
+
 ## SQL DML (`conn.sql`)
 
 - **`UPDATE … FROM` and `DELETE … USING` are rejected** → rewrite as a correlated subquery.
