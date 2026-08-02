@@ -8,6 +8,7 @@ match ``database.schema.identifier`` so ``{{ this }}``, ``ref()`` and ``is_incre
 resolve, with no attach or re-attach when a table is created.
 """
 from dbt.adapters.base.meta import available
+from dbt.adapters.capability import Capability, CapabilityDict, CapabilitySupport, Support
 from dbt.adapters.contracts.connection import ConnectionState
 from dbt.adapters.events.logging import AdapterLogger
 from dbt.adapters.duckdb.connections import DuckDBConnectionManager
@@ -36,10 +37,12 @@ class DuckrunConnectionManager(DuckDBConnectionManager):
         # upgrade but skipped notebookutils.session.restartPython()). Lazy import: same wheel.
         from duckrun._runtime import check_runtime_versions
         check_runtime_versions()
-        # duckrun runs single-threaded, so it uses ONE DuckDB connection for the whole run
-        # (DuckrunEnvironment) instead of dbt-duckdb's per-handle cursors — see environment.py.
-        # Pre-seed the base class's singleton _ENV with it for the local case; remote/MotherDuck
-        # fall through to dbt-duckdb's stock environment selection in the base open().
+        # duckrun keeps dbt-duckdb's environment model unchanged — ONE DuckDB database instance per
+        # process, one child cursor per dbt thread — and only swaps in DuckrunEnvironment for the
+        # extra setup it needs (self-acquired OneLake secret, catalog ATTACHes, the DML-intercepting
+        # cursor wrapper); see environment.py. Pre-seed the base class's singleton _ENV with it for
+        # the local case; remote/MotherDuck fall through to dbt-duckdb's stock environment selection
+        # in the base open().
         base = DuckDBConnectionManager
         if connection.state != ConnectionState.OPEN:
             creds = cls.get_credentials(connection.credentials)
@@ -62,29 +65,39 @@ class DuckrunAdapter(DuckDBAdapter):
     ConnectionManager = DuckrunConnectionManager
     Credentials = DuckrunCredentials
 
+    # dbt-duckdb declares MicrobatchConcurrency=Full, but that can't hold for a Delta target.
+    # Every batch of a microbatch model writes the SAME table, so unlike two independent models
+    # they contend rather than parallelize: they serialize on the Delta log anyway, and they race
+    # to `create or replace view <model>` (the read view over HEAD) from separate DuckDB
+    # transactions — which DuckDB rejects with "Catalog write-write conflict on alter". Declaring
+    # it unimplemented makes dbt run one model's batches in order while still running *models*
+    # across threads, which is where the parallelism was ever going to come from.
+    _capabilities = CapabilityDict(
+        {
+            **DuckDBAdapter._capabilities,
+            Capability.MicrobatchConcurrency: CapabilitySupport(support=Support.NotImplemented),
+        }
+    )
+
     def __init__(self, config, mp_context):
         super().__init__(config, mp_context)
-        # duckrun's Delta write path is single-threaded: parallel models would collide on the
-        # shared DuckDB connection (Arrow stream held open across the delta_rs write). dbt sizes
-        # its run thread pool from config.threads (dbt.task.runnable), and the adapter shares
-        # that RuntimeConfig object — so pin it to 1 here, overriding whatever the profile says.
-        # `threads` is deliberately undocumented for duckrun; users never need to set it.
-        try:
-            config.threads = 1
-        except Exception:  # pragma: no cover - frozen config fallback
-            try:
-                object.__setattr__(config, "threads", 1)
-            except Exception:  # pragma: no cover
-                pass
-        # Verify the pin actually took. Leaving threads > 1 is not a degraded run — it silently
-        # corrupts data (parallel models collide on the shared connection's open Arrow stream), so
-        # fail loud rather than let it through. A failed run is strictly better than a corrupt table.
-        if getattr(config, "threads", None) != 1:
-            raise RuntimeError(
-                "duckrun could not pin the run to a single thread (config.threads is "
-                f"{getattr(config, 'threads', None)!r}). The Delta write path is not thread-safe: "
-                "parallel models would collide on the shared DuckDB connection and can corrupt "
-                "tables. Set `threads: 1` in your profile and re-run."
+        # `threads` is honored from the profile, exactly as in dbt-duckdb — dbt's own default of 1
+        # applies when the profile omits it. duckrun used to pin it to 1 because store() hands
+        # delta_rs a live Arrow stream off a DuckDB cursor and the delta plugin kept ONE cursor
+        # slot, so parallel models could stream from the same connection (which DuckDB rejects
+        # outright). The cursor is now per-thread, matching dbt-duckdb's own model of one child
+        # cursor per dbt thread, so the pin is gone.
+        #
+        # The memory shares, though, are per-process: DuckDB's memory_limit is global to the
+        # database instance and the delta_rs merge pool is a slice of the same RAM. So publish the
+        # thread count to the engine, which divides those shares and — above 1 — pins memory_limit
+        # once for the run instead of letting each model set it. See engine.set_run_threads.
+        from . import engine
+        engine.set_run_threads(getattr(config, "threads", 1))
+        if engine.RUN_THREADS > 1:
+            logger.info(
+                f"duckrun: running {engine.RUN_THREADS} threads; concurrent writers share one "
+                f"DuckDB memory_limit and the delta_rs merge pool is divided between them"
             )
 
     @available
@@ -425,12 +438,12 @@ class DuckrunAdapter(DuckDBAdapter):
                 except Exception:  # pragma: no cover - close is best-effort
                     pass
 
-        with ThreadPoolExecutor(max_workers=min(engine.POOL_WORKERS, len(pairs))) as pool:
+        with ThreadPoolExecutor(max_workers=engine.pool_workers(len(pairs))) as pool:
             list(pool.map(_work, pairs))
 
     # ------------------------------------------------------------ bulk discovery prefetch
-    # dbt populates its relation cache at task start by listing EVERY manifest schema, and
-    # duckrun pins the run to one thread (Delta write safety), so those listings run serially.
+    # dbt populates its relation cache at task start by listing EVERY manifest schema, fanned out
+    # over a pool sized by `threads` — so on the common single-threaded profile they run serially.
     # The per-schema work is remote-latency-bound (delta-rs log opens + delta_scan view binds),
     # so paying it schema-by-schema left a multi-schema project with most of issue #16's tax
     # even after the per-schema opens went concurrent. _relations_cache_for_schemas is the one

@@ -23,6 +23,7 @@ import base64
 import json
 import os
 import sys
+import threading
 import time
 from typing import Dict, Optional
 
@@ -54,6 +55,11 @@ def _sleep(seconds: float) -> None:
 # catalog, so without this the OIDC/token endpoint is hammered (and rate-limits, then a later call fails
 # and delta-rs falls back to Azure IMDS). Refreshed automatically when the cached token nears expiry.
 _TOKEN_CACHE: dict = {}
+# Guards both process caches below. dbt honors `threads`, so N models can be resolving tokens at
+# once; without this each would independently miss the cache and mint its own, which is what the
+# cache exists to prevent (and, on an OIDC endpoint, what gets rate-limited). Re-entrant because
+# _cached_token holds it across token_is_expiring(), which reaches the expiry cache below.
+_CACHE_LOCK = threading.RLock()
 
 
 def _cache_key(scope: str):
@@ -68,13 +74,17 @@ def _cached_token(scope: str, acquire):
     ``acquire`` is a zero-arg callable returning a token or None. A non-JWT token (can't read expiry)
     is cached for the process — the same lifetime the caller would otherwise re-fetch it at."""
     key = _cache_key(scope)
-    cached = _TOKEN_CACHE.get(key)
-    if cached and not token_is_expiring(cached):
-        return cached
-    token = acquire()
-    if token:
-        _TOKEN_CACHE[key] = token
-    return token
+    # Held across ``acquire()`` on purpose: concurrent models sharing a scope should wait for the
+    # first mint and reuse it, not each mint their own. A mint is seconds at worst, once per token
+    # lifetime; every call after it is a dict lookup.
+    with _CACHE_LOCK:
+        cached = _TOKEN_CACHE.get(key)
+        if cached and not token_is_expiring(cached):
+            return cached
+        token = acquire()
+        if token:
+            _TOKEN_CACHE[key] = token
+        return token
 
 
 def _fabric_token() -> Optional[str]:
@@ -276,9 +286,13 @@ def _token_expiry_epoch(token: str) -> Optional[float]:
         exp = float(json.loads(base64.urlsafe_b64decode(seg.encode())).get("exp"))
     except Exception:
         exp = None
-    if len(_EXPIRY_CACHE) >= 16:  # a session holds a handful of live tokens, not a stream
-        _EXPIRY_CACHE.clear()
-    _EXPIRY_CACHE[token] = exp
+    # The clear-then-insert is not atomic: another thread reading between the two would see a miss
+    # and re-decode (harmless), but one clearing while another inserts could drop the fresh entry
+    # and leave the cache permanently over its bound. Cheap to just lock the mutation.
+    with _CACHE_LOCK:
+        if len(_EXPIRY_CACHE) >= 16:  # a session holds a handful of live tokens, not a stream
+            _EXPIRY_CACHE.clear()
+        _EXPIRY_CACHE[token] = exp
     return exp
 
 
@@ -307,5 +321,6 @@ def refresh_storage_token() -> Optional[str]:
         # Keep the per-scope cache in sync: the next get_onelake_token() then reuses this fresh
         # token instead of finding the near-expiry one and re-acquiring on its own — two callers,
         # one notion of "current token".
-        _TOKEN_CACHE[_cache_key(_STORAGE_SCOPE)] = token
+        with _CACHE_LOCK:
+            _TOKEN_CACHE[_cache_key(_STORAGE_SCOPE)] = token
     return token

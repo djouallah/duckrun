@@ -42,8 +42,11 @@ my_project:
 
 Things that differ from other adapters:
 
-- **No `threads:` needed.** duckrun always runs single-threaded and pins it internally.
-  Don't tune it, don't document it to users.
+- **`threads:` works, with a caveat.** It's honored like any dbt adapter (default 1), but
+  concurrent models share ONE DuckDB `memory_limit` — above 1 thread duckrun pins it once
+  for the run at the tighter share and divides the delta-rs merge pool. So raise it for
+  many small, network-bound models; leave it at 1 for a single big merge. A microbatch
+  model's batches always run in order regardless (they all write one table).
 - **No database file.** DuckDB is in-memory by default; don't add a `path:` expecting
   persistence — persistence is the Delta tables.
 - Models land at `<root_path>/<schema>/<model>`; a per-model `config(location=...)`

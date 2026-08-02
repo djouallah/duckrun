@@ -504,6 +504,29 @@ _MERGE_TEMP_DIR_FRACTION = 0.8  # delta_rs merge max_temp_directory_size, as a s
 # on a shared box, drop back toward 0.8 to leave slack for other tenants growing mid-run.
 _WRITE_MEM_FRACTION = 0.85
 
+# How many dbt models can be writing at once — dbt's `threads`, published here by the adapter
+# (see set_run_threads) because the memory shares above are per-process, not per-model. 1 for the
+# connection API and for any dbt run that doesn't set `threads`, so the single-threaded behaviour
+# is byte-identical to before. Process-global like POOL_WORKERS: one dbt run per process.
+RUN_THREADS = 1
+
+
+def set_run_threads(threads) -> None:
+    """Record the run's dbt thread count. Called once by the adapter at startup."""
+    global RUN_THREADS
+    try:
+        RUN_THREADS = max(1, int(threads))
+    except (TypeError, ValueError):  # unset/odd value -> single-threaded, the safe default
+        RUN_THREADS = 1
+
+
+def pool_workers(n_items: int) -> int:
+    """Worker count for a discovery pool of ``n_items``. Divided by the run's thread count so N
+    concurrent dbt models don't multiply into N x POOL_WORKERS in-flight requests; floored at 4 so
+    a wide project still gets some concurrency per model."""
+    per_thread = POOL_WORKERS if RUN_THREADS <= 1 else max(4, POOL_WORKERS // RUN_THREADS)
+    return max(1, min(per_thread, n_items))
+
 
 def _default_merge_spill_size() -> Optional[int]:
     """delta_rs merge ``max_spill_size`` default: ~60% of the *effective* memory limit
@@ -511,11 +534,14 @@ def _default_merge_spill_size() -> Optional[int]:
     the merge spills to disk instead of being OOM-killed. None if the limit is unknown (then the
     merge runs unbounded, as it did before).
 
+    Divided by the run's thread count: the share is a slice of ONE process's memory, so N models
+    merging at once must each take 1/N of it or they sum past the cap together.
+
     Caveat: this bounds delta_rs's merge *pool*, not the whole process — the Arrow source,
     read buffers, and spill-file page cache live outside it — so on a tight container with a
     large source the total can still exceed the cap. Override with ``merge_max_spill_size``."""
     limit = _effective_mem_limit_bytes()
-    return int(limit * _MERGE_SPILL_FRACTION) if limit else None
+    return int(limit * _MERGE_SPILL_FRACTION / RUN_THREADS) if limit else None
 
 
 def _merge_spill_dir() -> str:
@@ -536,14 +562,16 @@ def _default_merge_temp_dir_size() -> Optional[int]:
     bounds bytes on disk. Sizing it to the actual disk lets a big merge spill as far as the disk allows.
 
     0.8, not all of it, because DuckDB spills to the same disk during the merge (source collection) and
-    the dbt target dir + delta_rs write staging also live there — leave ~20% slack. None if free space
-    can't be read (then delta_rs keeps its 100 GB default). Override with ``merge_max_temp_directory_size``."""
+    the dbt target dir + delta_rs write staging also live there — leave ~20% slack. Divided by the run's
+    thread count for the same reason as ``max_spill_size``: concurrent merges spill to ONE disk. None if
+    free space can't be read (then delta_rs keeps its 100 GB default). Override with
+    ``merge_max_temp_directory_size``."""
     import shutil
     try:
         free = shutil.disk_usage(_merge_spill_dir()).free
     except Exception:
         return None
-    return int(free * _MERGE_TEMP_DIR_FRACTION) or None
+    return int(free * _MERGE_TEMP_DIR_FRACTION / RUN_THREADS) or None
 
 
 # Units DuckDB emits from current_setting('memory_limit') (e.g. "25.0 GiB"). Binary (GiB) and
@@ -584,11 +612,19 @@ def configure_duckdb_session(con) -> None:
     re-parsing every footer each scan — a real win over OneLake/remote where each footer is a
     round-trip. (DuckDB's data cache — ``enable_external_file_cache`` — is already on by default.)
 
-    The DuckDB ``memory_limit`` is deliberately left ALONE here; it's set per model in ``store()``.
-    The write path clamps it to ``_WRITE_MEM_FRACTION`` of the effective limit
+    Single-threaded runs leave the DuckDB ``memory_limit`` ALONE here; it's set per model in
+    ``store()``. The write path clamps it to ``_WRITE_MEM_FRACTION`` of the effective limit
     (``set_write_memory_limit``) — DuckDB has no competing delta_rs pool there so it gets the bulk,
     but still bounded so its host-physical-RAM default can't OOM-kill a container. The merge path
-    tightens further to its 0.3 share (``set_merge_memory_limit``)."""
+    tightens further to its 0.3 share (``set_merge_memory_limit``).
+
+    At ``threads > 1`` that per-model dance is unsafe: ``memory_limit`` is GLOBAL to the DuckDB
+    *instance*, not the cursor, so N writers would each claim the whole write share, and a model
+    entering the write path would reset the limit out from under a concurrent merge. So the limit is
+    instead pinned ONCE, here, to the conservative merge share — we can't know which models will
+    overlap, and DuckDB degrades to disk spill under a tight limit rather than failing — and the two
+    per-model setters below become no-ops (see set_run_threads)."""
+    _set_shared_memory_limit(con)
     try:
         con.execute("SET preserve_insertion_order=false")
     except Exception:  # best-effort tuning: a failed SET must not abort connection setup
@@ -638,12 +674,47 @@ def read_memory_limit(con) -> Optional[str]:
         return None
 
 
+def _set_shared_memory_limit(con) -> None:
+    """Multi-threaded runs only: pin ``memory_limit`` once, at connection setup, to the merge share.
+
+    ``memory_limit`` is a GLOBAL DuckDB setting, so with concurrent writers there is no such thing as
+    "this model's limit" — the last SET wins for everyone. Rather than have models fight over it,
+    fix it up front at the tightest share any path would ask for (``_DUCKDB_MEM_FRACTION``), and let
+    ``set_write_memory_limit`` / ``set_merge_memory_limit`` stand down. Costs the write path some
+    headroom (it spills to disk sooner) in exchange for parallelism; single-threaded runs keep the
+    old per-model behaviour untouched."""
+    if RUN_THREADS <= 1:
+        return
+    limit = _effective_mem_limit_bytes()
+    if not limit:
+        return
+    target = int(limit * _DUCKDB_MEM_FRACTION)
+    current = _parse_byte_size(read_memory_limit(con))
+    if current is not None and current <= target:
+        return  # an explicit lower profile limit wins
+    try:
+        con.execute(f"SET memory_limit='{target}B'")
+        logger.info(
+            f"threads={RUN_THREADS}: DuckDB memory_limit pinned to {target / 2 ** 30:.2f} GiB "
+            f"({int(_DUCKDB_MEM_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB effective limit) "
+            f"for the whole run; concurrent writers share it"
+        )
+    except Exception:  # best-effort tuning: a failed SET leaves the prior limit, no abort
+        pass
+
+
 def set_merge_memory_limit(con) -> None:
     """Tighten DuckDB's ``memory_limit`` to its merge share (``_DUCKDB_MEM_FRACTION`` of the
     effective limit) right before a merge, so DuckDB (producing the source) and the delta_rs merge
     pool (``max_spill_size`` = ``_MERGE_SPILL_FRACTION``) fit together in one process. This is the
     *only* place the split is applied — overwrite/append never call it. Tighten-only: never raises
-    a lower current/profile limit; no-op when the effective limit is unknown."""
+    a lower current/profile limit; no-op when the effective limit is unknown.
+
+    No-op at ``threads > 1``: the limit is global to the instance and already pinned to this same
+    share once per connection (``_set_shared_memory_limit``), so re-setting it per model would only
+    race concurrent writers."""
+    if RUN_THREADS > 1:
+        return
     limit = _effective_mem_limit_bytes()
     if not limit:
         return
@@ -682,7 +753,14 @@ def set_write_memory_limit(con, baseline: Optional[str]) -> None:
 
     Set to ``min(baseline, _WRITE_MEM_FRACTION * effective)`` so an explicit lower profile limit is
     respected and the bogus host default is capped. Falls back to restoring the baseline string when
-    the effective limit is unknown; no-op when neither is known."""
+    the effective limit is unknown; no-op when neither is known.
+
+    No-op at ``threads > 1``: ``memory_limit`` is global to the DuckDB instance, so restoring the
+    write share here would raise the limit out from under a concurrent merge that had tightened it —
+    the exact OOM the split exists to prevent. Multi-threaded runs pin it once instead
+    (``_set_shared_memory_limit``)."""
+    if RUN_THREADS > 1:
+        return
     eff = _effective_mem_limit_bytes()
     target = int(eff * _WRITE_MEM_FRACTION) if eff else None
     base_bytes = _parse_byte_size(baseline)
@@ -776,7 +854,7 @@ def open_delta_tables(targets):
 
     if len(targets) <= 1:
         return [_open(t) for t in targets]
-    with ThreadPoolExecutor(max_workers=min(POOL_WORKERS, len(targets))) as pool:
+    with ThreadPoolExecutor(max_workers=pool_workers(len(targets))) as pool:
         return list(pool.map(_open, targets))
 
 

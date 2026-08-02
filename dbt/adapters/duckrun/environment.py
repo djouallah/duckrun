@@ -13,6 +13,7 @@ process. We do the same for plugin sources here: instead of registering a Python
 and no dependence on dbt-duckdb's per-cursor relation re-registration.
 """
 import os
+import threading
 
 from dbt.adapters.duckdb.environments.local import (
     DuckDBConnectionWrapper,
@@ -22,6 +23,11 @@ from dbt.adapters.duckdb.environments.local import (
 
 from . import delta_dml
 from . import secret
+
+# Serializes OneLake token refreshes across threads. Module-level rather than per-wrapper because
+# the state it protects — the shared credentials object and the instance-global DuckDB secrets —
+# is shared by every cursor, and each dbt thread gets its own wrapper.
+_CREDS_REFRESH_LOCK = threading.Lock()
 
 
 class DuckrunCursorWrapper(DuckDBCursorWrapper):
@@ -76,11 +82,19 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
 
     def _refresh_one(self, so, catalog, is_default, setter) -> None:
         root = None if is_default else (self._duckrun_creds.catalogs.get(catalog) or {}).get("root_path")
-        fresh = secret.refresh_catalog_secret(
-            self._cursor, catalog, so, is_default=is_default, root=root
-        )
-        if fresh is not so:
-            setter(fresh)  # keep the live copy DML/discovery read from in sync
+        if not secret.bearer_token(so):
+            return  # no token to refresh (local / az:// / notebook) — never touches the lock
+        # The credentials object and its DuckDB secrets are shared by every thread, and this runs on
+        # EVERY statement, so a refresh must not interleave: two threads could otherwise both
+        # re-acquire and both issue CREATE OR REPLACE SECRET against the one DuckDB instance.
+        # Contention is negligible — on the common path the lock is held just long enough to read a
+        # cached JWT expiry, and the real re-acquisition happens at most once per token lifetime.
+        with _CREDS_REFRESH_LOCK:
+            fresh = secret.refresh_catalog_secret(
+                self._cursor, catalog, so, is_default=is_default, root=root
+            )
+            if fresh is not so:
+                setter(fresh)  # keep the live copy DML/discovery read from in sync
 
 
 class DuckrunEnvironment(LocalEnvironment):
@@ -109,46 +123,57 @@ class DuckrunEnvironment(LocalEnvironment):
 
         Guarded on (connection, token) identity like ``_attach_catalogs``: ``handle()`` runs per
         statement and secrets are database-global, so re-minting an unchanged token is pure waste;
-        a rebuilt connection or a rotated token still re-mints."""
-        if self.conn is None:
-            return
-        _, so = self.creds.root_for()   # self-acquires for an abfss:// default root
-        token = secret.bearer_token(so)
-        if token and getattr(self, "_secret_conn", None) is self.conn \
-                and getattr(self, "_secret_token", None) == token:
-            return
-        if secret.ensure_azure_secret(self.conn, so):
-            self._secret_conn, self._secret_token = self.conn, token
+        a rebuilt connection or a rotated token still re-mints. The guard is a check-then-act over
+        state shared by every thread, and it mints on the SHARED connection, so it runs under the
+        environment's lock — at ``threads > 1`` dbt opens each worker's handle concurrently and they
+        would otherwise all mint at once."""
+        with self.lock:
+            if self.conn is None:
+                return
+            _, so = self.creds.root_for()   # self-acquires for an abfss:// default root
+            token = secret.bearer_token(so)
+            if token and getattr(self, "_secret_conn", None) is self.conn \
+                    and getattr(self, "_secret_token", None) == token:
+                return
+            if secret.ensure_azure_secret(self.conn, so):
+                self._secret_conn, self._secret_token = self.conn, token
 
     def _attach_catalogs(self) -> None:
         """ATTACH each declared (non-default) catalog as an in-memory DuckDB catalog and mint its
         path-scoped Azure secret, so `alias.schema.table` relations resolve and each Lakehouse's
         reads authenticate with its own token. Runs once, on the shared connection, before the first
         model/discovery — cross-catalog `ref()` needs the alias to exist up front. No-op when no
-        catalogs are declared (single-catalog behavior is unchanged)."""
+        catalogs are declared (single-catalog behavior is unchanged).
+
+        Under the environment's lock: at ``threads > 1`` every worker opens its handle concurrently,
+        and the once-only guard plus the ATTACH/CREATE SECRET DDL all target the SHARED connection."""
         catalogs = getattr(self.creds, "catalogs", None)
-        # Guard on the connection identity, not a plain flag: if the env's in-memory connection is
-        # ever rebuilt, the ATTACHes are gone with it, so we must re-attach on the new one.
-        if not catalogs or self.conn is None or getattr(self, "_attached_conn", None) is self.conn:
+        if not catalogs:
             return
-        default_db = getattr(self.creds, "database", None)
-        for alias, cfg in catalogs.items():
-            if alias == default_db:
-                continue  # the default catalog is the base connection itself
-            cfg = cfg or {}
-            try:
-                # A quoted identifier so an alias with odd characters can't break the ATTACH.
-                self.conn.execute(f'ATTACH IF NOT EXISTS \':memory:\' AS "{alias}"')
-                # Self-acquire for a token-less abfss:// catalog root (same as the default + write
-                # paths) so a pure-OIDC multi-catalog project can READ each Lakehouse, not just write.
-                secret.mint_scoped_secret(
-                    self.conn, secret.scoped_secret_name(alias), cfg.get("root_path"),
-                    secret.with_onelake_token(cfg.get("root_path"), cfg.get("storage_options")),
-                )
-            except Exception as e:  # best-effort: a bad attach shouldn't sink an otherwise-usable run
-                if os.environ.get("DUCKRUN_AUTH_DEBUG"):
-                    print(f"[duckrun] could not attach catalog {alias!r}: {e!r}", flush=True)
-        self._attached_conn = self.conn
+        with self.lock:
+            # Guard on the connection identity, not a plain flag: if the env's in-memory connection
+            # is ever rebuilt, the ATTACHes are gone with it, so we must re-attach on the new one.
+            if self.conn is None or getattr(self, "_attached_conn", None) is self.conn:
+                return
+            default_db = getattr(self.creds, "database", None)
+            for alias, cfg in catalogs.items():
+                if alias == default_db:
+                    continue  # the default catalog is the base connection itself
+                cfg = cfg or {}
+                try:
+                    # A quoted identifier so an alias with odd characters can't break the ATTACH.
+                    self.conn.execute(f'ATTACH IF NOT EXISTS \':memory:\' AS "{alias}"')
+                    # Self-acquire for a token-less abfss:// catalog root (same as the default +
+                    # write paths) so a pure-OIDC multi-catalog project can READ each Lakehouse,
+                    # not just write.
+                    secret.mint_scoped_secret(
+                        self.conn, secret.scoped_secret_name(alias), cfg.get("root_path"),
+                        secret.with_onelake_token(cfg.get("root_path"), cfg.get("storage_options")),
+                    )
+                except Exception as e:  # best-effort: a bad attach shouldn't sink a usable run
+                    if os.environ.get("DUCKRUN_AUTH_DEBUG"):
+                        print(f"[duckrun] could not attach catalog {alias!r}: {e!r}", flush=True)
+            self._attached_conn = self.conn
 
     def load_source(self, plugin_name: str, source_config):
         plugin = self._plugins.get(plugin_name)

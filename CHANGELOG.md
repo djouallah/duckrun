@@ -119,6 +119,30 @@ All notable changes to this project will be documented in this file.
   rewrites and so can never be an append.
 
 ### Changed
+- **`threads` in the profile is honored, so models in one `dbt run` build in parallel.** The
+  adapter used to overwrite `config.threads = 1` and refuse to start if that didn't take: `store()`
+  hands delta-rs a live Arrow stream off a DuckDB cursor, and the write plugin kept a single cursor
+  slot that the last-opened connection won — so two models could end up streaming from one DuckDB
+  connection, which DuckDB rejects outright. The cursor is now held per thread, matching dbt-duckdb's
+  own model of one child cursor per dbt thread, and the pin is gone; a profile with no `threads:`
+  still runs single-threaded, because that's dbt's default. Verified end-to-end at 1, 4 and 8 threads
+  across `table`, `merge`, `delete+insert`, `microbatch` and snapshots — byte-identical tables at
+  every thread count. Two consequences worth knowing before raising it:
+  - **Concurrent writers share one memory budget.** DuckDB's `memory_limit` belongs to the database,
+    not to a model, so the old per-model clamp (0.85 for a write, 0.3 for a merge) would have had
+    each writer claim the whole share and a starting write reset a running merge's tighter limit.
+    Above one thread the limit is instead fixed once for the run at the tighter share, the per-model
+    setters stand down, and the delta-rs merge pool and spill-disk budget are divided by the thread
+    count. Big writes still complete; they spill to disk sooner. One large merge is still fastest at
+    `threads: 1` — the win is many independent, network-bound models.
+  - **A microbatch model's batches run in order.** Every batch writes the same table, so they
+    serialize on the Delta log regardless, and running them concurrently only raced them to rebuild
+    the model's read view (a DuckDB catalog write-write conflict). Different *models* still run in
+    parallel.
+- **Token acquisition, secret minting and catalog `ATTACH` are serialized across threads**, so N
+  models starting at once resolve one OneLake token between them instead of each minting its own and
+  re-issuing `CREATE SECRET` against the shared DuckDB instance. The discovery pools are also sized
+  down by the thread count, so a wide project no longer multiplies into 32 × N in-flight requests.
 - **An `insert` batch that adds nothing now writes no commit at all** — the Delta version does
   not move, where a delta-rs MERGE committed a no-op version. Re-running an already-loaded
   backlog leaves no log churn. The operation recorded in history is `WRITE`, not `MERGE`.

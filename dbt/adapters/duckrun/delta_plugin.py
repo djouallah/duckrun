@@ -8,6 +8,7 @@ deltalake 1.x consumes directly, so there is no pyarrow dependency.
 """
 import os
 import re
+import threading
 from typing import Any, Optional
 
 from dbt.adapters.duckdb.plugins import BasePlugin
@@ -27,6 +28,27 @@ except Exception:  # pragma: no cover - older layouts
 class Plugin(BasePlugin):
     """Registered automatically by the duckrun adapter (alias ``duckrun``)."""
 
+    # Class-level fallbacks, replaced per instance in initialize(). They exist so a Plugin built
+    # without going through initialize() (``Plugin.__new__``) still has a cursor slot and a lock.
+    _local = threading.local()
+    _lock = threading.Lock()
+
+    @property
+    def _cursor_handle(self):
+        """The DuckDB cursor this thread is working on, or None.
+
+        PER THREAD, not per plugin: dbt instantiates the plugin ONCE per environment but gives every
+        worker thread its own cursor, and store() hands that cursor's relation to delta_rs as a live
+        Arrow stream. A single shared slot meant the last configure_cursor won, so at threads>1 two
+        models would stream from one DuckDB connection — which DuckDB rejects outright ("Attempting
+        to execute an unsuccessful or closed pending query result"). Keeping it thread-local is what
+        keeps each model's stream on the cursor that staged it."""
+        return getattr(self._local, "cursor", None)
+
+    @_cursor_handle.setter
+    def _cursor_handle(self, cursor) -> None:
+        self._local.cursor = cursor
+
     def initialize(self, config: dict) -> None:
         config = config or {}
         self._storage_options: Optional[dict] = config.get("storage_options")
@@ -36,7 +58,11 @@ class Plugin(BasePlugin):
         self._catalogs: dict = config.get("catalogs") or {}
         self._default_database = config.get("default_database")
         self._conn = None
-        self._cursor_handle = None
+        self._local = threading.local()  # backs _cursor_handle; see the property above
+        # Guards the shared mutable state below against concurrent models: _microbatch_seen's
+        # check-then-act (two threads must not both decide they're the first batch) and the token
+        # refresh's read-modify-write of _storage_options / _catalogs.
+        self._lock = threading.Lock()
         # DuckDB's memory_limit as it stood when the connection was configured (profile value,
         # or DuckDB's own default). Restored on the overwrite/append path so DuckDB manages its
         # own memory; the merge path tightens it to DuckDB's split share instead.
@@ -78,7 +104,9 @@ class Plugin(BasePlugin):
         # initialize_cursor) and runs that model's pre-hooks / staged-model DDL on it.
         # DuckDB session state (e.g. SET VARIABLE used by getvariable()/read_csv()) is
         # cursor-local, so store()/load() MUST read on this same cursor — not a new child
-        # of the shared connection — or the variables/relations won't be visible.
+        # of the shared connection — or the variables/relations won't be visible. dbt resolves each
+        # thread's handle on that thread, so this lands in that thread's slot (see _cursor_handle)
+        # and store() on the same thread reads it back.
         self._cursor_handle = cursor
         # OneLake token refresh. A run longer than the bearer token's ~1h life would 401 mid-build
         # (the token is captured once at connection-open). dbt calls this once per model, so it's the
@@ -106,9 +134,15 @@ class Plugin(BasePlugin):
         if not secret.bearer_token(so):
             return
         fresh = secret.refreshed(so)
-        if fresh is so:  # token still valid (the common path)
+        if fresh is so:  # token still valid (the common path — stays lock-free)
             return
-        setter(fresh)  # token was actually re-acquired — keep the live copy in sync
+        # Only the genuine re-acquisition takes the lock: the setter rewrites plugin-wide state and
+        # re-mints an instance-global DuckDB secret, neither of which tolerates two threads at once.
+        with self._lock:
+            setter(fresh)  # token was actually re-acquired — keep the live copy in sync
+            self._mint_refreshed_secret(cursor, fresh, catalog, is_default)
+
+    def _mint_refreshed_secret(self, cursor, fresh, catalog, is_default) -> None:
         try:
             if is_default:
                 secret.ensure_azure_secret(cursor, fresh)
@@ -122,10 +156,20 @@ class Plugin(BasePlugin):
                 print(f"[duckrun-auth] configure_cursor: re-mint failed for {catalog!r}: {e!r}", flush=True)
 
     def _cursor(self):
-        # Prefer the live per-model cursor (shares the session where pre-hook variables and
-        # the staged relation were created); fall back to the shared connection.
-        if self._cursor_handle is not None:
-            return self._cursor_handle
+        # Prefer THIS THREAD's live per-model cursor (shares the session where pre-hook variables
+        # and the staged relation were created); fall back to the shared connection.
+        cursor = self._cursor_handle
+        if cursor is not None:
+            return cursor
+        if engine.RUN_THREADS > 1:
+            # The fallback below would hand this model a cursor that can't see its staged relation
+            # or its pre-hook variables, and — worse under concurrency — a second thread streaming
+            # off the shared connection. Fail loud instead: silence here is a corrupt/failed write.
+            raise RuntimeError(
+                "duckrun: no DuckDB cursor was configured on this thread, but the run is "
+                f"multi-threaded (threads={engine.RUN_THREADS}). Re-run with `threads: 1` and "
+                "report this — the write path cannot safely share a cursor across threads."
+            )
         if self._conn is None:
             raise RuntimeError(
                 "duckrun delta plugin has no DuckDB connection; "
@@ -496,12 +540,18 @@ class Plugin(BasePlugin):
         # First batch of a --full-refresh run truncates; later batches (and every batch of a
         # normal run) append into the window. A brand-new table is just created.
         invocation = cfg.get("invocation_id")
-        # Only the current run's batches matter; drop bookkeeping from earlier invocations so this
-        # set can't grow unbounded in a long-lived process (a notebook / runner doing many runs).
-        self._microbatch_seen = {k for k in self._microbatch_seen if k[0] == invocation}
-        seen_key = (invocation, path)
-        first_batch = seen_key not in self._microbatch_seen
-        self._microbatch_seen.add(seen_key)
+        # Locked: dbt fans a microbatch model's batches across the SAME pool it sizes from `threads`,
+        # so at threads>1 two batches hit this concurrently. Unguarded, both would read an empty set,
+        # both would call themselves the first batch, and both would overwrite — silently dropping a
+        # batch on --full-refresh. Prune, test and add must be one critical section.
+        with self._lock:
+            # Only the current run's batches matter; drop bookkeeping from earlier invocations so
+            # this set can't grow unbounded in a long-lived process (a notebook / runner doing many
+            # runs).
+            self._microbatch_seen = {k for k in self._microbatch_seen if k[0] == invocation}
+            seen_key = (invocation, path)
+            first_batch = seen_key not in self._microbatch_seen
+            self._microbatch_seen.add(seen_key)
 
         partition_by = cfg.get("partition_by")
         if not exists or (full_refresh and first_batch):

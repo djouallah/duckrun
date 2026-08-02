@@ -16,7 +16,7 @@ in full:
 | `materialized='view'` | runs, but is a connection-scoped DuckDB view — nothing on storage, gone next session; swapping a model `table` ⇄ `view` isn't supported | Delta defines no view ([below](#materializations)) |
 | `materialized='external'` | **errors** — duckrun doesn't ship it | materializations dispatch by adapter name, so there's no fallback to dbt-duckdb's. Every duckrun model is already an external table, just in Delta |
 | `materialized='table_function'` | **errors** — duckrun doesn't ship it | a DuckDB table macro is catalog-only state, and duckrun's DuckDB is in-memory, so it could only ever live for the length of one run |
-| `threads` | must be `1` | the in-process delta-rs write path isn't thread-safe ([below](#dbt-incremental)) |
+| `threads` | honored, but concurrent writers share one memory budget; a microbatch model's batches still run in order | DuckDB's `memory_limit` is per database, not per model, and a microbatch model's batches all write the same table ([below](#dbt-incremental)) |
 | `on_schema_change='sync_all_columns'` | only *adds* columns | delta-rs can't drop columns ([below](#schema-constraints)) |
 | `merge_on_using_columns`, clause `action: error` | rejected with a clear error | no delta-rs equivalent — refusing beats silently running something else ([below](#dbt-incremental)) |
 | `merge_returning_columns` | accepted and ignored | duckrun never surfaces a returned relation, so it changes no table state |
@@ -64,10 +64,21 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
 
 ## dbt & incremental
 
-- **A single `dbt run` is single-threaded** (`threads: 1`): the in-process delta-rs write path isn't
-  thread-safe, so models inside one dbt invocation don't parallelize. This is **not** a limit on
-  concurrent writers — separate runs / notebooks / jobs writing the same tables at once is fully
-  supported and safe (every write is snapshot-pinned and fails loud on a conflict).
+- **`threads` is honored**, as in dbt-duckdb — dbt's default of `1` applies when the profile omits
+  it. Two things behave differently from a pure-SQL adapter, both because a duckrun model writes a
+  real table rather than a row set:
+    - **Concurrent writers share one memory budget.** DuckDB's `memory_limit` applies to the
+      database, not to a model, so above one thread duckrun fixes it once for the run at the tighter
+      of its two shares instead of letting each model set its own, and divides the delta-rs merge
+      pool by the thread count. Writes still complete — they spill to disk sooner. A single big
+      merge is therefore usually fastest at `threads: 1`; many independent, network-bound models
+      benefit most from more.
+    - **A microbatch model's batches run in order**, even at higher thread counts, because every
+      batch writes the same table: they'd serialize on the Delta log anyway. Different *models*
+      still run in parallel.
+- None of this is a limit on concurrent **writers**: separate runs / notebooks / jobs writing the
+  same tables at once is fully supported and safe (every write is snapshot-pinned and fails loud on
+  a conflict).
 - **Two dbt merge configs are rejected, on purpose.** `merge_on_using_columns` and a clause
   `action: error` are dbt-duckdb spellings with no delta-rs equivalent (delta-rs can't join on a
   USING column list, and can't raise from a merge clause), so duckrun raises a clear error rather

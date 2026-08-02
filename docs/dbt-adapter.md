@@ -20,7 +20,8 @@ my_project:
   outputs:
     dev:
       type: duckrun
-      # No `threads:` needed — duckrun always runs single-threaded.
+      # `threads:` works as usual (dbt defaults to 1). Concurrent models share one DuckDB
+      # memory budget, so raise it for many small/network-bound models, not for one big merge.
       # DuckDB runs in-memory by default — the Delta tables are the only state.
       # Default Delta location for models that don't set config(location=...).
       # OneLake — address by GUID, not friendly names (see "OneLake: use GUID paths" below):
@@ -383,6 +384,6 @@ over immediate disk savings.
 
 ## Limitations
 
-The adapter's trade-offs — single-threaded dbt runs (concurrent writers are still safe), the shared
-two-engine memory pool, the soft-tombstone `DROP TABLE`, rejected merge configs, add-only schema
-evolution — are consolidated with everything else in the top-level [Limitations](limitations.md) page.
+The adapter's trade-offs — what `threads` above 1 costs you, the shared two-engine memory pool, the
+soft-tombstone `DROP TABLE`, rejected merge configs, add-only schema evolution — are consolidated
+with everything else in the top-level [Limitations](limitations.md) page.

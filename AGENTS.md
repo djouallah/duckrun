@@ -15,7 +15,9 @@ plugins/duckrun-projects/skills/duckrun-projects/SKILL.md
 A few defaults differ from other dbt adapters and cause silent mistakes if you assume the
 usual behavior:
 
-- Single-threaded by design — do **not** set `threads:`.
+- `threads:` is honored (dbt's default is 1), but every model writes a real table: concurrent
+  writers share one DuckDB `memory_limit` and a microbatch model's batches always run in order.
+  More threads help many network-bound models; they don't help one big merge.
 - DuckDB is in-memory; there is no database file. The Delta tables are the only state.
 - Incremental strategy defaults depend on `unique_key` (`merge` with it, `append`
   without). For large tables, `merge` vs a dedup-in-SQL `append` (auto-fenced when the
