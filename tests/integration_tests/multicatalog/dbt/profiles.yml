@@ -3,6 +3,9 @@ multicatalog_dbt:
   outputs:
     dev:
       type: duckrun
+      # 4: a real OneLake run is where concurrent token refresh and per-catalog secret
+      # minting actually get exercised.
+      threads: 4
       # A medallion across THREE Fabric Lakehouses. The default catalog is the Silver lakehouse;
       # Bronze and Gold are declared as named catalogs. Point each at its own `abfss://` Lakehouse
       # root on OneLake, or (the local de-risk) at three separate folders.

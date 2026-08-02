@@ -3,6 +3,10 @@ aemo_electricity:
   outputs:
     dev:
       type: duckrun
+      # 2, not 4: this is the memory-heavy MERGE pipeline (fct_scada), and concurrent
+      # writers now divide the delta-rs merge pool between them. Two keeps real parallelism
+      # while leaving each merge half the budget rather than a quarter.
+      threads: 2
       schema: "{{ env_var('DBT_SCHEMA', 'mart') }}"
       # NB: no `settings: {preserve_insertion_order: false}` here — duckrun sets that by
       # default now (engine.configure_duckdb_memory), so large writes/merges don't OOM.

@@ -9,6 +9,9 @@ techflow_analytics:
   outputs:
     dev:
       type: duckrun
+      # 4 so the parity diff also covers parallel builds: duckrun's output must match dbt-duckdb's
+      # regardless of how many models run at once.
+      threads: 4
       schema: "{{ env_var('DBT_SCHEMA', 'main') }}"
       root_path: "{{ env_var('WAREHOUSE_PATH', './warehouse') }}"
       # Local fs by default. Point WAREHOUSE_PATH at an abfss:// Tables path to materialize to Microsoft

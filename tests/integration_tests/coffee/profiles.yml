@@ -3,6 +3,9 @@ coffee_shop:
   outputs:
     dev:
       type: duckrun
+      # 4: a real OneLake run is where concurrent token refresh and per-catalog secret
+      # minting actually get exercised.
+      threads: 4
       schema: "{{ env_var('DBT_SCHEMA', 'dbo') }}"
       # Local-filesystem Delta warehouse by default (no OneLake needed). delta_rs writes land at
       # <root_path>/<schema>/<model>; existing tables come back as delta_scan views so ref() resolves.

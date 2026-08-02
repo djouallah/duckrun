@@ -6,6 +6,10 @@ aemo_electricity:
   outputs:
     dev:
       type: duckrun
+      # 2, not 4: this is the memory-heavy MERGE pipeline (fct_scada), and concurrent
+      # writers now divide the delta-rs merge pool between them. Two keeps real parallelism
+      # while leaving each merge half the budget rather than a quarter.
+      threads: 2
       schema: "{{ env_var('DBT_SCHEMA', 'mart') }}"
       root_path: "{{ env_var('ONELAKE_TABLES_PATH') }}"
       settings:
