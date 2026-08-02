@@ -3,6 +3,9 @@ snapshot_pin:
   outputs:
     dev:
       type: duckrun
+      # Deliberately 1, not a leftover: this suite lands a commit from a simulated concurrent writer
+      # at an exact point in the run and asserts the pin fails loudly. Parallel models would move
+      # that point around and blur the assertion.
       threads: 1
       # Local-filesystem Delta warehouse: delta_rs writes land at <root_path>/<schema>/<model>.
       # The harness sets WAREHOUSE_PATH to a fresh tmp dir per test, so each run is isolated.

@@ -3,6 +3,9 @@ multi_catalog:
   outputs:
     dev:
       type: duckrun
+      # 4 so the ATTACH of the extra catalogs and their scoped secrets are exercised from several
+      # worker threads opening their handles at once — the one path a single-catalog suite can't hit.
+      threads: 4
       # Default catalog (the "silver" lakehouse). A second local folder is declared as the
       # "lh_bronze" catalog so one project writes across two physical roots — the local-filesystem
       # stand-in for two Fabric Lakehouses. The harness points these at fresh tmp dirs per test.

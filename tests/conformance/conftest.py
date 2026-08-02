@@ -53,11 +53,17 @@ def profile_type(request):
 @pytest.fixture(scope="session")
 def dbt_profile_target(tmp_path_factory):
     # duckrun writes Delta tables under root_path/<schema>/<model> and reads them via
-    # delta_scan. dbt supplies a unique schema per test; DuckDB stays in-memory. (No threads:
-    # the adapter forces single-threaded — see README "Limitations".)
+    # delta_scan. dbt supplies a unique schema per test; DuckDB stays in-memory.
+    #
+    # threads=4 matches dbt-adapters' own reference dbt_profile_target, which this fixture replaces
+    # wholesale — so omitting it would silently drop to dbt's DEFAULT_THREADS=1 and run the whole
+    # suite serially. It used to, because the adapter pinned the run to one thread; now that
+    # `threads` is honored, taking upstream's value makes every conformance case (every
+    # materialization and incremental strategy) exercise parallel models for free.
     root = tmp_path_factory.mktemp("duckrun_warehouse")
     return {
         "type": "duckrun",
+        "threads": 4,
         "root_path": str(root).replace("\\", "/"),
     }
 
