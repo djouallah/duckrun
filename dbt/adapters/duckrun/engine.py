@@ -94,7 +94,17 @@ def _walk_cardinality(plan):
     v = plan.get("extra_info", {}).get("Estimated Cardinality")
     if v is not None and int(v) > 0:      # MUST skip 0: the projection above an ORDER_BY reports
         return int(v)                      # 0 (verified) — descend to the first non-zero (SEQ_SCAN)
-    for c in plan.get("children", []):
+    children = plan.get("children", [])
+    # A UNION ALL parent carries NO cardinality of its own (verified: name "UNION", card None) while
+    # each branch carries its own, so the plain first-child descent below would return ONE branch and
+    # silently drop the rest — an N-feed union reporting 1/N of its rows. Its result spans every
+    # branch, so sum them; for UNION ALL that is exact. Only this node sums: DuckDB collapses UNION
+    # (distinct), EXCEPT and INTERSECT into a single-child PROJECTION over HASH_GROUP_BY, so they
+    # never reach here and can't be over-summed, and summing a JOIN's inputs would be meaningless.
+    if len(children) > 1 and (plan.get("name") or "").upper() == "UNION":
+        parts = [r for r in (_walk_cardinality(c) for c in children) if r is not None]
+        return sum(parts) if parts else None
+    for c in children:
         r = _walk_cardinality(c)
         if r is not None:
             return r

@@ -1829,6 +1829,33 @@ def test_rg_for_floors_a_planner_estimate_higher_than_an_exact_count():
                          floor=engine._RG_MIN_ESTIMATED) == engine._RG_MAX
 
 
+def test_estimated_rows_sums_every_union_branch(conn):
+    # A UNION ALL parent carries no Estimated Cardinality of its own while each branch carries one, so
+    # a first-child descent returns ONE branch and drops the rest — an N-feed union reporting 1/N of
+    # its rows, and an UNDER-estimate is the direction that shrinks the row-group ceiling. Unlike the
+    # planner's own guesses this is ours to get right: DuckDB reports both branches correctly.
+    from dbt.adapters.duckrun import engine
+    cur = conn._connection
+    cur.execute("create or replace table ua as select i as x from range(2000000) t(i)")
+    cur.execute("create or replace table ub as select i as x from range(1000000) t(i)")
+    est = lambda q: engine.estimated_rows(cur, cur.sql(q))
+    assert est("select * from ua") == 2_000_000
+    assert est("select * from ua union all select * from ub") == 3_000_000
+    assert est("select * from ua union all select * from ub union all select * from ua") == 5_000_000
+    assert est("select * from (select * from ua union all select * from ub) "
+               "union all select * from ub") == 4_000_000                       # nested
+    # Only UNION sums. DuckDB collapses UNION (distinct) / EXCEPT / INTERSECT into a single-child
+    # PROJECTION over HASH_GROUP_BY so they never reach the summing branch, and a JOIN must never sum
+    # its inputs. Each stays at or below its larger input and never at the 3,000,000 a sum would give
+    # — every one is a correct upper bound on its own result, which is the harmless direction anyway
+    # (an over-estimate caps at _RG_MAX and lets the file roll decide).
+    for q, actual in (("select * from ua union select * from ub", 2_000_000),
+                      ("select * from ua except select * from ub", 1_000_000),
+                      ("select * from ua intersect select * from ub", 1_000_000),
+                      ("select a.* from ua a join ub b using (x)", 1_000_000)):
+        assert actual <= est(q) <= 2_000_000, q
+
+
 # NOTE: sort / partition on write are covered by test_sql_only.py (CREATE TABLE … SORTED BY /
 # PARTITIONED BY / SORTED BY AUTO). optimize / replaceWhere / the append_if_unchanged verb still have
 # no DuckDB-SQL surface and are gaps for now — their engine capabilities remain covered by

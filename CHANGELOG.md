@@ -166,6 +166,16 @@ All notable changes to this project will be documented in this file.
   heuristic that gates the plain `append` strategy.
 
 ### Fixed
+- **The overwrite row estimate no longer drops every `UNION ALL` branch but the first (#22).** A
+  `UNION` plan node carries no estimated cardinality of its own while each branch carries one, and
+  the walk that reads the plan returned the first child that yielded a number — so an N-feed union
+  reported roughly 1/N of its rows, and under-reporting is the direction that shrinks the row-group
+  ceiling. Unlike the planner's own guesses this one was ours to get right: DuckDB reports every
+  branch correctly. A union parent now sums its branches, which for `UNION ALL` is exact (verified
+  2-feed, 3-feed and nested). Nothing else sums: DuckDB collapses `UNION` (distinct), `EXCEPT` and
+  `INTERSECT` into a single-child projection over a hash aggregate so they never reach that branch,
+  and a join's inputs must never be summed — each of those stays a correct upper bound on its own
+  result, which is the harmless direction.
 - **A bad planner row estimate can no longer pin a large table's row groups to the bottom of the
   segment band (#22).** The row-group ceiling for a full-table overwrite is `ceil(rows / 8)`, and
   those `rows` come from DuckDB's planner. That number is not a measurement: DuckDB applies a fixed
