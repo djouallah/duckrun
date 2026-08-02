@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **The remote path now reports the temp notebook's item id**, so a run's Fabric capacity can be
+  attributed to the item that was billed for it (#21). Fabric bills a notebook run's compute against
+  the notebook **item**, but both remote surfaces created that item, ran it and deleted it without
+  ever naming it — leaving display-name matching against the Capacity Metrics model as the only join,
+  which needs the name to be unique and guessable and silently mis-attributes when it isn't.
+  `RemoteResult.item_id` (the dbt path) and `ScriptResult.item_id` (`run_python`) now carry the GUID,
+  reported *whether or not the notebook still exists*: that is precisely the case where the caller
+  can't get it any other way, and the id remains the join key to the capacity data long after the
+  item is gone. Every command batched into one `with` block shares the notebook and so reports the
+  same id, and a run that died before producing a result is attributed too — the raised
+  `RemoteRunError` carries `.item_id`. Purely additive; the previous workaround (`keep_notebook=True`,
+  re-list the workspace, match the display name, delete it yourself) reimplemented duckrun's own
+  teardown and cost two extra control-plane calls duckrun had already made.
 - **`workspace.deploy(mode=...)` picks a semantic model's storage mode at deploy time**, so one
   authored `model.bim` ships as either Direct Lake or DirectQuery instead of being fixed by however it
   was authored — and on a folder deploy, every model in the folder lands in that mode. `lakehouse=` /

@@ -200,6 +200,7 @@ def test_run_python_success_roundtrip(tmp_path, monkeypatch):
     assert isinstance(res, ScriptResult) and res.success and res.returncode == 0
     assert res.log == "hi\n"
     assert fake.deleted, "throwaway notebook must be deleted"
+    assert res.item_id == "item-guid", "the billed notebook's id must survive its own teardown"
     assert fake.started == 1
 
 
@@ -212,6 +213,7 @@ def test_run_python_script_failure_is_not_retried(tmp_path, monkeypatch):
 
     res = ws.run_python(str(script), lakehouse="lake", attempts=3)
     assert not res.success and res.returncode == 3
+    assert res.item_id == "item-guid"          # it ran, so it was billed — attributable either way
     assert fake.started == 1, "a script that RAN and failed must not be retried"
     assert fake.deleted
 
@@ -238,10 +240,11 @@ def test_run_python_session_death_exhausts_and_raises(tmp_path, monkeypatch):
     ws = _ws(fake, monkeypatch)
     _stub_result(monkeypatch, [RuntimeError("404")])
 
-    with pytest.raises(fr.RemoteRunError):
+    with pytest.raises(fr.RemoteRunError) as excinfo:
         ws.run_python(str(script), lakehouse="lake", attempts=2)
     assert fake.started == 2
     assert fake.deleted, "notebook deleted even when every attempt died"
+    assert excinfo.value.item_id == "item-guid", "a run that died still burned capacity"
 
 
 def test_run_python_lakehouse_inferred_when_single(tmp_path, monkeypatch):

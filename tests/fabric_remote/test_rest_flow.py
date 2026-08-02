@@ -91,6 +91,7 @@ def test_invoke_runs_full_sequence_and_populates_result(project, monkeypatch):
 
     assert res.success is True
     assert res.result == [{"node": "m", "status": "success"}]
+    assert res.item_id == "item-guid", "the billed notebook's id must survive its own teardown"
 
     seq = [m for m, _, _ in fake.calls]
     # workspaces, folders (best-effort park attempt; this fake rejects it -> root fallback),
@@ -107,10 +108,11 @@ def test_notebook_deleted_even_when_job_fails(project, monkeypatch):
     # result read should never be reached; make it explode if it is
     monkeypatch.setattr(fr, "_dfs_get", lambda *a: (_ for _ in ()).throw(AssertionError("read attempted")))
 
-    with pytest.raises(fr.RemoteRunError):
+    with pytest.raises(fr.RemoteRunError) as excinfo:
         _runner(project).invoke(["run", "--target", "fabric"])
 
     assert fake.deleted is True  # teardown ran despite the failure
+    assert excinfo.value.item_id == "item-guid", "a run that died still burned capacity"
 
 
 def test_batched_with_block_runs_one_notebook_for_all_invokes(project, monkeypatch):
@@ -132,6 +134,8 @@ def test_batched_with_block_runs_one_notebook_for_all_invokes(project, monkeypat
     assert test_res.result == [{"node": "t", "status": "fail"}]
     # exactly ONE notebook created + deleted for both commands
     assert sum(1 for m, u, _ in fake.calls if m == "POST" and "notebooks" in u) == 1
+    # ...so both commands attribute to the same item, whatever their own status
+    assert run_res.item_id == test_res.item_id == "item-guid"
     assert sum(1 for m, u, _ in fake.calls if m == "DELETE") == 1
 
 

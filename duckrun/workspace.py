@@ -382,13 +382,19 @@ def _has_notebook_activity(primary: str) -> bool:
 
 class ScriptResult:
     """What :meth:`Workspace.run_python` hands back: ``success`` (returncode == 0),
-    ``returncode`` (the remote script's exit status; -1 = it never ran), and ``log``
-    (the full captured stdout/stderr — already streamed live during the run)."""
+    ``returncode`` (the remote script's exit status; -1 = it never ran), ``log``
+    (the full captured stdout/stderr — already streamed live during the run), and ``item_id``
+    (the throwaway notebook the script ran in).
 
-    def __init__(self, returncode: int, log: str):
+    ``item_id`` is reported whether or not the notebook still exists — Fabric bills the run's
+    compute against that item, and once duckrun's teardown has deleted it the id is the only join
+    key left to the capacity data."""
+
+    def __init__(self, returncode: int, log: str, item_id: Optional[str] = None):
         self.returncode = int(returncode)
         self.success = self.returncode == 0
         self.log = log
+        self.item_id = item_id
 
     def __repr__(self) -> str:
         return f"ScriptResult(success={self.success}, returncode={self.returncode}, log=<{len(self.log)} chars>)"
@@ -769,8 +775,10 @@ class Workspace:
         Session-level failures (the job dies before the script ran — capacity throttling or
         contention) are retried up to ``attempts`` with growing backoff; a script that ran and
         exited non-zero is NOT retried. Returns a :class:`ScriptResult` (``success`` /
-        ``returncode`` / ``log``); the throwaway notebook is deleted afterwards unless
-        ``keep_notebook``.
+        ``returncode`` / ``log`` / ``item_id``); the throwaway notebook is deleted afterwards unless
+        ``keep_notebook`` — ``item_id`` names it either way, so the run's Fabric capacity can be
+        attributed to the item that was billed for it. When every attempt dies before the script
+        ran this raises instead, with the same id on the exception's ``item_id``.
         """
         if cores is not None and cores not in (4, 8, 16, 32, 64):
             raise RemoteRunError(
@@ -803,10 +811,11 @@ class Workspace:
                                    result_path=result_path, attempts=attempts,
                                    keep_notebook=keep_notebook)
         streamed = result.pop("_streamed_chars", 0)
+        item_id = result.pop("_item_id", None)
         log_text = result.get("log", "")
         if len(log_text) > streamed:
             _print_remote_log(log_text[streamed:])
-        return ScriptResult(result.get("returncode", -1), log_text)
+        return ScriptResult(result.get("returncode", -1), log_text, item_id)
 
     def schedule(self, name: str, every=None, daily=None, weekly=None, at=None, tz: str = "UTC") -> str:
         """Schedule a deployed notebook or pipeline to run on Fabric; return the schedule id.

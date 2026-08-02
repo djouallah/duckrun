@@ -35,7 +35,7 @@ import os
 import re
 import uuid
 import zipfile
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from dbt.adapters.duckrun import remote as _remote
 from dbt.adapters.duckrun.secret import TOKEN_KEYS as _TOKEN_KEYS
@@ -71,13 +71,23 @@ _POLL_INTERVAL = 10
 
 
 class RemoteRunError(RuntimeError):
-    """The remote notebook job failed, timed out, or its result could not be read back."""
+    """The remote notebook job failed, timed out, or its result could not be read back.
+
+    ``item_id`` is the temp notebook the failed run happened in, when one was created — a job that
+    burned capacity before dying is exactly the one worth attributing (see ``RemoteResult``)."""
+
+    item_id: Optional[str] = None
 
 
 class RemoteResult:
     """A lightweight stand-in for dbt's ``dbtRunnerResult``: enough for the common
     ``res.success`` / ``res.result`` check, NOT the full object. ``result`` is a list of
     ``{"node": name, "status": status}`` dicts as reported by the remote run.
+
+    ``item_id`` is the GUID of the temp notebook the run happened in — reported whether or not the
+    notebook still exists, since Fabric bills the run's compute against that item and the id stays
+    the join key to the capacity data long after the item is deleted. Every command batched into one
+    ``with`` block shares the notebook, so they all report the same id.
 
     In the batched (``with``) form this is returned empty from ``.invoke()`` and filled in when the
     block exits; in the plain form it is already populated on return."""
@@ -86,6 +96,7 @@ class RemoteResult:
         self.success: Optional[bool] = None
         self.result: Optional[List[dict]] = None
         self.exception = None
+        self.item_id: Optional[str] = None
 
     def __repr__(self):
         return f"RemoteResult(success={self.success}, nodes={len(self.result or [])})"
@@ -1038,8 +1049,10 @@ def _execute_notebook(*, fabric_token: str, storage_token: str, ws_id: str, name
     a stale success can never masquerade as this run's.
 
     Returns the result dict with ``_streamed_chars`` added (how much of ``log`` the live tail
-    already printed — callers print only the remainder). Raises the job error when no attempt
-    produced a result. The notebook is deleted on the way out unless ``keep_notebook``."""
+    already printed — callers print only the remainder) and ``_item_id`` (the notebook this ran in,
+    which the callers surface for capacity attribution). Raises the job error when no attempt
+    produced a result, with ``item_id`` set on the exception for the same reason. The notebook is
+    deleted on the way out unless ``keep_notebook``."""
     log_path = result_path[:-5] + ".log"
     streamed = {"chars": 0, "token": storage_token}
 
@@ -1073,6 +1086,7 @@ def _execute_notebook(*, fabric_token: str, storage_token: str, ws_id: str, name
                 result = None
             if result is not None:
                 result["_streamed_chars"] = streamed["chars"]
+                result["_item_id"] = item_id
                 return result
             if attempt < attempts:
                 delay = backoffs[min(attempt - 1, len(backoffs) - 1)]
@@ -1083,8 +1097,14 @@ def _execute_notebook(*, fabric_token: str, storage_token: str, ws_id: str, name
             _delete_item(_fresh_token(fabric_token, auth.get_fabric_token), ws_id, item_id)
         _dfs_delete(log_path, _fresh_token(streamed["token"], auth.get_onelake_token))
     if job_err is not None:
+        try:
+            job_err.item_id = item_id      # arbitrary exception type — __slots__ would reject it
+        except AttributeError:
+            pass
         raise job_err
-    raise RemoteRunError("remote job finished but produced no result JSON")
+    err = RemoteRunError("remote job finished but produced no result JSON")
+    err.item_id = item_id
+    raise err
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1160,8 +1180,9 @@ class RemoteRunner:
             return False
         commands = [cmd for cmd, _ in queue]
         proxies = [proxy for _, proxy in queue]
-        for proxy, res in zip(proxies, self._run(commands)):
-            _apply(proxy, res)
+        item_id, results = self._run(commands)
+        for proxy, res in zip(proxies, results):
+            _apply(proxy, res, item_id)
         return False
 
     def invoke(self, args) -> RemoteResult:
@@ -1173,13 +1194,13 @@ class RemoteRunner:
         if self._queue is not None:
             self._queue.append((args, proxy))
             return proxy
-        [res] = self._run([args])
-        _apply(proxy, res)
+        item_id, [res] = self._run([args])
+        _apply(proxy, res, item_id)
         return proxy
 
-    def _run(self, commands: List[List[str]]) -> List[dict]:
+    def _run(self, commands: List[List[str]]) -> Tuple[Optional[str], List[dict]]:
         """Package the project, spin up a temp notebook to run ``commands``, tear it down, and return
-        the per-command result dicts the notebook reported."""
+        the notebook's item id plus the per-command result dicts it reported."""
         first = commands[0] if commands else []
         target = self.target or _flag(first, "--target")
         profiles_dir = self.profiles_dir or _flag(first, "--profiles-dir")
@@ -1209,10 +1230,11 @@ class RemoteRunner:
         # Print whatever the live tail didn't catch (the .log flush is periodic; the result JSON
         # is authoritative). When nothing streamed — e.g. a fast job — this is the whole log.
         streamed = result.pop("_streamed_chars", 0)
+        item_id = result.pop("_item_id", None)
         log_text = result.get("log", "")
         if len(log_text) > streamed:
             _print_remote_log(log_text[streamed:])
-        return result.get("results", [])
+        return item_id, result.get("results", [])
 
 
 def _flag(args: List[str], name: str) -> Optional[str]:
@@ -1223,9 +1245,10 @@ def _flag(args: List[str], name: str) -> Optional[str]:
     return None
 
 
-def _apply(proxy: RemoteResult, res: dict) -> None:
+def _apply(proxy: RemoteResult, res: dict, item_id: Optional[str] = None) -> None:
     proxy.success = bool(res.get("success"))
     proxy.result = res.get("nodes", [])
+    proxy.item_id = item_id
 
 
 def _print_remote_log(log_text: str) -> None:
