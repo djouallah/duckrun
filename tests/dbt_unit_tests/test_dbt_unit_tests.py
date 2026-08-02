@@ -163,6 +163,68 @@ def test_merge_materialize_source_two_runs(tmp_path):
     assert rows == {1: 111.0, 2: 222.0, 3: 333.0, 4: 400.0, 5: 500.0, 6: 600.0}, rows
 
 
+def _fingerprint(wh: str) -> dict:
+    """``{table: (row_count, content_hash)}`` for every Delta table in the warehouse.
+
+    The hash is ``sum(hash(<every column>))`` — a whole-row hash, so a value moving between rows is
+    caught, summed so the result is independent of row ORDER. Order can't be part of the comparison:
+    duckrun runs with ``preserve_insertion_order=false`` and delta-rs is free to lay files out
+    differently, so two runs of the same project legitimately differ in physical order.
+    """
+    con = duckrun.connect(wh, schema=SCHEMA, read_only=True)
+    out = {}
+    for table in sorted(p.name for p in (Path(wh) / SCHEMA).iterdir() if p.is_dir()):
+        cols = [c[0] for c in con.sql(f"describe select * from {table}").fetchall()]
+        row_hash = "hash(" + ", ".join('"' + c.replace('"', '""') + '"' for c in cols) + ")"
+        rows, digest = con.sql(
+            f"select count(*), sum({row_hash}::HUGEINT) from {table}").fetchone()
+        out[table] = (rows, str(digest))
+    return out
+
+
+def _build_everything(wh: str, threads: int) -> None:
+    """The project's full lifecycle at a given dbt thread count: cold build, then a second
+    incremental load of every strategy, then both microbatch day-batches."""
+    t = ("--threads", str(threads))
+    assert _dbt(wh, "seed", *t).success
+    assert _dbt(wh, "run", *t, *_EXCLUDE_MICROBATCH, "--vars", "{load: 1}").success
+    assert _dbt(wh, "build", *t, *_EXCLUDE_MICROBATCH, "--vars", "{load: 2}").success
+    assert _dbt(wh, "run", *t, "--select", "+events_microbatch",
+                "--event-time-start", "2024-01-01", "--event-time-end", "2024-01-02").success
+    assert _dbt(wh, "run", *t, "--select", "events_microbatch",
+                "--event-time-start", "2024-01-02", "--event-time-end", "2024-01-03").success
+
+
+def test_threads_produce_identical_tables(tmp_path):
+    """The SAME project built serially and in parallel must produce byte-identical table contents.
+
+    duckrun honors `threads`, so models build concurrently — each on its own DuckDB cursor, streaming
+    its own relation into delta-rs. Every other suite only asserts that a parallel run doesn't
+    ERROR, but the failure mode that matters here is silent: a race in the delta plugin's per-thread
+    cursor, in the microbatch first-batch bookkeeping, or in the shared token/secret state produces a
+    table with the WRONG ROWS, not a crash. (A concrete example: before the batches were serialized,
+    two `--full-refresh` microbatch batches could each believe they were the first and one batch's
+    rows would vanish.) So build the whole project twice into separate warehouses and diff.
+    """
+    from dbt.adapters.duckrun import engine
+
+    serial, parallel = _wh(tmp_path) + "_t1", _wh(tmp_path) + "_t4"
+    _build_everything(serial, threads=1)
+    _build_everything(parallel, threads=4)
+
+    # Guard against the comparison quietly becoming 1-vs-1: the adapter publishes the run's thread
+    # count here, so if `threads` is ever pinned again this test fails loudly instead of passing
+    # vacuously. (Set at adapter init, so it reflects the last run above.)
+    assert engine.RUN_THREADS == 4, (
+        f"the parallel build ran at {engine.RUN_THREADS} thread(s), so this test compared a serial "
+        "run against another serial run and proved nothing")
+
+    got, want = _fingerprint(parallel), _fingerprint(serial)
+    assert set(got) == set(want), f"different tables built: {set(got) ^ set(want)}"
+    differing = {t: (want[t], got[t]) for t in want if want[t] != got[t]}
+    assert not differing, f"threads=4 produced different data than threads=1: {differing}"
+
+
 def test_incremental_microbatch_two_batches(tmp_path):
     """The microbatch strategy: dbt runs one delete+insert per daily event_time batch. Process day 1
     (events 1-3) then day 2 (events 4-6) with bounded --event-time windows and assert the real Delta
