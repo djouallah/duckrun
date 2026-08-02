@@ -191,16 +191,26 @@ class DuckrunEnvironment(LocalEnvironment):
         # writing on a closed cursor: "Connection already closed". A raw cursor has no such side
         # effect, and CREATE OR REPLACE VIEW is lazy (the scan — and its httpfs/json/spatial
         # extensions — runs later on whichever initialized per-node cursor reads the view).
+        # The whole body is under the lock, not just the lazy connect. dbt compiles nodes across its
+        # thread pool and resolves a plugin source once per referencing node, so at threads>1 two
+        # nodes on the same source race to CREATE OR REPLACE the same catalog entry from separate
+        # DuckDB transactions — which DuckDB rejects outright:
+        #   TransactionContext Error: Catalog write-write conflict on create with "...View\0<source>"
+        # Unlike the delta_scan views the adapter registers during discovery, this path has no
+        # best-effort fallback (the source MUST exist for the node to compile), so a conflict kills
+        # the run. Serializing costs nothing: a project has a handful of sources, each registered
+        # once, and CREATE OR REPLACE VIEW is lazy — the scan itself runs later, off the lock, on
+        # whichever per-node cursor reads the view.
         with self.lock:
             if self.conn is None:
                 self.conn = self.initialize_db(self.creds, self._plugins)
-        cursor = self.conn.cursor()
-        try:
-            if source_config.schema:
-                cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {source_config.schema}")
-            cursor.execute(
-                f"CREATE OR REPLACE VIEW {source_config.table_name()} AS "
-                f"{scan_sql(source_config)}"
-            )
-        finally:
-            cursor.close()
+            cursor = self.conn.cursor()
+            try:
+                if source_config.schema:
+                    cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {source_config.schema}")
+                cursor.execute(
+                    f"CREATE OR REPLACE VIEW {source_config.table_name()} AS "
+                    f"{scan_sql(source_config)}"
+                )
+            finally:
+                cursor.close()
