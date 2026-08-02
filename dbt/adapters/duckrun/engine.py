@@ -19,7 +19,8 @@ from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, DEFAULT_TARGET_FILE_SIZE,
-                                         ROW_GROUP_MAX_ROWS, RG_LANES, RG_MIN, RG_MAX, rg_for)
+                                         ROW_GROUP_MAX_ROWS, RG_LANES, RG_MIN, RG_MIN_ESTIMATED,
+                                         RG_MAX, rg_for)
 
 logger = AdapterLogger("Duckrun")
 
@@ -82,9 +83,11 @@ _PART_PRUNE_MAX = 400
 
 # The adaptive row-group sizing rule (policy.rg_for) and its constants live in policy.py. Aliased here
 # so in-module callers and the tests keep referring to engine._RG_*. The overwrite geometry is computed
-# from policy.rg_for(estimated_rows(...)) in write_delta; append is NOT sized (delta_rs defaults,
-# compaction-folded).
-_RG_LANES, _RG_MIN, _RG_MAX = RG_LANES, RG_MIN, RG_MAX
+# from policy.rg_for(estimated_rows(...), floor=_RG_MIN_ESTIMATED) in write_delta — the higher floor
+# because that row count is a planner GUESS; compaction and optimize size off the exact log count and
+# keep _RG_MIN. An append is not sized at all: it passes row_group_rows=None, so the ceiling stays
+# _ROW_GROUP_SIZE and the 256 MB file roll picks the group.
+_RG_LANES, _RG_MIN, _RG_MIN_ESTIMATED, _RG_MAX = RG_LANES, RG_MIN, RG_MIN_ESTIMATED, RG_MAX
 
 
 def _walk_cardinality(plan):
@@ -159,10 +162,13 @@ def _writer_properties(row_group_rows=None):
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
     # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap, an EXPLICIT
     # 20k-row data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
-    # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults)
-    # so a merge stays quick and never rewrites fat files; post-merge compaction folds merged files up
-    # into this layout later. Degrade gracefully if the pinned wheel rejects a newer parameter
-    # (last rung: SNAPPY-only).
+    # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults) so a
+    # merge stays quick and never rewrites fat files, and so the known OOM-prone path does not also
+    # take on a 16M-row write buffer; post-merge compaction folds merged files up into this layout
+    # later. That exemption covers only a merge that actually reaches delta_rs: an insert-only merge
+    # is routed to a DuckDB anti-join + plain append (see insert_delta) and IS written with this
+    # profile. Degrade gracefully if the pinned wheel rejects a newer parameter (last rung:
+    # SNAPPY-only).
     if WriterProperties is None:
         return None
     rg = row_group_rows if row_group_rows is not None else _ROW_GROUP_SIZE
@@ -791,13 +797,24 @@ def build_write_deltalake_args(
 ) -> Dict[str, Any]:
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
-    A full-table write (overwrite / replace-where) gets the one read-layout profile: the tuned writer
-    properties plus the 256 MB ``target_file_size``. An ``append`` — like MERGE — writes with delta_rs
-    defaults (no writer_properties, no ``target_file_size``): appends are transient increments that
-    threshold-gated compaction folds into the read layout on a later pass, so paying the 16M-group
-    profile on every small append is wasted (and the 16M row group is the write-memory ceiling). MERGE
-    does not go through here at all. ``row_group_rows`` is the adaptive overwrite geometry (see
-    ``write_delta`` / ``rg_for``); it is meaningless on append and ignored there."""
+    EVERY write through here — overwrite, replace-where and append alike — gets the one read-layout
+    profile: the tuned writer properties plus the 256 MB ``target_file_size``. MERGE does not go
+    through here at all and keeps delta_rs defaults.
+
+    Append used to be excluded on the theory that appends are transient increments which
+    threshold-gated compaction folds into the read layout on a later pass. That fold does not
+    happen: compaction fires on small-file BYTE debt (>= 8 files under half-target, see
+    ``policy.MaintenancePolicy``), so append files that are already a healthy size are invisible to
+    the trigger and keep delta_rs's 1,048,576-row groups and 100 MB files forever — the bottom of
+    the segment band, permanently, on exactly the append-only fact tables that can least afford it
+    (issue #22). Sizing the append correctly at write time is what closes that, and it costs
+    nothing on a small append: ``max_row_group_size`` is a CEILING, and an increment that never
+    reaches it is written exactly as before.
+
+    ``row_group_rows`` is the adaptive overwrite geometry (see ``write_delta`` / ``rg_for``). It is
+    meaningless on append — an increment knows nothing about the table it lands in — so append
+    passes ``None`` and keeps the ``_ROW_GROUP_SIZE`` ceiling, letting the file roll pick the group.
+    """
     args: Dict[str, Any] = {
         "table_or_uri": path,
         "data": data,
@@ -811,11 +828,11 @@ def build_write_deltalake_args(
     # mode only) — delta-rs's own schema_mode values, passed straight through.
     if schema_mode in ("merge", "overwrite"):
         args["schema_mode"] = schema_mode
-    if mode != "append":  # append → delta_rs defaults (lean, compaction-folded), like MERGE
-        args["target_file_size"] = _TARGET_FILE_SIZE
-        wp = _writer_properties(row_group_rows=row_group_rows)
-        if wp is not None:
-            args["writer_properties"] = wp
+    args["target_file_size"] = _TARGET_FILE_SIZE
+    # append passes row_group_rows=None → the _ROW_GROUP_SIZE ceiling, file roll decides (see above)
+    wp = _writer_properties(row_group_rows=row_group_rows)
+    if wp is not None:
+        args["writer_properties"] = wp
     return args
 
 
@@ -1340,7 +1357,9 @@ def write_delta(
     ONE Delta write seam), so a fenced write is pinned to the caller's snapshot and fails loudly on a
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
-    Every write lands in the one read-layout profile (tuned writer properties + 256 MB files).
+    Every write lands in the one read-layout profile (tuned writer properties + 256 MB files) —
+    append included. Only the row-group CEILING differs: an overwrite sizes it from the result (see
+    ``rg_for``), an append leaves it at the maximum and lets the file roll pick the group.
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
@@ -1361,9 +1380,13 @@ def write_delta(
     # dbt table / full-refresh path (delta_plugin) share one seam and behave identically. A small result
     # yields ~_RG_LANES groups; big/unknown keeps 16M. Needs the producing connection (cur); never break
     # a write on the planner estimate.
+    #
+    # This is the ONE rg_for caller whose row count is a planner estimate rather than a measurement, so
+    # it is also the one that passes the higher _RG_MIN_ESTIMATED floor — an estimate that is an order
+    # of magnitude low must not be able to pin the table to the bottom of the band (issue #22).
     if mode == "overwrite" and row_group_rows is None:
         try:
-            row_group_rows = rg_for(estimated_rows(cur, data))
+            row_group_rows = rg_for(estimated_rows(cur, data), floor=_RG_MIN_ESTIMATED)
         except Exception:
             row_group_rows = None
         logger.debug(f"duckrun: overwrite geometry rg={row_group_rows}")

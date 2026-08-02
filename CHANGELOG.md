@@ -166,6 +166,34 @@ All notable changes to this project will be documented in this file.
   heuristic that gates the plain `append` strategy.
 
 ### Fixed
+- **A bad planner row estimate can no longer pin a large table's row groups to the bottom of the
+  segment band (#22).** The row-group ceiling for a full-table overwrite is `ceil(rows / 8)`, and
+  those `rows` come from DuckDB's planner. That number is not a measurement: DuckDB applies a fixed
+  0.2 selectivity guess to filters and anti/semi joins, a set-operation parent carries no cardinality
+  of its own, and a CSV's row count is extrapolated from *file size*, so a compressed source is off
+  by its compression ratio. Measured, these are 2x–5x each and compound — a two-feed union with a
+  filter estimated 9.3x low. The failure is one-sided: an over-estimate is harmless (it caps at 16M
+  and the file roll decides), while an under-estimate collapses the ceiling onto the floor. A 370M-row
+  fact built that way landed at **380 row groups of ~974k rows** where ~34 belong, and no later pass
+  fixed it. duckrun does not try to out-guess the planner — instead an estimate is now floored at
+  **6M** rows instead of 1M, capping the worst case at ~68 groups. An *exact* row count, which
+  compaction and `VACUUM <table>` read for free from the Delta log, keeps the 1M floor and is
+  unchanged, so compacting a table still restores the finer geometry. The cost is that the ~8-lane
+  target for a small table is only reached above ~48M rows.
+- **Appends now get the read-layout profile instead of delta_rs defaults (#22).** An append was
+  written with no writer properties and no 256 MB file target, on the reasoning that appends are
+  transient increments which threshold-gated compaction folds into the read layout later. That fold
+  never happens for the tables it matters most for: compaction fires on small-file **byte debt**, so
+  an append-only fact whose files are already a healthy size never trips the trigger and keeps
+  delta_rs's 1,048,576-row groups and 100 MB files permanently. Measured on a 40M-row append: 2 files
+  / 39 row groups / 1,025,641 rows each before, 1 file / 3 row groups / 16M rows each after. This
+  costs nothing on a small increment, because the row-group size is a ceiling an append that never
+  reaches it never pays. Appends are still not *sized* — they keep the 16M ceiling and let the file
+  roll pick the group, since an increment knows nothing about the table it lands in. This also covers
+  an insert-only merge (`incremental_strategy='insert'`, or `merge_clauses` with
+  `when_matched: do_nothing`), which is routed to a DuckDB anti-join and committed as a plain append.
+  A merge that genuinely reaches delta_rs still writes with delta_rs defaults, deliberately: that
+  path is the OOM-prone one and must not also take on a 16M-row write buffer.
 - **`get_stats` no longer overstates `total_rows` on a table with deletion vectors.** A parquet
   footer still counts rows a DV has logically removed, so summing `parquet_file_metadata.num_rows`
   reported the *physical* row count — a Fabric Warehouse table read as 144,349,058 rows against a

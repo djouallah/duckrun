@@ -1636,30 +1636,33 @@ def _row_groups(conn, table):
 
 
 def test_ctas_small_result_adapts_row_groups(conn):
-    # A small CTAS result should shrink its row-group size so the table still yields ~_RG_LANES (8)
-    # Direct Lake segments, not the 2 it would get from the 16M constant. 20M rows / ceil(20M/8)=2.5M.
+    # A small CTAS result should shrink its row-group ceiling so the table yields more than the 2
+    # segments the 16M constant would give. 20M rows / ceil(20M/8) = 2.5M, raised to the 6M estimate
+    # floor (_RG_MIN_ESTIMATED) → 4 groups. The floor is what keeps a bad planner estimate from
+    # pinning a table to the bottom of the segment band, and it costs lanes below _RG_LANES × 6M rows.
     conn.sql("CREATE OR REPLACE TABLE small_ctas AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "small_ctas")
-    assert 7 <= n <= 9, f"expected ~8 row groups, got {n}"
+    assert 3 <= n <= 5, f"expected ~4 row groups (20M at the 6M estimate floor), got {n}"
 
 
 def test_ctas_sorted_result_adapts_row_groups(conn):
     # Same, but SORTED BY (j): the projection above ORDER_BY reports Estimated Cardinality "0", so a
-    # naive estimator would collapse to _RG_MIN (1M → ~20 groups). The zero-skip must descend past it.
+    # naive estimator would collapse to the floor. The zero-skip must descend past it — which at 20M
+    # rows is now only visible as "not RG_MAX", since the floor and the adapted size both give 4.
     conn.sql("CREATE OR REPLACE TABLE sorted_ctas SORTED BY (j) AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "sorted_ctas")
-    assert 6 <= n <= 10, f"sorted CTAS collapsed/inflated to {n} row groups (zero-estimate not skipped?)"
+    assert 3 <= n <= 5, f"sorted CTAS collapsed/inflated to {n} row groups (zero-estimate not skipped?)"
 
 
 def test_ctas_limit_sizes_off_limited_count_not_source(conn):
     # A LIMIT is invisible to the planner estimate (DuckDB annotates STREAMING_LIMIT with nothing, so
     # the walk falls through to the full-source count). Sizing off the 200M source would keep the 16M
-    # profile (2 groups); the limited 20M result must adapt to ~8. Guards the limit-aware exact count.
+    # profile (2 groups); the limited 20M result must adapt (4). Guards the limit-aware exact count.
     conn.sql("CREATE OR REPLACE TABLE limited_ctas AS "
              "select * from (select i as j from range(200000000) t(i) limit 20000000)")
     assert conn.sql("select count(*) from limited_ctas").fetchone()[0] == 20000000
     n = _row_groups(conn, "limited_ctas")
-    assert 7 <= n <= 9, f"expected ~8 row groups from the limited count, got {n}"
+    assert 3 <= n <= 5, f"expected ~4 row groups from the limited count, got {n}"
 
 
 def test_ctas_large_estimate_keeps_16m_profile(conn, monkeypatch):
@@ -1695,7 +1698,7 @@ def test_overwrite_seam_adapts_regardless_of_caller(conn):
     engine.write_delta(loc, data, "overwrite", storage_options=conn.storage_options,
                        cur=conn._connection)
     n = _row_groups(conn, "ow_direct")
-    assert 7 <= n <= 9, f"overwrite seam did not adapt: {n} row groups"
+    assert 3 <= n <= 5, f"overwrite seam did not adapt: {n} row groups"
 
 
 def test_row_group_rows_reaches_only_overwrite(conn, monkeypatch):
@@ -1719,15 +1722,16 @@ def test_row_group_rows_reaches_only_overwrite(conn, monkeypatch):
     assert ap and all(rg is None for rg in ap), f"an append leaked row_group_rows: {ap}"
 
 
-def test_append_uses_delta_rs_defaults():
-    # Append is transient (compaction folds it into the read layout later), so it writes with delta_rs
-    # defaults — no tuned writer_properties, no target_file_size — exactly like MERGE. A full-table
-    # overwrite keeps the profile.
+def test_append_uses_the_read_layout_profile():
+    # Append gets the SAME read-layout profile as a full-table overwrite. It used to be excluded on the
+    # theory that compaction would fold it in later, but compaction fires on small-file byte debt, so
+    # healthy-sized append files never trip it and stayed at delta_rs's 1,048,576-row groups forever
+    # (issue #22). Only MERGE still writes with delta_rs defaults.
     from dbt.adapters.duckrun import engine
     ow = engine.build_write_deltalake_args("p", None, "overwrite")
     ap = engine.build_write_deltalake_args("p", None, "append")
     assert "target_file_size" in ow and "writer_properties" in ow
-    assert "target_file_size" not in ap and "writer_properties" not in ap
+    assert "target_file_size" in ap and "writer_properties" in ap
 
 
 def test_compaction_adapts_row_groups(conn):
@@ -1802,6 +1806,27 @@ def test_rg_for_clamps():
     assert engine.rg_for(100_000_000) < engine._RG_MAX               # large but below cutoff → adapts
     assert engine.rg_for(None) == engine._RG_MAX                     # unknown → today's constant
     assert engine.rg_for(engine._RG_LANES * engine._RG_MAX) == engine._RG_MAX  # at/above cutoff → 16M
+
+
+def test_rg_for_floors_a_planner_estimate_higher_than_an_exact_count():
+    # The floor is the caller's trust in its row count, and it is the whole fix for issue #22. An EXACT
+    # count from the Delta log (compaction, optimize) is a measurement and keeps _RG_MIN. A DuckDB
+    # planner ESTIMATE cannot be: a fixed 0.2 filter/anti-join selectivity guess, a set-op parent that
+    # carries no cardinality, and CSVs extrapolated from file size all under-report by an order of
+    # magnitude — which pinned a 370M-row fact to 380 row groups where ~34 belong. So a guess never
+    # drives the ceiling below _RG_MIN_ESTIMATED, capping the damage at ~6M-row segments.
+    from dbt.adapters.duckrun import engine
+    assert engine._RG_MIN_ESTIMATED > engine._RG_MIN
+    for bad in (1, 100, 4_000_000, engine._RG_LANES * engine._RG_MIN_ESTIMATED - 1):
+        assert engine.rg_for(bad) == max(engine._RG_MIN, -(-bad // engine._RG_LANES))
+        assert engine.rg_for(bad, floor=engine._RG_MIN_ESTIMATED) >= engine._RG_MIN_ESTIMATED
+    # Above the floor's reach the two agree — the floor only ever raises a shrunk ceiling, and neither
+    # floor can push a ceiling past the 16M segment maximum.
+    big = engine._RG_LANES * engine._RG_MIN_ESTIMATED * 2
+    assert engine.rg_for(big) == engine.rg_for(big, floor=engine._RG_MIN_ESTIMATED)
+    assert engine.rg_for(None, floor=engine._RG_MIN_ESTIMATED) == engine._RG_MAX
+    assert engine.rg_for(engine._RG_LANES * engine._RG_MAX,
+                         floor=engine._RG_MIN_ESTIMATED) == engine._RG_MAX
 
 
 # NOTE: sort / partition on write are covered by test_sql_only.py (CREATE TABLE … SORTED BY /

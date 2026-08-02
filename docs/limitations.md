@@ -126,6 +126,16 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   a rough rule, not a broadly tested optimum. A table with unusual width, cardinality, or skew may well
   have its sweet spot elsewhere. See
   [How the numbers are grounded](parquet-layout.md#how-the-numbers-are-grounded).
+- **On a full-table overwrite, that row estimate is a planner guess and can be badly low.** DuckDB
+  applies a fixed 0.2 selectivity guess to filters and anti/semi joins, a set-operation parent carries
+  no cardinality of its own, and a CSV's row count is extrapolated from *file size* (so a compressed
+  source is off by its compression ratio). These compound, and duckrun cannot correct them without
+  reimplementing a planner. The failure is one-sided — an over-estimate is harmless, an under-estimate
+  shrinks the ceiling — so a guess is floored at **6M rows**, capping the damage at ~6M-row segments
+  rather than the ~1M ones a bad estimate used to produce. The cost is that the ~8-lane target is only
+  reached above ~48M rows; a smaller table gets fewer, larger segments. Compaction and `VACUUM <table>`
+  are unaffected: they size from the exact row count in the Delta log and keep the 1M floor, so
+  compacting a table restores the finer geometry.
 
 ## Memory
 
