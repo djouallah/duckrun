@@ -51,9 +51,12 @@ RG_MIN = 1_000_000
 # over-estimate is harmless (it caps at RG_MAX and the file roll decides), while an under-estimate
 # pins a huge table to the bottom of the band permanently — measured on a 370M-row fact, a 9x
 # under-estimate produced 380 row groups where ~34 belong (issue #22). A guess therefore never drives
-# the ceiling below 6M. This costs the ~RG_LANES target below RG_LANES × RG_MIN_ESTIMATED rows, which
-# is the deliberate trade: fewer lanes on a small table, no floor-pinning on a large one.
-RG_MIN_ESTIMATED = 6_000_000
+# the ceiling below 8M — Power BI's default segment size, so a floor-bound write hands Direct Lake
+# its native segment rather than a fraction of one (measured on a 144M-row mart: a 9.7x planner
+# under-estimate floor-pinned every segment). This costs the ~RG_LANES target below
+# RG_LANES × RG_MIN_ESTIMATED rows, which is the deliberate trade: fewer lanes on a small table,
+# no floor-pinning on a large one.
+RG_MIN_ESTIMATED = 8_000_000
 RG_MAX = ROW_GROUP_MAX_ROWS  # big/unknown estimates keep this exactly
 
 
