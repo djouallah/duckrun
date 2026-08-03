@@ -6,7 +6,8 @@
 {{ config(
     materialized='table',
     schema='mart',
-    merge_schema=true
+    merge_schema=true,
+    sort_by='auto'
 ) }}
 
 WITH summary AS (
