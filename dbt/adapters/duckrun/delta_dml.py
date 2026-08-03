@@ -1293,7 +1293,8 @@ class _DeltaDML:
         if sort_cols == "AUTO":  # the connection API substitutes explicit columns before we get here
             raise ValueError(
                 "CREATE TABLE … SORTED BY AUTO is a connection-API feature (it profiles the query to "
-                "pick the sort key); give an explicit SORTED BY (cols) on this path.")
+                "pick the sort key); give an explicit SORTED BY (cols) on this path, or set "
+                "sort_by='auto' in the dbt model config.")
         if sort_cols:  # cluster the write: DuckDB ORDER BY the query, then materialize
             order = ", ".join('"' + c + '"' for c in sort_cols)
             body = f"SELECT * FROM ({body}) ORDER BY {order}"

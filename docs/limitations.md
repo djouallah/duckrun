@@ -114,7 +114,8 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
 
 ## Parquet layout
 
-- **`SORTED BY AUTO` picks the key with a naive, lightly-tested heuristic.** The auto sort-key picker
+- **`SORTED BY AUTO` picks the key with a naive, lightly-tested heuristic** (also reachable from dbt
+  as the model config `sort_by: auto`). The auto sort-key picker
   is a cheap greedy single pass over statistical *sketches* (approximate cardinalities, HyperLogLog
   functional-dependency tests) — a stack of rules of thumb, each of which can be wrong on a given
   distribution. It is not guaranteed to shrink anything and can occasionally pick a worse key than the

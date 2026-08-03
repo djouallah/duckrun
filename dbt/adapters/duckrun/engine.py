@@ -22,6 +22,7 @@ from deltalake.exceptions import CommitFailedError, TableNotFoundError
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, DEFAULT_TARGET_FILE_SIZE,
                                          ROW_GROUP_MAX_ROWS, RG_LANES, RG_MIN, RG_MIN_ESTIMATED,
                                          RG_MAX, rg_for)
+from dbt.adapters.duckrun import sortkey
 
 logger = AdapterLogger("Duckrun")
 
@@ -1105,6 +1106,41 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
     except Exception as exc:
         logger.debug(f"duckrun: no Delta column stats for {path!r}: {exc}")
         return {}, 0, 0
+
+
+def auto_sort_cols(cur, source, *, partition_cols=None, seed=None, label=("df", "sort()")):
+    """Run the sort-key recommender over any FROM-able ``source`` (a staged relation/view — no
+    Delta table behind it, so no partitions on disk and no log stats) and return
+    ``(cols, lines)``: the recommended ORDER BY columns (``[]`` if nothing pays off) and the
+    advisory lines for the CALLER to print/log. The one seam behind dbt's ``sort_by='auto'`` and
+    the connection API's relation fallback for ``SORTED BY AUTO``.
+
+    Profiles a bounded reservoir sample sized by a schema-only width estimate (no Delta log to
+    read real bytes), and NEVER exact — the source's row count is unknown without evaluating it,
+    so uniqueness is never claimed here. ``partition_cols`` keeps declared partition columns from
+    burning a sort-key slot; ``seed`` makes the sample reproducible. The ``_rle_src`` temp table
+    is connection-local (each dbt worker thread has its own cursor), so concurrent models don't
+    collide."""
+    desc = cur.sql(f"DESCRIBE SELECT * FROM {source}").fetchall()
+    cols = [d[0] for d in desc]
+    types = {d[0]: str(d[1]) for d in desc}
+    if not cols:
+        return [], []
+    plan_rows, exact = sortkey.plan_sample(None, sortkey.estimate_row_bytes(types))
+    samp = (f"reservoir({plan_rows} ROWS) REPEATABLE ({int(seed)})"
+            if seed is not None else f"{plan_rows} ROWS")
+    src = "_rle_src"
+    cur.execute(f"CREATE OR REPLACE TEMP TABLE {src} AS "
+                f"SELECT * FROM {source} USING SAMPLE {samp}")
+    try:
+        rows, _, lines = sortkey.recommend_sort_key(
+            cur, label[0], label[1], src, cols, types, list(partition_cols or []),
+            sample_rows=plan_rows, exact=exact)
+    finally:
+        cur.execute(f"DROP TABLE IF EXISTS {src}")
+    # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
+    key = [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+    return key, lines
 
 
 # Delta column-metadata key under which we stash a dbt column description, and the dollar-quote

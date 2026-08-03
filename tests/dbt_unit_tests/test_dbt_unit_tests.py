@@ -124,6 +124,31 @@ def test_sort_by_writes_physically_ordered(tmp_path):
     assert keys == [1, 2, 3, 4, 5], keys  # physically sorted, not the shuffled input order
 
 
+def test_sort_by_auto_writes_clustered(tmp_path):
+    """sort_by='auto' (the dbt spelling of SORTED BY AUTO) profiles the staged model result and
+    picks the sort key itself: sorted_layout_auto's hash-scattered 3-value category must land
+    physically clustered on disk (read back in FILE order, no ORDER BY), while the unique id is
+    grain-stopped out of the key. Also drives the case-insensitive spelling and the rejection of
+    'auto' hidden inside a list."""
+    from deltalake import DeltaTable
+
+    wh = _wh(tmp_path)
+    assert _dbt(wh, "run", "--select", "sorted_layout_auto").success
+    uri = f"{wh}/{SCHEMA}/sorted_layout_auto"
+    cats = DeltaTable(uri).to_pyarrow_table().column("category").to_pylist()
+    assert len(cats) == 200, len(cats)
+    assert cats == sorted(cats), "category not physically clustered — the auto key was not applied"
+    # Case-insensitive: 'AUTO' resolves the same way.
+    assert _dbt(wh, "run", "--select", "sorted_layout_auto",
+                "--vars", "{auto_sort_by: AUTO}").success
+    cats = DeltaTable(uri).to_pyarrow_table().column("category").to_pylist()
+    assert cats == sorted(cats), "AUTO spelling did not cluster"
+    # 'auto' must be the scalar config value — inside a list it is rejected, the run fails.
+    res = _dbt(wh, "run", "--select", "sorted_layout_auto",
+               "--vars", "{auto_sort_by: ['auto']}")
+    assert not res.success, "sort_by=['auto'] should fail the run"
+
+
 # Per-strategy two-run expectations: load 1 = events 1-3 @ original amounts, load 2 = events 1-3
 # RE-EMITTED @ changed amounts + new 4-6. The final {event_id: amount} below is what each strategy's
 # real Delta table must hold after both runs — the row content is what distinguishes the strategies.

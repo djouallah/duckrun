@@ -72,7 +72,7 @@ One caveat dominates everything here, and it is the reason this whole page is fr
 
 `CREATE OR REPLACE TABLE <t> SORTED BY AUTO AS SELECT * FROM <t>` selects the sort key **for you**. You do not pass a column list — duckrun profiles the table (each column's cardinality, skew, null density, and functional dependencies), chooses a short key from that profile, and rewrites every file physically ordered by it.
 
-The selection is a heuristic built on statistical estimates of your data. It is usually a reasonable key; it is never guaranteed to be the best one, and on some data distributions it will not help at all. See [the picker rules](#how-the-automatic-picker-chooses) and their failure modes below.
+The selection is a heuristic built on statistical estimates of your data. It is usually a reasonable key; it is never guaranteed to be the best one, and on some data distributions it will not help at all. See [the picker rules](#how-the-automatic-picker-chooses) and their failure modes below. From dbt, the same picker is reachable as the model config `sort_by: auto` — it profiles the staged model result and writes unsorted when nothing pays off.
 
 ```sql
 -- auto: profile the table, pick the key, rewrite clustered by it

@@ -218,7 +218,10 @@ class Plugin(BasePlugin):
         # preserve_insertion_order=false DuckDB may reorder any result lacking a top-level ORDER BY.
         # A top-level ORDER BY on this read IS honored, so long RLE runs / dictionary locality (the
         # point of the Parquet tuning) are deterministic regardless of the global flag.
-        sort_by = cfg.get("sort_by")
+        # sort_by='auto' resolves here to concrete columns (or None); rewrite cfg so every
+        # downstream cfg.get('sort_by') reader (the merge branch) sees the resolved value too.
+        sort_by = self._resolve_sort_by(cur, name, cfg.get("sort_by"), partition_by)
+        cfg["sort_by"] = sort_by
         if sort_by:
             cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
             order = ", ".join(engine.quote_ident(c) for c in cols)
@@ -358,6 +361,33 @@ class Plugin(BasePlugin):
                 f"Unknown incremental_strategy '{strategy}'. "
                 "Use 'merge', 'insert', 'delete+insert', 'append', or 'microbatch'."
             )
+
+    def _resolve_sort_by(self, cur, name, sort_by, partition_by):
+        """Resolve ``sort_by='auto'`` (case-insensitive scalar) into concrete columns by profiling
+        the staged relation via :func:`engine.auto_sort_cols` — the dbt spelling of the connection
+        API's ``CREATE TABLE … SORTED BY AUTO``, backed by the same sampler. No payoff resolves to
+        ``None`` (unsorted write, exactly as connect() drops the clause). ``'auto'`` inside a list
+        is rejected — which also means a column literally named ``auto`` can't be addressed here.
+        Every other config value passes through untouched."""
+        if isinstance(sort_by, (list, tuple)):
+            if any(isinstance(c, str) and c.strip().lower() == "auto" for c in sort_by):
+                raise ValueError(
+                    "sort_by: 'auto' must be the scalar value (sort_by='auto'), not a list "
+                    "element. Use an explicit column list otherwise."
+                )
+            return sort_by
+        if not (isinstance(sort_by, str) and sort_by.strip().lower() == "auto"):
+            return sort_by
+        pcols = (list(partition_by) if isinstance(partition_by, (list, tuple))
+                 else [partition_by] if partition_by else [])
+        key, lines = engine.auto_sort_cols(cur, name, partition_cols=pcols,
+                                           label=("model", name))
+        for line in lines:  # full advisory (model version, per-column verdicts) at debug
+            engine.logger.debug(line)
+        engine.logger.info(
+            f"duckrun: sort_by=auto for {name} -> "
+            + (", ".join(key) if key else "no sort (nothing pays off)"))
+        return key or None
 
     def _store_overwrite(self, path, cur, data, partition_by, merge_schema, exists,
                          storage_options) -> None:

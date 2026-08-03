@@ -318,6 +318,7 @@ whatever the previous attempt already loaded.
 | `incremental_predicates`| merge / insert: extra predicates AND-ed into the merge (or anti-join) condition (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). On `insert`, a `target.<part> = source.<part>` entry also unlocks literal partition pruning of the target probe. |
 | `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. (`sync_all_columns` only *adds* — delta_rs can't drop columns.) |
 | `partition_by`          | Delta partition column(s).                                                   |
+| `sort_by`               | column(s) to physically ORDER the write by (long RLE runs / dictionary locality — a trailing `ORDER BY` in the model SQL is **not** honored, this config is). The scalar `'auto'` (case-insensitive, **experimental**) profiles the staged model result and picks the key itself — the same heuristic as the connection API's `SORTED BY AUTO`. It writes unsorted when nothing pays off, re-profiles every incremental batch (so the key can vary run to run), and is inert on the delta_rs `merge` / `microbatch` / `delete+insert` paths, which keep the table's existing layout. See [Automatic sorting](parquet-layout.md#automatic-sorting). |
 | `merge_schema`          | allow schema evolution on write.                                            |
 | `storage_options`       | per-model override forwarded to deltalake.                                   |
 

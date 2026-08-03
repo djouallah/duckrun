@@ -329,6 +329,7 @@ don't run other writers against a microbatch table during its window.
 | `incremental_predicates` | extra predicates AND-ed into the merge condition — use to prune partitions on big targets |
 | `on_schema_change` | `ignore` (default) / `append_new_columns` / `fail`. `sync_all_columns` only ADDS — delta-rs cannot drop columns |
 | `partition_by` | Delta partition column(s) |
+| `sort_by` | column(s) to physically ORDER the write by; the scalar `'auto'` (experimental) picks the key by profiling the model result — same heuristic as the connection API's `SORTED BY AUTO`, unsorted when nothing pays off. Inert on merge/microbatch/delete+insert |
 | `merge_schema` | allow schema evolution on write |
 | `merge_max_spill_size` | bytes cap on delta-rs's merge pool before it spills to disk; sensible cgroup-aware default; `0` disables |
 | `merge_streamed_exec` | `true` streams a HUGE source instead of collecting it — at the cost of losing target-file pruning. Default `false` is right for the normal small-delta-into-big-table case |

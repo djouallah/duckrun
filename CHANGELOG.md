@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`sort_by: auto` on dbt models (experimental)** — the connection API's `SORTED BY AUTO` sort-key
+  picker is now reachable from dbt as a magic value on the existing `sort_by` config (scalar,
+  case-insensitive; project-wide via `+sort_by: auto` in `dbt_project.yml`). The staged model result
+  is profiled with the same sampler both surfaces now share (`engine.auto_sort_cols`), the chosen key
+  is logged, and when nothing pays off the write is simply unsorted — exactly as connect() drops the
+  clause. `'auto'` hidden inside a column list is rejected. Explicit `sort_by` lists, and every other
+  config, are untouched.
 - **The remote path now reports the temp notebook's item id**, so a run's Fabric capacity can be
   attributed to the item that was billed for it (#21). Fabric bills a notebook run's compute against
   the notebook **item**, but both remote surfaces created that item, ran it and deleted it without

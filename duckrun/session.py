@@ -1434,37 +1434,22 @@ class DuckSession:
 
     def _auto_sort_cols(self, relation, seed: Optional[int] = None) -> List[str]:
         """Run the sort-key recommender over an arbitrary relation (no Delta table behind it, so no
-        partitions and no log stats) and return the recommended ORDER BY columns, or ``[]`` if nothing
-        pays off. Backs the no-arg ``DataFrame.sort()``. Profiles a bounded reservoir sample, not the
-        whole relation — sized by a schema-only width estimate (no Delta log to read real bytes), and
-        NEVER exact (a relation's row count is unknown without evaluating it, so uniqueness is never
-        claimed here). ``seed`` makes the reservoir sample reproducible."""
-        cols = list(relation.columns)
-        types = {n: str(t) for n, t in zip(relation.columns, relation.types)}
-        if not cols:
-            return []
-        # No Delta log → estimate the in-memory row width from the schema alone; total_rows unknown
-        # (None) → plan_sample never returns exact, so this path always samples.
-        plan_rows, exact = sortkey.plan_sample(None, sortkey.estimate_row_bytes(types))
-        samp = (f"reservoir({plan_rows} ROWS) REPEATABLE ({int(seed)})"
-                if seed is not None else f"{plan_rows} ROWS")
-        view, src = "_rle_relation_src", "_rle_src"
+        partitions and no log stats) and return the recommended ORDER BY columns, or ``[]`` if
+        nothing pays off. Backs ``SORTED BY AUTO`` over a derived query. Thin delegate: registers
+        the relation as a view and hands it to :func:`engine.auto_sort_cols` — the shared sampler
+        behind this path and dbt's ``sort_by='auto'`` — so both surfaces profile identically.
+        ``seed`` makes the reservoir sample reproducible."""
+        view = "_rle_relation_src"
         relation.create_view(view, replace=True)
         try:
-            self.con.execute(
-                f"CREATE OR REPLACE TEMP TABLE {src} AS "
-                f"SELECT * FROM {view} USING SAMPLE {samp}")
-            rows, _, lines = sortkey.recommend_sort_key(
-                self.con, "df", "sort()", src, cols, types, [], sample_rows=plan_rows, exact=exact)
+            cols, lines = engine.auto_sort_cols(self.con, view, seed=seed)
         finally:
-            self.con.execute(f"DROP TABLE IF EXISTS {src}")
             self.con.execute(f"DROP VIEW IF EXISTS {view}")
         # The no-arg sort() path prints ONLY the ORDER BY line (not the full advisory block).
         for line in lines:
             if line.strip().startswith("ORDER BY"):
                 print(line)
-        # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
-        return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+        return cols
 
     def _auto_sort_cols_from_table(self, source_table: str, seed: Optional[int] = None) -> List[str]:
         """No-arg ``df.sort()`` key for a frame that carries a source TABLE: profile it via ``_get_rle``,
