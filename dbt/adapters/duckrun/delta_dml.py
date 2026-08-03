@@ -1384,14 +1384,14 @@ class _DeltaDML:
         if materialize_tag is None:
             data = self.cursor.sql(sql)
             engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
-                                          storage_options=self.so)
+                                          storage_options=self.so, cur=self.cursor)
             return
         tmp = engine.tmp_name(materialize_tag, loc)
         self.cursor.execute(f'create or replace temp table "{tmp}" as {sql}')
         try:
             data = self.cursor.sql(f'select * from "{tmp}"')
             engine.overwrite_if_unchanged(loc, data, read_version=vB, overwrite_schema=True,
-                                          storage_options=self.so)
+                                          storage_options=self.so, cur=self.cursor)
         finally:
             self.cursor.execute(f'drop table if exists "{tmp}"')
 

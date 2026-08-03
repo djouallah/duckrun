@@ -682,6 +682,7 @@ class Plugin(BasePlugin):
                 read_version=vB,
                 partition_by=partition_by,
                 storage_options=storage_options,
+                cur=cur,
             )
         finally:
             cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
