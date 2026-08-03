@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 from typing import Any, Dict, List, Optional
 
@@ -503,7 +504,9 @@ def mem_profile(label: str, con=None, interval: float = 0.1):
 # hash-join pool, and starving that pool makes delta_rs raise "Resources exhausted" (the merge can't
 # fit its working set) — the opposite failure from an OOM. DuckDB also spills gracefully under a
 # tight limit, whereas the delta_rs pool is brittle, so the merge gets the bulk. 0.3 + 0.6 leaves
-# ~10% slack for Python, Arrow buffers, and page cache.
+# ~10% slack for Python, Arrow buffers, and page cache. The shares are sized to the WHOLE budget,
+# not a per-thread slice — ``_MERGE_GATE`` (below) keeps that honest at threads > 1 by letting
+# only one delta_rs merge run at a time.
 _DUCKDB_MEM_FRACTION = 0.3   # DuckDB's memory_limit (see set_merge_memory_limit)
 _MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size (in-memory pool)
 _MERGE_TEMP_DIR_FRACTION = 0.8  # delta_rs merge max_temp_directory_size, as a share of free spill disk
@@ -544,20 +547,15 @@ def pool_workers(n_items: int) -> int:
     return max(1, min(per_thread, n_items))
 
 
-def _default_merge_spill_size() -> Optional[int]:
-    """delta_rs merge ``max_spill_size`` default: ~60% of the *effective* memory limit
-    (the tightest of physical RAM, the cgroup/container cap, and the RAM free at startup), so
-    the merge spills to disk instead of being OOM-killed. None if the limit is unknown (then the
-    merge runs unbounded, as it did before).
-
-    Divided by the run's thread count: the share is a slice of ONE process's memory, so N models
-    merging at once must each take 1/N of it or they sum past the cap together.
-
-    Caveat: this bounds delta_rs's merge *pool*, not the whole process — the Arrow source,
-    read buffers, and spill-file page cache live outside it — so on a tight container with a
-    large source the total can still exceed the cap. Override with ``merge_max_spill_size``."""
-    limit = _effective_mem_limit_bytes()
-    return int(limit * _MERGE_SPILL_FRACTION / RUN_THREADS) if limit else None
+# At most ONE delta_rs merge runs at a time, and it holds the FULL merge budget (the RAM pool
+# and the disk spill cap below). The merge is the only write whose working set is a large share
+# of the whole process budget — delta_rs holds ~99% of merge RSS while DuckDB sits near-idle —
+# so the alternative, dividing the caps by the thread count, charges every merge for concurrency
+# that usually isn't happening (one big merge at threads=4 would get a quarter of the budget with
+# the other three threads running views and appends). Concurrent merges queue here instead; the
+# other dbt threads keep running everything cheap (anti-join inserts, appends, overwrites) while
+# a merge holds the gate. Two big merges overlapping would also thrash the one spill disk.
+_MERGE_GATE = threading.Lock()
 
 
 def _merge_spill_dir() -> str:
@@ -578,16 +576,16 @@ def _default_merge_temp_dir_size() -> Optional[int]:
     bounds bytes on disk. Sizing it to the actual disk lets a big merge spill as far as the disk allows.
 
     0.8, not all of it, because DuckDB spills to the same disk during the merge (source collection) and
-    the dbt target dir + delta_rs write staging also live there — leave ~20% slack. Divided by the run's
-    thread count for the same reason as ``max_spill_size``: concurrent merges spill to ONE disk. None if
-    free space can't be read (then delta_rs keeps its 100 GB default). Override with
-    ``merge_max_temp_directory_size``."""
+    the dbt target dir + delta_rs write staging also live there — leave ~20% slack. Not divided by the
+    thread count: ``_MERGE_GATE`` serializes delta_rs merges, so at most one is spilling at a time and
+    it gets the whole disk. None if free space can't be read (then delta_rs keeps its 100 GB default).
+    Override with ``merge_max_temp_directory_size``."""
     import shutil
     try:
         free = shutil.disk_usage(_merge_spill_dir()).free
     except Exception:
         return None
-    return int(free * _MERGE_TEMP_DIR_FRACTION / RUN_THREADS) or None
+    return int(free * _MERGE_TEMP_DIR_FRACTION) or None
 
 
 # Units DuckDB emits from current_setting('memory_limit') (e.g. "25.0 GiB"). Binary (GiB) and
@@ -1807,7 +1805,7 @@ def merge_delta(
       always runs ``merge_schema=False`` — never letting delta_rs back-fill a new column onto a
       matched row from the source.
     - max_spill_size caps the merge's in-memory pool (bytes); beyond it delta_rs spills the
-      join to disk instead of OOMing. None -> default to ~60% of RAM (_default_merge_spill_size);
+      join to disk instead of OOMing. None -> default to ~60% of RAM (see _merge_spill_caps);
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
     - max_temp_directory_size caps the merge's ON-DISK spill (bytes). delta_rs/DataFusion otherwise
       hard-caps it at a flat 100 GB regardless of disk size, aborting a wide merge on a terabyte disk.
@@ -2431,10 +2429,6 @@ def merge_delta_clauses(
       * the generated SQL will not bind (``AntiJoinUnsupported``): a MERGE ``ON`` predicate is
         DataFusion SQL and may use something DuckDB does not accept. Nothing is committed before that
         point, so falling through is safe."""
-    spill_kwargs, temp_dir_kwargs = _merge_spill_caps(
-        max_spill_size, max_temp_directory_size, streamed_exec
-    )
-
     # A merge always has an existing target (a brand-new table is created, never merged into), so
     # the caller (the dbt materialization / conn.sql MERGE INTO) always pins the version it read.
     # read_version=None would silently merge against HEAD and reopen the read->write gap — refuse it.
@@ -2487,26 +2481,42 @@ def merge_delta_clauses(
             except Exception:  # pragma: no cover - the view is temp; a failed drop is harmless
                 pass
 
-    dt = _delta_table(path, storage_options)
-    # Pin the target to the snapshot the model read (vB, or vB+1 after a decoupled add-columns commit)
-    # so OCC validates (effective_version, HEAD] — one snapshot for both the read and the commit.
-    dt.load_as_version(effective_version)
+    # One delta_rs merge at a time (see _MERGE_GATE): the spill caps are sized to the WHOLE
+    # budget, not a 1/N share, so two merges running together would sum past it. The caps are
+    # resolved AFTER the gate so free RAM/disk are sampled when this merge actually starts, not
+    # while the previous one still holds its working set — and so a merge diverted to the
+    # anti-join above never logs caps it doesn't use.
+    if not _MERGE_GATE.acquire(blocking=False):
+        logger.info("merge gate: waiting for an in-flight delta_rs merge to finish")
+        _MERGE_GATE.acquire()
+    try:
+        spill_kwargs, temp_dir_kwargs = _merge_spill_caps(
+            max_spill_size, max_temp_directory_size, streamed_exec
+        )
 
-    predicate = _merge_partition_prune(dt, data, predicate, streamed_exec)
+        dt = _delta_table(path, storage_options)
+        # Pin the target to the snapshot the model read (vB, or vB+1 after a decoupled add-columns
+        # commit) so OCC validates (effective_version, HEAD] — one snapshot for both the read and
+        # the commit.
+        dt.load_as_version(effective_version)
 
-    merger = dt.merge(
-        source=data,
-        predicate=predicate,
-        source_alias="source",
-        target_alias="target",
-        merge_schema=False,
-        streamed_exec=streamed_exec,
-        **spill_kwargs,
-        **temp_dir_kwargs,
-    )
-    for c in clauses:
-        merger = _apply_merge_clause(merger, c)
-    merger.execute()
+        predicate = _merge_partition_prune(dt, data, predicate, streamed_exec)
+
+        merger = dt.merge(
+            source=data,
+            predicate=predicate,
+            source_alias="source",
+            target_alias="target",
+            merge_schema=False,
+            streamed_exec=streamed_exec,
+            **spill_kwargs,
+            **temp_dir_kwargs,
+        )
+        for c in clauses:
+            merger = _apply_merge_clause(merger, c)
+        merger.execute()
+    finally:
+        _MERGE_GATE.release()
 
     # Same best-effort maintenance as the append / delete+insert paths: a merged-on-every-run
     # incremental table fragments into small files and leaves tombstoned old versions otherwise.

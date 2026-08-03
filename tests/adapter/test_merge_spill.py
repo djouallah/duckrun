@@ -9,6 +9,7 @@ currently-available RAM) and lets a model override it via ``merge_max_spill_size
 ``configure_duckdb_session`` + ``restore_memory_limit``). These tests pin that wiring down.
 """
 import re
+import threading
 import time
 
 import duckdb
@@ -107,9 +108,10 @@ def test_effective_limit_adds_own_rss_back(monkeypatch):
     assert engine._effective_mem_limit_bytes() == 16 * 2 ** 30
 
 
-def test_default_merge_spill_size_is_fraction_of_effective_limit(monkeypatch):
+def test_default_merge_spill_cap_is_fraction_of_effective_limit(monkeypatch):
     monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
-    assert engine._default_merge_spill_size() == int(16 * 2 ** 30 * engine._MERGE_SPILL_FRACTION)
+    spill_kwargs, _ = engine._merge_spill_caps(None, None, False)
+    assert spill_kwargs["max_spill_size"] == int(16 * 2 ** 30 * engine._MERGE_SPILL_FRACTION)
     assert 0 < engine._MERGE_SPILL_FRACTION < 1
 
 
@@ -321,13 +323,49 @@ def _spy(monkeypatch):
     return captured
 
 
+def test_delta_rs_merges_serialize_on_the_gate(monkeypatch):
+    """The spill caps are sized to the WHOLE budget (no 1/N division by the thread count), which is
+    only safe because _MERGE_GATE lets one delta_rs merge run at a time — two concurrent merges must
+    never be inside execute() together."""
+    state = {"active": 0, "peak": 0}
+    track = threading.Lock()
+
+    class _OverlapMerger(_FakeMerger):
+        def execute(self):
+            with track:
+                state["active"] += 1
+                state["peak"] = max(state["peak"], state["active"])
+            time.sleep(0.05)  # long enough for the second thread to reach the gate
+            with track:
+                state["active"] -= 1
+
+    class _OverlapTable(_FakeDeltaTable):
+        def merge(self, **kwargs):
+            return _OverlapMerger()
+
+    monkeypatch.setattr(engine, "_delta_table", lambda path, so: _OverlapTable({}))
+    monkeypatch.setattr(engine, "_maintain", lambda *a, **k: None)
+
+    threads = [
+        threading.Thread(
+            target=lambda: engine.merge_delta("target", _table([1]), "id", read_version=0))
+        for _ in range(2)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    # peak == 0 means neither merge reached execute() (an error upstream); 2 means they overlapped.
+    assert state["peak"] == 1
+
+
 def test_max_spill_size_defaults_to_effective_fraction(monkeypatch):
     # Pin the limit so the forwarded cap can be compared exactly (free RAM is now sampled live
     # on every call, so two unpinned reads would differ by a few KB and flake).
     monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
     captured = _spy(monkeypatch)
     engine.merge_delta("target", _table([1]), "id", read_version=0)
-    assert captured["max_spill_size"] == engine._default_merge_spill_size()
+    assert captured["max_spill_size"] == int(16 * 2 ** 30 * engine._MERGE_SPILL_FRACTION)
 
 
 def test_max_spill_size_explicit_is_forwarded(monkeypatch):

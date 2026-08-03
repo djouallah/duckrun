@@ -144,10 +144,15 @@ All notable changes to this project will be documented in this file.
   - **Concurrent writers share one memory budget.** DuckDB's `memory_limit` belongs to the database,
     not to a model, so the old per-model clamp (0.85 for a write, 0.3 for a merge) would have had
     each writer claim the whole share and a starting write reset a running merge's tighter limit.
-    Above one thread the limit is instead fixed once for the run at the tighter share, the per-model
-    setters stand down, and the delta-rs merge pool and spill-disk budget are divided by the thread
-    count. Big writes still complete; they spill to disk sooner. One large merge is still fastest at
-    `threads: 1` — the win is many independent, network-bound models.
+    Above one thread the limit is instead fixed once for the run at the tighter share and the
+    per-model setters stand down. delta-rs merges are serialized on a process-wide gate: at most one
+    runs at a time and holds the **full** merge pool and disk spill cap. Dividing those budgets by
+    the thread count would instead charge every merge for concurrency that usually isn't happening —
+    delta-rs holds ~99% of a merge's memory while DuckDB sits near idle, so one large merge at
+    `threads: 4` would run on a quarter of its budget while the other three threads build views. The
+    other threads keep running everything cheap (views, appends, overwrites, insert-only anti-join
+    merges) while a merge holds the gate; the caps are resolved when the merge actually starts, so
+    free RAM and disk are sampled then, not while a previous merge still holds its working set.
   - **A microbatch model's batches run in order.** Every batch writes the same table, so they
     serialize on the Delta log regardless, and running them concurrently only raced them to rebuild
     the model's read view (a DuckDB catalog write-write conflict). Different *models* still run in

@@ -69,10 +69,11 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   real table rather than a row set:
     - **Concurrent writers share one memory budget.** DuckDB's `memory_limit` applies to the
       database, not to a model, so above one thread duckrun fixes it once for the run at the tighter
-      of its two shares instead of letting each model set its own, and divides the delta-rs merge
-      pool by the thread count. Writes still complete — they spill to disk sooner. A single big
-      merge is therefore usually fastest at `threads: 1`; many independent, network-bound models
-      benefit most from more.
+      of its two shares instead of letting each model set its own. delta-rs merges are serialized:
+      at most one runs at a time and holds the **full** merge pool and disk spill cap, while the
+      other threads keep running everything else (views, appends, overwrites, insert-only merges).
+      A run of many genuinely small merges therefore won't overlap them; many independent,
+      network-bound models benefit most from more threads.
     - **A microbatch model's batches run in order**, even at higher thread counts, because every
       batch writes the same table: they'd serialize on the Delta log anyway. Different *models*
       still run in parallel.

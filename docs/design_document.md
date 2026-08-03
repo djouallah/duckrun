@@ -178,11 +178,15 @@ DuckDB and delta_rs each manage their own memory and neither knows the other exi
 **merge** — the one path where both peak in the same process at the same time (DuckDB
 producing the source relation, delta_rs running the join pool) — they share one RAM budget
 with no shared allocator. duckrun therefore carves a single *effective* limit into static
-shares (`engine.set_merge_memory_limit` / `_default_merge_spill_size`):
+shares (`engine.set_merge_memory_limit` / `_merge_spill_caps`):
 
 - DuckDB `memory_limit` → `_DUCKDB_MEM_FRACTION` (**0.3**),
 - delta_rs `max_spill_size` → `_MERGE_SPILL_FRACTION` (**0.6**),
 - the remaining **~10%** is slack for Python, Arrow buffers, and page cache.
+
+The shares are sized to the whole budget, never a per-thread slice: at `threads > 1` delta-rs
+merges are serialized (`engine._MERGE_GATE`), so at most one merge runs at a time and holds the
+full merge pool and disk spill cap while the other threads keep running the cheap write paths.
 
 Past its share each consumer **spills to disk** rather than OOM-killing the container. The
 write path (overwrite/append/microbatch) has no competing delta_rs pool, so DuckDB
