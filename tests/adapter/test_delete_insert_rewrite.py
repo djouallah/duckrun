@@ -393,6 +393,31 @@ def test_insert_strategy_routes_to_the_duckdb_append(tmp_path, monkeypatch, cfg_
     assert seen == (["duckdb"] if expect_duckdb else ["delta_rs"])
 
 
+def test_insert_strategy_forwards_the_merge_overrides(tmp_path, monkeypatch):
+    """incremental_strategy='insert' forwards merge_max_spill_size / merge_max_temp_directory_size /
+    merge_streamed_exec to engine.merge_delta. streamed_exec matters most: it is the documented way
+    back to a real delta_rs merge for this spelling (the engine diverts to the anti-join only when
+    it is False), and it used to be silently dropped on this path; the spill caps bound the pool if
+    the engine falls through to delta_rs (AntiJoinUnsupported)."""
+    path = (tmp_path / "t").as_posix()
+    write_deltalake(path, pa.table({"id": ["1"], "a": ["x"]}))
+    con = duckdb.connect()
+    con.execute("create view increment as select '2' as id, 'y' as a")
+
+    seen = {}
+    monkeypatch.setattr(engine, "merge_delta", lambda *a, **k: seen.update(k))
+    _store_plugin(con).store(_store_target_config(path, "increment", {
+        "incremental": True, "full_refresh": False, "dbt_believes_exists": True,
+        "incremental_strategy": "insert", "unique_key": "id",
+        "merge_max_spill_size": 123, "merge_max_temp_directory_size": 456,
+        "merge_streamed_exec": True,
+        "read_version": DeltaTable(path).version(),
+    }))
+    assert seen.get("max_spill_size") == 123
+    assert seen.get("max_temp_directory_size") == 456
+    assert seen.get("streamed_exec") is True
+
+
 def test_merge_strategy_still_routes_to_delta_rs(tmp_path, monkeypatch):
     """Scope guard: only insert-only moved. A true upsert must remove old row versions, which can
     never be a plain append, so `merge` is untouched."""

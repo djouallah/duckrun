@@ -169,15 +169,6 @@ def _is_restore(query: str) -> bool:
     return bool(_RESTORE_RE.match(_strip_leading(query)))
 
 
-_MERGE_RE = re.compile(r"(?is)^\s*merge\s+into\b")
-
-
-def _is_merge(query: str) -> bool:
-    """True if ``query`` is a ``MERGE INTO …`` — the write that shares the process with delta_rs's own
-    merge pool, so DuckDB's memory_limit is tightened to its split share (not just the write share)."""
-    return bool(_MERGE_RE.match(_strip_leading(query)))
-
-
 def _delta_write_message(query: str) -> str:
     """The error for a raw-SQL write conn.sql() can't route to delta_rs. For an INSERT/UPDATE/DELETE
     whose target isn't a discovered Delta table — the common cause being a typo or a table written
@@ -382,11 +373,10 @@ class DuckSession:
         self._in_explicit_txn = False  # an explicit BEGIN … is open on self.con (Delta writes can't join it)
 
         self.con = duckdb.connect()
+        # Session tuning + the one memory_limit pin (85% of the container-aware effective limit) —
+        # so neither a write nor an interactive read can OOM on DuckDB's host-RAM default in a
+        # container. Mirrors the dbt path; no per-write clamp/restore dance beyond this.
         engine.configure_duckdb_session(self.con)
-        # DuckDB's memory_limit as configured (its host-RAM default; configure_duckdb_session leaves it
-        # alone). A Delta write clamps DOWN from this and restores to it — so a write can't OOM on a
-        # container's host-RAM default while interactive reads keep full memory. Mirrors the dbt path.
-        self._baseline_memory_limit: Optional[str] = engine.read_memory_limit(self.con)
 
         # The catalog registry: name -> _CatEntry (root / creds / read-only). "Which catalog & schema
         # is current" is NOT tracked here — DuckDB owns it (current_database() / current_schema(),
@@ -779,21 +769,11 @@ class DuckSession:
         self._catalogs[name] = entry._replace(storage_options=so)
 
     def _handle_delta_write(self, entry, query: str) -> bool:
-        """Route a Delta write through ``delta_dml.handle`` with the DuckDB ``memory_limit`` clamped to
-        the write-path share (and tightened to the merge split for a ``MERGE``, which shares the process
-        with delta_rs's merge pool), then restored to the baseline. Without this the write inherits
-        DuckDB's host-physical-RAM default and OOM-kills the session on a container — the same clamp the
-        dbt path applies in ``store()``, reusing the same engine helpers so the two can't drift. The
-        restore keeps interactive reads at full memory once the write is done."""
-        baseline = self._baseline_memory_limit
-        engine.set_write_memory_limit(self.con, baseline)
-        if _is_merge(query):
-            engine.set_merge_memory_limit(self.con)
-        try:
-            return delta_dml.handle(self.con, entry.root_path, entry.storage_options,
-                                    query, default_schema=self._current_database)
-        finally:
-            engine.restore_memory_limit(self.con, baseline)
+        """Route a Delta write through ``delta_dml.handle``. Memory is already handled: the session's
+        ``memory_limit`` was pinned once at connect (``configure_duckdb_session``), and a ``MERGE``'s
+        delta_rs pool is bounded by its own spill caps behind the merge gate in the engine."""
+        return delta_dml.handle(self.con, entry.root_path, entry.storage_options,
+                                query, default_schema=self._current_database)
 
     def sql(self, query: str) -> duckdb.DuckDBPyRelation:
         """Run a query and return DuckDB's native ``DuckDBPyRelation`` — unwrapped, with all of its

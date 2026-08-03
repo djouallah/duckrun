@@ -172,40 +172,35 @@ So the plugin overrides `configure_cursor(cursor)` to stash the live per-model c
 `store()`/`load()` read on **that** cursor (falling back to the shared connection). The
 pre-hook variable, the staged view, and the delta_rs read all share one session.
 
-### 3. Memory: one cap split across two engines  (`engine.py`) { #3-memory-one-cap-split-across-two-engines }
+### 3. Memory: one pin + the delta-rs spill caps  (`engine.py`) { #3-memory-one-cap-split-across-two-engines }
 
-DuckDB and delta_rs each manage their own memory and neither knows the other exists. On a
-**merge** — the one path where both peak in the same process at the same time (DuckDB
-producing the source relation, delta_rs running the join pool) — they share one RAM budget
-with no shared allocator. duckrun therefore carves a single *effective* limit into static
-shares (`engine.set_merge_memory_limit` / `_merge_spill_caps`):
+DuckDB and delta_rs each manage their own memory and neither knows the other exists. Profiling
+(`DUCKRUN_MEM_PROFILE`) settled who matters: during a delta-rs merge, **delta_rs holds ~99% of
+process RSS while DuckDB sits near ~15 MB** — the merge pool is the OOM driver, not DuckDB. So
+duckrun does not divide the budget between them; it applies two independent guardrails:
 
-- DuckDB `memory_limit` → `_DUCKDB_MEM_FRACTION` (**0.3**),
-- delta_rs `max_spill_size` → `_MERGE_SPILL_FRACTION` (**0.6**),
-- the remaining **~10%** is slack for Python, Arrow buffers, and page cache.
+- **One DuckDB `memory_limit` pin**, once per connection at any thread count
+  (`configure_duckdb_session` → `_pin_memory_limit`): `_MEM_LIMIT_FRACTION` (**0.85**) of the
+  effective limit, tighten-only so an explicit lower profile limit wins. It exists because
+  DuckDB's own default is 80% of *host* physical RAM, blind to cgroups — on Fabric/k8s that
+  sees the whole node, not our slice, and the kernel OOM-kills us.
+- **The delta-rs merge spill caps** (`_merge_spill_caps`): `max_spill_size` →
+  `_MERGE_SPILL_FRACTION` (**0.6**) of the effective limit for the in-memory pool, and
+  `max_temp_directory_size` for the on-disk spill. Past the cap the merge spills instead of
+  OOMing.
 
-The shares are sized to the whole budget, never a per-thread slice: at `threads > 1` delta-rs
-merges are serialized (`engine._MERGE_GATE`), so at most one merge runs at a time and holds the
-full merge pool and disk spill cap while the other threads keep running the cheap write paths.
-
-Past its share each consumer **spills to disk** rather than OOM-killing the container. The
-write path (overwrite/append/microbatch) has no competing delta_rs pool, so DuckDB
-gets the bulk — clamped to `_WRITE_MEM_FRACTION` (**0.85**) of the effective limit
-(`engine.set_write_memory_limit`).
-
-At `threads > 1` the limit can't be set per model (it is global to the DuckDB instance), so it is
-pinned once at connection setup — to the **write** share. The merge share is applied lazily, by the
-first delta-rs merge, and is never raised back for the rest of the run. The pin used to take the
-merge share up front, which charged every run for a pool it might never allocate: a project whose
-facts all use `incremental_strategy='insert'` runs no delta-rs merge at all, yet DuckDB was capped at
-0.3 while 0.6 sat reserved and unused — measured as an OOM on a 29 GiB node with ~20 GiB idle.
+0.85 + 0.6 deliberately sum past 1.0 — they are not shares of a divided budget. Measurement
+shows the two consumers never peak together, and the caps are sized to the whole budget, never
+a per-thread slice: at `threads > 1` delta-rs merges are serialized (`engine._MERGE_GATE`), so
+at most one merge runs at a time and holds the full merge pool and disk spill cap while the
+other threads keep running the cheap write paths.
 
 The effective limit (`_effective_mem_limit_bytes`) is the **tightest of physical RAM, the
-cgroup/container cap, and the RAM actually free**, sampled fresh per job. It is cgroup-aware
-on purpose: on Fabric/k8s, DuckDB's own default (80% of *physical* RAM) sees the whole
-node, not our slice, so without this clamp the kernel OOM-kills us.
+cgroup/container cap, and the RAM actually free** (sampled fresh per merge for the spill caps).
+It is cgroup-aware on purpose: on Fabric/k8s, DuckDB's own default sees the whole node, not our
+slice, so without this clamp the kernel OOM-kills us.
 
-This is a coordination layer that exists *only* because two independent processes split one
+This is a coordination layer that exists *only* because two independent engines share one
 RAM budget. A single engine would not need it — see [Tradeoffs](#tradeoffs).
 
 ## Cross-process state
@@ -225,15 +220,15 @@ Two engines split across a write means paying for a handoff that a single native
 wouldn't. The honest costs:
 
 - **Managing memory across two independent systems is a hack.** This is the headline cost.
-  Neither engine knows the other exists, yet on a merge both peak in one process against one
-  RAM budget with no shared allocator. duckrun papers over that with a *static* `0.3` /
-  `0.6` / `0.7` split (see [§3](#3-memory-one-cap-split-across-two-engines)) and a
-  cgroup-derived limit sampled per job. There is no split that is right for every workload:
-  pick wrong and you either starve the merge pool ("Resources exhausted") or overcommit and
-  get OOM-killed. A single engine has **one allocator over one budget** and spills against
-  its own true peak — it will always be more predictable than two processes dividing a number
-  they each only estimate. A native engine needs no tuning constant here at all; this one
-  does, and the constant is a guess.
+  Neither engine knows the other exists, yet they run in one process against one RAM budget
+  with no shared allocator. duckrun papers over that with a static `memory_limit` pin (0.85)
+  plus per-merge spill caps (see [§3](#3-memory-one-cap-split-across-two-engines)) derived
+  from a cgroup-aware limit. The constants are still guesses backed by measurement, not an
+  allocator: size the merge cap wrong and you either starve the pool ("Resources exhausted")
+  or overcommit and get OOM-killed. A single engine has **one allocator over one budget** and
+  spills against its own true peak — it will always be more predictable than two engines each
+  bounded by a number they only estimate. A native engine needs no tuning constant here at
+  all; this one does.
 - **The Arrow bridge isn't truly zero-copy.** The C-stream interface passes buffers by
   pointer, but DuckDB's internal vector format is *not* Arrow — producing the Arrow stream
   materializes DuckDB's results into Arrow buffers first. So "zero-copy" describes the

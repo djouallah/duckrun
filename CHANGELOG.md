@@ -4,6 +4,37 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **The DuckDB-vs-delta_rs memory split is gone; one pin remains.** The memory machinery exists to
+  stop complex merges from OOMing a container — it was never meant to tax every other path. Profiling
+  (`DUCKRUN_MEM_PROFILE`) showed that during a delta_rs merge, delta_rs holds ~99% of process RSS
+  while DuckDB sits near ~15 MB — so the per-model "tighten DuckDB to its 0.3 merge share" dance
+  protected nothing and reserved 30% of the budget for a consumer that doesn't use it. What actually
+  prevents the OOM is unchanged and kept: target pruning (`streamed_exec=False`), the delta_rs
+  `max_spill_size` cap (~60% of the effective limit), the merge gate (one delta_rs merge at a time,
+  full budget), the disk-spill cap, and bounding DuckDB's container-blind 80%-of-host-RAM default.
+  That last bound is now the *only* `memory_limit` duckrun sets: pinned once per connection at any
+  thread count, to 85% of the container-aware effective limit, tighten-only so a lower profile limit
+  wins. Deleted: `set_merge_memory_limit`, `set_write_memory_limit`, `restore_memory_limit`, the
+  threads>1-only shared pin, and the 0.3 `_DUCKDB_MEM_FRACTION`. Merges now leave DuckDB at the same
+  85% as every other path (the point of the change), and `duckrun.connect()` sessions are pinned at
+  connect time instead of clamped-per-write-then-restored — interactive reads are now bounded on
+  containers too, instead of running at DuckDB's host-RAM default. This also dissolves three latent
+  holes in the old dance: a merge diverted to the DuckDB anti-join pinned a threads>1 run to the 0.3
+  share for the rest of the run, the anti-join fall-through could allocate the merge pool without
+  ever tightening, and the unlocked tighten could race at threads>1.
+
+### Fixed
+- **`incremental_strategy='insert'` now forwards the merge overrides.** `merge_streamed_exec: true`
+  is the documented way back to a real delta_rs merge for the insert spelling, but the flag (and
+  `merge_max_spill_size` / `merge_max_temp_directory_size`) was silently dropped on that path — the
+  anti-join divert was unconditional and the fall-through merge ignored the model's caps.
+- **`merge_max_temp_directory_size` is now actually passed by the dbt macro.** It was documented and
+  read by the plugin, but the materialization never put the key in the config it hands over, so a
+  model setting it silently kept the default.
+- **The threads>1 run-start log told the old story** ("the delta_rs merge pool is divided between
+  them") — merges serialize on a gate, each holding the full spill cap; the log now says so.
+
 ### Added
 - **A write whose row estimate turned out badly low now says so.** After a full-table overwrite, the
   rows that actually landed are exact and free in the just-committed Delta log, so duckrun compares

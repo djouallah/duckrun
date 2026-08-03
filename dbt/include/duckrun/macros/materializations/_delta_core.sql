@@ -217,6 +217,7 @@
       'merge_returning_columns': config.get('merge_returning_columns'),
       'merge_clauses': config.get('merge_clauses'),
       'merge_max_spill_size': config.get('merge_max_spill_size'),
+      'merge_max_temp_directory_size': config.get('merge_max_temp_directory_size'),
       'merge_streamed_exec': config.get('merge_streamed_exec'),
       'incremental_predicates': config.get('incremental_predicates') or config.get('predicates'),
       'on_schema_change': config.get('on_schema_change', 'ignore'),

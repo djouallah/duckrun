@@ -573,37 +573,34 @@ def mem_profile(label: str, con=None, interval: float = 0.1):
     return _MemSampler(label, con=con, interval=interval)
 
 
-# How the effective memory limit is split between the two big consumers that can peak at the
-# same time during a merge — DuckDB (producing the source relation) and delta_rs (the merge
-# pool). They share one cap, so the shares must sum *under* 1.0 or we've just moved the OOM; each
-# consumer spills to disk past its share rather than OOM-killing the container. The merge gets the
-# larger share: when DuckDB is only *streaming* the merge source it needs far less than the merge's
-# hash-join pool, and starving that pool makes delta_rs raise "Resources exhausted" (the merge can't
-# fit its working set) — the opposite failure from an OOM. DuckDB also spills gracefully under a
-# tight limit, whereas the delta_rs pool is brittle, so the merge gets the bulk. 0.3 + 0.6 leaves
-# ~10% slack for Python, Arrow buffers, and page cache. The shares are sized to the WHOLE budget,
-# not a per-thread slice — ``_MERGE_GATE`` (below) keeps that honest at threads > 1 by letting
-# only one delta_rs merge run at a time.
-_DUCKDB_MEM_FRACTION = 0.3   # DuckDB's memory_limit (see set_merge_memory_limit)
+# The two delta_rs merge spill caps. ``max_spill_size`` bounds the merge's in-memory pool — the
+# consumer that actually OOMs: profiling (DUCKRUN_MEM_PROFILE) measured that during a merge
+# delta_rs holds ~99% of process RSS while DuckDB sits near ~15 MB. Sized to the WHOLE effective
+# limit, not a per-thread slice — ``_MERGE_GATE`` (below) keeps that honest by letting only one
+# delta_rs merge run at a time. Past the cap the merge spills to disk instead of OOM-killing the
+# container; too small a cap makes delta_rs raise "Resources exhausted" instead (the merge can't
+# fit its working set), so the cap gets the bulk of the budget.
 _MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size (in-memory pool)
 _MERGE_TEMP_DIR_FRACTION = 0.8  # delta_rs merge max_temp_directory_size, as a share of free spill disk
 
-# Write path (overwrite/append/append_if_unchanged/microbatch): DuckDB runs alone — no competing delta_rs
-# merge pool — so it gets the bulk of the cap, not a 0.3 share. But it must still be BOUNDED to the
-# effective limit, because DuckDB's own default memory_limit is 80% of *physical* RAM, and on a
-# container (Fabric/k8s) physical RAM is the whole node, not our slice — so the default
-# overcommits and the kernel OOM-kills us. 0.85 of the effective limit (which folds in available RAM,
-# the only signal that reflects the container on Fabric where the cgroup is the unlimited root)
-# leaves ~15% for the Parquet writer's row-group buffers, the Arrow batch in flight, and — the real
-# reason for the margin — DuckDB overshooting its own *soft* memory_limit. Safe because the job owns
-# the machine (effective folds in currently-free RAM, so the OS/other processes are already excluded);
-# on a shared box, drop back toward 0.8 to leave slack for other tenants growing mid-run.
-_WRITE_MEM_FRACTION = 0.85
+# The one DuckDB memory_limit pin, applied once per connection (see _pin_memory_limit). It exists
+# because DuckDB's own default memory_limit is 80% of *physical* RAM, and on a container
+# (Fabric/k8s) physical RAM is the whole node, not our slice — so the default overcommits and the
+# kernel OOM-kills us. 0.85 of the effective limit (which folds in available RAM, the only signal
+# that reflects the container on Fabric where the cgroup is the unlimited root) leaves ~15% for the
+# Parquet writer's row-group buffers, the Arrow batch in flight, and — the real reason for the
+# margin — DuckDB overshooting its own *soft* memory_limit. 0.85 + the 0.6 merge cap above
+# deliberately "sum past 1.0": they are not shares of a divided budget but two independent
+# guardrails on different consumers, and measurement shows they never peak together (DuckDB is
+# near-idle while a delta_rs merge runs). Safe because the job owns the machine (effective folds in
+# currently-free RAM, so the OS/other processes are already excluded); on a shared box, drop back
+# toward 0.8 to leave slack for other tenants growing mid-run.
+_MEM_LIMIT_FRACTION = 0.85
 
 # How many dbt models can be writing at once — dbt's `threads`, published here by the adapter
-# (see set_run_threads) because the memory shares above are per-process, not per-model. 1 for the
-# connection API and for any dbt run that doesn't set `threads`, so the single-threaded behaviour
-# is byte-identical to before. Process-global like POOL_WORKERS: one dbt run per process.
+# (see set_run_threads). Used to divide the discovery pool (pool_workers) and by the plugin's
+# multi-thread cursor guard. 1 for the connection API and for any dbt run that doesn't set
+# `threads`. Process-global like POOL_WORKERS: one dbt run per process.
 RUN_THREADS = 1
 
 
@@ -703,20 +700,12 @@ def configure_duckdb_session(con) -> None:
     re-parsing every footer each scan — a real win over OneLake/remote where each footer is a
     round-trip. (DuckDB's data cache — ``enable_external_file_cache`` — is already on by default.)
 
-    Single-threaded runs leave the DuckDB ``memory_limit`` ALONE here; it's set per model in
-    ``store()``. The write path clamps it to ``_WRITE_MEM_FRACTION`` of the effective limit
-    (``set_write_memory_limit``) — DuckDB has no competing delta_rs pool there so it gets the bulk,
-    but still bounded so its host-physical-RAM default can't OOM-kill a container. The merge path
-    tightens further to its 0.3 share (``set_merge_memory_limit``).
-
-    At ``threads > 1`` that per-model dance is unsafe: ``memory_limit`` is GLOBAL to the DuckDB
-    *instance*, not the cursor, so N writers would each claim the whole write share, and a model
-    entering the write path would reset the limit out from under a concurrent merge. So the limit is
-    instead pinned ONCE, here, to the WRITE share, and ``set_write_memory_limit`` becomes a no-op
-    (see set_run_threads). The merge share is not pre-applied: the first delta_rs merge tightens the
-    pin to 0.3 and it stays there — so a run that never merges keeps the full write share instead of
-    reserving 60% of the box for a pool nothing allocates (see ``_set_shared_memory_limit``)."""
-    _set_shared_memory_limit(con)
+    The ``memory_limit`` is pinned ONCE here, for every connection at any thread count
+    (``_pin_memory_limit``): 85% of the container-aware effective limit, tighten-only so an
+    explicit lower profile limit wins. There is no per-model or per-path memory dance beyond
+    this — delta_rs merges are bounded separately by their own spill caps (``_merge_spill_caps``)
+    and serialized on ``_MERGE_GATE``."""
+    _pin_memory_limit(con)
     try:
         con.execute("SET preserve_insertion_order=false")
     except Exception:  # best-effort tuning: a failed SET must not abort connection setup
@@ -743,9 +732,9 @@ def configure_duckdb_session(con) -> None:
             os.environ.setdefault("TMPDIR", spill_dir)  # delta_rs + tempfile off the tiny /tmp
     except Exception:  # best-effort: never abort connection setup over a spill dir
         pass
-    # An in-memory DuckDB defaults to an empty temp_directory and then *cannot* spill; give it one so a
-    # tight memory_limit (set later for a merge) degrades to disk instead of erroring. Respect an
-    # explicit temp_directory (a file-backed DB, or a user override).
+    # An in-memory DuckDB defaults to an empty temp_directory and then *cannot* spill; give it one so
+    # the session's pinned memory_limit degrades to disk instead of erroring. Respect an explicit
+    # temp_directory (a file-backed DB, or a user override).
     try:
         tmp = con.execute("SELECT current_setting('temp_directory')").fetchone()[0]
     except Exception:  # best-effort: if we can't read it, skip overriding rather than guess
@@ -759,133 +748,39 @@ def configure_duckdb_session(con) -> None:
 
 def read_memory_limit(con) -> Optional[str]:
     """DuckDB's current ``memory_limit`` as it reports it (e.g. '25.0 GiB'), or None if
-    unreadable. Captured once at connection setup as the baseline to restore on write paths."""
+    unreadable."""
     try:
         return con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
-    except Exception:  # best-effort: unreadable limit -> None baseline (write path skips clamping)
+    except Exception:  # best-effort: unreadable limit -> None (the pin then applies unconditionally)
         return None
 
 
-def _set_shared_memory_limit(con) -> None:
-    """Multi-threaded runs only: pin ``memory_limit`` once, at connection setup, to the WRITE share.
+def _pin_memory_limit(con) -> None:
+    """Pin DuckDB's ``memory_limit`` once, at connection setup, at any thread count: 85%
+    (``_MEM_LIMIT_FRACTION``) of the container-aware effective limit. This is the only place
+    duckrun touches ``memory_limit`` — there is no per-model or per-path tightening. Bounding
+    DuckDB matters because its own default is 80% of *host* physical RAM, blind to
+    cgroups/containers (the original Fabric OOM); bounding it *further* around merges does not:
+    profiling showed delta_rs holds ~99% of merge RSS, and delta_rs is bounded by its own spill
+    caps (``_merge_spill_caps``) behind ``_MERGE_GATE``, not by DuckDB's limit.
 
-    ``memory_limit`` is a GLOBAL DuckDB setting, so with concurrent writers there is no such thing as
-    "this model's limit" — the last SET wins for everyone, and the per-model dance
-    ``set_write_memory_limit`` does at threads=1 would have one model reset the limit out from under
-    a concurrent merge. So it is fixed once here instead, and ``set_write_memory_limit`` stands down.
-
-    It is pinned to ``_WRITE_MEM_FRACTION``, NOT the merge share. This used to pin the tightest share
-    any path could ask for (``_DUCKDB_MEM_FRACTION``, 0.3) up front, on the reasoning that we cannot
-    know which models will merge. That was wrong in the expensive direction: a project that never
-    runs a delta_rs merge — every fact on ``incremental_strategy='insert'``, or plain table/append
-    models — reserved 60% of the box for a merge pool that was never allocated and capped DuckDB at
-    30%, while the docstring claimed the cost was only "spills to disk sooner". Measured on a 29 GiB
-    node at threads=4: pinned to 8.72 GiB, and the build died with ~20 GiB idle
-    ("failed to pin block of size 256.0 KiB (8.7/8.7 GiB used)"). It also silently defeated the
-    ``insert`` path's deliberate choice NOT to take the merge share (see delta_plugin).
-
-    The merge share is applied LAZILY instead: the first delta_rs merge tightens the pin to 0.3 via
-    ``set_merge_memory_limit`` and nothing raises it back for the rest of the run. So a run that
-    never merges never sees 0.3, and a run that does gets exactly the old behaviour from its first
-    merge onward. Single-threaded runs keep the per-model behaviour untouched."""
-    if RUN_THREADS <= 1:
-        return
+    Tighten-only: an explicit lower profile limit wins; no-op when the effective limit is
+    unknown (leave DuckDB's default alone rather than guess)."""
     limit = _effective_mem_limit_bytes()
     if not limit:
         return
-    target = int(limit * _WRITE_MEM_FRACTION)
+    target = int(limit * _MEM_LIMIT_FRACTION)
     current = _parse_byte_size(read_memory_limit(con))
     if current is not None and current <= target:
         return  # an explicit lower profile limit wins
     try:
         con.execute(f"SET memory_limit='{target}B'")
         logger.info(
-            f"threads={RUN_THREADS}: DuckDB memory_limit pinned to {target / 2 ** 30:.2f} GiB "
-            f"({int(_WRITE_MEM_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB effective limit); "
-            f"concurrent writers share it, and the first delta_rs merge tightens it to the "
-            f"{int(_DUCKDB_MEM_FRACTION * 100)}% merge share for the rest of the run"
+            f"DuckDB memory_limit pinned to {target / 2 ** 30:.2f} GiB "
+            f"({int(_MEM_LIMIT_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB "
+            f"{_effective_mem_limit_source()}); delta_rs merges serialize on a gate with a "
+            f"{int(_MERGE_SPILL_FRACTION * 100)}% spill cap"
         )
-    except Exception:  # best-effort tuning: a failed SET leaves the prior limit, no abort
-        pass
-
-
-def set_merge_memory_limit(con) -> None:
-    """Tighten DuckDB's ``memory_limit`` to its merge share (``_DUCKDB_MEM_FRACTION`` of the
-    effective limit) right before a merge, so DuckDB (producing the source) and the delta_rs merge
-    pool (``max_spill_size`` = ``_MERGE_SPILL_FRACTION``) fit together in one process. This is the
-    *only* place the split is applied — overwrite/append never call it. Tighten-only: never raises
-    a lower current/profile limit; no-op when the effective limit is unknown.
-
-    At ``threads > 1`` this is what applies the merge share at all, and it applies it for the REST OF
-    THE RUN: the connection is pinned to the larger write share at setup (``_set_shared_memory_limit``)
-    and ``set_write_memory_limit`` stands down there, so nothing raises the limit back afterward. That
-    one-way tighten is deliberate — the limit is global to the DuckDB instance, so a per-model
-    raise/lower dance would reset it out from under a concurrent merge. Lowering it mid-run does not
-    abort a running query: ``memory_limit`` is checked on new allocations, so a concurrent writer
-    already above the new target simply spills from there on. The cost is that a run's first merge
-    tightens DuckDB for every later model too, merge or not; the benefit is that a run with NO merge
-    never pays the merge share at all (see ``_set_shared_memory_limit``)."""
-    limit = _effective_mem_limit_bytes()
-    if not limit:
-        return
-    target = int(limit * _DUCKDB_MEM_FRACTION)
-    current = _parse_byte_size(read_memory_limit(con))
-    # Tighten only: skip when an explicit limit is already at/below our target.
-    if current is None or current > target:
-        try:
-            con.execute(f"SET memory_limit='{target}B'")
-            logger.info(
-                f"merge: DuckDB memory_limit set to {target / 2 ** 30:.2f} GiB "
-                f"({int(_DUCKDB_MEM_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB effective limit)"
-            )
-        except Exception:  # best-effort tuning: a failed SET leaves the prior limit, no abort
-            pass
-
-
-def restore_memory_limit(con, baseline: Optional[str]) -> None:
-    """Restore DuckDB's ``memory_limit`` to the connection ``baseline`` — its profile value, or
-    DuckDB's own default if none. No-op if the baseline is unknown."""
-    if not baseline:
-        return
-    try:
-        con.execute(f"SET memory_limit='{baseline}'")
-    except Exception:  # best-effort restore: a failed SET leaves the current limit, no abort
-        pass
-
-
-def set_write_memory_limit(con, baseline: Optional[str]) -> None:
-    """Write-path (overwrite/append/append_if_unchanged/microbatch) ``memory_limit``: the connection
-    ``baseline``, clamped DOWN to ``_WRITE_MEM_FRACTION`` of the effective limit. The write path
-    has no competing delta_rs pool, so DuckDB gets the bulk — but still bounded, because DuckDB's
-    own default is 80% of *physical* RAM, which on a container is the whole node, not our slice, and
-    OOM-kills us (the bug this fixes on Fabric). Also undoes any tightening a prior merge left on the
-    shared connection, by setting the limit absolutely (not tighten-only) from the baseline.
-
-    Set to ``min(baseline, _WRITE_MEM_FRACTION * effective)`` so an explicit lower profile limit is
-    respected and the bogus host default is capped. Falls back to restoring the baseline string when
-    the effective limit is unknown; no-op when neither is known.
-
-    No-op at ``threads > 1``: ``memory_limit`` is global to the DuckDB instance, so restoring the
-    write share here would raise the limit out from under a concurrent merge that had tightened it —
-    the exact OOM the split exists to prevent. Multi-threaded runs pin it once instead
-    (``_set_shared_memory_limit``)."""
-    if RUN_THREADS > 1:
-        return
-    eff = _effective_mem_limit_bytes()
-    target = int(eff * _WRITE_MEM_FRACTION) if eff else None
-    base_bytes = _parse_byte_size(baseline)
-    candidates = [v for v in (base_bytes, target) if v]
-    if not candidates:
-        restore_memory_limit(con, baseline)
-        return
-    final = min(candidates)
-    try:
-        con.execute(f"SET memory_limit='{final}B'")
-        if target is not None and final == target:
-            logger.info(
-                f"write: DuckDB memory_limit set to {final / 2 ** 30:.2f} GiB "
-                f"({int(_WRITE_MEM_FRACTION * 100)}% of {eff / 2 ** 30:.2f} GiB effective limit)"
-            )
     except Exception:  # best-effort tuning: a failed SET leaves the prior limit, no abort
         pass
 
@@ -2006,7 +1901,7 @@ def merge_delta(
     - delete_unmatched_by_source: the "WHEN NOT MATCHED BY SOURCE THEN DELETE" form — also remove
       target rows the source doesn't carry. True deletes every unmatched target row (full sync); a
       string deletes only those matching that predicate; None (default, used by the dbt incremental
-      strategies) adds no such clause. Used by the connection-API ``df.merge`` full-sync option.
+      strategies) adds no such clause.
 
     After the merge, run the same best-effort maintenance the append/delete+insert paths use
     (``_maintain``): compact small files when the byte debt is worth it, vacuum tombstoned old

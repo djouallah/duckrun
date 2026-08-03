@@ -63,10 +63,6 @@ class Plugin(BasePlugin):
         # check-then-act (two threads must not both decide they're the first batch) and the token
         # refresh's read-modify-write of _storage_options / _catalogs.
         self._lock = threading.Lock()
-        # DuckDB's memory_limit as it stood when the connection was configured (profile value,
-        # or DuckDB's own default). Restored on the overwrite/append path so DuckDB manages its
-        # own memory; the merge path tightens it to DuckDB's split share instead.
-        self._baseline_memory_limit: Optional[str] = None
         # Microbatch: remember which (invocation, path) pairs we've written this run, so a
         # multi-batch --full-refresh truncates the table on its *first* batch only and appends
         # the rest. Keyed by dbt's per-run invocation_id, so two runs in one process (the test
@@ -81,14 +77,12 @@ class Plugin(BasePlugin):
             conn.execute("INSTALL delta; LOAD delta;")
         except Exception:  # best-effort: delta may already be loaded / autoloaded; reads still work
             pass
-        # Always-on write-path tuning (preserve_insertion_order=false + a temp_directory to spill
-        # to). The DuckDB memory_limit is NOT touched here — store() sets it per model: the write
-        # path clamps to _WRITE_MEM_FRACTION of the effective limit (set_write_memory_limit), the
-        # merge path to its 0.3 share (set_merge_memory_limit). Capture the baseline limit (profile
-        # value or DuckDB's default) so store() can clamp DOWN from it rather than guess a floor.
+        # Always-on session tuning (preserve_insertion_order=false, a temp_directory to spill to,
+        # and the one memory_limit pin — 85% of the effective limit, tighten-only, all thread
+        # counts). No per-model memory tuning happens after this; delta_rs merges are bounded by
+        # their own spill caps behind the merge gate.
         try:
             engine.configure_duckdb_session(conn)
-            self._baseline_memory_limit = engine.read_memory_limit(conn)
         except Exception:  # best-effort tuning: a failure just leaves DuckDB's defaults in place
             pass
         # If a bearer token was supplied in storage_options (e.g. OneLake/ADLS), mint a
@@ -206,12 +200,6 @@ class Plugin(BasePlugin):
         # Keep `cur` referenced for the whole write so the relation's Arrow stream
         # stays valid while deltalake consumes it.
         cur = self._cursor()
-        # Start every model bounded to the write-path share (_WRITE_MEM_FRACTION of the effective
-        # limit), clamping DuckDB's host-physical-RAM default that OOM-kills us on containers. Also
-        # undoes any tightening a previous merge left on the shared connection; the merge branch
-        # below re-tightens to its 0.3 share. So the write clamp applies to overwrite/append/
-        # microbatch, and the 0.3/0.6 split applies to merge ONLY.
-        engine.set_write_memory_limit(cur, self._baseline_memory_limit)
         name = self._relation_name(target_config.relation)
         # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
         # honored here — the staged relation is read through a wrapper SELECT *, and with
@@ -336,11 +324,10 @@ class Plugin(BasePlugin):
             evolve_schema, _ = self._resolve_schema_change(
                 (cfg.get("on_schema_change") or "ignore").lower(), path, data, storage_options
             )
-            # No set_merge_memory_limit here: nothing runs a delta_rs merge pool alongside DuckDB, so
-            # DuckDB keeps the full write share instead of the 0.3 merge share — at threads=1 the one
-            # store() applied, at threads>1 the shared connection pin. (That used to hold only at
-            # threads=1: the shared pin took the merge share up front, so an insert-only project paid
-            # for a pool it never allocated and OOM'd with most of the box idle.)
+            # No per-model memory tuning: the session pin covers every path, and the anti-join
+            # runs at DuckDB's full pinned limit. The merge overrides are forwarded so the
+            # `merge_streamed_exec: true` escape hatch (and the spill caps, should the engine
+            # fall through to a real delta_rs merge) work on this spelling too.
             with engine.mem_profile("insert", con=cur):
                 self._store_insert(
                     path, cur, name, data, unique_key, storage_options,
@@ -350,6 +337,9 @@ class Plugin(BasePlugin):
                     incremental_predicates=cfg.get("incremental_predicates"),
                     insert_condition=cfg.get("merge_insert_condition"),
                     sort_by=sort_by,
+                    max_spill_size=cfg.get("merge_max_spill_size"),
+                    max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
+                    streamed_exec=bool(cfg.get("merge_streamed_exec")),
                 )
             if src_tmp is not None:
                 cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")
@@ -416,20 +406,15 @@ class Plugin(BasePlugin):
 
     def _store_merge(self, path, cur, data, cfg, unique_key, strategy, storage_options,
                      src_tmp) -> None:
-        """The merge / insert strategies: validate config, resolve on_schema_change, tighten the
-        DuckDB memory share, and dispatch to the clause-core (merge_clauses /
-        merge_update_set_expressions) or the flat-kwarg merge_delta path.
+        """The merge / insert strategies: validate config, resolve on_schema_change, and dispatch
+        to the clause-core (merge_clauses / merge_update_set_expressions) or the flat-kwarg
+        merge_delta path.
 
         ``partition_by`` / ``sort_by`` are forwarded even though a merge writes into whatever
         partitioning the table already has: an insert-only clause list is ROUTED to the anti-join +
         plain append inside ``engine.merge_delta_clauses``, and that append needs them for the exact
         partition ``IN`` probe filter (``engine.probe_filters``) and the write order. They are inert on
-        the delta_rs merge branch, which never reads them.
-
-        One accepted difference from ``incremental_strategy='insert'``: this path has already called
-        ``set_merge_memory_limit``, so a routed anti-join computes under DuckDB's 0.3 merge share rather
-        than the full write share. Correct, just more spill-prone — the routing decision lives in the
-        engine, so the plugin cannot know in advance that no delta_rs pool will run."""
+        the delta_rs merge branch, which never reads them."""
         # Validate the merge config shape FIRST — before any Delta access, memory tuning, or
         # write — so an invalid config fails fast and cleanly (no partial/late delta_rs
         # "Schema error" after the log has moved). Messages mirror dbt-duckdb's
@@ -448,9 +433,6 @@ class Plugin(BasePlugin):
         evolve_schema, existing_cols = self._resolve_schema_change(
             on_schema_change, path, data, storage_options
         )
-        # Merge is the only path where DuckDB and the delta_rs pool peak together: tighten
-        # DuckDB to its share so the two fit. (write/append left it at the baseline.)
-        engine.set_merge_memory_limit(cur)
         # streamed_exec: default False so delta_rs collects the source and uses its stats to
         # prune the target (right for small incremental deltas into a large table). A model
         # whose source is itself huge can set merge_streamed_exec=true to stream it instead.
@@ -694,6 +676,7 @@ class Plugin(BasePlugin):
         self, path, cur, name, data, unique_key, storage_options,
         read_version=None, partition_by=None, merge_schema=False,
         incremental_predicates=None, insert_condition=None, sort_by=None,
+        max_spill_size=None, max_temp_directory_size=None, streamed_exec=False,
     ) -> None:
         """dbt ``incremental_strategy='insert'``: append only the batch rows whose ``unique_key`` is
         not already in the target — an idempotent dedupe-append.
@@ -760,6 +743,9 @@ class Plugin(BasePlugin):
             sort_by=sort_by,
             storage_options=storage_options,
             cur=cur,
+            max_spill_size=max_spill_size,
+            max_temp_directory_size=max_temp_directory_size,
+            streamed_exec=streamed_exec,
         )
 
     @staticmethod

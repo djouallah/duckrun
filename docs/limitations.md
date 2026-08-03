@@ -68,14 +68,10 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   it. Two things behave differently from a pure-SQL adapter, both because a duckrun model writes a
   real table rather than a row set:
     - **Concurrent writers share one memory budget.** DuckDB's `memory_limit` applies to the
-      database, not to a model, so above one thread duckrun fixes it once for the run instead of
-      letting each model set its own. It is fixed at the **write** share; the smaller merge share is
-      applied only when a delta-rs merge actually runs, and then stays for the rest of the run. So a
-      project with no merge model — every fact on `insert`, or plain `table`/`append` models — keeps
-      the full write budget rather than reserving most of the box for a merge pool nothing allocates.
-      delta-rs merges are serialized: at most one runs at a time and holds the **full** merge pool
-      and disk spill cap, while the other threads keep running everything else (views, appends,
-      overwrites, insert-only merges).
+      database, not to a model, so duckrun pins it once for the run (85% of the container-aware
+      effective limit) — no model sets its own. delta-rs merges are serialized: at most one runs
+      at a time and holds the **full** merge pool and disk spill cap, while the other threads keep
+      running everything else (views, appends, overwrites, insert-only merges).
       A run of many genuinely small merges therefore won't overlap them; many independent,
       network-bound models benefit most from more threads.
     - **A microbatch model's batches run in order**, even at higher thread counts, because every
@@ -155,10 +151,11 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
 ## Memory
 
 - **Two engines share one machine's memory.** DuckDB and delta-rs each keep their own pool in the same
-  process; heavy merges split the budget, and that split is fragile (delta-rs's merge spill-to-disk is
-  itself flaky). Background in the [Design document](design_document.md). This applies to the `merge`
-  strategy and the raw `MERGE INTO` verb. `insert`, `delete+insert`, `append`, `microbatch` and
-  `overwrite` do not run a delta-rs merge pool at all, so DuckDB keeps the full write budget there.
+  process. duckrun bounds them independently — DuckDB by one pinned `memory_limit`, a delta-rs merge
+  by its own spill caps behind a gate — but a bound is not a shared allocator, and delta-rs's merge
+  spill-to-disk is itself flaky. Background in the [Design document](design_document.md). The merge
+  pool exists only for the `merge` strategy and the raw `MERGE INTO` verb; `insert`, `delete+insert`,
+  `append`, `microbatch` and `overwrite` never run one.
 - **`merge` is the write path most likely to run out of memory, and the ceiling is not duckrun's.**
   A delta-rs `MERGE` plans a join against the whole pinned target, so its cost scales with the
   target's *partition span*, not the size of the batch — a batch straddling many monthly partitions

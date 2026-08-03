@@ -6,7 +6,7 @@ shapes against it — mixed upsert, insert-only, update-only, idempotent re-merg
 delta-rs clause set (CDC delete+update+insert, by-source delete, expression update) — plus a
 plain `append` and `overwrite` of the same batch for comparison, all through the
 **connection API** (`duckrun.connect()` + `conn.sql(...)` — no dbt), on a single machine with
-duckrun's shipping memory defaults (per-merge DuckDB `memory_limit` + delta_rs `max_spill_size`
+duckrun's shipping memory defaults (the session DuckDB `memory_limit` pin + delta_rs `max_spill_size`
 + target pruning). It runs on a standard **GitHub-hosted runner (~16 GB RAM)** — no beefy
 hardware — proving the merges stay within that RAM and apply every UPDATE/INSERT/DELETE
 correctly, and lets you compare a MERGE's cost against a plain write of the same batch. It gates

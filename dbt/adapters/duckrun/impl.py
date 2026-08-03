@@ -88,16 +88,15 @@ class DuckrunAdapter(DuckDBAdapter):
         # outright). The cursor is now per-thread, matching dbt-duckdb's own model of one child
         # cursor per dbt thread, so the pin is gone.
         #
-        # The memory shares, though, are per-process: DuckDB's memory_limit is global to the
-        # database instance and the delta_rs merge pool is a slice of the same RAM. So publish the
-        # thread count to the engine, which divides those shares and — above 1 — pins memory_limit
-        # once for the run instead of letting each model set it. See engine.set_run_threads.
+        # Publish the thread count to the engine: it divides the discovery pool (pool_workers)
+        # and backs the plugin's multi-thread cursor guard. See engine.set_run_threads.
         from . import engine
         engine.set_run_threads(getattr(config, "threads", 1))
         if engine.RUN_THREADS > 1:
             logger.info(
                 f"duckrun: running {engine.RUN_THREADS} threads; concurrent writers share one "
-                f"DuckDB memory_limit and the delta_rs merge pool is divided between them"
+                f"pinned DuckDB memory_limit, and delta_rs merges serialize on a gate — each "
+                f"holding the full spill cap while other threads keep running the cheap paths"
             )
 
     @available

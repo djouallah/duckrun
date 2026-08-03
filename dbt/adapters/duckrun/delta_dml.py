@@ -60,8 +60,7 @@ Supported / unsupported (what reaches delta_rs):
                                                              (multi-key/range/non-equi). ON/WHEN may
                                                              use your own aliases or the table/relation
                                                              names (normalized to the target/source
-                                                             aliases delta_rs uses). Same boundary as
-                                                             DeltaTable.merge.
+                                                             aliases delta_rs uses).
     update … from / delete … using / multi-stmt              NOT handled here — the connection API
                                                              (session.sql) rejects them with a clear
                                                              error; the dbt path never emits them.
@@ -843,9 +842,8 @@ def validate_merge_condition(condition: str) -> None:
     """Raise if the merge ``ON`` condition references a qualifier other than the canonical
     ``target``/``source`` (user aliases are already rewritten to those by the caller). Does NOT
     require a ``target.k = source.k`` key equality — any boolean predicate delta-rs accepts
-    (multi-key, range, non-equi) is allowed, matching the full delta-rs MERGE surface. Shared by the
-    SQL MERGE handler here and the DataFrame ``DeltaTable.merge`` builder so both enforce ONE
-    boundary."""
+    (multi-key, range, non-equi) is allowed, matching the full delta-rs MERGE surface. The SQL
+    MERGE handler is the one caller, so this is the ONE boundary."""
     for qual in _qualifiers(condition):
         if qual.lower() not in ("target", "source"):
             raise ValueError(
@@ -1747,8 +1745,8 @@ class _DeltaDML:
     # -- merge into <target> using <source> on <cond> when … : full delta_rs MERGE ---------------
     def _merge(self, m, rel, schema, loc) -> None:
         """Dispatch a raw SQL MERGE to ``engine.merge_delta_clauses`` — the full delta-rs TableMerger
-        surface, same engine core, snapshot pin, and boundary as the DataFrame ``DeltaTable.merge``
-        builder. Any number of ``WHEN MATCHED`` / ``WHEN NOT MATCHED`` / ``WHEN NOT MATCHED BY
+        surface, with the same engine core and snapshot pin as the dbt merge strategies. Any
+        number of ``WHEN MATCHED`` / ``WHEN NOT MATCHED`` / ``WHEN NOT MATCHED BY
         SOURCE`` clauses are parsed in order; the ON condition may be any boolean predicate. The ON
         and WHEN clauses may use the user's own aliases (``MERGE INTO t a USING s b ON a.k = b.k``)
         or the table/relation names; these are normalized to the literal ``target``/``source``
@@ -1813,15 +1811,14 @@ class _DeltaDML:
         source = self.cursor.sql(f"select * from {source_part.strip()}")
         # A WHEN NOT MATCHED BY SOURCE merge (full-sync) anti-joins the WHOLE target, so collecting the
         # source whole to compute target-pruning stats builds a non-spillable hash → OOM on a large
-        # source. Stream it instead — the raw-SQL equivalent of the builder's streamed_exec=True.
+        # source. Stream it instead (streamed_exec=True; the dbt spelling is merge_streamed_exec).
         by_source = any(c.get("clause") == "not_matched_by_source" for c in clauses)
         engine.merge_delta_clauses(
             loc,
             source,
             cond,
             clauses,
-            # Pin the target to the version read at statement start (single statement) — same as
-            # the builder's .merge(), which captures the version at call time.
+            # Pin the target to the version read at statement start (single statement).
             read_version=self._vB(loc),
             streamed_exec=by_source,
             storage_options=self.so,
