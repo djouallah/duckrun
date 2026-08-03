@@ -1635,6 +1635,16 @@ def _row_groups(conn, table):
         f"from parquet_metadata({files!r}))").fetchone()[0]
 
 
+def _live_row_groups(conn, table):
+    # Same count, but over the table's LIVE files only. An overwrite tombstones the previous version's
+    # parquet without deleting it (vacuum keeps the 168h retention), so a table written more than once
+    # must not be counted with the raw glob _row_groups uses — the retired files would be counted too.
+    from dbt.adapters.duckrun import engine
+    live = engine._delta_table(conn.root_path + "/dbo/" + table, conn.storage_options).file_uris()
+    return conn.sql(f"select count(*) from (select distinct file_name, row_group_id "
+                    f"from parquet_metadata({live!r}))").fetchone()[0]
+
+
 def test_ctas_small_result_adapts_row_groups(conn):
     # A small CTAS result should shrink its row-group ceiling so the table yields more than the 2
     # segments the 16M constant would give. 20M rows / ceil(20M/8) = 2.5M, raised to the 6M estimate
@@ -1701,6 +1711,108 @@ def test_overwrite_seam_adapts_regardless_of_caller(conn):
     assert 3 <= n <= 5, f"overwrite seam did not adapt: {n} row groups"
 
 
+def test_overwrite_floors_the_estimate_with_the_prior_row_count(conn, monkeypatch):
+    # When the table already exists, its prior version's EXACT log row count is a free second signal and
+    # a far better one than the planner guess — so a badly-low estimate no longer pins the table to the
+    # bottom of the segment band (issue #22, where a 370M-row fact estimated ~9x low landed at 380 row
+    # groups where ~34 belong). Both counts are forced so the test doesn't have to write 200M rows.
+    from dbt.adapters.duckrun import engine
+    conn.sql("CREATE OR REPLACE TABLE prior_floor AS select i as j from range(10) t(i)")
+    monkeypatch.setattr(engine, "estimated_rows", lambda cur, data: 100_000)
+    monkeypatch.setattr(engine, "prior_row_count", lambda cur, path, so=None: 200_000_000)
+    conn.sql("CREATE OR REPLACE TABLE prior_floor AS select i as j from range(20000000) t(i)")
+    assert _live_row_groups(conn, "prior_floor") == 2, "the prior count did not lift the bad estimate"
+    # Without a prior count (a first CREATE, or a table whose log can't be read) the same low estimate
+    # falls back to the 6M floor — the blunter, pre-existing defense.
+    monkeypatch.setattr(engine, "prior_row_count", lambda cur, path, so=None: None)
+    conn.sql("CREATE OR REPLACE TABLE prior_floor AS select i as j from range(20000000) t(i)")
+    n = _live_row_groups(conn, "prior_floor")
+    assert 3 <= n <= 5, f"expected the 6M estimate floor (~4 groups) with no prior count, got {n}"
+
+
+def test_prior_row_count_never_lowers_the_ceiling(conn, monkeypatch):
+    # The composition rule is MONOTONE: a prior count may only ever RAISE an estimate that already
+    # exists, never lower one and never create one. That is what makes the prior-count floor provably
+    # non-regressive — no input yields a smaller ceiling than the estimate alone would have given. A
+    # plain max() over both would break exactly here: an overwrite that deliberately SHRINKS a table
+    # must keep the big ceiling, and a failed EXPLAIN must keep _RG_MAX rather than size off a stub.
+    from dbt.adapters.duckrun import engine
+    conn.sql("CREATE OR REPLACE TABLE prior_mono AS select i as j from range(10) t(i)")
+    monkeypatch.setattr(engine, "estimated_rows", lambda cur, data: 200_000_000)
+    monkeypatch.setattr(engine, "prior_row_count", lambda cur, path, so=None: 1_000_000)
+    conn.sql("CREATE OR REPLACE TABLE prior_mono AS select i as j from range(20000000) t(i)")
+    assert _live_row_groups(conn, "prior_mono") == 2, "a small prior count lowered the ceiling"
+
+
+def test_prior_row_count_failure_is_safe(conn, monkeypatch):
+    # The prior count only ever IMPROVES a ceiling the estimate already produced, so a failure reading
+    # it must keep the estimate's answer — not break the write, and not discard it back to _RG_MAX.
+    from dbt.adapters.duckrun import engine
+
+    def boom(cur, path, so=None):
+        raise RuntimeError("store exploded")
+
+    monkeypatch.setattr(engine, "estimated_rows", lambda cur, data: 100_000)
+    monkeypatch.setattr(engine, "prior_row_count", boom)
+    conn.sql("CREATE OR REPLACE TABLE prior_safe AS select i as j from range(20000000) t(i)")
+    assert conn.sql("select count(*) from prior_safe").fetchone()[0] == 20000000
+    n = _row_groups(conn, "prior_safe")
+    assert 3 <= n <= 5, f"a prior-count failure discarded the estimate's ceiling: {n} row groups"
+
+
+def test_prior_row_count_swallows_a_store_error(conn):
+    # prior_row_count must NOT inherit open_if_exists' fail-loud contract. That one re-raises a transient
+    # store error because a wrong EXISTENCE answer is data loss; this is only SIZING, where a wrong
+    # answer costs segment shape and never correctness — so every failure degrades to "unknown".
+    from dbt.adapters.duckrun import engine
+    assert engine.prior_row_count(conn._connection, conn.root_path + "/dbo/never_written") is None
+    assert engine.prior_row_count(None, conn.root_path + "/dbo/anything") is None  # no cursor
+
+
+def test_replace_where_keeps_the_flat_ceiling(conn, monkeypatch):
+    # A replaceWhere writes a SLICE, not a table, so it deliberately bypasses the overwrite sizing seam:
+    # ceil(slice_rows / RG_LANES) would size this window off a number that says nothing about the
+    # table's segment budget, and it is also what structurally keeps the prior-count floor away from a
+    # partial replace (where "rows in the table" is a meaningless proxy for "rows in this slice").
+    from dbt.adapters.duckrun import engine
+    seen, called = [], []
+    orig = engine.build_write_deltalake_args
+    monkeypatch.setattr(engine, "build_write_deltalake_args",
+                        lambda *a, **k: (seen.append(k.get("row_group_rows")), orig(*a, **k))[1])
+    monkeypatch.setattr(engine, "estimated_rows",
+                        lambda cur, data: called.append("est") or 1_000_000)
+    monkeypatch.setattr(engine, "prior_row_count",
+                        lambda cur, path, so=None: called.append("prior") or None)
+    conn.sql("CREATE OR REPLACE TABLE rw_flat AS select i as j from range(100) t(i)")
+    loc = conn.root_path + "/dbo/rw_flat"
+    vB = engine._delta_table(loc, conn.storage_options).version()
+    seen.clear(), called.clear()
+    engine.replace_where(loc, conn._connection.sql("select i as j from range(50) t(i)"),
+                         "j < 50", read_version=vB, storage_options=conn.storage_options,
+                         cur=conn._connection)
+    assert seen == [None], f"replaceWhere leaked an adaptive row-group ceiling: {seen}"
+    assert not called, f"replaceWhere took a row estimate it must not take: {called}"
+
+
+def test_overwrite_warns_when_the_estimate_was_far_off(conn, monkeypatch):
+    # The issue-#22 field detector: the rows that actually landed are exact and free in the
+    # just-committed log, so a badly-low estimate is reported instead of silently producing a table
+    # pinned to the bottom of the band. Only the UNDER-estimate direction warns — an over-estimate caps
+    # at _RG_MAX and lets the file roll decide, which is harmless by design.
+    from dbt.adapters.duckrun import engine
+    warned = []
+    monkeypatch.setattr(engine.logger, "warning", lambda msg, *a, **k: warned.append(msg))
+    monkeypatch.setattr(engine, "estimated_rows", lambda cur, data: 100_000)
+    conn.sql("CREATE OR REPLACE TABLE est_off AS select i as j from range(20000000) t(i)")
+    assert len(warned) == 1, f"expected one estimate-accuracy warning, got {warned}"
+    assert "20,000,000" in warned[0] and "100,000" in warned[0], warned[0]
+    # ...and a correctly-estimated write stays silent.
+    warned.clear()
+    monkeypatch.setattr(engine, "estimated_rows", lambda cur, data: 20_000_000)
+    conn.sql("CREATE OR REPLACE TABLE est_ok AS select i as j from range(20000000) t(i)")
+    assert not warned, f"a correctly-sized write warned: {warned}"
+
+
 def test_row_group_rows_reaches_only_overwrite(conn, monkeypatch):
     # The adaptive geometry reaches the write seam only for overwrite; an append (INSERT) keeps
     # row_group_rows=None and — like MERGE — gets delta_rs defaults, no tuned profile at all.
@@ -1759,6 +1871,30 @@ def test_table_num_records_reads_the_log(conn):
     dt = engine._delta_table(conn.root_path + "/dbo/nrec", conn.storage_options)
     assert engine.table_num_records(conn._connection, dt) == 1234567
     assert engine.table_num_records(None, dt) is None  # no cursor -> unknown -> caller keeps 16M
+
+
+def test_table_num_records_is_unknown_when_a_file_lacks_stats(conn):
+    # A log where only SOME live files carry stats must report UNKNOWN, not the partial sum: SQL sum
+    # ignores NULLs, so such a log would answer with a fraction of the table — and compaction trusts
+    # this count at the LOW _RG_MIN floor, so it would size row groups off that fraction. Unknown keeps
+    # the 16M ceiling; a silently-low count pins the table to the bottom of the band, the issue-#22
+    # failure shape reached from the other direction. delta-rs always writes num_records, so this only
+    # fires on a foreign-written log — hence the stub.
+    from dbt.adapters.duckrun import engine
+    cur = conn._connection
+
+    class _Dt:
+        def __init__(self, sql):
+            self.sql = sql
+
+        def get_add_actions(self, flatten=True):
+            return cur.sql(self.sql)
+
+    assert engine.table_num_records(cur, _Dt("select 5::bigint as num_records "
+                                             "union all select 7::bigint")) == 12
+    assert engine.table_num_records(cur, _Dt("select 5::bigint as num_records "
+                                             "union all select null::bigint")) is None
+    assert engine.table_num_records(cur, _Dt("select 0::bigint as num_records")) is None  # empty table
 
 
 def test_deleted_row_count_gates_on_the_protocol(conn):

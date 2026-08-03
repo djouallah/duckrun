@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- **A write whose row estimate turned out badly low now says so.** After a full-table overwrite, the
+  rows that actually landed are exact and free in the just-committed Delta log, so duckrun compares
+  them against the count it sized row groups for and warns when the estimate was low by 4× or more,
+  naming both numbers and pointing at compaction as the remedy. Without it, a table pinned to the
+  bottom of the segment band was invisible until someone inspected the Parquet footers — which is how
+  #22 was found. Only the under-estimate direction warns (an over-estimate is harmless by design) and
+  only when the ceiling was actually shrunk, so a correctly-sized write is silent; a table that merely
+  grows between runs does not trip it either, because the planner sees the new data. The sizing
+  decision itself is also now logged in full at debug level (estimate, its source, the resulting
+  ceiling, and which bound won).
 - **`sort_by: auto` on dbt models (experimental)** — the connection API's `SORTED BY AUTO` sort-key
   picker is now reachable from dbt as a magic value on the existing `sort_by` config (scalar,
   case-insensitive; project-wide via `+sort_by: auto` in `dbt_project.yml`). The staged model result
@@ -139,6 +149,28 @@ All notable changes to this project will be documented in this file.
   rewrites and so can never be an append.
 
 ### Changed
+- **An overwrite of an existing table now sizes its row groups from the table's exact prior row
+  count, not just the planner's guess.** Row-group geometry has only ever had one input: an
+  `EXPLAIN`-derived row estimate that DuckDB does not intend as a measurement — a fixed 0.2 filter
+  selectivity, no cardinality on a set-op parent, a CSV extrapolated from file size. An under-estimate
+  pins a table to the bottom of the segment band permanently, which is how a 370M-row fact landed at
+  380 row groups where ~34 belong (#22). The 6M guess floor capped that damage but could not correct
+  it. When the target table already exists, its prior version's exact row count is free in the Delta
+  log, and it is a far better signal — so it is now read and used to **raise** the estimate when it is
+  larger. The rule is deliberately monotone: a prior count can only ever raise an estimate that
+  already exists, never lower one and never create one, so no input produces a smaller ceiling than
+  before. (An overwrite that deliberately shrinks a table therefore keeps the larger ceiling —
+  harmless, since the 256 MB file roll closes the group anyway.) The log read is skipped entirely when
+  the ceiling is already at the 16M maximum, and any failure reading it leaves the estimate's answer
+  untouched. First creates are unaffected and still rely on the 6M floor.
+  - **`delete+insert` gets adaptive geometry for the first time.** `overwrite_if_unchanged` never took
+    a `cur` argument — unlike its `append_if_unchanged` sibling — so the one strategy that rewrites a
+    whole existing table, and the one path where a prior exact row count is guaranteed to exist, was
+    silently writing at the flat 16M ceiling. It and the `ALTER TABLE ADD/DROP/RENAME COLUMN` rewrites
+    now forward the cursor and size like every other overwrite.
+  - `replaceWhere` writes (the microbatch strategy, `INSERT … REPLACE WHERE`) remain deliberately
+    unsized and now say so in the code: they replace a *slice*, so sizing the window off its own row
+    count would say nothing about the table's segment budget.
 - **`threads` in the profile is honored, so models in one `dbt run` build in parallel.** The
   adapter used to overwrite `config.threads = 1` and refuse to start if that didn't take: `store()`
   hands delta-rs a live Arrow stream off a DuckDB cursor, and the write plugin kept a single cursor
@@ -178,6 +210,18 @@ All notable changes to this project will be documented in this file.
   heuristic that gates the plain `append` strategy.
 
 ### Fixed
+- **A Delta log where only some files carry statistics no longer reports a silently-low row count.**
+  The free row count compaction sizes from is `sum(num_records)` over the log, and SQL `sum` ignores
+  NULLs — so a table whose files were not all written with statistics answered with a *fraction* of
+  its rows, and compaction, which trusts that count at the finer 1M floor, sized its row groups off
+  that fraction. Such a log now reports unknown, which keeps the 16M ceiling: an unknown count costs
+  nothing, a silently-low one pins the table to the bottom of the segment band — the same failure as
+  #22, reached from the other direction. delta-rs always writes `num_records`, so this only affects
+  tables written by something else. An empty table still reports unknown, as before.
+- **The row estimator no longer registers its probe under a fixed name.** Two writes sharing one
+  DuckDB connection — the notebook API driven from user threads, or the adapter's shared-connection
+  fallback — could unregister each other's relation mid-estimate. The name is now per thread and per
+  relation.
 - **The overwrite row estimate no longer drops every `UNION ALL` branch but the first (#22).** A
   `UNION` plan node carries no estimated cardinality of its own while each branch carries one, and
   the walk that reads the plan returned the first child that yielded a number — so an N-feed union

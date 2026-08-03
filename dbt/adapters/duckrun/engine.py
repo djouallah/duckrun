@@ -137,7 +137,10 @@ def estimated_rows(cur, data):
     ``count(*)`` instead; the limit short-circuits the scan, so it stays cheap."""
     if cur is None:
         return None
-    name = "__duckrun_rg_est"
+    # Per-thread, per-relation name: a fixed one would have two concurrent writes sharing a connection
+    # (the notebook API driven from user threads, or the shared-connection fallback in delta_plugin)
+    # clobber each other's registration mid-estimate.
+    name = tmp_name("rgest", (threading.get_ident(), id(data)))
     try:
         cur.register(name, data)
         try:
@@ -149,7 +152,8 @@ def estimated_rows(cur, data):
             return _walk_cardinality(plan)
         finally:
             cur.unregister(name)
-    except Exception:
+    except Exception as exc:
+        logger.debug(f"duckrun: row estimate unavailable: {exc}")
         return None
 
 
@@ -157,15 +161,87 @@ def table_num_records(cur, dt):
     """Total live rows of an EXISTING table from the Delta **log** (sum of per-file num_records) — free,
     no data scan. This is the exact size compaction is about to rewrite, so compaction sizes its row
     groups from it directly (no planner estimate needed). None if unavailable (no cursor, or a stat-less
-    log) so the caller keeps the 16M profile. 0 rows -> None (an empty table has nothing to size)."""
+    log) so the caller keeps the 16M profile. 0 rows -> None (an empty table has nothing to size).
+
+    A log where only SOME live files carry stats reports None too, not the partial sum: SQL ``sum``
+    ignores NULLs, so such a log would answer with a fraction of the table and the caller (compaction,
+    which trusts this count at the LOW RG_MIN floor) would size its row groups off that fraction. An
+    unknown count keeps the 16M ceiling; a silently-low one pins the table to the bottom of the band —
+    the issue-#22 failure shape, reached from the other direction. delta-rs always writes num_records,
+    so this only fires on a foreign-written log.
+
+    Counts PHYSICAL rows: deletion vectors are not subtracted (that costs a DV read — see
+    deleted_row_count). An over-count is the harmless direction here, so this is deliberate."""
     if cur is None:
         return None
     try:
         add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
-        row = cur.sql("select coalesce(sum(num_records), 0)::bigint from add_actions").fetchone()
-    except Exception:
+        row = cur.sql(
+            "select coalesce(sum(num_records), 0)::bigint, "
+            "count(*) filter (where num_records is null) from add_actions"
+        ).fetchone()
+    except Exception as exc:
+        logger.debug(f"duckrun: log row count unavailable: {exc}")
         return None
-    return int(row[0]) if row and row[0] else None   # 0 / null stats -> unknown -> keep 16M
+    if not row:
+        return None
+    total, missing = row[0], row[1]
+    if missing:
+        logger.debug(f"duckrun: {missing} file(s) carry no num_records — row count unknown, keeping 16M")
+        return None
+    return int(total) if total else None   # 0 rows -> unknown -> keep 16M
+
+
+def prior_row_count(cur, path, storage_options=None):
+    """Exact live rows of the table an overwrite is ABOUT TO REPLACE, read from the Delta log — a free
+    lower bound on a planner estimate that cannot be trusted (see policy.RG_MIN_ESTIMATED). None on ANY
+    failure: no cursor, no table yet, a stat-less log, or a transient store error.
+
+    Deliberately NOT ``open_if_exists``'s fail-loud contract. That one re-raises a transient store error
+    because a wrong EXISTENCE answer is data loss (a 503 must not look like "no table" and overwrite an
+    increment over a real one). This is only SIZING — a wrong answer costs segment shape, never
+    correctness — so every error degrades to "unknown" and the write proceeds untouched. Keep the two
+    separate; do not route this through open_if_exists."""
+    if cur is None:
+        return None
+    try:
+        dt = _delta_table(path, storage_options)
+    except Exception as exc:
+        logger.debug(f"duckrun: prior row count unavailable for {path!r}: {exc}")
+        return None
+    return table_num_records(cur, dt)
+
+
+# An overwrite whose row estimate was low by this factor or more gets a warning. 4x is well outside
+# normal planner error and comfortably inside the ~9x that produced issue #22.
+_RG_EST_WARN_FACTOR = 4
+
+
+def _warn_if_estimate_was_far_off(cur, dt, est, row_group_rows):
+    """Tell the user when an overwrite's row estimate turned out badly low — the issue-#22 field
+    detector. The rows that actually landed are exact and free (the just-committed log), so this closes
+    the loop the planner estimate opens: without it, a table pinned to the bottom of the row-group band
+    is invisible until someone inspects the Parquet footers.
+
+    NOT a realized-layout check: the Delta log carries no row-group information at all, only per-file
+    num_records / size_bytes. It compares what we SIZED FOR against what LANDED, nothing more.
+
+    Only the under-estimate direction warns (an over-estimate is harmless by design — it caps at RG_MAX
+    and the file roll decides) and only when the ceiling was actually shrunk, so a correctly-sized write
+    is silent. A table that merely grows run-over-run does not trip it either: the planner sees the new
+    data. Best-effort — never raises, never touches the committed write."""
+    if cur is None or not est or not row_group_rows or row_group_rows >= _RG_MAX:
+        return
+    try:
+        actual = table_num_records(cur, dt)
+        if actual and actual >= _RG_EST_WARN_FACTOR * est:
+            logger.warning(
+                f"duckrun: row-group geometry was sized for ~{est:,} rows but {actual:,} landed "
+                f"({actual / est:.1f}x) — segments are smaller than intended. Compact the table "
+                f"(VACUUM <table> / optimize) to re-lay it out from its exact row count."
+            )
+    except Exception as exc:
+        logger.debug(f"duckrun: estimate-accuracy check skipped: {exc}")
 
 
 def _writer_properties(row_group_rows=None):
@@ -1428,12 +1504,41 @@ def write_delta(
     # This is the ONE rg_for caller whose row count is a planner estimate rather than a measurement, so
     # it is also the one that passes the higher _RG_MIN_ESTIMATED floor — an estimate that is an order
     # of magnitude low must not be able to pin the table to the bottom of the band (issue #22).
+    #
+    # When the table already EXISTS, its prior version's exact log row count is a free second signal, and
+    # a far better one than the guess. The composition rule is MONOTONE: the prior count may only ever
+    # RAISE an estimate that already exists, never create one. That makes it provably non-regressive — no
+    # input yields a smaller ceiling than the estimate alone would. (A plain max(planner or 0, prior or 0)
+    # would LOWER the ceiling when EXPLAIN itself failed, replacing today's safe None -> RG_MAX fallback
+    # with a new under-sizing path: a first big load replacing a stub table would size off the stub.)
+    # An overwrite that deliberately SHRINKS a table over-estimates and keeps a larger ceiling — harmless
+    # by the documented asymmetry (policy.RG_MIN_ESTIMATED): the 256 MB file roll closes the group anyway.
+    est, est_src = None, "none"
     if mode == "overwrite" and row_group_rows is None:
         try:
-            row_group_rows = rg_for(estimated_rows(cur, data), floor=_RG_MIN_ESTIMATED)
-        except Exception:
-            row_group_rows = None
-        logger.debug(f"duckrun: overwrite geometry rg={row_group_rows}")
+            est = estimated_rows(cur, data)
+            est_src = "planner" if est is not None else "none"
+            row_group_rows = rg_for(est, floor=_RG_MIN_ESTIMATED)
+        except Exception as exc:  # never break a write on a sizing failure
+            logger.debug(f"duckrun: overwrite geometry unavailable: {exc}")
+            est, est_src, row_group_rows = None, "none", None
+        # The prior-count floor gets its OWN guard: it only ever IMPROVES a ceiling we already have, so
+        # a failure here must keep the estimate's answer rather than discard it back to _RG_MAX. And a
+        # prior count can only help a ceiling that was SHRUNK — at _RG_MAX there is nothing to fix, so
+        # skip the log read entirely (and with it the 404-shaped probe on a fresh CREATE).
+        if est is not None and row_group_rows is not None and row_group_rows < _RG_MAX:
+            try:
+                prior = prior_row_count(cur, path, storage_options)
+                if prior and prior > est:
+                    est, est_src = prior, "prior-log"
+                    row_group_rows = rg_for(est, floor=_RG_MIN_ESTIMATED)
+            except Exception as exc:
+                logger.debug(f"duckrun: prior-count floor skipped: {exc}")
+        bound = ("none" if row_group_rows is None else
+                 "max" if row_group_rows >= _RG_MAX else
+                 "floor" if row_group_rows <= _RG_MIN_ESTIMATED else "lanes")
+        logger.debug(f"duckrun: overwrite geometry rg={row_group_rows} est={est} "
+                     f"src={est_src} bound={bound}")
 
     args = build_write_deltalake_args(
         path, data, mode,
@@ -1457,6 +1562,7 @@ def write_delta(
 
     if mode == "overwrite":
         dt = _delta_table(path, storage_options)
+        _warn_if_estimate_was_far_off(cur, dt, est, row_group_rows)
         # A fresh table (this overwrite created v0) has no prior versions — nothing for vacuum or
         # cleanup_metadata to reclaim, so skip both store-listing operations on a brand-new create.
         if dt.version() > 0:
@@ -1537,6 +1643,7 @@ def overwrite_if_unchanged(
     partition_by: Optional[List[str]] = None,
     overwrite_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
+    cur=None,
 ) -> None:
     """Optimistic FULL-TABLE overwrite: replace every row with ``data`` only if the table version
     has not moved since we read it — otherwise refuse with ``CommitFailedError``. The overwrite
@@ -1548,7 +1655,12 @@ def overwrite_if_unchanged(
     non-conflicting to delta_rs's checker — it would otherwise just replace whatever HEAD is — so
     strict version CAS is the only way to make it fail-loud.) ``read_version`` is REQUIRED; a
     brand-new table's first write goes through ``write_delta``, not here. Then the same vacuum +
-    metadata cleanup as the plain overwrite path."""
+    metadata cleanup as the plain overwrite path.
+
+    ``cur`` is the connection that produced ``data`` — forwarded so this path gets the same adaptive
+    row-group geometry as every other overwrite. Without it (the old signature) a ``delete+insert``
+    rebuild, which is a genuine full-table rewrite AND the one path where a prior exact row count is
+    guaranteed to exist, silently wrote at the flat 16M ceiling."""
     if read_version is None:
         raise ValueError(
             "overwrite_if_unchanged requires read_version (the version the caller read). A fenced "
@@ -1561,6 +1673,7 @@ def overwrite_if_unchanged(
         partition_by=partition_by,
         overwrite_schema=overwrite_schema,
         storage_options=storage_options,
+        cur=cur,
         read_version=read_version,
     )
 
@@ -1593,6 +1706,16 @@ def replace_where(
             "replace_where requires read_version (the version the caller read). A replaceWhere is "
             "a read-modify-write and must be pinned to its snapshot."
         )
+    # No row_group_rows and no estimate — DELIBERATE, not an oversight in the one overwrite sizing
+    # seam (write_delta). A replaceWhere writes a SLICE, not a table: ceil(slice_rows / RG_LANES) sizes
+    # this window's segments off a number that says nothing about the table's segment budget, and would
+    # leave a table with 16M-row groups everywhere except the last-replaced window. The estimate floor
+    # would also make it inert for any window under RG_LANES x RG_MIN_ESTIMATED rows (the common
+    # microbatch), so it could only ever distort the large-window case. And the bypass is what
+    # structurally keeps write_delta's prior-count
+    # floor (see prior_row_count) away from a partial replace, where "rows in the table" is a meaningless
+    # proxy for "rows in this slice". A microbatch's FIRST batch does go through write_delta and IS
+    # sized — correct, because at that instant the table is just that window.
     args = build_write_deltalake_args(
         path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
     )
