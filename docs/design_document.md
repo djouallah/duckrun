@@ -190,8 +190,15 @@ full merge pool and disk spill cap while the other threads keep running the chea
 
 Past its share each consumer **spills to disk** rather than OOM-killing the container. The
 write path (overwrite/append/microbatch) has no competing delta_rs pool, so DuckDB
-gets the bulk — clamped to `_WRITE_MEM_FRACTION` (**0.7**) of the effective limit
+gets the bulk — clamped to `_WRITE_MEM_FRACTION` (**0.85**) of the effective limit
 (`engine.set_write_memory_limit`).
+
+At `threads > 1` the limit can't be set per model (it is global to the DuckDB instance), so it is
+pinned once at connection setup — to the **write** share. The merge share is applied lazily, by the
+first delta-rs merge, and is never raised back for the rest of the run. The pin used to take the
+merge share up front, which charged every run for a pool it might never allocate: a project whose
+facts all use `incremental_strategy='insert'` runs no delta-rs merge at all, yet DuckDB was capped at
+0.3 while 0.6 sat reserved and unused — measured as an OOM on a 29 GiB node with ~20 GiB idle.
 
 The effective limit (`_effective_mem_limit_bytes`) is the **tightest of physical RAM, the
 cgroup/container cap, and the RAM actually free**, sampled fresh per job. It is cgroup-aware

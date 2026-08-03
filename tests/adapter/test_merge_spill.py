@@ -199,6 +199,59 @@ def test_configure_duckdb_session_leaves_memory_limit_alone():
     assert not any(k == "memory_limit" for k, _ in con.sets)
 
 
+def test_shared_pin_takes_the_write_share_not_the_merge_share(monkeypatch):
+    """threads>1 pins memory_limit once at connection setup — to the WRITE share, not the merge one.
+
+    It used to pin the merge share (0.3) up front, reasoning that we can't know which models merge.
+    That charged every run for a delta_rs pool it might never allocate: a project whose facts are all
+    incremental_strategy='insert' runs no delta_rs merge at all, yet DuckDB was capped at 30% while
+    60% sat reserved and unused. Measured on a 29 GiB node at threads=4 — pinned to 8.72 GiB, build
+    died with ~20 GiB idle."""
+    monkeypatch.setattr(engine, "RUN_THREADS", 4)
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
+    con = _FakeCon({"memory_limit": "100.0 GiB", "temp_directory": ".tmp"})
+    engine.configure_duckdb_session(con)
+    write_share = int(16 * 2 ** 30 * engine._WRITE_MEM_FRACTION)
+    assert ("memory_limit", f"{write_share}B") in con.sets
+    assert write_share > int(16 * 2 ** 30 * engine._DUCKDB_MEM_FRACTION)
+
+
+def test_shared_pin_keeps_a_lower_profile_limit(monkeypatch):
+    """The pin clamps DuckDB's host-RAM default down; it never loosens an explicit smaller limit."""
+    monkeypatch.setattr(engine, "RUN_THREADS", 4)
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
+    con = _FakeCon({"memory_limit": "2.0 GiB", "temp_directory": ".tmp"})
+    engine.configure_duckdb_session(con)
+    assert not any(k == "memory_limit" for k, _ in con.sets)
+
+
+def test_first_merge_applies_the_merge_share_at_threads_gt_1(monkeypatch):
+    """At threads>1 the merge share is applied LAZILY — by the first delta_rs merge, not up front.
+    set_merge_memory_limit used to be a no-op there (the setup pin had already taken 0.3); now it is
+    the only thing that applies the split, so a run that does merge still ends up exactly where it
+    used to be."""
+    monkeypatch.setattr(engine, "RUN_THREADS", 4)
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
+    write_share = f"{int(16 * 2 ** 30 * engine._WRITE_MEM_FRACTION)}B"
+    con = _FakeCon({"memory_limit": write_share, "temp_directory": ".tmp"})
+    engine.set_merge_memory_limit(con)
+    assert ("memory_limit", f"{int(16 * 2 ** 30 * engine._DUCKDB_MEM_FRACTION)}B") in con.sets
+
+
+def test_merge_tighten_is_one_way_at_threads_gt_1(monkeypatch):
+    """...and nothing raises it back. memory_limit is global to the DuckDB instance, so a later
+    model's write path must not loosen it out from under a concurrent merge — set_write_memory_limit
+    stays a no-op at threads>1, which is what makes the one-way tighten safe."""
+    monkeypatch.setattr(engine, "RUN_THREADS", 4)
+    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
+    merge_share = f"{int(16 * 2 ** 30 * engine._DUCKDB_MEM_FRACTION)}B"
+    con = _FakeCon({"memory_limit": merge_share, "temp_directory": ".tmp"})
+    engine.set_write_memory_limit(con, "100.0 GiB")
+    assert not any(k == "memory_limit" for k, _ in con.sets)
+    engine.set_merge_memory_limit(con)   # re-entering a merge is idempotent, never loosens
+    assert not any(k == "memory_limit" for k, _ in con.sets)
+
+
 def test_set_merge_memory_limit_tightens_host_default(monkeypatch):
     """Before a merge, DuckDB's host-RAM default gets pulled down to its split share."""
     monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)

@@ -210,6 +210,21 @@ All notable changes to this project will be documented in this file.
   heuristic that gates the plain `append` strategy.
 
 ### Fixed
+- **At `threads > 1`, a run that never merges no longer gets capped at the merge share.** DuckDB's
+  `memory_limit` is global to the instance, so above one thread duckrun pins it once at connection
+  setup rather than letting each model set its own. That pin took the *tightest* share any path could
+  ask for — `_DUCKDB_MEM_FRACTION` (0.3) — on the reasoning that we cannot know in advance which
+  models will merge. The cost was not, as the code claimed, that the write path "spills to disk
+  sooner": a project that runs no delta-rs merge at all reserved 60% of the box for a pool that was
+  never allocated and capped DuckDB at 30%. Measured on a 29 GiB node at `threads: 4` — pinned to
+  8.72 GiB, and the build died with roughly 20 GiB idle (`failed to pin block of size 256.0 KiB
+  (8.7 GiB/8.7 GiB used)`). It also silently defeated the `insert` strategy's deliberate choice *not*
+  to take the merge share, which held only at `threads: 1`. The pin is now the **write** share, and
+  the merge share is applied lazily by the first delta-rs merge, staying for the rest of the run. A
+  run with no merge keeps the full write budget; a run with merges is unchanged from its first merge
+  onward. The one-way tighten is what keeps it safe — nothing raises the limit back out from under a
+  concurrent merge — and `memory_limit` is checked on new allocations, so lowering it mid-run makes a
+  running query spill rather than fail.
 - **A Delta log where only some files carry statistics no longer reports a silently-low row count.**
   The free row count compaction sizes from is `sum(num_records)` over the log, and SQL `sum` ignores
   NULLs — so a table whose files were not all written with statistics answered with a *fraction* of

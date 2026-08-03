@@ -712,9 +712,10 @@ def configure_duckdb_session(con) -> None:
     At ``threads > 1`` that per-model dance is unsafe: ``memory_limit`` is GLOBAL to the DuckDB
     *instance*, not the cursor, so N writers would each claim the whole write share, and a model
     entering the write path would reset the limit out from under a concurrent merge. So the limit is
-    instead pinned ONCE, here, to the conservative merge share — we can't know which models will
-    overlap, and DuckDB degrades to disk spill under a tight limit rather than failing — and the two
-    per-model setters below become no-ops (see set_run_threads)."""
+    instead pinned ONCE, here, to the WRITE share, and ``set_write_memory_limit`` becomes a no-op
+    (see set_run_threads). The merge share is not pre-applied: the first delta_rs merge tightens the
+    pin to 0.3 and it stays there — so a run that never merges keeps the full write share instead of
+    reserving 60% of the box for a pool nothing allocates (see ``_set_shared_memory_limit``)."""
     _set_shared_memory_limit(con)
     try:
         con.execute("SET preserve_insertion_order=false")
@@ -766,20 +767,33 @@ def read_memory_limit(con) -> Optional[str]:
 
 
 def _set_shared_memory_limit(con) -> None:
-    """Multi-threaded runs only: pin ``memory_limit`` once, at connection setup, to the merge share.
+    """Multi-threaded runs only: pin ``memory_limit`` once, at connection setup, to the WRITE share.
 
     ``memory_limit`` is a GLOBAL DuckDB setting, so with concurrent writers there is no such thing as
-    "this model's limit" — the last SET wins for everyone. Rather than have models fight over it,
-    fix it up front at the tightest share any path would ask for (``_DUCKDB_MEM_FRACTION``), and let
-    ``set_write_memory_limit`` / ``set_merge_memory_limit`` stand down. Costs the write path some
-    headroom (it spills to disk sooner) in exchange for parallelism; single-threaded runs keep the
-    old per-model behaviour untouched."""
+    "this model's limit" — the last SET wins for everyone, and the per-model dance
+    ``set_write_memory_limit`` does at threads=1 would have one model reset the limit out from under
+    a concurrent merge. So it is fixed once here instead, and ``set_write_memory_limit`` stands down.
+
+    It is pinned to ``_WRITE_MEM_FRACTION``, NOT the merge share. This used to pin the tightest share
+    any path could ask for (``_DUCKDB_MEM_FRACTION``, 0.3) up front, on the reasoning that we cannot
+    know which models will merge. That was wrong in the expensive direction: a project that never
+    runs a delta_rs merge — every fact on ``incremental_strategy='insert'``, or plain table/append
+    models — reserved 60% of the box for a merge pool that was never allocated and capped DuckDB at
+    30%, while the docstring claimed the cost was only "spills to disk sooner". Measured on a 29 GiB
+    node at threads=4: pinned to 8.72 GiB, and the build died with ~20 GiB idle
+    ("failed to pin block of size 256.0 KiB (8.7/8.7 GiB used)"). It also silently defeated the
+    ``insert`` path's deliberate choice NOT to take the merge share (see delta_plugin).
+
+    The merge share is applied LAZILY instead: the first delta_rs merge tightens the pin to 0.3 via
+    ``set_merge_memory_limit`` and nothing raises it back for the rest of the run. So a run that
+    never merges never sees 0.3, and a run that does gets exactly the old behaviour from its first
+    merge onward. Single-threaded runs keep the per-model behaviour untouched."""
     if RUN_THREADS <= 1:
         return
     limit = _effective_mem_limit_bytes()
     if not limit:
         return
-    target = int(limit * _DUCKDB_MEM_FRACTION)
+    target = int(limit * _WRITE_MEM_FRACTION)
     current = _parse_byte_size(read_memory_limit(con))
     if current is not None and current <= target:
         return  # an explicit lower profile limit wins
@@ -787,8 +801,9 @@ def _set_shared_memory_limit(con) -> None:
         con.execute(f"SET memory_limit='{target}B'")
         logger.info(
             f"threads={RUN_THREADS}: DuckDB memory_limit pinned to {target / 2 ** 30:.2f} GiB "
-            f"({int(_DUCKDB_MEM_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB effective limit) "
-            f"for the whole run; concurrent writers share it"
+            f"({int(_WRITE_MEM_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB effective limit); "
+            f"concurrent writers share it, and the first delta_rs merge tightens it to the "
+            f"{int(_DUCKDB_MEM_FRACTION * 100)}% merge share for the rest of the run"
         )
     except Exception:  # best-effort tuning: a failed SET leaves the prior limit, no abort
         pass
@@ -801,11 +816,15 @@ def set_merge_memory_limit(con) -> None:
     *only* place the split is applied — overwrite/append never call it. Tighten-only: never raises
     a lower current/profile limit; no-op when the effective limit is unknown.
 
-    No-op at ``threads > 1``: the limit is global to the instance and already pinned to this same
-    share once per connection (``_set_shared_memory_limit``), so re-setting it per model would only
-    race concurrent writers."""
-    if RUN_THREADS > 1:
-        return
+    At ``threads > 1`` this is what applies the merge share at all, and it applies it for the REST OF
+    THE RUN: the connection is pinned to the larger write share at setup (``_set_shared_memory_limit``)
+    and ``set_write_memory_limit`` stands down there, so nothing raises the limit back afterward. That
+    one-way tighten is deliberate — the limit is global to the DuckDB instance, so a per-model
+    raise/lower dance would reset it out from under a concurrent merge. Lowering it mid-run does not
+    abort a running query: ``memory_limit`` is checked on new allocations, so a concurrent writer
+    already above the new target simply spills from there on. The cost is that a run's first merge
+    tightens DuckDB for every later model too, merge or not; the benefit is that a run with NO merge
+    never pays the merge share at all (see ``_set_shared_memory_limit``)."""
     limit = _effective_mem_limit_bytes()
     if not limit:
         return

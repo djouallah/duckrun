@@ -68,10 +68,14 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   it. Two things behave differently from a pure-SQL adapter, both because a duckrun model writes a
   real table rather than a row set:
     - **Concurrent writers share one memory budget.** DuckDB's `memory_limit` applies to the
-      database, not to a model, so above one thread duckrun fixes it once for the run at the tighter
-      of its two shares instead of letting each model set its own. delta-rs merges are serialized:
-      at most one runs at a time and holds the **full** merge pool and disk spill cap, while the
-      other threads keep running everything else (views, appends, overwrites, insert-only merges).
+      database, not to a model, so above one thread duckrun fixes it once for the run instead of
+      letting each model set its own. It is fixed at the **write** share; the smaller merge share is
+      applied only when a delta-rs merge actually runs, and then stays for the rest of the run. So a
+      project with no merge model — every fact on `insert`, or plain `table`/`append` models — keeps
+      the full write budget rather than reserving most of the box for a merge pool nothing allocates.
+      delta-rs merges are serialized: at most one runs at a time and holds the **full** merge pool
+      and disk spill cap, while the other threads keep running everything else (views, appends,
+      overwrites, insert-only merges).
       A run of many genuinely small merges therefore won't overlap them; many independent,
       network-bound models benefit most from more threads.
     - **A microbatch model's batches run in order**, even at higher thread counts, because every

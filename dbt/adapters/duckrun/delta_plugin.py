@@ -337,7 +337,10 @@ class Plugin(BasePlugin):
                 (cfg.get("on_schema_change") or "ignore").lower(), path, data, storage_options
             )
             # No set_merge_memory_limit here: nothing runs a delta_rs merge pool alongside DuckDB, so
-            # DuckDB keeps the full write share store() already applied instead of the 0.3 merge share.
+            # DuckDB keeps the full write share instead of the 0.3 merge share — at threads=1 the one
+            # store() applied, at threads>1 the shared connection pin. (That used to hold only at
+            # threads=1: the shared pin took the merge share up front, so an insert-only project paid
+            # for a pool it never allocated and OOM'd with most of the box idle.)
             with engine.mem_profile("insert", con=cur):
                 self._store_insert(
                     path, cur, name, data, unique_key, storage_options,
