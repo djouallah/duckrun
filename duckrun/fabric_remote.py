@@ -303,6 +303,27 @@ def _python_code_cell(src: str) -> dict:
             "execution_count": None, "outputs": []}
 
 
+def _normalize_cell_sources(notebook: dict) -> dict:
+    """``notebook`` with every cell's ``source`` as a LIST of lines — the shape Fabric renders.
+
+    nbformat lets a cell's ``source`` be one string OR a list of lines, and editors do write the
+    string form, but Fabric wants the list. Both spellings parse, so nothing downstream would
+    notice: the upload succeeds and the notebook only misbehaves once opened in the workspace.
+    ``keepends=True`` matches how :func:`_python_code_cell` builds one, so a normalized cell is
+    byte-identical to a duckrun-built one. Cells already in list form are left alone — the notebooks
+    duckrun builds itself pass through untouched, and the input dict is never mutated."""
+    cells = notebook.get("cells")
+    if not isinstance(cells, list):
+        return notebook
+    if not any(isinstance(c, dict) and isinstance(c.get("source"), str) for c in cells):
+        return notebook
+    return {**notebook, "cells": [
+        {**c, "source": c["source"].splitlines(keepends=True)}
+        if isinstance(c, dict) and isinstance(c.get("source"), str) else c
+        for c in cells
+    ]}
+
+
 def _python_notebook(cells: List[dict]) -> dict:
     """An nbformat-4 PURE-PYTHON Fabric notebook wrapping ``cells``. The metadata here is EXACTLY
     what a real Fabric pure-Python notebook carries (copied from a known-good one) and is load-
@@ -732,9 +753,11 @@ def _create_item(token: str, ws_id: str, endpoint: str, name: str, parts: List[d
 def _create_notebook(token: str, ws_id: str, name: str, notebook: dict,
                      item_id: Optional[str] = None, folder_id: Optional[str] = None) -> str:
     """Create a notebook item from an inline base64 ipynb definition (or update ``item_id`` in place);
-    return its item id. ``folder_id`` parks it inside a workspace folder instead of the root."""
+    return its item id. ``folder_id`` parks it inside a workspace folder instead of the root. Cell
+    sources are normalized on the way out (see :func:`_normalize_cell_sources`), so a hand-edited
+    ipynb carrying string sources deploys as something Fabric renders."""
     parts = [
-        _b64_part("notebook-content.ipynb", notebook),
+        _b64_part("notebook-content.ipynb", _normalize_cell_sources(notebook)),
         _b64_part(".platform", _platform_part(name, "Notebook")),
     ]
     return _create_item(token, ws_id, "notebooks", name, parts, fmt="ipynb", item_id=item_id,

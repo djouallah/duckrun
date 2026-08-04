@@ -57,6 +57,7 @@ from .fabric_remote import (
     _schedule_item,
     _ensure_folder,
     _execute_notebook,
+    _log,
     _looks_like_guid,
     _print_remote_log,
     _zip_payload,
@@ -135,6 +136,13 @@ _ITEM_ENDPOINT = {
     "DataPipeline": "dataPipelines",
 }
 _DOWNLOAD_FMT = {"Notebook": "ipynb", "SemanticModel": "TMSL"}
+# What to call each collection in the created/updated line ``deploy`` logs.
+_ITEM_NOUN = {
+    "notebooks": "notebook",
+    "semanticModels": "semantic model",
+    "dataPipelines": "data pipeline",
+    "variableLibraries": "variable library",
+}
 
 # Item collections that ``run`` can execute, and the Fabric job type for each.
 _RUNNABLE = {"notebooks": "RunNotebook", "dataPipelines": "Pipeline"}
@@ -445,9 +453,25 @@ class Workspace:
         across all result pages."""
         return _paged_values(f"{_FABRIC_API}/workspaces/{self.id}/{kind}", token=self._token)
 
+    def list_items(self, kind: Optional[str] = None) -> List[Dict]:
+        """Every item in the workspace as ``[{"displayName": ..., "id": ..., "type": ...}, ...]``.
+
+        Omitted, ``kind`` lists items of EVERY type, each tagged with its ``type`` — which is how
+        you confirm what a :meth:`deploy` landed, and that ``overwrite=True`` updated in place
+        rather than creating a second item of the same name::
+
+            [it for it in ws.list_items() if it["type"] == "Notebook"]
+
+        ``kind`` narrows to one REST collection — ``"notebooks"``, ``"semanticModels"``,
+        ``"lakehouses"``, ``"warehouses"``, ``"dataPipelines"``, ``"variableLibraries"``, … — whose
+        entries carry no ``type`` (the collection *is* the type). Paged to completion either way.
+        """
+        return self._items(kind if kind else "items")
+
     def list_lakehouses(self) -> List[Dict]:
-        """Every lakehouse in the workspace as ``[{"displayName": ..., "id": ...}, ...]``."""
-        return self._items("lakehouses")
+        """Every lakehouse in the workspace as ``[{"displayName": ..., "id": ...}, ...]`` — the
+        :meth:`list_items` wrapper for the collection :meth:`create_lakehouse` writes to."""
+        return self.list_items("lakehouses")
 
     def create_lakehouse(self, name: str, schemas: bool = True,
                          folder: Optional[str] = None) -> str:
@@ -616,21 +640,26 @@ class Workspace:
         # Explicitly requested placement is required (raise on failure), applies to fresh creates.
         folder_id = _ensure_folder(self._token, self.id, folder, required=True) if folder else None
 
+        verb = "updated" if existing else "created"
         if endpoint == "notebooks":
-            return _create_notebook(self._token, self.id, name, json.loads(content),
-                                    item_id=item_id, folder_id=folder_id)
-        if endpoint == "dataPipelines":
-            return _create_pipeline(self._token, self.id, name, content, item_id=item_id,
-                                    folder_id=folder_id)
-        if endpoint == "variableLibraries":
-            return _create_variable_library(self._token, self.id, name, content, item_id=item_id,
-                                            folder_id=folder_id)
-        # semanticModels → create/update; a Direct Lake model is then refreshed (a reframe onto the
-        # latest Delta data) so it is live. A DirectQuery-only model has nothing to reframe — it
-        # queries live — so no refresh.
-        item_id = _create_semantic_model(self._token, self.id, name, content, item_id=item_id,
-                                         folder_id=folder_id)
-        if directlake:
+            item_id = _create_notebook(self._token, self.id, name, json.loads(content),
+                                       item_id=item_id, folder_id=folder_id)
+        elif endpoint == "dataPipelines":
+            item_id = _create_pipeline(self._token, self.id, name, content, item_id=item_id,
+                                       folder_id=folder_id)
+        elif endpoint == "variableLibraries":
+            item_id = _create_variable_library(self._token, self.id, name, content, item_id=item_id,
+                                               folder_id=folder_id)
+        else:
+            item_id = _create_semantic_model(self._token, self.id, name, content, item_id=item_id,
+                                             folder_id=folder_id)
+        # Which of the two happened is otherwise invisible — the return is just an id, so a caller
+        # can't tell an in-place update from a second item of the same name. Logged before the
+        # refresh below, and one line per item on a folder deploy.
+        _log(f"{verb} {_ITEM_NOUN[endpoint]} {name!r} ({item_id})")
+        # A Direct Lake semantic model is then refreshed (a reframe onto the latest Delta data) so it
+        # is live. A DirectQuery-only model has nothing to reframe — it queries live — so no refresh.
+        if endpoint == "semanticModels" and directlake:
             _refresh_semantic_model(get_powerbi_token(), self.id, item_id)
         return item_id
 

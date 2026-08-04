@@ -24,7 +24,25 @@ All notable changes to this project will be documented in this file.
   share for the rest of the run, the anti-join fall-through could allocate the merge pool without
   ever tightening, and the unlocked tighten could race at threads>1.
 
+### Added
+- **`Workspace.list_items(kind=None)` (#26).** The handle listed lakehouses and nothing else, so
+  listing notebooks (or pipelines, or semantic models) meant reaching for the private `_items()`.
+  With no argument it returns every item in the workspace tagged with its `type`; `kind` narrows to
+  one REST collection (`"notebooks"`, `"semanticModels"`, …). Paged to completion either way, and
+  `list_lakehouses()` is now the thin wrapper over it.
+
 ### Fixed
+- **`deploy()` says whether it created or updated the item (#28).** It returned just an item id, so
+  the caller could not tell an in-place update from a second item of the same name — the exact
+  failure people fear with `overwrite=True`. Each item now logs `created notebook 'etl' (f05e…)` or
+  `updated notebook 'etl' (…)`, before the semantic-model refresh and one line per item on a folder
+  deploy. The information was already computed and discarded; the return type is unchanged.
+- **A malformed `.ipynb` no longer deploys 'successfully' and breaks in Fabric (#27).** `deploy()`
+  shipped the notebook JSON verbatim, so a cell whose `source` was a single string instead of a list
+  of lines — valid nbformat, and what some editors write — uploaded fine, returned an item id, and
+  only misbehaved once opened in the workspace. Cell sources are now normalized on the deploy path
+  the same way duckrun builds its own cells (`splitlines(keepends=True)`); a notebook already in
+  list form is byte-identical to before.
 - **Raw SQL against a model works outside cache population (#24, part B).** `run_query("select …
   from main.my_model")` in a `dbt run-operation` macro — and any command under
   `--no-populate-cache` — died with `Catalog Error: Table with name my_model does not exist!`,

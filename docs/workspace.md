@@ -20,7 +20,17 @@ pl_id = ws.deploy("pipeline.json")              # deploy a data pipeline
 vl_id = ws.deploy("variables.json", variables={"lakehouse_name": "bronze", "workspace_id": ws.id})
 ws.run("etl.ipynb")                             # run a deployed notebook/pipeline on Fabric, wait
 ws.schedule("pipeline", daily="06:00")          # or every="1h" / weekly=["Mon"], at="06:00"
+ws.list_items()                                 # [{"displayName":…, "id":…, "type":…}, ...]
 ws.list_lakehouses()                            # [{"displayName": ..., "id": ...}, ...]
+```
+
+**`list_items(kind=None)`** lists what's actually in the workspace. With no argument you get every
+item of every type, each tagged with its `type`; pass a collection name — `"notebooks"`,
+`"semanticModels"`, `"lakehouses"`, `"dataPipelines"`, `"variableLibraries"` — to narrow to one.
+Paged to completion either way. `list_lakehouses()` is the wrapper for the lakehouse collection.
+
+```python
+[it for it in ws.list_items() if it["type"] == "Notebook"]   # what deploy actually landed
 ```
 
 **`create_lakehouse(name, schemas=True)`** provisions an empty container by name. It is
@@ -40,6 +50,13 @@ takes an optional `variables=` mapping to set values at deploy time —
 environment-specific injection, without editing the file (an unknown variable name raises). A `.json`
 that is neither raises. `deploy` is **not** idempotent: if an item of that name already exists it is
 replaced only when `overwrite=True`, otherwise the call raises rather than hide a stale deploy.
+
+Each item logs which of the two happened — `created notebook 'etl' (f05e7780…)` vs
+`updated notebook 'etl' (…)` — so an `overwrite=True` that updated in place is distinguishable from
+a second item of the same name, one line per item on a folder deploy. A `.ipynb`'s cell sources are
+**normalized** on the way out: nbformat allows a cell's `source` to be a single string and editors do
+write it that way, but Fabric wants a list of lines, so duckrun splits it rather than shipping a
+notebook that uploads fine and renders wrong.
 
 **Pointing a Direct Lake model at a lakehouse.** A Direct Lake `model.bim` bakes in the OneLake
 workspace + lakehouse GUIDs it reads from; deploying it elsewhere would leave it pointed at the wrong

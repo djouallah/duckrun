@@ -38,8 +38,9 @@ class FakeResp:
 class FakeFabric:
     """Scripts the lakehouse REST sequence and records every call (method, url, json_body)."""
 
-    def __init__(self, *, existing=None, create=None):
+    def __init__(self, *, existing=None, create=None, items=None):
         self.existing = existing or []          # lakehouses already in the workspace
+        self.items = items or []                # the generic /items collection (every type)
         self.create = create or FakeResp(201, {"id": "lh-new"})
         self.calls = []                         # (method, url, json_body)
 
@@ -47,6 +48,10 @@ class FakeFabric:
         self.calls.append((method, url, json_body))
         if method == "GET" and url.endswith("/workspaces"):
             return FakeResp(200, {"value": [{"displayName": "Analytics", "id": "ws-guid"}]})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/items"):
+            return FakeResp(200, {"value": self.items})
+        if method == "GET" and url.endswith("/workspaces/ws-guid/notebooks"):
+            return FakeResp(200, {"value": [it for it in self.items if it.get("type") == "Notebook"]})
         if method == "GET" and url.endswith("/workspaces/ws-guid"):
             return FakeResp(200, {"id": "ws-guid", "displayName": "Analytics"})
         if method == "GET" and url.endswith("/workspaces/ws-guid/lakehouses"):
@@ -170,6 +175,30 @@ def test_list_lakehouses_shape(_patch):
     _patch(FakeFabric(existing=[{"displayName": "a", "id": "1"}, {"displayName": "b", "id": "2"}]))
     got = _ws().list_lakehouses()
     assert got == [{"displayName": "a", "id": "1"}, {"displayName": "b", "id": "2"}]
+
+
+def test_list_items_no_kind_lists_every_type(_patch):
+    # No argument → the generic /items collection: every item, each tagged with its type. This is
+    # what you use to confirm what a deploy landed, instead of reaching for the private _items().
+    everything = [{"displayName": "etl", "id": "nb-1", "type": "Notebook"},
+                  {"displayName": "bronze", "id": "lh-1", "type": "Lakehouse"}]
+    fake = _patch(FakeFabric(items=everything))
+    assert _ws().list_items() == everything
+    assert any(u.endswith("/workspaces/ws-guid/items") for _, u, _ in fake.calls)
+    assert [it for it in _ws().list_items() if it["type"] == "Notebook"] == [everything[0]]
+
+
+def test_list_items_kind_narrows_to_one_collection(_patch):
+    _patch(FakeFabric(items=[{"displayName": "etl", "id": "nb-1", "type": "Notebook"},
+                             {"displayName": "bronze", "id": "lh-1", "type": "Lakehouse"}]))
+    assert _ws().list_items("notebooks") == [{"displayName": "etl", "id": "nb-1", "type": "Notebook"}]
+
+
+def test_list_lakehouses_is_a_list_items_wrapper(_patch):
+    # list_lakehouses stays exactly the lakehouses collection — not the generic /items one.
+    fake = _patch(FakeFabric(existing=[{"displayName": "a", "id": "1"}], items=[{"type": "Notebook"}]))
+    assert _ws().list_lakehouses() == [{"displayName": "a", "id": "1"}]
+    assert not any(u.endswith("/workspaces/ws-guid/items") for _, u, _ in fake.calls)
 
 
 def test_lakehouse_id_resolves_name(_patch):
@@ -918,6 +947,55 @@ def test_deploy_overwrite_update_failure_raises_loudly(_patch, tmp_path):
     src = _write(tmp_path, "etl.ipynb", json.dumps({"nbformat": 4}))
     with pytest.raises(fr.RemoteRunError, match="could not update.*400.*bad definition"):
         _ws().deploy(src, overwrite=True)
+
+
+def test_deploy_logs_created_vs_updated(_patch, tmp_path, capsys):
+    # The return is just an id, so which of the two happened is otherwise invisible — in particular
+    # whether overwrite= updated in place or made a second item of the same name.
+    _patch(DeployFabric(kind="notebooks"))
+    src = _write(tmp_path, "etl.ipynb", json.dumps({"nbformat": 4}))
+    _ws().deploy(src)
+    assert "created notebook 'etl' (item-new)" in capsys.readouterr().out
+
+    _patch(DeployFabric(kind="notebooks", existing=[{"displayName": "etl", "id": "old"}]))
+    _ws().deploy(src, overwrite=True)
+    assert "updated notebook 'etl' (old)" in capsys.readouterr().out
+
+
+def test_deploy_logs_the_item_kind(_patch, monkeypatch, tmp_path, capsys):
+    fake = _bim_fabric(_patch, monkeypatch, [{"displayName": "silver", "id": "lh-silver"}])
+    src = _write(tmp_path, "sales.bim", _directlake_bim())
+    _ws().deploy(src)
+    assert "created semantic model 'sales' (item-new)" in capsys.readouterr().out
+
+
+def _deployed_notebook(fake):
+    import base64
+    parts = {p["path"]: p for p in fake.post_body("/workspaces/ws-guid/notebooks")["definition"]["parts"]}
+    return json.loads(base64.b64decode(parts["notebook-content.ipynb"]["payload"]).decode())
+
+
+def test_deploy_normalizes_string_cell_sources(_patch, tmp_path):
+    # nbformat allows a cell source as one string, and editors write it that way, but Fabric wants a
+    # list of lines. Both parse, so an unnormalized deploy "succeeds" and only breaks once opened.
+    fake = _patch(DeployFabric(kind="notebooks"))
+    src = _write(tmp_path, "etl.ipynb", json.dumps({"nbformat": 4, "metadata": {}, "cells": [
+        {"cell_type": "code", "source": "import duckrun\nduckrun.connect('lh')\n"},
+        {"cell_type": "markdown", "source": ["# already a list\n"]},
+    ]}))
+    _ws().deploy(src)
+    cells = _deployed_notebook(fake)["cells"]
+    assert cells[0]["source"] == ["import duckrun\n", "duckrun.connect('lh')\n"]
+    assert cells[0]["cell_type"] == "code"                  # the rest of the cell survives
+    assert cells[1]["source"] == ["# already a list\n"]     # untouched
+
+
+def test_deploy_leaves_a_well_formed_notebook_byte_identical(_patch, tmp_path):
+    nb = {"nbformat": 4, "nbformat_minor": 5, "metadata": {"kernelspec": {"name": "jupyter"}},
+          "cells": [{"cell_type": "code", "source": ["x = 1\n"], "outputs": [], "execution_count": None}]}
+    fake = _patch(DeployFabric(kind="notebooks"))
+    _ws().deploy(_write(tmp_path, "etl.ipynb", json.dumps(nb)))
+    assert _deployed_notebook(fake) == nb
 
 
 def test_deploy_unsupported_extension_raises(_patch, tmp_path):
