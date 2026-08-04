@@ -36,6 +36,13 @@ MACRO_SQL = """{% macro show_cols(model_name, schema=none) %}
 {% endmacro %}
 """
 
+# Ad-hoc SQL against a model, the other thing a run-operation macro does (issue #24 part B).
+RUN_SQL_MACRO = """{% macro run_sql(query) %}
+  {% set res = run_query(query) %}
+  {{ log("RESULT: " ~ (res.columns[0].values() | join(",")), info=True) }}
+{% endmacro %}
+"""
+
 
 @pytest.fixture
 def project(tmp_path):
@@ -51,6 +58,7 @@ def project(tmp_path):
         encoding="utf-8")
     (proj / "models" / "events.sql").write_text(MODEL_SQL, encoding="utf-8")
     (proj / "macros" / "show_cols.sql").write_text(MACRO_SQL, encoding="utf-8")
+    (proj / "macros" / "run_sql.sql").write_text(RUN_SQL_MACRO, encoding="utf-8")
     root = (tmp_path / "wh").as_posix()
     os.environ["OPS_PATH"] = root
     return proj, root
@@ -201,3 +209,121 @@ def test_bind_falls_back_to_the_duckdb_tombstone_probe(monkeypatch, tombstoned, 
 
     assert adapter._bind_delta_view(relation) is expected
     assert registered == ([] if tombstoned else [relation])
+
+
+# --- part B: raw SQL against a model, lazy-bound on the catalog error (issue #24) ---------------
+# `run_query("select … from main.events")` in a run-operation macro died with
+# `Catalog Error: Table with name events does not exist!` — same root cause as above, but the SQL
+# goes straight to DuckDB, so the adapter never sees which relation it needs. The cursor wrapper
+# now catches the catalog error, binds the missing relation's delta_scan view, and retries; a
+# genuinely missing table re-raises the original error unchanged.
+
+def _run_sql(proj, query):
+    """`dbt run-operation run_sql` from a fresh process, returning (result, first column values,
+    logged messages — where a failed operation reports its error)."""
+    import json
+    _fresh_process()
+    res, msgs = _dbt(proj, "run-operation", "run_sql", "--args", json.dumps({"query": query}))
+    values = _logged(msgs, "RESULT:") if res.success else []
+    return res, values, msgs
+
+
+def test_run_operation_raw_sql_reads_the_model(project):
+    """The bug itself: ad-hoc SQL against a materialized model, qualified as macros write it."""
+    proj, _ = project
+    assert _dbt(proj, "run")[0].success
+
+    res, values, _ = _run_sql(proj, "select count(*) as n from main.events")
+    assert res.success
+    assert values == ["1"]
+
+
+def test_run_operation_raw_sql_unqualified_name(project):
+    """An unqualified name resolves under the profile's default schema — DuckDB's error names the
+    bare table, and the statement itself carries no schema to recover it from."""
+    proj, _ = project
+    assert _dbt(proj, "run")[0].success
+
+    res, values, _ = _run_sql(proj, "select count(*) as n from events")
+    assert res.success
+    assert values == ["1"]
+
+
+def test_run_operation_raw_sql_join_binds_every_model(project):
+    """A join of two unbound models errors on one table at a time, so the bind-and-retry has to
+    loop until the statement stops naming new relations."""
+    proj, _ = project
+    (proj / "models" / "clicks.sql").write_text(
+        "{{ config(materialized='table') }}\nselect 1 as id", encoding="utf-8")
+    assert _dbt(proj, "run")[0].success
+
+    res, values, _ = _run_sql(
+        proj, "select count(*) as n from main.events e join main.clicks c on e.id = c.id")
+    assert res.success
+    assert values == ["1"]
+
+
+def test_run_operation_raw_sql_custom_schema_model(project):
+    """A custom-schema model fails with DuckDB's other error shape — `Table with name
+    \"main_x2.other\" does not exist because schema \"main_x2\" does not exist.` — and the bind
+    has to create the schema before the view."""
+    proj, _ = project
+    (proj / "models" / "other.sql").write_text(
+        "{{ config(materialized='table', schema='x2') }}\nselect 42 as answer", encoding="utf-8")
+    assert _dbt(proj, "run")[0].success
+
+    res, values, _ = _run_sql(proj, "select answer from main_x2.other")
+    assert res.success
+    assert values == ["42"]
+
+
+def test_run_operation_raw_sql_missing_table_still_errors(project):
+    """Nothing on disk → the original catalog error surfaces unchanged; the lazy bind must not
+    swallow or reshape a genuine failure."""
+    proj, _ = project
+    assert _dbt(proj, "run")[0].success
+
+    res, _, msgs = _run_sql(proj, "select count(*) as n from main.no_such_model")
+    assert not res.success
+    assert any("no_such_model" in m and "does not exist" in m for m in msgs)
+
+
+def test_run_operation_raw_sql_dropped_table_still_errors(project):
+    """The drop-tombstone contract holds on this path too: a dropped model must not come back as
+    a queryable one-column `__duckrun_deleted__` view."""
+    proj, root = project
+    assert _dbt(proj, "run")[0].success
+    duckrun.connect(root, schema="main", read_only=False).sql("drop table events")
+
+    res, _, _msgs = _run_sql(proj, "select count(*) as n from main.events")
+    assert not res.success
+
+
+def test_show_no_populate_cache_works(project):
+    """`--no-populate-cache` skips discovery on every command, failing through the identical
+    path — the lazy bind fixes it for free, so pin that."""
+    proj, _ = project
+    assert _dbt(proj, "run")[0].success
+
+    _fresh_process()
+    res, _ = _dbt(proj, "show", "--inline", "select * from {{ ref('events') }}",
+                  "--no-populate-cache")
+    assert res.success
+
+
+def test_normal_run_never_lazy_binds(project, monkeypatch):
+    """A `dbt run` raises no catalog errors, so the lazy bind — like the introspection fallback
+    above — must cost a working run nothing."""
+    proj, _ = project
+    assert _dbt(proj, "run")[0].success  # build once so run 2 rediscovers an existing model too
+
+    from dbt.adapters.duckrun.environment import DuckrunCursorWrapper
+
+    binds = []
+    real_bind = DuckrunCursorWrapper._lazy_bind_delta_view
+    monkeypatch.setattr(DuckrunCursorWrapper, "_lazy_bind_delta_view",
+                        lambda self, *c: (binds.append(c), real_bind(self, *c))[1])
+
+    _fresh_process()
+    assert _dbt(proj, "run")[0].success
+    assert binds == []

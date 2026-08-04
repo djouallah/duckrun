@@ -25,6 +25,19 @@ All notable changes to this project will be documented in this file.
   ever tightening, and the unlocked tighten could race at threads>1.
 
 ### Fixed
+- **Raw SQL against a model works outside cache population (#24, part B).** `run_query("select …
+  from main.my_model")` in a `dbt run-operation` macro — and any command under
+  `--no-populate-cache` — died with `Catalog Error: Table with name my_model does not exist!`,
+  because the `delta_scan` views only ever got created while dbt populated its relation cache. The
+  cursor now catches that catalog error, resolves the missing relation to its Delta location, binds
+  that one view (same existence/tombstone contract as discovery and the introspection fallback,
+  now shared in `delta_dml.live_delta_target` so the three can't drift), and retries — looping,
+  since a join of two unbound models errors one table at a time. Deliberately lazy: the eager
+  alternative (bind every manifest schema up front) would re-introduce the discovery startup cost
+  #16 removed, on every operation. Working paths pay nothing — no error, none of it runs — and a
+  genuinely missing table re-raises the original error unchanged. If DuckDB ever rewords the
+  catalog error, the bind simply never fires and behavior degrades back to the old error, pinned
+  by tests.
 - **`dbt run-operation` can see a model's columns (#24).** A duckrun model is a `delta_scan` view that
   only exists once dbt has populated its relation cache — and `run-operation` never populates it
   (`RunOperationTask` is not a graph task). `adapter.get_columns_in_relation()` therefore came back

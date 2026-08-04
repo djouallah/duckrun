@@ -13,21 +13,41 @@ process. We do the same for plugin sources here: instead of registering a Python
 and no dependence on dbt-duckdb's per-cursor relation re-registration.
 """
 import os
+import re
 import threading
+
+import duckdb
 
 from dbt.adapters.duckdb.environments.local import (
     DuckDBConnectionWrapper,
     DuckDBCursorWrapper,
     LocalEnvironment,
 )
+from dbt.adapters.events.logging import AdapterLogger
 
 from . import delta_dml
 from . import secret
+
+logger = AdapterLogger("Duckrun")
 
 # Serializes OneLake token refreshes across threads. Module-level rather than per-wrapper because
 # the state it protects — the shared credentials object and the instance-global DuckDB secrets —
 # is shared by every cursor, and each dbt thread gets its own wrapper.
 _CREDS_REFRESH_LOCK = threading.Lock()
+
+# DuckDB's catalog error for a relation that isn't bound. Two shapes (duckdb 1.5):
+#   Catalog Error: Table with name my_model does not exist!                       (schema exists)
+#   Catalog Error: Table with name "main_x2.other" does not exist because schema "main_x2" does not exist.
+# The captured name is bare in the first and schema-qualified in the second. If DuckDB ever
+# rewords this, the lazy bind simply never fires and the original error surfaces unchanged —
+# degraded back to pre-fix behavior, pinned by tests/adapter/test_run_operation_columns.py.
+_MISSING_REL = re.compile(r'(?:Table|View) with name "?([^"!\n]+?)"? does not exist')
+
+# A qualified identifier in SQL text: `schema.table` or `catalog.schema.table`, each part plain or
+# double-quoted. Used only after a catalog error, to recover the schema a bare missing-table name
+# was addressed under.
+_IDENT = r'(?:"[^"]+"|[A-Za-z_][\w$]*)'
+_QUAL_REF = re.compile(rf"({_IDENT})\.({_IDENT})(?:\.({_IDENT}))?")
 
 
 class DuckrunCursorWrapper(DuckDBCursorWrapper):
@@ -66,7 +86,97 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
             storage_options = secret.with_onelake_token(root_path, storage_options)
             if delta_dml.handle(self._cursor, root_path, storage_options, sql):
                 return self._cursor  # applied to Delta; nothing to run on DuckDB
-        return super().execute(sql, bindings)
+        try:
+            return super().execute(sql, bindings)
+        except duckdb.CatalogException as exc:
+            return self._execute_after_lazy_binds(sql, bindings, exc)
+
+    # --- lazy bind on a catalog error (issue #24, part B) -----------------------------------------
+    # A duckrun model is a `delta_scan` view that only exists once dbt has populated its relation
+    # cache, and `dbt run-operation` (or any command under --no-populate-cache) never populates it —
+    # so raw SQL against a model that is sitting on disk died with
+    #   Catalog Error: Table with name my_model does not exist!
+    # The eager fix (bind every manifest schema up front) would re-introduce exactly the discovery
+    # startup cost #16 removed, on every operation. So bind lazily instead: only when a statement
+    # has ALREADY failed with a catalog error, resolve the missing relation to its Delta location,
+    # bind that one view, and retry. Every working path pays nothing — no error, none of this runs —
+    # and a genuinely missing table re-raises the original error unchanged.
+
+    def _execute_after_lazy_binds(self, sql, bindings, exc):
+        """Bind the Delta relation(s) a catalog error names, then retry ``sql`` — repeatedly, since
+        a join of two unbound models errors on one table at a time. Terminates because every pass
+        must bind at least one NEW relation (a query names finitely many); re-raises the latest
+        error when it can't, so a post-bind failure (e.g. a missing column on the now-visible
+        model) surfaces as itself rather than as the stale catalog error."""
+        attempted = set()
+        for _ in range(8):  # belt over the must-bind-new rule; no sane statement joins more
+            fresh = [c for c in self._missing_delta_candidates(exc, sql) if c not in attempted]
+            attempted.update(fresh)
+            if not any([self._lazy_bind_delta_view(*c) for c in fresh]):  # bind ALL before deciding
+                raise exc
+            try:
+                return super().execute(sql, bindings)
+            except duckdb.CatalogException as next_exc:
+                exc = next_exc
+        raise exc
+
+    def _missing_delta_candidates(self, exc, sql):
+        """``[(catalog, schema, table), …]`` the error could be talking about, unquoted, in SQL
+        order. DuckDB names the missing table bare when its schema exists, so the schema (and
+        catalog) are recovered from the statement's own qualified references to that name; a name
+        the statement never qualifies is addressed under the profile's default schema. False
+        positives (an alias.column that happens to match) are harmless — they just fail the
+        on-disk existence check in the bind."""
+        m = _MISSING_REL.search(str(exc))
+        if not m:
+            return []
+        parts = [p.strip('"') for p in m.group(1).split(".")]
+        if len(parts) == 3:
+            return [tuple(parts)]
+        if len(parts) == 2:  # "schema.table" — the schema-does-not-exist shape
+            return [(None, parts[0], parts[1])]
+        missing = parts[0].lower()
+        candidates = []
+        for ref in _QUAL_REF.finditer(sql):
+            cat, schema, table = ref.group(1), ref.group(2), ref.group(3)
+            if table is None:
+                cat, schema, table = None, cat, schema
+            c = (cat and cat.strip('"'), schema.strip('"'), table.strip('"'))
+            if c[2].lower() == missing and c not in candidates:
+                candidates.append(c)
+        if not candidates:
+            default_schema = getattr(self._duckrun_creds, "schema", None) or "main"
+            candidates = [(None, default_schema, parts[0])]
+        return candidates
+
+    def _lazy_bind_delta_view(self, catalog, schema, table) -> bool:
+        """Register the ``delta_scan`` view for one ``(catalog, schema, table)``. True only when a
+        view was actually created. Same contract as adapter introspection's on-demand bind, via
+        the shared :func:`delta_dml.live_delta_target`: a table that isn't on disk and a
+        drop-tombstone must not surface. Every failure is swallowed at debug — the caller re-raises
+        the original catalog error, which must not be masked by a bind gone wrong."""
+        try:
+            # root_for falls back to the default catalog for an undeclared name — which is what a
+            # dbt-rendered `"memory"."main"."events"` needs — and self-acquires the OneLake token.
+            root_path, so = self._duckrun_creds.root_for(catalog)
+            if not root_path:
+                return False
+            location = root_path.rstrip("/") + "/" + schema + "/" + table
+            should_bind, _ = delta_dml.live_delta_target(self._cursor, location, so)
+            if not should_bind:
+                return False
+            prefix = f'"{catalog}".' if catalog else ""
+            # The view needs its schema; a custom-schema model has none in a fresh in-memory DuckDB.
+            self._cursor.execute(f'create schema if not exists {prefix}"{schema}"')
+            loc_sql = location.replace("'", "''")
+            self._cursor.execute(
+                f'create or replace view {prefix}"{schema}"."{table}" as '
+                f"select * from delta_scan('{loc_sql}')"
+            )
+            return True
+        except Exception as e:
+            logger.debug(f"duckrun: lazy bind for {catalog}.{schema}.{table} failed: {e}")
+            return False
 
     def _refresh_onelake_token(self, creds) -> None:
         # Refresh the default catalog and every attached catalog: a stale aliased token would 401 only

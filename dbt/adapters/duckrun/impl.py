@@ -622,13 +622,12 @@ class DuckrunAdapter(DuckDBAdapter):
         """Register the ``delta_scan`` view for ONE ``relation`` on demand. True when a bind was
         attempted, False when there is nothing to bind.
 
-        The single-relation counterpart of discovery's bulk registration, under the same contract:
-        a table that isn't on disk and a drop-tombstone must not surface. Nothing here may turn a
-        previously-silent introspection into a failed run, so every error is swallowed at debug
-        and leaves the caller with the empty column list it already had.
+        The single-relation counterpart of discovery's bulk registration, under the same contract
+        (:func:`delta_dml.live_delta_target` — shared with the cursor's lazy bind so the two can't
+        drift): a table that isn't on disk and a drop-tombstone must not surface. Nothing here may
+        turn a previously-silent introspection into a failed run, so every error is swallowed at
+        debug and leaves the caller with the empty column list it already had.
         """
-        from . import engine
-
         if relation is None or not relation.identifier or not relation.schema:
             return False
         try:
@@ -641,21 +640,9 @@ class DuckrunAdapter(DuckDBAdapter):
                 + "/" + str(relation.identifier).strip('"')
             )
 
-            settled, dt = True, None
-            try:
-                dt = engine.open_if_exists(location, so)
-            except Exception as exc:
-                # delta-rs couldn't open it — e.g. an az:// store whose credential lives only in
-                # the DuckDB `secrets:` block. Existence is unsettled, so fall through to the bind
-                # attempt (DuckDB holds that secret) rather than reporting "no columns" for a
-                # table that is really there; a wrong guess just fails the CREATE VIEW silently.
-                logger.debug(f"duckrun: could not open {location!r} for an on-demand bind: {exc}")
-                settled = False
-            if settled:
-                if dt is None or delta_dml.is_dropped_dt(dt):
-                    return False  # no Delta table there, or a drop-tombstone — must not surface
-            elif delta_dml.is_dropped(self._cursor(), location, so):
-                return False  # a tombstone DuckDB can still see, exactly as in _live_relations
+            should_bind, dt = delta_dml.live_delta_target(self._cursor(), location, so)
+            if not should_bind:
+                return False
 
             # The view needs its schema; a custom-schema model has none in a fresh in-memory DuckDB.
             try:

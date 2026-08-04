@@ -114,6 +114,34 @@ def is_dropped_dt(dt) -> bool:
         logger.debug(f"duckrun: is_dropped_dt could not read schema, treating as live: {exc}")
         return False
 
+
+def live_delta_target(cursor, location: str, storage_options=None) -> tuple:
+    """``(should_bind, dt)`` for binding a single ``delta_scan`` view at ``location`` on demand.
+
+    THE single-relation existence/tombstone contract, shared by adapter column introspection
+    (``impl._bind_delta_view``) and the cursor's lazy bind on a catalog error
+    (``environment.DuckrunCursorWrapper``), so the two can't drift — the same rule
+    :meth:`impl._live_relations` applies during bulk discovery:
+
+    * **Not on disk** (delta-rs settles it: no table there) → don't bind.
+    * **A drop-tombstone** → don't bind; a dropped table must not resurface with its
+      ``__duckrun_deleted__`` marker as if the model still existed.
+    * **delta-rs can't open the store at all** — e.g. an az:// root whose credential lives only in
+      the DuckDB ``secrets:`` block — existence is unsettled, so bind anyway (DuckDB may hold the
+      secret; a wrong guess just fails the CREATE VIEW) after the DuckDB-side tombstone probe.
+
+    ``dt`` is the already-open handle when delta-rs settled it, for callers that reuse it
+    (persisted-docs read); None otherwise.
+    """
+    try:
+        dt = engine.open_if_exists(location, storage_options)
+    except Exception as exc:
+        logger.debug(f"duckrun: could not open {location!r} for an on-demand bind: {exc}")
+        return (not is_dropped(cursor, location, storage_options)), None
+    if dt is None or is_dropped_dt(dt):
+        return False, None
+    return True, dt
+
 # --- statement matchers (leading-anchored, DOTALL so multi-line bodies match) ----------------
 # `create [or replace] table [if not exists] <rel> as <query>`. The body is ANY query text (a bare
 # `select …`, a `with … select …` CTE, or a parenthesised `(select …)`); it's handed to DuckDB

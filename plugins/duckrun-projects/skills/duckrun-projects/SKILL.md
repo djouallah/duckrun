@@ -196,10 +196,12 @@ Patterns worth reusing from this:
 
 - **run-operation as a boolean probe.** A macro that `raise_compiler_error(...)` to
   signal "yes" lets the runner branch on `.success` (or the exit code in bash). Inside
-  such a macro, query **physical paths** directly (`delta_scan('<abfss path>')`,
-  `read_parquet(...)`) — run-operations register no model views, so `ref()`/`{{ this }}`
-  won't resolve there. Run-operations also skip `on-run-start` hooks, so re-apply any
-  session settings the macro needs.
+  such a macro, models are queryable directly — `run_query("select … from main.my_model")`
+  (or via `ref()`) works: the cursor binds the model's `delta_scan` view on demand when
+  the catalog misses it. On duckrun < 0.4.42 that bind didn't exist, so older versions
+  must query **physical paths** instead (`delta_scan('<abfss path>')`, `read_parquet(...)`).
+  `{{ this }}` has no meaning outside a model either way, and run-operations skip
+  `on-run-start` hooks, so re-apply any session settings the macro needs.
 - **Conditional `--full-refresh` of a single model**, decided by the probe BEFORE the
   models that would change its answer get built — order the probe accordingly.
 - **`dbt retry` once** on a failed main build, before failing the run.
