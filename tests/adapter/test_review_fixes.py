@@ -494,6 +494,38 @@ def test_catalog_view_detection_is_structural(tmp_path):
     assert con.execute(CATALOG_VIEW_TYPE_SQL, ["mentions"]).fetchone()[0] == "VIEW"
 
 
+def test_delta_core_macro_forwards_every_config_key_the_plugin_reads():
+    """The 0.4.43 regression class, pinned: a model config the plugin reads but _delta_core.sql's
+    delta_config dict never forwards is silently None for EVERY dbt model — max_row_group_size,
+    target_file_size_mb and merge_materialize_source all shipped that way, with the parser unit
+    test and the parquet_layout CI (engine seam, no dbt config) both green. Assert the macro's
+    whitelist covers every literal cfg.get key in delta_plugin.py plus the _geometry_config keys,
+    so the NEXT plugin-side key that forgets the macro hop fails here instead of in production."""
+    import re
+    from pathlib import Path
+
+    from dbt.adapters.duckrun import delta_plugin
+
+    plugin_path = Path(delta_plugin.__file__)
+    plugin_src = plugin_path.read_text(encoding="utf-8")
+    wanted = set(re.findall(r"""cfg\.get\(["']([a-z_]+)["']""", plugin_src))
+    wanted |= set(re.findall(r"""_pos_int\("([a-z_]+)"\)""", plugin_src))
+    # 'predicates' is the legacy alias: the macro folds it into 'incremental_predicates' at
+    # hand-off; the plugin's own fallback read serves the non-dbt (connection API) callers.
+    wanted -= {"predicates"}
+
+    macro = (plugin_path.parents[2] / "include" / "duckrun" / "macros" / "materializations"
+             / "_delta_core.sql").read_text(encoding="utf-8")
+    block = macro.split("set delta_config", 1)[1].split("}", 1)[0]
+    forwarded = set(re.findall(r"'([a-z_]+)':", block))
+
+    missing = sorted(wanted - forwarded)
+    assert not missing, (
+        f"delta_plugin reads model config keys the _delta_core.sql macro never forwards "
+        f"(silently None for every dbt model): {missing}"
+    )
+
+
 def test_geometry_config_validation():
     # The per-model write-geometry configs: max_row_group_size (rows, deltalake's own spelling) and
     # target_file_size_mb (MB -> bytes at this seam; everything below the plugin speaks bytes).

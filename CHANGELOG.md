@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **The per-model geometry configs now actually reach the writer from dbt.** `max_row_group_size`
+  and `target_file_size_mb` shipped in 0.4.43 fully plumbed on the plugin/engine side, documented
+  and unit-tested — and unreachable from any dbt model: `_delta_core.sql` forwards model config to
+  the plugin as a fixed key dict, and neither key was on it, so the plugin saw `None` and the
+  adaptive layout ran while everything reported green (measured in the wild: a 143.98M-row table
+  declared at 48M rows / 1 GB wrote the estimator's 19 row groups in 3×~217 MB files). Nothing
+  caught it because both existing checks bypass the broken hop — the unit test drives the parser
+  directly, and the parquet_layout CI pins `engine.rg_for`/`_TARGET_FILE_SIZE` because its CTAS has
+  no dbt config. `merge_materialize_source` had the same hole (harmless output, so its two-run test
+  passed without the materialization ever happening). All three keys are now forwarded, an
+  end-to-end dbt model test asserts a 3-row ceiling really produces 4 row groups on disk, and a
+  static test pins the whole class: every literal `cfg.get` key in `delta_plugin.py` must appear in
+  the macro's `delta_config` dict, so the next plugin-side config that forgets the macro hop fails
+  in CI instead of silently in production.
+
 ### Changed
 - **The DuckDB-vs-delta_rs memory split is gone; one pin remains.** The memory machinery exists to
   stop complex merges from OOMing a container — it was never meant to tax every other path. Profiling

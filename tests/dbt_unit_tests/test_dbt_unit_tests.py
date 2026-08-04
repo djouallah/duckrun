@@ -124,6 +124,24 @@ def test_sort_by_writes_physically_ordered(tmp_path):
     assert keys == [1, 2, 3, 4, 5], keys  # physically sorted, not the shuffled input order
 
 
+def test_geometry_configs_reach_the_writer(tmp_path):
+    """max_row_group_size / target_file_size_mb must survive the materialization macro's config
+    hand-off. This is the hop that broke in 0.4.43: _delta_core.sql's delta_config carried sort_by
+    but neither geometry key, so the plugin saw None and fell back to the adaptive layout — while
+    test_geometry_config_validation (parser only) and the parquet_layout CI (pins the engine seam
+    directly, no dbt config) both stayed green. 10 rows under a 3-row ceiling = 4 row groups; the
+    adaptive default writes 1, so a dropped key fails this loudly."""
+    import pyarrow.parquet as pq
+    from deltalake import DeltaTable
+
+    wh = _wh(tmp_path)
+    assert _dbt(wh, "run", "--select", "geometry_layout").success
+    files = DeltaTable(f"{wh}/{SCHEMA}/geometry_layout").file_uris()
+    assert len(files) == 1, files
+    rg = pq.ParquetFile(files[0]).metadata.num_row_groups
+    assert rg == 4, f"expected 4 row groups from max_row_group_size=3 over 10 rows, got {rg}"
+
+
 def test_sort_by_auto_writes_clustered(tmp_path):
     """sort_by='auto' (the dbt spelling of SORTED BY AUTO) profiles the staged model result and
     picks the sort key itself: sorted_layout_auto's hash-scattered 3-value category must land
