@@ -18,9 +18,16 @@ any, optimised). The Delta log's own vorder flag guards the control: Fabric enab
 default on some runtimes, so a ``plain`` table that comes back flagged vorder=True aborts the
 probe rather than reporting a contaminated A/B.
 
+``PROBE_SEED_ORDER`` picks what the known order IS: ``sorted`` (date,time,DUID — the layout a
+tuned fact already has) or ``shuffle`` (ORDER BY hash of the key — the worst case, maximum
+incentive for V-Order to reorder). ``rid`` is stamped AFTER that ordering, so the seed is
+rid-ascending physically either way and descent detection works identically; the shuffle names
+get their own ``_shuffle`` seed/table so both experiments coexist.
+
 Env in: ONELAKE_TABLES_PATH, WS_ID, LH_ID (resolve_env.py), PROBE_ROWS (default 20M),
-FORCE_REBUILD. Writes only Files/probe/ and tests.order_probe_* — never touches mart.*; tables
-are left in place (skip-if-exists), like every other harness table.
+PROBE_SEED_ORDER (sorted|shuffle, default sorted), FORCE_REBUILD. Writes only Files/probe/ and
+tests.order_probe* — never touches mart.*; tables are left in place (skip-if-exists), like
+every other harness table.
 """
 import json
 import os
@@ -38,7 +45,13 @@ from dbt.adapters.duckrun import engine
 TABLES = os.environ["ONELAKE_TABLES_PATH"].rstrip("/")
 assert TABLES.endswith("/Tables"), f"expected a /Tables path, got {TABLES}"
 FILES_ROOT = TABLES[: -len("/Tables")] + "/Files"
-SEED_REMOTE = f"{FILES_ROOT}/probe/order_probe.parquet"
+SEED_ORDER = os.environ.get("PROBE_SEED_ORDER", "sorted").strip().lower()
+assert SEED_ORDER in ("sorted", "shuffle"), f"PROBE_SEED_ORDER must be sorted|shuffle, got {SEED_ORDER}"
+# hash() of the unique key = a deterministic shuffle: scrambled for every column, reproducible.
+RID_OVER = ('"date", "time", "DUID"' if SEED_ORDER == "sorted"
+            else 'hash("date", "time", "DUID")')
+SUFFIX = "" if SEED_ORDER == "sorted" else "_shuffle"
+SEED_REMOTE = f"{FILES_ROOT}/probe/order_probe{SUFFIX}.parquet"
 FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 _rows = os.environ.get("PROBE_ROWS", "").strip()
 N = int(_rows) if _rows.isdigit() and int(_rows) > 0 else 20_000_000
@@ -108,14 +121,14 @@ def _spark_code(variant, enabled):
     # Session default is pinned OFF at creation; the per-write option is the ONLY toggle, so the
     # two writes differ in exactly one boolean. coalesce(1) = a single task, pinning Spark's own
     # plumbing order so the plain control is a real noise floor.
+    tbl = f"tests.order_probe{SUFFIX}_{variant}"
     return (
         'spark.sql("CREATE SCHEMA IF NOT EXISTS tests")\n'
         f'df = spark.read.parquet("{SEED_REMOTE}").coalesce(1)\n'
         f'(df.write.mode("overwrite").format("delta")\n'
         f'   .option("parquet.vorder.enabled", "{enabled}")\n'
-        f'   .saveAsTable("tests.order_probe_{variant}"))\n'
-        f'print("WRITE_OK tests.order_probe_{variant} rows=" '
-        f'+ str(spark.read.table("tests.order_probe_{variant}").count()))\n'
+        f'   .saveAsTable("{tbl}"))\n'
+        f'print("WRITE_OK {tbl} rows=" + str(spark.read.table("{tbl}").count()))\n'
     )
 
 
@@ -188,7 +201,7 @@ def _tot(metrics, key):
 
 
 def _verdict(seed, plain, vorder):
-    lines = ["## V-Order reordering probe", "",
+    lines = [f"## V-Order reordering probe — seed order: {SEED_ORDER}", "",
              f"seed: {sum(r['rows'] for r in seed):,} rows, rid strictly ascending "
              f"(descents={_tot(seed, 'rid_descents')})", ""]
     hdr = ["table", "row groups", "rid descents", "rid breaks", "DUID descents"] + \
@@ -244,10 +257,10 @@ def main():
             pass
     if not seed_ok:
         scratch = tempfile.mkdtemp(prefix="order_probe_")
-        local = os.path.join(scratch, "order_probe.parquet").replace("\\", "/")
+        local = os.path.join(scratch, f"order_probe{SUFFIX}.parquet").replace("\\", "/")
         print(f"Building seed ({N:,} rows) locally...", flush=True)
         con.con.execute(f"""
-            COPY (SELECT row_number() OVER (ORDER BY "date", "time", "DUID") AS rid,
+            COPY (SELECT row_number() OVER (ORDER BY {RID_OVER}) AS rid,
                          "date", "time", "DUID", mw, price
                   FROM (SELECT * FROM mart.fct_summary LIMIT {N})
                   ORDER BY rid)
@@ -262,10 +275,10 @@ def main():
     # 2) the two Spark writes — one Livy session, V-Order default pinned OFF, per-write option
     # is the only difference between the variants.
     todo = {v: e for v, e in VARIANTS.items()
-            if FORCE or not _exists(con, f"order_probe_{v}")}
+            if FORCE or not _exists(con, f"order_probe{SUFFIX}_{v}")}
     for v in VARIANTS:
         if v not in todo:
-            print(f"tests.order_probe_{v} already exists — skipping (rebuild=true to rebuild)",
+            print(f"tests.order_probe{SUFFIX}_{v} already exists — skipping (rebuild=true to rebuild)",
                   flush=True)
     if todo:
         print("Creating Livy session (vorder default OFF)...", flush=True)
@@ -276,7 +289,7 @@ def main():
         try:
             _poll_session(sid)
             for v, enabled in todo.items():
-                print(f"Building tests.order_probe_{v} (vorder={enabled})...", flush=True)
+                print(f"Building tests.order_probe{SUFFIX}_{v} (vorder={enabled})...", flush=True)
                 _run_statement(sid, _spark_code(v, enabled))
         finally:
             print(f"Deleting session {sid}...", flush=True)
@@ -287,15 +300,15 @@ def main():
 
     # 3) probe — physical-order metrics for the seed and both results, then the verdict. The
     # Delta log's vorder flag guards the A/B before any row is read.
-    plain_files, plain_vorder = _table_files(con, "order_probe_plain")
-    vorder_files, vorder_vorder = _table_files(con, "order_probe_vorder")
+    plain_files, plain_vorder = _table_files(con, f"order_probe{SUFFIX}_plain")
+    vorder_files, vorder_vorder = _table_files(con, f"order_probe{SUFFIX}_vorder")
     print(f"\nDelta-log vorder flags: plain={plain_vorder} vorder={vorder_vorder}", flush=True)
     if plain_vorder:
-        sys.exit("CONTROL CONTAMINATED: tests.order_probe_plain is flagged vorder=True in its "
+        sys.exit(f"CONTROL CONTAMINATED: tests.order_probe{SUFFIX}_plain is flagged vorder=True in its "
                  "Delta log — the runtime's V-Order default won over the per-write option. "
                  "Fix the session/write config; this A/B proves nothing as-is.")
     if not vorder_vorder:
-        print("WARN: tests.order_probe_vorder is NOT flagged vorder=True — the option may not "
+        print(f"WARN: tests.order_probe{SUFFIX}_vorder is NOT flagged vorder=True — the option may not "
               "have taken; treat a 'no reordering' verdict with suspicion.", flush=True)
     seed = _order_metrics(con, [SEED_REMOTE], "seed")
     plain = _order_metrics(con, plain_files, "plain")

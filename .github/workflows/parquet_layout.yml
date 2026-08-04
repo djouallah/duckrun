@@ -69,6 +69,13 @@ on:
         description: "[order_probe] rows in the seed table (20M ≈ 2 row groups per result; plenty to detect a permutation)"
         type: string
         default: "20000000"
+      probe_seed_order:
+        description: "[order_probe] physical order of the seed: sorted (date,time,DUID) or shuffle (hash of the key — max incentive for V-Order to reorder)"
+        type: choice
+        default: sorted
+        options:
+          - sorted
+          - shuffle
 
 permissions:
   id-token: write
@@ -391,4 +398,5 @@ jobs:
           PYTHONUNBUFFERED: "1"
           FORCE_REBUILD: ${{ inputs.rebuild }}
           PROBE_ROWS: ${{ inputs.probe_rows }}
+          PROBE_SEED_ORDER: ${{ inputs.probe_seed_order }}
         run: python tests/parquet_layout/aemo/vorder_order_probe.py
