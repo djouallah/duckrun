@@ -61,6 +61,10 @@ on:
         description: "duckrun sort for the auto_sort copy ('auto' recommender, or cols like 'date, time' / 'OrderDate, ProductKey')"
         type: string
         default: "auto"
+      opt_rg:
+        description: "[aemo] pin the auto_sort build's row-group ceiling (rows, e.g. 16000000; the harness spelling of the max_row_group_size model config). Empty = adaptive default. Use with rebuild=true."
+        type: string
+        default: ""
       rebuild:
         description: "rebuild the auto_sort/vorder (and, for contoso, the base) tables even if they already exist (else reuse)"
         type: boolean
@@ -163,6 +167,7 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
           OPT_SORT: ${{ inputs.opt_sort }}
+          OPT_RG: ${{ inputs.opt_rg }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_auto_sort.py

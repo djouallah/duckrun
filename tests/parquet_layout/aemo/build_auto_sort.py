@@ -10,6 +10,17 @@ import report  # noqa: E402
 sort = (os.environ.get("OPT_SORT") or "auto").strip()
 clause = "sorted by auto" if sort.lower() == "auto" else f"sorted by ({sort})"
 force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
+# OPT_RG: pin the row-group CEILING for this build (rows), e.g. 16000000 vs 8000000 — the harness
+# spelling of the per-model `max_row_group_size` dbt config, for A/B-ing geometries in THIS CI.
+# The CTAS goes through the connection API (no dbt config to carry it), so pin it at the one
+# documented sizing seam every overwrite flows through: engine.rg_for. Same writer path
+# (row_group_rows -> WriterProperties) the dbt config feeds; empty = the adaptive default.
+_rg = os.environ.get("OPT_RG", "").strip()
+OPT_RG = int(_rg) if _rg.isdigit() and int(_rg) > 0 else None
+if OPT_RG is not None:
+    from dbt.adapters.duckrun import engine as _engine
+    _engine.rg_for = lambda est, floor=None, _v=OPT_RG: _v
+    print(f"OPT_RG: row-group ceiling pinned to {OPT_RG:,} rows for this build", flush=True)
 # Read the source mart.fct_summary DIRECTLY (its own independent read, separate from the Spark
 # V-Order build's) with the same row cap. SORTED BY AUTO re-sorts regardless of input order.
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
@@ -49,4 +60,5 @@ else:
 
 report.merge({"tables": {"fct_summary_auto_sort": {"build": {
     "engine": "delta_rs", "sort": clause, "vorder": False,
+    "row_group_ceiling": OPT_RG,   # None = adaptive (the default sizing)
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})
