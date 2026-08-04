@@ -12,7 +12,11 @@ from duckrun import auth  # noqa: E402
 TOKEN = auth.get_fabric_token()  # self-acquire the Fabric control-plane token (Livy) from OIDC
 BASE = (f"https://api.fabric.microsoft.com/v1/workspaces/{os.environ['WS_ID']}"
         f"/lakehouses/{os.environ['LH_ID']}/livyapi/versions/2023-12-01")
-FORCE = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
+# The V-Order reference reads the pristine mart.fct_summary and depends on NO duckrun knob, so it
+# never changes between runs — its OWN rebuild flag, not the shared FORCE_REBUILD, which the
+# auto_sort geometry experiments flip on every dispatch (that used to drag a ~3-minute byte-identical
+# Spark rebuild along each time). Rebuild it only when the source/row_limit actually changed.
+FORCE = os.environ.get("FORCE_REBUILD_VORDER", "false").strip().lower() == "true"
 
 # Read the source mart.fct_summary DIRECTLY (never a duckrun-written intermediate) so the V-Order
 # input is never influenced by duckrun's write layout. The row cap is applied here, independently

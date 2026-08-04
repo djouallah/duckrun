@@ -70,7 +70,11 @@ on:
         type: string
         default: ""
       rebuild:
-        description: "rebuild the auto_sort/vorder (and, for contoso, the base) tables even if they already exist (else reuse)"
+        description: "rebuild the auto_sort (and, for contoso, the base) tables even if they already exist (else reuse). The aemo V-Order reference is NOT rebuilt by this — it never changes; see rebuild_vorder."
+        type: boolean
+        default: false
+      rebuild_vorder:
+        description: "[aemo] also rebuild the Spark V-Order reference table (only needed when the source or row_limit changed — it depends on no duckrun knob)"
         type: boolean
         default: false
       probe_rows:
@@ -159,10 +163,12 @@ jobs:
         run: python tests/parquet_layout/aemo/check_tables.py
 
       - name: ⚡ Build Spark V-Order table (Livy, reads mart.fct_summary directly)
-        if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
+        # skip-if-exists inside the script; only rebuild_vorder forces it (the reference never
+        # changes with duckrun knobs, so the geometry experiments' rebuild leaves it alone)
+        if: ${{ inputs.rebuild_vorder || steps.check.outputs.build_needed == 'true' }}
         env:
           PYTHONIOENCODING: utf-8
-          FORCE_REBUILD: ${{ inputs.rebuild }}
+          FORCE_REBUILD_VORDER: ${{ inputs.rebuild_vorder }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_spark_variant.py
 
