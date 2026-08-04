@@ -2120,3 +2120,65 @@ def test_iceberg_sql_is_a_passthrough():
 def test_connect_rejects_unknown_format(tmp_path):
     with pytest.raises(ValueError, match="unknown format"):
         duckrun.connect(str(tmp_path), format="hudi")
+
+
+def test_explicit_target_file_size_overrides_the_constant():
+    # The per-model target_file_size_mb config lands here as bytes and overrides the 256 MB
+    # constant for THIS write only; None keeps the default. Same for overwrite and append.
+    from dbt.adapters.duckrun import engine
+    default = engine.build_write_deltalake_args("p", None, "overwrite")
+    assert default["target_file_size"] == engine._TARGET_FILE_SIZE
+    custom = engine.build_write_deltalake_args(
+        "p", None, "append", target_file_size=64 * 1024 * 1024)
+    assert custom["target_file_size"] == 64 * 1024 * 1024
+
+
+def test_explicit_row_group_bypasses_estimator_and_lands(conn, monkeypatch):
+    # An explicit max_row_group_size is a DECLARED geometry, not a guess: the planner estimator
+    # must not run at all (no estimate, no prior-log probe, no accuracy warning), and the ceiling
+    # must land verbatim in the written parquet.
+    from dbt.adapters.duckrun import engine
+    called, warned = [], []
+    monkeypatch.setattr(engine, "estimated_rows", lambda cur, data: called.append(1) or 999)
+    monkeypatch.setattr(engine.logger, "warning", lambda msg, *a, **k: warned.append(msg))
+    data = conn._connection.sql("select i from range(1000) t(i)")
+    loc = conn.root_path + "/dbo/geo_explicit"
+    engine.write_delta(loc, data, "overwrite", cur=conn._connection,
+                       storage_options=conn.storage_options, row_group_rows=250)
+    assert not called, "explicit geometry must bypass the estimator"
+    assert not warned, f"explicit geometry must not trip the estimate-accuracy warning: {warned}"
+    live = engine._delta_table(loc, conn.storage_options).file_uris()
+    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchone()[0]
+    assert mx <= 250, f"explicit row-group ceiling not honored: max group {mx}"
+
+
+def test_maintain_honors_model_geometry(conn, monkeypatch):
+    # A model's declared geometry must survive maintenance: without threading it through, the very
+    # next compaction would re-fold the files into the global 256 MB / adaptive-16M layout and
+    # silently undo the config the write just honored. Force the compact trigger and check both the
+    # policy's target and the compacted row-group ceiling.
+    from dbt.adapters.duckrun import engine
+    conn.sql("CREATE OR REPLACE TABLE mgeo AS select i as j from range(100) t(i)")
+    conn.sql("INSERT INTO mgeo select i from range(100, 200) t(i)")
+    loc = conn.root_path + "/dbo/mgeo"
+    captured = {}
+    real_policy = engine.MaintenancePolicy
+
+    class SpyPolicy(real_policy):
+        def __init__(self, target_file_size):
+            captured["target"] = target_file_size
+            super().__init__(target_file_size=target_file_size)
+
+        def should_compact(self, sizes):
+            return True  # force the rewrite so the row-group cap is observable
+
+    monkeypatch.setattr(engine, "MaintenancePolicy", SpyPolicy)
+    engine._maintain(conn._connection, loc, storage_options=conn.storage_options,
+                     target_file_size=64 * 1024 * 1024, row_group_cap=7)
+    assert captured["target"] == 64 * 1024 * 1024
+    live = engine._delta_table(loc, conn.storage_options).file_uris()
+    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchone()[0]
+    assert mx <= 7, f"compaction ignored the explicit row-group cap: max group {mx}"
+    # Unset -> the defaults, unchanged.
+    engine._maintain(conn._connection, loc, storage_options=conn.storage_options)
+    assert captured["target"] == engine._TARGET_FILE_SIZE

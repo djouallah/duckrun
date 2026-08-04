@@ -180,6 +180,10 @@ class Plugin(BasePlugin):
         cfg = target_config.config or {}
 
         partition_by = cfg.get("partition_by")
+        # Per-model write geometry (both optional; None = the adaptive defaults). Explicit ceilings
+        # like sort_by/partition_by: duckrun-only configs upstream parses and ignores. Validated
+        # loudly HERE, before any Delta access, so a typo fails the model cleanly.
+        row_group_rows, target_file_size = self._geometry_config(cfg)
         merge_schema = bool(cfg.get("merge_schema", False))
         unique_key = cfg.get("unique_key")
         incremental = bool(cfg.get("incremental", False))
@@ -279,6 +283,7 @@ class Plugin(BasePlugin):
             self._store_microbatch(
                 path, cur, name, cfg, storage_options, exists, full_refresh,
                 read_version=cfg.get("read_version"),
+                row_group_rows=row_group_rows, target_file_size=target_file_size,
             )
             return
 
@@ -286,7 +291,9 @@ class Plugin(BasePlugin):
         # overwrite on first run / full-refresh, then apply the incremental strategy.
         if not incremental or full_refresh or not exists:
             self._store_overwrite(path, cur, data, partition_by, merge_schema, exists,
-                                  storage_options)
+                                  storage_options,
+                                  row_group_rows=row_group_rows,
+                                  target_file_size=target_file_size)
             return
 
         # Resolve the incremental strategy: default to merge when a unique_key is given, else append.
@@ -305,6 +312,7 @@ class Plugin(BasePlugin):
                 path, cur, name, unique_key, storage_options,
                 read_version=cfg.get("read_version"), partition_by=partition_by,
                 incremental_predicates=cfg.get("incremental_predicates"),
+                row_group_rows=row_group_rows, target_file_size=target_file_size,
             )
             return
 
@@ -340,20 +348,46 @@ class Plugin(BasePlugin):
                     max_spill_size=cfg.get("merge_max_spill_size"),
                     max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                     streamed_exec=bool(cfg.get("merge_streamed_exec")),
+                    row_group_rows=row_group_rows, target_file_size=target_file_size,
                 )
             if src_tmp is not None:
                 cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")
             return
 
         if strategy in ("merge", "insert"):
-            self._store_merge(path, cur, data, cfg, unique_key, strategy, storage_options, src_tmp)
+            self._store_merge(path, cur, data, cfg, unique_key, strategy, storage_options,
+                              src_tmp, row_group_rows=row_group_rows,
+                              target_file_size=target_file_size)
         elif strategy == "append":
-            self._store_append(path, cur, data, cfg, partition_by, merge_schema, storage_options)
+            self._store_append(path, cur, data, cfg, partition_by, merge_schema, storage_options,
+                               row_group_rows=row_group_rows, target_file_size=target_file_size)
         else:
             raise ValueError(
                 f"Unknown incremental_strategy '{strategy}'. "
                 "Use 'merge', 'insert', 'delete+insert', 'append', or 'microbatch'."
             )
+
+    @staticmethod
+    def _geometry_config(cfg):
+        """The per-model write-geometry overrides: ``max_row_group_size`` (rows — deltalake's own
+        ``WriterProperties`` spelling) and ``target_file_size_mb`` (megabytes; converted to bytes
+        HERE — everything below the plugin speaks bytes). Returns ``(row_group_rows, target_bytes)``,
+        each ``None`` when unset (the adaptive estimator / 16M ceiling / 256 MB roll stay in charge).
+        Explicit values are CEILINGS the engine honors verbatim — an explicit row-group size also
+        bypasses the planner estimate entirely (a declared geometry is not a guess to second-guess).
+        Ints or digit-strings accepted (YAML quoting); anything else fails the model loudly."""
+        def _pos_int(key):
+            val = cfg.get(key)
+            if val is None:
+                return None
+            if isinstance(val, str) and val.strip().isdigit():
+                val = int(val.strip())
+            if isinstance(val, bool) or not isinstance(val, int) or val <= 0:
+                raise ValueError(f"{key} must be a positive integer, got {val!r}")
+            return val
+        rg = _pos_int("max_row_group_size")
+        mb = _pos_int("target_file_size_mb")
+        return rg, (mb * 1024 * 1024 if mb is not None else None)
 
     def _resolve_sort_by(self, cur, name, sort_by, partition_by):
         """Resolve ``sort_by='auto'`` (case-insensitive scalar) into concrete columns by profiling
@@ -383,7 +417,7 @@ class Plugin(BasePlugin):
         return key or None
 
     def _store_overwrite(self, path, cur, data, partition_by, merge_schema, exists,
-                         storage_options) -> None:
+                         storage_options, row_group_rows=None, target_file_size=None) -> None:
         """The CREATE OR REPLACE branch: a table model, a --full-refresh, or a first run.
         When we are REPLACING an existing table (exists), allow delta_rs to replace the schema
         wholesale (schema_mode="overwrite") — the model SQL defines the new schema, exactly as
@@ -402,10 +436,12 @@ class Plugin(BasePlugin):
                 overwrite_schema=overwrite_schema,
                 storage_options=storage_options,
                 cur=cur,
+                row_group_rows=row_group_rows,
+                target_file_size=target_file_size,
             )
 
     def _store_merge(self, path, cur, data, cfg, unique_key, strategy, storage_options,
-                     src_tmp) -> None:
+                     src_tmp, row_group_rows=None, target_file_size=None) -> None:
         """The merge / insert strategies: validate config, resolve on_schema_change, and dispatch
         to the clause-core (merge_clauses / merge_update_set_expressions) or the flat-kwarg
         merge_delta path.
@@ -457,6 +493,8 @@ class Plugin(BasePlugin):
                     sort_by=cfg.get("sort_by"),
                     storage_options=storage_options,
                     cur=cur,
+                    row_group_rows=row_group_rows,
+                    target_file_size=target_file_size,
                 )
             else:
                 engine.merge_delta(
@@ -477,12 +515,14 @@ class Plugin(BasePlugin):
                     read_version=cfg.get("read_version"),
                     storage_options=storage_options,
                     cur=cur,
+                    row_group_rows=row_group_rows,
+                    target_file_size=target_file_size,
                 )
         if src_tmp is not None:
             cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")  # #14: release the materialized source
 
     def _store_append(self, path, cur, data, cfg, partition_by, merge_schema,
-                      storage_options) -> None:
+                      storage_options, row_group_rows=None, target_file_size=None) -> None:
         """The append strategy. A read-modify-append on the SAME table — the model read {{ this }}
         (e.g. an incremental append whose watermark is `max(ts) from {{ this }}`) — is fenced to the
         version the model read (vB, captured before it read {{ this }}): a concurrent commit any time
@@ -500,6 +540,8 @@ class Plugin(BasePlugin):
                     merge_schema=merge_schema,
                     storage_options=storage_options,
                     cur=cur,
+                    row_group_rows=row_group_rows,
+                    target_file_size=target_file_size,
                 )
             else:
                 engine.write_delta(
@@ -508,11 +550,13 @@ class Plugin(BasePlugin):
                     merge_schema=merge_schema,
                     storage_options=storage_options,
                     cur=cur,
+                    row_group_rows=row_group_rows,
+                    target_file_size=target_file_size,
                 )
 
     def _store_microbatch(
         self, path, cur, name, cfg, storage_options, exists, full_refresh,
-        read_version=None,
+        read_version=None, row_group_rows=None, target_file_size=None,
     ) -> None:
         """dbt ``incremental_strategy='microbatch'``: for the current batch window
         ``[event_time_start, event_time_end)``, atomically replace the rows already in that window
@@ -575,6 +619,8 @@ class Plugin(BasePlugin):
                 partition_by=partition_by,
                 storage_options=storage_options,
                 cur=cur,
+                row_group_rows=row_group_rows,
+                target_file_size=target_file_size,
             )
         else:
             engine.replace_window(
@@ -584,11 +630,14 @@ class Plugin(BasePlugin):
                 partition_by=partition_by,
                 storage_options=storage_options,
                 cur=cur,
+                row_group_rows=row_group_rows,
+                target_file_size=target_file_size,
             )
 
     def _store_delete_insert(
         self, path, cur, name, unique_key, storage_options,
         read_version=None, partition_by=None, incremental_predicates=None,
+        row_group_rows=None, target_file_size=None,
     ) -> None:
         """dbt ``incremental_strategy='delete+insert'``: delete the target rows whose ``unique_key``
         is present in the incoming batch (optionally further restricted by ``incremental_predicates``),
@@ -668,6 +717,8 @@ class Plugin(BasePlugin):
                 partition_by=partition_by,
                 storage_options=storage_options,
                 cur=cur,
+                row_group_rows=row_group_rows,
+                target_file_size=target_file_size,
             )
         finally:
             cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
@@ -677,6 +728,7 @@ class Plugin(BasePlugin):
         read_version=None, partition_by=None, merge_schema=False,
         incremental_predicates=None, insert_condition=None, sort_by=None,
         max_spill_size=None, max_temp_directory_size=None, streamed_exec=False,
+        row_group_rows=None, target_file_size=None,
     ) -> None:
         """dbt ``incremental_strategy='insert'``: append only the batch rows whose ``unique_key`` is
         not already in the target — an idempotent dedupe-append.
@@ -746,6 +798,8 @@ class Plugin(BasePlugin):
             max_spill_size=max_spill_size,
             max_temp_directory_size=max_temp_directory_size,
             streamed_exec=streamed_exec,
+            row_group_rows=row_group_rows,
+            target_file_size=target_file_size,
         )
 
     @staticmethod

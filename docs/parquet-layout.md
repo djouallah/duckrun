@@ -40,6 +40,14 @@ With that frame in place, the table below is the full configuration; the [reason
 | **Statistics** | chunk-level, truncated | Row-group min/max is all a reader needs to skip row groups; page-level statistics only bloat the footer. Long strings are truncated in the statistics. |
 | **Target file size** | 256 MB | A row group cannot span files, so this byte cap is effectively a segment cap. A narrow fact reaches a full 16M-row segment well under 256 MB; a wide fact fills 256 MB before 16M rows, so there the file size — not the row count — sets the segment. It is deliberately well below **1 GB**, which forced whole-file copy-on-write and inflated merge cost on disk. (File size is not the dominant merge-memory lever — the dictionary limit is.) |
 
+**Per-model overrides.** The adaptive sizing above depends on a planner row estimate, which can
+under-shoot on the *first* build of a big joined/aggregated model (a rebuild of an existing table
+gets the prior version's exact log count as a floor, so it self-corrects). A dbt model that knows
+its own size can declare its geometry instead: `max_row_group_size` (rows) and
+`target_file_size_mb` (MB) pin the row-group ceiling and file size for that model's writes — the
+explicit value bypasses the estimate entirely and is preserved by post-write compaction. See the
+[model config reference](dbt-adapter.md#config-options-table--incremental--delta).
+
 ### The logic behind the numbers
 
 Every value above is pulled in two opposite directions:

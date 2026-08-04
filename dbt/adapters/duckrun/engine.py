@@ -793,6 +793,7 @@ def build_write_deltalake_args(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
@@ -813,6 +814,9 @@ def build_write_deltalake_args(
     ``row_group_rows`` is the adaptive overwrite geometry (see ``write_delta`` / ``rg_for``). It is
     meaningless on append — an increment knows nothing about the table it lands in — so append
     passes ``None`` and keeps the ``_ROW_GROUP_SIZE`` ceiling, letting the file roll pick the group.
+
+    ``target_file_size`` (bytes) overrides the 256 MB default for THIS write — the per-model
+    ``target_file_size_mb`` dbt config lands here. ``None`` keeps ``_TARGET_FILE_SIZE``.
     """
     args: Dict[str, Any] = {
         "table_or_uri": path,
@@ -827,7 +831,7 @@ def build_write_deltalake_args(
     # mode only) — delta-rs's own schema_mode values, passed straight through.
     if schema_mode in ("merge", "overwrite"):
         args["schema_mode"] = schema_mode
-    args["target_file_size"] = _TARGET_FILE_SIZE
+    args["target_file_size"] = target_file_size if target_file_size is not None else _TARGET_FILE_SIZE
     # append passes row_group_rows=None → the _ROW_GROUP_SIZE ceiling, file roll decides (see above)
     wp = _writer_properties(row_group_rows=row_group_rows)
     if wp is not None:
@@ -1302,7 +1306,9 @@ def _cleanup_due(path: str, dt: DeltaTable) -> bool:
     return dt.version() - _last_cleanup_version.get(path, -_MAINT_CLEANUP_EVERY) >= _MAINT_CLEANUP_EVERY
 
 
-def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) -> None:
+def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, *,
+              target_file_size: Optional[int] = None,
+              row_group_cap: Optional[int] = None) -> None:
     """Best-effort post-write upkeep shared by the append / merge / delete+insert paths: compact
     small files when the byte debt is worth it, then (only if a compaction happened) vacuum, and —
     on its own log-growth gate — clean up expired log entries. Without it a table written on every
@@ -1324,20 +1330,27 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None) 
     The byte debt is measured with the DuckDB cursor ``cur`` (a replacement scan over the Delta log's
     add-actions); a caller with no cursor to lend — a bare engine write outside a session — simply
     gets no maintenance. Every production write path (the dbt plugin, the DataFrame writer, the raw-DML
-    router, the table handles) wires one, so this only skips ad-hoc/direct engine calls."""
+    router, the table handles) wires one, so this only skips ad-hoc/direct engine calls.
+
+    ``target_file_size`` / ``row_group_cap`` carry a model's EXPLICIT write geometry (the
+    ``target_file_size_mb`` / ``max_row_group_size`` dbt configs) into maintenance: without them, the
+    very next compaction would re-fold the model's files back into the global 256 MB / adaptive-16M
+    layout, silently undoing the config the write just honored. ``None`` = the defaults, unchanged."""
     if cur is None:
         return
     dt = _delta_table(path, storage_options)
     debt = compaction_debt(cur, path, dt=dt, storage_options=storage_options)
-    policy = _policy()
+    _target = target_file_size if target_file_size is not None else _TARGET_FILE_SIZE
+    policy = MaintenancePolicy(target_file_size=_target)
 
     # Adaptive row-group geometry: compaction rewrites the whole table into the read layout, and the
     # table's live row count is free in the log — so a small table compacts to ~_RG_LANES small groups
-    # instead of one fat 16M group (big/unknown -> 16M). Same knob as the overwrite path.
-    _compact_rg = rg_for(table_num_records(cur, dt))
+    # instead of one fat 16M group (big/unknown -> 16M). Same knob as the overwrite path. An explicit
+    # per-model ceiling wins verbatim — it IS the declared layout, not an estimate to improve on.
+    _compact_rg = row_group_cap if row_group_cap is not None else rg_for(table_num_records(cur, dt))
 
     def _compact():
-        dt.optimize.compact(target_size=_TARGET_FILE_SIZE,
+        dt.optimize.compact(target_size=_target,
                             writer_properties=_writer_properties(row_group_rows=_compact_rg))
 
     def _vacuum():  # past the retention-length gate only; a compaction just ran → compacted=True
@@ -1375,6 +1388,7 @@ def write_delta(
     cur=None,
     read_version: Optional[int] = None,
     row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """
     Materialize ``data`` (a DuckDB relation / Arrow C-stream) to Delta and maintain it.
@@ -1394,6 +1408,10 @@ def write_delta(
     Every write lands in the one read-layout profile (tuned writer properties + 256 MB files) —
     append included. Only the row-group CEILING differs: an overwrite sizes it from the result (see
     ``rg_for``), an append leaves it at the maximum and lets the file roll pick the group.
+
+    An EXPLICIT ``row_group_rows`` (the ``max_row_group_size`` dbt config) bypasses the estimator
+    entirely — a declared geometry is not a guess to second-guess — and, with ``target_file_size``
+    (bytes), is carried into post-write maintenance so compaction preserves it.
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
@@ -1428,6 +1446,7 @@ def write_delta(
     # An overwrite that deliberately SHRINKS a table over-estimates and keeps a larger ceiling — harmless
     # by the documented asymmetry (policy.RG_MIN_ESTIMATED): the 256 MB file roll closes the group anyway.
     est, est_src = None, "none"
+    explicit_rg = row_group_rows   # a caller-declared ceiling (per-model config); None = adaptive
     if mode == "overwrite" and row_group_rows is None:
         try:
             est = estimated_rows(cur, data)
@@ -1460,6 +1479,7 @@ def write_delta(
         partition_by=partition_by,
         storage_options=storage_options,
         row_group_rows=row_group_rows,
+        target_file_size=target_file_size,
     )
     if read_version is None:
         write_deltalake(**args)
@@ -1483,7 +1503,8 @@ def write_delta(
             dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
             dt.cleanup_metadata()
     else:  # append
-        _maintain(cur, path, storage_options=storage_options)
+        _maintain(cur, path, storage_options=storage_options,
+                  target_file_size=target_file_size, row_group_cap=explicit_rg)
 
 
 def create_empty_delta(
@@ -1512,6 +1533,8 @@ def append_if_unchanged(
     merge_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
+    row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """
     Optimistic ("safe") append: append ``data`` only if the table version has not moved since
@@ -1546,6 +1569,8 @@ def append_if_unchanged(
         storage_options=storage_options,
         cur=cur,
         read_version=read_version,
+        row_group_rows=row_group_rows,
+        target_file_size=target_file_size,
     )
 
 
@@ -1558,6 +1583,8 @@ def overwrite_if_unchanged(
     overwrite_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
+    row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """Optimistic FULL-TABLE overwrite: replace every row with ``data`` only if the table version
     has not moved since we read it — otherwise refuse with ``CommitFailedError``. The overwrite
@@ -1589,6 +1616,8 @@ def overwrite_if_unchanged(
         storage_options=storage_options,
         cur=cur,
         read_version=read_version,
+        row_group_rows=row_group_rows,
+        target_file_size=target_file_size,
     )
 
 
@@ -1601,6 +1630,8 @@ def replace_where(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
+    row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
     replace the rows matching ``predicate`` with ``data``. One commit, not a delete-then-append
@@ -1620,18 +1651,21 @@ def replace_where(
             "replace_where requires read_version (the version the caller read). A replaceWhere is "
             "a read-modify-write and must be pinned to its snapshot."
         )
-    # No row_group_rows and no estimate — DELIBERATE, not an oversight in the one overwrite sizing
-    # seam (write_delta). A replaceWhere writes a SLICE, not a table: ceil(slice_rows / RG_LANES) sizes
-    # this window's segments off a number that says nothing about the table's segment budget, and would
-    # leave a table with 16M-row groups everywhere except the last-replaced window. The estimate floor
-    # would also make it inert for any window under RG_LANES x RG_MIN_ESTIMATED rows (the common
+    # No DERIVED row_group_rows and no estimate — DELIBERATE, not an oversight in the one overwrite
+    # sizing seam (write_delta). A replaceWhere writes a SLICE, not a table: ceil(slice_rows / RG_LANES)
+    # sizes this window's segments off a number that says nothing about the table's segment budget, and
+    # would leave a table with 16M-row groups everywhere except the last-replaced window. The estimate
+    # floor would also make it inert for any window under RG_LANES x RG_MIN_ESTIMATED rows (the common
     # microbatch), so it could only ever distort the large-window case. And the bypass is what
     # structurally keeps write_delta's prior-count
     # floor (see prior_row_count) away from a partial replace, where "rows in the table" is a meaningless
     # proxy for "rows in this slice". A microbatch's FIRST batch does go through write_delta and IS
     # sized — correct, because at that instant the table is just that window.
+    # An EXPLICIT row_group_rows (per-model config) is different in kind: a declared CEILING, not a
+    # derived size — it applies to a slice exactly as it applies to an append.
     args = build_write_deltalake_args(
         path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
+        row_group_rows=row_group_rows, target_file_size=target_file_size,
     )
     args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
     # Pin to the read snapshot and disable rebasing (CAS), so a concurrent commit since vB fails
@@ -1641,7 +1675,8 @@ def replace_where(
 
     # Maintenance ALWAYS at a fresh HEAD — never the pinned snapshot (a stale file list would
     # compact/vacuum files live versions still reference and corrupt the table).
-    _maintain(cur, path, storage_options=storage_options)
+    _maintain(cur, path, storage_options=storage_options,
+              target_file_size=target_file_size, row_group_cap=row_group_rows)
 
 
 def replace_window(
@@ -1655,6 +1690,8 @@ def replace_window(
     partition_by: Optional[List[str]] = None,
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
+    row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """Microbatch window replace: atomically replace the rows in ``[start, end)`` on ``column``
     with ``data`` (the batch's rows) — the Delta-native equivalent of dbt's microbatch "delete the
@@ -1669,6 +1706,7 @@ def replace_window(
         path, data, predicate,
         read_version=read_version, partition_by=partition_by,
         storage_options=storage_options, cur=cur,
+        row_group_rows=row_group_rows, target_file_size=target_file_size,
     )
 
 
@@ -1853,6 +1891,8 @@ def merge_delta(
     cur=None,
     partition_by: Optional[List[str]] = None,
     sort_by=None,
+    row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """
     Merge ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
@@ -1955,6 +1995,8 @@ def merge_delta(
         # append path (see merge_delta_clauses); a delta_rs merge writes into the existing layout.
         partition_by=partition_by,
         sort_by=sort_by,
+        row_group_rows=row_group_rows,
+        target_file_size=target_file_size,
     )
 
 
@@ -2277,6 +2319,8 @@ def insert_delta(
     merge_schema: bool = False,
     storage_options: Optional[Dict[str, str]] = None,
     sort_by=None,
+    row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """Insert only the source rows that match no target row, as a PLAIN APPEND — the anti-join form of
     ``WHEN NOT MATCHED THEN INSERT *``.
@@ -2364,6 +2408,8 @@ def insert_delta(
             merge_schema=merge_schema,
             storage_options=storage_options,
             cur=cur,
+            row_group_rows=row_group_rows,
+            target_file_size=target_file_size,
         )
     finally:
         cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
@@ -2470,6 +2516,8 @@ def merge_delta_clauses(
     cur=None,
     partition_by: Optional[List[str]] = None,
     sort_by=None,
+    row_group_rows: Optional[int] = None,
+    target_file_size: Optional[int] = None,
 ) -> None:
     """Run a MERGE described by an ORDERED list of clause dicts — the full delta-rs ``TableMerger``
     surface. Each clause is ``{"clause": "matched"|"not_matched"|"not_matched_by_source",
@@ -2543,6 +2591,8 @@ def merge_delta_clauses(
                 merge_schema=merge_schema,
                 storage_options=storage_options,
                 sort_by=sort_by,
+                row_group_rows=row_group_rows,
+                target_file_size=target_file_size,
             )
             return
         except AntiJoinUnsupported as e:
@@ -2593,4 +2643,8 @@ def merge_delta_clauses(
 
     # Same best-effort maintenance as the append / delete+insert paths: a merged-on-every-run
     # incremental table fragments into small files and leaves tombstoned old versions otherwise.
-    _maintain(cur, path, storage_options=storage_options)
+    # The merge itself writes with delta_rs defaults (deliberately — no writer_properties on the
+    # OOM-prone path), so THIS is where a model's declared geometry reaches a merged table: the
+    # post-merge compaction folds the lean merge files into it.
+    _maintain(cur, path, storage_options=storage_options,
+              target_file_size=target_file_size, row_group_cap=row_group_rows)

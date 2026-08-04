@@ -492,3 +492,21 @@ def test_catalog_view_detection_is_structural(tmp_path):
     assert con.execute(CATALOG_VIEW_TYPE_SQL, ["real_delta"]).fetchone()[0] == "BASE TABLE"
     assert con.execute(CATALOG_VIEW_TYPE_SQL, ["versioned"]).fetchone()[0] == "BASE TABLE"
     assert con.execute(CATALOG_VIEW_TYPE_SQL, ["mentions"]).fetchone()[0] == "VIEW"
+
+
+def test_geometry_config_validation():
+    # The per-model write-geometry configs: max_row_group_size (rows, deltalake's own spelling) and
+    # target_file_size_mb (MB -> bytes at this seam; everything below the plugin speaks bytes).
+    # Unset -> (None, None) so the adaptive defaults stay in charge. Digit-strings are accepted
+    # (YAML quoting); anything else fails the model loudly BEFORE any Delta access.
+    gc = Plugin._geometry_config
+    assert gc({}) == (None, None)
+    assert gc({"max_row_group_size": 16_000_000}) == (16_000_000, None)
+    assert gc({"target_file_size_mb": 512}) == (None, 512 * 1024 * 1024)
+    assert gc({"max_row_group_size": "8000000", "target_file_size_mb": "128"}) == (
+        8_000_000, 128 * 1024 * 1024)
+    for bad in (0, -1, True, 1.5, "16MB", [16]):
+        with pytest.raises(ValueError):
+            gc({"max_row_group_size": bad})
+        with pytest.raises(ValueError):
+            gc({"target_file_size_mb": bad})
