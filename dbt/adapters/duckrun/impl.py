@@ -594,6 +594,80 @@ class DuckrunAdapter(DuckDBAdapter):
         merged.extend(discovered)
         return merged
 
+    # --- column introspection with no cache population -------------------------------------------
+    def get_columns_in_relation(self, relation):
+        """dbt-duckdb's answer (an ``information_schema`` query), plus an on-demand bind when it
+        comes back empty.
+
+        A duckrun model is a ``delta_scan`` view, and every path that creates one hangs off dbt's
+        relation-cache population (:meth:`_relations_cache_for_schemas` →
+        :meth:`list_relations_without_caching` → :meth:`_register_delta_view`). ``dbt
+        run-operation`` never populates that cache — ``RunOperationTask`` is not a graph task, it
+        compiles the manifest and runs the macro — so ``information_schema`` is empty there and
+        every column-introspection consumer (dbt-codegen's ``generate_model_yaml``, dbt-osmosis,
+        project macros) silently got ZERO columns back for a model sitting on disk — so there was
+        no supported way to bootstrap a ``schema.yml`` for an existing model (issue #24). Bind the
+        one relation being asked about, then ask again.
+
+        The fallback only runs where the answer was already wrong (empty). Every path that
+        works today — a materialization introspecting its temp table, anything after cache
+        population — is answered by the base call and pays nothing extra.
+        """
+        columns = super().get_columns_in_relation(relation)
+        if columns or not self._bind_delta_view(relation):
+            return columns
+        return super().get_columns_in_relation(relation)
+
+    def _bind_delta_view(self, relation):
+        """Register the ``delta_scan`` view for ONE ``relation`` on demand. True when a bind was
+        attempted, False when there is nothing to bind.
+
+        The single-relation counterpart of discovery's bulk registration, under the same contract:
+        a table that isn't on disk and a drop-tombstone must not surface. Nothing here may turn a
+        previously-silent introspection into a failed run, so every error is swallowed at debug
+        and leaves the caller with the empty column list it already had.
+        """
+        from . import engine
+
+        if relation is None or not relation.identifier or not relation.schema:
+            return False
+        try:
+            root_path, so = self.config.credentials.root_for(relation.database)
+            if not root_path:
+                return False
+            location = (
+                root_path.rstrip("/")
+                + "/" + str(relation.schema).strip('"')
+                + "/" + str(relation.identifier).strip('"')
+            )
+
+            settled, dt = True, None
+            try:
+                dt = engine.open_if_exists(location, so)
+            except Exception as exc:
+                # delta-rs couldn't open it — e.g. an az:// store whose credential lives only in
+                # the DuckDB `secrets:` block. Existence is unsettled, so fall through to the bind
+                # attempt (DuckDB holds that secret) rather than reporting "no columns" for a
+                # table that is really there; a wrong guess just fails the CREATE VIEW silently.
+                logger.debug(f"duckrun: could not open {location!r} for an on-demand bind: {exc}")
+                settled = False
+            if settled:
+                if dt is None or delta_dml.is_dropped_dt(dt):
+                    return False  # no Delta table there, or a drop-tombstone — must not surface
+            elif delta_dml.is_dropped(self._cursor(), location, so):
+                return False  # a tombstone DuckDB can still see, exactly as in _live_relations
+
+            # The view needs its schema; a custom-schema model has none in a fresh in-memory DuckDB.
+            try:
+                self.create_schema(relation)
+            except Exception as exc:  # best-effort, same contract as the registration below
+                logger.debug(f"duckrun: could not create schema for {relation}: {exc}")
+            self._register_delta_view(relation, dt=dt)
+            return True
+        except Exception as exc:  # pragma: no cover - introspection must never turn loud here
+            logger.debug(f"duckrun: on-demand bind for {relation} failed: {exc}")
+            return False
+
     # --- dbt docs: table stats from the Delta log -------------------------------------------------
     # The stock catalog query (duckrun__get_catalog) emits only column metadata, so dbt-docs shows an
     # empty Stats panel (issue #3). dbt assembles the panel from columns named

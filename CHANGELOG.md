@@ -25,6 +25,16 @@ All notable changes to this project will be documented in this file.
   ever tightening, and the unlocked tighten could race at threads>1.
 
 ### Fixed
+- **`dbt run-operation` can see a model's columns (#24).** A duckrun model is a `delta_scan` view that
+  only exists once dbt has populated its relation cache — and `run-operation` never populates it
+  (`RunOperationTask` is not a graph task). `adapter.get_columns_in_relation()` therefore came back
+  EMPTY for a model sitting on disk, and silently so: dbt-codegen's `generate_model_yaml`,
+  dbt-osmosis and any project macro produced a `schema.yml` with no columns in it rather than
+  failing, and there was no supported way to bootstrap a `schema.yml` for an existing model. The
+  adapter now binds the one relation being asked about when the base `information_schema` answer is
+  empty, so column introspection no longer depends on cache population. Gated on that empty answer,
+  so every path that already worked is unchanged and pays nothing; a table that isn't on disk and a
+  drop-tombstone still report no columns.
 - **`incremental_strategy='insert'` now forwards the merge overrides.** `merge_streamed_exec: true`
   is the documented way back to a real delta_rs merge for the insert spelling, but the flag (and
   `merge_max_spill_size` / `merge_max_temp_directory_size`) was silently dropped on that path — the
