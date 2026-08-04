@@ -21,6 +21,17 @@ if OPT_RG is not None:
     from dbt.adapters.duckrun import engine as _engine
     _engine.rg_for = lambda est, floor=None, _v=OPT_RG: _v
     print(f"OPT_RG: row-group ceiling pinned to {OPT_RG:,} rows for this build", flush=True)
+# OPT_TFS_MB: pin the target parquet FILE size (MB) — the harness spelling of the
+# `target_file_size_mb` model config, same seam (the module global every write reads at call
+# time). 1024 with a ~765 MB table = a single file, matching the V-Order reference's file count.
+# NOTE an OPT_RG past ~16M also raises arrow-rs's per-writer buffer (a full uncompressed row
+# group); ~48M rows of this fact is ~2 GB on the runner — fine on 16 GB, mind it elsewhere.
+_tfs = os.environ.get("OPT_TFS_MB", "").strip()
+OPT_TFS_MB = int(_tfs) if _tfs.isdigit() and int(_tfs) > 0 else None
+if OPT_TFS_MB is not None:
+    from dbt.adapters.duckrun import engine as _engine
+    _engine._TARGET_FILE_SIZE = OPT_TFS_MB * 1024 * 1024
+    print(f"OPT_TFS_MB: target file size pinned to {OPT_TFS_MB} MB for this build", flush=True)
 # Read the source mart.fct_summary DIRECTLY (its own independent read, separate from the Spark
 # V-Order build's) with the same row cap. SORTED BY AUTO re-sorts regardless of input order.
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
@@ -60,5 +71,6 @@ else:
 
 report.merge({"tables": {"fct_summary_auto_sort": {"build": {
     "engine": "delta_rs", "sort": clause, "vorder": False,
-    "row_group_ceiling": OPT_RG,   # None = adaptive (the default sizing)
+    "row_group_ceiling": OPT_RG,     # None = adaptive (the default sizing)
+    "target_file_size_mb": OPT_TFS_MB,  # None = the 256 MB default
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})
