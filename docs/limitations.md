@@ -128,22 +128,30 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   a rough rule, not a broadly tested optimum. A table with unusual width, cardinality, or skew may well
   have its sweet spot elsewhere. See
   [How the numbers are grounded](parquet-layout.md#how-the-numbers-are-grounded).
-- **On a full-table overwrite, that row estimate is a planner guess and can be badly low.** DuckDB
-  applies a fixed 0.2 selectivity guess to filters and anti/semi joins, a set-operation parent carries
-  no cardinality of its own, and a CSV's row count is extrapolated from *file size* (so a compressed
-  source is off by its compression ratio). These compound, and duckrun cannot correct them without
-  reimplementing a planner. The failure is one-sided — an over-estimate is harmless, an under-estimate
-  shrinks the ceiling — so two defenses apply, in order. When the table **already exists**, the guess is
-  raised to the prior version's *exact* row count from the Delta log if that is larger; this is free and
-  it is what keeps a rebuilt fact table at its proper geometry. It can only ever raise the estimate,
-  never lower it, so an overwrite that deliberately shrinks a table simply keeps the larger ceiling.
-  Failing that — a **first create**, or a log that can't be read — the guess is floored at **6M rows**,
-  capping the damage at ~6M-row segments rather than the ~1M ones a bad estimate used to produce. The
-  cost of that fallback is that the ~8-lane target is only reached above ~48M rows; a smaller *new*
-  table gets fewer, larger segments. If an estimate still turns out low by 4× or more, the write logs a
-  warning naming the rows it sized for and the rows that landed. Compaction and `VACUUM <table>` are
-  unaffected throughout: they size from the exact row count in the Delta log and keep the 1M floor, so
-  compacting a table restores the finer geometry.
+- **On a full-table overwrite, that row estimate is a planner guess and can be badly low — not
+  slightly low, *multiples* low.** DuckDB applies a fixed 0.2 selectivity guess to filters and
+  anti/semi joins, a set-operation parent carries no cardinality of its own, and a CSV's row count is
+  extrapolated from *file size* (so a compressed source is off by its compression ratio). On a real
+  model — joins feeding an aggregation, the ordinary shape of a fact build — these compound
+  multiplicatively: measured under-estimates include **9× on a 370M-row fact** (issue #22, which
+  produced 380 row groups where ~34 belong) and **9.7× on a 144M-row mart**. duckrun cannot correct
+  this without reimplementing a planner, so treat the estimate as unreliable by default on any
+  non-trivial query. The failure is one-sided — an over-estimate is harmless, an under-estimate
+  shrinks the ceiling — so the defenses apply in order. When the table **already exists**, the guess
+  is raised to the prior version's *exact* row count from the Delta log if that is larger; this is
+  free and it is what keeps a rebuilt fact table at its proper geometry. It can only ever raise the
+  estimate, never lower it, so an overwrite that deliberately shrinks a table simply keeps the larger
+  ceiling. Failing that — a **first create**, or a log that can't be read — the guess is floored at
+  **8M rows** (Power BI's native segment size), capping the damage at half-full segments rather than
+  the ~1M ones a bad estimate used to produce. The cost of that fallback is that the ~8-lane target
+  is only reached above ~64M rows; a smaller *new* table gets fewer, larger segments. If an estimate
+  still turns out low by 4× or more, the write logs a warning naming the rows it sized for and the
+  rows that landed. Compaction and `VACUUM <table>` are unaffected throughout: they size from the
+  exact row count in the Delta log and keep the 1M floor, so compacting a table restores the finer
+  geometry. **When you know the size, don't rely on any of this**: the model config
+  `max_row_group_size` (dbt) declares the geometry explicitly and bypasses the estimate entirely —
+  the right answer for a big fact's very first build. See the
+  [model config reference](dbt-adapter.md#config-options-table--incremental--delta).
 - **A `replaceWhere` write is never sized.** The microbatch strategy and `INSERT … REPLACE WHERE`
   replace a *slice* of a table, so they keep the flat 16M ceiling and let the 256 MB file roll pick the
   group — sizing a window off its own row count would say nothing about the table's segment budget.
