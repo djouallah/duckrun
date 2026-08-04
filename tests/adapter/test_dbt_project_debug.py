@@ -46,6 +46,42 @@ where id > (select max(id) from {{ this }})
 {% endif %}
 """
 
+# The comment sits BETWEEN two CTEs, at paren depth 0, and contains a comma — the shape that a
+# depth-only splitter gets wrong, and that dbt models are full of.
+CTE_MODEL = """{{ config(materialized='table') }}
+with base as (
+    select id, name, amount from {{ ref('stg_items') }}
+),
+-- allocate the amount, then halve it
+allocated as (select id, name, amount / 2 as share from base),
+final as (
+    select id, sum(share) as total from allocated group by 1
+)
+select * from final
+"""
+
+EPHEMERAL = """{{ config(materialized='ephemeral') }}
+select id, name, amount from {{ ref('stg_items') }} where amount > 15
+"""
+USES_EPHEMERAL = """{{ config(materialized='table') }}
+with picked as (select * from {{ ref('eph_filtered') }})
+select * from picked
+"""
+
+# A macro that emits an entire CTE — name, body and its own comment.
+MACRO = """{% macro scaled_cte(name, src, factor) %}
+{{ name }} as (
+    -- emitted by a macro, with a comma
+    select id, amount * {{ factor }} as scaled from {{ src }}
+)
+{% endmacro %}
+"""
+MACRO_MODEL = """{{ config(materialized='table') }}
+with base as (select id, amount from {{ ref('stg_items') }}),
+{{ scaled_cte('macro_made', 'base', 2) }}
+select * from macro_made
+"""
+
 
 @pytest.fixture
 def project(tmp_path):
@@ -58,9 +94,15 @@ def project(tmp_path):
         "dbg:\n  target: dev\n  outputs:\n    dev:\n"
         "      type: duckrun\n      root_path: \"{{ env_var('DBG2_PATH') }}\"\n",
         encoding="utf-8")
+    (proj / "macros").mkdir()
     (proj / "models" / "stg_items.sql").write_text(STG, encoding="utf-8")
     (proj / "models" / "mart_items.sql").write_text(MART, encoding="utf-8")
     (proj / "models" / "incr_items.sql").write_text(INCR, encoding="utf-8")
+    (proj / "models" / "cte_model.sql").write_text(CTE_MODEL, encoding="utf-8")
+    (proj / "models" / "eph_filtered.sql").write_text(EPHEMERAL, encoding="utf-8")
+    (proj / "models" / "uses_ephemeral.sql").write_text(USES_EPHEMERAL, encoding="utf-8")
+    (proj / "models" / "macro_model.sql").write_text(MACRO_MODEL, encoding="utf-8")
+    (proj / "macros" / "helpers.sql").write_text(MACRO, encoding="utf-8")
     os.environ["DBG2_PATH"] = (tmp_path / "wh").as_posix()
 
     assert dbtRunner().invoke(
@@ -169,6 +211,18 @@ def test_a_compile_alone_does_not_trigger_a_reparse(p):
     assert p._manifest is manifest and p._signature == signature
 
 
+def test_dbts_own_user_yml_does_not_look_like_an_edit(p, project, capsys):
+    """dbt writes `.user.yml` into the PROFILES directory — which for a duckrun project, and in a
+    Fabric notebook, is the project directory. dbt's first parse creates it, so a naive mtime walk
+    reports "the project changed" on the very next call and re-parses for nothing."""
+    p.compiled("mart_items")
+    assert (project / ".user.yml").is_file(), "precondition: dbt should have written it"
+    capsys.readouterr()
+
+    p.compiled("mart_items")
+    assert "parsed" not in capsys.readouterr().out
+
+
 def test_the_reparse_message_names_the_file(p, project, capsys):
     p.compiled("mart_items")
     capsys.readouterr()
@@ -235,6 +289,96 @@ def test_an_ambiguous_selector_lists_the_candidates(p):
     `+mart_items` is dbt's "this node and its parents", so it selects stg_items too."""
     with pytest.raises(DbtProjectError, match="matched 2 nodes: mart_items, stg_items"):
         p.compiled("+mart_items")
+
+
+# ── CTE slicing ────────────────────────────────────────────────────────────────────────────────
+
+def test_ctes_lists_the_names_in_order(p):
+    assert p.ctes("cte_model") == ["base", "allocated", "final"]
+
+
+def test_cte_runs_only_up_to_that_cte(p):
+    """The move a wrong-numbers model always needs: look at the intermediate step."""
+    rel = p.cte("cte_model", "allocated")
+    assert rel.columns == ["id", "name", "share"]
+    assert sorted(rel.fetchall()) == [(1, "a", 5.25), (2, "b", 10.25)]
+
+    final = p.show("cte_model")
+    assert final.columns == ["id", "total"]        # the model itself aggregates them away
+
+
+def test_cte_keeps_the_compiled_text_verbatim(p):
+    """No re-parse and no re-generation, so what runs is character-for-character dbt's output —
+    comments included. You debug the query, not a rendering of it."""
+    p.cte("cte_model", "allocated")
+    ran = p.last_compile.sql
+
+    assert "-- allocate the amount, then halve it" in ran   # a comment BETWEEN two CTEs
+    assert "select id, name, amount / 2 as share from base" in ran
+    assert "final" not in ran                               # the later CTE is dropped
+    assert p.last_compile.cte == "allocated"
+
+
+def test_cte_is_lazy_like_show(p):
+    narrowed = p.cte("cte_model", "base").filter("id = 2")
+    assert type(narrowed).__name__ == "DuckDBPyRelation"
+    assert narrowed.fetchall() == [(2, "b", 20.5)]
+
+
+def test_an_unknown_cte_lists_the_real_ones(p):
+    with pytest.raises(DbtProjectError, match="no CTE 'nope'.*base, allocated, final"):
+        p.cte("cte_model", "nope")
+
+
+def test_a_model_without_ctes_says_so(p):
+    with pytest.raises(DbtProjectError, match="has no CTEs.*Use show"):
+        p.cte("stg_items", "anything")
+
+
+def test_ephemeral_models_show_up_as_ctes(p):
+    """dbt has no standalone compiled form for an ephemeral model — it injects it as a CTE. So the
+    thing the issue lists as an open caveat is answered by the CTE path: the ephemeral model is
+    right there in ctes(), and cte() runs it."""
+    names = p.ctes("uses_ephemeral")
+    injected = [n for n in names if n.startswith("__dbt__cte__")]
+    assert injected == ["__dbt__cte__eph_filtered"]
+
+    rel = p.cte("uses_ephemeral", injected[0])
+    assert rel.columns == ["id", "name", "amount"]
+    assert sorted(rel.fetchall()) == [(2, "b", 20.5)]
+
+
+def test_compiling_twice_does_not_lose_the_ephemeral_cte(p):
+    """The reason `_compile` caches per manifest generation.
+
+    dbt sets `extra_ctes_injected` on a node once it has spliced an ephemeral parent in. A second
+    compile against the same manifest object rebuilds `compiled_code` from `raw_code` and skips
+    re-injection — leaving SQL that still REFERENCES `__dbt__cte__<parent>` while no longer
+    defining it. Silently broken, from the second call onward, for any project with ephemeral
+    models. Before the cache this failed on call two."""
+    first = p.compiled("uses_ephemeral")
+    assert "__dbt__cte__eph_filtered as" in first
+
+    for _ in range(3):
+        assert p.compiled("uses_ephemeral") == first
+
+    p.reload()                                     # a fresh manifest must still be correct
+    assert "__dbt__cte__eph_filtered as" in p.compiled("uses_ephemeral")
+
+
+def test_ephemeral_models_also_work_through_sql(p):
+    """The other route to the same place, for when you do not want to name the generated CTE."""
+    rel = p.sql("select * from {{ ref('eph_filtered') }}")
+    assert sorted(rel.fetchall()) == [(2, "b", 20.5)]
+
+
+def test_macro_generated_ctes_are_sliced_like_any_other(p):
+    """A CTE can be emitted wholesale by a macro — name, body, comments. By the time we see it,
+    macros are expanded and it is ordinary text."""
+    assert "macro_made" in p.ctes("macro_model")
+    rel = p.cte("macro_model", "macro_made")
+    assert rel.columns == ["id", "scaled"]
+    assert "-- emitted by a macro, with a comma" in p.last_compile.sql
 
 
 # ── the connection ─────────────────────────────────────────────────────────────────────────────

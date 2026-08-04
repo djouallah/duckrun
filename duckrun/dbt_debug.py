@@ -55,6 +55,10 @@ _WATCHED_SUFFIXES = frozenset({".sql", ".yml", ".yaml", ".csv", ".md", ".py"})
 # Directories that change constantly without changing what dbt would parse. `target/` in particular
 # is rewritten by every compile, so watching it would make the project look edited on every call.
 _SKIP_DIRS = frozenset({"target", "logs", "dbt_packages", ".git", "__pycache__", ".venv", ".ipynb_checkpoints"})
+# dbt writes `.user.yml` (its anonymous-usage id) into the PROFILES directory — which, in a duckrun
+# project and in most Fabric notebooks, is the project directory. dbt's own first parse creates it,
+# so without this the very next call sees "the project changed" and re-parses for nothing.
+_SKIP_FILES = frozenset({".user.yml"})
 
 
 class DbtProjectError(RuntimeError):
@@ -70,17 +74,22 @@ class CompileResult:
     here instead, on ``DbtProject.last_compile``.
     """
 
-    __slots__ = ("model", "node_id", "sql", "full_refresh")
+    __slots__ = ("model", "node_id", "sql", "full_refresh", "cte")
 
-    def __init__(self, model, node_id, sql, full_refresh):
+    def __init__(self, model, node_id, sql, full_refresh, cte=None):
         self.model = model
         self.node_id = node_id
+        #: The SQL that actually RAN — for a ``cte()`` call that is the sliced query, not the
+        #: model's full compiled text, so this always answers "what did I just execute".
         self.sql = sql
         #: True when the compile was forced down the ``is_incremental() == False`` branch.
         self.full_refresh = full_refresh
+        #: The CTE this was sliced down to, or None for a whole model.
+        self.cte = cte
 
     def __repr__(self):
-        extra = ", full_refresh=True" if self.full_refresh else ""
+        extra = f", cte={self.cte!r}" if self.cte else ""
+        extra += ", full_refresh=True" if self.full_refresh else ""
         return f"<CompileResult {self.model!r}{extra}, {len(self.sql or '')} chars of SQL>"
 
 
@@ -95,6 +104,7 @@ class DbtProject:
         self.last_compile = None
         self._manifest = None
         self._signature = None
+        self._compiled = {}
         self._creds = None
         self._env = None
         self._handle = None
@@ -119,8 +129,8 @@ class DbtProject:
         ``incremental=False`` forces the ``is_incremental() == False`` branch (dbt's
         ``--full-refresh``), so both branches of a branching model can be compared side by side
         instead of guessed at. ``None`` (the default) lets dbt decide, exactly as a run would."""
-        node = self._compile(selector=model, full_refresh=self._full_refresh_for(incremental))
-        return node.compiled_code
+        return self._compile(selector=model,
+                             full_refresh=self._full_refresh_for(incremental)).sql
 
     def show(self, model, incremental=None):
         """``model`` as a ``DuckDBPyRelation`` — real DuckDB types, and lazy.
@@ -135,8 +145,54 @@ class DbtProject:
         Compiled by dbt itself (``dbt compile --inline``), so refs resolve exactly the way they do
         in a model — including ephemeral models, which have no standalone compiled form but are
         injected as CTEs into whatever selects from them."""
-        node = self._compile(inline=query)
-        return self._relation(node.compiled_code)
+        return self._relation(self._compile(inline=query).sql)
+
+    def ctes(self, model, incremental=None) -> list:
+        """The names of ``model``'s CTEs, in the order they are defined.
+
+        Read off the COMPILED SQL, not the model source, so it also lists what you cannot see in
+        the file: CTEs a macro generated, and ephemeral models, which dbt injects as
+        ``__dbt__cte__<name>``."""
+        from dbt.adapters.duckrun.delta_dml import split_cte_list
+        sql = self.compiled(model, incremental=incremental)
+        return [name for name, _ in split_cte_list(sql)[1]]
+
+    def cte(self, model, name, incremental=None):
+        """Run ``model`` only as far as the CTE ``name``, as a relation.
+
+        When a model runs clean but returns nonsense, the move is always the same: take the CTEs one
+        at a time and find where the row count or a key goes wrong. Done by hand that means copying
+        blocks out of the compiled SQL, twenty times, getting it slightly wrong once. This is the
+        same rewrite mechanically — keep the WITH list up to and including ``name``, then select
+        from it — with real types at every intermediate step, which is what makes comparing two
+        steps trustworthy.
+
+        The CTE text is spliced from the compiled SQL verbatim; nothing is re-parsed or
+        re-generated, so what runs is character-for-character what dbt produced."""
+        sql = self.compiled(model, incremental=incremental)
+        sliced = self._slice_to_cte(sql, name, model)
+        self.last_compile.sql = sliced       # last_compile describes what RAN, not what was compiled
+        self.last_compile.cte = name
+        return self._relation(sliced)
+
+    @staticmethod
+    def _slice_to_cte(sql, name, model) -> str:
+        from dbt.adapters.duckrun.delta_dml import split_cte_list
+
+        head, parts, _ = split_cte_list(sql)
+        names = [n for n, _ in parts]
+        if not names:
+            raise DbtProjectError(
+                f"{model!r} has no CTEs — its compiled SQL is a single SELECT. Use show() instead.")
+        if name not in names:
+            raise DbtProjectError(
+                f"{model!r} has no CTE {name!r}. It has: {', '.join(names)}")
+        kept = parts[:names.index(name) + 1]
+        # Later CTEs are dropped rather than left in place. DuckDB would not evaluate them anyway —
+        # it does not even bind an unused CTE — so this is for what you READ back in
+        # last_compile.sql: exactly the query that ran, and nothing that did not.
+        quoted = '"' + name.replace('"', '""') + '"'
+        return head + ",".join(text for _, text in kept) + f"\nselect * from {quoted}"
 
     def reload(self):
         """Re-parse the project now. Rarely needed — an edit is detected automatically — but useful
@@ -213,6 +269,8 @@ class DbtProject:
         for dirpath, dirnames, filenames in os.walk(self.project_dir):
             dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
             for name in filenames:
+                if name in _SKIP_FILES:
+                    continue
                 if Path(name).suffix.lower() in _WATCHED_SUFFIXES:
                     p = os.path.join(dirpath, name)
                     try:
@@ -234,6 +292,7 @@ class DbtProject:
             with contextlib.suppress(Exception):
                 self._handle.close()   # our own child cursor; the shared connection stays up
         self._manifest = self._signature = self._creds = None
+        self._compiled = {}
         self._env = self._handle = self._cursor = None
 
     def _changed_since(self, signature):
@@ -293,9 +352,31 @@ class DbtProject:
             "incremental=False to compile the full-refresh branch instead."
         )
 
-    def _compile(self, selector=None, inline=None, full_refresh=False):
-        """Compile one node and remember what it was. Returns the dbt node."""
+    def _compile(self, selector=None, inline=None, full_refresh=False) -> CompileResult:
+        """Compile one node, at most once per manifest generation, and record what it was.
+
+        The cache is a CORRECTNESS requirement, not a speed-up — though it is also that. dbt marks a
+        node ``extra_ctes_injected`` once it has spliced an ephemeral parent in as a CTE, so a
+        SECOND compile against the same manifest object regenerates ``compiled_code`` from
+        ``raw_code`` and does not re-inject. The result still REFERENCES ``__dbt__cte__<parent>``
+        while no longer defining it: silently broken SQL, from the second call onward, for any
+        project with ephemeral models. Compiling once per generation sidesteps that entirely instead
+        of reaching into dbt to reset the flag.
+
+        Safe to cache because ``_ensure_manifest`` runs first: any edit drops the manifest and this
+        cache with it, so a hit can only ever be SQL that is still current."""
         self._ensure_manifest()
+        key = (selector, inline, full_refresh)
+        if key not in self._compiled:
+            self._compiled[key] = self._run_compile(selector, inline, full_refresh)
+        name, node_id, sql = self._compiled[key]
+        # A fresh CompileResult per call: cte() rewrites .sql on it, and that must not reach back
+        # into the cache and corrupt the next caller's answer.
+        self.last_compile = CompileResult(
+            model=name, node_id=node_id, sql=sql, full_refresh=full_refresh)
+        return self.last_compile
+
+    def _run_compile(self, selector, inline, full_refresh):
         args = ["compile"]
         args += ["--inline", inline] if inline is not None else ["--select", selector]
         if full_refresh:
@@ -315,10 +396,7 @@ class DbtProject:
                 f"the selector {selector!r} matched {len(nodes)} nodes: {names}\n"
                 "  show() needs exactly one — narrow the selector.")
         node = nodes[0]
-        self.last_compile = CompileResult(
-            model=getattr(node, "name", selector), node_id=getattr(node, "unique_id", None),
-            sql=node.compiled_code, full_refresh=full_refresh)
-        return node
+        return getattr(node, "name", selector), getattr(node, "unique_id", None), node.compiled_code
 
     # ── the connection ─────────────────────────────────────────────────────────────────────────
 
