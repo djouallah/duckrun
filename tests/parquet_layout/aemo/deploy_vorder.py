@@ -13,6 +13,7 @@ from pathlib import Path
 import yaml
 
 import duckrun
+from duckrun import auth, fabric_remote
 
 HERE = Path(__file__).resolve().parent            # this script lives in tests/parquet_layout/aemo/
 BENCH = HERE                                       # the *.SemanticModel folders live here
@@ -30,6 +31,14 @@ if not names:
     raise SystemExit(f"No *.SemanticModel found under {BENCH}")
 
 ws = duckrun.workspace(WS_ID)
+# Delete existing benchmark models FIRST so every run deploys a FRESH item (new GUID). The
+# Capacity Metrics app aggregates CU per item GUID, so reusing an item smears this run's cost
+# into every earlier run's total; a fresh GUID makes each run's CU line unique and attributable.
+existing = {it["displayName"]: it["id"] for it in ws.list_items("semanticModels")}
+for n in names:
+    if n in existing:
+        fabric_remote._delete_item(auth.get_fabric_token(), ws.id, existing[n])
+        print(f"deleted existing semantic model {n} ({existing[n]}) — fresh GUID this run", flush=True)
 for n in names:
     bim = BENCH / f"{n}.SemanticModel" / "model.bim"   # deploy() names the item, repoints, refreshes
     ws.deploy(str(bim), lakehouse=LH_NAME, name=n, overwrite=True)
