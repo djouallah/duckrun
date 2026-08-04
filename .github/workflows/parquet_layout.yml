@@ -207,6 +207,14 @@ jobs:
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
         run: python tests/parquet_layout/aemo/xmla_compare.py
 
+      - name: 🧬 VertiPaq DMV readout (resident encodings per column/segment, both models)
+        continue-on-error: true   # diagnostic sidecar; never blocks the benchmark
+        env:
+          PYTHONNET_RUNTIME: coreclr
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"
+        run: python tests/parquet_layout/aemo/vertipaq_dmv.py
+
       - name: 📝 Render report to job summary (computes + merges the analysis block)
         if: always()
         continue-on-error: true
