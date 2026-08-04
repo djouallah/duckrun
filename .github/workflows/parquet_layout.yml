@@ -9,6 +9,11 @@ name: Direct Lake query benchmark
 #   • contoso — the Contoso sibling: same auto_sort-vs-vorder XMLA benchmark on the Contoso Sales fact,
 #               generated from scratch with SQLBI's Contoso Data Generator into a DEDICATED, schema-
 #               enabled `sqlbi` lakehouse. See tests/parquet_layout/contoso/README.md.
+#   • order_probe — does V-Order PERMUTE rows or only re-encode them? Seeds a rid-stamped table of
+#               known physical order, writes it via Spark with V-Order on AND off (the off write is
+#               the control for Spark's own plumbing), then diffs the physical row order + per-column
+#               run counts. No semantic model, no XMLA — Livy + OneLake only. See
+#               tests/parquet_layout/aemo/vorder_order_probe.py.
 #
 # Both run on ubuntu-latest (ADOMD.NET's NetCore build is cross-platform, loads under pythonnet/coreclr).
 # Pick one with the `benchmark` dropdown; the other job is skipped. Inputs are shared — `orders` is
@@ -23,6 +28,7 @@ on:
         options:
           - aemo
           - contoso
+          - order_probe
       env:
         description: "deploy_config.yml env whose workspace to query"
         type: string
@@ -59,6 +65,10 @@ on:
         description: "rebuild the auto_sort/vorder (and, for contoso, the base) tables even if they already exist (else reuse)"
         type: boolean
         default: false
+      probe_rows:
+        description: "[order_probe] rows in the seed table (20M ≈ 2 row groups per result; plenty to detect a permutation)"
+        type: string
+        default: "20000000"
 
 permissions:
   id-token: write
@@ -348,3 +358,37 @@ jobs:
           name: run-report-contoso
           path: run_report.json
           if-no-files-found: warn
+
+  order-probe:
+    name: 🧪 V-Order order probe
+    if: ${{ inputs.benchmark == 'order_probe' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # Same OIDC-only auth as the benchmarks: duckrun mints storage + Fabric (Livy) tokens itself.
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install deps (duckrun from THIS tree)
+        run: |
+          pip install pyyaml
+          pip install -e .
+
+      - name: 🔑 Resolve lakehouse + workspace (duckrun, no az)
+        run: python tests/parquet_layout/aemo/resolve_env.py --env ${{ inputs.env }}
+
+      - name: 🧪 Seed known order, write V-Order on/off via Livy, diff the physical order
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+          PROBE_ROWS: ${{ inputs.probe_rows }}
+        run: python tests/parquet_layout/aemo/vorder_order_probe.py
