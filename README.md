@@ -121,6 +121,28 @@ select ...
 Profiles, materializations, incremental strategies (merge, insert, append, delete+insert, microbatch), sources,
 and automatic compaction/vacuum are all in **[docs/dbt-adapter.md](docs/dbt-adapter.md)**.
 
+### Debugging a model
+
+When a model runs but the numbers are wrong, compile it with dbt and get a DuckDB relation back —
+real types, lazy, read-only. Because the adapter runs DuckDB in-process, dbt only has to *compile*;
+duckrun executes. No `dbt show` JSON round trip, so nothing has to guess a type per column.
+
+```python
+from duckrun import dbt_project
+
+p = dbt_project("dbt/", target="dev")
+
+p.show("orders_enriched").filter("customer = 'X'").limit(100)   # pushes into the delta_scan
+p.sql("select * from {{ ref('stg_orders') }} where year = 2026")
+
+# run the model one CTE at a time to find where the row count goes wrong
+p.ctes("orders_enriched")                        # ['base', 'allocated', 'final']
+p.cte("orders_enriched", "allocated").count("*")
+```
+
+More — CTE slicing, which `is_incremental()` branch you are looking at, ephemeral models, and why
+the session cannot write — in **[docs/dbt-debug.md](docs/dbt-debug.md)**.
+
 See it on real projects: [aemo](tests/integration_tests/aemo) and [coffee](tests/integration_tests/coffee) are
 runnable starters, and [parity_tests/](tests/parity_tests) runs real `type: duckdb` projects (jaffle_shop,
 sde, MRR, TechFlow, Tuva) unchanged on duckrun and diffs the output against dbt-duckdb.

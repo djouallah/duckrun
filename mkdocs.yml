@@ -106,6 +106,7 @@ nav:
   - Getting started: getting-started.md
   - dbt:
       - Adapter: dbt-adapter.md
+      - Debug a model: dbt-debug.md
       - Remote (Fabric): remote.md
       - Conformance: conformance.md
   - Notebook:

@@ -1,6 +1,6 @@
 ---
 name: duckrun-projects
-description: How to build, configure, and run dbt projects on the duckrun adapter — dbt models executed in DuckDB and materialized as Delta Lake tables via delta-rs, locally or on S3/GCS/ADLS/OneLake (Microsoft Fabric) — plus the SQL-first duckrun.connect() notebook API over the same tables. Use this skill whenever a data engineer is setting up a duckrun profile, writing models or sources for it, choosing an incremental strategy (merge, insert, append, delete+insert, microbatch), pointing dbt at OneLake/a Fabric Lakehouse, using duckrun.connect() in a notebook, debugging a duckrun run, or asking "dbt + DuckDB + Delta" questions in general. Consult it BEFORE writing profiles.yml or any incremental model config — several defaults differ from other dbt adapters.
+description: How to build, configure, and run dbt projects on the duckrun adapter — dbt models executed in DuckDB and materialized as Delta Lake tables via delta-rs, locally or on S3/GCS/ADLS/OneLake (Microsoft Fabric) — plus the SQL-first duckrun.connect() notebook API over the same tables. Use this skill whenever a data engineer is setting up a duckrun profile, writing models or sources for it, choosing an incremental strategy (merge, insert, append, delete+insert, microbatch), pointing dbt at OneLake/a Fabric Lakehouse, using duckrun.connect() in a notebook, debugging a duckrun run, working out why a model's numbers are wrong (duckrun.dbt_project() — compile a model and inspect it, or one of its CTEs, as a DuckDB relation), or asking "dbt + DuckDB + Delta" questions in general. Consult it BEFORE writing profiles.yml or any incremental model config — several defaults differ from other dbt adapters.
 ---
 
 # Building dbt projects with duckrun
@@ -467,6 +467,63 @@ OPTIMIZE for these tables", the answer is: you don't, it's built in.
 - **Don't read the Delta path with other tools mid-run** expecting the new version
   until dbt reports the model done; the view flips to the new version atomically at
   registration.
+
+## Debugging a model that runs but returns the wrong numbers
+
+`dbt show` is the wrong tool for this: it truncates, and `--output json` serializes through
+agate, so the schema is gone before the rows arrive — decimals become strings or floats,
+dates become strings, and the DataFrame guesses a type per column. Use
+`duckrun.dbt_project()` instead. It compiles with dbt and executes on duckrun, so you get
+a **DuckDB relation**: real types end to end, and lazy.
+
+```python
+from duckrun import dbt_project
+
+p = dbt_project("dbt/", target="dev")     # returns at once; parses on first use
+
+p.show("orders_enriched")                 # DuckDBPyRelation -- .pl() .arrow() .df() .filter()
+p.sql("select * from {{ ref('stg_orders') }} where year = 2026")
+p.compiled("orders_enriched")             # the SQL text
+```
+
+**The move that actually finds the bug** is `cte()` — run the model one CTE at a time and
+find where the row count or a key goes wrong, instead of copying blocks out of the
+compiled SQL by hand:
+
+```python
+p.ctes("orders_enriched")                        # ['base', 'allocated', 'final']
+p.cte("orders_enriched", "base").count("*")      # -> 41233, fine
+p.cte("orders_enriched", "allocated").count("*") # -> 38902, the join drops rows
+p.cte("orders_enriched", "allocated").filter("share is null").pl()
+```
+
+Things to know before you rely on it:
+
+- **`is_incremental()` models have two compiled forms and the SQL will not tell you
+  which one you got** — rendering erases the `{% if %}`. duckrun prints the branch, and
+  `p.compiled(model, incremental=False)` compiles the other one so you can compare.
+  `p.last_compile.incremental` is `True`/`False`, or `None` when the model does not
+  branch. Reading the incremental branch as if it were the table's contents is the
+  classic way to lose an hour here.
+- **Read-only is structural** — the session's cursor has no route to delta_rs at all, so
+  a write cannot reach the lakehouse. `CREATE TEMP TABLE` / `CREATE VIEW` scratch stays
+  allowed (session-local, never written out). Caveat worth stating plainly: this covers
+  what the SESSION executes. Compiling is a real `dbt compile` on dbt's own connection,
+  so an introspective macro (`{% if execute %}` + `run_query`) still runs, exactly as
+  under `dbt compile`.
+- **Ephemeral models** need nothing special: dbt injects them as `__dbt__cte__<name>`, so
+  they appear in `p.ctes()` of their consumer, and `p.sql("select * from {{ ref('eph') }}")`
+  works too.
+- **Selectors go to dbt untouched** — `"my_model"`, `"path:models/marts/my_model.sql"`,
+  `tag:` all work. One matching several nodes lists them rather than guessing.
+- **Editing a model mid-session is safe**: the manifest is kept warm for speed but
+  mtime-checked per call, so you never get the SQL from before your last edit.
+- The connection is the profile's `DuckrunEnvironment` — dbt's own when it matches — so
+  secrets, catalog `ATTACH`es and the lazy bind are identical to a real run, and only one
+  DuckDB instance exists. Never rebuild a debug session out of `duckrun.connect()` with
+  hand-aligned catalog names; in a multi-Lakehouse project that drifts silently.
+
+Full page: https://djouallah.github.io/duckrun/dbt-debug.html
 
 ## Project shape that works well
 
