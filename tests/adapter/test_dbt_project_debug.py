@@ -190,6 +190,75 @@ def test_sql_renders_refs(p):
     assert "{{" not in p.last_compile.sql
 
 
+def test_sql_can_be_called_more_than_once(p):
+    """`dbt compile --inline` PARSES a node called `inline_query` into the manifest it was handed.
+    Ours is warm and reused, so the second call found the first one still sitting there and dbt
+    refused the duplicate name — i.e. sql() worked exactly once per parse. A notebook does nothing
+    but call it repeatedly."""
+    assert p.sql("select count(*) as n from {{ ref('stg_items') }}").fetchall() == [(2,)]
+    assert p.sql("select 111 as a").fetchall() == [(111,)]
+    assert p.sql("select 222 as b").fetchall() == [(222,)]
+
+
+def test_ddl_over_an_ephemeral_ref_explains_itself(p):
+    """dbt prepends `with __dbt__cte__x as (...)` to an inline query that refs an ephemeral model,
+    and that only parses before a SELECT. Before this, DuckDB reported `syntax error at or near
+    "create"` against a line number in SQL the caller never wrote — which reads like a typo in
+    their own statement."""
+    with pytest.raises(DbtProjectError, match="ephemeral model"):
+        p.sql("create temp table k as select * from {{ ref('eph_filtered') }}")
+
+    # The route that does work, and that the message points at.
+    rel = p.sql("select * from {{ ref('eph_filtered') }}")
+    rel.create("k")
+    assert p.sql("select count(*) as n from k").fetchall() == [(1,)]
+
+    # DDL without an ephemeral ref is untouched: no injected CTEs, nothing to collide with.
+    p.sql("create temp table plain as select 1 as one")
+    assert p.sql("select one from plain").fetchall() == [(1,)]
+
+
+def test_a_failed_sql_does_not_poison_the_session(p):
+    """dbt leaves the node it parsed for --inline behind when the compile FAILS, and it is named
+    `inline_query`, so the next sql() hit "dbt found two sql_operations with the name
+    inline_query" — an error about our leftovers, not about anything the caller did. One typo
+    then cost a kernel restart. Only reachable because the manifest is kept warm; dbt's own CLI
+    parses a fresh one every time and never sees it."""
+    with pytest.raises(DbtProjectError):
+        p.sql("select * from {{ ref('does_not_exist') }}")
+
+    assert p.sql("select 1 as one").fetchall() == [(1,)]
+
+    # And the second failure must still read like the first — same diagnosis, not a duplicate-name
+    # complaint that sends you looking in the wrong place.
+    with pytest.raises(DbtProjectError) as second:
+        p.sql("select * from {{ ref('does_not_exist') }}")
+    assert "two sql_operations" not in str(second.value)
+
+
+def test_sql_and_show_do_not_disturb_each_other(p):
+    """The inline node must be gone before anything else compiles against the same manifest."""
+    p.sql("select 1 as one")
+    assert "stg_items" in p.compiled("mart_items")
+    p.sql("select 2 as two")
+    assert p.ctes("cte_model")
+
+
+def test_ctes_can_leave_out_the_injected_ephemeral_models(p):
+    """On a project with a staging layer the injected CTEs outnumber the model's own — eighteen of
+    thirty on the project this came from — so the steps you came to read get lost among them."""
+    everything = p.ctes("uses_ephemeral")
+    own = p.ctes("uses_ephemeral", ephemeral=False)
+
+    assert "__dbt__cte__eph_filtered" in everything
+    assert "picked" in everything
+    assert own == [n for n in everything if not n.startswith("__dbt__cte__")]
+    assert "picked" in own
+
+    # Hidden from the listing only: it is really in the SQL, and slicing at it still works.
+    assert p.cte("uses_ephemeral", "__dbt__cte__eph_filtered").fetchall()
+
+
 def test_compiled_returns_the_sql_text(p):
     sql = p.compiled("mart_items")
     assert "stg_items" in sql and "{{" not in sql

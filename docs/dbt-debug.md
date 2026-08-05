@@ -119,6 +119,17 @@ p.cte("mart", "__dbt__cte__stg_clean")
 p.sql("select * from {{ ref('stg_clean') }}")
 ```
 
+On a project with a staging layer they can dominate the list — eighteen of thirty, on the project
+this was tested against. `ephemeral=False` leaves them out when what you want is the model's own
+steps:
+
+```python
+p.ctes("mart", ephemeral=False)            # ['base', 'final']
+```
+
+It hides them from the listing only. They really are in the compiled SQL, and slicing at one is
+often exactly right: it shows a staging model in the context of the model that consumes it.
+
 ## Read-only
 
 The session cannot write. That is **structural**, not a setting: its cursor is a
@@ -139,6 +150,21 @@ p.sql("create or replace view v_check as select customer, count(*) from candidat
 
 They live only in the in-memory DuckDB catalog and never reach the lakehouse. duckrun has no `view`
 materialization at all — the only things it writes are Delta tables, through delta_rs.
+
+One exception, and it is dbt's rather than duckrun's: a `create` statement that refs an **ephemeral**
+model cannot work. dbt injects an ephemeral model by prepending `with __dbt__cte__<name> as (...)`
+to the query, and a `WITH` clause only parses in front of a `SELECT`. Build the relation first
+instead — same result, and it reads better:
+
+```python
+rel = p.sql("select * from {{ ref('stg_orders') }} where amount > 1000")
+rel.create("candidates")            # or rel.create_view("candidates")
+```
+
+`.create()` goes through DuckDB's relation API rather than the session cursor, so it does not pass
+the read-only check — and does not need to: duckrun's route to delta_rs lives in that cursor, so the
+relation API has no way to reach the lakehouse. What it makes is a plain DuckDB table, the same kind
+of scratch object `create temp table` already gives you.
 
 !!! warning "Read-only covers what the session executes — not dbt's compile"
 
@@ -203,9 +229,9 @@ RAM, so a second environment beside dbt's is an OOM in a Fabric notebook, not a 
 | --- | --- |
 | `dbt_project(project_dir=".", target=None, profiles_dir=None)` | a `DbtProject` |
 | `p.show(model, incremental=None)` | `DuckDBPyRelation` |
-| `p.sql(query)` | `DuckDBPyRelation` — `ref()`/`source()` rendered |
-| `p.compiled(model, incremental=None)` | the compiled SQL, as text |
-| `p.ctes(model, incremental=None)` | list of CTE names, in order |
+| `p.sql(query)` | `DuckDBPyRelation` — `ref()`/`source()` rendered; `None` for a statement with no result set |
+| `p.compiled(model, incremental=None)` | the compiled SQL, as text — `print()` it |
+| `p.ctes(model, incremental=None, ephemeral=True)` | list of CTE names, in order; `ephemeral=False` leaves out the injected ones |
 | `p.cte(model, name, incremental=None)` | `DuckDBPyRelation` for that step |
 | `p.reload()` | re-parses now |
 | `p.last_compile` | `.model` `.sql` `.incremental` `.full_refresh` `.cte` `.node_id` |

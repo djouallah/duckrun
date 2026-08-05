@@ -59,6 +59,9 @@ _SKIP_DIRS = frozenset({"target", "logs", "dbt_packages", ".git", "__pycache__",
 # project and in most Fabric notebooks, is the project directory. dbt's own first parse creates it,
 # so without this the very next call sees "the project changed" and re-parses for nothing.
 _SKIP_FILES = frozenset({".user.yml"})
+# dbt's own prefix for an ephemeral model injected as a CTE. Not configurable in dbt, and the same
+# string its compiled SQL carries — so matching on it is reading dbt's output, not guessing a name.
+_EPHEMERAL_CTE = "__dbt__cte__"
 
 
 class DbtProjectError(RuntimeError):
@@ -149,17 +152,28 @@ class DbtProject:
         Compiled by dbt itself (``dbt compile --inline``), so refs resolve exactly the way they do
         in a model — including ephemeral models, which have no standalone compiled form but are
         injected as CTEs into whatever selects from them."""
-        return self._relation(self._compile(inline=query).sql)
+        sql = self._compile(inline=query).sql
+        self._reject_ddl_over_injected_ctes(query, sql)
+        return self._relation(sql)
 
-    def ctes(self, model, incremental=None) -> list:
+    def ctes(self, model, incremental=None, ephemeral=True) -> list:
         """The names of ``model``'s CTEs, in the order they are defined.
 
         Read off the COMPILED SQL, not the model source, so it also lists what you cannot see in
         the file: CTEs a macro generated, and ephemeral models, which dbt injects as
-        ``__dbt__cte__<name>``."""
+        ``__dbt__cte__<name>``.
+
+        ``ephemeral=False`` leaves the injected ones out. On a project with a staging layer they
+        can be most of the list — eighteen of thirty is a real number from a real project — and
+        then the model's own steps, which is what you came to read, are hard to find.
+
+        It hides them from the LISTING only. They are genuinely in the compiled SQL, ``cte()``
+        still takes their names, and slicing at one is often exactly right: it shows a staging
+        model in the context of the model that consumes it."""
         from dbt.adapters.duckrun.delta_dml import split_cte_list
         sql = self.compiled(model, incremental=incremental)
-        return [name for name, _ in split_cte_list(sql)[1]]
+        names = [name for name, _ in split_cte_list(sql)[1]]
+        return names if ephemeral else [n for n in names if not n.startswith(_EPHEMERAL_CTE)]
 
     def cte(self, model, name, incremental=None):
         """Run ``model`` only as far as the CTE ``name``, as a relation.
@@ -345,6 +359,57 @@ class DbtProject:
                 f"dbt {' '.join(args)} failed\n{detail}\n{captured.getvalue().strip()}".strip())
         return result
 
+    @staticmethod
+    def _reject_ddl_over_injected_ctes(query, sql):
+        """Say what went wrong when an inline DDL statement refs an ephemeral model.
+
+        dbt injects an ephemeral model by prepending ``with __dbt__cte__<name> as (...)`` to the
+        query — which is only valid in front of a SELECT. Put a ``create temp table`` there and the
+        compiled text reads ``) create temp table ...``, and DuckDB reports ``syntax error at or
+        near "create"`` pointing at line 83 of SQL the caller never wrote. That reads like a typo
+        in their own statement, so they look in the wrong place.
+
+        Detected from BOTH sides, and deliberately not with ``split_cte_list``: that scanner locates
+        the final SELECT of a compiled model, so on this shape it hands back the SELECT and drops
+        the ``create temp table ... as`` in front of it — correct for what it is for, and blind to
+        exactly the thing being detected here. The compiled text says an ephemeral model was
+        injected; the caller's own query says the statement is not a SELECT. Both are needed:
+        neither DDL alone nor an ephemeral ref alone is a problem.
+
+        A leading comment makes the keyword check miss, and that is fine — the guard simply does
+        not fire and DuckDB reports it as before. A project without ephemeral models never reaches
+        this at all, which is why it took a real one to find."""
+        head = query.lstrip()
+        if _EPHEMERAL_CTE not in sql or not head or head.startswith("("):
+            return
+        keyword = head.split(None, 1)[0].lower()
+        if keyword in ("select", "with"):
+            return
+        raise DbtProjectError(
+            f"{query.strip()[:60]}...\n"
+            f"  This refs an ephemeral model. dbt injects those as a WITH clause in front of the "
+            f"query, which only parses before a SELECT -- not before {keyword.upper()}.\n"
+            "  Build the relation first, then materialise it:\n"
+            "    rel = p.sql('select ...')\n"
+            "    rel.create('scratch_name')        # or rel.create_view('scratch_name')")
+
+    def _drop_inline_node(self):
+        """Take the node ``--inline`` parsed into our manifest back out.
+
+        A SUCCESSFUL inline compile removes it itself. A FAILED one does not — and what it leaves
+        is named ``inline_query``, so the NEXT sql() parses a second one and dbt refuses the
+        duplicate name. One failed sql() therefore turned every later sql() in the session into
+        "dbt found two sql_operations with the name inline_query": an error about our leftovers,
+        which says nothing about what the caller actually got wrong, and which a notebook user can
+        only escape by restarting the kernel.
+
+        Only reachable because the manifest is kept WARM. dbt's own CLI parses a fresh one per
+        invocation, so it never sees this. Cleaning up in a finally is the whole fix: it costs a
+        dict lookup, and it makes a failed sql() cost exactly the failed sql()."""
+        nodes = getattr(self._manifest, "nodes", None) or {}
+        for key in [k for k, n in nodes.items() if getattr(n, "name", None) == "inline_query"]:
+            del nodes[key]
+
     def _full_refresh_for(self, incremental):
         if incremental is None:
             return False
@@ -433,7 +498,11 @@ class DbtProject:
         args += ["--inline", inline] if inline is not None else ["--select", selector]
         if full_refresh:
             args += ["--full-refresh"]
-        result = self._invoke(args, manifest=self._manifest)
+        try:
+            result = self._invoke(args, manifest=self._manifest)
+        finally:
+            if inline is not None:
+                self._drop_inline_node()
 
         nodes = [r.node for r in (getattr(result.result, "results", None) or [])
                  if getattr(r, "node", None) is not None]
