@@ -18,6 +18,7 @@ Env in: PBI_WORKSPACE, ADOMD_DIR (PBI_TOKEN self-acquired via duckrun when absen
 comparison, and appends to GITHUB_STEP_SUMMARY.
 """
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -57,6 +58,11 @@ def _pick(cols, row, name, default=None):
         return default
 
 
+def _norm(ident):
+    """DMV identifiers carry an internal id suffix — 'DUID (114)' -> 'DUID'."""
+    return re.sub(r" \(\d+\)$", "", ident)
+
+
 def read_model(workspace, model, token):
     conn = xc.open_conn(workspace, model, token)
     try:
@@ -70,10 +76,11 @@ def read_model(workspace, model, token):
 
     out = {}
     for row in crows:
-        tid = str(_pick(ccols, row, "TABLE_ID", ""))
-        if FACT not in tid:
+        # data table only: hierarchy/relationship shadow tables spell as H$fct_summary/R$…
+        tid = _norm(str(_pick(ccols, row, "TABLE_ID", "")))
+        if tid != FACT:
             continue
-        col = str(_pick(ccols, row, "COLUMN_ID", ""))
+        col = _norm(str(_pick(ccols, row, "COLUMN_ID", "")))
         if col.startswith("RowNumber"):
             continue
         out[col] = {
@@ -83,10 +90,10 @@ def read_model(workspace, model, token):
             "segments": [],
         }
     for row in srows:
-        tid = str(_pick(scols, row, "TABLE_ID", ""))
-        if FACT not in tid:
+        tid = _norm(str(_pick(scols, row, "TABLE_ID", "")))
+        if tid != FACT:
             continue
-        col = str(_pick(scols, row, "COLUMN_ID", ""))
+        col = _norm(str(_pick(scols, row, "COLUMN_ID", "")))
         if col not in out:
             continue
         out[col]["segments"].append({
@@ -102,6 +109,7 @@ def render(model, data, out):
     out.append(f"\n### {model} — resident fact columns (VertiPaq DMVs)")
     out.append("| column | encoding | dict MB | segs | resident MB | bits/seg | compression/seg |")
     out.append("|---|---|---|---|---|---|---|")
+    rendered = 0
     for col in ("date", "time", "DUID", "mw", "price", "cutoff"):
         d = data.get(col)
         if not d:
@@ -112,6 +120,9 @@ def render(model, data, out):
         comp = "/".join(s["compression"] for s in segs)
         out.append(f"| {col} | {d['encoding']} | {d['dictionary_mb']} | {len(segs)} "
                    f"| {used} | {bits} | {comp} |")
+        rendered += 1
+    if not rendered:  # never render silently-empty tables again; show what the DMV actually keyed
+        out.append(f"| _no column matched; DMV keys were: {sorted(data)[:8]}_ | | | | | | |")
 
 
 def main():
