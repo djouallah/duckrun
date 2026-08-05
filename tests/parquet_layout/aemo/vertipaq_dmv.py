@@ -34,7 +34,7 @@ FACT = "fct_summary"
 HYDRATE = ('EVALUATE ROW("r", COUNTROWS(fct_summary), "d", DISTINCTCOUNT(fct_summary[DUID]), '
            '"dt", DISTINCTCOUNT(fct_summary[date]), "t", DISTINCTCOUNT(fct_summary[time]), '
            '"m", SUM(fct_summary[mw]), "p", SUM(fct_summary[price]), '
-           '"y", DISTINCTCOUNT(fct_summary[year]), "c", MAX(fct_summary[cutoff]))')
+           '"c", MAX(fct_summary[cutoff]))')
 
 
 def dmv_rows(conn, sql):
@@ -102,7 +102,7 @@ def render(model, data, out):
     out.append(f"\n### {model} — resident fact columns (VertiPaq DMVs)")
     out.append("| column | encoding | dict MB | segs | resident MB | bits/seg | compression/seg |")
     out.append("|---|---|---|---|---|---|---|")
-    for col in ("date", "time", "DUID", "mw", "price", "year", "cutoff"):
+    for col in ("date", "time", "DUID", "mw", "price", "cutoff"):
         d = data.get(col)
         if not d:
             continue

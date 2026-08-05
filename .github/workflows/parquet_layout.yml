@@ -215,6 +215,11 @@ jobs:
           PYTHONUNBUFFERED: "1"
         run: python tests/parquet_layout/aemo/vertipaq_dmv.py
 
+      - name: 🧹 Delete benchmark semantic models (throwaway items — never accumulate)
+        if: always()
+        continue-on-error: true   # cleanup; never blocks the run or masks its result
+        run: python tests/parquet_layout/aemo/deploy_vorder.py --env ${{ inputs.env }} --delete
+
       - name: 📝 Render report to job summary (computes + merges the analysis block)
         if: always()
         continue-on-error: true

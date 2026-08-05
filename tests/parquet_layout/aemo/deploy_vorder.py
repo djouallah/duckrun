@@ -5,7 +5,11 @@
 lakehouse, creates the semantic model, and refreshes it (a Direct Lake reframe, retried while OneLake
 read permission propagates) — no Fabric CLI, no manual GUID swap, no bim mutation to restore. Auth is
 duckrun's self-acquired OIDC tokens (Fabric control plane + Power BI). Args: --env (deploy_config.yml
-section, default main).
+section, default main), --delete (delete the benchmark models instead of deploying — the end-of-run
+cleanup so throwaway models never accumulate in the workspace).
+
+Models land in the ``duckrun`` workspace folder (deploy() creates it if absent; placement always
+applies because the delete-first pass below means every deploy is a CREATE, never an in-place update).
 """
 import argparse
 from pathlib import Path
@@ -20,6 +24,8 @@ BENCH = HERE                                       # the *.SemanticModel folders
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--env", default="main")
+ap.add_argument("--delete", action="store_true",
+                help="delete the benchmark semantic models instead of deploying")
 args = ap.parse_args()
 
 allc = yaml.safe_load((HERE / "deploy_config.yml").read_text())
@@ -31,17 +37,25 @@ if not names:
     raise SystemExit(f"No *.SemanticModel found under {BENCH}")
 
 ws = duckrun.workspace(WS_ID)
-# Delete existing benchmark models FIRST so every run deploys a FRESH item (new GUID). The
-# Capacity Metrics app aggregates CU per item GUID, so reusing an item smears this run's cost
-# into every earlier run's total; a fresh GUID makes each run's CU line unique and attributable.
-existing = {it["displayName"]: it["id"] for it in ws.list_items("semanticModels")}
-for n in names:
-    if n in existing:
-        fabric_remote._delete_item(auth.get_fabric_token(), ws.id, existing[n])
-        print(f"deleted existing semantic model {n} ({existing[n]}) — fresh GUID this run", flush=True)
+# Delete EVERY existing benchmark model FIRST — every item whose name matches, not one per name:
+# duplicates do occur (XMLA then refuses to connect at all: "multiple datasets named ..."), and a
+# name-keyed dict silently collapses them, leaving survivors that deploy() then updates in place.
+# Fresh items also keep the Capacity Metrics CU lines unique per run (the app aggregates per item
+# GUID), and folder placement only applies on a CREATE.
+deleted = 0
+for it in ws.list_items("semanticModels"):
+    if it["displayName"] in names:
+        fabric_remote._delete_item(auth.get_fabric_token(), ws.id, it["id"])
+        print(f"deleted existing semantic model {it['displayName']} ({it['id']})", flush=True)
+        deleted += 1
+
+if args.delete:
+    print(f"Benchmark semantic model(s) deleted: {deleted}")
+    raise SystemExit(0)
+
 for n in names:
     bim = BENCH / f"{n}.SemanticModel" / "model.bim"   # deploy() names the item, repoints, refreshes
-    ws.deploy(str(bim), lakehouse=LH_NAME, name=n, overwrite=True)
+    ws.deploy(str(bim), lakehouse=LH_NAME, name=n, overwrite=True, folder="duckrun")
     print(f"deployed + refreshed {n}", flush=True)
 
 print("Benchmark semantic model(s) deployed + refreshed:", ", ".join(names))
