@@ -76,9 +76,11 @@ def read_model(workspace, model, token):
 
     out = {}
     for row in crows:
-        # data table only: hierarchy/relationship shadow tables spell as H$fct_summary/R$…
-        tid = _norm(str(_pick(ccols, row, "TABLE_ID", "")))
-        if tid != FACT:
+        # the table name lives in DIMENSION_NAME (VertiPaq Analyzer's key); TABLE_ID is the
+        # storage-object id ('H$…'/'R$…' prefixes for shadow tables — keep only the data table)
+        tname = str(_pick(ccols, row, "DIMENSION_NAME", ""))
+        tid = str(_pick(ccols, row, "TABLE_ID", ""))
+        if tname != FACT or tid.startswith(("H$", "R$", "U$")):
             continue
         col = _norm(str(_pick(ccols, row, "COLUMN_ID", "")))
         if col.startswith("RowNumber"):
@@ -89,9 +91,14 @@ def read_model(workspace, model, token):
             "dictionary_mb": round((_pick(ccols, row, "DICTIONARY_SIZE") or 0) / 1e6, 2),
             "segments": [],
         }
+    if not out:  # filter matched nothing — dump reality so the next fix is fact-based
+        print(f"  DMV columns: {ccols}", flush=True)
+        for r in crows[:6]:
+            print(f"  DMV row sample: {r}", flush=True)
     for row in srows:
-        tid = _norm(str(_pick(scols, row, "TABLE_ID", "")))
-        if tid != FACT:
+        tname = str(_pick(scols, row, "DIMENSION_NAME", ""))
+        tid = str(_pick(scols, row, "TABLE_ID", ""))
+        if tname != FACT or tid.startswith(("H$", "R$", "U$")):
             continue
         col = _norm(str(_pick(scols, row, "COLUMN_ID", "")))
         if col not in out:
