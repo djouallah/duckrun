@@ -259,6 +259,64 @@ def test_incremental_true_cannot_be_forced_and_says_why(p):
         p.compiled("incr_items", incremental=True)
 
 
+def test_the_compiled_branch_is_reported(p, capsys):
+    """djouallah's second condition: which branch was compiled must be visible, not silent. The
+    target table exists here, so the incremental branch is what you get — and the SQL alone would
+    never tell you, because rendering erases the `{% if %}`."""
+    p.show("incr_items")
+
+    # Whitespace-normalised: the assertion is about what the hint SAYS, not where it wraps.
+    out = " ".join(capsys.readouterr().out.split())
+    assert "incr_items: is_incremental() = True" in out
+    assert "not the table's contents" in out
+    assert p.last_compile.incremental is True
+
+
+def test_a_model_that_does_not_branch_says_nothing(p, capsys):
+    """The hint has to stay rare to stay meaningful. A model with no `is_incremental()` in its
+    source has only one possible compilation, so there is nothing to disambiguate — and it must not
+    pay for the second compile either."""
+    p.compiled("mart_items")
+    capsys.readouterr()
+
+    p.show("mart_items")
+
+    assert "is_incremental" not in capsys.readouterr().out
+    assert p.last_compile.incremental is None
+
+
+def test_the_branch_is_reported_every_time_not_once(p, capsys):
+    """A hint you scrolled past three cells ago is the same as no hint."""
+    p.show("incr_items")
+    capsys.readouterr()
+
+    p.show("incr_items")
+
+    assert "is_incremental() = True" in capsys.readouterr().out
+
+
+def test_asking_for_the_full_refresh_branch_is_not_lectured_at(p, capsys):
+    """You typed `incremental=False`; being told the branch is the one you asked for is noise. The
+    field is still set, so it can be read back."""
+    p.compiled("incr_items", incremental=False)
+
+    assert "is_incremental()" not in capsys.readouterr().out
+    assert p.last_compile.incremental is False
+
+
+def test_the_branch_answer_comes_from_dbt_not_from_our_own_rule(p):
+    """The exact method: compile the same model with --full-refresh, which forces the branch false,
+    and compare. Different text means the default compile took the incremental branch. Re-deriving
+    dbt's rule (does the relation exist? was --full-refresh passed?) would be a copy that drifts."""
+    default = p.compiled("incr_items")
+    forced = p.compiled("incr_items", incremental=False)
+
+    assert default != forced
+    assert p.compiled("incr_items") == default        # and asking again is stable
+    p.show("incr_items")
+    assert p.last_compile.incremental is True
+
+
 # ── read-only, through the session API ─────────────────────────────────────────────────────────
 
 def test_writes_through_the_session_are_rejected(p, project):
@@ -272,6 +330,37 @@ def test_writes_through_the_session_are_rejected(p, project):
     with pytest.raises(DuckrunReadOnlyError):
         p.sql("delete from {{ ref('stg_items') }}")
 
+    assert DeltaTable(f"{root}/main/stg_items").version() == before
+
+
+# ── shadowing a model with a session view ──────────────────────────────────────────────────────
+
+def test_a_view_shadowing_a_model_does_not_survive_the_next_call(p):
+    """Why there is no shadow warning and no reset().
+
+    A `create or replace view` CAN take over the name a model is bound under, and a direct cursor
+    read then answers from the override. But every method on DbtProject compiles through dbt first,
+    and dbt's compile re-registers the delta_scan views — so the override is gone before it can
+    mislead anyone reading through the session. A warning saying "reads no longer see the Delta
+    table" would be false by the very next call.
+
+    Pinned rather than merely deleted: if dbt ever stops re-binding here, the hazard becomes real
+    and this test is what says so."""
+    from deltalake import DeltaTable
+    root = os.environ["DBG2_PATH"]
+    before = DeltaTable(f"{root}/main/stg_items").version()
+
+    p.show("stg_items")
+    cursor = p._cursor
+    cursor.sql('create or replace view "memory"."main"."stg_items" as select 99 as id')
+
+    # Straight at the cursor, with no compile in between: the override is live.
+    assert cursor.sql('select count(*) as n from "memory"."main"."stg_items"').fetchall() == [(1,)]
+
+    p.sql("select 1 as x")            # any session call at all — it compiles, which re-binds
+
+    assert cursor.sql('select count(*) as n from "memory"."main"."stg_items"').fetchall() == [(2,)]
+    # And through all of it the lakehouse never moved.
     assert DeltaTable(f"{root}/main/stg_items").version() == before
 
 

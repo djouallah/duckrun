@@ -74,9 +74,9 @@ class CompileResult:
     here instead, on ``DbtProject.last_compile``.
     """
 
-    __slots__ = ("model", "node_id", "sql", "full_refresh", "cte")
+    __slots__ = ("model", "node_id", "sql", "full_refresh", "cte", "incremental")
 
-    def __init__(self, model, node_id, sql, full_refresh, cte=None):
+    def __init__(self, model, node_id, sql, full_refresh, cte=None, incremental=None):
         self.model = model
         self.node_id = node_id
         #: The SQL that actually RAN — for a ``cte()`` call that is the sliced query, not the
@@ -86,9 +86,13 @@ class CompileResult:
         self.full_refresh = full_refresh
         #: The CTE this was sliced down to, or None for a whole model.
         self.cte = cte
+        #: Which ``is_incremental()`` branch this SQL came from — True or False — or None when the
+        #: model does not branch on it at all and there is therefore nothing to be ambiguous about.
+        self.incremental = incremental
 
     def __repr__(self):
         extra = f", cte={self.cte!r}" if self.cte else ""
+        extra += f", incremental={self.incremental}" if self.incremental is not None else ""
         extra += ", full_refresh=True" if self.full_refresh else ""
         return f"<CompileResult {self.model!r}{extra}, {len(self.sql or '')} chars of SQL>"
 
@@ -369,12 +373,60 @@ class DbtProject:
         key = (selector, inline, full_refresh)
         if key not in self._compiled:
             self._compiled[key] = self._run_compile(selector, inline, full_refresh)
-        name, node_id, sql = self._compiled[key]
+        name, node_id, sql, branches = self._compiled[key]
+        incremental = self._which_branch(selector, inline, full_refresh, sql, branches)
         # A fresh CompileResult per call: cte() rewrites .sql on it, and that must not reach back
         # into the cache and corrupt the next caller's answer.
         self.last_compile = CompileResult(
-            model=name, node_id=node_id, sql=sql, full_refresh=full_refresh)
+            model=name, node_id=node_id, sql=sql, full_refresh=full_refresh,
+            incremental=incremental)
+        if branches and not full_refresh:
+            self._report_branch(self.last_compile)
         return self.last_compile
+
+    def _which_branch(self, selector, inline, full_refresh, sql, branches):
+        """Which ``is_incremental()`` branch produced ``sql`` — True, False, or None for a model
+        that does not branch.
+
+        Answered by ASKING DBT rather than by re-deriving its rule. ``is_incremental()`` is true when
+        the model is incremental, the target relation exists, and ``--full-refresh`` was not passed;
+        working that out here would mean duplicating dbt's relation lookup, which is exactly the kind
+        of copy that drifts from the adapter without anyone noticing. Instead: compile the same model
+        with ``--full-refresh``, which forces the branch false, and compare. Different text means the
+        default compile took the incremental branch.
+
+        Costs one extra compile — but only for a model whose source actually contains
+        ``is_incremental``, only on the default path, and only once per manifest generation, because
+        the second compile lands in the same cache. A model that does not branch pays nothing at all.
+        Identical texts on a branching model mean the false branch was taken anyway (typically a
+        target table that does not exist yet), which is worth reporting too."""
+        if not branches:
+            return None
+        if full_refresh:
+            return False        # forced false by construction — no second compile needed
+        other = (selector, inline, True)
+        if other not in self._compiled:
+            self._compiled[other] = self._run_compile(selector, inline, True)
+        return self._compiled[other][2] != sql
+
+    @staticmethod
+    def _report_branch(result):
+        """Say which branch was compiled, every time, for a model that has two.
+
+        Not once-per-session: a hint you scrolled past three cells ago is the same as no hint, and
+        the failure it prevents — reading a delta as if it were the table — costs an hour."""
+        # ASCII only, and that is not a style choice: issue #15: a non-ASCII progress print raises
+        # UnicodeEncodeError on a stock Windows cp1252 console and takes the caller down with it.
+        # tests/connection_api/test_connection_api.py asserts it for every print in the package.
+        if result.incremental:
+            print(f"[duckrun] {result.model}: is_incremental() = True -- this is the incremental "
+                  f"branch,\n          i.e. the rows a run would write INTO the existing table, "
+                  f"not the table's\n          contents. The other branch: incremental=False")
+        else:
+            print(f"[duckrun] {result.model}: is_incremental() = False -- this is the full-refresh "
+                  f"branch.\n          The model does branch, but the target table does not exist "
+                  f"yet, so a run\n          today compiles this same SQL; once it exists it will "
+                  f"not.")
 
     def _run_compile(self, selector, inline, full_refresh):
         args = ["compile"]
@@ -396,7 +448,14 @@ class DbtProject:
                 f"the selector {selector!r} matched {len(nodes)} nodes: {names}\n"
                 "  show() needs exactly one — narrow the selector.")
         node = nodes[0]
-        return getattr(node, "name", selector), getattr(node, "unique_id", None), node.compiled_code
+        # Whether the model branches at all is read off its SOURCE, before compilation erases the
+        # `{% if %}` — after rendering there is nothing left to tell two branches apart. This is only
+        # a gate: it decides whether asking dbt the exact question is worth a second compile, so a
+        # false positive costs 0.9s and a false negative costs a hint, never a wrong answer.
+        raw = getattr(node, "raw_code", "") or ""
+        branches = selector is not None and "is_incremental" in raw
+        return (getattr(node, "name", selector), getattr(node, "unique_id", None),
+                node.compiled_code, branches)
 
     # ── the connection ─────────────────────────────────────────────────────────────────────────
 
@@ -442,6 +501,13 @@ class DbtProject:
             self._env = self._environment()
             self._handle = self._env.debug_handle()
             self._cursor = self._handle.cursor()
+        # No guard here against a CREATE VIEW taking over a model's name. It is possible, and it
+        # does change what a direct cursor read returns — but it does not survive: every method on
+        # this class compiles through dbt first, and dbt's compile re-registers the delta_scan
+        # views, overwriting the override. Measured: shadow, direct read gives the override; one
+        # p.sql() later the delta_scan view is back and reads are correct again. Warning about a
+        # hazard that repairs itself before it can mislead would be a false statement in a message
+        # whose whole job is to be trusted.
         return self._cursor.sql(sql)
 
 
