@@ -161,6 +161,15 @@ p.show("tag:daily")                        # …if it resolves to exactly one mo
 A selector matching several nodes lists them rather than picking one, since guessing would give a
 silently wrong answer.
 
+The tests on a model are not "several nodes". dbt hands them back alongside it (indirect selection),
+and duckrun keeps the model — but a test named outright still resolves, which turns a failing test
+into something you can read with real types instead of re-deriving its SQL by hand:
+
+```python
+p.show("not_null_orders_enriched_id").pl()
+p.show("not_null_orders_enriched_id").limit(20)     # lazy: nothing read until you ask
+```
+
 ## Editing while you debug
 
 The parsed manifest is kept warm — a re-parse costs seconds on a real project — but it is checked

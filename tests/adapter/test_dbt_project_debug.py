@@ -82,6 +82,20 @@ with base as (select id, amount from {{ ref('stg_items') }}),
 select * from macro_made
 """
 
+# Generic tests on a model, because every real project has them and dbt hands them back
+# alongside the model they test (indirect selection). Without this the fixture was quietly
+# easier than any project this runs against.
+SCHEMA_YML = """version: 2
+
+models:
+  - name: mart_items
+    columns:
+      - name: id
+        data_tests:
+          - not_null
+          - unique
+"""
+
 
 @pytest.fixture
 def project(tmp_path):
@@ -103,6 +117,7 @@ def project(tmp_path):
     (proj / "models" / "uses_ephemeral.sql").write_text(USES_EPHEMERAL, encoding="utf-8")
     (proj / "models" / "macro_model.sql").write_text(MACRO_MODEL, encoding="utf-8")
     (proj / "macros" / "helpers.sql").write_text(MACRO, encoding="utf-8")
+    (proj / "models" / "schema.yml").write_text(SCHEMA_YML, encoding="utf-8")
     os.environ["DBG2_PATH"] = (tmp_path / "wh").as_posix()
 
     assert dbtRunner().invoke(
@@ -185,6 +200,22 @@ def test_compiled_returns_the_sql_text(p):
 def test_a_path_selector_works(p, project):
     """Selectors are handed to dbt untouched, so dbt's full syntax comes along for free."""
     assert p.compiled("path:models/mart_items.sql") == p.compiled("mart_items")
+
+
+def test_a_model_carrying_generic_tests_is_not_ambiguous(p):
+    """dbt's `eager` indirect selection returns a model together with the tests on it, so a plain
+    model name arrives here as three nodes. That is not an ambiguous selector and must not be
+    reported as one — every real project puts not_null/unique on its models, which made this the
+    first thing a real project hit."""
+    assert "stg_items" in p.compiled("mart_items")
+    assert p.last_compile.node_id.startswith("model.")
+
+
+def test_a_test_can_still_be_selected_by_name(p):
+    """Dropping the INDIRECT pull-in must not cost the direct one: a failing test read back as a
+    relation — with real types, and filterable — is one of the better uses of this."""
+    assert p.compiled("not_null_mart_items_id")
+    assert p.last_compile.node_id.startswith("test.")
 
 
 # ── freshness ──────────────────────────────────────────────────────────────────────────────────

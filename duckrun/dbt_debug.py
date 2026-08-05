@@ -437,6 +437,17 @@ class DbtProject:
 
         nodes = [r.node for r in (getattr(result.result, "results", None) or [])
                  if getattr(r, "node", None) is not None]
+        # dbt selects tests INDIRECTLY: with the default `eager` indirect selection, `--select
+        # my_model` returns the model and every generic test hanging off it. Any real project puts
+        # not_null/unique on its models, so a perfectly unambiguous selector arrived at the guard
+        # below as "matched 3 nodes". Tests are the only thing dbt adds indirectly, so dropping
+        # them resolves it -- unless tests are ALL that matched, which means one was named
+        # outright, and reading a failing test back as a relation is one of the better uses of
+        # this. Filtered here rather than passed as --indirect-selection=empty because `compile`
+        # only grew that flag after 1.8, and duckrun supports dbt-core >=1.8.
+        selected = [n for n in nodes
+                    if getattr(getattr(n, "resource_type", None), "value", None) != "test"]
+        nodes = selected or nodes
         if not nodes:
             raise DbtProjectError(
                 f"the selector {selector!r} matched no model. "
