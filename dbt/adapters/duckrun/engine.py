@@ -62,11 +62,17 @@ _DICT_PAGE_SIZE_LIMIT = 32 * 1024 * 1024
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
-# Data page ROW-COUNT limit — the real page safeguard, set EXPLICITLY (delta-rs 1.5.0's default is far
-# higher than 20k, measured). Without it a highly compressible column buffers its whole 16M-row group as a
-# single page: ~10x write memory, and giant pages that blow the merge's read-side spill cap → out of disk
-# (arrow-rs #5797 / #4973). 20k rows/page is arrow-rs's intended default; measured +0 MB write overhead.
-_DATA_PAGE_ROW_LIMIT = 20_000
+# Data page ROW-COUNT limit — the backstop for columns the byte cap can't see: the byte cap is checked
+# on ENCODED page bytes, so a highly compressible column would otherwise buffer its whole 16M-row group
+# as a single page (~10x write memory, and giant pages blow the merge's read-side spill cap → out of
+# disk; arrow-rs #5797 / #4973). At 20k (arrow-rs's intended default) this cap fired FIRST on every
+# column, overriding the 1 MB byte cap into ~20k-row micro-pages — and page count is pure read-side
+# overhead: each page costs the reader a header parse, a decompressor setup, and an encoding-run
+# restart. 1M lets the byte cap shape dense columns into ~1 MB pages (the page size every mainstream
+# parquet writer targets) while still bounding the degenerate compressible case. Measured on the
+# layout benchmark (tests/parquet_layout/aemo): ~40x fewer pages per chunk, cold column loads
+# consistently faster, write memory unchanged (dense pages are bounded by bytes, not rows).
+_DATA_PAGE_ROW_LIMIT = 1_000_000
 # Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a segment
 # cap: it lets more of a table reach the full 16M-row group before the file rolls (a narrow fact fits a
 # 16M-row segment well under 256 MB; a wide fact like lineitem is capped by the file size first), giving
@@ -248,8 +254,9 @@ def _writer_properties(row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
     # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a 32 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
-    # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap, an EXPLICIT
-    # 20k-row data-page cap (see _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
+    # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap that shapes
+    # dense columns into ~1 MB pages (the 1M-row cap only backstops ultra-compressible columns — see
+    # _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
     # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults) so a
     # merge stays quick and never rewrites fat files, and so the known OOM-prone path does not also
     # take on a 16M-row write buffer; post-merge compaction folds merged files up into this layout
