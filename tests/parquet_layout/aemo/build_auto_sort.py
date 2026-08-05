@@ -32,6 +32,18 @@ if OPT_TFS_MB is not None:
     from dbt.adapters.duckrun import engine as _engine
     _engine._TARGET_FILE_SIZE = OPT_TFS_MB * 1024 * 1024
     print(f"OPT_TFS_MB: target file size pinned to {OPT_TFS_MB} MB for this build", flush=True)
+# OPT_PAGE_ROWS: raise the data-page ROW cap (default 20k, see engine._DATA_PAGE_ROW_LIMIT) — the
+# page-granularity A/B vs the V-Order reference: its parquet-mr pages are ~1 MB / ~775k rows
+# (~61 data pages per 47M-row chunk) where duckrun's 20k-row cap makes ~2,350. With the cap
+# raised the 1 MB byte limit binds instead, landing pages at parquet-mr's shape. Same call-time
+# module-global seam as OPT_TFS_MB.
+_pr = os.environ.get("OPT_PAGE_ROWS", "").strip()
+OPT_PAGE_ROWS = int(_pr) if _pr.isdigit() and int(_pr) > 0 else None
+if OPT_PAGE_ROWS is not None:
+    from dbt.adapters.duckrun import engine as _engine
+    _engine._DATA_PAGE_ROW_LIMIT = OPT_PAGE_ROWS
+    print(f"OPT_PAGE_ROWS: data-page row cap pinned to {OPT_PAGE_ROWS:,} rows for this build",
+          flush=True)
 # Read the source mart.fct_summary DIRECTLY (its own independent read, separate from the Spark
 # V-Order build's) with the same row cap. SORTED BY AUTO re-sorts regardless of input order.
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()

@@ -69,6 +69,10 @@ on:
         description: "[aemo] pin the auto_sort build's target file size (MB, e.g. 1024 for a single ~765 MB file; the harness spelling of target_file_size_mb). Empty = 256 MB default. Use with rebuild=true."
         type: string
         default: ""
+      opt_page_rows:
+        description: "[aemo] raise the data-page ROW cap for the auto_sort build (e.g. 1000000 so the 1 MB byte cap binds -> parquet-mr-shaped ~1 MB pages like the V-Order reference). Empty = 20k default. Use with rebuild=true."
+        type: string
+        default: ""
       rebuild:
         description: "rebuild the auto_sort (and, for contoso, the base) tables even if they already exist (else reuse). The aemo V-Order reference is NOT rebuilt by this — it never changes; see rebuild_vorder."
         type: boolean
@@ -179,6 +183,7 @@ jobs:
           OPT_SORT: ${{ inputs.opt_sort }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_TFS_MB: ${{ inputs.opt_tfs_mb }}
+          OPT_PAGE_ROWS: ${{ inputs.opt_page_rows }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_auto_sort.py
