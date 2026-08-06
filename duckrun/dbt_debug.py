@@ -112,6 +112,7 @@ class DbtProject:
         self._manifest = None
         self._signature = None
         self._compiled = {}
+        self._compiled_nodes = set()
         self._creds = None
         self._env = None
         self._handle = None
@@ -311,6 +312,7 @@ class DbtProject:
                 self._handle.close()   # our own child cursor; the shared connection stays up
         self._manifest = self._signature = self._creds = None
         self._compiled = {}
+        self._compiled_nodes = set()
         self._env = self._handle = self._cursor = None
 
     def _changed_since(self, signature):
@@ -422,18 +424,15 @@ class DbtProject:
         )
 
     def _compile(self, selector=None, inline=None, full_refresh=False) -> CompileResult:
-        """Compile one node, at most once per manifest generation, and record what it was.
+        """Compile one node, once per (selector, branch) per manifest generation, and record what it
+        was.
 
-        The cache is a CORRECTNESS requirement, not a speed-up — though it is also that. dbt marks a
-        node ``extra_ctes_injected`` once it has spliced an ephemeral parent in as a CTE, so a
-        SECOND compile against the same manifest object regenerates ``compiled_code`` from
-        ``raw_code`` and does not re-inject. The result still REFERENCES ``__dbt__cte__<parent>``
-        while no longer defining it: silently broken SQL, from the second call onward, for any
-        project with ephemeral models. Compiling once per generation sidesteps that entirely instead
-        of reaching into dbt to reset the flag.
+        The cache keeps ``ctes()`` followed by ``cte()`` to one compile, and is safe because
+        ``_ensure_manifest`` runs first: any edit drops the manifest and this cache with it, so a hit
+        can only ever be SQL that is still current.
 
-        Safe to cache because ``_ensure_manifest`` runs first: any edit drops the manifest and this
-        cache with it, so a hit can only ever be SQL that is still current."""
+        It is NOT what makes a repeat compile safe — see :meth:`_reset_injected_ctes`. It cannot be:
+        the ``is_incremental()`` probe deliberately compiles the same node under a second key."""
         self._ensure_manifest()
         key = (selector, inline, full_refresh)
         if key not in self._compiled:
@@ -463,8 +462,13 @@ class DbtProject:
         Costs one extra compile — but only for a model whose source actually contains
         ``is_incremental``, only on the default path, and only once per manifest generation, because
         the second compile lands in the same cache. A model that does not branch pays nothing at all.
-        Identical texts on a branching model mean the false branch was taken anyway (typically a
-        target table that does not exist yet), which is worth reporting too."""
+        Identical texts on a branching model mean the false branch was taken anyway, which is worth
+        reporting too.
+
+        Comparing TEXTS is only a valid question to ask because :meth:`_reset_injected_ctes` makes the
+        second compile of a node produce what a first one would. Without it the two texts differ for a
+        model with an ephemeral parent no matter which branch was taken, and this reports True for
+        every one of them — the exact misreading the hint exists to prevent."""
         if not branches:
             return None
         if full_refresh:
@@ -488,16 +492,44 @@ class DbtProject:
                   f"branch,\n          i.e. the rows a run would write INTO the existing table, "
                   f"not the table's\n          contents. The other branch: incremental=False")
         else:
+            # What was OBSERVED is that both compiles produced the same text -- not WHY. The usual
+            # cause is a target table that does not exist yet, but two branches can also render
+            # identically; naming a cause we never checked is the one thing a hint must not do.
             print(f"[duckrun] {result.model}: is_incremental() = False -- this is the full-refresh "
-                  f"branch.\n          The model does branch, but the target table does not exist "
-                  f"yet, so a run\n          today compiles this same SQL; once it exists it will "
-                  f"not.")
+                  f"branch.\n          The model does branch, but both branches compile to the same "
+                  f"SQL right now\n          (typically: the target table does not exist yet), so a "
+                  f"run today\n          produces this.")
+
+    def _reset_injected_ctes(self):
+        """Let a node that was already compiled in this manifest generation be compiled again.
+
+        dbt injects an ephemeral parent as a CTE exactly once per node and records that in
+        ``extra_ctes_injected``. ``compile_node`` always re-renders ``compiled_code`` from
+        ``raw_code``, but ``_recursively_prepend_ctes`` then returns early on that flag — so a SECOND
+        compile of the same node against the same manifest hands back SQL that still REFERENCES
+        ``__dbt__cte__<parent>`` while no longer defining it. The manifest we pass to ``dbtRunner`` is
+        used as-is, never copied, so the node and its flag are shared across invocations.
+
+        The ``is_incremental()`` probe has to compile the same node twice (once with
+        ``--full-refresh``), so clearing the flag first is what keeps both branches whole. dbt then
+        re-injects from ``extra_ctes``, which still carries the parent ids, rebuilding each CTE from
+        the parent's own ``_pre_injected_sql`` — the same text a first compile produced. Only the
+        consumer's flag is touched; an ephemeral parent keeps its state and is reused as-is.
+
+        (dbt 1.8-1.11: compilation.py ``compile_node`` / ``_recursively_prepend_ctes``,
+        cli/requires.py ``setup_manifest``.)"""
+        nodes = getattr(self._manifest, "nodes", None) or {}
+        for node_id in self._compiled_nodes:
+            node = nodes.get(node_id)
+            if getattr(node, "extra_ctes_injected", False):
+                node.extra_ctes_injected = False
 
     def _run_compile(self, selector, inline, full_refresh):
         args = ["compile"]
         args += ["--inline", inline] if inline is not None else ["--select", selector]
         if full_refresh:
             args += ["--full-refresh"]
+        self._reset_injected_ctes()
         try:
             result = self._invoke(args, manifest=self._manifest)
         finally:
@@ -534,8 +566,10 @@ class DbtProject:
         # false positive costs 0.9s and a false negative costs a hint, never a wrong answer.
         raw = getattr(node, "raw_code", "") or ""
         branches = selector is not None and "is_incremental" in raw
-        return (getattr(node, "name", selector), getattr(node, "unique_id", None),
-                node.compiled_code, branches)
+        node_id = getattr(node, "unique_id", None)
+        if node_id is not None:
+            self._compiled_nodes.add(node_id)   # so a repeat compile of it re-injects; see above
+        return (getattr(node, "name", selector), node_id, node.compiled_code, branches)
 
     # ── the connection ─────────────────────────────────────────────────────────────────────────
 

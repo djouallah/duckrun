@@ -67,6 +67,16 @@ USES_EPHEMERAL = """{{ config(materialized='table') }}
 with picked as (select * from {{ ref('eph_filtered') }})
 select * from picked
 """
+# BOTH at once: branches on is_incremental() AND has an ephemeral parent. That intersection is the
+# only shape where the branch probe's second compile can damage the first one's SQL, and a model
+# that is one or the other never reaches it — see
+# test_an_incremental_over_an_ephemeral_stays_whole_in_both_orders.
+INCR_OVER_EPH = """{{ config(materialized='incremental', unique_key='id') }}
+select * from {{ ref('eph_filtered') }}
+{% if is_incremental() %}
+where id > (select max(id) from {{ this }})
+{% endif %}
+"""
 
 # A macro that emits an entire CTE — name, body and its own comment.
 MACRO = """{% macro scaled_cte(name, src, factor) %}
@@ -115,6 +125,7 @@ def project(tmp_path):
     (proj / "models" / "cte_model.sql").write_text(CTE_MODEL, encoding="utf-8")
     (proj / "models" / "eph_filtered.sql").write_text(EPHEMERAL, encoding="utf-8")
     (proj / "models" / "uses_ephemeral.sql").write_text(USES_EPHEMERAL, encoding="utf-8")
+    (proj / "models" / "incr_over_eph.sql").write_text(INCR_OVER_EPH, encoding="utf-8")
     (proj / "models" / "macro_model.sql").write_text(MACRO_MODEL, encoding="utf-8")
     (proj / "macros" / "helpers.sql").write_text(MACRO, encoding="utf-8")
     (proj / "models" / "schema.yml").write_text(SCHEMA_YML, encoding="utf-8")
@@ -553,6 +564,48 @@ def test_compiling_twice_does_not_lose_the_ephemeral_cte(p):
 
     p.reload()                                     # a fresh manifest must still be correct
     assert "__dbt__cte__eph_filtered as" in p.compiled("uses_ephemeral")
+
+
+def test_an_incremental_over_an_ephemeral_stays_whole_in_both_orders(p, project):
+    """A model can be BOTH — and then the is_incremental() probe compiles it a second time.
+
+    The probe answers "which branch was this?" by compiling the same model again with
+    --full-refresh and comparing the text. That second compile is exactly the one dbt hands back
+    without re-injecting the ephemeral parent, so without `_reset_injected_ctes` one of the two
+    texts references `__dbt__cte__eph_filtered` while no longer defining it — and which one depends
+    only on the order you asked in. It also made the comparison meaningless: the texts then differ
+    for every such model, so the hint said "is_incremental() = True" regardless of the branch, which
+    is the misreading it exists to prevent.
+
+    Both orders, and both must agree."""
+    def whole(sql):
+        return "__dbt__cte__eph_filtered as" in sql and "__dbt__cte__eph_filtered" in sql
+
+    default_first = p.compiled("incr_over_eph")
+    forced_second = p.compiled("incr_over_eph", incremental=False)
+
+    # A fresh session = a fresh manifest, so the other order gets the same clean start.
+    q = duckrun.dbt_project(project)
+    forced_first = q.compiled("incr_over_eph", incremental=False)
+    default_second = q.compiled("incr_over_eph")
+
+    assert whole(default_first) and whole(forced_second)
+    assert whole(forced_first) and whole(default_second)
+    assert default_first == default_second
+    assert forced_first == forced_second
+    assert default_first != forced_first          # they really are two different branches
+
+
+def test_the_branch_report_is_right_for_a_model_over_an_ephemeral(p, capsys):
+    """The half that fails silently: the hint itself. The target table exists (the fixture built
+    it), so the incremental branch is the honest answer — and the SQL has to actually run, which is
+    what proves the injected CTE survived the probe rather than merely reading right."""
+    rel = p.show("incr_over_eph")
+
+    assert rel.fetchall() == []        # `id > max(id)` over its own table: nothing new to add
+    assert p.last_compile.incremental is True
+    out = " ".join(capsys.readouterr().out.split())
+    assert "incr_over_eph: is_incremental() = True" in out
 
 
 def test_ephemeral_models_also_work_through_sql(p):
