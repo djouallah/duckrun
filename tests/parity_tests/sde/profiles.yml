@@ -9,7 +9,7 @@ sde_dbt_tutorial:
   outputs:
     dev:
       type: duckrun
-      # 4 so the parity diff also covers parallel builds: duckrun's output must match dbt-duckdb's
+      # 4 so the compatibility build also covers parallel model builds: the project must run green
       # regardless of how many models run at once. Safe with `path` below — the sources are only
       # READ from that DuckDB file; models still materialize to Delta.
       threads: 4

@@ -7,7 +7,7 @@ jaffle_shop:
   outputs:
     dev:
       type: duckrun
-      # 4 so the parity diff also covers parallel builds: duckrun's output must match dbt-duckdb's
+      # 4 so the compatibility build also covers parallel model builds: the project must run green
       # regardless of how many models run at once.
       threads: 4
       schema: "{{ env_var('DBT_SCHEMA', 'main') }}"

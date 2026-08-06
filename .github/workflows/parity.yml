@@ -1,15 +1,15 @@
 name: parity
 
-# dbt-duckdb validation. Take a real, UNMODIFIED `type: duckdb` dbt project and run it on duckrun;
-# confirm it builds green and — where cheap — that duckrun's Delta output matches dbt-duckdb row for
-# row. dbt-duckdb is the oracle; a mismatch is a duckrun bug (fixed in duckrun, never in the project).
+# dbt-duckdb compatibility. Take a real, UNMODIFIED `type: duckdb` dbt project and run it VERBATIM
+# on duckrun — only the connection profile is swapped. The bar is a green `dbt build`: seeds, models,
+# snapshots, and the project's OWN data tests and unit tests all pass. A failure is a duckrun bug
+# (fixed in duckrun, never in the project). dbt-duckdb itself is not built — nothing here tests it.
 #
-# The duckrun side materializes to live Microsoft Fabric OneLake (abfss://), exactly like the
+# Everything materializes to live Microsoft Fabric OneLake (abfss://), exactly like the
 # integration suite (integration_tests_onelake.yml): duckrun self-acquires the OneLake token from the
 # OIDC identity (AZURE_CLIENT_ID/AZURE_TENANT_ID) and WAREHOUSE_PATH points at the lakehouse's Tables.
 # Each project writes its own Tables/parity_<proj> subfolder so the shared lakehouse never collides,
-# and takes a per-project concurrency lock. The diff reads the duckrun tables back over abfss://
-# (delta_scan + the same Azure secret the adapter mints).
+# and takes a per-project concurrency lock.
 # Run locally without OneLake by leaving WAREHOUSE_PATH unset — run_parity.py falls back to a local
 # Delta warehouse.
 #
@@ -38,7 +38,7 @@ on:
   workflow_dispatch:
     inputs:
       run_parity:
-        description: "Build the projects on dbt-duckdb AND duckrun (materialize to OneLake) and diff every table — the oracle comparison."
+        description: "Run each project VERBATIM on duckrun (materialize to OneLake) — the compatibility builds."
         type: boolean
         default: true
       run_debug:
@@ -90,8 +90,8 @@ jobs:
         run: python tests/parity_tests/techflow/run_debug.py
 
   jaffle_shop:
-    # Fast (~30s): clone jaffle_shop, build it on dbt-duckdb (oracle) AND duckrun (→ OneLake), diff
-    # every persisted table (EXCEPT ALL both ways). The full differential — the strongest parity check.
+    # Fast (~30s): clone jaffle_shop and build it VERBATIM on duckrun (→ OneLake) — seeds, models,
+    # and the project's own data tests.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_parity }}
     runs-on: ubuntu-latest
     concurrency:
@@ -114,7 +114,7 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun (dbt-duckdb + duckdb + deltalake come with it)
         run: pip install -e ".[test]"
-      - name: Parity — jaffle_shop, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
+      - name: Compatibility — jaffle_shop runs VERBATIM on duckrun (→ OneLake)
         run: python tests/parity_tests/jaffle_shop/run_parity.py
       - name: Generate jaffle_shop dbt docs (static — catalog with row/byte stats off the OneLake tables)
         env:
@@ -130,8 +130,8 @@ jobs:
 
   sde:
     # Fast (~2 min): the Start Data Engineering project (a delete+insert incremental model, an SCD2
-    # snapshot, a medallion flow, packages) on dbt-duckdb (oracle) AND duckrun (→ OneLake), then diff
-    # every persisted table. The repo's own EL + dbt build run UNCHANGED; only the connection differs.
+    # snapshot, a medallion flow, packages) built VERBATIM on duckrun (→ OneLake). The repo's own
+    # EL + dbt build run UNCHANGED; only the connection differs.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_parity }}
     runs-on: ubuntu-latest
     concurrency:
@@ -149,7 +149,7 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun
         run: pip install -e ".[test]"
-      - name: Parity — sde, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
+      - name: Compatibility — sde runs VERBATIM on duckrun (→ OneLake)
         run: python tests/parity_tests/sde/run_parity.py
       - name: Generate sde dbt docs (static — catalog stats off the OneLake tables)
         env:
@@ -164,10 +164,10 @@ jobs:
           if-no-files-found: error
 
   mrr:
-    # Fast (~30s): the MRR (subscription-revenue) project on dbt-duckdb (oracle) AND duckrun (→ OneLake),
-    # then diff every persisted table. Seeds-only (no EL), staging/intermediate views, mart TABLES that
-    # amortize invoices into monthly recurring revenue + MRR movements. First project here with native
-    # dbt `unit_tests:` (3 cases) + an exposure — `dbt build` runs them on both adapters.
+    # Fast (~30s): the MRR (subscription-revenue) project built VERBATIM on duckrun (→ OneLake).
+    # Seeds-only (no EL), staging/intermediate views, mart TABLES that amortize invoices into monthly
+    # recurring revenue + MRR movements. Native dbt `unit_tests:` (3 cases) + an exposure —
+    # `dbt build` runs them all.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_parity }}
     runs-on: ubuntu-latest
     concurrency:
@@ -185,7 +185,7 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun
         run: pip install -e ".[test]"
-      - name: Parity — mrr, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
+      - name: Compatibility — mrr runs VERBATIM on duckrun (→ OneLake)
         run: python tests/parity_tests/mrr/run_parity.py
       - name: Generate mrr dbt docs (static — catalog stats off the OneLake tables)
         env:
@@ -200,12 +200,10 @@ jobs:
           if-no-files-found: error
 
   techflow:
-    # Fast: the TechFlow Analytics SaaS project on dbt-duckdb (oracle) AND duckrun (→ OneLake), then
-    # diff every persisted table. First parity project with native dbt `unit_tests:`; also exercises
-    # sources read from committed parquet (external_location), an incremental model, two snapshots,
-    # dbt_expectations and exposures. dbt_project_evaluator's own models are skipped from the diff (a
-    # linting package hardcoded to `target.type in ['duckdb']`, so it describes the adapter, not the
-    # data) — it still builds green on duckrun; everything the project actually produces is diffed.
+    # Fast: the TechFlow Analytics SaaS project built VERBATIM on duckrun (→ OneLake). Exercises
+    # native dbt `unit_tests:`, sources read from committed parquet (external_location), an
+    # incremental model (--full-refresh over the persistent store), two snapshots, dbt_expectations,
+    # dbt_project_evaluator and exposures — the whole project, its own tests included, builds green.
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_parity }}
     runs-on: ubuntu-latest
     concurrency:
@@ -223,7 +221,7 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun
         run: pip install -e ".[test]"
-      - name: Parity — techflow, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
+      - name: Compatibility — techflow runs VERBATIM on duckrun (→ OneLake)
         run: python tests/parity_tests/techflow/run_parity.py
       - name: Generate techflow dbt docs (static — catalog stats off the OneLake tables)
         env:

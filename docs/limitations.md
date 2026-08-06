@@ -6,9 +6,8 @@ by deliberate caution. Most come with a "do this instead." Deeper detail lives i
 ## Gaps vs dbt-duckdb
 
 duckrun aims to be a **drop-in for dbt-duckdb** — same DuckDB SQL, same model and config spelling —
-and [parity](parity.md) proves that against real, unmodified `type: duckdb` projects diffed
-table-for-table against dbt-duckdb as the oracle. These are the places where it is *not* the same,
-in full:
+and [parity](parity.md) proves that by running real, unmodified `type: duckdb` projects verbatim
+on duckrun, their own tests included. These are the places where it is *not* the same, in full:
 
 | gap | what happens | why |
 |---|---|---|

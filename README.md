@@ -145,7 +145,7 @@ the session cannot write — in **[docs/dbt-debug.md](docs/dbt-debug.md)**.
 
 See it on real projects: [aemo](tests/integration_tests/aemo) and [coffee](tests/integration_tests/coffee) are
 runnable starters, and [parity_tests/](tests/parity_tests) runs real `type: duckdb` projects (jaffle_shop,
-sde, MRR, TechFlow, Tuva) unchanged on duckrun and diffs the output against dbt-duckdb.
+sde, MRR, TechFlow, Tuva) unchanged on duckrun — their own tests included.
 
 ## Building with an AI assistant
 

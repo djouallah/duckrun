@@ -1,10 +1,11 @@
-# dbt-duckdb parity
+# dbt-duckdb compatibility
 
 duckrun is built to be a **drop-in for dbt-duckdb** — same DuckDB SQL, same models, but every
 table materializes to Delta Lake via delta-rs. `parity_tests/`
-([on GitHub](../tests/parity_tests/)) proves that claim against *real, unmodified* dbt+DuckDB projects:
-take a project whose profile says `type: duckdb`, run it **verbatim** on both dbt-duckdb (the
-oracle) and duckrun, and check the results match.
+([on GitHub](../tests/parity_tests/)) proves that claim against *real, unmodified* dbt+DuckDB
+projects: take a project whose profile says `type: duckdb` and run it **verbatim** on duckrun. The
+bar is a green `dbt build` — the project's own models, seeds, snapshots, data tests and unit tests
+all pass, with only the connection swapped.
 
 "Unmodified" is literal. The project repo is cloned fresh and not edited — not one line. The only
 thing supplied from outside is the connection: a duckrun profile passed via `--profiles-dir`. In
@@ -12,22 +13,12 @@ dbt the profile is connection config that lives *outside* the project (that's wh
 in `profiles/<warehouse>/`), so swapping in a duckrun profile changes nothing in the repo. When a
 project does expose a gap, the fix lands in **duckrun**, never in the project.
 
-## jaffle_shop — full differential { #jaffle_shop }
+## jaffle_shop — the canonical reference { #jaffle_shop }
 
 [`parity_tests/jaffle_shop/run_parity.py`](../tests/parity_tests/jaffle_shop/run_parity.py) clones
-[dbt-labs/jaffle_shop_duckdb](https://github.com/dbt-labs/jaffle_shop_duckdb), runs `dbt build`
-once on dbt-duckdb and once on duckrun, then diffs **every persisted table** with a row-multiset
-`EXCEPT ALL` both ways. dbt-duckdb's tables are ground truth; a mismatch is a duckrun bug.
-
-Result — identical, row for row, both sides 28/28 green:
-
-| table          | rows | duckrun == dbt-duckdb |
-|----------------|------|:---------------------:|
-| customers      | 100  | ✓ |
-| orders         | 99   | ✓ |
-| raw_customers  | 100  | ✓ |
-| raw_orders     | 99   | ✓ |
-| raw_payments   | 113  | ✓ |
+[dbt-labs/jaffle_shop_duckdb](https://github.com/dbt-labs/jaffle_shop_duckdb) and runs `dbt build`
+on duckrun. The full build runs green — 28/28: 3 seeds, 2 table models, 3 view models, 20 data
+tests — unmodified.
 
 → **[Browse the jaffle_shop dbt docs](jaffle_shop.html)** — the full dbt documentation site (DAG +
 catalog with per-table row/byte stats), generated on duckrun by `dbt docs generate --static`.
@@ -38,20 +29,11 @@ catalog with per-table row/byte stats), generated on duckrun by `dbt docs genera
 bronze→silver→gold project with a **`delete+insert` incremental model**, an **SCD2 snapshot**,
 packages, and an exposure. It ingests raw CSVs into a DuckDB file via its own EL and reads them as
 `sources` — so the duckrun profile sets `path` to that file and `root_path` to a Delta warehouse.
-[`run_parity.py`](../tests/parity_tests/sde/run_parity.py) builds it on dbt-duckdb and duckrun and diffs
-every persisted table.
+[`run_parity.py`](../tests/parity_tests/sde/run_parity.py) runs the repo's EL then `dbt build`.
 
 This is the project that exposed duckrun silently aliasing `delete+insert` to `merge`; with real
-delete+insert it runs **verbatim** and matches:
-
-| table | rows | duckrun == dbt-duckdb |
-|-------|------|:---------------------:|
-| fct_clickstream (delete+insert) | 100 | ✓ |
-| fct_orders | 999 | ✓ |
-| order_status_code (seed) | 6 | ✓ |
-| dim_customer (SCD2) | 100 | ✓ * |
-
-\* compared on business columns; the SCD2 bookkeeping columns are stamped from run wall-clock.
+delete+insert it runs **verbatim** and green — the incremental `fct_clickstream`, `fct_orders`, the
+seed, the SCD2 `dim_customer` snapshot, and every test.
 
 → **[Browse the sde dbt docs](sde.html)** — generated on duckrun by `dbt docs generate --static`.
 
@@ -64,25 +46,6 @@ reactivation / retained (`fct_mrr_movements`). It's the first project here with 
 `unit_tests:`** (3 cases on the amortization model) plus singular tests and an exposure, so a green
 `dbt build` proves duckrun's unit-test / test path too. No external sources, so the duckrun profile
 just points `root_path` at a Delta warehouse.
-[`run_parity.py`](../tests/parity_tests/mrr/run_parity.py) builds it on dbt-duckdb and duckrun and diffs
-every persisted table:
-
-| table | rows | duckrun == dbt-duckdb |
-|-------|------|:---------------------:|
-| fct_mrr | 1484 | ✓ |
-| fct_mrr_movements | 2078 | ✓ * |
-| invoices (seed) | 2441 | ✓ |
-| subscriptions (seed) | 666 | ✓ |
-| customers (seed) | 292 | ✓ |
-| schools (seed) | 292 | ✓ |
-| products (seed) | 9 | ✓ |
-
-\* `fct_mrr_movements` buckets customer-months (new / expansion / contraction / reactivation /
-retained) via a strict `>`/`<` on **unrounded** float sums, so cent-equal months (~5e-14 apart from
-summation order) tip buckets differently for a native table vs a `delta_scan` — a non-determinism in
-the project's SQL, not a duckrun bug (`fct_mrr`, the rounded mart, matches exactly). It's compared
-rolled up past that split, on the bucket-invariant quantities (`sum(customer_count)` and
-`round(sum(mrr_change_usd), 2)` per `(month, use_case, country)`).
 
 The full build — 5 seeds, 2 table models, 6 views, 43 data tests, 3 unit tests, 1 exposure — runs
 green on duckrun, unmodified.
@@ -92,35 +55,17 @@ green on duckrun, unmodified.
 ## TechFlow — unit tests + parquet sources + snapshots { #techflow }
 
 [ameijin/dbt-example](https://github.com/ameijin/dbt-example) ("TechFlow Analytics") is a SaaS model
-and the first parity project with **native dbt `unit_tests:`**. It also reads its raw data from
-committed **parquet** via dbt-duckdb `external_location` sources, and exercises an **incremental**
-model, two **timestamp snapshots**, `dbt_expectations` and exposures — all deterministic.
-[`run_parity.py`](../tests/parity_tests/techflow/run_parity.py) builds it on dbt-duckdb and duckrun and
-diffs every persisted table; the full `dbt build` (seeds, snapshots, ~30 models, 2 unit tests, 137
-data tests, exposures) runs green on duckrun, unmodified.
+that stacks patterns the others don't: raw data read from committed **parquet** via dbt-duckdb
+`external_location` sources, an **incremental** model, two **timestamp snapshots**,
+`dbt_expectations`, exposures and native `unit_tests:`. The full `dbt build` (seeds, snapshots,
+~30 models, 2 unit tests, 137 data tests, exposures) runs green on duckrun, unmodified.
 
-| table | rows | duckrun == dbt-duckdb |
-|-------|------|:---------------------:|
-| fct_events | 52232 | ✓ |
-| fct_user_engagement_daily | 36092 | ✓ |
-| fct_revenue | 3772 | ✓ |
-| fct_mrr_daily (incremental) | 2718 | ✓ * |
-| dim_users / dim_customers | 500 / 500 | ✓ |
-| dim_subscriptions | 475 | ✓ |
-| user_plan_snapshot / subscription_pricing_snapshot | 500 / 475 | ✓ ** |
-| seeds (plan_catalog / product_features / utm_channel_mapping) | 18 / 18 / 20 | ✓ |
-
-\* compared excluding `loaded_at` (stamped `current_timestamp`). \*\* snapshots compared on business
-columns (SCD2 bookkeeping is per-run).
-
-This project also bundles **dbt_project_evaluator**, a dbt Labs *linting* package. Its models don't
-model the SaaS data — they introspect the dbt graph, and the package hardcodes
-`+materialized: "{{ 'table' if target.type in ['duckdb'] else 'view' }}"`. duckrun is its **own**
-adapter type (`target.type == 'duckrun'`), so the package's own models materialize differently and
-its `database` column reports a different catalog — connection metadata that can't match across two
-adapters and can't be "fixed" in duckrun (reporting `type: duckdb` is what makes dbt load dbt-duckdb).
-So those models are **skipped from the row diff** (by `package_name`, logged explicitly); the package
-still builds green on duckrun.
+This project also bundles **dbt_project_evaluator**, a dbt Labs *linting* package that introspects
+the dbt graph. One knowing quirk: the package hardcodes
+`+materialized: "{{ 'table' if target.type in ['duckdb'] else 'view' }}"`, and duckrun is its
+**own** adapter type (`target.type == 'duckrun'`), so the package's own bookkeeping models
+materialize as views under duckrun. That can't be "fixed" in duckrun — reporting `type: duckdb` is
+what makes dbt load dbt-duckdb — and the package still runs green.
 
 → **[Browse the TechFlow dbt docs](techflow.html)** — generated on duckrun by `dbt docs generate --static`.
 

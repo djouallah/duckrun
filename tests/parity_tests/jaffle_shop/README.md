@@ -1,9 +1,9 @@
-# Parity test — jaffle_shop on duckrun (dbt-duckdb validation)
+# Compatibility test — jaffle_shop on duckrun
 
-**Goal:** prove duckrun is a faithful drop-in for dbt-duckdb. Take a real `type: duckdb` dbt
-project, run it **unchanged** two ways — on dbt-duckdb (the oracle) and on duckrun — and assert
-every materialized table is **identical, row for row**. dbt-duckdb's output is ground truth; any
-mismatch is a duckrun bug (fixed in duckrun, never in the project).
+**Goal:** prove an existing `type: duckdb` dbt project runs on duckrun **as-is**. Take the real
+jaffle_shop repo, swap in nothing but the connection profile, and `dbt build` it VERBATIM — seeds,
+models and the project's own data tests. Green build = compatible; a failure is a duckrun bug
+(fixed in duckrun, never in the project). dbt-duckdb itself is not built — nothing here tests it.
 
 ## The repo under test
 
@@ -22,26 +22,16 @@ lives outside the project, so the repo is never modified.
 python tests/parity_tests/jaffle_shop/run_parity.py
 ```
 
-The script clones the repo (if needed), runs `dbt build` once with the repo's own duckdb profile
-(→ `jaffle_shop.duckdb`) and once with the duckrun profile here (→ a local Delta warehouse), then
-diffs every persisted table with a row-multiset `EXCEPT ALL` both ways. Exit 0 = parity.
+The script clones the repo (if needed) and runs `dbt build` with the duckrun profile here —
+materializing to OneLake in CI (`WAREHOUSE_PATH`), or a local Delta warehouse otherwise.
+Exit 0 = the project built green.
 
-## Result (latest local run)
+## Result (latest run)
 
-Both sides build green (28/28: 3 seeds, 2 table models, 3 view models, 20 tests). Every table the
-duckrun side persists matches the duckdb oracle exactly:
-
-| table          | rows | match |
-|----------------|------|-------|
-| customers      | 100  | ✓     |
-| orders         | 99   | ✓     |
-| raw_customers  | 100  | ✓     |
-| raw_orders     | 99   | ✓     |
-| raw_payments   | 113  | ✓     |
-
+The full build runs green (28/28: 3 seeds, 2 table models, 3 view models, 20 tests), unmodified.
 Staging models are `view`s; duckrun has no durable view (it materializes only tables to Delta), so
-they're intermediate-only and not part of the persisted diff — the marts that depend on them match,
-which validates the pipeline.
+they're intermediate-only — the marts that depend on them build and test green, which validates the
+pipeline.
 
 ## Also here: the debug session (`run_debug.py`)
 
