@@ -45,9 +45,14 @@ which validates the pipeline.
 
 ## Also here: the debug session (`run_debug.py`)
 
-`python tests/parity_tests/jaffle_shop/run_debug.py`, after `run_parity.py` has built the project.
-It points `duckrun.dbt_project()` — the notebook debug session — at this same clone and checks what
-it hands back. Read-only: the repo is not modified and nothing is written to the warehouse.
+`python tests/parity_tests/jaffle_shop/run_debug.py` — standalone. It points
+`duckrun.dbt_project()` — the notebook debug session — at this project and checks what it hands
+back. Read-only end to end: it clones the project source (dbt needs the `.sql` files to compile),
+reads the jaffle_shop tables the warehouse **already** holds, and builds nothing. It does not need
+`run_parity.py` to have run first — needing a writer to run first would be the opposite of what a
+read-only session claims — it only needs `WAREHOUSE_PATH` to point at a warehouse jaffle_shop has
+been built into at some point (the parity lakehouse in CI). An empty warehouse is reported as a
+failure, never fixed by building one.
 
 Why here rather than in a fixture: every bug that feature shipped with was found by pointing it at a
 real project (generic tests made every model name look ambiguous; ephemeral CTEs outnumbered the

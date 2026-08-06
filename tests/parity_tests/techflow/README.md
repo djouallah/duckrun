@@ -85,14 +85,16 @@ because comparing a linting tool's adapter-introspection across two adapters is 
 
 ## Also here: the debug session (`run_debug.py`)
 
-`python tests/parity_tests/techflow/run_debug.py`, after `run_parity.py` has built the project.
-Read-only, compile-only, ~20s.
+`python tests/parity_tests/techflow/run_debug.py` — standalone, read-only, compile-only. It clones
+the project source and installs its packages (dbt cannot parse an unresolved `packages.yml`), then
+compiles. It builds nothing and writes nothing; `WAREHOUSE_PATH` has to point at a warehouse
+techflow has been built into at some point, so that `fct_mrr_daily` exists to be reasoned about.
 
 jaffle_shop's `run_debug.py` covers the relation / CTE / read-only surface of
 `duckrun.dbt_project()`. What techflow adds is `fct_mrr_daily`: a real `is_incremental()` branch on a
 project with ~30 models and 137 data tests. The session reports which branch it compiled — it cannot
-be read off the SQL, since rendering erases the `{% if %}` — and the parity build has just
-materialized the target table, so that report has a correct answer to be checked against: the
+be read off the SQL, since rendering erases the `{% if %}` — and because the target table is already
+in the warehouse, that report has a correct answer to be checked against: the
 incremental branch by default, the full-refresh branch under `incremental=False`, and different SQL
 for the two.
 

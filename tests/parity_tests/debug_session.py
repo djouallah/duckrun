@@ -7,16 +7,36 @@ failed inline compile poisoned the session, ephemeral CTEs outnumbered the model
 written beside the code cannot produce those, because it is written by whoever already knows the
 answer.
 
-So this runs the session against the projects the parity suite already clones and builds. It is a
-READER: the project is never modified (dbt writes `target/` inside the clone, exactly as the parity
-build already does), nothing is written to the warehouse, and the whole battery is a few seconds
-because `run_parity.py` has just built everything it reads.
+So this runs the session against the projects the parity suite already uses, over the tables those
+projects have already materialized. It is a READER, top to bottom: it never builds anything, never
+writes to the warehouse, and never modifies the repo — it clones the project source (dbt needs the
+.sql files to compile) and reads what is already there. An empty warehouse is a failure it reports,
+not something it fixes by building.
 
 Each project supplies the model names it actually has; a check whose model is None is skipped rather
 than guessed at. Call `check(...)` and exit on its return value — see `<project>/run_debug.py`.
 """
 import os
+import subprocess
+import sys
 import traceback
+
+
+def ensure_project(clone_dir, repo_url):
+    """The project SOURCE, and nothing else — no build.
+
+    The debug session is a reader: it compiles models and reads the tables that are already in the
+    warehouse. So this clones the repo if it is not there (dbt needs the .sql files to compile) and
+    installs its packages if it has any (dbt cannot even PARSE a project whose packages.yml is
+    unresolved). It never runs `dbt build` — if the warehouse has nothing in it, that is a real
+    failure and the battery says so, rather than quietly materializing something to read back."""
+    clone_dir = str(clone_dir)
+    if not os.path.isfile(os.path.join(clone_dir, "dbt_project.yml")):
+        subprocess.run(["git", "clone", "--depth", "1", repo_url, clone_dir], check=True)
+    if (os.path.isfile(os.path.join(clone_dir, "packages.yml"))
+            and not os.path.isdir(os.path.join(clone_dir, "dbt_packages"))):
+        subprocess.run([sys.executable, "-m", "dbt.cli.main", "deps"], cwd=clone_dir, check=True)
+    return clone_dir
 
 
 def _rows(rel):
@@ -61,6 +81,8 @@ def check(project_dir, profiles_dir, warehouse, schema, *, seed_backed_model=Non
       views, so this documents what a cold session can NOT read.
     * ``incremental_model`` — a model that branches on ``is_incremental()``. Compile-only, so its
       parents' materializations do not matter.
+
+    Nothing here writes. The models must already be materialized in ``warehouse``/``schema``.
     """
     # The profile renders root_path/schema from these; run_parity.py passes them to the dbt
     # subprocess only, so an in-process session has to export them itself.
