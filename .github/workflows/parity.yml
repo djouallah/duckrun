@@ -70,6 +70,10 @@ jobs:
         run: pip install -e ".[test]"
       - name: Parity — jaffle_shop, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python tests/parity_tests/jaffle_shop/run_parity.py
+      - name: Debug session — duckrun.dbt_project() against the project the build just materialized
+        # Reads only (~15s): types, CTE slicing, selectors under real generic tests, and a refused
+        # write on a LIVE OneLake table. The feature's own fixtures cannot produce any of that.
+        run: python tests/parity_tests/jaffle_shop/run_debug.py
       - name: Generate jaffle_shop dbt docs (static — catalog with row/byte stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/tests/parity_tests/jaffle_shop
@@ -176,6 +180,10 @@ jobs:
         run: pip install -e ".[test]"
       - name: Parity — techflow, duckrun (OneLake) vs dbt-duckdb (build both, diff every table)
         run: python tests/parity_tests/techflow/run_parity.py
+      - name: Debug session — which is_incremental() branch duckrun.dbt_project() compiled
+        # Compile-only (~20s), on a real incremental model with the target table freshly built, so
+        # the branch it reports has a correct answer to be checked against.
+        run: python tests/parity_tests/techflow/run_debug.py
       - name: Generate techflow dbt docs (static — catalog stats off the OneLake tables)
         env:
           DBT_PROFILES_DIR: ${{ github.workspace }}/tests/parity_tests/techflow

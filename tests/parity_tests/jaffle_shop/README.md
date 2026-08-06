@@ -42,3 +42,24 @@ duckrun side persists matches the duckdb oracle exactly:
 Staging models are `view`s; duckrun has no durable view (it materializes only tables to Delta), so
 they're intermediate-only and not part of the persisted diff — the marts that depend on them match,
 which validates the pipeline.
+
+## Also here: the debug session (`run_debug.py`)
+
+`python tests/parity_tests/jaffle_shop/run_debug.py`, after `run_parity.py` has built the project.
+It points `duckrun.dbt_project()` — the notebook debug session — at this same clone and checks what
+it hands back. Read-only: the repo is not modified and nothing is written to the warehouse.
+
+Why here rather than in a fixture: every bug that feature shipped with was found by pointing it at a
+real project (generic tests made every model name look ambiguous; ephemeral CTEs outnumbered the
+model's own). jaffle_shop is the cheapest project that has the shapes that matter — CTE-structured
+staging models reading straight from seeds (real Delta tables, so a cold session can execute them),
+marts reading from `view` models, and generic tests on everything.
+
+It checks that `show()` returns real DuckDB types and stays lazy, that `ctes()`/`cte()` slice the
+compiled SQL verbatim, that a model name resolves despite the tests hanging off it (and that a test
+named outright still resolves), and that a `delete` through the session is refused with the live
+Delta table left at exactly the same row count.
+
+One check pins a **limitation** rather than a promise: `customers` compiles but cannot be READ from a
+cold session, because its parents are `view` models and duckrun has no durable view. Should that ever
+change, the check fails and says so.

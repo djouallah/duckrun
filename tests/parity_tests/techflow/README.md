@@ -82,3 +82,20 @@ So [run_parity.py](run_parity.py) **skips the dbt_project_evaluator models** fro
 (identified from the run's `manifest.json` by `package_name`, logged explicitly — not by quietly
 trimming columns). The package still builds and runs **green on duckrun**; it's just not row-compared,
 because comparing a linting tool's adapter-introspection across two adapters is apples-to-oranges.
+
+## Also here: the debug session (`run_debug.py`)
+
+`python tests/parity_tests/techflow/run_debug.py`, after `run_parity.py` has built the project.
+Read-only, compile-only, ~20s.
+
+jaffle_shop's `run_debug.py` covers the relation / CTE / read-only surface of
+`duckrun.dbt_project()`. What techflow adds is `fct_mrr_daily`: a real `is_incremental()` branch on a
+project with ~30 models and 137 data tests. The session reports which branch it compiled — it cannot
+be read off the SQL, since rendering erases the `{% if %}` — and the parity build has just
+materialized the target table, so that report has a correct answer to be checked against: the
+incremental branch by default, the full-refresh branch under `incremental=False`, and different SQL
+for the two.
+
+It also asserts neither branch references an ephemeral `__dbt__cte__` it does not define. The branch
+answer costs a second compile of the same node against one warm manifest, which is exactly where dbt
+stops re-injecting ephemeral parents.
