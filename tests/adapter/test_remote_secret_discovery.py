@@ -380,14 +380,22 @@ def test_discovery_uses_rest_listing_for_abfss(monkeypatch):
     assert all(r.type == RelationType.Table for r in relations)
 
 
-def test_discovery_swallows_rest_failure_as_empty(monkeypatch):
-    # A transient/other listing failure stays best-effort → [] (a momentary blip mustn't abort a run;
-    # the actual write fails loud anyway).
-    def boom(root, schema, so):
-        raise RuntimeError("403 Forbidden")
-    monkeypatch.setattr(remote, "list_delta_tables", boom)
+def test_discovery_propagates_transient_listing_failure(monkeypatch):
+    # Parity run 31064614190: OneLake threw persistent 500s ("Private link validation failed") and
+    # discovery swallowed them into [] — every existing table vanished from the relation cache,
+    # is_incremental() flipped off, and a run would have full-refreshed over the table. A listing
+    # error that survives the DFS retry (429/5xx x _MAX_ATTEMPTS) must abort discovery loudly.
+    import requests
+    calls = {"n": 0}
+    def fake_get(url, params=None, headers=None, timeout=None):
+        calls["n"] += 1
+        return _PageResp(status_code=500)
+    monkeypatch.setattr(requests, "get", fake_get)
+    monkeypatch.setattr(remote, "_sleep", lambda s: None)  # no real waiting
     adapter = _bare_adapter()
-    assert adapter._discover_delta_relations(_SchemaRelation()) == []
+    with pytest.raises(RuntimeError, match="HTTP 500"):
+        adapter._discover_delta_relations(_SchemaRelation())
+    assert calls["n"] == remote._MAX_ATTEMPTS  # the retry ran first; only then did it fail loud
 
 
 def test_discovery_propagates_access_error(monkeypatch):

@@ -274,19 +274,16 @@ class DuckrunAdapter(DuckDBAdapter):
 
     def _discover_via_rest(self, root_path, schema, so=None):
         """Table names under ``<root_path>/<schema>`` on a OneLake/ADLS store, via REST. ``so`` is
-        the catalog's storage_options (the token for THIS root)."""
-        try:
-            return remote.list_delta_tables(root_path, str(schema).strip('"'), so)
-        except remote.OneLakeAccessError:
-            # A genuine access failure (wrong tenant / item not in workspace) must fail loud, NOT
-            # masquerade as "no Delta tables" — otherwise a dbt test/docs run goes silently green
-            # against a store it can't even see.
-            raise
-        except Exception as exc:
-            # A transient/other listing failure stays best-effort: log (debug) and fall back to the
-            # in-memory catalog, so a momentary blip doesn't abort the run (writes fail loud anyway).
-            logger.debug(f"duckrun: OneLake table listing failed under {root_path}/{schema}: {exc}")
-            return []
+        the catalog's storage_options (the token for THIS root).
+
+        Fail loud on ANY listing error. The benign "no tables" cases (no token, absent schema
+        dir) already return ``[]`` inside ``remote.list_delta_tables``; whatever escapes its
+        retried request (3 attempts on 429/5xx) is a store we genuinely cannot see right now.
+        Degrading that to an empty schema makes every existing table vanish from the relation
+        cache, flips ``is_incremental()`` off, and the model then full-refreshes over the table —
+        the exact clobber :meth:`_live_relations` and :meth:`_has_delta_log` bend over backwards
+        to avoid. The connection API (``session._list_tables``) makes the same call unguarded."""
+        return remote.list_delta_tables(root_path, str(schema).strip('"'), so)
 
     def _discover_via_glob(self, root_path, schema):
         """Table names under ``<root_path>/<schema>`` on a local / az:// store, via DuckDB glob."""
