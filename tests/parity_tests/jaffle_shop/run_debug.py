@@ -33,7 +33,8 @@ def main():
         seed_backed_model="stg_customers",
         cte_model="stg_orders",
         seed_ref="raw_customers",
-        # `customers` refs the staging VIEWS. Compiles fine, cannot be read cold.
+        # `customers` refs the staging VIEWS — three of them, none of which exists anywhere until
+        # the session registers them from the manifest.
         view_backed_model="customers",
     )
     sys.exit(0 if ok else 1)

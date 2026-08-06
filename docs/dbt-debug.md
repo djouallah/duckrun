@@ -47,6 +47,20 @@ rel.types                                  # real DuckDB types, end to end
 rel.filter("customer = 'X'").limit(100).pl()   # pushes INTO the delta_scan; nothing read before
 ```
 
+### Models materialized as `view`
+
+duckrun writes only Delta tables, so a `view` model is a plain DuckDB view that exists inside the
+session that built it and nowhere afterwards. A debug session is a different process, so on a
+project with a `view` staging layer that would leave everything downstream unreadable.
+
+It doesn't, because the manifest already says which parents are views and dbt can compile them: the
+session registers them **as views**, in dependency order, before the query runs — by default, not
+after a failure. Nothing is materialized and nothing is copied, so a `.filter()` still pushes all
+the way down through the staging layer into the `delta_scan`.
+
+They are dropped whenever the project is re-parsed, so an edited `view` model is never read through
+its old definition.
+
 ## `cte()` — the part that actually solves the problem
 
 When a model runs clean but returns nonsense, the move is always the same: run the CTEs one at a

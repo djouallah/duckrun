@@ -35,6 +35,13 @@ construction.
 anywhere in its class hierarchy — see environment.py. A debug session built from the real profile
 otherwise sits one typo away from a production write.
 
+**A ``view`` model is exposed as a view.** duckrun persists only Delta tables, so a `view` model
+exists only inside the session that built it — and a cold debug session would find nothing under
+that name, making everything downstream of a staging layer unreadable. The manifest already says
+which parents are views and dbt can compile them, so they are registered as DuckDB views before the
+query runs, in dependency order, by default rather than in reaction to a catalog error. A view, not
+a materialization: the relation stays lazy either way.
+
 **A stale manifest is never served.** Keeping the parsed manifest warm matters for notebook
 ergonomics (a re-parse costs seconds on a real project), but a warm manifest hands back the SQL as
 it was parsed — so after you edit a model, ``show()`` would show you the version from before your
@@ -66,6 +73,10 @@ _EPHEMERAL_CTE = "__dbt__cte__"
 
 class DbtProjectError(RuntimeError):
     """A dbt command issued by the debug session failed, or the project/profile is unusable."""
+
+
+def _materialization(node) -> str:
+    return getattr(getattr(node, "config", None), "materialized", None) or ""
 
 
 class CompileResult:
@@ -113,6 +124,7 @@ class DbtProject:
         self._signature = None
         self._compiled = {}
         self._compiled_nodes = set()
+        self._bound_views = set()
         self._creds = None
         self._env = None
         self._handle = None
@@ -307,6 +319,17 @@ class DbtProject:
         """Drop everything derived from the manifest. The cursor goes too: a changed profile means
         different roots, secrets and ATTACHes, and silently reading through the old connection is
         exactly the class of stale answer this session exists to prevent."""
+        # The views we registered for `view`-materialized models go first, while the cursor is
+        # still open. They live in the shared in-memory catalog, so they would otherwise outlive
+        # the manifest that defined them — and a model whose materialization changed from view to
+        # table would then be read through yesterday's view. Dropped through the RAW cursor: the
+        # read-only classifier reads `drop` as a write, which is true of a Delta table and not of a
+        # catalog object we created ourselves.
+        raw = getattr(self._cursor, "_cursor", None)
+        for relation in self._bound_views if raw is not None else ():
+            with contextlib.suppress(Exception):
+                raw.execute(f"drop view if exists {relation}")
+        self._bound_views = set()
         if self._handle is not None:
             with contextlib.suppress(Exception):
                 self._handle.close()   # our own child cursor; the shared connection stays up
@@ -605,6 +628,72 @@ class DbtProject:
             return env
         return DuckrunEnvironment(creds)
 
+    def _bind_view_ancestors(self, node_id):
+        """Register every ``view``-materialized model the compiled node reads — as a VIEW — before
+        running it. By default, on every call; never in reaction to an error.
+
+        duckrun persists only Delta tables. A ``view`` model is a plain DuckDB view that lived in
+        the catalog of the session that built it and died with it, so a cold debug session finds
+        nothing under that name: no Delta table for the lazy bind to attach, and no view in a fresh
+        in-memory catalog. Everything downstream of a staging layer is then unreadable — which on a
+        real project is most of the project.
+
+        None of that is unknowable, and that is the point. The manifest says which parents are views
+        and dbt can compile each one, so this walks the node's ancestry depth-first and creates them
+        in dependency order. The alternative — let DuckDB fail, then parse the missing name back out
+        of its message — is how the RUN path's lazy bind works, and it is right there because on a
+        build dbt creates the views itself and the bind is only a rescue. A debug session has the
+        manifest in hand; rediscovering from an error string what is already in memory is slower and
+        breaks the day the message changes.
+
+        It costs nothing extra: a view is catalog metadata, and binding its body resolves exactly
+        the parents the query had to resolve anyway. Only the ancestry of what you asked for —
+        registering the whole project eagerly would NOT be free, since it would open every Delta
+        ancestor's ``_delta_log`` for models you never open.
+
+        A VIEW, never a materialization: ``create or replace view``, so the relation stays lazy and
+        ``.filter(...)`` still pushes through it into the ``delta_scan`` underneath."""
+        nodes = getattr(self._manifest, "nodes", None) or {}
+        seen = set()
+
+        def walk(nid):
+            if nid in seen:
+                return
+            seen.add(nid)
+            node = nodes.get(nid)
+            if node is None:
+                return          # a source, or anything not in `nodes` — delta_scan binding covers it
+            for parent in getattr(getattr(node, "depends_on", None), "nodes", None) or ():
+                walk(parent)    # deepest first, so each view's body binds when it is created
+            # The requested node itself is never created: its compiled SQL is what we are about to
+            # run, and a view over it would be a second name for the same query.
+            if nid != node_id and _materialization(node) == "view":
+                self._create_view(node)
+
+        walk(node_id)
+
+    def _create_view(self, node):
+        """``create or replace view`` for one view-materialized model, at the name dbt renders for
+        it. Once per manifest generation — an edit invalidates the manifest, which drops these
+        views, so a re-created one is always the current definition."""
+        relation = getattr(node, "relation_name", None)
+        if not relation or relation in self._bound_views:
+            return
+        key = (node.name, None, False)
+        if key not in self._compiled:
+            self._compiled[key] = self._run_compile(node.name, None, False)
+        sql = self._compiled[key][2]
+        schema, database = getattr(node, "schema", None), getattr(node, "database", None)
+        if schema:
+            # A custom-schema model has no schema in a fresh in-memory DuckDB (same reason the
+            # adapter's Delta bind creates one).
+            prefix = f'"{database}".' if database else ""
+            self._cursor.execute(f'create schema if not exists {prefix}"{schema}"')
+        # Through the debug cursor, not the raw one: `create or replace view` classifies as
+        # passthrough, and going this way means a Delta-backed parent still gets its lazy bind.
+        self._cursor.execute(f"create or replace view {relation} as {sql}")
+        self._bound_views.add(relation)
+
     def _relation(self, sql):
         """Run already-compiled SQL on the read-only cursor. No freshness check here: the compile
         that produced ``sql`` just did one, and re-checking could only re-parse for a change that
@@ -622,6 +711,8 @@ class DbtProject:
         # p.sql() later the delta_scan view is back and reads are correct again. Warning about a
         # hazard that repairs itself before it can mislead would be a false statement in a message
         # whose whole job is to be trusted.
+        if self.last_compile is not None and self.last_compile.node_id:
+            self._bind_view_ancestors(self.last_compile.node_id)
         return self._cursor.sql(sql)
 
 

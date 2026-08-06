@@ -60,6 +60,20 @@ final as (
 select * from final
 """
 
+# A `view` model, a view OVER that view, and a table that reads the chain. duckrun persists only
+# Delta tables, so neither view exists in a cold session — the session has to register them from
+# the manifest before it can read anything downstream. Two levels deep on purpose: one level would
+# pass even if the walk never recursed.
+VIEW_MODEL = """{{ config(materialized='view') }}
+select id, name, amount * 10 as boosted from {{ ref('stg_items') }}
+"""
+VIEW_OVER_VIEW = """{{ config(materialized='view') }}
+select id, name, boosted * 2 as doubled from {{ ref('v_boosted') }}
+"""
+USES_VIEW = """{{ config(materialized='table') }}
+select id, doubled from {{ ref('v_chained') }}
+"""
+
 EPHEMERAL = """{{ config(materialized='ephemeral') }}
 select id, name, amount from {{ ref('stg_items') }} where amount > 15
 """
@@ -126,6 +140,9 @@ def project(tmp_path):
     (proj / "models" / "eph_filtered.sql").write_text(EPHEMERAL, encoding="utf-8")
     (proj / "models" / "uses_ephemeral.sql").write_text(USES_EPHEMERAL, encoding="utf-8")
     (proj / "models" / "incr_over_eph.sql").write_text(INCR_OVER_EPH, encoding="utf-8")
+    (proj / "models" / "v_boosted.sql").write_text(VIEW_MODEL, encoding="utf-8")
+    (proj / "models" / "v_chained.sql").write_text(VIEW_OVER_VIEW, encoding="utf-8")
+    (proj / "models" / "uses_view.sql").write_text(USES_VIEW, encoding="utf-8")
     (proj / "models" / "macro_model.sql").write_text(MACRO_MODEL, encoding="utf-8")
     (proj / "macros" / "helpers.sql").write_text(MACRO, encoding="utf-8")
     (proj / "models" / "schema.yml").write_text(SCHEMA_YML, encoding="utf-8")
@@ -606,6 +623,59 @@ def test_the_branch_report_is_right_for_a_model_over_an_ephemeral(p, capsys):
     assert p.last_compile.incremental is True
     out = " ".join(capsys.readouterr().out.split())
     assert "incr_over_eph: is_incremental() = True" in out
+
+
+# ── view-materialized models ───────────────────────────────────────────────────────────────────
+
+def test_a_model_over_a_view_model_reads(p):
+    """The session builds the whole chain, so nothing is unreadable just because dbt's
+    materialization for it was `view`.
+
+    duckrun persists only Delta tables: `v_boosted` and `v_chained` exist only in the catalog of
+    the process that built them, and this session is a different one. Both are registered from the
+    manifest before the query runs -- deepest first, or `v_chained`'s own body would not bind."""
+    rel = p.show("uses_view")
+
+    assert rel.columns == ["id", "doubled"]
+    assert sorted(rel.fetchall()) == [(1, 210.0), (2, 410.0)]
+
+
+def test_a_view_model_is_registered_as_a_view_not_materialized(p):
+    """A VIEW. Materializing it as an in-memory table would read the whole thing eagerly, cost RAM
+    proportional to the model rather than to the answer, and kill the pushdown that makes a
+    relation worth returning in the first place."""
+    p.show("uses_view")
+    raw = p._cursor._cursor
+
+    kinds = dict(raw.execute(
+        "select table_name, table_type from information_schema.tables "
+        "where table_name in ('v_boosted', 'v_chained')").fetchall())
+    assert kinds == {"v_boosted": "VIEW", "v_chained": "VIEW"}
+
+    # And the pushdown survives the extra hop through them.
+    assert p.show("uses_view").filter("id = 2").fetchall() == [(2, 410.0)]
+
+
+def test_reading_a_view_model_itself_still_runs_its_own_sql(p):
+    """Asking for a view model runs the model's compiled SQL — the point is the query, not the
+    catalog object. Its view PARENT is still registered, or the body would not resolve."""
+    rel = p.show("v_chained")
+
+    assert sorted(rel.fetchall()) == [(1, "a", 210.0), (2, "b", 410.0)]
+    assert '"v_boosted"' in " ".join(p._bound_views)
+
+
+def test_an_edited_view_model_is_not_read_through_the_old_view(p, project):
+    """The registered views are derived from the manifest, so they cannot outlive it: an edit drops
+    them, and the next read re-creates them from the SQL as it is now. Otherwise this feature would
+    have re-introduced exactly the stale-answer failure the mtime check exists to prevent."""
+    assert sorted(p.show("uses_view").fetchall()) == [(1, 210.0), (2, 410.0)]
+
+    (project / "models" / "v_boosted.sql").write_text(
+        VIEW_MODEL.replace("amount * 10", "amount * 100"), encoding="utf-8")
+    time.sleep(0.05)                                   # mtime granularity
+
+    assert sorted(p.show("uses_view").fetchall()) == [(1, 2100.0), (2, 4100.0)]
 
 
 def test_ephemeral_models_also_work_through_sql(p):

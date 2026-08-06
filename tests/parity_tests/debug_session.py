@@ -78,7 +78,7 @@ def check(project_dir, profiles_dir, warehouse, schema, *, seed_backed_model=Non
     * ``cte_model`` — a model with CTEs, also Delta-backed. Listing and verbatim slicing.
     * ``seed_ref`` — a seed, i.e. a real Delta table, for the read-only proof.
     * ``view_backed_model`` — a model whose parents are `view`-materialized. duckrun does not persist
-      views, so this documents what a cold session can NOT read.
+      views, so reading it at all depends on the session registering them from the manifest first.
     * ``incremental_model`` — a model that branches on ``is_incremental()``. Compile-only, so its
       parents' materializations do not matter.
 
@@ -204,26 +204,30 @@ def check(project_dir, profiles_dir, warehouse, schema, *, seed_backed_model=Non
         b.skip("read-only", "no seed named for this project")
 
     if view_backed_model:
-        def view_parents_are_not_readable_cold():
-            """A KNOWN limitation, pinned rather than left to be discovered: duckrun has no
-            persistent view — a `view` model exists only inside the session that built it. So a
-            model whose parents are views cannot be read from a cold debug session; its compiled
-            SQL is fine, the parent relation simply is not there. Compiling still works, which is
-            what makes ctes()/compiled() useful on these models anyway.
+        def view_parents_are_registered_as_views():
+            """A model whose parents are `view` models has to read anyway.
 
-            If duckrun ever names the view-materialized parent in the error, this check fails and
-            says so, instead of the improvement going unnoticed."""
-            assert p.compiled(view_backed_model).strip(), "compiling should still work"
-            try:
-                _rows(p.show(view_backed_model).limit(1))
-            except Exception as exc:                 # noqa: BLE001 — the failure IS the pinned shape
-                return f"{type(exc).__name__}: {str(exc).splitlines()[0][:90]}"
-            raise AssertionError(
-                f"{view_backed_model} read fine from a cold session — duckrun now persists views, "
-                "or its parents stopped being views. Re-pin this check.")
+            duckrun persists only Delta tables, so those parents exist in no catalog this session
+            can see — they died with the process that built them. The session registers them from
+            the manifest before running, as VIEWS, deepest first. On jaffle_shop that is the whole
+            staging layer between a mart and the seeds, which is most of what anyone opens a debug
+            session to look at."""
+            rel = p.show(view_backed_model)
+            n = _count(rel)
+            assert n > 0, f"{view_backed_model} read but returned nothing"
+            registered = [r.rsplit(".", 1)[-1].strip('"') for r in p._bound_views]
+            assert registered, "nothing was registered — are its parents still `view` models?"
+            # VIEWS, never materialized copies: a copy would read the whole parent eagerly and cost
+            # RAM proportional to the model instead of to the answer.
+            holes = ", ".join("?" for _ in registered)
+            kinds = dict(p._cursor._cursor.execute(
+                f"select table_name, table_type from information_schema.tables "
+                f"where table_name in ({holes})", registered).fetchall())
+            assert set(kinds.values()) == {"VIEW"}, f"not registered as views: {kinds}"
+            assert len(_rows(p.show(view_backed_model).limit(5))) <= 5   # still lazy through them
+            return f"{n} rows through {len(registered)} registered view(s): {sorted(registered)}"
 
-        b.check("a view-backed model compiles but cannot be read cold (known limitation)",
-                view_parents_are_not_readable_cold)
+        b.check("a model over view-materialized parents reads", view_parents_are_registered_as_views)
     else:
         b.skip("view-backed model", "none named for this project")
 

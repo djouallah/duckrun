@@ -514,6 +514,11 @@ Things to know before you rely on it:
 - **Ephemeral models** need nothing special: dbt injects them as `__dbt__cte__<name>`, so
   they appear in `p.ctes()` of their consumer, and `p.sql("select * from {{ ref('eph') }}")`
   works too.
+- **`view` models** need nothing special either, though they are the one case that had to
+  be built: duckrun persists only Delta tables, so a `view` model exists only in the
+  session that built it. The debug session registers each one it needs as a DuckDB view
+  first, from the manifest, in dependency order — so a mart over a `view` staging layer
+  reads normally, and `.filter()` still pushes down through it. Nothing is materialized.
 - **Selectors go to dbt untouched** — `"my_model"`, `"path:models/marts/my_model.sql"`,
   `tag:` all work. One matching several nodes lists them rather than guessing.
 - **Editing a model mid-session is safe**: the manifest is kept warm for speed but
