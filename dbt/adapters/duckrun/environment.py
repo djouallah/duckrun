@@ -50,46 +50,37 @@ _IDENT = r'(?:"[^"]+"|[A-Za-z_][\w$]*)'
 _QUAL_REF = re.compile(rf"({_IDENT})\.({_IDENT})(?:\.({_IDENT}))?")
 
 
-class DuckrunCursorWrapper(DuckDBCursorWrapper):
-    """Cursor wrapper that routes raw DML against duckrun-managed (Delta-backed) relations to
-    delta_rs instead of running it on the read-only ``delta_scan`` view.
+class DuckrunReadOnlyError(RuntimeError):
+    """A write was attempted on a read-only duckrun cursor (``duckrun.dbt_project``)."""
 
-    Every SQL statement — whether issued by dbt's connection manager or by the adapter-test
-    harness (which goes straight to ``conn.handle.cursor().execute``) — funnels through here, so
-    this is the single production interception point. Non-matching statements, parameterized
-    statements (the seed loader's ``insert ... values (?)``), and DML against native relations all
-    fall through to DuckDB unchanged. See delta_dml.handle.
+
+class _DeltaBindCursor(DuckDBCursorWrapper):
+    """The cursor machinery both of duckrun's cursor kinds need: the OneLake token refresh every
+    statement depends on, and the lazy bind that resolves a duckrun model to its Delta location
+    after a catalog error.
+
+    Deliberately knows NOTHING about writing. :class:`DuckrunCursorWrapper` (the run path) adds the
+    delta_rs DML interception on top; :class:`DuckrunDebugCursor` (the read-only debug session) does
+    not — and that absence IS its read-only guarantee: ``delta_dml.handle`` is nowhere in its MRO,
+    so a write has no route to delta_rs at all. It lands on the read-only ``delta_scan`` view
+    instead, which DuckDB rejects. Structural, not a flag someone can flip.
     """
 
     def __init__(self, cursor, credentials):
         super().__init__(cursor)
         self._duckrun_creds = credentials
 
-    def execute(self, sql, bindings=None):
-        creds = self._duckrun_creds
-        # OneLake token freshness — the universal guard. configure_cursor re-mints per model, but a
-        # long build's later phases (dbt's tests / on-run-end reads) run on a reused cursor that it
-        # never revisits, so the once-minted DuckDB secret + storage_options go stale and every
-        # delta_scan 401s past the token's ~1h life. EVERY statement funnels through here, so this is
-        # the one place that covers them all. Cheap: refreshed() only parses the JWT expiry and returns
-        # the same object unless the token is genuinely near expiry — it hits the network at most once
-        # per token lifetime, not per statement.
-        self._refresh_onelake_token(creds)
-        if bindings is None:
-            # Route raw DML to the catalog its target names (a 3-part `catalog.schema.table`), else
-            # the default catalog. `root_for` falls back to the default when there are no catalogs,
-            # so single-catalog behavior is unchanged.
-            target_cat = delta_dml.dml_target_catalog(sql)
-            root_path, storage_options = creds.root_for(target_cat)
-            # Self-acquire a OneLake token for an abfss:// target whose profile omits bearer_token, so
-            # raw-DML / snapshot delta-rs writes authenticate (mirrors the plugin + read paths).
-            storage_options = secret.with_onelake_token(root_path, storage_options)
-            if delta_dml.handle(self._cursor, root_path, storage_options, sql):
-                return self._cursor  # applied to Delta; nothing to run on DuckDB
+    def _run_with_lazy_binds(self, sql, run):
+        """``run()``, retried after binding whatever Delta relations a catalog error names.
+
+        ``run`` is a callable rather than a fixed ``super().execute(...)`` because the two cursor
+        kinds need the SAME bind-and-retry around DIFFERENT operations: the run path executes,
+        while the debug path calls ``cursor.sql()`` for a relation. See
+        :meth:`DuckrunDebugCursor.sql` for why the distinction matters."""
         try:
-            return super().execute(sql, bindings)
+            return run()
         except duckdb.CatalogException as exc:
-            return self._execute_after_lazy_binds(sql, bindings, exc)
+            return self._retry_after_lazy_binds(sql, exc, run)
 
     # --- lazy bind on a catalog error (issue #24, part B) -----------------------------------------
     # A duckrun model is a `delta_scan` view that only exists once dbt has populated its relation
@@ -102,8 +93,8 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
     # bind that one view, and retry. Every working path pays nothing — no error, none of this runs —
     # and a genuinely missing table re-raises the original error unchanged.
 
-    def _execute_after_lazy_binds(self, sql, bindings, exc):
-        """Bind the Delta relation(s) a catalog error names, then retry ``sql`` — repeatedly, since
+    def _retry_after_lazy_binds(self, sql, exc, run):
+        """Bind the Delta relation(s) a catalog error names, then retry ``run`` — repeatedly, since
         a join of two unbound models errors on one table at a time. Terminates because every pass
         must bind at least one NEW relation (a query names finitely many); re-raises the latest
         error when it can't, so a post-bind failure (e.g. a missing column on the now-visible
@@ -115,7 +106,7 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
             if not any([self._lazy_bind_delta_view(*c) for c in fresh]):  # bind ALL before deciding
                 raise exc
             try:
-                return super().execute(sql, bindings)
+                return run()
             except duckdb.CatalogException as next_exc:
                 exc = next_exc
         raise exc
@@ -207,15 +198,120 @@ class DuckrunCursorWrapper(DuckDBCursorWrapper):
                 setter(fresh)  # keep the live copy DML/discovery read from in sync
 
 
+class DuckrunCursorWrapper(_DeltaBindCursor):
+    """Cursor wrapper that routes raw DML against duckrun-managed (Delta-backed) relations to
+    delta_rs instead of running it on the read-only ``delta_scan`` view.
+
+    Every SQL statement — whether issued by dbt's connection manager or by the adapter-test
+    harness (which goes straight to ``conn.handle.cursor().execute``) — funnels through here, so
+    this is the single production interception point. Non-matching statements, parameterized
+    statements (the seed loader's ``insert ... values (?)``), and DML against native relations all
+    fall through to DuckDB unchanged. See delta_dml.handle.
+    """
+
+    def execute(self, sql, bindings=None):
+        creds = self._duckrun_creds
+        # OneLake token freshness — the universal guard. configure_cursor re-mints per model, but a
+        # long build's later phases (dbt's tests / on-run-end reads) run on a reused cursor that it
+        # never revisits, so the once-minted DuckDB secret + storage_options go stale and every
+        # delta_scan 401s past the token's ~1h life. EVERY statement funnels through here, so this is
+        # the one place that covers them all. Cheap: refreshed() only parses the JWT expiry and returns
+        # the same object unless the token is genuinely near expiry — it hits the network at most once
+        # per token lifetime, not per statement.
+        self._refresh_onelake_token(creds)
+        if bindings is None:
+            # Route raw DML to the catalog its target names (a 3-part `catalog.schema.table`), else
+            # the default catalog. `root_for` falls back to the default when there are no catalogs,
+            # so single-catalog behavior is unchanged.
+            target_cat = delta_dml.dml_target_catalog(sql)
+            root_path, storage_options = creds.root_for(target_cat)
+            # Self-acquire a OneLake token for an abfss:// target whose profile omits bearer_token, so
+            # raw-DML / snapshot delta-rs writes authenticate (mirrors the plugin + read paths).
+            storage_options = secret.with_onelake_token(root_path, storage_options)
+            if delta_dml.handle(self._cursor, root_path, storage_options, sql):
+                return self._cursor  # applied to Delta; nothing to run on DuckDB
+        return self._run_with_lazy_binds(
+            sql, lambda: super(DuckrunCursorWrapper, self).execute(sql, bindings))
+
+
+class DuckrunDebugCursor(_DeltaBindCursor):
+    """Read-only cursor for the dbt debug session (``duckrun.dbt_project``), issue #29.
+
+    Sibling of :class:`DuckrunCursorWrapper`, not a subclass, and that is the whole point: it
+    inherits the token refresh and the lazy bind, and it inherits NO route to delta_rs. A write
+    can't be re-enabled by a flag here because there is nothing to re-enable — it falls through to
+    a ``delta_scan`` view, which DuckDB refuses to write to. A debug session built from the real
+    profile sits one typo away from a production write, so that has to hold by construction.
+    """
+
+    def sql(self, query):
+        """A ``DuckDBPyRelation`` for ``query``, lazy-binding any duckrun model it names.
+
+        Defined explicitly in order to SHADOW ``DuckDBCursorWrapper.__getattr__``, which forwards
+        every attribute except ``execute`` straight through to the raw DuckDB cursor — so a plain
+        ``cursor.sql(...)`` goes around the lazy bind entirely and dies on the first model dbt's
+        relation cache never bound, which in a fresh debug session is every model.
+
+        Routing through ``execute`` instead would bind the views but materialize the entire result
+        to do it — and the lazy filter pushdown that makes returning a relation worthwhile would be
+        paid for twice. Retrying ``sql()`` costs nothing by comparison: DuckDB only binds here, it
+        reads no data until the relation is consumed."""
+        self._reject_write(query)
+        self._refresh_onelake_token(self._duckrun_creds)
+        return self._run_with_lazy_binds(query, lambda: self._cursor.sql(query))
+
+    def execute(self, sql, bindings=None):
+        """The DBAPI path, under the same read-only contract — ``get_columns_in_relation`` and any
+        other adapter introspection a debug session wants to reuse go through ``execute``."""
+        self._reject_write(sql)
+        self._refresh_onelake_token(self._duckrun_creds)
+        return self._run_with_lazy_binds(
+            sql, lambda: super(DuckrunDebugCursor, self).execute(sql, bindings))
+
+    def _reject_write(self, sql) -> None:
+        """Raise for a statement whose FORM writes.
+
+        This is the error MESSAGE, not the safety — the safety is that this class has no delta_rs
+        route at all. Without it a write still fails, but as DuckDB's bare "cannot ... a view",
+        which never explains that the view is a view because duckrun made it one. Classified by the
+        very ``delta_dml.classify`` the write path routes on, so "what counts as a write" can't
+        drift between the two. ``CREATE TEMP TABLE`` / ``CREATE VIEW`` classify as passthrough and
+        stay allowed: scratch objects are how you actually debug.
+
+        Single-statement by construction (classify takes one statement). A multi-statement script
+        whose first statement reads slips past the message — and then fails anyway, on the view, in
+        DuckDB. Degraded message, never degraded safety."""
+        if delta_dml.classify(sql) == "passthrough":
+            return
+        first = " ".join(str(sql).split())[:120]
+        raise DuckrunReadOnlyError(
+            f"read-only debug session: this statement writes.\n    {first}\n"
+            "duckrun models are read-only delta_scan views here, so nothing in this session can "
+            "reach delta_rs. To write, use `dbt run` or duckrun.connect(..., read_only=False)."
+        )
+
+
 class DuckrunEnvironment(LocalEnvironment):
     def handle(self):
         # Swap dbt-duckdb's cursor wrapper for ours so raw DML on Delta relations is intercepted
         # on every cursor (connection-manager AND test-harness paths) — see DuckrunCursorWrapper.
+        return self._handle_with(DuckrunCursorWrapper)
+
+    def debug_handle(self):
+        """A handle for the read-only dbt debug session (``duckrun.dbt_project``, issue #29).
+
+        The SAME connection a real run uses — same secrets, same catalog ATTACHes, same lazy bind —
+        differing in exactly one thing: its cursor is a :class:`DuckrunDebugCursor`, which has no
+        route to delta_rs. That is what "the run path minus the write" means concretely. The debug
+        session never reconstructs a connection of its own, so it cannot drift from the adapter."""
+        return self._handle_with(DuckrunDebugCursor)
+
+    def _handle_with(self, cursor_cls):
         h = super().handle()  # initializes self.conn (+ mints the default catalog's secret)
         self._ensure_default_secret()
         self._attach_catalogs()
         if isinstance(h, DuckDBConnectionWrapper):
-            h._cursor = DuckrunCursorWrapper(h._cursor._cursor, self.creds)
+            h._cursor = cursor_cls(h._cursor._cursor, self.creds)
         return h
 
     def _ensure_default_secret(self) -> None:

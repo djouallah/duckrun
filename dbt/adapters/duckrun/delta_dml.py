@@ -378,12 +378,17 @@ def _strip_leading(query: str) -> str:
             return t
 
 
-def _strip_comments(sql: str) -> str:
+def _strip_comments(sql: str, keep_length: bool = False) -> str:
     """Remove ``--`` line and ``/* */`` block comments that are OUTSIDE string/identifier quotes,
     replacing each with a single space so adjacent tokens don't fuse. Quote-aware so a ``--``/``/*``
     inside a literal (``'a -- b'``) is left intact. Applied to the whole statement before structural
     parsing so an inline comment can't inject a false USING/ON/WHEN/THEN boundary (``_strip_leading``
-    only peels comments off the *front*)."""
+    only peels comments off the *front*).
+
+    ``keep_length`` pads each removed comment with spaces to its original width, so every offset in
+    the result still addresses the same character of ``sql``. That is what lets :func:`split_cte_list`
+    locate CTE boundaries on a comment-free copy and then slice the ORIGINAL text — the model's SQL
+    reaches DuckDB exactly as dbt compiled it, comments and formatting included."""
     out, i, n, quote = [], 0, len(sql), None
     while i < n:
         ch = sql[i]
@@ -402,12 +407,14 @@ def _strip_comments(sql: str) -> str:
             i = de
         elif ch == "-" and i + 1 < n and sql[i + 1] == "-":
             nl = sql.find("\n", i)
-            i = n if nl == -1 else nl  # stop before the newline so it's preserved
-            out.append(" ")
+            stop = n if nl == -1 else nl  # stop before the newline so it's preserved
+            out.append(" " * (stop - i) if keep_length else " ")
+            i = stop
         elif ch == "/" and i + 1 < n and sql[i + 1] == "*":
             end = sql.find("*/", i + 2)
-            i = n if end == -1 else end + 2
-            out.append(" ")
+            stop = n if end == -1 else end + 2
+            out.append(" " * (stop - i) if keep_length else " ")
+            i = stop
         else:
             out.append(ch)
             i += 1
@@ -838,6 +845,53 @@ def _split_top_level_commas(s: str) -> List[str]:
             start = i + 1
     out.append(s[start:])
     return [p.strip() for p in out if p.strip()]
+
+
+# ── CTE slicing, for the dbt debug session (duckrun.dbt_project, issue #29) ────────────────────
+_CTE_LEADING_WITH = re.compile(r"\s*with\s+(?:recursive\s+)?", re.I)
+_CTE_COMMA = re.compile(r",")
+# `name [(cols)] AS …` — the name is a bare identifier or a double-quoted one ("" escapes a quote).
+_CTE_NAME = re.compile(r'\s*("(?:[^"]|"")+"|[A-Za-z_]\w*)')
+
+
+def split_cte_list(sql: str):
+    """``(head, [(name, text), …], main_select)`` for a ``WITH … SELECT`` query.
+
+    ``head`` is the literal ``with``/``with recursive`` lead-in, each ``text`` is one CTE **exactly
+    as it appears in the input**, and ``main_select`` is the query the WITH list feeds. A statement
+    with no leading WITH returns ``("", [], sql)``.
+
+    Lives here rather than in the debug session because this is where duckrun's quote-, paren-,
+    CASE- and comment-aware scanners already are — the same ones DML routing depends on. A separate
+    splitter would be a second set of rules to keep in step on exactly the cases that are hard
+    (a comma inside a string literal, a ``select`` inside a comment, a quoted identifier with a
+    comma in it), and the reason those scanners are shared is that they must not drift.
+
+    Boundaries are located on a comment-blanked, literal-blanked copy of equal length, then applied
+    to the ORIGINAL string. So the CTE bodies handed back are byte-identical to the SQL dbt
+    compiled: what you debug is the query, not a reformatted rendering of it."""
+    mask = _blank_string_literals(_strip_comments(sql, keep_length=True))
+    lead = _CTE_LEADING_WITH.match(mask)
+    if not lead:
+        return "", [], sql
+    after = lead.end()
+    # The first top-level SELECT after the WITH list is the main one: every CTE's own SELECT sits
+    # inside parentheses, which the scanner steps over.
+    offset = _find_top_level(mask[after:], _SELECT_KW)
+    if offset < 0:
+        return "", [], sql
+    end = after + offset
+    bounds = [after] + [after + c + 1 for c in _find_all_top_level(mask[after:end], _CTE_COMMA)]
+    parts = []
+    for start, stop in zip(bounds, bounds[1:] + [end]):
+        text = sql[start:stop].rstrip().rstrip(",")
+        if not text.strip():
+            continue
+        named = _CTE_NAME.match(mask[start:stop])
+        if not named:
+            return "", [], sql  # unrecognizable shape — don't guess, just decline to slice
+        parts.append((named.group(1).strip('"').replace('""', '"'), text))
+    return sql[:after], parts, sql[end:]
 
 
 def _qualifiers(s: str) -> List[str]:

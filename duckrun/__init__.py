@@ -36,6 +36,11 @@ from .session import connect, DuckSession
 from .iceberg import IcebergSession
 from .fabric_remote import RemoteRunner, RemoteResult
 from .workspace import workspace, Workspace, ScriptResult
+# Debug a dbt model and get a DuckDB relation back. Safe to import eagerly: dbt_debug imports dbt
+# only inside its functions. `dbt.adapters` is already pulled in by session.py, but dbt's CLI layer
+# (dbtRunner) is a further ~0.9s of import that only a debug session needs — and importing it here
+# would also run dbt.adapters.duckrun.impl -> duckrun._runtime while `duckrun` is still initializing.
+from .dbt_debug import dbt_project, DbtProject
 
 try:
     # Single source of truth: the installed distribution's version (built from pyproject.toml).
@@ -46,4 +51,4 @@ except PackageNotFoundError:  # running from a source tree that was never instal
     __version__ = "0+unknown"
 
 __all__ = ["connect", "DuckSession", "IcebergSession", "RemoteRunner", "RemoteResult",
-           "workspace", "Workspace", "ScriptResult", "__version__"]
+           "workspace", "Workspace", "ScriptResult", "dbt_project", "DbtProject", "__version__"]
