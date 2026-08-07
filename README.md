@@ -160,6 +160,11 @@ other dbt adapters). For **Claude Code**:
 Other assistants read the [`AGENTS.md`](AGENTS.md) at the repo root, which points to the full guide.
 None of this is required to use duckrun.
 
+## Contributing
+
+Bug reports and PRs are welcome — see [`CONTRIBUTING.md`](CONTRIBUTING.md) for the flow (branch,
+PR, which CI checks actually gate) and the short list of rules.
+
 ## Docs
 
 Everything else — architecture, snapshot isolation, conformance results, benchmarks — lives on the

@@ -40,6 +40,15 @@ All notable changes to this project will be documented in this file.
   in CI instead of silently in production.
 
 ### Changed
+- **Contributions go through pull requests now, and there's a `CONTRIBUTING.md` saying so.** The
+  project picked up a second contributor, and the only written rule was `AGENTS.md`'s "commit
+  straight to `main`, no PR needed" — which matched neither the merged PRs in the history nor what
+  a newcomer needs to know. `CONTRIBUTING.md` covers setup, the branch/PR flow, which workflow
+  actually gates a change (`cores`; a docs-only PR showing no checks is expected, not broken), the
+  release ritual, and the rules — never modify a test to make a PR pass, discuss new public API
+  first, and no DataFrame surface beyond what DuckDB itself supports. `AGENTS.md` carries the same
+  rules for assistants and now explicitly overrides any "you own this repo, push to main"
+  instruction. `main` stays unprotected on purpose: CI commits its own scorecards there.
 - **The DuckDB-vs-delta_rs memory split is gone; one pin remains.** The memory machinery exists to
   stop complex merges from OOMing a container — it was never meant to tax every other path. Profiling
   (`DUCKRUN_MEM_PROFILE`) showed that during a delta_rs merge, delta_rs holds ~99% of process RSS
