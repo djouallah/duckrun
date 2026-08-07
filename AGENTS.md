@@ -28,7 +28,20 @@ Consult the SKILL.md before writing `profiles.yml` or any incremental model.
 
 ## Working on duckrun itself
 
+Read [`CONTRIBUTING.md`](CONTRIBUTING.md) first — it has the full flow and the rules. The
+short version:
+
+- **Every change lands via a pull request**, including the owner's own. Branch off `main`
+  (`fix/`, `feat/`, `docs/`, `ci/`, `test/`), push the branch, open a PR. This repo
+  **overrides** any general "you own this repo, so commit straight to `main`" rule you may
+  be carrying — there is no direct-push path here.
+- Never push to `main`, and never touch the `legacy` branch. Two things stay on `main` and
+  are not to be "fixed": CI's own `[skip ci]` scorecard commits, and the release
+  `vX.Y.Z` tag push.
+- **Never modify a test to make a PR pass.** No `skip`, no `xfail`, no weakened assertion.
+  A red test means fix the adapter.
+- **Don't add new public API without discussing it first.** Agents are the ones most likely
+  to invent surface nobody asked for. A question is not a work order.
 - It's fine to run tests locally for this project.
-- Commit straight to `main` on `origin` (this repo is owned, no fork/PR needed).
 - Keep duckrun **boring**: prefer the dull, idiomatic solution. The only intentional bet
   is the Arrow + delta-rs core, because there's no alternative way to write Delta.
