@@ -63,8 +63,10 @@ conformance.xml
 !tests/integration_tests/**/*.csv
 !tests/integration_tests/**/*.yml
 !tests/integration_tests/**/*.json
-# ...and the vendored connection-API fixtures (coffee dimension CSVs)
+# ...and the vendored connection-API fixtures (coffee dimension CSVs, and the Delta log of the
+# Databricks-written column-mapped table -- the *.json rule above is aimed at RUNTIME Delta logs)
 !tests/connection_api/**/*.csv
+!tests/connection_api/data/**/_delta_log/*.json
 # ...and the native-unit-test project's seeds (raw_customers / raw_orders / top_level_email_domains)
 !tests/dbt_unit_tests/**/*.csv
 

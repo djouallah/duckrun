@@ -1,0 +1,4 @@
+# Vendored verbatim from upstream (see README.md) — no EOL conversion, ever. These are a real
+# engine's Delta log and parquet files; a checkout that rewrote their line endings would no longer
+# be the artifact the tests claim to be reading.
+* -text

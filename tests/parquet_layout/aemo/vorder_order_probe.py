@@ -182,7 +182,7 @@ def _order_metrics(con, files, label):
 
 
 def _table_files(con, table):
-    files, _, vorder, _ = engine.delta_file_summary(
+    files, _, vorder, _, _ = engine.delta_file_summary(
         con.con, f"{TABLES}/tests/{table}", con.storage_options)
     return files, vorder
 

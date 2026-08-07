@@ -206,6 +206,27 @@ def _qlit(text: str) -> str:
     return str(text).replace("'", "''")
 
 
+def _logical_names(colmap: Dict[str, str]) -> str:
+    """The ``* REPLACE`` clause that rewrites ``parquet_metadata()``'s ``path_in_schema`` — the
+    PHYSICAL parquet name — back to the logical column name, for a Delta table with column mapping on
+    (Fabric Warehouse always, Spark whenever a table feature needs it). Without it every per-column
+    row of ``get_stats(detailed=True)`` reads ``col-<guid>`` and is unidentifiable — type and size
+    don't disambiguate, so the caller can't recover the name from what it got back.
+
+    ``path_in_schema`` names a nested column one level per ``', '`` segment (DuckDB's separator, NOT
+    a dot) and each level carries its own physical name, so it is translated segment by segment; a
+    segment that isn't in the map — parquet's synthesised ``list``/``element`` levels, or a name we
+    couldn't translate — passes through unchanged, and since the split and the join use the same
+    separator such a path round-trips byte-identically. An empty map (no column mapping) yields no
+    clause at all, because on an unmapped table the raw footer names already ARE the logical ones."""
+    if not colmap:
+        return ""
+    cases = " ".join(f"WHEN '{_qlit(physical)}' THEN '{_qlit(logical)}'"
+                     for physical, logical in colmap.items())
+    return (" REPLACE (array_to_string(list_transform(str_split(m.path_in_schema, ', '), "
+            f"y -> CASE y {cases} ELSE y END), ', ') AS path_in_schema)")
+
+
 def _case_collision(names):
     """The first ``(earlier, later)`` pair of ``names`` that are equal ignoring case but differ in
     spelling — a case-fold collision DuckDB's case-INSENSITIVE catalog would silently merge (so one
@@ -1147,7 +1168,9 @@ class DuckSession:
     def get_stats(self, source: Optional[str] = None, detailed: bool = False) -> "duckdb.DuckDBPyRelation":
         """Delta table statistics — the "why is my table slow / full of small files" view. Returns a
         native DuckDB relation, one row per table (``detailed=False``) or one row per parquet **row
-        group** (``detailed=True``, the raw ``parquet_metadata`` columns).
+        group** (``detailed=True``, the raw ``parquet_metadata`` columns — with ``path_in_schema``
+        translated to the **logical** column name, since a column-mapped table writes ``col-<guid>``
+        into the footer).
 
         ``source``: ``None`` → every table across all attached catalogs; a table name (1/2/3-part)
         → that table; a schema name → every matching table in it (any catalog); a wildcard pattern
@@ -1170,7 +1193,7 @@ class DuckSession:
         parts = []
         for cat, sch, tbl in targets:
             entry = self._catalogs[cat]
-            files, size_bytes, vorder, deleted = engine.delta_file_summary(
+            files, size_bytes, vorder, deleted, colmap = engine.delta_file_summary(
                 self.con, f"{entry.root_path}/{sch}/{tbl}", entry.storage_options)
             pre = (f"'{_qlit(cat)}' AS catalog, '{_qlit(sch)}' AS schema, "
                    f"'{_qlit(tbl)}' AS \"table\"")
@@ -1182,7 +1205,8 @@ class DuckSession:
                 continue
             lit = "[" + ", ".join(f"'{_qlit(f)}'" for f in files) + "]"
             if detailed:
-                parts.append(f"SELECT {pre}, m.* FROM parquet_metadata({lit}) m")
+                parts.append(f"SELECT {pre}, m.*{_logical_names(colmap)} "
+                             f"FROM parquet_metadata({lit}) m")
             else:
                 parts.append(
                     f"SELECT {pre}, "
@@ -1208,7 +1232,7 @@ class DuckSession:
         md = dt.metadata()
         # count_deleted=False: `describe detail` reports files/bytes, no row count, so the
         # deletion-vector read (the only expensive part) would buy nothing.
-        files, size_bytes, _, _ = engine.delta_file_summary(
+        files, size_bytes, _, _, _ = engine.delta_file_summary(
             self.con, path, entry.storage_options, count_deleted=False)
         parts = list(md.partition_columns or [])
         part_lit = "[" + ", ".join(f"'{_qlit(p)}'" for p in parts) + "]"

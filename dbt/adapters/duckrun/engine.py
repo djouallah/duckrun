@@ -1021,6 +1021,52 @@ def deleted_row_count(cur, dt) -> int:
         "from deletion_vectors").fetchone()[0])
 
 
+_DELTA_PHYSICAL_NAME_KEY = "delta.columnMapping.physicalName"
+
+
+def _mapped_child_fields(dtype):
+    """The named child fields of a Delta ``DataType`` — the recursion step of
+    :func:`physical_to_logical`. Only a struct has fields (and so physical names); an array or a map
+    is unwrapped to reach any struct inside it, and a primitive has none."""
+    kind = getattr(dtype, "type", None)
+    if kind == "struct":
+        return list(dtype.fields)
+    if kind == "array":
+        return _mapped_child_fields(dtype.element_type)
+    if kind == "map":
+        return _mapped_child_fields(dtype.key_type) + _mapped_child_fields(dtype.value_type)
+    return []
+
+
+def physical_to_logical(dt) -> Dict[str, str]:
+    """``{physical name: logical column name}`` for a Delta table with **column mapping** on — the
+    translation the parquet footer and the log's per-column stats both need to be readable. Fabric
+    Warehouse enables mapping on every table and Spark does whenever a table feature requires it, and
+    then the footer and ``add.stats`` are keyed ``col-<guid>`` where the column name belongs;
+    delta-rs never enables it, and then this is empty and those names already ARE the logical ones.
+    (``add.partitionValues`` needs no translation — delta-rs resolves it back before
+    ``get_add_actions`` flattens it.) Nested fields are walked too, because a parquet schema path
+    names a nested column one level at a time and each level has its own physical name. Free: the
+    schema is already in the snapshot the caller opened. Best-effort — anything unreadable yields
+    ``{}``, i.e. the untranslated names."""
+    out: Dict[str, str] = {}
+    try:
+        mode = str((dt.metadata().configuration or {}).get(
+            "delta.columnMapping.mode", "")).strip().lower()
+        if mode not in ("name", "id"):
+            return {}
+        pending = list(dt.schema().fields)
+        while pending:
+            f = pending.pop()
+            physical = (f.metadata or {}).get(_DELTA_PHYSICAL_NAME_KEY)
+            if physical:
+                out[str(physical)] = f.name
+            pending.extend(_mapped_child_fields(f.type))
+    except Exception:  # best-effort: an unreadable mapping just leaves the physical names alone
+        return {}
+    return out
+
+
 def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]] = None,
                        count_deleted: bool = True):
     """Active-file list (absolute paths) + total size + VORDER flag + deletion-vector row count for a
@@ -1030,7 +1076,9 @@ def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]]
     :func:`delta_stats` (no pyarrow). VORDER is read from the table metadata property (see below).
     ``deleted`` is what :func:`deleted_row_count` finds — the caller must subtract it from any row
     count taken off the parquet footers; ``count_deleted=False`` skips that read (returning ``0``)
-    for callers that report no row count at all."""
+    for callers that report no row count at all. The last element is :func:`physical_to_logical` —
+    empty unless the table has column mapping on, in which case the parquet footers carry
+    ``col-<guid>`` names the caller has to translate before showing them to anyone."""
     dt = _delta_table(path, storage_options)
     files = list(dt.file_uris())
     add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
@@ -1040,7 +1088,8 @@ def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]]
     # read the property off the reconstructed metadata (survives checkpointing).
     config = dt.metadata().configuration or {}
     vorder = str(config.get("delta.parquet.vorder.enabled", "")).strip().lower() == "true"
-    return files, size, vorder, deleted_row_count(cur, dt) if count_deleted else 0
+    return (files, size, vorder, deleted_row_count(cur, dt) if count_deleted else 0,
+            physical_to_logical(dt))
 
 
 def _log_ndv_cap(cur, type_str: str, qmn: str, qmx: str):
@@ -1077,8 +1126,12 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
       usable bound.
 
     A column past the indexed-column cap, or a statless writer, simply gets no entry — the caller falls
-    back to the sample profile for it. Returns ``({c: {"null_frac", "constancy", "ndv_cap"}}, num_files,
-    total_rows)``; ``({}, 0, 0)`` on ANY failure — a best-effort refinement, never a hard dependency."""
+    back to the sample profile for it. ``cols`` are the LOGICAL names (they come off a ``delta_scan``),
+    and a column-mapped table keys its ``add.stats`` by the PHYSICAL one, so each key is looked up
+    logical-first then physical — otherwise every column of a Fabric Warehouse / Spark table misses and
+    the profiler silently loses its null shares. Returns ``({c: {"null_frac", "constancy", "ndv_cap"}},
+    num_files, total_rows)`` keyed by the logical name; ``({}, 0, 0)`` on ANY failure — a best-effort
+    refinement, never a hard dependency."""
     try:
         dt = _delta_table(path, storage_options)
         add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
@@ -1086,9 +1139,11 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
         nfiles, total = cur.sql(
             "select count(*), coalesce(sum(num_records), 0)::bigint from add_actions").fetchone()
         nfiles, total = int(nfiles or 0), int(total or 0)
+        phys = {logical: physical for physical, logical in physical_to_logical(dt).items()}
         out = {}
         for c in cols:
-            nc, mn, mx = f"null_count.{c}", f"min.{c}", f"max.{c}"
+            k = c if f"min.{c}" in have else phys.get(c, c)
+            nc, mn, mx = f"null_count.{k}", f"min.{k}", f"max.{k}"
             if nc not in have or mn not in have or mx not in have:
                 continue
             qnc, qmn, qmx = (s.replace('"', '""') for s in (nc, mn, mx))

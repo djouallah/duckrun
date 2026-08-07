@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **Column-mapped tables no longer report their statistics under generated GUIDs** (#32). A Delta
+  table with `delta.columnMapping.mode` on keys its parquet footer and its `add.stats` by a physical
+  `col-<guid>` name, so `get_stats(detailed=True)` returned per-column size / encoding / dictionary
+  / row-group facts that could not be joined back to a column — type and size don't disambiguate,
+  and the `[min,max]` overlap and run-length reports derived from the same footer read inherited it.
+  Fabric **Warehouse** enables mapping on every table unconditionally and Spark enables it whenever
+  a table feature needs it, so this was every warehouse table. A second, silent instance of the same
+  root cause: `delta_column_stats` built its `min.<c>` / `max.<c>` / `null_count.<c>` keys from
+  logical names, so on a mapped table every column missed and the whole dict came back empty —
+  `SORTED BY AUTO` then lost its null shares and NDV caps and picked a worse sort key with no
+  warning. Both now resolve through a `{physical: logical}` map read off `dt.schema()` on the
+  snapshot the caller already holds (zero extra I/O), applied one parquet-path segment at a time so
+  nested columns translate and anything unmapped passes through byte-identically. Nothing local
+  could have caught this — delta-rs cannot write column mapping — so the tests run against a real
+  Databricks-written table vendored from delta-rs (`tests/connection_api/data/`, Apache-2.0).
+  Residual: `mode: id` is served by the same `physicalName` lookup, which every writer populates; a
+  writer that named its parquet columns something else entirely would still show physical names,
+  i.e. no worse than before. `delta.partitionColumns` and `add.partitionValues` needed no change —
+  delta-rs already resolves both back to logical names.
 - **The per-model geometry configs now actually reach the writer from dbt.** `max_row_group_size`
   and `target_file_size_mb` shipped in 0.4.43 fully plumbed on the plugin/engine side, documented
   and unit-tested — and unreachable from any dbt model: `_delta_core.sql` forwards model config to

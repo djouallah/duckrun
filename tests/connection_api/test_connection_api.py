@@ -185,7 +185,11 @@ class TestSession:
 
     def test_get_stats_detailed(self, conn):
         st = conn.get_stats("src", detailed=True)  # one row per parquet row group
-        assert len(st.fetchall()) >= 1 and "table" in st.columns
+        rows = st.fetchall()
+        assert len(rows) >= 1 and "table" in st.columns
+        # delta-rs never enables column mapping, so the footer names already ARE the logical ones and
+        # the translation must leave them exactly alone (the mapped case is covered separately).
+        assert {r[st.columns.index("path_in_schema")] for r in rows} == {"id", "name"}
 
     def test_get_stats_glob(self, conn):
         # wildcard patterns match table names across schemas in the current catalog.
@@ -1934,6 +1938,104 @@ def test_get_stats_subtracts_deletion_vector_rows(conn, monkeypatch):
     assert rows_of() == 100
     monkeypatch.setattr(engine, "deleted_row_count", lambda cur, dt: 7)
     assert rows_of() == 93
+
+
+# A REAL Databricks-written table with delta.columnMapping.mode=name, vendored from delta-rs --
+# delta-rs itself cannot write column mapping, so nothing stamped by hand would be honest evidence.
+# See data/README.md for provenance. Logical `Company Very Short` (partition) / `Super Name` (data).
+_CM_FIXTURE = Path(__file__).parent / "data" / "table_with_column_mapping"
+_CM_PARTITION = "col-173b4db9-b5ad-427f-9e75-516aae37fbbb"
+_CM_DATA = "col-3877fd94-0973-4941-ac6b-646849a1ff65"
+
+
+def _install_column_mapped(conn, name="cm_t"):
+    """Copy the vendored column-mapped table into `conn`'s lakehouse, register it, return its path."""
+    import shutil
+    path = Path(conn.root_path) / "dbo" / name
+    shutil.copytree(_CM_FIXTURE, path)
+    conn.refresh(quiet=True)
+    return str(path)
+
+
+def test_get_stats_names_columns_logically_under_column_mapping(conn):
+    # A column-mapped table writes col-<guid> into the parquet footer, so every per-column row of
+    # detailed=True came back unidentifiable -- type and size don't disambiguate, so the caller could
+    # not recover which column a size/encoding/run-length fact described. Fabric Warehouse enables
+    # mapping on EVERY table, so this was every warehouse table.
+    _install_column_mapped(conn)
+    st = conn.get_stats("cm_t", detailed=True)
+    # The partition column lives in the path, not the parquet -- one physical column in the footer.
+    assert {r[st.columns.index("path_in_schema")] for r in st.fetchall()} == {"Super Name"}
+    # The aggregate half is name-free and must be untouched by the translation.
+    agg = conn.get_stats("cm_t")
+    d = dict(zip(agg.columns, agg.fetchall()[0]))
+    assert (d["total_rows"], d["num_files"], d["num_row_groups"], d["vorder"]) == (5, 2, 2, False)
+
+
+def test_delta_column_stats_reads_a_column_mapped_log(conn):
+    # The sort-key profiler's null shares come from add.stats, which a mapped table keys by the
+    # PHYSICAL name while `cols` (off a delta_scan) are logical -- so every column missed and the
+    # whole dict came back EMPTY, silently, and SORTED BY AUTO picked a worse key with no warning.
+    path = _install_column_mapped(conn)
+    cols = ["Company Very Short", "Super Name"]
+    stats, nfiles, total = engine.delta_column_stats(
+        conn._connection, path, cols, {c: "VARCHAR" for c in cols})
+    assert (nfiles, total) == (2, 5)
+    assert stats["Super Name"]["null_frac"] == 0.0   # both files record nullCount 0
+    assert "Company Very Short" not in stats         # Delta does not stat partition columns
+
+
+def test_physical_to_logical_reads_the_column_mapping(conn):
+    from deltalake.schema import ArrayType, Field, MapType, Schema, StructType
+    dt = engine._delta_table(_install_column_mapped(conn), None)
+    assert engine.physical_to_logical(dt) == {_CM_PARTITION: "Company Very Short",
+                                              _CM_DATA: "Super Name"}
+
+    # Branches the (flat) fixture can't reach: a parquet schema path names a nested column one level
+    # at a time and each level carries its own physical name, so the walk has to descend structs and
+    # unwrap arrays/maps to reach the structs inside them.
+    def _f(name, dtype, physical):
+        return Field(name, dtype, metadata={"delta.columnMapping.physicalName": physical})
+
+    schema = Schema([
+        _f("nest", StructType([_f("kid", "integer", "col-3")]), "col-2"),
+        _f("arr", ArrayType(StructType([_f("elem_kid", "integer", "col-5")])), "col-4"),
+        _f("m", MapType("string", StructType([_f("val_kid", "integer", "col-7")])), "col-6"),
+        Field("unmapped", "integer"),  # no physicalName -> absent, so that segment passes through
+    ])
+
+    class _Dt:
+        def __init__(self, config):
+            self.config = config
+
+        def metadata(self):
+            return types.SimpleNamespace(configuration=self.config)
+
+        def schema(self):
+            return schema
+
+    assert engine.physical_to_logical(_Dt({"delta.columnMapping.mode": "name"})) == {
+        "col-2": "nest", "col-3": "kid", "col-4": "arr", "col-5": "elem_kid",
+        "col-6": "m", "col-7": "val_kid"}
+    # id mode records physicalName too, so one lookup serves both modes.
+    assert engine.physical_to_logical(_Dt({"delta.columnMapping.mode": "id"}))["col-2"] == "nest"
+    assert engine.physical_to_logical(_Dt({})) == {}                      # delta-rs: no mapping
+    assert engine.physical_to_logical(_Dt({"delta.columnMapping.mode": "none"})) == {}
+    assert engine.physical_to_logical(object()) == {}                     # best-effort, never raises
+
+
+def test_logical_names_escapes_and_passes_unknown_segments_through(conn):
+    # The REPLACE clause is string-interpolated, so a quote in either name must go through _qlit; and
+    # an untranslated segment (parquet's synthesised list/element levels, or a name the map missed)
+    # must survive intact -- split and join use the same separator, so it round-trips byte-identically.
+    conn.sql("CREATE OR REPLACE TABLE esc_t AS select 1 AS id, 'x' AS name")
+    files = engine._delta_table(str(Path(conn.root_path) / "dbo" / "esc_t"), None).file_uris()
+    lit = "[" + ", ".join(f"'{f}'" for f in files) + "]"
+    clause = session_mod._logical_names({"id": "DU'ID"})   # `name` deliberately not in the map
+    got = conn.sql(f"select path_in_schema from "
+                   f"(select m.*{clause} from parquet_metadata({lit}) m)").fetchall()
+    assert {r[0] for r in got} == {"DU'ID", "name"}
+    assert session_mod._logical_names({}) == ""            # no mapping -> no clause at all
 
 
 def test_rg_for_clamps():
