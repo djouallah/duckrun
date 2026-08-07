@@ -42,3 +42,4 @@ dispatch), newest at the bottom. Written by the `tpch-stress` job; the live scor
 | 2026-08-04 | [#95](https://github.com/djouallah/duckrun/actions/runs/30959757609) | 9645e1a | 1.5.5 | 1.5.0 | 10 | 4 | 66.1s | 28.8s | ✅ |
 | 2026-08-05 | [#96](https://github.com/djouallah/duckrun/actions/runs/30981560637) | 206a6db | 1.5.5 | 1.5.0 | 10 | 4 | 62.9s | 27.8s | ✅ |
 | 2026-08-06 | [#97](https://github.com/djouallah/duckrun/actions/runs/31069832866) | b825720 | 1.5.5 | 1.5.0 | 10 | 4 | 65.6s | 27.8s | ✅ |
+| 2026-08-07 | [#98](https://github.com/djouallah/duckrun/actions/runs/31158636537) | 2cfc057 | 1.5.5 | 1.5.0 | 10 | 4 | 66.1s | 28.0s | ✅ |
