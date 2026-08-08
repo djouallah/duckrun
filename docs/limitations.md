@@ -28,7 +28,13 @@ sources, and the full merge-config surface (`merge_clauses` — including `do_no
 clause defaults, `mode`, `by: source`, `insert: {columns, values}` — and
 `merge_update_set_expressions`) all behave as they do upstream. duckrun's own additions
 (`incremental_strategy='insert'`, `partition_by`, `sort_by`, `location`, `catalogs`) are a superset:
-a dbt-duckdb project never has to use them. Test-by-test detail is in
+a dbt-duckdb project never has to use them. dbt-duckdb 1.11's canonical `partitioned_by` /
+`sorted_by` spellings are accepted as aliases of `partition_by` / `sort_by` (same precedence as
+upstream, canonical name first) — with one behavior difference: upstream applies them only to
+DuckLake tables (warn-and-ignore otherwise), duckrun applies them to its Delta tables, which is
+what a duckrun model means by partitioning/sorting. The other dbt-duckdb 1.11 additions
+(DuckLake `partitioned_by`/`sorted_by` alter flows, DuckLake transactions) are DuckLake-specific
+and don't apply to a Delta-backed adapter. Test-by-test detail is in
 [Conformance](conformance.md).
 
 ## Setup & versions

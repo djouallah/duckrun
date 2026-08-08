@@ -7,6 +7,11 @@ base classes, complete with the adapter-specific overrides (expected catalogs, c
 type maps, etc.) that a bare `class Test(Base): pass` would miss. We point them at a
 `duckrun` target instead of `duckdb`, so the results show exactly where duckrun's Delta
 layer diverges from vanilla dbt-duckdb. No cloud credentials needed.
+
+Last synced against dbt-duckdb tag 1.11.0. Deliberately not vendored from that tag:
+`test_ducklake_*.py` and `test_database_type.py` (they configure DuckLake/typed attaches —
+meaningless against a duckrun target), plugin/MotherDuck/unit tests. Some vendored files
+carry duckrun-specific additions appended after the upstream content (marked as such).
 """
 from importlib import metadata
 
@@ -33,6 +38,16 @@ def pytest_configure(config):
     # Markers used by the vendored dbt-duckdb test files.
     config.addinivalue_line("markers", "skip_profile(*profiles): skip on the named profiles")
     config.addinivalue_line("markers", "requires_ducklake: needs the ducklake extension")
+    config.addinivalue_line(
+        "markers", "skip_database_type(*types): skip on the named database types"
+    )
+
+
+# What upstream's --database-type option resolves to here: duckrun's Delta layer sits behind a
+# plain in-memory DuckDB, never a DuckLake attach — so DuckLake-only cases (marked
+# skip_database_type('duckdb')) skip, and cases DuckLake can't run (marked
+# skip_database_type('ducklake')) run.
+DATABASE_TYPE = "duckdb"
 
 
 def pytest_report_header():
@@ -81,3 +96,11 @@ def pytest_collection_modifyitems(config, items):
     for item in items:
         if "requires_ducklake" in item.keywords:
             item.add_marker(skip_ducklake)
+        # Collection-time (not a class-scoped fixture) so module-, class- and function-level
+        # skip_database_type marks are all honored uniformly.
+        for marker in item.iter_markers("skip_database_type"):
+            if DATABASE_TYPE in marker.args:
+                reason = marker.kwargs.get(
+                    "reason", f"skipped on '{DATABASE_TYPE}' database type"
+                )
+                item.add_marker(pytest.mark.skip(reason=reason))
