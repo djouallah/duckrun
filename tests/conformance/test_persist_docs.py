@@ -7,17 +7,24 @@ from dbt.tests.adapter.persist_docs.test_persist_docs import (
 )
 from dbt.tests.util import run_dbt
 
-@pytest.mark.skip_profile("md")
+
+@pytest.mark.skip_database_type(
+    "ducklake", reason="DuckLake does not support comments on view columns"
+)
 class TestPersistDocs(BasePersistDocs):
     pass
 
 
-@pytest.mark.skip_profile("md")
+@pytest.mark.skip_database_type(
+    "ducklake", reason="DuckLake does not support comments on view columns"
+)
 class TestPersistDocsColumnMissing(BasePersistDocsColumnMissing):
     pass
 
 
-@pytest.mark.skip_profile("md")
+@pytest.mark.skip_database_type(
+    "ducklake", reason="DuckLake does not support comments on view columns"
+)
 class TestPersistDocsCommentOnQuotedColumn(BasePersistDocsCommentOnQuotedColumn):
     pass
 

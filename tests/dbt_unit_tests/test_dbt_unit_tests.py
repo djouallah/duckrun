@@ -124,6 +124,28 @@ def test_sort_by_writes_physically_ordered(tmp_path):
     assert keys == [1, 2, 3, 4, 5], keys  # physically sorted, not the shuffled input order
 
 
+def test_canonical_spellings_sorted_by_partitioned_by(tmp_path):
+    """dbt-duckdb 1.11's canonical config spellings (sorted_by/partitioned_by — upstream aliases
+    duckrun's sort_by/partition_by both ways) must behave exactly like duckrun's own spellings: a
+    verbatim upstream project using them must not be silently unpartitioned/unsorted.
+    sorted_layout_canonical uses ONLY the canonical names; assert the partition column reached the
+    Delta writer and rows landed physically sorted within each partition (file order, no ORDER BY)."""
+    from deltalake import DeltaTable
+
+    wh = _wh(tmp_path)
+    assert _dbt(wh, "run", "--select", "sorted_layout_canonical").success
+    dt = DeltaTable(f"{wh}/{SCHEMA}/sorted_layout_canonical")
+    assert dt.metadata().partition_columns == ["bucket"], dt.metadata().partition_columns
+    table = dt.to_pyarrow_table()
+    by_bucket = {}
+    for bucket, key in zip(table.column("bucket").to_pylist(),
+                           table.column("sort_key").to_pylist()):
+        by_bucket.setdefault(bucket, []).append(key)
+    assert sorted(by_bucket) == ["a", "b"], by_bucket
+    for bucket, keys in by_bucket.items():
+        assert keys == sorted(keys), f"partition {bucket} not physically sorted: {keys}"
+
+
 def test_geometry_configs_reach_the_writer(tmp_path):
     """max_row_group_size / target_file_size_mb must survive the materialization macro's config
     hand-off. This is the hop that broke in 0.4.43: _delta_core.sql's delta_config carried sort_by
