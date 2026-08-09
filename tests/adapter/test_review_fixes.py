@@ -6,7 +6,7 @@ Pure-Python unit tests for the small, self-contained fixes — the ones that don
 import duckdb
 import pytest
 
-from dbt.adapters.duckrun import delta_dml, engine, policy, secret, sqlscan
+from dbt.adapters.duckrun import delta_dml, engine, policy, remote, secret, sqlscan
 from dbt.adapters.duckrun.credentials import DuckrunCredentials
 from dbt.adapters.duckrun.delta_plugin import Plugin
 from duckrun.session import _is_multi_statement
@@ -542,3 +542,23 @@ def test_geometry_config_validation():
             gc({"max_row_group_size": bad})
         with pytest.raises(ValueError):
             gc({"target_file_size_mb": bad})
+
+
+# ------------------------------------------------------- glob discovery fails loud
+
+def test_glob_listing_missing_dir_is_empty_not_error(tmp_path):
+    """The benign case stays benign: DuckDB's glob yields zero rows for a path that does not exist
+    (a schema dir before the first write), no exception — so discovery sees an empty schema."""
+    con = duckdb.connect()
+    assert remote.list_delta_tables_via_glob(con, (tmp_path / "nope").as_posix(), "dbo") == []
+
+
+def test_glob_listing_store_error_raises(tmp_path):
+    """A store we genuinely cannot see must abort discovery, not read as an empty schema: an empty
+    listing makes every table vanish from the relation cache, flips is_incremental() off, and the
+    next run full-refreshes over the table — the same silent clobber the OneLake lister fails loud
+    on. az:// with no secret is the cheapest real store failure (and if the azure extension itself
+    cannot load, that raises too — equally a listing failure, never [])."""
+    con = duckdb.connect()
+    with pytest.raises(duckdb.Error):
+        remote.list_delta_tables_via_glob(con, "az://no-secret-container/x", "dbo")

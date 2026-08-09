@@ -849,9 +849,68 @@ def _split_top_level_commas(s: str) -> List[str]:
 
 # ── CTE slicing, for the dbt debug session (duckrun.dbt_project, issue #29) ────────────────────
 _CTE_LEADING_WITH = re.compile(r"\s*with\s+(?:recursive\s+)?", re.I)
-_CTE_COMMA = re.compile(r",")
+_CTE_AS_KW = re.compile(r"as\b", re.I)
 # `name [(cols)] AS …` — the name is a bare identifier or a double-quoted one ("" escapes a quote).
 _CTE_NAME = re.compile(r'\s*("(?:[^"]|"")+"|[A-Za-z_]\w*)')
+
+
+def has_leading_with(sql: str) -> bool:
+    """True when the statement opens with ``WITH`` (comment- and whitespace-tolerant) — i.e. it HAS
+    a CTE list, even if :func:`split_cte_list` declined to take it apart."""
+    return bool(_CTE_LEADING_WITH.match(_blank_string_literals(_strip_comments(sql, keep_length=True))))
+
+
+def _cte_list_bounds(mask: str, after: int):
+    """``(comma_positions, main_start)`` for the CTE list beginning at ``after`` in ``mask``.
+
+    Walks the list STRUCTURALLY instead of hunting for a ``SELECT`` keyword: after each CTE body's
+    closing ``)`` at depth 0, the next token is either ``,`` (another CTE), ``AS`` (the ``)`` closed
+    a column list / ``USING KEY`` list, the body is still to come), or the main query — whatever it
+    starts with. A keyword hunt cannot get that right: a main query of ``(select …) union all
+    (select …)`` has no top-level ``SELECT`` at all, and DuckDB's ``FROM x SELECT y`` puts its
+    top-level ``SELECT`` in the middle, so hunting either declines a sliceable model or hands the
+    tail CTE half the main query. ``main_start`` is ``-1`` when the list never hands over
+    (malformed / truncated input)."""
+    commas: List[int] = []
+    depth, quote, closed = 0, None, False
+    i, n = after, len(mask)
+    while i < n:
+        ch = mask[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            i += 1
+            continue
+        if ch == "$":
+            de = _dollar_quote_end(mask, i)
+            if de is not None:
+                i = de
+                continue
+        if depth == 0:
+            if ch == ",":
+                commas.append(i)
+                closed = False
+                i += 1
+                continue
+            if closed and not ch.isspace():
+                at_boundary = not (i and (mask[i - 1].isalnum() or mask[i - 1] == "_"))
+                if at_boundary and _CTE_AS_KW.match(mask, i):
+                    closed = False  # `name (cols) AS (…)` — that `)` ended the column list
+                    i += 2
+                    continue
+                return commas, i    # the CTE list handed over: the main query starts here
+        if ch in "([":
+            depth += 1
+        elif ch in ")]":
+            depth -= 1
+            if depth == 0 and ch == ")":
+                closed = True
+        i += 1
+    return commas, -1
 
 
 def split_cte_list(sql: str):
@@ -875,13 +934,10 @@ def split_cte_list(sql: str):
     if not lead:
         return "", [], sql
     after = lead.end()
-    # The first top-level SELECT after the WITH list is the main one: every CTE's own SELECT sits
-    # inside parentheses, which the scanner steps over.
-    offset = _find_top_level(mask[after:], _SELECT_KW)
-    if offset < 0:
+    commas, end = _cte_list_bounds(mask, after)
+    if end < 0:
         return "", [], sql
-    end = after + offset
-    bounds = [after] + [after + c + 1 for c in _find_all_top_level(mask[after:end], _CTE_COMMA)]
+    bounds = [after] + [c + 1 for c in commas]
     parts = []
     for start, stop in zip(bounds, bounds[1:] + [end]):
         text = sql[start:stop].rstrip().rstrip(",")

@@ -165,6 +165,12 @@ p.sql("create or replace view v_check as select customer, count(*) from candidat
 They live only in the in-memory DuckDB catalog and never reach the lakehouse. duckrun has no `view`
 materialization at all — the only things it writes are Delta tables, through delta_rs.
 
+File exports are refused too. `COPY ... TO` and `EXPORT DATABASE` never touch delta_rs, but they
+write files wherever the session's store credentials reach — including the lakehouse — so a
+read-only session rejects them the same way. `COPY <table> FROM ...` (loading a file *into* a
+scratch table) keeps working. To export a result, fetch the relation and write it client-side, or
+use `duckrun.connect(..., read_only=False)`.
+
 One exception, and it is dbt's rather than duckrun's: a `create` statement that refs an **ephemeral**
 model cannot work. dbt injects an ephemeral model by prepending `with __dbt__cte__<name> as (...)`
 to the query, and a `WITH` clause only parses in front of a `SELECT`. Build the relation first

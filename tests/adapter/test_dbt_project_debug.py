@@ -92,6 +92,26 @@ where id > (select max(id) from {{ this }})
 {% endif %}
 """
 
+# Main queries a SELECT-keyword hunt gets wrong: a parenthesized UNION has no top-level SELECT at
+# all (every SELECT sits inside parens), and DuckDB's FROM-first syntax puts its only top-level
+# SELECT in the MIDDLE of the main query. Both must list and slice — the splitter walks the WITH
+# list's structure, it does not hunt for a keyword.
+CTE_UNION = """{{ config(materialized='table') }}
+with base as (select id, name from {{ ref('stg_items') }})
+(select id, name from base where id = 1)
+union all
+(select id, name from base where id = 2)
+"""
+CTE_FROM_FIRST = """{{ config(materialized='table') }}
+with base as (select id, name, amount from {{ ref('stg_items') }})
+from base select id, upper(name) as shout
+"""
+# DuckDB resolves unquoted identifiers case-insensitively; cte() must match names the same way.
+CTE_MIXED_CASE = """{{ config(materialized='table') }}
+with MixedTotals as (select id, amount * 2 as total from {{ ref('stg_items') }})
+select * from MixedTotals
+"""
+
 # A macro that emits an entire CTE — name, body and its own comment.
 MACRO = """{% macro scaled_cte(name, src, factor) %}
 {{ name }} as (
@@ -144,6 +164,9 @@ def project(tmp_path):
     (proj / "models" / "v_chained.sql").write_text(VIEW_OVER_VIEW, encoding="utf-8")
     (proj / "models" / "uses_view.sql").write_text(USES_VIEW, encoding="utf-8")
     (proj / "models" / "macro_model.sql").write_text(MACRO_MODEL, encoding="utf-8")
+    (proj / "models" / "cte_union.sql").write_text(CTE_UNION, encoding="utf-8")
+    (proj / "models" / "cte_from_first.sql").write_text(CTE_FROM_FIRST, encoding="utf-8")
+    (proj / "models" / "cte_mixed_case.sql").write_text(CTE_MIXED_CASE, encoding="utf-8")
     (proj / "macros" / "helpers.sql").write_text(MACRO, encoding="utf-8")
     (proj / "models" / "schema.yml").write_text(SCHEMA_YML, encoding="utf-8")
     os.environ["DBG2_PATH"] = (tmp_path / "wh").as_posix()
@@ -725,3 +748,90 @@ def test_importing_duckrun_does_not_import_dbts_cli():
     """)
     out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
     assert "CLI:False" in out.stdout, out.stdout
+
+
+# ── sql() over view models, and CTE shapes a keyword hunt got wrong ────────────────────────────
+
+def test_sql_reads_a_view_model_on_a_cold_session(p):
+    """`sql()` compiles inline, and the inline node is out of the manifest before anything runs
+    (dbt removes it on success, _drop_inline_node on failure) — so view-ancestor binding must start
+    from the compile's recorded parents. Before the fix the walk found nothing to register and the
+    ref died in the lazy bind (a view model never wrote a Delta table for it to find): show() of
+    the same model worked, sql() over a ref to it did not."""
+    rows = p.sql("select id, boosted from {{ ref('v_boosted') }} order by id").fetchall()
+    assert [(r[0], float(r[1])) for r in rows] == [(1, 105.0), (2, 205.0)]
+    # Through the two-level view chain too: binding must recurse, not stop at the first parent.
+    rows = p.sql("select id, doubled from {{ ref('v_chained') }} order by id").fetchall()
+    assert [(r[0], float(r[1])) for r in rows] == [(1, 210.0), (2, 410.0)]
+
+
+def test_a_parenthesized_union_main_lists_and_slices(p):
+    """`(select …) union all (select …)` as the main query has NO top-level SELECT, so the old
+    keyword hunt declined and ctes() reported [] — a false "has no CTEs" for a model that plainly
+    has one. The structural walk hands over at the `(` instead."""
+    assert p.ctes("cte_union") == ["base"]
+    rows = p.cte("cte_union", "base").fetchall()
+    assert sorted(r[0] for r in rows) == [1, 2]
+
+
+def test_a_from_first_main_slices_clean(p):
+    """DuckDB's FROM-first syntax (`from base select …`) puts the model's only top-level SELECT in
+    the middle of the main query. Hunting for it swallowed `from base` into the last CTE's text and
+    the splice ran two body clauses — invalid SQL about a model that was fine."""
+    assert p.ctes("cte_from_first") == ["base"]
+    rows = p.cte("cte_from_first", "base").fetchall()
+    assert sorted(r[0] for r in rows) == [1, 2]
+    assert sorted(r[1] for r in p.show("cte_from_first").fetchall()) == ["A", "B"]
+
+
+def test_cte_names_match_case_insensitively(p):
+    """DuckDB resolves unquoted identifiers case-insensitively, so `cte(m, 'mixedtotals')` must
+    find the CTE spelled MixedTotals. A name that matches nothing still lists the real ones."""
+    rows = p.cte("cte_mixed_case", "mixedtotals").fetchall()
+    assert sorted((r[0], float(r[1])) for r in rows) == [(1, 21.0), (2, 41.0)]
+    with pytest.raises(DbtProjectError) as exc:
+        p.cte("cte_mixed_case", "no_such_step")
+    assert "MixedTotals" in str(exc.value)
+
+
+def test_show_survives_a_same_named_model_in_a_package(tmp_path):
+    """A view ancestor is compiled by its full fqn, never its bare name: `--select v_boosted`
+    matches EVERY node of that name, so one same-named model in an installed package aborted
+    show() of a model the caller DID name unambiguously — with advice to "narrow the selector",
+    about a selector they never wrote."""
+    proj = tmp_path / "proj"
+    (proj / "models").mkdir(parents=True)
+    (proj / "dbt_project.yml").write_text(
+        "name: dbg\nversion: '1.0'\nconfig-version: 2\nprofile: dbg\nmodel-paths: [models]\n",
+        encoding="utf-8")
+    (proj / "profiles.yml").write_text(
+        "dbg:\n  target: dev\n  outputs:\n    dev:\n"
+        f"      type: duckrun\n      root_path: \"{(tmp_path / 'wh').as_posix()}\"\n",
+        encoding="utf-8")
+    (proj / "models" / "stg_items.sql").write_text(STG, encoding="utf-8")
+    (proj / "models" / "v_boosted.sql").write_text(VIEW_MODEL, encoding="utf-8")
+    (proj / "models" / "uses_boosted.sql").write_text(
+        "{{ config(materialized='table') }}\nselect * from {{ ref('v_boosted') }}\n",
+        encoding="utf-8")
+    # The same model NAME in a local package, on its own schema so dbt itself has no name clash —
+    # only bare-name selection is ambiguous.
+    pkg = tmp_path / "pkg"
+    (pkg / "models").mkdir(parents=True)
+    (pkg / "dbt_project.yml").write_text(
+        "name: pkglib\nversion: '1.0'\nconfig-version: 2\nmodel-paths: [models]\n"
+        "models:\n  pkglib:\n    +schema: pkgspace\n", encoding="utf-8")
+    (pkg / "models" / "v_boosted.sql").write_text(
+        "{{ config(materialized='view') }}\nselect 1 as one\n", encoding="utf-8")
+    (proj / "packages.yml").write_text("packages:\n  - local: ../pkg\n", encoding="utf-8")
+
+    assert dbtRunner().invoke(
+        ["deps", "--project-dir", str(proj), "--profiles-dir", str(proj), "--quiet"]).success
+    assert dbtRunner().invoke(
+        ["run", "--project-dir", str(proj), "--profiles-dir", str(proj), "--quiet",
+         "--exclude", "pkglib.*"]).success
+    from dbt.adapters.duckdb.connections import DuckDBConnectionManager
+    DuckDBConnectionManager.close_all_connections()
+
+    p = duckrun.dbt_project(proj)
+    rows = p.show("uses_boosted").fetchall()
+    assert [(r[0], float(r[2])) for r in sorted(rows)] == [(1, 105.0), (2, 205.0)]

@@ -88,9 +88,9 @@ class CompileResult:
     here instead, on ``DbtProject.last_compile``.
     """
 
-    __slots__ = ("model", "node_id", "sql", "full_refresh", "cte", "incremental")
+    __slots__ = ("model", "node_id", "sql", "full_refresh", "cte", "incremental", "parents")
 
-    def __init__(self, model, node_id, sql, full_refresh, cte=None, incremental=None):
+    def __init__(self, model, node_id, sql, full_refresh, cte=None, incremental=None, parents=()):
         self.model = model
         self.node_id = node_id
         #: The SQL that actually RAN — for a ``cte()`` call that is the sliced query, not the
@@ -103,6 +103,11 @@ class CompileResult:
         #: Which ``is_incremental()`` branch this SQL came from — True or False — or None when the
         #: model does not branch on it at all and there is therefore nothing to be ambiguous about.
         self.incremental = incremental
+        #: The compiled node's direct manifest parents. For an inline ``sql()`` compile the node
+        #: itself is gone from the manifest by the time anything runs (dbt removes it on success,
+        #: :meth:`DbtProject._drop_inline_node` on failure), so these are what view-ancestor
+        #: binding starts from.
+        self.parents = tuple(parents or ())
 
     def __repr__(self):
         extra = f", cte={self.cte!r}" if self.cte else ""
@@ -183,9 +188,16 @@ class DbtProject:
         It hides them from the LISTING only. They are genuinely in the compiled SQL, ``cte()``
         still takes their names, and slicing at one is often exactly right: it shows a staging
         model in the context of the model that consumes it."""
-        from dbt.adapters.duckrun.delta_dml import split_cte_list
+        from dbt.adapters.duckrun.delta_dml import has_leading_with, split_cte_list
         sql = self.compiled(model, incremental=incremental)
-        names = [name for name, _ in split_cte_list(sql)[1]]
+        parts = split_cte_list(sql)[1]
+        if not parts and has_leading_with(sql):
+            # The compiled SQL opens with WITH but the splitter declined to take it apart.
+            # Reporting [] here would claim the model has no CTEs, which is false.
+            raise DbtProjectError(
+                f"{model!r} has a WITH list this splitter cannot take apart — read it with "
+                f"compiled() instead.")
+        names = [name for name, _ in parts]
         return names if ephemeral else [n for n in names if not n.startswith(_EPHEMERAL_CTE)]
 
     def cte(self, model, name, incremental=None):
@@ -208,16 +220,25 @@ class DbtProject:
 
     @staticmethod
     def _slice_to_cte(sql, name, model) -> str:
-        from dbt.adapters.duckrun.delta_dml import split_cte_list
+        from dbt.adapters.duckrun.delta_dml import has_leading_with, split_cte_list
 
         head, parts, _ = split_cte_list(sql)
         names = [n for n, _ in parts]
         if not names:
+            if has_leading_with(sql):
+                raise DbtProjectError(
+                    f"{model!r} has a WITH list this splitter cannot take apart — read it with "
+                    f"compiled() instead.")
             raise DbtProjectError(
                 f"{model!r} has no CTEs — its compiled SQL is a single SELECT. Use show() instead.")
         if name not in names:
-            raise DbtProjectError(
-                f"{model!r} has no CTE {name!r}. It has: {', '.join(names)}")
+            # DuckDB resolves unquoted identifiers case-insensitively, so `cte(m, 'totals')` must
+            # find a CTE spelled TOTALS. Exact match first; fold only when it is unambiguous.
+            folded = [n for n in names if n.lower() == str(name).lower()]
+            if len(folded) != 1:
+                raise DbtProjectError(
+                    f"{model!r} has no CTE {name!r}. It has: {', '.join(names)}")
+            name = folded[0]
         kept = parts[:names.index(name) + 1]
         # Later CTEs are dropped rather than left in place. DuckDB would not evaluate them anyway —
         # it does not even bind an unused CTE — so this is for what you READ back in
@@ -460,13 +481,13 @@ class DbtProject:
         key = (selector, inline, full_refresh)
         if key not in self._compiled:
             self._compiled[key] = self._run_compile(selector, inline, full_refresh)
-        name, node_id, sql, branches = self._compiled[key]
+        name, node_id, sql, branches, parents = self._compiled[key]
         incremental = self._which_branch(selector, inline, full_refresh, sql, branches)
         # A fresh CompileResult per call: cte() rewrites .sql on it, and that must not reach back
         # into the cache and corrupt the next caller's answer.
         self.last_compile = CompileResult(
             model=name, node_id=node_id, sql=sql, full_refresh=full_refresh,
-            incremental=incremental)
+            incremental=incremental, parents=parents)
         if branches and not full_refresh:
             self._report_branch(self.last_compile)
         return self.last_compile
@@ -592,7 +613,11 @@ class DbtProject:
         node_id = getattr(node, "unique_id", None)
         if node_id is not None:
             self._compiled_nodes.add(node_id)   # so a repeat compile of it re-injects; see above
-        return (getattr(node, "name", selector), node_id, node.compiled_code, branches)
+        # The node's direct parents, taken NOW: for an inline compile the node object outlives the
+        # manifest entry (dbt removes it on success, _drop_inline_node on failure), and these ids
+        # are all view-ancestor binding has left to start from.
+        parents = tuple(getattr(getattr(node, "depends_on", None), "nodes", None) or ())
+        return (getattr(node, "name", selector), node_id, node.compiled_code, branches, parents)
 
     # ── the connection ─────────────────────────────────────────────────────────────────────────
 
@@ -628,7 +653,7 @@ class DbtProject:
             return env
         return DuckrunEnvironment(creds)
 
-    def _bind_view_ancestors(self, node_id):
+    def _bind_view_ancestors(self, node_id, parents=()):
         """Register every ``view``-materialized model the compiled node reads — as a VIEW — before
         running it. By default, on every call; never in reaction to an error.
 
@@ -652,7 +677,13 @@ class DbtProject:
         ancestor's ``_delta_log`` for models you never open.
 
         A VIEW, never a materialization: ``create or replace view``, so the relation stays lazy and
-        ``.filter(...)`` still pushes through it into the ``delta_scan`` underneath."""
+        ``.filter(...)`` still pushes through it into the ``delta_scan`` underneath.
+
+        ``parents`` is the fallback root set for a node the manifest no longer holds — an inline
+        ``sql()`` compile, whose node dbt removes on success and :meth:`_drop_inline_node` on
+        failure. Walking from its recorded parents is the same traversal one level down; without it
+        an inline ``{{ ref() }}`` to a view model found nothing to register and died in the lazy
+        bind, which only knows Delta tables (a view model never wrote one)."""
         nodes = getattr(self._manifest, "nodes", None) or {}
         seen = set()
 
@@ -670,7 +701,11 @@ class DbtProject:
             if nid != node_id and _materialization(node) == "view":
                 self._create_view(node)
 
-        walk(node_id)
+        if node_id in nodes or not parents:
+            walk(node_id)
+        else:
+            for parent in parents:
+                walk(parent)
 
     def _create_view(self, node):
         """``create or replace view`` for one view-materialized model, at the name dbt renders for
@@ -679,9 +714,20 @@ class DbtProject:
         relation = getattr(node, "relation_name", None)
         if not relation or relation in self._bound_views:
             return
-        key = (node.name, None, False)
+        # By full fqn, never by bare name: `--select v_boosted` selects EVERY node of that name, so
+        # one same-named model in an installed package aborted show() on a dependency the caller
+        # never typed ("matched 2 nodes ... narrow the selector" — about a selector they never
+        # wrote). The dotted fqn is unique per node; the id check makes a selector-semantics drift
+        # loud instead of quietly compiling somebody else's SQL into this view.
+        selector = "fqn:" + ".".join(str(part) for part in (getattr(node, "fqn", None) or [node.name]))
+        key = (selector, None, False)
         if key not in self._compiled:
-            self._compiled[key] = self._run_compile(node.name, None, False)
+            self._compiled[key] = self._run_compile(selector, None, False)
+        compiled_id = self._compiled[key][1]
+        if compiled_id != getattr(node, "unique_id", compiled_id):
+            raise DbtProjectError(
+                f"binding the view ancestor {node.name!r}: {selector!r} compiled "
+                f"{compiled_id!r} instead — please report this.")
         sql = self._compiled[key][2]
         schema, database = getattr(node, "schema", None), getattr(node, "database", None)
         if schema:
@@ -711,8 +757,8 @@ class DbtProject:
         # p.sql() later the delta_scan view is back and reads are correct again. Warning about a
         # hazard that repairs itself before it can mislead would be a false statement in a message
         # whose whole job is to be trusted.
-        if self.last_compile is not None and self.last_compile.node_id:
-            self._bind_view_ancestors(self.last_compile.node_id)
+        if self.last_compile is not None and (self.last_compile.node_id or self.last_compile.parents):
+            self._bind_view_ancestors(self.last_compile.node_id, self.last_compile.parents)
         return self._cursor.sql(sql)
 
 
