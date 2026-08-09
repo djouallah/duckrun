@@ -30,10 +30,10 @@ Every still-failing test in the card below falls into one of three categories:
 ## dbt adapter conformance — duckrun
 
 ```
-┌───────────────────────────────────────────────────────┐
-│ ✅ 149 passed   ❌ 4 failed   💥 0 errors   ⏭️ 5 skipped │
-│ 158 total · 94% passing                               │
-└───────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────┐
+│ ✅ 152 passed   ❌ 4 failed   💥 0 errors   ⏭️ 10 skipped │
+│ 166 total · 92% passing                                │
+└────────────────────────────────────────────────────────┘
 ```
 
 ### By suite
@@ -44,20 +44,22 @@ Every still-failing test in the card below falls into one of three categories:
 | `caching` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `concurrency` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `constraints` | `██████████` 100% | 19 | 0 | 0 | 0 | 19 |
+| `drop_relation` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `empty` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `ephemeral` | `██████████` 100% | 3 | 0 | 0 | 0 | 3 |
 | `fast_seed` | `██████████` 100% | 4 | 0 | 0 | 0 | 4 |
+| `get_columns_in_relation` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `incremental_microbatch` | `██████████` 100% | 14 | 0 | 0 | 0 | 14 |
 | `simple_snapshot` | `██████████` 100% | 9 | 0 | 0 | 0 | 9 |
 | `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `unit_testing` | `██████████` 100% | 5 | 0 | 0 | 0 | 5 |
 | `unit_testing_incremental` | `██████████` 100% | 15 | 0 | 0 | 0 | 15 |
 | `basic` | `█████████░` 94% | 15 | 1 | 0 | 0 | 16 |
-| `incremental` | `█████████░` 92% | 24 | 2 | 0 | 0 | 26 |
 | `utils` | `█████████░` 88% | 28 | 0 | 0 | 4 | 32 |
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
+| `incremental` | `████████░░` 76% | 22 | 2 | 0 | 5 | 29 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `█████████░` **94%** | **149** | **4** | **0** | **5** | **158** |
+| **Total** | `█████████░` **92%** | **152** | **4** | **0** | **10** | **166** |
 
 ### Incremental / write support
 
@@ -92,7 +94,7 @@ Every still-failing test in the card below falls into one of three categories:
 | ❌ | `TestChangeRelationTypesDuckDB::test_changing_materialization_changes_relation_type` | AssertionError: dbt exit state did not match expected |
 
 </details>
-<details><summary><b>incremental</b> — 2 not passing (24/26 pass)</summary>
+<details><summary><b>incremental</b> — 2 not passing (22/29 pass)</summary>
 
 | Outcome | Test | Message |
 | --- | --- | --- |
