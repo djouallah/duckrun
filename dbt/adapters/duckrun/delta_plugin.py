@@ -916,9 +916,13 @@ class Plugin(BasePlugin):
             else:
                 clause_keys = ("when_matched", "when_not_matched", "when_not_matched_by_source")
                 if not any(k in merge_clauses for k in clause_keys):
+                    # Wording pinned by the vendored conformance test (dbt-duckdb 1.11.0 asserts
+                    # the "'when_matched' or 'when_not_matched'" substring verbatim); the duckrun
+                    # superset key is mentioned after it.
                     errors.append(
                         "merge_clauses must contain at least one of "
-                        "'when_matched', 'when_not_matched', or 'when_not_matched_by_source' keys"
+                        "'when_matched' or 'when_not_matched' keys "
+                        "('when_not_matched_by_source' is also accepted)"
                     )
                 for ct in clause_keys:
                     if ct not in merge_clauses:

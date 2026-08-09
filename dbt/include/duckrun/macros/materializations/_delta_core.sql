@@ -194,7 +194,10 @@
   {%- set _batch_start = _batch.get('event_time_start').strftime('%Y-%m-%d %H:%M:%S') if _batch and _batch.get('event_time_start') else none -%}
   {%- set _batch_end = _batch.get('event_time_end').strftime('%Y-%m-%d %H:%M:%S') if _batch and _batch.get('event_time_end') else none -%}
 
-  {#-- 2. Hand off to the delta-write plugin (store -> write_deltalake / merge) --#}
+  {#-- 2. Hand off to the delta-write plugin (store -> write_deltalake / merge).
+       partition/sort: dbt-duckdb 1.11 canonicalized the spellings as partitioned_by/sorted_by
+       (aliasing our spellings both ways); accept its spellings with the same precedence,
+       canonical name first. --#}
   {%- set delta_config = {
       'incremental': is_incremental,
       'incremental_strategy': config.get('incremental_strategy'),
@@ -204,8 +207,8 @@
       'not_null_columns': not_null_columns,
       'full_refresh': should_full_refresh(),
       'unique_key': config.get('unique_key'),
-      'partition_by': config.get('partition_by'),
-      'sort_by': config.get('sort_by'),
+      'partition_by': config.get('partitioned_by') or config.get('partition_by'),
+      'sort_by': config.get('sorted_by') or config.get('sort_by'),
       'max_row_group_size': config.get('max_row_group_size'),
       'target_file_size_mb': config.get('target_file_size_mb'),
       'merge_schema': config.get('merge_schema', false),
