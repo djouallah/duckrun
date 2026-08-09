@@ -176,6 +176,39 @@ def test_scratch_objects_are_still_allowed(creds):
     assert cur.sql("select b from v_scratch").fetchall() == [(2,)]
 
 
+FILE_WRITES = [
+    "copy (select 1 as x) to '{out}' (format parquet)",
+    "copy \"memory\".\"main\".\"events\" to '{out}'",
+    "export database '{out}'",
+]
+
+
+@pytest.mark.parametrize("stmt", FILE_WRITES)
+def test_file_exports_are_rejected_and_nothing_lands_on_disk(tmp_path, creds, stmt):
+    """COPY ... TO / EXPORT DATABASE classify as passthrough — native DuckDB, no delta_rs — but
+    they write files wherever this session's live store credentials reach, and no read-only
+    delta_scan view sits downstream to refuse them. Here the check IS the safety, so the file must
+    not exist afterwards."""
+    from dbt.adapters.duckrun.environment import DuckrunReadOnlyError
+
+    out = tmp_path / "leak.out"
+    env, cur = _fresh_debug_cursor(creds)
+    with pytest.raises(DuckrunReadOnlyError):
+        cur.sql(stmt.format(out=out.as_posix()))
+    assert not out.exists()
+
+
+def test_copy_from_into_scratch_is_still_allowed(tmp_path, creds):
+    """COPY <table> FROM loads a file INTO the catalog — scratch territory, the same contract as
+    CREATE TEMP TABLE. Only the writing direction (a top-level TO) is refused."""
+    src = tmp_path / "in.csv"
+    src.write_text("a\n1\n2\n", encoding="utf-8")
+    env, cur = _fresh_debug_cursor(creds)
+    cur.sql("create temp table loaded (a int)")
+    cur.sql(f"copy loaded from '{src.as_posix()}' (header)")
+    assert cur.sql("select count(*) from loaded").fetchall() == [(2,)]
+
+
 # ── 3. the run path is unchanged ───────────────────────────────────────────────────────────────
 
 def test_run_cursor_still_writes_through_delta_rs(project, creds):

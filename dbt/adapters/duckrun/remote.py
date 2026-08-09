@@ -199,15 +199,17 @@ def list_delta_tables_via_glob(cursor, root_path: str, schema: str) -> List[str]
     the caller is responsible for having minted whatever store secret the glob needs first
     (az://, s3, gcs). OneLake (``abfss://``) can't be globbed; use ``list_delta_tables`` there.
 
-    Returns ``[]`` if nothing matches or the glob errors (e.g. the schema dir doesn't exist yet)."""
+    Returns ``[]`` when nothing matches — which is what an absent schema dir produces: DuckDB's
+    ``glob`` yields zero rows for a missing path, no error. Raises on everything else (missing
+    secret, transport failure, absent bucket): those are stores we genuinely cannot see right now,
+    and degrading them to an empty schema makes every table vanish from the relation cache, flips
+    ``is_incremental()`` off, and full-refreshes over the table — the same silent clobber
+    ``list_delta_tables`` fails loud on for OneLake."""
     base = root_path.rstrip("/") + "/" + str(schema).strip('"')
     # `*` matches one path segment (the table dir); every committed Delta table has at least one
     # commit json (00..0.json is unreliable after cleanup_metadata()).
     pattern = (base + "/*/_delta_log/*.json").replace("'", "''")
-    try:
-        rows = cursor.execute(f"SELECT DISTINCT file FROM glob('{pattern}')").fetchall()
-    except Exception:  # missing dir / unsupported store -> no tables (caller may log)
-        return []
+    rows = cursor.execute(f"SELECT DISTINCT file FROM glob('{pattern}')").fetchall()
 
     marker = "/_delta_log/"
     names: List[str] = []

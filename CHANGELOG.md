@@ -5,6 +5,44 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **`p.sql()` can now read a `ref()` to a view-materialized model on a cold session** (#29
+  follow-up). An inline compile's node is out of the manifest before anything runs — dbt removes it
+  on success, the session's own cleanup on failure — so view-ancestor binding, which started from
+  the node id, found nothing to register and the ref died in the lazy bind (`Catalog Error`,
+  because a view model never wrote a Delta table for it to find). `show()` of the same model
+  worked, which made the failure look like the user's SQL. The compile now records the inline
+  node's direct parents and binding walks from them.
+- **A same-named model in an installed package no longer aborts `show()`** (#29 follow-up). View
+  ancestors were compiled by bare name, and `--select v_boosted` matches every node of that name —
+  so a package shipping any model with the same name failed a `show()` the caller HAD named
+  unambiguously, with "narrow the selector" advice about a selector they never wrote. Ancestors now
+  compile by full dotted fqn (`fqn:pkg.….model`), with the returned node id checked.
+- **CTE slicing now walks the WITH list's structure instead of hunting for a `SELECT` keyword**
+  (#29 follow-up). A main query of `(select …) union all (select …)` has no top-level `SELECT` at
+  all, so `ctes()` reported `[]` and `cte()` claimed the model "has no CTEs" — false for a model
+  that plainly has them; and DuckDB's FROM-first syntax (`from base select …`) put the hunted
+  keyword mid-query, so the last CTE's text silently swallowed `from base` and the splice ran two
+  body clauses. The splitter now hands over to the main query at the token that follows the last
+  CTE body, whatever the query starts with. A WITH list the splitter still cannot take apart is now
+  said out loud instead of being reported as "no CTEs", and `cte()` matches names
+  case-insensitively, as DuckDB itself resolves identifiers.
+- **The read-only debug cursor refuses `COPY … TO` and `EXPORT DATABASE`.** Both classify as
+  passthrough — native DuckDB, no delta_rs route — but they write files wherever the session's live
+  store credentials reach, including the lakehouse, and no read-only `delta_scan` view sits
+  downstream to refuse them. `COPY <table> FROM …` (loading into a scratch table) still works.
+- **A store error during glob discovery fails the run instead of emptying the schema.** On
+  local / `az://` / `s3://` / `gs://` roots, `list_delta_tables_via_glob` caught every exception
+  and returned `[]` — but DuckDB's `glob` already yields zero rows (no error) for a missing schema
+  dir, so the only things the catch ever converted were real failures: a missing/expired secret, a
+  transport error, an absent bucket. An empty listing makes every table vanish from dbt's relation
+  cache, flips `is_incremental()` off, and the next run full-refreshes over the table — the exact
+  silent clobber OneLake discovery already fails loud on. Glob stores now share that contract.
+- **`partitioned_by` / `sorted_by` follow upstream's precedence exactly** (dbt-duckdb 1.11
+  follow-up). The aliases were resolved with a truthiness `or`, so a canonical empty list —
+  `partitioned_by: []`, an explicit "no partitioning" — silently fell through to a legacy
+  `partition_by` and the model got partitioned anyway. Upstream keeps the canonical value unless it
+  is none or `''`, and rejects an empty column list outright ("must contain at least one column");
+  duckrun now does both, in `_delta_core.sql` and `seed.sql`.
 - **Column-mapped tables no longer report their statistics under generated GUIDs** (#32). A Delta
   table with `delta.columnMapping.mode` on keys its parquet footer and its `add.stats` by a physical
   `col-<guid>` name, so `get_stats(detailed=True)` returned per-column size / encoding / dictionary

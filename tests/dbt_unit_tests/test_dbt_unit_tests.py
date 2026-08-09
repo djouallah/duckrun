@@ -146,6 +146,24 @@ def test_canonical_spellings_sorted_by_partitioned_by(tmp_path):
         assert keys == sorted(keys), f"partition {bucket} not physically sorted: {keys}"
 
 
+def test_alias_precedence_matches_upstream(tmp_path):
+    """dbt-duckdb 1.11's precedence, exactly: when both spellings are set the canonical
+    partitioned_by wins, and a canonical EMPTY list is upstream's compiler error ("must contain at
+    least one column") — never a silent fall-through to the legacy key (which would partition a
+    model whose config explicitly said not to) and never a silently unpartitioned table."""
+    from deltalake import DeltaTable
+
+    wh = _wh(tmp_path)
+    assert _dbt(wh, "run", "--select", "alias_precedence_layout", "--vars",
+                "{alias_partitioned_by: ['bucket'], alias_partition_by: ['id']}").success
+    dt = DeltaTable(f"{wh}/{SCHEMA}/alias_precedence_layout")
+    assert dt.metadata().partition_columns == ["bucket"], dt.metadata().partition_columns
+
+    res = _dbt(wh, "run", "--select", "alias_precedence_layout", "--vars",
+               "{alias_partitioned_by: [], alias_partition_by: ['id']}")
+    assert not res.success, "partitioned_by: [] must be an error, not a fall-through"
+
+
 def test_geometry_configs_reach_the_writer(tmp_path):
     """max_row_group_size / target_file_size_mb must survive the materialization macro's config
     hand-off. This is the hop that broke in 0.4.43: _delta_core.sql's delta_config carried sort_by

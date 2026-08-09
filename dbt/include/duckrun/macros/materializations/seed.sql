@@ -64,12 +64,20 @@
   {%- set columns = adapter.get_columns_in_relation(tmp_relation) -%}
 
   {#-- 2. Hand the staged rows to the delta-write plugin: a plain overwrite, exactly like `table`.
-        partition: dbt-duckdb 1.11's canonical spelling accepted too, same precedence as _delta_core. --#}
+        partition: dbt-duckdb 1.11's canonical spelling accepted too, upstream precedence exactly
+        as _delta_core (canonical wins unless none or ''; an empty column list is an error). --#}
+  {%- set _partition_by = config.get('partitioned_by') -%}
+  {%- if _partition_by is none or _partition_by == '' -%}
+    {%- set _partition_by = config.get('partition_by') -%}
+  {%- endif -%}
+  {%- if _partition_by is not none and _partition_by is not string and _partition_by | length == 0 -%}
+    {% do exceptions.raise_compiler_error("partitioned_by/partition_by must contain at least one column") %}
+  {%- endif -%}
   {%- set delta_config = {
       'incremental': false,
       'full_refresh': should_full_refresh(),
       'storage_options': config.get('storage_options'),
-      'partition_by': config.get('partitioned_by') or config.get('partition_by'),
+      'partition_by': _partition_by,
   } -%}
   {% do adapter.store_relation('duckrun', tmp_relation, columns, location, 'delta', delta_config) %}
 

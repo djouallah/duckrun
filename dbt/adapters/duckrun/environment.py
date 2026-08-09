@@ -54,6 +54,15 @@ class DuckrunReadOnlyError(RuntimeError):
     """A write was attempted on a read-only duckrun cursor (``duckrun.dbt_project``)."""
 
 
+# Statements that write OUTSIDE the DuckDB catalog — files, or another attached database — from a
+# session holding live store credentials. `classify` calls these passthrough (correctly: they are
+# native DuckDB, no delta_rs route), so the read-only cursor must catch them itself: unlike a
+# catalog write there is no delta_scan view downstream to refuse them.
+_COPY_HEAD = re.compile(r"\s*copy\b", re.I)
+_COPY_TO_KW = re.compile(r"\bto\b", re.I)   # leading \b: `manifesto` must not read as ... TO
+_EXPORT_HEAD = re.compile(r"\s*export\s+database\b", re.I)
+
+
 class _DeltaBindCursor(DuckDBCursorWrapper):
     """The cursor machinery both of duckrun's cursor kinds need: the OneLake token refresh every
     statement depends on, and the lazy bind that resolves a duckrun model to its Delta location
@@ -271,24 +280,42 @@ class DuckrunDebugCursor(_DeltaBindCursor):
     def _reject_write(self, sql) -> None:
         """Raise for a statement whose FORM writes.
 
-        This is the error MESSAGE, not the safety — the safety is that this class has no delta_rs
-        route at all. Without it a write still fails, but as DuckDB's bare "cannot ... a view",
-        which never explains that the view is a view because duckrun made it one. Classified by the
-        very ``delta_dml.classify`` the write path routes on, so "what counts as a write" can't
-        drift between the two. ``CREATE TEMP TABLE`` / ``CREATE VIEW`` classify as passthrough and
-        stay allowed: scratch objects are how you actually debug.
+        For a Delta write this is the error MESSAGE, not the safety — the safety is that this class
+        has no delta_rs route at all. Without it a write still fails, but as DuckDB's bare "cannot
+        ... a view", which never explains that the view is a view because duckrun made it one.
+        Classified by the very ``delta_dml.classify`` the write path routes on, so "what counts as
+        a write" can't drift between the two. ``CREATE TEMP TABLE`` / ``CREATE VIEW`` classify as
+        passthrough and stay allowed: scratch objects are how you actually debug.
+
+        For ``COPY ... TO`` / ``COPY FROM DATABASE ... TO`` / ``EXPORT DATABASE`` the check IS the
+        safety: they classify passthrough (native DuckDB, no delta_rs), but they write files —
+        anywhere the session's live store credentials reach, including the lakehouse — and there is
+        no read-only view downstream to refuse them. ``COPY <table> FROM ...`` (a load into a
+        scratch table) keeps working; a top-level ``TO`` is what marks the writing direction.
 
         Single-statement by construction (classify takes one statement). A multi-statement script
         whose first statement reads slips past the message — and then fails anyway, on the view, in
         DuckDB. Degraded message, never degraded safety."""
-        if delta_dml.classify(sql) == "passthrough":
-            return
         first = " ".join(str(sql).split())[:120]
-        raise DuckrunReadOnlyError(
-            f"read-only debug session: this statement writes.\n    {first}\n"
-            "duckrun models are read-only delta_scan views here, so nothing in this session can "
-            "reach delta_rs. To write, use `dbt run` or duckrun.connect(..., read_only=False)."
-        )
+        if delta_dml.classify(sql) != "passthrough":
+            raise DuckrunReadOnlyError(
+                f"read-only debug session: this statement writes.\n    {first}\n"
+                "duckrun models are read-only delta_scan views here, so nothing in this session "
+                "can reach delta_rs. To write, use `dbt run` or "
+                "duckrun.connect(..., read_only=False)."
+            )
+        mask = delta_dml._blank_string_literals(
+            delta_dml._strip_comments(str(sql), keep_length=True))
+        if _EXPORT_HEAD.match(mask) or (
+                _COPY_HEAD.match(mask)
+                and delta_dml._find_top_level(mask, _COPY_TO_KW) >= 0):
+            raise DuckrunReadOnlyError(
+                f"read-only debug session: this statement writes files.\n    {first}\n"
+                "COPY ... TO / EXPORT DATABASE write with this session's store credentials, so a "
+                "read-only session refuses them. To export, materialize through "
+                "duckrun.connect(..., read_only=False), or fetch the relation and write it "
+                "client-side."
+            )
 
 
 class DuckrunEnvironment(LocalEnvironment):

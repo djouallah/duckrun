@@ -195,9 +195,24 @@
   {%- set _batch_end = _batch.get('event_time_end').strftime('%Y-%m-%d %H:%M:%S') if _batch and _batch.get('event_time_end') else none -%}
 
   {#-- 2. Hand off to the delta-write plugin (store -> write_deltalake / merge).
-       partition/sort: dbt-duckdb 1.11 canonicalized the spellings as partitioned_by/sorted_by
-       (aliasing our spellings both ways); accept its spellings with the same precedence,
-       canonical name first. --#}
+       partition/sort: dbt-duckdb 1.11 canonicalized the spellings as partitioned_by/sorted_by.
+       Upstream precedence, verbatim: the canonical name wins unless it is none or '' — an empty
+       LIST is kept, not quietly rescued by a legacy partition_by/sort_by, and (as upstream) an
+       empty column list is a hard error rather than a silently unpartitioned/unsorted table. --#}
+  {%- set _partition_by = config.get('partitioned_by') -%}
+  {%- if _partition_by is none or _partition_by == '' -%}
+    {%- set _partition_by = config.get('partition_by') -%}
+  {%- endif -%}
+  {%- if _partition_by is not none and _partition_by is not string and _partition_by | length == 0 -%}
+    {% do exceptions.raise_compiler_error("partitioned_by/partition_by must contain at least one column") %}
+  {%- endif -%}
+  {%- set _sort_by = config.get('sorted_by') -%}
+  {%- if _sort_by is none or _sort_by == '' -%}
+    {%- set _sort_by = config.get('sort_by') -%}
+  {%- endif -%}
+  {%- if _sort_by is not none and _sort_by is not string and _sort_by | length == 0 -%}
+    {% do exceptions.raise_compiler_error("sorted_by/sort_by must contain at least one column") %}
+  {%- endif -%}
   {%- set delta_config = {
       'incremental': is_incremental,
       'incremental_strategy': config.get('incremental_strategy'),
@@ -207,8 +222,8 @@
       'not_null_columns': not_null_columns,
       'full_refresh': should_full_refresh(),
       'unique_key': config.get('unique_key'),
-      'partition_by': config.get('partitioned_by') or config.get('partition_by'),
-      'sort_by': config.get('sorted_by') or config.get('sort_by'),
+      'partition_by': _partition_by,
+      'sort_by': _sort_by,
       'max_row_group_size': config.get('max_row_group_size'),
       'target_file_size_mb': config.get('target_file_size_mb'),
       'merge_schema': config.get('merge_schema', false),
