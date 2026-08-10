@@ -144,12 +144,14 @@ Each catalog carries its own `storage_options`, so a per-Lakehouse OneLake token
 mints a path-scoped DuckDB secret per catalog). `ref()` resolves across catalogs, and
 `is_incremental()` / `dbt docs generate` work per Lakehouse.
 
-### Multiple environments (dev / PPE / prod)
+### Multiple environments (dev / test / prod)
 
-A team promoting the same project across Fabric workspaces (dev → PPE → prod) needs one **target**
+A team promoting the same project across Fabric workspaces (dev → test → prod) needs one **target**
 per environment, each pointing its `catalogs:` aliases at that environment's own Lakehouses. Reuse
 the same alias names in every target — only the `root_path`s change — so model config
-(`+database: lh_bronze`) doesn't need to differ per environment.
+(`+database: lh_bronze`) doesn't need to differ per environment. `storage_options` can stay empty on
+OneLake — duckrun self-acquires the token per environment (see
+[OneLake authentication](#onelake-authentication--tokens-are-optional)).
 
 ```yaml
 my_project:
@@ -158,31 +160,25 @@ my_project:
     dev:
       type: duckrun
       root_path: "abfss://dev_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
-      storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
       catalogs:
         lh_bronze:
           root_path: "abfss://dev_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
-          storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
-    ppe:
+    test:
       type: duckrun
-      root_path: "abfss://ppe_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
-      storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
+      root_path: "abfss://test_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
       catalogs:
         lh_bronze:
-          root_path: "abfss://ppe_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
-          storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
+          root_path: "abfss://test_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
     prod:
       type: duckrun
       root_path: "abfss://prod_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
-      storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
       catalogs:
         lh_bronze:
           root_path: "abfss://prod_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
-          storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
 ```
 
 ```bash
-dbt run --target ppe
+dbt run --target test
 ```
 
 Model config (`+database: lh_bronze`) never mentions an environment, so the same project runs
@@ -210,33 +206,9 @@ the current target has no `lh_bronze` entry under `catalogs:` — a typo, or a t
 updated yet — Jinja renders it as an empty string instead of failing, so the source silently becomes
 `/dbo/raw_events`, and the failure surfaces later as a confusing
 `InvalidTableLocationError: Path does not exist` (or an empty read) rather than a clear "unknown
-catalog" error. Catch it up front with an `on-run-start` guard that checks every alias your sources
-rely on before anything runs:
-
-```sql
--- macros/require_catalogs.sql
-{% macro require_catalogs(aliases) %}
-  {% for alias in aliases %}
-    {% if alias not in (target.catalog_locations or {}) %}
-      {{ exceptions.raise_compiler_error("target '" ~ target.name ~ "' has no `" ~ alias ~ "` catalog") }}
-    {% endif %}
-  {% endfor %}
-{% endmacro %}
-```
-
-#### Guarding production
-
-To stop an accidental `dbt run --target prod` (or a `--full-refresh` a prod run should never take),
-add another `on-run-start` macro that checks `target.name` before anything executes:
-
-```sql
--- macros/guard_prod.sql
-{% macro guard_prod() %}
-  {% if target.name == 'prod' and flags.FULL_REFRESH %}
-    {{ exceptions.raise_compiler_error("--full-refresh is blocked against target 'prod'") }}
-  {% endif %}
-{% endmacro %}
-```
+catalog" error. If that's a risk for your project, check membership (`'lh_bronze' in
+target.catalog_locations`) before indexing — e.g. in an `on-run-start` macro that fails the run early
+with a clear message instead of letting it surface downstream.
 
 ```yaml
 # dbt_project.yml — both guards run on every invocation, in order
