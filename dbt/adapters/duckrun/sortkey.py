@@ -27,6 +27,10 @@ The recommendation, in order:
      functionally-dependent columns (they cluster for free), stop at the table's grain, cap at 4.
   5. the key-organized special case: a (near-)unique key that barely compresses is sorted for
      join/segment locality instead of the marginal compression key.
+  6. measure TAIL slots: below the dim key, greedily append the measures whose in-group ordering
+     pays real modeled bytes — correlated/zero-heavy measures collapse into runs there (probe:
+     tests/parquet_layout/nyc — ~62% of a run-minimizing writer's money-column win, from ORDER BY
+     alone). Tails refine order INSIDE each dim group, so the dims queries filter on are untouched.
 """
 import math
 import re
@@ -40,7 +44,14 @@ _SKEW_EXACT_NDV = 100_000
 # plumbing — sample sizing, the explicit exact flag, seeding, returning lines instead of printing —
 # does NOT bump it. Appended to the recommendation header so a recommendation is attributable to the
 # model that produced it, making future threshold churn traceable.
-MODEL_VERSION = "2"
+# v3: measure tail slots (step 6) — measures may now FOLLOW the dim key, never hold a dim slot.
+MODEL_VERSION = "3"
+
+# A tail slot must pay for itself twice over: save at least ``tail_gain_frac`` of the measure's own
+# modeled bytes (an in-group sort that barely moves a column isn't worth a longer key) AND at least
+# this fraction of the whole table's modeled bytes (a near-empty column can pass the relative test
+# on savings nobody would ever notice — nyc mta_tax/improvement_surcharge are the measured case).
+_TAIL_MIN_TABLE_FRAC = 0.005
 
 # Sample-sizing knobs — NOT the recommendation byte model. A byte budget divided by an estimated
 # in-memory row width gives a width-aware row count: a wide table samples fewer rows, a narrow one
@@ -138,7 +149,7 @@ def estimate_row_bytes(types):
 def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        sort_key_cap=4, min_gain_pct=1.0, key_sort_below_pct=10.0,
                        stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,
-                       *, sample_rows, exact):
+                       *, sample_rows, exact, tail_cap=4, tail_gain_frac=0.25):
     """The sort-key model, run against the materialized sample ``src`` on connection ``con``. All
     counts (``n``, ``ndv``, run estimates) are SAMPLE estimates — enough to rank candidates and test
     functional dependencies, not exact table cardinalities.
@@ -156,7 +167,9 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     ``sample_rows`` is the number of rows the caller materialized, and ``exact`` says whether that
     sample IS the whole table (the caller knows — it planned the sample). ``exact`` gates the
     uniqueness claim (a sample can't tell a unique key from a merely higher-than-sample column) and
-    the "profiled a N-row sample" advisory line.
+    the "profiled a N-row sample" advisory line. ``tail_cap`` bounds the measure tail (step 6) and
+    ``tail_gain_frac`` is its keep-the-slot relative byte gate — tail slots are IN ADDITION to
+    ``sort_key_cap``, which stays a dim-only budget.
 
     Returns ``(rows, schema, lines)`` — one row per column, ``schema`` a DuckDB DDL string, and
     ``lines`` the advisory text for the CALLER to print (this module prints nothing)."""
@@ -377,19 +390,70 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                 f"is at its floor" + (f", best-effort compression sort {', '.join(comp_alt)} only "
                 f"~{comp_saved:.1f}%" if comp_alt else ""))
 
+    # 6) measure TAIL slots (probe-backed: tests/parquet_layout/nyc). Within the kept dim prefix,
+    # ordering rows BY the measures themselves collapses correlated / zero-heavy measures into runs
+    # (nyc: fare/tip/tolls + the near-FD total_amount — ~62% of a run-minimizing writer's
+    # money-column advantage, from plain ORDER BY). R7 stands: a measure never holds a DIM slot —
+    # a tail slot sits BELOW every dim, refining order inside each dim group, so nothing queries
+    # filter on is disturbed and the grain stop above is unaffected. Greedy by MARGINAL modeled
+    # byte saving at the growing tail prefix, one batched HLL scan per level exactly like the dim
+    # loop — marginal credit is what keeps a wide measure (nyc trip_distance) from grabbing the
+    # first tail slot and fragmenting the runs of every measure after it. R5's FD band applies to
+    # tails too, against the TAIL prefix's grain: a measure (near-)determined by the prefix
+    # (amount ← region) already clusters for free under the dim sort — a slot on it orders nothing
+    # and its iid-relative "saving" belongs to the dims, not the slot. A candidate that clears the
+    # band but stays near-FD (nyc total_amount ≈ fare+tip+tolls) still earns a slot by breaking
+    # the prefix's remaining ties. A candidate whose in-group runs stay ~iid (the dim prefix is
+    # already at the table's grain) models a ~zero saving and is never kept — the byte gate is the
+    # grain stop here. Key-organized tables skip tails entirely: a unique key leaves no groups.
+    tail = []
+    if sort_key and note is None:
+        t_remaining = [c for c in cols
+                       if _is_measure(types[c]) and ndv[c] > 1
+                       and c not in null_heavy and c not in partition_cols]
+        t_grain = kept_ndv                    # grain of the kept dim prefix (dim loop invariant)
+        t_prefix = list(sort_key)
+        while t_remaining and len(tail) < tail_cap:
+            pfx = ", ".join(_qid(x) for x in t_prefix)
+            scan = list(t_remaining)          # trow is indexed by THIS order; t_remaining mutates
+            sel = ", ".join(
+                f"approx_count_distinct(hash({pfx}, {_qid(c)})) AS t{j}"
+                for j, c in enumerate(scan))
+            trow = con.sql(f"SELECT {sel} FROM {src}").fetchone()
+            best, best_runs, best_save = None, None, 0.0
+            for j, c in enumerate(scan):
+                runs = max(int(trow[j] or 0), 1)
+                # FD of the prefix → clusters for free, permanently out (FD survives prefix growth).
+                if runs < t_grain * (1.0 + fd_band):
+                    t_remaining.remove(c)
+                    continue
+                save = iid_bytes[c] - _col_bytes(c, runs)
+                if save > best_save:
+                    best, best_runs, best_save = c, runs, save
+            if (best is None
+                    or best_save < tail_gain_frac * iid_bytes[best]
+                    or best_save < _TAIL_MIN_TABLE_FRAC * baseline_total):
+                break
+            tail.append(best)
+            sorted_runs[best] = best_runs
+            t_grain = best_runs
+            t_prefix.append(best)
+            t_remaining.remove(best)
+
     # Partition columns lead the physical order, so they end up perfectly grouped (runs = ndv) —
     # and Delta stores them in the path, not the data file. Reflect that clustered state so they
     # don't show a spurious size regression against their already-partitioned current layout.
     for c in partition_cols:
         sorted_runs[c] = ndv[c]
     est_sorted, sorted_total = _bytes_for(sorted_runs)
-    pos = {c: i + 1 for i, c in enumerate(sort_key)}
+    pos = {c: i + 1 for i, c in enumerate(sort_key + tail)}
     # a genuine unique key's dictionary is inherent — you cannot "cut" a key's cardinality — so a
     # column flagged dictionary-bound is only the non-key high-card hash columns.
     dict_bound = [c for c in cols if _encoding(types[c]) == "hash" and c not in unique_cols
                   and _dict_bytes(c) > 0.5 * est_sorted[c] and ndv[c] > 0.5 * max(n, 1)]
-    # measures aren't sortable-away; a costly one shrinks by cutting precision / splitting the column.
-    heavy_measures = [c for c in cols if _is_measure(types[c])
+    # a measure the tail didn't rescue isn't sortable-away; a costly one shrinks by cutting
+    # precision / splitting the column. Tail members are excluded — their slot IS the fix.
+    heavy_measures = [c for c in cols if _is_measure(types[c]) and c not in tail
                       and est_sorted[c] > 0.15 * max(sorted_total, 1)]
 
     def _kb(x):
@@ -401,7 +465,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # R8: partition columns lead the printed ORDER BY (write-locality) but hold no key slot. This
     # module PRINTS NOTHING — it collects the advisory into ``lines`` and the caller prints them
     # (``_get_rle`` prints all; the no-arg ``sort()`` path prints only the ORDER BY line).
-    order_cols = partition_cols + [c for c in sort_key if c not in partition_cols]
+    order_cols = partition_cols + [c for c in sort_key + tail if c not in partition_cols]
     lines = [f"\nrecommend_sort_key('{sch}.{tbl}') — sort-key recommendation (experimental) "
              f"[model v{MODEL_VERSION}]:"]
     if not exact:
@@ -416,6 +480,9 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # (CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t) and measuring via the Delta log.
     if note:
         lines.append(f"  ({note})")
+    if tail:
+        lines.append(f"  (measure tail — in-group ordering below the dim key, dims untouched: "
+                     f"{', '.join(tail)})")
     if dict_bound:
         lines.append(f"  (dictionary-bound — sort won't help, cut cardinality: {', '.join(dict_bound)})")
     if heavy_measures:
@@ -430,5 +497,5 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     rows = [(f"{sch}.{tbl}", c in pos, pos.get(c, 0), c, types[c], _encoding(types[c]), ndv[c],
              round(100.0 * simpson[c], 2), current_runs[c], c in unique_set, _kb(est_current[c]),
              _kb(est_sorted[c]), _saved(est_current[c], est_sorted[c]))
-            for c in sort_key + rest]
+            for c in sort_key + tail + rest]
     return rows, _SCHEMA, lines

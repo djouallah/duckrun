@@ -1,0 +1,3 @@
+# probe working dirs — raw TLC months (download cache) and the local Delta tables it writes
+_data/
+_out/

@@ -252,6 +252,47 @@ def test_optimize_analyze_seed_is_deterministic(session, capsys):
     assert r1 == r2
 
 
+# ── 17. Measure tail (step 6): a dim-correlated zero-heavy measure gets a TAIL slot, below the ──
+#        dim key — the nyc fare/tip/tolls shape (probe: tests/parquet_layout/nyc). ───────────────
+def test_measure_tail_zero_heavy():
+    con = duckdb.connect()
+    # price is 0 for three of region's four values and takes 7 small values under region=3 —
+    # ordering rows by price INSIDE each region group collapses it into a handful of runs.
+    recs, lines = _profile(
+        con, "select (i % 4) as region, "
+             "(case when i % 4 = 3 then ((i // 4) % 7) * 1.5 else 0 end)::double as price "
+             "from range(4000) t(i)")
+    assert recs["region"]["in_sort_key"] and recs["region"]["sort_position"] == 1
+    assert recs["price"]["in_sort_key"]                                  # earned a tail slot …
+    assert recs["price"]["sort_position"] > recs["region"]["sort_position"]  # … below every dim
+    assert any("measure tail" in ln and "price" in ln for ln in lines)
+    assert any(ln.strip().startswith("ORDER BY region, price") for ln in lines)
+
+
+# ── 17b. Tail FD band: a measure determined by the dims clusters for free — no slot; an ─────────
+#         uncorrelated continuous measure has no in-group runs to buy — no slot either. ──────────
+def test_measure_tail_fd_and_uncorrelated_refused():
+    con = duckdb.connect()
+    recs, lines = _profile(
+        con, "select (i % 4) as region, ((i % 4) * 1.5)::double as fd_amount, "
+             "(i * 1.7)::double as noise_price from range(4000) t(i)")
+    assert recs["region"]["in_sort_key"]
+    assert not recs["fd_amount"]["in_sort_key"]      # FD of region → free clustering, no slot
+    assert not recs["noise_price"]["in_sort_key"]    # in-group runs ~iid → no modeled saving
+    assert not any("measure tail" in ln for ln in lines)
+
+
+# ── 17c. Key-organized tables grow no tail: a unique key leaves no groups to refine. ────────────
+def test_measure_tail_skipped_when_key_organized():
+    con = duckdb.connect()
+    recs, lines = _profile(
+        con, "select i as pk, (case when i % 4 = 3 then ((i // 4) % 7) * 1.5 else 0 end)::double "
+             "as price from range(500) t(i)")
+    assert _key_order(recs) == ["pk"]
+    assert not recs["price"]["in_sort_key"]
+    assert not any("measure tail" in ln for ln in lines)
+
+
 # ── 16. decimal_narrow_target: a wide DECIMAL (p>18 → FLBA, no arrow-rs dictionary) narrows to ──
 #        DECIMAL(18,s) iff its EXACT max fits; scale is preserved. Pure — no DB. ──────────────────
 def test_decimal_narrow_target():
