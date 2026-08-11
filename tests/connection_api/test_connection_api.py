@@ -1651,18 +1651,18 @@ def _live_row_groups(conn, table):
 
 def test_ctas_small_result_adapts_row_groups(conn):
     # A small CTAS result should shrink its row-group ceiling so the table yields more than the 2
-    # segments the 16M constant would give. 20M rows / ceil(20M/8) = 2.5M, raised to the 6M estimate
-    # floor (_RG_MIN_ESTIMATED) → 4 groups. The floor is what keeps a bad planner estimate from
-    # pinning a table to the bottom of the segment band, and it costs lanes below _RG_LANES × 6M rows.
+    # segments the 16M constant would give. 20M rows / ceil(20M/8) = 2.5M, raised to the 8M estimate
+    # floor (_RG_MIN_ESTIMATED) → 3 groups. The floor is what keeps a bad planner estimate from
+    # pinning a table to the bottom of the segment band, and it costs lanes below _RG_LANES × 8M rows.
     conn.sql("CREATE OR REPLACE TABLE small_ctas AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "small_ctas")
-    assert 3 <= n <= 5, f"expected ~4 row groups (20M at the 6M estimate floor), got {n}"
+    assert 3 <= n <= 5, f"expected ~3 row groups (20M at the 8M estimate floor), got {n}"
 
 
 def test_ctas_sorted_result_adapts_row_groups(conn):
     # Same, but SORTED BY (j): the projection above ORDER_BY reports Estimated Cardinality "0", so a
     # naive estimator would collapse to the floor. The zero-skip must descend past it — which at 20M
-    # rows is now only visible as "not RG_MAX", since the floor and the adapted size both give 4.
+    # rows is now only visible as "not RG_MAX", since the floor and the adapted size both give 3.
     conn.sql("CREATE OR REPLACE TABLE sorted_ctas SORTED BY (j) AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "sorted_ctas")
     assert 3 <= n <= 5, f"sorted CTAS collapsed/inflated to {n} row groups (zero-estimate not skipped?)"
@@ -1727,11 +1727,11 @@ def test_overwrite_floors_the_estimate_with_the_prior_row_count(conn, monkeypatc
     conn.sql("CREATE OR REPLACE TABLE prior_floor AS select i as j from range(20000000) t(i)")
     assert _live_row_groups(conn, "prior_floor") == 2, "the prior count did not lift the bad estimate"
     # Without a prior count (a first CREATE, or a table whose log can't be read) the same low estimate
-    # falls back to the 6M floor — the blunter, pre-existing defense.
+    # falls back to the 8M floor — the blunter, pre-existing defense.
     monkeypatch.setattr(engine, "prior_row_count", lambda cur, path, so=None: None)
     conn.sql("CREATE OR REPLACE TABLE prior_floor AS select i as j from range(20000000) t(i)")
     n = _live_row_groups(conn, "prior_floor")
-    assert 3 <= n <= 5, f"expected the 6M estimate floor (~4 groups) with no prior count, got {n}"
+    assert 3 <= n <= 5, f"expected the 8M estimate floor (~3 groups) with no prior count, got {n}"
 
 
 def test_prior_row_count_never_lowers_the_ceiling(conn, monkeypatch):
@@ -2052,7 +2052,7 @@ def test_rg_for_floors_a_planner_estimate_higher_than_an_exact_count():
     # planner ESTIMATE cannot be: a fixed 0.2 filter/anti-join selectivity guess, a set-op parent that
     # carries no cardinality, and CSVs extrapolated from file size all under-report by an order of
     # magnitude — which pinned a 370M-row fact to 380 row groups where ~34 belong. So a guess never
-    # drives the ceiling below _RG_MIN_ESTIMATED, capping the damage at ~6M-row segments.
+    # drives the ceiling below _RG_MIN_ESTIMATED, capping the damage at ~8M-row segments.
     from dbt.adapters.duckrun import engine
     assert engine._RG_MIN_ESTIMATED > engine._RG_MIN
     for bad in (1, 100, 4_000_000, engine._RG_LANES * engine._RG_MIN_ESTIMATED - 1):
