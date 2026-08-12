@@ -144,6 +144,79 @@ Each catalog carries its own `storage_options`, so a per-Lakehouse OneLake token
 mints a path-scoped DuckDB secret per catalog). `ref()` resolves across catalogs, and
 `is_incremental()` / `dbt docs generate` work per Lakehouse.
 
+### Multiple environments (dev / test / prod)
+
+A team promoting the same project across Fabric workspaces (dev → test → prod) needs one **target**
+per environment, each pointing its `catalogs:` aliases at that environment's own Lakehouses. Reuse
+the same alias names in every target — only the `root_path`s change — so model config
+(`+database: lh_bronze`) doesn't need to differ per environment. `storage_options` can stay empty on
+OneLake — duckrun self-acquires the token per environment (see
+[OneLake authentication](#onelake-authentication--tokens-are-optional)).
+
+```yaml
+my_project:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      root_path: "abfss://dev_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
+      catalogs:
+        lh_bronze:
+          root_path: "abfss://dev_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
+    test:
+      type: duckrun
+      root_path: "abfss://test_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
+      catalogs:
+        lh_bronze:
+          root_path: "abfss://test_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
+    prod:
+      type: duckrun
+      root_path: "abfss://prod_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
+      catalogs:
+        lh_bronze:
+          root_path: "abfss://prod_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
+```
+
+```bash
+dbt run --target test
+```
+
+Model config (`+database: lh_bronze`) never mentions an environment, so the same project runs
+unmodified against any target.
+
+#### Following the target from a source
+
+A source can resolve its path the same way, via the alias → root map the profile resolver exposes
+on the Jinja `target` as `target.catalog_locations` (see [Config your profile](#configure-your-profile)) —
+`{alias: root_path}` for every entry under `catalogs:`, no tokens. This lets a source pick up
+whichever environment's Lakehouse the current target points at, instead of hard-coding one path:
+
+```yaml
+sources:
+  - name: lake
+    tables:
+      - name: raw_events
+        meta:
+          plugin: duckrun
+          delta_table_path: "{{ target.catalog_locations['lh_bronze'] }}/dbo/raw_events"
+```
+
+**The empty-string trap.** `target.catalog_locations['lh_bronze']` is a plain Jinja dict lookup: if
+the current target has no `lh_bronze` entry under `catalogs:` — a typo, or a target that hasn't been
+updated yet — Jinja renders it as an empty string instead of failing, so the source silently becomes
+`/dbo/raw_events`, and the failure surfaces later as a confusing
+`InvalidTableLocationError: Path does not exist` (or an empty read) rather than a clear "unknown
+catalog" error. If that's a risk for your project, check membership (`'lh_bronze' in
+target.catalog_locations`) before indexing — e.g. in an `on-run-start` macro that fails the run early
+with a clear message instead of letting it surface downstream.
+
+```yaml
+# dbt_project.yml — both guards run on every invocation, in order
+on-run-start:
+  - "{{ require_catalogs(['lh_bronze', 'lh_gold']) }}"
+  - "{{ guard_prod() }}"
+```
+
 ## Materializations
 
 | materialized      | backed by                | notes                                                                 |
