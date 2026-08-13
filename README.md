@@ -7,8 +7,7 @@
 [![License](https://img.shields.io/pypi/l/duckrun?color=lightgrey)](https://github.com/djouallah/duckrun/blob/main/LICENSE)
 
 > **Disclaimer:** This is a personal project. It is
-> not affiliated with, endorsed by, or supported by any employer or vendor. No warranty —
-> use it at your own risk.
+> not affiliated with, endorsed by, or supported by any employer or vendor.
 
 **duckrun** runs SQL in [DuckDB](https://duckdb.org/) and reads/writes
 [**Delta Lake**](https://delta-io.github.io/delta-rs/) via delta-rs — locally or on OneLake / S3 /
