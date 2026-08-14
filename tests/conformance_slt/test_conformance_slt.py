@@ -50,6 +50,16 @@ EXPECTED_DEVIATIONS = {
         "INSERT INTO métriques VALUES (36.6)",
         'SELECT "温度" FROM métriques',
     },
+    "02_types.slt": {
+        # #42 naive-timestamp UTC coercion — a duckrun INVARIANT: a naive TIMESTAMP column is
+        # written UTC-adjusted (Delta `timestamp`, not `timestamp_ntz`) because Fabric's SQL
+        # analytics endpoint silently omits timestamp_ntz columns. The stored INSTANT is the naive
+        # wall clock read as UTC (value fidelity is pinned in tests/correctness), but ::VARCHAR now
+        # renders with a zone offset, deviating from the oracle's naive rendering. Deliberate;
+        # DUCKRUN_TIMESTAMP_NTZ=1 restores the verbatim write.
+        "SELECT min(ts)::VARCHAR FROM t_time",
+        "SELECT ts::VARCHAR FROM t_time WHERE d = DATE '2024-02-29'",
+    },
     "05_adversarial_parser.slt": {
         # #9 whitespace-in-identifier (as above) + its downstream reads.
         'CREATE TABLE "select from where" (v INTEGER)',

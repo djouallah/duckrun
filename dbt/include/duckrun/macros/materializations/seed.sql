@@ -78,6 +78,7 @@
       'full_refresh': should_full_refresh(),
       'storage_options': config.get('storage_options'),
       'partition_by': _partition_by,
+      'timestamp_ntz': config.get('timestamp_ntz'),
   } -%}
   {% do adapter.store_relation('duckrun', tmp_relation, columns, location, 'delta', delta_config) %}
 

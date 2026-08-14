@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Naive `TIMESTAMP` columns are written UTC-adjusted by default — Delta `timestamp`, not
+  `timestamp_ntz`** (#42). Fabric's SQL analytics endpoint does not support `timestamp_ntz` and
+  silently omits such columns — the table appears, every other column queries fine, and the first
+  T-SQL naming the timestamp dies with *Invalid column name*. Since `TIMESTAMP` is DuckDB's
+  default spelling, duckrun now reprojects naive timestamp columns as `timezone('UTC', col)` (the
+  naive value read as a UTC wall clock, independent of the session `TimeZone`) at the one engine
+  write seam — dbt models, raw SQL and the connection API all coerce identically, MERGE sources
+  and the bare `CREATE TABLE (ts TIMESTAMP)` empty-create included. `TIMESTAMPTZ` columns are
+  untouched; values keep their instant, only the declared type changes.
+  - Escape hatch: `timestamp_ntz: true` (model config, validated like the geometry configs) or
+    `DUCKRUN_TIMESTAMP_NTZ=1` (env — the connection-API / whole-run spelling).
+  - **Migration:** an existing `timestamp_ntz` table keeps working untouched — appends/merges
+    skip the coercion for its NTZ columns and warn once, naming them; rebuild with
+    `--full-refresh` / `CREATE OR REPLACE` to retype (any full-rewrite raw-SQL operation —
+    `DELETE`/`UPDATE` fallback, `ALTER` — retypes too).
+  - Out of scope: timestamps nested in `STRUCT`/`LIST` (still `timestamp_ntz`), and DuckDB's own
+    session-TZ cast when a raw `INSERT` puts a naive value into an already tz-aware column.
+- **`CREATE TABLE (col defs)` with a `TIMESTAMPTZ` column now works in a non-UTC session.**
+  DuckDB stamps the session `TimeZone` on the Arrow field and `DeltaTable.create` accepts only
+  UTC, so the empty-create errored with *Invalid data type for Delta Lake:
+  Timestamp(µs, "<zone>")*. The zone label (never the values) is normalized to UTC.
+
 ### Fixed
 - **`p.sql()` can now read a `ref()` to a view-materialized model on a cold session** (#29
   follow-up). An inline compile's node is out of the manifest before anything runs — dbt removes it

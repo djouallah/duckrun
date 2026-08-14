@@ -66,6 +66,25 @@ def test_replace_window_quotes_event_time_column(monkeypatch):
     assert captured["predicate"] == '"order" >= \'2025-01-01 00:00:00\' AND "order" < \'2025-01-02 00:00:00\''
 
 
+# ------------------------------------------------------- #42 timestamp_ntz config validation
+
+
+def test_timestamp_ntz_config_accepts_bools_and_yaml_strings():
+    assert Plugin._timestamp_ntz_config({}) is None
+    assert Plugin._timestamp_ntz_config({"timestamp_ntz": True}) is True
+    assert Plugin._timestamp_ntz_config({"timestamp_ntz": False}) is False
+    assert Plugin._timestamp_ntz_config({"timestamp_ntz": "true"}) is True
+    assert Plugin._timestamp_ntz_config({"timestamp_ntz": "False"}) is False
+
+
+def test_timestamp_ntz_config_rejects_garbage_loudly():
+    # Validated before any Delta access, like the geometry configs — a typo fails the model cleanly.
+    with pytest.raises(ValueError, match="timestamp_ntz"):
+        Plugin._timestamp_ntz_config({"timestamp_ntz": "utc"})
+    with pytest.raises(ValueError, match="timestamp_ntz"):
+        Plugin._timestamp_ntz_config({"timestamp_ntz": 1})
+
+
 # ------------------------------------------------------- #17 trailing-slash normalization
 
 def test_root_path_trailing_slash_stripped():

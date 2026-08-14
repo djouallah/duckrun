@@ -172,15 +172,22 @@ def _rw(root, name, select_sql, mode="overwrite"):
 
 
 def _read(root, name):
-    """Read ``dbo.<name>`` back through a FRESH connection → rows sorted (real Delta on disk only)."""
-    rel = duckrun.connect(root, schema="dbo").sql(f"select * from {name}")
+    """Read ``dbo.<name>`` back through a FRESH connection → rows sorted (real Delta on disk only).
+    Session pinned to UTC so tz-aware values (a naive TIMESTAMP is UTC-coerced on write since
+    issue #42) render identically on every machine — and the year-9999 boundary value doesn't
+    overflow Python's datetime in a positive-offset local zone."""
+    conn = duckrun.connect(root, schema="dbo")
+    conn.sql("SET TimeZone='UTC'")
+    rel = conn.sql(f"select * from {name}")
     return sorted(rel.fetchall(), key=_k)
 
 
 def _oracle(select_sql):
-    """The source-of-truth: the same relation evaluated in plain DuckDB, never touching Delta."""
+    """The source-of-truth: the same relation evaluated in plain DuckDB, never touching Delta.
+    UTC-pinned exactly like ``_read`` so both sides of the comparison share one rendering."""
     con = duckdb.connect()
     try:
+        con.execute("SET TimeZone='UTC'")
         return sorted(con.sql(select_sql).fetchall(), key=_k)
     finally:
         con.close()
@@ -205,24 +212,44 @@ TYPE_MATRIX = [
     ("varchar",      "('hello world'::VARCHAR),(''),('café — 日本語 — 😀'),(repeat('x', 100000)),(NULL)"),
     ("blob",         "('\\xDE\\xAD\\xBE\\xEF'::BLOB),('\\x00'::BLOB),(''::BLOB),(NULL)"),
     ("date",         "(DATE '2026-06-22'),(DATE '1970-01-01'),(DATE '0001-01-01'),(DATE '9999-12-31'),(NULL)"),
+    # A naive TIMESTAMP is UTC-coerced on write since issue #42 (Fabric's SQL endpoint cannot read
+    # timestamp_ntz), so its oracle reads the same values through the identical timezone('UTC', v)
+    # projection: the INSTANT written must equal the instant read — value fidelity unchanged, only
+    # the declared type is (by design). The pre-#42 verbatim round-trip stays pinned under the
+    # escape hatch in test_timestamp_ntz_escape_hatch_roundtrip.
     ("timestamp",    "(TIMESTAMP '2026-06-22 13:45:01.123456'),(TIMESTAMP '1970-01-01 00:00:00'),"
-                     "(TIMESTAMP '9999-12-31 23:59:59.999999'),(NULL)"),
+                     "(TIMESTAMP '9999-12-31 23:59:59.999999'),(NULL)",
+                     "select timezone('UTC', v) as v from (values {values}) t(v)"),
     ("timestamptz",  "(TIMESTAMPTZ '2026-06-22 13:45:01+00'),(TIMESTAMPTZ '1970-01-01 00:00:00+00'),(NULL)"),
 ]
 
 
-@pytest.mark.parametrize("case_id,values", TYPE_MATRIX, ids=[c[0] for c in TYPE_MATRIX])
-def test_type_value_roundtrip(root, case_id, values):
+@pytest.mark.parametrize("case", TYPE_MATRIX, ids=[c[0] for c in TYPE_MATRIX])
+def test_type_value_roundtrip(root, case):
     """A column of boundary values (incl. interleaved NULL) must survive write→fresh-read unchanged,
     OR fail loudly. The oracle is the SAME VALUES list in plain DuckDB — no hand-asserted storage type.
+    A case may carry a third element: an oracle template for types whose DECLARED type changes on
+    write by design (the naive-timestamp UTC coercion, issue #42) — the value assertion is unchanged.
     """
+    case_id, values = case[0], case[1]
     select_sql = f"select v from (values {values}) t(v)"
+    oracle_sql = case[2].format(values=values) if len(case) > 2 else select_sql
     try:
         _rw(root, case_id, select_sql)
     except Exception as exc:  # noqa: BLE001 — pin the loud failure for unrepresentable types.
         pytest.skip(f"delta-rs cannot store {case_id}; pinned as loud failure: {type(exc).__name__}")
         return
-    assert _read(root, case_id) == _oracle(select_sql), f"value mutated on round-trip: {case_id}"
+    assert _read(root, case_id) == _oracle(oracle_sql), f"value mutated on round-trip: {case_id}"
+
+
+def test_timestamp_ntz_escape_hatch_roundtrip(root, monkeypatch):
+    """DUCKRUN_TIMESTAMP_NTZ=1 restores the pre-#42 verbatim naive round-trip: written naive,
+    stored as Delta timestamp_ntz, read back naive and equal to the plain-DuckDB oracle."""
+    monkeypatch.setenv("DUCKRUN_TIMESTAMP_NTZ", "1")
+    sql = ("select v from (values (TIMESTAMP '2026-06-22 13:45:01.123456'),"
+           "(TIMESTAMP '9999-12-31 23:59:59.999999'),(NULL)) t(v)")
+    _rw(root, "ts_ntz_kept", sql)
+    assert _read(root, "ts_ntz_kept") == _oracle(sql)
 
 
 def test_multicolumn_all_nulls_roundtrip(root):
@@ -269,7 +296,7 @@ def test_wide_realistic_10_rows(root):
             'cust_' || (i % 3)                       as customer,
             (i * 19.99)::DECIMAL(12,2)               as amount,
             (i % 2 = 0)                              as is_paid,
-            TIMESTAMP '2026-01-01 00:00:00' + to_hours(i) as ordered_at,
+            TIMESTAMPTZ '2026-01-01 00:00:00+00' + to_hours(i) as ordered_at,
             [i, i*2, i*3]                            as line_qtys,
             {'sku': 'S' || i, 'discount': i * 0.5}   as detail,
             case when i % 4 = 0 then NULL else 'note ' || i end as memo

@@ -1850,6 +1850,161 @@ def test_append_uses_the_read_layout_profile():
     assert "target_file_size" in ap and "writer_properties" in ap
 
 
+# ── issue #42: a naive DuckDB TIMESTAMP lands as UTC-adjusted Delta `timestamp`, not timestamp_ntz
+# (Fabric's SQL analytics endpoint silently OMITS timestamp_ntz columns). Coercion happens once at
+# the engine write seam (engine.coerce_naive_timestamps); `DUCKRUN_TIMESTAMP_NTZ=1` /
+# `timestamp_ntz: true` keep the pre-#42 NTZ behavior; a pre-existing NTZ target is matched, not
+# broken (target-aware skip + one warning).
+
+def _delta_field_types(loc):
+    dt = deltalake.DeltaTable(loc)
+    return {f.name: (getattr(f.type, "type", None) or str(f.type)) for f in dt.schema().fields}
+
+
+def test_naive_timestamp_lands_as_utc_timestamp(conn):
+    # The write session deliberately runs NON-UTC: timezone('UTC', ts) must read the naive value
+    # as a UTC wall clock regardless (a bare ::TIMESTAMPTZ cast would shift it by the session TZ).
+    conn.sql("SET TimeZone='Australia/Brisbane'")
+    conn.sql("CREATE OR REPLACE TABLE ts42 AS "
+             "select 1 as id, TIMESTAMP '2014-01-01 10:00:00' as lpep_pickup_datetime")
+    loc = conn.root_path + "/dbo/ts42"
+    assert _delta_field_types(loc)["lpep_pickup_datetime"] == "timestamp"
+    proto = deltalake.DeltaTable(loc).protocol()
+    feats = (proto.reader_features or []) + (proto.writer_features or [])
+    assert "timestampNtz" not in feats, feats
+    conn.sql("SET TimeZone='UTC'")
+    assert conn.sql("select lpep_pickup_datetime::varchar from ts42").fetchone()[0] \
+        == "2014-01-01 10:00:00+00"
+
+
+def test_timestamp_ntz_env_escape_hatch(conn, monkeypatch):
+    monkeypatch.setenv("DUCKRUN_TIMESTAMP_NTZ", "1")
+    conn.sql("CREATE OR REPLACE TABLE ts42_ntz AS select TIMESTAMP '2014-01-01 10:00:00' as ts")
+    loc = conn.root_path + "/dbo/ts42_ntz"
+    assert _delta_field_types(loc)["ts"] == "timestamp_ntz"
+    proto = deltalake.DeltaTable(loc).protocol()
+    assert "timestampNtz" in (proto.reader_features or []), proto.reader_features
+
+
+def test_existing_ntz_table_append_skips_and_warns(conn, monkeypatch):
+    # A pre-#42 table keeps working untouched: the append matches the existing NTZ schema instead
+    # of clashing with it, and says so ONCE, with the --full-refresh way out in the message.
+    monkeypatch.setenv("DUCKRUN_TIMESTAMP_NTZ", "1")
+    conn.sql("CREATE OR REPLACE TABLE ts42_old AS select TIMESTAMP '2014-01-01 10:00:00' as ts, 1 as x")
+    monkeypatch.delenv("DUCKRUN_TIMESTAMP_NTZ")
+    warned = []
+    monkeypatch.setattr(engine.logger, "warning", lambda msg, *a, **k: warned.append(str(msg)))
+    conn.sql("INSERT INTO ts42_old values (TIMESTAMP '2014-01-02 11:00:00', 2)")
+    loc = conn.root_path + "/dbo/ts42_old"
+    assert _delta_field_types(loc)["ts"] == "timestamp_ntz"
+    assert conn.sql("select count(*) from ts42_old").fetchone()[0] == 2
+    hits = [w for w in warned if "timestamp_ntz" in w]
+    assert len(hits) == 1 and "ts" in hits[0] and "--full-refresh" in hits[0], warned
+    # ...and a full replace retypes it.
+    conn.sql("CREATE OR REPLACE TABLE ts42_old AS select TIMESTAMP '2014-01-03 12:00:00' as ts, 3 as x")
+    assert _delta_field_types(loc)["ts"] == "timestamp"
+
+
+def test_create_coldefs_timestamp_is_tz(conn, monkeypatch):
+    # The empty-create path (DeltaTable.create from an Arrow schema) coerces the SCHEMA the same
+    # way: a bare CREATE TABLE (ts TIMESTAMP) types as `timestamp`, the escape hatch keeps NTZ,
+    # and a user-typed TIMESTAMPTZ is untouched either way.
+    conn.sql("CREATE TABLE ts42_empty (ts TIMESTAMP, tstz TIMESTAMPTZ, x INT)")
+    t = _delta_field_types(conn.root_path + "/dbo/ts42_empty")
+    assert t["ts"] == "timestamp" and t["tstz"] == "timestamp", t
+    monkeypatch.setenv("DUCKRUN_TIMESTAMP_NTZ", "1")
+    conn.sql("CREATE OR REPLACE TABLE ts42_empty2 (ts TIMESTAMP)")
+    assert _delta_field_types(conn.root_path + "/dbo/ts42_empty2")["ts"] == "timestamp_ntz"
+
+
+def test_coerce_helper_unit_matrix(monkeypatch):
+    con = duckdb.connect()
+    con.execute("SET TimeZone='Australia/Brisbane'")
+    # Every naive granularity (TIMESTAMP_S/_MS/_NS included) → one microsecond tz type; already-tz
+    # and non-timestamp columns untouched; exotic quoted names survive.
+    rel = con.sql('select TIMESTAMP \'2014-01-01 10:00:00\' as "ts ""odd""", '
+                  "TIMESTAMP_S '2014-01-01 10:00:00' as ts_s, "
+                  "TIMESTAMP_MS '2014-01-01 10:00:00.123' as ts_ms, "
+                  "TIMESTAMP_NS '2014-01-01 10:00:00.123456789' as ts_ns, "
+                  "TIMESTAMPTZ '2014-01-01 10:00:00+00' as tstz, 1 as x")
+    out = engine.coerce_naive_timestamps(rel, path="__nope__", retype_ok=True)
+    got = dict(zip(out.columns, (str(t) for t in out.types)))
+    assert got == {'ts "odd"': "TIMESTAMP WITH TIME ZONE", "ts_s": "TIMESTAMP WITH TIME ZONE",
+                   "ts_ms": "TIMESTAMP WITH TIME ZONE", "ts_ns": "TIMESTAMP WITH TIME ZONE",
+                   "tstz": "TIMESTAMP WITH TIME ZONE", "x": "INTEGER"}, got
+    # The values are the naive wall clock READ AS UTC — session TZ (Brisbane) must not leak in.
+    epoch = out.query("__v", 'select epoch_us("ts ""odd""") from __v').fetchone()[0]
+    naive_utc = duckdb.connect().sql(
+        "select epoch_us(timezone('UTC', TIMESTAMP '2014-01-01 10:00:00'))").fetchone()[0]
+    assert epoch == naive_utc
+
+
+def test_coerce_helper_fast_paths(monkeypatch):
+    con = duckdb.connect()
+    # No naive column → the SAME relation object back, and the target log is never opened.
+    monkeypatch.setattr(engine, "open_if_exists",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("log opened")))
+    rel = con.sql("select TIMESTAMPTZ '2014-01-01 10:00:00+00' as tstz, 1 as x")
+    assert engine.coerce_naive_timestamps(rel, path="__nope__") is rel
+    # Idempotent: a coerced relation has no naive column left, so re-invocation is the identity.
+    naive = con.sql("select TIMESTAMP '2014-01-01 10:00:00' as ts")
+    once = engine.coerce_naive_timestamps(naive, path="__nope__", retype_ok=True)
+    assert engine.coerce_naive_timestamps(once, path="__nope__") is once
+    # Escape hatch and non-relation inputs return unchanged without touching the log.
+    monkeypatch.setenv("DUCKRUN_TIMESTAMP_NTZ", "1")
+    assert engine.coerce_naive_timestamps(naive, path="__nope__") is naive
+    monkeypatch.delenv("DUCKRUN_TIMESTAMP_NTZ")
+    assert engine.coerce_naive_timestamps("not-a-relation", path="__nope__") == "not-a-relation"
+    # A nested naive timestamp (top-level STRUCT) is out of scope — untouched, documented gap.
+    nested = con.sql("select {'t': TIMESTAMP '2014-01-01 10:00:00'} as s")
+    assert engine.coerce_naive_timestamps(nested, path="__nope__", retype_ok=True) is nested
+
+
+def test_merge_naive_source_into_tz_target(conn, monkeypatch):
+    # The merge seam coerces the SOURCE too (dt.merge bypasses build_write_deltalake_args), so a
+    # naive-timestamp source merges into a tz target with UTC instants — and the documented
+    # CAST-free string-literal predicate spelling still binds against the tz column.
+    conn.sql("SET TimeZone='Australia/Brisbane'")
+    conn.sql("CREATE OR REPLACE TABLE m42 AS select i as id, "
+             "TIMESTAMP '2026-01-01 00:00:00' + to_hours(i) as ts, 'v' || i as val "
+             "from range(3) t(i)")
+    assert _delta_field_types(conn.root_path + "/dbo/m42")["ts"] == "timestamp"
+    conn.sql("MERGE INTO m42 USING (select 1 as id, TIMESTAMP '2026-06-01 12:00:00' as ts, "
+             "'upd' as val) s ON m42.id = s.id AND m42.ts >= '2020-01-01 00:00:00' "
+             "WHEN MATCHED THEN UPDATE SET ts = s.ts, val = s.val")
+    conn.sql("SET TimeZone='UTC'")
+    assert conn.sql("select ts::varchar, val from m42 where id = 1").fetchone() \
+        == ("2026-06-01 12:00:00+00", "upd")
+    # Insert-only MERGE takes the anti-join divert (append seam): same UTC semantics, no clash.
+    warned = []
+    monkeypatch.setattr(engine.logger, "warning", lambda msg, *a, **k: warned.append(str(msg)))
+    conn.sql("MERGE INTO m42 USING (select 9 as id, TIMESTAMP '2026-09-09 09:00:00' as ts, "
+             "'new' as val) s ON m42.id = s.id WHEN NOT MATCHED THEN INSERT *")
+    assert conn.sql("select ts::varchar from m42 where id = 9").fetchone()[0] \
+        == "2026-09-09 09:00:00+00"
+    assert not [w for w in warned if "timestamp_ntz" in w], warned
+
+
+def test_replace_window_into_tz_column(conn):
+    # Microbatch risk pin: replace_window's CAST-free naive string bounds must bind against the
+    # now-tz event-time column, compared as UTC (dbt's batch bounds are UTC wall clocks).
+    conn.sql("CREATE OR REPLACE TABLE w42 AS select i as id, "
+             "TIMESTAMP '2026-01-01 00:00:00' + to_hours(i) as ts from range(4) t(i)")
+    loc = conn.root_path + "/dbo/w42"
+    vB = engine.table_version(loc, conn.storage_options)
+    batch = conn._connection.sql("select 100 as id, TIMESTAMP '2026-01-01 01:30:00' as ts")
+    engine.replace_window(loc, batch, column="ts",
+                          start="2026-01-01 01:00:00", end="2026-01-01 02:00:00",
+                          read_version=vB, storage_options=conn.storage_options,
+                          cur=conn._connection)
+    conn.refresh()
+    conn.sql("SET TimeZone='UTC'")
+    rows = sorted(conn.sql("select id, ts::varchar from w42").fetchall())
+    # id=1 (01:00 UTC) fell inside the window and was replaced by the batch row; the rest stayed.
+    assert rows == [(0, "2026-01-01 00:00:00+00"), (2, "2026-01-01 02:00:00+00"),
+                    (3, "2026-01-01 03:00:00+00"), (100, "2026-01-01 01:30:00+00")], rows
+
+
 def test_compaction_adapts_row_groups(conn):
     # Compaction rewrites the whole table into the read layout, sizing row groups from the live row
     # count that's FREE in the Delta log — so a small fragmented table compacts to ~8 small groups, not

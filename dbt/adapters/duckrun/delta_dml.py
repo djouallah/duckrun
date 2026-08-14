@@ -1477,7 +1477,26 @@ class _DeltaDML:
         tmp = engine.tmp_name("empty", (schema, identifier))
         self.cursor.execute(f'create or replace temp table "{tmp}" ({m.group("defs")})')
         try:
-            arrow_schema = self.cursor.sql(f'select * from "{tmp}" limit 0').arrow().schema
+            rel0 = self.cursor.sql(f'select * from "{tmp}" limit 0')
+            # Naive-timestamp coercion (issue #42) on the SQL side, BEFORE .arrow() — a bare
+            # CREATE TABLE replaces the schema wholesale, so retype_ok (a user-typed TIMESTAMPTZ
+            # is untouched; a user-typed TIMESTAMP becomes UTC-adjusted unless the escape hatch
+            # keeps NTZ).
+            rel0 = engine.coerce_naive_timestamps(rel0, path=loc, storage_options=self.so,
+                                                  retype_ok=True)
+            arrow_schema = rel0.arrow().schema
+            # DuckDB stamps the SESSION TimeZone on tz-aware Arrow fields, and DeltaTable.create
+            # accepts only UTC (isAdjustedToUTC) — a zone LABEL, not a value shift (the instants
+            # are identical). Normalize it, or any TIMESTAMPTZ coldef in a non-UTC session fails.
+            import pyarrow as pa  # local: this path already materializes .arrow() (needs pyarrow)
+            if any(pa.types.is_timestamp(f.type) and f.type.tz not in (None, "UTC")
+                   for f in arrow_schema):
+                arrow_schema = pa.schema(
+                    [f.with_type(pa.timestamp(f.type.unit, tz="UTC"))
+                     if pa.types.is_timestamp(f.type) and f.type.tz is not None else f
+                     for f in arrow_schema],
+                    metadata=arrow_schema.metadata,
+                )
         finally:
             self.cursor.execute(f'drop table if exists "{tmp}"')
         # Mode from the SAME existence check as the guards above (no second open, no window in

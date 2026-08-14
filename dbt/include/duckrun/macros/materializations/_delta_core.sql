@@ -226,6 +226,7 @@
       'sort_by': _sort_by,
       'max_row_group_size': config.get('max_row_group_size'),
       'target_file_size_mb': config.get('target_file_size_mb'),
+      'timestamp_ntz': config.get('timestamp_ntz'),
       'merge_schema': config.get('merge_schema', false),
       'storage_options': config.get('storage_options'),
       'merge_update_columns': config.get('merge_update_columns'),
