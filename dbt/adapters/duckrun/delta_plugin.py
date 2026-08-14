@@ -184,6 +184,9 @@ class Plugin(BasePlugin):
         # like sort_by/partition_by: duckrun-only configs upstream parses and ignores. Validated
         # loudly HERE, before any Delta access, so a typo fails the model cleanly.
         row_group_rows, target_file_size = self._geometry_config(cfg)
+        # issue #42: keep-NTZ escape hatch (+timestamp_ntz: true). None = unset → the engine
+        # falls back to DUCKRUN_TIMESTAMP_NTZ; validated loudly here like the geometry configs.
+        timestamp_ntz = self._timestamp_ntz_config(cfg)
         merge_schema = bool(cfg.get("merge_schema", False))
         unique_key = cfg.get("unique_key")
         incremental = bool(cfg.get("incremental", False))
@@ -284,6 +287,7 @@ class Plugin(BasePlugin):
                 path, cur, name, cfg, storage_options, exists, full_refresh,
                 read_version=cfg.get("read_version"),
                 row_group_rows=row_group_rows, target_file_size=target_file_size,
+                timestamp_ntz=timestamp_ntz, existing_dt=dt0,
             )
             return
 
@@ -293,7 +297,8 @@ class Plugin(BasePlugin):
             self._store_overwrite(path, cur, data, partition_by, merge_schema, exists,
                                   storage_options,
                                   row_group_rows=row_group_rows,
-                                  target_file_size=target_file_size)
+                                  target_file_size=target_file_size,
+                                  timestamp_ntz=timestamp_ntz, existing_dt=dt0)
             return
 
         # Resolve the incremental strategy: default to merge when a unique_key is given, else append.
@@ -313,6 +318,7 @@ class Plugin(BasePlugin):
                 read_version=cfg.get("read_version"), partition_by=partition_by,
                 incremental_predicates=cfg.get("incremental_predicates"),
                 row_group_rows=row_group_rows, target_file_size=target_file_size,
+                timestamp_ntz=timestamp_ntz, existing_dt=dt0,
             )
             return
 
@@ -349,6 +355,7 @@ class Plugin(BasePlugin):
                     max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                     streamed_exec=bool(cfg.get("merge_streamed_exec")),
                     row_group_rows=row_group_rows, target_file_size=target_file_size,
+                    timestamp_ntz=timestamp_ntz, existing_dt=dt0,
                 )
             if src_tmp is not None:
                 cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")
@@ -357,10 +364,12 @@ class Plugin(BasePlugin):
         if strategy in ("merge", "insert"):
             self._store_merge(path, cur, data, cfg, unique_key, strategy, storage_options,
                               src_tmp, row_group_rows=row_group_rows,
-                              target_file_size=target_file_size)
+                              target_file_size=target_file_size,
+                              timestamp_ntz=timestamp_ntz, existing_dt=dt0)
         elif strategy == "append":
             self._store_append(path, cur, data, cfg, partition_by, merge_schema, storage_options,
-                               row_group_rows=row_group_rows, target_file_size=target_file_size)
+                               row_group_rows=row_group_rows, target_file_size=target_file_size,
+                               timestamp_ntz=timestamp_ntz, existing_dt=dt0)
         else:
             raise ValueError(
                 f"Unknown incremental_strategy '{strategy}'. "
@@ -388,6 +397,21 @@ class Plugin(BasePlugin):
         rg = _pos_int("max_row_group_size")
         mb = _pos_int("target_file_size_mb")
         return rg, (mb * 1024 * 1024 if mb is not None else None)
+
+    @staticmethod
+    def _timestamp_ntz_config(cfg):
+        """The per-model ``timestamp_ntz`` escape hatch (issue #42): True keeps naive TIMESTAMP
+        columns as Delta ``timestamp_ntz`` instead of the default UTC-adjust coercion. Returns
+        None when unset (the engine then consults ``DUCKRUN_TIMESTAMP_NTZ``). Bools or the YAML
+        string spellings accepted; anything else fails the model loudly, before any Delta access."""
+        val = cfg.get("timestamp_ntz")
+        if val is None:
+            return None
+        if isinstance(val, bool):
+            return val
+        if isinstance(val, str) and val.strip().lower() in ("true", "false"):
+            return val.strip().lower() == "true"
+        raise ValueError(f"timestamp_ntz must be true or false, got {val!r}")
 
     def _resolve_sort_by(self, cur, name, sort_by, partition_by):
         """Resolve ``sort_by='auto'`` (case-insensitive scalar) into concrete columns by profiling
@@ -417,7 +441,8 @@ class Plugin(BasePlugin):
         return key or None
 
     def _store_overwrite(self, path, cur, data, partition_by, merge_schema, exists,
-                         storage_options, row_group_rows=None, target_file_size=None) -> None:
+                         storage_options, row_group_rows=None, target_file_size=None,
+                         timestamp_ntz=None, existing_dt=None) -> None:
         """The CREATE OR REPLACE branch: a table model, a --full-refresh, or a first run.
         When we are REPLACING an existing table (exists), allow delta_rs to replace the schema
         wholesale (schema_mode="overwrite") — the model SQL defines the new schema, exactly as
@@ -438,10 +463,13 @@ class Plugin(BasePlugin):
                 cur=cur,
                 row_group_rows=row_group_rows,
                 target_file_size=target_file_size,
+                timestamp_ntz=timestamp_ntz,
+                existing_dt=existing_dt,
             )
 
     def _store_merge(self, path, cur, data, cfg, unique_key, strategy, storage_options,
-                     src_tmp, row_group_rows=None, target_file_size=None) -> None:
+                     src_tmp, row_group_rows=None, target_file_size=None,
+                     timestamp_ntz=None, existing_dt=None) -> None:
         """The merge / insert strategies: validate config, resolve on_schema_change, and dispatch
         to the clause-core (merge_clauses / merge_update_set_expressions) or the flat-kwarg
         merge_delta path.
@@ -495,6 +523,8 @@ class Plugin(BasePlugin):
                     cur=cur,
                     row_group_rows=row_group_rows,
                     target_file_size=target_file_size,
+                    timestamp_ntz=timestamp_ntz,
+                    existing_dt=existing_dt,
                 )
             else:
                 engine.merge_delta(
@@ -517,12 +547,15 @@ class Plugin(BasePlugin):
                     cur=cur,
                     row_group_rows=row_group_rows,
                     target_file_size=target_file_size,
+                    timestamp_ntz=timestamp_ntz,
+                    existing_dt=existing_dt,
                 )
         if src_tmp is not None:
             cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")  # #14: release the materialized source
 
     def _store_append(self, path, cur, data, cfg, partition_by, merge_schema,
-                      storage_options, row_group_rows=None, target_file_size=None) -> None:
+                      storage_options, row_group_rows=None, target_file_size=None,
+                      timestamp_ntz=None, existing_dt=None) -> None:
         """The append strategy. A read-modify-append on the SAME table — the model read {{ this }}
         (e.g. an incremental append whose watermark is `max(ts) from {{ this }}`) — is fenced to the
         version the model read (vB, captured before it read {{ this }}): a concurrent commit any time
@@ -542,6 +575,8 @@ class Plugin(BasePlugin):
                     cur=cur,
                     row_group_rows=row_group_rows,
                     target_file_size=target_file_size,
+                    timestamp_ntz=timestamp_ntz,
+                    existing_dt=existing_dt,
                 )
             else:
                 engine.write_delta(
@@ -552,11 +587,14 @@ class Plugin(BasePlugin):
                     cur=cur,
                     row_group_rows=row_group_rows,
                     target_file_size=target_file_size,
+                    timestamp_ntz=timestamp_ntz,
+                    existing_dt=existing_dt,
                 )
 
     def _store_microbatch(
         self, path, cur, name, cfg, storage_options, exists, full_refresh,
         read_version=None, row_group_rows=None, target_file_size=None,
+        timestamp_ntz=None, existing_dt=None,
     ) -> None:
         """dbt ``incremental_strategy='microbatch'``: for the current batch window
         ``[event_time_start, event_time_end)``, atomically replace the rows already in that window
@@ -621,6 +659,8 @@ class Plugin(BasePlugin):
                 cur=cur,
                 row_group_rows=row_group_rows,
                 target_file_size=target_file_size,
+                timestamp_ntz=timestamp_ntz,
+                existing_dt=existing_dt,
             )
         else:
             engine.replace_window(
@@ -632,12 +672,15 @@ class Plugin(BasePlugin):
                 cur=cur,
                 row_group_rows=row_group_rows,
                 target_file_size=target_file_size,
+                timestamp_ntz=timestamp_ntz,
+                existing_dt=existing_dt,
             )
 
     def _store_delete_insert(
         self, path, cur, name, unique_key, storage_options,
         read_version=None, partition_by=None, incremental_predicates=None,
         row_group_rows=None, target_file_size=None,
+        timestamp_ntz=None, existing_dt=None,
     ) -> None:
         """dbt ``incremental_strategy='delete+insert'``: delete the target rows whose ``unique_key``
         is present in the incoming batch (optionally further restricted by ``incremental_predicates``),
@@ -673,8 +716,10 @@ class Plugin(BasePlugin):
         # created it during this run — capture the current version and pin to that.
         vB = read_version if read_version is not None else engine.table_version(path, storage_options)
 
-        target_cols = list(cur.sql(f"SELECT * FROM delta_scan('{loc_sql}', version => {vB}) LIMIT 0").columns)
-        batch_cols = list(cur.sql(f"SELECT * FROM {name} LIMIT 0").columns)
+        tgt_rel = cur.sql(f"SELECT * FROM delta_scan('{loc_sql}', version => {vB}) LIMIT 0")
+        batch_rel = cur.sql(f"SELECT * FROM {name} LIMIT 0")
+        target_cols = list(tgt_rel.columns)
+        batch_cols = list(batch_rel.columns)
         # Loud failure on a column mismatch instead of letting an explicit projection produce a DuckDB
         # binder error (or a positional overwrite silently shift values) — mirror on_schema_change='fail'.
         tset, bset = {c.lower() for c in target_cols}, {c.lower() for c in batch_cols}
@@ -697,8 +742,23 @@ class Plugin(BasePlugin):
             delete_cond = "(" + delete_cond + ") AND " + " AND ".join(f"({p})" for p in preds)
         # Project the batch onto the target column list (by name, target order) so the UNION aligns by
         # column regardless of the model SELECT's column order — a reorder can't shift values.
+        # issue #42 strategy parity: a batch column that is naive while the target column is tz-aware
+        # gets the explicit UTC read here — the bare UNION would otherwise implicit-cast it through
+        # the session TimeZone, making delete+insert disagree with merge on the same model. NTZ
+        # targets are untouched (both sides stay naive; the engine seam then target-aware-skips).
+        tgt_types = {c.lower(): str(t).upper() for c, t in zip(target_cols, tgt_rel.types)}
+        batch_naive = (set() if engine.resolve_timestamp_ntz(timestamp_ntz) else
+                       {c.lower() for c, t in zip(batch_cols, batch_rel.types)
+                        if str(t).upper() in engine._NAIVE_TS_TYPES})
+
+        def _bcol(c):
+            if (c.lower() in batch_naive
+                    and tgt_types.get(c.lower(), "").startswith("TIMESTAMP WITH TIME ZONE")):
+                return f'timezone(\'UTC\', CAST("{c}" AS TIMESTAMP)) AS "{c}"'
+            return f'"{c}"'
+
         tcols_t = ", ".join(f't."{c}"' for c in target_cols)
-        tcols = ", ".join(f'"{c}"' for c in target_cols)
+        tcols = ", ".join(_bcol(c) for c in target_cols)
         tmp = engine.tmp_name("di", path)
         cur.execute(
             f'CREATE OR REPLACE TEMP TABLE "{tmp}" AS '
@@ -719,6 +779,8 @@ class Plugin(BasePlugin):
                 cur=cur,
                 row_group_rows=row_group_rows,
                 target_file_size=target_file_size,
+                timestamp_ntz=timestamp_ntz,
+                existing_dt=existing_dt,
             )
         finally:
             cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
@@ -729,6 +791,7 @@ class Plugin(BasePlugin):
         incremental_predicates=None, insert_condition=None, sort_by=None,
         max_spill_size=None, max_temp_directory_size=None, streamed_exec=False,
         row_group_rows=None, target_file_size=None,
+        timestamp_ntz=None, existing_dt=None,
     ) -> None:
         """dbt ``incremental_strategy='insert'``: append only the batch rows whose ``unique_key`` is
         not already in the target — an idempotent dedupe-append.
@@ -800,6 +863,8 @@ class Plugin(BasePlugin):
             streamed_exec=streamed_exec,
             row_group_rows=row_group_rows,
             target_file_size=target_file_size,
+            timestamp_ntz=timestamp_ntz,
+            existing_dt=existing_dt,
         )
 
     @staticmethod

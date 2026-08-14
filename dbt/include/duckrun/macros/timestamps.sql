@@ -13,9 +13,11 @@
   no project-side change and keep the time zone: DuckDB now() is TIMESTAMP WITH TIME ZONE, which
   writes as a Delta ``timestamp`` (isAdjustedToUTC=true) that Fabric accepts.
 
-  Scoped to the snapshot metadata columns ONLY — these are dbt-generated internals, not the
-  user's model column types, which duckrun still writes verbatim (a user's explicit ::timestamp
-  is their choice and is left untouched).
+  These macros cover the snapshot metadata columns; since issue #42 the same NTZ problem is
+  fixed for USER columns too, at the engine write seam (engine.coerce_naive_timestamps): a naive
+  TIMESTAMP model column is coerced to UTC-adjusted ``timestamp`` by default, with
+  ``timestamp_ntz: true`` (model config) / ``DUCKRUN_TIMESTAMP_NTZ=1`` (env) restoring the old
+  written-verbatim behavior.
 #}
 
 {% macro duckrun__snapshot_get_time() -%}

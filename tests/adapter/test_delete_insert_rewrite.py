@@ -418,6 +418,25 @@ def test_insert_strategy_forwards_the_merge_overrides(tmp_path, monkeypatch):
     assert seen.get("streamed_exec") is True
 
 
+def test_model_timestamp_ntz_reaches_the_write_seam(tmp_path, monkeypatch):
+    """issue #42: `+timestamp_ntz: true` travels macro dict → store() → the engine write kwargs,
+    and the handle store() already opened rides along as existing_dt, so the target-aware
+    naive-timestamp skip never pays a second log open on the dbt surface."""
+    path = (tmp_path / "t").as_posix()
+    write_deltalake(path, pa.table({"id": ["1"], "a": ["x"]}))
+    con = duckdb.connect()
+    con.execute("create view increment as select '2' as id, 'y' as a")
+
+    seen = {}
+    monkeypatch.setattr(engine, "write_delta", lambda *a, **k: seen.update(k))
+    _store_plugin(con).store(_store_target_config(path, "increment", {
+        "incremental": True, "full_refresh": False, "dbt_believes_exists": True,
+        "incremental_strategy": "append", "timestamp_ntz": True,
+    }))
+    assert seen.get("timestamp_ntz") is True
+    assert seen.get("existing_dt") is not None  # the store-time handle, reused
+
+
 def test_merge_strategy_still_routes_to_delta_rs(tmp_path, monkeypatch):
     """Scope guard: only insert-only moved. A true upsert must remove old row versions, which can
     never be a plain append, so `merge` is untouched."""

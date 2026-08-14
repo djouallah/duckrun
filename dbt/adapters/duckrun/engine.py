@@ -901,6 +901,89 @@ def quote_ident(name) -> str:
     return '"' + str(name).strip().strip('"').replace('"', '""') + '"'
 
 
+# DuckDB's naive timestamp spellings. Top-level columns only: a naive timestamp nested in a
+# STRUCT/LIST types as "STRUCT(...)" and is left alone (documented gap in docs/limitations.md).
+_NAIVE_TS_TYPES = {"TIMESTAMP", "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS"}
+
+
+def _ntz_field_names(dt: DeltaTable) -> set:
+    """Lower-cased names of the table's ``timestamp_ntz`` columns, from the Delta schema."""
+    out = set()
+    for f in dt.schema().fields:
+        t = getattr(f.type, "type", None) or str(f.type)
+        if str(t).lower() in {"timestamp_ntz", "timestampntz"}:
+            out.add(f.name.lower())
+    return out
+
+
+def resolve_timestamp_ntz(timestamp_ntz: Optional[bool] = None) -> bool:
+    """THE one resolution of the keep-NTZ escape hatch: an explicit per-model/caller value wins,
+    else the ``DUCKRUN_TIMESTAMP_NTZ=1`` env var (the connect()/notebook spelling). True = keep
+    naive timestamps as Delta ``timestamp_ntz`` (pre-#42 behavior)."""
+    return (timestamp_ntz if timestamp_ntz is not None
+            else os.environ.get("DUCKRUN_TIMESTAMP_NTZ", "0") == "1")
+
+
+def coerce_naive_timestamps(data, *, path: str,
+                            storage_options: Optional[Dict[str, str]] = None,
+                            retype_ok: bool = False,
+                            timestamp_ntz: Optional[bool] = None,
+                            existing_dt: Optional[DeltaTable] = None):
+    """Reproject naive TIMESTAMP columns to UTC-adjusted TIMESTAMPTZ before a Delta write
+    (issue #42): delta_rs types a naive Arrow timestamp as Delta ``timestamp_ntz`` and stamps
+    the ``timestampNtz`` table feature, and Fabric's SQL analytics endpoint silently OMITS such
+    columns. ``timezone('UTC', col)`` — not a bare ``::TIMESTAMPTZ`` cast — so the naive value
+    is read as a UTC wall clock regardless of the session ``TimeZone``. The inner
+    ``CAST(.. AS TIMESTAMP)`` normalizes TIMESTAMP_S/_MS/_NS to microseconds (Delta stores
+    microseconds; nanoseconds truncate).
+
+    The result is another DuckDB relation (``data.query``), never an Arrow-level cast — the
+    downstream seams keep relying on relation behavior (``estimated_rows``, ``.columns``,
+    ``.limit(0)``, ``.create_view``).
+
+    ``timestamp_ntz`` True keeps NTZ (the per-model escape hatch); None falls back to the
+    ``DUCKRUN_TIMESTAMP_NTZ=1`` env var — one resolution point for all three write surfaces.
+
+    Unless ``retype_ok`` (the write replaces the schema wholesale), columns that are ALREADY
+    ``timestamp_ntz`` in the existing table are skipped — an append/merge must keep matching
+    the target it lands in, so a pre-#42 table keeps working untouched — with one warning
+    naming them and the ``--full-refresh`` way out. ``existing_dt`` reuses an open handle;
+    otherwise one ``open_if_exists`` probe (None on a fresh create → coerce everything).
+
+    Idempotent and cheap to re-invoke: an already-coerced relation has no naive columns left
+    and returns unchanged without touching the log."""
+    if not (hasattr(data, "types") and hasattr(data, "query")):
+        return data  # not a DuckDB relation (e.g. a pyarrow Table on a fallback path)
+    naive = [c for c, t in zip(data.columns, data.types)
+             if str(t).upper() in _NAIVE_TS_TYPES]
+    if not naive:
+        return data
+    if resolve_timestamp_ntz(timestamp_ntz):
+        return data
+    if not retype_ok:
+        tgt = existing_dt if existing_dt is not None else open_if_exists(path, storage_options)
+        if tgt is not None:
+            ntz = _ntz_field_names(tgt)
+            skipped = [c for c in naive if c.lower() in ntz]
+            if skipped:
+                logger.warning(
+                    f"duckrun: column(s) {skipped} stay timestamp_ntz to match the existing "
+                    f"table at '{path}' — Fabric's SQL analytics endpoint omits such columns. "
+                    f"Rebuild (--full-refresh / CREATE OR REPLACE) to retype them to "
+                    f"UTC-adjusted timestamp, or set timestamp_ntz: true to silence this."
+                )
+                naive = [c for c in naive if c.lower() not in ntz]
+            if not naive:
+                return data
+    # Direct quoting, NOT quote_ident: these names come from data.columns verbatim, and
+    # quote_ident's strip-then-requote (built for possibly-pre-quoted config input) would mangle
+    # a name with a leading/trailing quote character.
+    def _q(c):
+        return '"' + str(c).replace('"', '""') + '"'
+    repl = ", ".join(f"timezone('UTC', CAST({_q(c)} AS TIMESTAMP)) AS {_q(c)}" for c in naive)
+    return data.query("__duckrun_tsutc", f"SELECT * REPLACE ({repl}) FROM __duckrun_tsutc")
+
+
 def merge_on_predicate(unique_key, predicates: Optional[List[str]] = None) -> str:
     """The canonical MERGE ``ON`` predicate: ``target."k" = source."k" [AND …]`` for each join key,
     plus any extra predicates. THE one builder for both merge surfaces — :func:`merge_delta` and the
@@ -1451,6 +1534,8 @@ def write_delta(
     read_version: Optional[int] = None,
     row_group_rows: Optional[int] = None,
     target_file_size: Optional[int] = None,
+    timestamp_ntz: Optional[bool] = None,
+    existing_dt: Optional[DeltaTable] = None,
 ) -> None:
     """
     Materialize ``data`` (a DuckDB relation / Arrow C-stream) to Delta and maintain it.
@@ -1489,6 +1574,15 @@ def write_delta(
         if table_exists(path, storage_options):
             return
         mode = "overwrite"
+
+    # Naive-timestamp coercion (issue #42) at the seam, BEFORE the geometry estimate so the
+    # estimate sees the relation that is actually written. A schema-replacing overwrite may
+    # retype freely; anything else must keep matching an existing NTZ target (target-aware skip).
+    data = coerce_naive_timestamps(
+        data, path=path, storage_options=storage_options,
+        retype_ok=(schema_mode == "overwrite"),
+        timestamp_ntz=timestamp_ntz, existing_dt=existing_dt,
+    )
 
     # Adaptive row-group geometry for a full-table overwrite, computed HERE so the SQL CTAS path and the
     # dbt table / full-refresh path (delta_plugin) share one seam and behave identically. A small result
@@ -1597,6 +1691,8 @@ def append_if_unchanged(
     cur=None,
     row_group_rows: Optional[int] = None,
     target_file_size: Optional[int] = None,
+    timestamp_ntz: Optional[bool] = None,
+    existing_dt: Optional[DeltaTable] = None,
 ) -> None:
     """
     Optimistic ("safe") append: append ``data`` only if the table version has not moved since
@@ -1633,6 +1729,8 @@ def append_if_unchanged(
         read_version=read_version,
         row_group_rows=row_group_rows,
         target_file_size=target_file_size,
+        timestamp_ntz=timestamp_ntz,
+        existing_dt=existing_dt,
     )
 
 
@@ -1647,6 +1745,8 @@ def overwrite_if_unchanged(
     cur=None,
     row_group_rows: Optional[int] = None,
     target_file_size: Optional[int] = None,
+    timestamp_ntz: Optional[bool] = None,
+    existing_dt: Optional[DeltaTable] = None,
 ) -> None:
     """Optimistic FULL-TABLE overwrite: replace every row with ``data`` only if the table version
     has not moved since we read it — otherwise refuse with ``CommitFailedError``. The overwrite
@@ -1680,6 +1780,8 @@ def overwrite_if_unchanged(
         read_version=read_version,
         row_group_rows=row_group_rows,
         target_file_size=target_file_size,
+        timestamp_ntz=timestamp_ntz,
+        existing_dt=existing_dt,
     )
 
 
@@ -1694,6 +1796,8 @@ def replace_where(
     cur=None,
     row_group_rows: Optional[int] = None,
     target_file_size: Optional[int] = None,
+    timestamp_ntz: Optional[bool] = None,
+    existing_dt: Optional[DeltaTable] = None,
 ) -> None:
     """``replaceWhere`` / ``INSERT OVERWRITE`` as a SINGLE atomic Delta commit: atomically
     replace the rows matching ``predicate`` with ``data``. One commit, not a delete-then-append
@@ -1725,6 +1829,11 @@ def replace_where(
     # sized — correct, because at that instant the table is just that window.
     # An EXPLICIT row_group_rows (per-model config) is different in kind: a declared CEILING, not a
     # derived size — it applies to a slice exactly as it applies to an append.
+    # A replaceWhere writes INTO an existing schema, never replaces it — target-aware skip applies.
+    data = coerce_naive_timestamps(
+        data, path=path, storage_options=storage_options,
+        timestamp_ntz=timestamp_ntz, existing_dt=existing_dt,
+    )
     args = build_write_deltalake_args(
         path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
         row_group_rows=row_group_rows, target_file_size=target_file_size,
@@ -1754,6 +1863,8 @@ def replace_window(
     cur=None,
     row_group_rows: Optional[int] = None,
     target_file_size: Optional[int] = None,
+    timestamp_ntz: Optional[bool] = None,
+    existing_dt: Optional[DeltaTable] = None,
 ) -> None:
     """Microbatch window replace: atomically replace the rows in ``[start, end)`` on ``column``
     with ``data`` (the batch's rows) — the Delta-native equivalent of dbt's microbatch "delete the
@@ -1769,6 +1880,7 @@ def replace_window(
         read_version=read_version, partition_by=partition_by,
         storage_options=storage_options, cur=cur,
         row_group_rows=row_group_rows, target_file_size=target_file_size,
+        timestamp_ntz=timestamp_ntz, existing_dt=existing_dt,
     )
 
 
@@ -1955,6 +2067,8 @@ def merge_delta(
     sort_by=None,
     row_group_rows: Optional[int] = None,
     target_file_size: Optional[int] = None,
+    timestamp_ntz: Optional[bool] = None,
+    existing_dt: Optional[DeltaTable] = None,
 ) -> None:
     """
     Merge ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
@@ -2059,6 +2173,8 @@ def merge_delta(
         sort_by=sort_by,
         row_group_rows=row_group_rows,
         target_file_size=target_file_size,
+        timestamp_ntz=timestamp_ntz,
+        existing_dt=existing_dt,
     )
 
 
@@ -2383,6 +2499,7 @@ def insert_delta(
     sort_by=None,
     row_group_rows: Optional[int] = None,
     target_file_size: Optional[int] = None,
+    timestamp_ntz: Optional[bool] = None,
 ) -> None:
     """Insert only the source rows that match no target row, as a PLAIN APPEND — the anti-join form of
     ``WHEN NOT MATCHED THEN INSERT *``.
@@ -2472,6 +2589,7 @@ def insert_delta(
             cur=cur,
             row_group_rows=row_group_rows,
             target_file_size=target_file_size,
+            timestamp_ntz=timestamp_ntz,
         )
     finally:
         cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
@@ -2580,6 +2698,8 @@ def merge_delta_clauses(
     sort_by=None,
     row_group_rows: Optional[int] = None,
     target_file_size: Optional[int] = None,
+    timestamp_ntz: Optional[bool] = None,
+    existing_dt: Optional[DeltaTable] = None,
 ) -> None:
     """Run a MERGE described by an ORDERED list of clause dicts — the full delta-rs ``TableMerger``
     surface. Each clause is ``{"clause": "matched"|"not_matched"|"not_matched_by_source",
@@ -2633,6 +2753,15 @@ def merge_delta_clauses(
         logger.info("merge: every clause is DO NOTHING; nothing to do (no commit)")
         return
 
+    # Naive-timestamp coercion (issue #42) BEFORE the decoupled schema evolution and the
+    # insert-only divert, so an evolved new column is typed tz-aware (the zero-row
+    # schema_mode="merge" append derives its type from this relation) and both branches see the
+    # coerced source. A merge writes into an existing target, so the target-aware skip applies.
+    data = coerce_naive_timestamps(
+        data, path=path, storage_options=storage_options,
+        timestamp_ntz=timestamp_ntz, existing_dt=existing_dt,
+    )
+
     _merge_cardinality_guard(data, predicate, clauses, streamed_exec)
     effective_version = _merge_evolve_schema(path, data, storage_options, read_version,
                                              merge_schema, existing_columns=existing_columns)
@@ -2655,6 +2784,9 @@ def merge_delta_clauses(
                 sort_by=sort_by,
                 row_group_rows=row_group_rows,
                 target_file_size=target_file_size,
+                # Coercion already resolved on `data` above — True stops the downstream append
+                # from re-opening the target or double-warning (idempotent either way).
+                timestamp_ntz=True,
             )
             return
         except AntiJoinUnsupported as e:

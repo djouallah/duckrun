@@ -19,6 +19,7 @@ on duckrun, their own tests included. These are the places where it is *not* the
 | `on_schema_change='sync_all_columns'` | only *adds* columns | delta-rs can't drop columns ([below](#schema-constraints)) |
 | `merge_on_using_columns`, clause `action: error` | rejected with a clear error | no delta-rs equivalent — refusing beats silently running something else ([below](#dbt-incremental)) |
 | `merge_returning_columns` | accepted and ignored | duckrun never surfaces a returned relation, so it changes no table state |
+| naive `TIMESTAMP` columns | written **UTC-adjusted** (Delta `timestamp`) by default, where dbt-duckdb/delta-rs write `timestamp_ntz`; `timestamp_ntz: true` (model config) or `DUCKRUN_TIMESTAMP_NTZ=1` restores the verbatim write | Fabric's SQL analytics endpoint silently **omits** `timestamp_ntz` columns (issue #42) — duckrun's default keeps the table fully readable there ([below](#microsoft-fabric--onelake)) |
 
 Everything else carries over: `DuckrunCredentials` subclasses dbt-duckdb's, so the whole profile
 surface (`attach`, `secrets`, `settings`, `extensions`, `plugins`, `filesystems`, `remote`, `retries`,
@@ -49,6 +50,25 @@ and don't apply to a Delta-backed adapter. Test-by-test detail is in
   workspace/artifact ids (*"Either WorkspaceId or ArtifactId are missing in the request"*), so
   `vacuum` and other multi-file deletes fail against OneLake. This is a major reason duckrun pins
   `deltalake == 1.5.0`. See [delta-rs #4401](https://github.com/delta-io/delta-rs/issues/4401).
+
+- **Naive `TIMESTAMP` columns are UTC-coerced on write** (issue #42). Fabric's SQL analytics
+  endpoint does not support Delta `timestamp_ntz`: the table appears, but the column is silently
+  missing and any T-SQL naming it fails with *Invalid column name*. So by default duckrun rewrites
+  a naive timestamp as `timezone('UTC', col)` — the naive value read as a **UTC wall clock**,
+  independent of the session `TimeZone` — before handing data to delta-rs, landing it as plain
+  Delta `timestamp`. Details and edges:
+  - `timestamp_ntz: true` (per model) or `DUCKRUN_TIMESTAMP_NTZ=1` (whole run / connection API)
+    keeps the old verbatim `timestamp_ntz` write.
+  - A **pre-existing** `timestamp_ntz` column is matched, not broken: appends/merges skip the
+    coercion for that column and warn once; a full rebuild (`--full-refresh` /
+    `CREATE OR REPLACE`) retypes it. Note that any full-rewrite operation goes through the same
+    seam — the raw-SQL `DELETE`/`UPDATE` subquery fallbacks and `ALTER` rewrites also retype.
+  - Timestamps **nested** in a `STRUCT`/`LIST` are out of scope and still land as
+    `timestamp_ntz` (top-level columns only).
+  - A raw-SQL `INSERT` of a naive value **into an existing tz-aware column** keeps DuckDB's
+    native cast semantics (interpreted in the session `TimeZone`), exactly as it would in plain
+    DuckDB — the UTC read applies where duckrun itself decides the type, not to DuckDB's own
+    column-cast rules.
 
 - **`get_stats` is slow on tables with deletion vectors.** A parquet footer counts rows a DV has
   already removed, so `total_rows` subtracts the DV total to stay equal to `SELECT COUNT(*)` — and

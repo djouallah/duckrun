@@ -178,7 +178,10 @@ class TestDocsGenerateDuckDB(BaseDocsGenerate):
             role=None,
             id_type="INTEGER",
             text_type="VARCHAR",
-            time_type="TIMESTAMP",
+            # issue #42: a naive TIMESTAMP column is UTC-coerced on write (Fabric's SQL endpoint
+            # can't read timestamp_ntz), so the seed's updated_at — and every view over it —
+            # catalogs as TIMESTAMP WITH TIME ZONE.
+            time_type="TIMESTAMP WITH TIME ZONE",
             view_type="VIEW",
             table_type="BASE TABLE",
             model_stats=no_stats(),
@@ -196,7 +199,8 @@ class TestDocsGenReferencesDuckDB(BaseDocsGenReferences):
             role=None,
             id_type="INTEGER",
             text_type="VARCHAR",
-            time_type="TIMESTAMP",
+            # issue #42: naive TIMESTAMP is UTC-coerced on write — see TestDocsGenerateDuckDB.
+            time_type="TIMESTAMP WITH TIME ZONE",
             view_type="VIEW",
             table_type="BASE TABLE",
             # ephemeral_summary is materialized='table' -> a Delta table -> duckrun publishes stats.
