@@ -41,20 +41,36 @@ def _exists():
         return False
 
 
+def resolved_sort_key(body):
+    """The COLUMNS `clause` resolves to — see the AEMO build_auto_sort.py this mirrors for why the
+    report needs the key and not just the string "sorted by auto", and why this resolves the key
+    separately instead of substituting an explicit `sorted by (<cols>)` into the CTAS (doing that
+    would skip `_narrow_wide_decimals`, which is worth ~1 GB and a 10x cold cliff on exactly this
+    benchmark's price columns)."""
+    if sort.lower() != "auto":
+        return [c.strip() for c in sort.split(",") if c.strip()]
+    tbl = con._auto_sort_single_table(body)
+    return (con._auto_sort_cols_from_table(tbl) if tbl is not None
+            else con._auto_sort_cols(con.con.sql(body)))
+
+
 _t0 = time.perf_counter()
+sort_key = None
 if not force and _exists():
     rows = con.sql("select count(*) from tests.sales_auto_sort").fetchone()[0]
     print(f"tests.sales_auto_sort already exists ({rows:,} rows) — skipping "
           "(rebuild=true to rebuild)", flush=True)
-    status = "skipped"
+    status = "skipped"   # nothing was written, so no key was chosen — report null, not a guess
 else:
+    body = f"select * from {_src}"
+    sort_key = resolved_sort_key(body)
+    print(f"sort key: {clause} -> {sort_key or '(no sort — nothing pays off)'}", flush=True)
     print(f"Building tests.sales_auto_sort with '{clause}' ...", flush=True)
-    con.sql(f"create or replace table tests.sales_auto_sort {clause} "
-            f"as select * from {_src}")
+    con.sql(f"create or replace table tests.sales_auto_sort {clause} as {body}")
     rows = con.sql("select count(*) from tests.sales_auto_sort").fetchone()[0]
     print(f"done — tests.sales_auto_sort built ({rows:,} rows)", flush=True)
     status = "rebuilt"
 
 report.merge({"tables": {"sales_auto_sort": {"build": {
-    "engine": "delta_rs", "sort": clause, "vorder": False,
+    "engine": "delta_rs", "sort": clause, "sort_key": sort_key, "vorder": False,
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})

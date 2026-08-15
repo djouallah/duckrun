@@ -238,8 +238,14 @@ _LAYOUT_COLS = ["table", "writer", "sort", "rows", "files", "row groups", "avg R
 
 
 def _sort_label(rep, t):
-    """The `sort` cell. Prefer build metadata; else the layout's definitional intent."""
+    """The `sort` cell. Prefer the RESOLVED key (the columns AUTO actually picked) over the
+    requested clause, which renders an AUTO build as the literal "sorted by auto" and hides the one
+    thing the comparison is for. `sort_key` is `None` when nothing was built this cycle and `[]`
+    when the picker declined; else the layout's definitional intent."""
     b = rep.get("tables", {}).get(t, {}).get("build", {})
+    key = b.get("sort_key")
+    if key is not None:
+        return "sorted by (" + ", ".join(key) + ")" if key else "no sort (nothing paid off)"
     if b.get("sort"):
         return b["sort"]
     suf = t.removeprefix("sales_")
