@@ -71,6 +71,45 @@ def test_near_fd_band_country_city():
     assert not recs["city"]["in_sort_key"]
 
 
+# ── 2b. R5 at REAL dimension cardinality: a strict FD still earns no slot. ──────────────────────
+# Tests 1 and 2 above profile 300-row tables at ndv 200, where `approx_count_distinct` is
+# near-exact — which is precisely why they never caught this. At the cardinality a real date column
+# lives at (10³–10⁵) the sketch is wrong by ±10–25%, so the ratio R5 tests against `fd_band` (12%)
+# was dominated by its own noise: measured on duckdb 1.5.5 for a TRUE ratio of exactly 1.0, the
+# sketched ratio ranged 0.88–1.48. Observed in production — aemo's `year`, joined from a calendar
+# dimension on `date` and therefore determined by it, took the second key slot on a real 142M-row
+# build (`ORDER BY date, year, time`). HLL is deterministic, so that was systematic: every build of
+# that table burned the same slot. `year` here is `year(date)` — an FD by construction, as the real
+# one is.
+@pytest.mark.parametrize("n_dates", [500, 2_000, 5_000, 20_000, 50_000])
+def test_strict_fd_takes_no_slot_at_real_cardinality(n_dates):
+    con = duckdb.connect()
+    recs, _ = _profile(con, f"""
+        select date '2000-01-01' + ((i % {n_dates})::INTEGER) as date,
+               year(date '2000-01-01' + ((i % {n_dates})::INTEGER)) as year,
+               (i % 24) as hour
+        from range(200000) t(i)""")
+    key = _key_order(recs)
+    assert "year" not in key, f"year is determined by date and must earn no slot; key={key}"
+    assert key[:1] == ["date"], f"the date should still lead; key={key}"
+
+
+def test_genuine_refiner_still_earns_its_slot():
+    """Control for the test above: the exact confirm must only DROP columns that are really FD.
+
+    A drop is permanent, so an over-eager R5 silently costs a real clustering dimension — the same
+    failure in the other direction. `hour` refines `date` genuinely (24 distinct values inside every
+    date, grain stays well under grain_frac·n), so it must survive."""
+    con = duckdb.connect()
+    recs, _ = _profile(con, """
+        select date '2000-01-01' + ((i % 2000)::INTEGER) as date,
+               year(date '2000-01-01' + ((i % 2000)::INTEGER)) as year,
+               (i % 24) as hour
+        from range(200000) t(i)""")
+    key = _key_order(recs)
+    assert key == ["date", "hour"], f"expected date then hour, got {key}"
+
+
 # ── 3. Ascending cardinality (R4): ndv 5 / 50 / 500 → key ordered by cardinality. ───────────────
 def test_ascending_cardinality():
     con = duckdb.connect()
@@ -375,6 +414,70 @@ def test_measure_tail_fd_and_uncorrelated_refused():
     assert not recs["fd_amount"]["in_sort_key"]      # FD of region → free clustering, no slot
     assert not recs["noise_price"]["in_sort_key"]    # in-group runs ~iid → no modeled saving
     assert not any("measure tail" in ln for ln in lines)
+
+
+# ── 17d. Group-starved sample: the tail is recovered from a stratified read of the SOURCE. ──────
+# The aemo case. A uniform ROW sample cannot answer "how many distinct values does this measure take
+# INSIDE one dim group" once the dim prefix is fine: the real mart is 142M rows over ~2.6M
+# (date, time) groups against an 8M-row sample — 3.1 rows per group, so every measure reads as
+# ~unique per group and no tail is ever awarded. `price` is a regional price (exactly 5 values per
+# interval) and `date, time, price` measures 596 MB against `date, time`'s 779 MB: a 23% saving the
+# picker could not see. Reading whole groups instead separates price (5/group) from mw (450/group).
+def _aemo_shaped(con, days=20, times=288, duids=450):
+    """One row per (date, time, DUID); price regional (5 per interval), mw per-DUID."""
+    con.execute(f"""create or replace table full_t as
+        select date '2024-01-01' + ((d)::INTEGER) as date, (t*5) as time, ('DUID'||u) as DUID,
+               ((u*7+d*3+t) % 9973 * 0.11)::DECIMAL(18,4) as mw,
+               (((d*288+t)*31 + (u%5)*977) % 4001 * 0.05)::DECIMAL(18,4) as price
+        from range({days}) tt(d), range({times}) t2(t), range({duids}) u2(u)""")
+    n = con.sql("select count(*) from full_t").fetchone()[0]
+    groups = con.sql("select count(distinct hash(date, time)) from full_t").fetchone()[0]
+    s = int(groups * 3.1)          # the production density that hides the tail
+    con.execute(f"create or replace table samp as select * from full_t "
+                f"using sample reservoir({s} ROWS) REPEATABLE (0)")
+    return n, con.sql("select count(*) from samp").fetchone()[0]
+
+
+def _key_of(con, table, sample_rows, **kw):
+    desc = con.sql(f"describe {table}").fetchall()
+    rows, _, _ = sortkey.recommend_sort_key(
+        con, "m", "t", table, [r[0] for r in desc], {r[0]: str(r[1]) for r in desc}, [],
+        sample_rows=sample_rows, exact=False, **kw)
+    return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+
+
+def test_group_starved_sample_loses_the_tail_without_the_source():
+    """Baseline: this is what the sample alone can see, and why full_src exists."""
+    con = duckdb.connect()
+    _n, s = _aemo_shaped(con)
+    assert _key_of(con, "samp", s) == ["date", "time"]
+
+
+def test_group_starved_sample_recovers_the_tail_from_the_source():
+    con = duckdb.connect()
+    n, s = _aemo_shaped(con)
+    assert _key_of(con, "samp", s, full_src="full_t", total_rows=n) == ["date", "time", "price"]
+
+
+def test_stratified_tail_still_refuses_a_prefix_determined_measure():
+    """The stratified path must not just award everything: a measure the dim prefix DETERMINES takes
+    one value per group, so its run fraction collapses onto the prefix's own and it earns no slot."""
+    con = duckdb.connect()
+    n, s = _aemo_shaped(con)
+    # one price per interval (FD of date,time) instead of five — nothing left for a slot to order.
+    con.execute("create or replace table full_t as select date, time, DUID, mw, "
+                "(((date - date '2024-01-01')*288 + time) % 4001 * 0.05)::DECIMAL(18,4) as price "
+                "from full_t")
+    con.execute(f"create or replace table samp as select * from full_t "
+                f"using sample reservoir({s} ROWS) REPEATABLE (0)")
+    assert "price" not in _key_of(con, "samp", s, full_src="full_t", total_rows=n)
+
+
+def test_stratified_read_leaves_no_temp_table_behind():
+    con = duckdb.connect()
+    n, s = _aemo_shaped(con)
+    _key_of(con, "samp", s, full_src="full_t", total_rows=n)
+    assert not [r[0] for r in con.sql("show tables").fetchall() if r[0].startswith("_rle")]
 
 
 # ── 17c. Key-organized tables grow no tail: a unique key leaves no groups to refine. ────────────

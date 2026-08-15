@@ -20,12 +20,14 @@ from the sample the caller materialises. That sample is therefore seeded by defa
 twice returns the same key.
 
 The recommendation, in order:
-  1. sample each column's cardinality (``approx_count_distinct`` HLL — never an exact
-     ``COUNT(DISTINCT)``, which was the OOM lever), capped by the Delta-log value range.
+  1. sample each column's cardinality (``approx_count_distinct`` HLL — never the BATCHED exact
+     ``COUNT(DISTINCT)`` over every column at once, which was the OOM lever), capped by the
+     Delta-log value range.
   2. per-column skew Σp² (Simpson index) — exact histogram for low-card columns, ``1/ndv`` above.
   3. an in-memory columnar byte model: each column costs ``min(bit-packed, RLE)`` + dictionary.
   4. greedy short key: eligible dimensions in ascending cardinality (one temporal may lead), drop
-     functionally-dependent columns (they cluster for free), stop at the table's grain, cap at 4.
+     functionally-dependent columns (they cluster for free — screened on the sketch, confirmed
+     exactly near the grain, see ``_FD_CONFIRM_BELOW``), stop at the table's grain, cap at 4.
   5. the key-organized special case: a (near-)unique key that barely compresses is sorted for
      join/segment locality instead of the marginal compression key.
   6. measure TAIL slots: below the dim key, greedily append the measures whose in-group ordering
@@ -46,13 +48,47 @@ _SKEW_EXACT_NDV = 100_000
 # does NOT bump it. Appended to the recommendation header so a recommendation is attributable to the
 # model that produced it, making future threshold churn traceable.
 # v3: measure tail slots (step 6) — measures may now FOLLOW the dim key, never hold a dim slot.
-MODEL_VERSION = "3"
+# v4: R5 decides on EXACT counts inside the noise zone (see _FD_CONFIRM_BELOW) — the HLL ratio it
+#     used to trust is worth ±25% at the cardinalities real date columns live at. Step 6 measures
+#     in-group cardinality on whole GROUPS read from the source when the sample is too thin per
+#     group to see any (see _GROUP_STARVED_FRAC) — it was awarding no tail at all on a real fact.
+MODEL_VERSION = "4"
+
+# R5's FD ratio SCREENS on HLL and DECIDES on exact counts below this multiple of the kept grain.
+# `approx_count_distinct` is a sketch, and at the NDV where real dimensions live (10²–10⁵) it is
+# wrong by ±10–25% — measured on duckdb 1.5.5 against a column and a strict FD of it (true ratio
+# EXACTLY 1.0): the sketched ratio ranged 0.88–1.48 across date cardinalities 500…50k, so the 12%
+# `fd_band` sat entirely inside the noise. The observed miss: aemo's `year` (a calendar join on
+# `date`, so determined by it by construction) took the second key slot on a real 142M-row build.
+# HLL is deterministic, so this was systematic, not flaky — the same table wasted the same slot on
+# every build. A candidate the sketch says does not even ~double the grain is therefore unresolved,
+# not FD, and earns one exact confirming scan; above 2.0 the sketch's error cannot flip the verdict
+# and it is trusted as-is. This is NOT the exact COUNT(DISTINCT) that was the OOM lever: that
+# batched every high-card column at once, this is one column at a time, only near the grain, over a
+# sample already byte-budgeted by `plan_sample`.
+_FD_CONFIRM_BELOW = 2.0
 
 # A tail slot must pay for itself twice over: save at least ``tail_gain_frac`` of the measure's own
 # modeled bytes (an in-group sort that barely moves a column isn't worth a longer key) AND at least
 # this fraction of the whole table's modeled bytes (a near-empty column can pass the relative test
 # on savings nobody would ever notice — nyc mta_tax/improvement_surcharge are the measured case).
 _TAIL_MIN_TABLE_FRAC = 0.005
+
+# A tail slot asks "how many distinct values does this measure take INSIDE one dim group" — and a
+# uniform ROW sample cannot answer that once the dim prefix is fine enough, because it leaves only a
+# handful of rows in each group. Measured on the real aemo mart: 142M rows, ~2.6M (date, time)
+# groups, an 8M-row sample ⇒ 3.1 sampled rows per group, so EVERY measure looks ~unique per group and
+# the tail awards nothing. `price` (a regional price — exactly 5 values per interval) was the case:
+# `date, time, price` measures 596 MB against `date, time`'s 779 MB, a 23% saving the picker could
+# not see. At that density the uniform sample reads price at 2.68 distinct/group vs mw's 3.63 (both
+# saturating the 3.1 rows available); taking WHOLE groups instead reads 5.00 vs 450.00 — the truth.
+# So when groups get denser than this fraction of the sample, in-group counts come from a
+# GROUP-stratified read of the source (all rows of a 1-in-K slice of groups) rather than the sample.
+_GROUP_STARVED_FRAC = 0.05
+# Rows to aim for in that stratified read. Whole groups, so it is a hash slice of the SOURCE, not a
+# row sample: on the aemo mart K lands ~70 and the read touches ~1.4% of the table, one pass, once
+# per profile. Materialized to a temp table so every tail level regroups it locally.
+_STRAT_TARGET_ROWS = 2_000_000
 
 # Sample-sizing knobs — NOT the recommendation byte model. A byte budget divided by an estimated
 # in-memory row width gives a width-aware row count: a wide table samples fewer rows, a narrow one
@@ -158,20 +194,31 @@ def estimate_row_bytes(types):
 def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        sort_key_cap=4, min_gain_pct=1.0, key_sort_below_pct=10.0,
                        stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,
-                       *, sample_rows, exact, tail_cap=4, tail_gain_frac=0.25):
+                       *, sample_rows, exact, tail_cap=4, tail_gain_frac=0.25,
+                       full_src=None, total_rows=None):
     """The sort-key model, run against the materialized sample ``src`` on connection ``con``. All
     counts (``n``, ``ndv``, run estimates) are SAMPLE estimates — enough to rank candidates and test
     functional dependencies, not exact table cardinalities.
 
-    Every count is an ``approx_count_distinct`` HLL sketch (fixed KB of state) — NO exact
-    ``COUNT(DISTINCT)`` anywhere: that was the OOM lever (an O(NDV·width) hash table per column, over
-    every high-card column at once). The functional-dependency ratio in key selection stays reliable
-    by hashing both sides (``hash(prefix)`` vs ``hash(prefix, c)``) so HLL's bias cancels. ``stats``
+    Every count is an ``approx_count_distinct`` HLL sketch (fixed KB of state) — never a batched
+    exact ``COUNT(DISTINCT)`` over every high-card column at once, which was the OOM lever (an
+    O(NDV·width) hash table per column, all live together). The functional-dependency ratio is the
+    one place that is not settled on a sketch: hashing both sides does NOT cancel HLL's error (the
+    two sides are different value domains with independent bias), and at real dimension
+    cardinalities that error dwarfs ``fd_band`` — so R5 screens on the sketch and confirms a
+    near-grain candidate with one exact scan for that column alone (see ``_FD_CONFIRM_BELOW``). ``stats``
     is the optional Delta-log column profile (``engine.delta_column_stats``): ``null_frac`` drops
     mostly-null columns from candidacy (``null_excl``); ``ndv_cap`` (discrete ``max−min+1``) caps the
     HLL estimate for free. ``None`` (pre-write relation path, or an unreadable log) means "no log
     stats". ``fd_band`` is the near-FD tolerance and ``grain_frac`` the stop-at-grain fraction for key
     selection (step 4). This is all heuristic ranking, not exact science.
+
+    ``full_src`` (a FROM-able spelling of the table the sample was drawn from) and ``total_rows``
+    are optional and used ONLY by the measure tail (step 6): together they let it read whole dim
+    GROUPS from the source when the sample has too few rows per group to see in-group structure at
+    all (see ``_GROUP_STARVED_FRAC``). Omit either and the tail falls back to sample-only counts —
+    correct on a table whose groups the sample covers densely, blind to a tail slot on one whose
+    groups it does not.
 
     ``sample_rows`` is the number of rows the caller materialized, and ``exact`` says whether that
     sample IS the whole table (the caller knows — it planned the sample). ``exact`` gates the
@@ -323,12 +370,23 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     candidates = sorted(
         (c for c in cols if _elig(c)),
         key=lambda c: (0 if c == lead_temporal else 1, ndv[c]))
-    # Greedy prefix build, fully HLL — NO exact COUNT(DISTINCT) anywhere. Each level issues ONE sample
-    # scan: approx_count_distinct(hash(kept_prefix, c)) for EVERY remaining candidate at once (fixed KB
-    # of state per sketch, so batching over high-card columns can't OOM). The grain is measured against
-    # the ACTUAL kept prefix, and BOTH sides of the FD ratio go through hash() so HLL's bias cancels in
-    # the ratio (measured: hash(a)=112, hash(a,b)=111 → 0.99 for a 99%-FD; the unhashed ndv would read
-    # 98 vs 111 → 1.13 and miss it). Scans = one per key column kept (≤ sort_key_cap).
+    # Greedy prefix build. Each level issues ONE batched sample scan:
+    # approx_count_distinct(hash(kept_prefix, c)) for EVERY remaining candidate at once (fixed KB of
+    # state per sketch, so batching over high-card columns can't OOM). That sketch RANKS and SCREENS;
+    # it does not settle R5 — below _FD_CONFIRM_BELOW × the grain the sketch's own error exceeds
+    # fd_band, so the candidate gets one exact confirming scan for itself alone. Scans = one batched
+    # per key column kept (≤ sort_key_cap), plus at most one exact per candidate examined near grain.
+    def _exact_pair(prefix_cols, c):
+        """Exact (distinct(prefix), distinct(prefix, c)) over the sample — the FD verdict's inputs.
+
+        Both sides hashed exactly as the sketch spells them, so the confirm answers the same question
+        the screen asked. One column at a time and only near the grain: the OOM lever was the BATCHED
+        exact count over every high-card column simultaneously, not a single bounded one."""
+        pfx = ", ".join(_qid(x) for x in prefix_cols)
+        row = con.sql(f"SELECT count(DISTINCT hash({pfx})), "
+                      f"count(DISTINCT hash({pfx}, {_qid(c)})) FROM {src}").fetchone()
+        return int(row[0] or 1), int(row[1] or 1)
+
     sort_key, sorted_runs = [], {}
     remaining = list(candidates)  # ranked (one temporal lead, then ascending ndv), consumed as decided
     kept_ndv = 1                  # grain of the kept prefix (empty prefix → 1)
@@ -346,12 +404,22 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             # is ≥ ~(1−fd_band) determined by the prefix (year ← date; subcategory ← category, and now
             # a 99%-near-FD too). Clustered for free by the prefix sort ⇒ no key slot; a later
             # independent column may still refine. (The old exact-equality test missed near-FDs.)
+            #
+            # The sketched `runs` only SCREENS here: inside the noise zone its error is several times
+            # fd_band, which is how a strict FD (aemo `year` ← `date`) read as independent and took a
+            # slot. Confirm exactly, then decide — and adopt the exact grain for the levels below, so
+            # a sketch's error can't compound down the prefix.
+            if sort_key and runs < _FD_CONFIRM_BELOW * kept_ndv:
+                kept_ndv, runs = _exact_pair(sort_key, c)
+                marg[c] = runs
             if sort_key and runs < kept_ndv * (1.0 + fd_band):
                 remaining.remove(c)
                 continue
             # Grain stop: c would push the grain past grain_frac·n — it's near the table's own grain,
             # so it behaves like a key, not a clustering dimension (it can't form runs), and since the
             # rank is ascending-cardinality everything after it is finer still. Stop the key here.
+            # Left on the sketch deliberately: grain_frac·n is a coarse half-the-table threshold, so
+            # sketch error cannot realistically flip it the way it flips the tight fd_band ratio.
             if runs >= grain_frac * n:
                 stop = True
                 break
@@ -422,6 +490,51 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        and c not in null_heavy and c not in partition_cols]
         t_grain = kept_ndv                    # grain of the kept dim prefix (dim loop invariant)
         t_prefix = list(sort_key)
+        # Group-stratified read of the SOURCE, when the sample is too thin per dim group to measure
+        # in-group structure (see _GROUP_STARVED_FRAC). Takes ALL rows of a 1-in-K hash slice of
+        # groups — whole groups are the point; a row sample of the same size answers the wrong
+        # question. Materialized once here so every tail level regroups it locally instead of
+        # re-reading the source. Best-effort: any failure leaves strat None and the tail falls back
+        # to the sample-only counts it used before.
+        strat = None
+        if full_src and total_rows and kept_ndv > _GROUP_STARVED_FRAC * n:
+            k = max(1, -(-int(total_rows) // _STRAT_TARGET_ROWS))
+            gpfx = ", ".join(_qid(x) for x in sort_key)
+            # Only the columns the tail actually groups by or counts — a fact table is mostly columns
+            # this phase never looks at, and materializing them would be the memory cost this whole
+            # path is supposed to avoid.
+            need = ", ".join(_qid(x) for x in list(dict.fromkeys(sort_key + t_remaining)))
+            try:
+                con.execute(f"CREATE OR REPLACE TEMP TABLE _rle_strat AS SELECT {need} "
+                            f"FROM {full_src} WHERE hash({gpfx}) % {k} = 0")
+                if con.sql("SELECT count(*) FROM _rle_strat").fetchone()[0] > 0:
+                    strat = "_rle_strat"
+            except Exception:
+                strat = None
+
+        def _run_fracs(prefix_cols, candidates):
+            """Run count as a FRACTION of rows for each candidate, ordered by ``prefix_cols`` then
+            itself — plus that same fraction for the bare prefix, read from ``strat``.
+
+            A fraction, not a count, because the byte model works in SAMPLE units while ``strat``
+            holds whole groups from the SOURCE: the two have different row counts and a raw count
+            would not survive the trip (an earlier cut multiplied group count by per-group distincts
+            and saturated at n, hiding the very slot this exists to find). ``strat`` holds every row
+            of a 1-in-K slice of groups, so ``Σ distinct-per-group / Σ rows`` is exactly the sorted
+            layout's run fraction and **K cancels** — no extrapolation anywhere.
+
+            aemo: price → 5 values in each of 5,760 intervals over 2.59M rows ⇒ ~1.1%, against an
+            iid ~100%. mw → 450 per interval ⇒ 100%, no saving, no slot. That is the whole
+            discrimination the sample could not make."""
+            gb = ", ".join(_qid(x) for x in prefix_cols)
+            inner = ", ".join(f"count(DISTINCT {_qid(c)}) AS g{j}" for j, c in enumerate(candidates))
+            sel = ", ".join(f"sum(g{j})::DOUBLE / nullif(sum(k), 0) AS f{j}"
+                            for j in range(len(candidates)))
+            row = con.sql(f"SELECT {sel}, count(*)::DOUBLE / nullif(sum(k), 0) "
+                          f"FROM (SELECT {inner}, count(*) AS k FROM {strat} "
+                          f"GROUP BY {gb})").fetchone()
+            return [float(v) if v is not None else 1.0 for v in row[:-1]], float(row[-1] or 1.0)
+
         while t_remaining and len(tail) < tail_cap:
             pfx = ", ".join(_qid(x) for x in t_prefix)
             scan = list(t_remaining)          # trow is indexed by THIS order; t_remaining mutates
@@ -429,13 +542,32 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                 f"approx_count_distinct(hash({pfx}, {_qid(c)})) AS t{j}"
                 for j, c in enumerate(scan))
             trow = con.sql(f"SELECT {sel} FROM {src}").fetchone()
+            # Where a stratified read exists, take runs from the layout's true run FRACTION and
+            # scale it into the sample units the byte model speaks. `pfrac` is the bare prefix's own
+            # fraction — the floor a measure hits when the prefix already determines it.
+            fracs, pfrac = _run_fracs(t_prefix, scan) if strat else (None, None)
             best, best_runs, best_save = None, None, 0.0
             for j, c in enumerate(scan):
                 runs = max(int(trow[j] or 0), 1)
                 # FD of the prefix → clusters for free, permanently out (FD survives prefix growth).
-                if runs < t_grain * (1.0 + fd_band):
-                    t_remaining.remove(c)
-                    continue
+                if fracs:
+                    # The stratified read answers the FD question directly: a measure the prefix
+                    # determines takes ONE value inside every group, so its run fraction collapses
+                    # onto the prefix's own. No sketch, no confirm — and no clobbering these numbers
+                    # with sample counts that cannot see in-group structure in the first place.
+                    if fracs[j] < pfrac * (1.0 + fd_band):
+                        t_remaining.remove(c)
+                        continue
+                    runs = max(1, min(int(n), int(round(n * fracs[j]))))
+                else:
+                    # Sample-only path: same screen-then-confirm as the dim loop, because the sketch
+                    # cannot resolve fd_band near the grain, and here a false FD reading drops the
+                    # candidate PERMANENTLY — it could bin a measure that deserved a tail slot.
+                    if runs < _FD_CONFIRM_BELOW * t_grain:
+                        t_grain, runs = _exact_pair(t_prefix, c)
+                    if runs < t_grain * (1.0 + fd_band):
+                        t_remaining.remove(c)
+                        continue
                 save = iid_bytes[c] - _col_bytes(c, runs)
                 if save > best_save:
                     best, best_runs, best_save = c, runs, save
@@ -448,6 +580,8 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             t_grain = best_runs
             t_prefix.append(best)
             t_remaining.remove(best)
+        if strat:   # connection-local temp table; this module owns it, so this module clears it
+            con.execute("DROP TABLE IF EXISTS _rle_strat")
 
     # Partition columns lead the physical order, so they end up perfectly grouped (runs = ndv) —
     # and Delta stores them in the path, not the data file. Reflect that clustered state so they

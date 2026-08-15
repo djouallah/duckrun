@@ -1273,10 +1273,19 @@ def auto_sort_cols(cur, source, *, partition_cols=None, seed=None, label=("df", 
     src = "_rle_src"
     cur.execute(f"CREATE OR REPLACE TEMP TABLE {src} AS "
                 f"SELECT * FROM {source} USING SAMPLE {samp}")
+    # Row count for the measure tail's group-stratified read (sortkey._GROUP_STARVED_FRAC): it only
+    # needs a K to slice groups by, so a failure just costs the tail that path, never the profile.
+    # One aggregate over an already-staged relation, against a write that is about to sort every row
+    # of it — noise. Not a `plan_sample` input: that ran above, and its answer must not move.
+    try:
+        source_rows = cur.sql(f"SELECT count(*) FROM {source}").fetchone()[0]
+    except Exception:
+        source_rows = None
     try:
         rows, _, lines = sortkey.recommend_sort_key(
             cur, label[0], label[1], src, cols, types, list(partition_cols or []),
-            sample_rows=plan_rows, exact=exact)
+            sample_rows=plan_rows, exact=exact,
+            full_src=source, total_rows=source_rows)
     finally:
         cur.execute(f"DROP TABLE IF EXISTS {src}")
     # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
