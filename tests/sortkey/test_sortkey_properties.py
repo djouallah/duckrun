@@ -416,6 +416,70 @@ def test_measure_tail_fd_and_uncorrelated_refused():
     assert not any("measure tail" in ln for ln in lines)
 
 
+# ── 17d. Group-starved sample: the tail is recovered from a stratified read of the SOURCE. ──────
+# The aemo case. A uniform ROW sample cannot answer "how many distinct values does this measure take
+# INSIDE one dim group" once the dim prefix is fine: the real mart is 142M rows over ~2.6M
+# (date, time) groups against an 8M-row sample — 3.1 rows per group, so every measure reads as
+# ~unique per group and no tail is ever awarded. `price` is a regional price (exactly 5 values per
+# interval) and `date, time, price` measures 596 MB against `date, time`'s 779 MB: a 23% saving the
+# picker could not see. Reading whole groups instead separates price (5/group) from mw (450/group).
+def _aemo_shaped(con, days=20, times=288, duids=450):
+    """One row per (date, time, DUID); price regional (5 per interval), mw per-DUID."""
+    con.execute(f"""create or replace table full_t as
+        select date '2024-01-01' + ((d)::INTEGER) as date, (t*5) as time, ('DUID'||u) as DUID,
+               ((u*7+d*3+t) % 9973 * 0.11)::DECIMAL(18,4) as mw,
+               (((d*288+t)*31 + (u%5)*977) % 4001 * 0.05)::DECIMAL(18,4) as price
+        from range({days}) tt(d), range({times}) t2(t), range({duids}) u2(u)""")
+    n = con.sql("select count(*) from full_t").fetchone()[0]
+    groups = con.sql("select count(distinct hash(date, time)) from full_t").fetchone()[0]
+    s = int(groups * 3.1)          # the production density that hides the tail
+    con.execute(f"create or replace table samp as select * from full_t "
+                f"using sample reservoir({s} ROWS) REPEATABLE (0)")
+    return n, con.sql("select count(*) from samp").fetchone()[0]
+
+
+def _key_of(con, table, sample_rows, **kw):
+    desc = con.sql(f"describe {table}").fetchall()
+    rows, _, _ = sortkey.recommend_sort_key(
+        con, "m", "t", table, [r[0] for r in desc], {r[0]: str(r[1]) for r in desc}, [],
+        sample_rows=sample_rows, exact=False, **kw)
+    return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+
+
+def test_group_starved_sample_loses_the_tail_without_the_source():
+    """Baseline: this is what the sample alone can see, and why full_src exists."""
+    con = duckdb.connect()
+    _n, s = _aemo_shaped(con)
+    assert _key_of(con, "samp", s) == ["date", "time"]
+
+
+def test_group_starved_sample_recovers_the_tail_from_the_source():
+    con = duckdb.connect()
+    n, s = _aemo_shaped(con)
+    assert _key_of(con, "samp", s, full_src="full_t", total_rows=n) == ["date", "time", "price"]
+
+
+def test_stratified_tail_still_refuses_a_prefix_determined_measure():
+    """The stratified path must not just award everything: a measure the dim prefix DETERMINES takes
+    one value per group, so its run fraction collapses onto the prefix's own and it earns no slot."""
+    con = duckdb.connect()
+    n, s = _aemo_shaped(con)
+    # one price per interval (FD of date,time) instead of five — nothing left for a slot to order.
+    con.execute("create or replace table full_t as select date, time, DUID, mw, "
+                "(((date - date '2024-01-01')*288 + time) % 4001 * 0.05)::DECIMAL(18,4) as price "
+                "from full_t")
+    con.execute(f"create or replace table samp as select * from full_t "
+                f"using sample reservoir({s} ROWS) REPEATABLE (0)")
+    assert "price" not in _key_of(con, "samp", s, full_src="full_t", total_rows=n)
+
+
+def test_stratified_read_leaves_no_temp_table_behind():
+    con = duckdb.connect()
+    n, s = _aemo_shaped(con)
+    _key_of(con, "samp", s, full_src="full_t", total_rows=n)
+    assert not [r[0] for r in con.sql("show tables").fetchall() if r[0].startswith("_rle")]
+
+
 # ── 17c. Key-organized tables grow no tail: a unique key leaves no groups to refine. ────────────
 def test_measure_tail_skipped_when_key_organized():
     con = duckdb.connect()

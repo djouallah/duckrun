@@ -49,7 +49,9 @@ _SKEW_EXACT_NDV = 100_000
 # model that produced it, making future threshold churn traceable.
 # v3: measure tail slots (step 6) — measures may now FOLLOW the dim key, never hold a dim slot.
 # v4: R5 decides on EXACT counts inside the noise zone (see _FD_CONFIRM_BELOW) — the HLL ratio it
-#     used to trust is worth ±25% at the cardinalities real date columns live at.
+#     used to trust is worth ±25% at the cardinalities real date columns live at. Step 6 measures
+#     in-group cardinality on whole GROUPS read from the source when the sample is too thin per
+#     group to see any (see _GROUP_STARVED_FRAC) — it was awarding no tail at all on a real fact.
 MODEL_VERSION = "4"
 
 # R5's FD ratio SCREENS on HLL and DECIDES on exact counts below this multiple of the kept grain.
@@ -71,6 +73,22 @@ _FD_CONFIRM_BELOW = 2.0
 # this fraction of the whole table's modeled bytes (a near-empty column can pass the relative test
 # on savings nobody would ever notice — nyc mta_tax/improvement_surcharge are the measured case).
 _TAIL_MIN_TABLE_FRAC = 0.005
+
+# A tail slot asks "how many distinct values does this measure take INSIDE one dim group" — and a
+# uniform ROW sample cannot answer that once the dim prefix is fine enough, because it leaves only a
+# handful of rows in each group. Measured on the real aemo mart: 142M rows, ~2.6M (date, time)
+# groups, an 8M-row sample ⇒ 3.1 sampled rows per group, so EVERY measure looks ~unique per group and
+# the tail awards nothing. `price` (a regional price — exactly 5 values per interval) was the case:
+# `date, time, price` measures 596 MB against `date, time`'s 779 MB, a 23% saving the picker could
+# not see. At that density the uniform sample reads price at 2.68 distinct/group vs mw's 3.63 (both
+# saturating the 3.1 rows available); taking WHOLE groups instead reads 5.00 vs 450.00 — the truth.
+# So when groups get denser than this fraction of the sample, in-group counts come from a
+# GROUP-stratified read of the source (all rows of a 1-in-K slice of groups) rather than the sample.
+_GROUP_STARVED_FRAC = 0.05
+# Rows to aim for in that stratified read. Whole groups, so it is a hash slice of the SOURCE, not a
+# row sample: on the aemo mart K lands ~70 and the read touches ~1.4% of the table, one pass, once
+# per profile. Materialized to a temp table so every tail level regroups it locally.
+_STRAT_TARGET_ROWS = 2_000_000
 
 # Sample-sizing knobs — NOT the recommendation byte model. A byte budget divided by an estimated
 # in-memory row width gives a width-aware row count: a wide table samples fewer rows, a narrow one
@@ -176,7 +194,8 @@ def estimate_row_bytes(types):
 def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        sort_key_cap=4, min_gain_pct=1.0, key_sort_below_pct=10.0,
                        stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,
-                       *, sample_rows, exact, tail_cap=4, tail_gain_frac=0.25):
+                       *, sample_rows, exact, tail_cap=4, tail_gain_frac=0.25,
+                       full_src=None, total_rows=None):
     """The sort-key model, run against the materialized sample ``src`` on connection ``con``. All
     counts (``n``, ``ndv``, run estimates) are SAMPLE estimates — enough to rank candidates and test
     functional dependencies, not exact table cardinalities.
@@ -193,6 +212,13 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     HLL estimate for free. ``None`` (pre-write relation path, or an unreadable log) means "no log
     stats". ``fd_band`` is the near-FD tolerance and ``grain_frac`` the stop-at-grain fraction for key
     selection (step 4). This is all heuristic ranking, not exact science.
+
+    ``full_src`` (a FROM-able spelling of the table the sample was drawn from) and ``total_rows``
+    are optional and used ONLY by the measure tail (step 6): together they let it read whole dim
+    GROUPS from the source when the sample has too few rows per group to see in-group structure at
+    all (see ``_GROUP_STARVED_FRAC``). Omit either and the tail falls back to sample-only counts —
+    correct on a table whose groups the sample covers densely, blind to a tail slot on one whose
+    groups it does not.
 
     ``sample_rows`` is the number of rows the caller materialized, and ``exact`` says whether that
     sample IS the whole table (the caller knows — it planned the sample). ``exact`` gates the
@@ -464,6 +490,51 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        and c not in null_heavy and c not in partition_cols]
         t_grain = kept_ndv                    # grain of the kept dim prefix (dim loop invariant)
         t_prefix = list(sort_key)
+        # Group-stratified read of the SOURCE, when the sample is too thin per dim group to measure
+        # in-group structure (see _GROUP_STARVED_FRAC). Takes ALL rows of a 1-in-K hash slice of
+        # groups — whole groups are the point; a row sample of the same size answers the wrong
+        # question. Materialized once here so every tail level regroups it locally instead of
+        # re-reading the source. Best-effort: any failure leaves strat None and the tail falls back
+        # to the sample-only counts it used before.
+        strat = None
+        if full_src and total_rows and kept_ndv > _GROUP_STARVED_FRAC * n:
+            k = max(1, -(-int(total_rows) // _STRAT_TARGET_ROWS))
+            gpfx = ", ".join(_qid(x) for x in sort_key)
+            # Only the columns the tail actually groups by or counts — a fact table is mostly columns
+            # this phase never looks at, and materializing them would be the memory cost this whole
+            # path is supposed to avoid.
+            need = ", ".join(_qid(x) for x in list(dict.fromkeys(sort_key + t_remaining)))
+            try:
+                con.execute(f"CREATE OR REPLACE TEMP TABLE _rle_strat AS SELECT {need} "
+                            f"FROM {full_src} WHERE hash({gpfx}) % {k} = 0")
+                if con.sql("SELECT count(*) FROM _rle_strat").fetchone()[0] > 0:
+                    strat = "_rle_strat"
+            except Exception:
+                strat = None
+
+        def _run_fracs(prefix_cols, candidates):
+            """Run count as a FRACTION of rows for each candidate, ordered by ``prefix_cols`` then
+            itself — plus that same fraction for the bare prefix, read from ``strat``.
+
+            A fraction, not a count, because the byte model works in SAMPLE units while ``strat``
+            holds whole groups from the SOURCE: the two have different row counts and a raw count
+            would not survive the trip (an earlier cut multiplied group count by per-group distincts
+            and saturated at n, hiding the very slot this exists to find). ``strat`` holds every row
+            of a 1-in-K slice of groups, so ``Σ distinct-per-group / Σ rows`` is exactly the sorted
+            layout's run fraction and **K cancels** — no extrapolation anywhere.
+
+            aemo: price → 5 values in each of 5,760 intervals over 2.59M rows ⇒ ~1.1%, against an
+            iid ~100%. mw → 450 per interval ⇒ 100%, no saving, no slot. That is the whole
+            discrimination the sample could not make."""
+            gb = ", ".join(_qid(x) for x in prefix_cols)
+            inner = ", ".join(f"count(DISTINCT {_qid(c)}) AS g{j}" for j, c in enumerate(candidates))
+            sel = ", ".join(f"sum(g{j})::DOUBLE / nullif(sum(k), 0) AS f{j}"
+                            for j in range(len(candidates)))
+            row = con.sql(f"SELECT {sel}, count(*)::DOUBLE / nullif(sum(k), 0) "
+                          f"FROM (SELECT {inner}, count(*) AS k FROM {strat} "
+                          f"GROUP BY {gb})").fetchone()
+            return [float(v) if v is not None else 1.0 for v in row[:-1]], float(row[-1] or 1.0)
+
         while t_remaining and len(tail) < tail_cap:
             pfx = ", ".join(_qid(x) for x in t_prefix)
             scan = list(t_remaining)          # trow is indexed by THIS order; t_remaining mutates
@@ -471,18 +542,32 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                 f"approx_count_distinct(hash({pfx}, {_qid(c)})) AS t{j}"
                 for j, c in enumerate(scan))
             trow = con.sql(f"SELECT {sel} FROM {src}").fetchone()
+            # Where a stratified read exists, take runs from the layout's true run FRACTION and
+            # scale it into the sample units the byte model speaks. `pfrac` is the bare prefix's own
+            # fraction — the floor a measure hits when the prefix already determines it.
+            fracs, pfrac = _run_fracs(t_prefix, scan) if strat else (None, None)
             best, best_runs, best_save = None, None, 0.0
             for j, c in enumerate(scan):
                 runs = max(int(trow[j] or 0), 1)
                 # FD of the prefix → clusters for free, permanently out (FD survives prefix growth).
-                # Same screen-then-confirm as the dim loop: the sketch cannot resolve fd_band near the
-                # grain, and here a false FD reading also drops the candidate PERMANENTLY, so an
-                # unconfirmed sketch could bin a measure that deserved a tail slot.
-                if runs < _FD_CONFIRM_BELOW * t_grain:
-                    t_grain, runs = _exact_pair(t_prefix, c)
-                if runs < t_grain * (1.0 + fd_band):
-                    t_remaining.remove(c)
-                    continue
+                if fracs:
+                    # The stratified read answers the FD question directly: a measure the prefix
+                    # determines takes ONE value inside every group, so its run fraction collapses
+                    # onto the prefix's own. No sketch, no confirm — and no clobbering these numbers
+                    # with sample counts that cannot see in-group structure in the first place.
+                    if fracs[j] < pfrac * (1.0 + fd_band):
+                        t_remaining.remove(c)
+                        continue
+                    runs = max(1, min(int(n), int(round(n * fracs[j]))))
+                else:
+                    # Sample-only path: same screen-then-confirm as the dim loop, because the sketch
+                    # cannot resolve fd_band near the grain, and here a false FD reading drops the
+                    # candidate PERMANENTLY — it could bin a measure that deserved a tail slot.
+                    if runs < _FD_CONFIRM_BELOW * t_grain:
+                        t_grain, runs = _exact_pair(t_prefix, c)
+                    if runs < t_grain * (1.0 + fd_band):
+                        t_remaining.remove(c)
+                        continue
                 save = iid_bytes[c] - _col_bytes(c, runs)
                 if save > best_save:
                     best, best_runs, best_save = c, runs, save
@@ -495,6 +580,8 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             t_grain = best_runs
             t_prefix.append(best)
             t_remaining.remove(best)
+        if strat:   # connection-local temp table; this module owns it, so this module clears it
+            con.execute("DROP TABLE IF EXISTS _rle_strat")
 
     # Partition columns lead the physical order, so they end up perfectly grouped (runs = ndv) —
     # and Delta stores them in the path, not the data file. Reflect that clustered state so they

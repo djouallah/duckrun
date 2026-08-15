@@ -1430,7 +1430,11 @@ class DuckSession:
                 self.con, sch, tbl, src, cols, types, partition_cols,
                 sort_key_cap=sort_key_cap, min_gain_pct=min_gain_pct,
                 key_sort_below_pct=key_sort_below_pct, stats=stats, null_excl=null_excl,
-                fd_band=fd_band, grain_frac=grain_frac, sample_rows=plan_rows, exact=exact)
+                fd_band=fd_band, grain_frac=grain_frac, sample_rows=plan_rows, exact=exact,
+                # The measure tail reads whole dim GROUPS from here when the sample is too thin per
+                # group to see in-group structure (sortkey._GROUP_STARVED_FRAC) — the aemo `price`
+                # case. Sample-only counts cannot answer that question at any precision.
+                full_src=f"delta_scan('{plit}')", total_rows=total_rows or None)
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
         for line in lines:   # the module is pure; the caller prints the advisory
