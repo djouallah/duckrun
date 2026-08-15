@@ -1337,8 +1337,9 @@ class DuckSession:
         the byte budget is profiled EXACTLY (no ``USING SAMPLE`` at all) and larger ones sample fewer
         rows the wider they are. ``ndv``/``skew``/``current_runs`` are SAMPLE estimates otherwise.
         Uniqueness is only asserted when the profile was exact — a sample can't tell a unique key from
-        a merely higher-than-sample-cardinality column. ``seed`` makes the reservoir sample
-        reproducible (``REPEATABLE``): two runs on the same table return byte-identical rows.
+        a merely higher-than-sample-cardinality column. The reservoir sample is always
+        ``REPEATABLE`` — seeded with ``sortkey.DEFAULT_SAMPLE_SEED`` unless ``seed`` overrides it —
+        so two runs on the same table return byte-identical rows.
 
         The target is an in-memory columnar encoding, **not** parquet-on-disk: each column is value- or hash/dictionary-encoded
         (indices bit-packed at ``ceil(log2 ndv)`` bits) and then RLE is kept only when it beats the
@@ -1419,8 +1420,8 @@ class DuckSession:
             self.con.execute(
                 f"CREATE OR REPLACE TEMP TABLE {src} AS SELECT * FROM delta_scan('{plit}')")
         else:
-            samp = (f"reservoir({plan_rows} ROWS) REPEATABLE ({int(seed)})"
-                    if seed is not None else f"{plan_rows} ROWS")
+            samp = (f"reservoir({plan_rows} ROWS) "
+                    f"REPEATABLE ({int(sortkey.DEFAULT_SAMPLE_SEED if seed is None else seed)})")
             self.con.execute(
                 f"CREATE OR REPLACE TEMP TABLE {src} AS "
                 f"SELECT * FROM delta_scan('{plit}') USING SAMPLE {samp}")
@@ -1442,7 +1443,7 @@ class DuckSession:
         nothing pays off. Backs ``SORTED BY AUTO`` over a derived query. Thin delegate: registers
         the relation as a view and hands it to :func:`engine.auto_sort_cols` — the shared sampler
         behind this path and dbt's ``sort_by='auto'`` — so both surfaces profile identically.
-        ``seed`` makes the reservoir sample reproducible."""
+        ``seed`` overrides the default ``REPEATABLE`` seed; the sample is seeded either way."""
         view = "_rle_relation_src"
         relation.create_view(view, replace=True)
         try:

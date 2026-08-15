@@ -70,7 +70,7 @@ on:
         type: string
         default: ""
       opt_page_rows:
-        description: "[aemo] raise the data-page ROW cap for the auto_sort build (e.g. 1000000 so the 1 MB byte cap binds -> parquet-mr-shaped ~1 MB pages like the V-Order reference). Empty = 20k default. Use with rebuild=true."
+        description: "[aemo] pin the data-page ROW cap for the auto_sort build. Empty = the 1M default (raised from 20k in d0d23b4, so the 1 MB byte cap is what shapes pages). Use with rebuild=true."
         type: string
         default: ""
       rebuild:

@@ -16,7 +16,7 @@ import duckdb
 import pytest
 
 import duckrun
-from dbt.adapters.duckrun import sortkey
+from dbt.adapters.duckrun import engine, sortkey
 
 
 _COLS = ["table", "in_sort_key", "sort_position", "column", "data_type", "encoding", "ndv",
@@ -252,6 +252,101 @@ def test_optimize_analyze_seed_is_deterministic(session, capsys):
     assert r1 == r2
 
 
+# ── 16. The DEFAULT (no seed passed) sample is seeded too. ──────────────────────────────────────
+# Regression: every production caller reaches the sampler WITHOUT a seed — dbt's `sort_by='auto'`
+# (delta_plugin) and the connection API's `SORTED BY AUTO`, over a relation (engine.auto_sort_cols)
+# or over a table (session._get_rle). That used to mean an UNSEEDED reservoir, so one config could
+# pick a different key on every build: measured at 8.8% (700 MB) of a 592M-row table when a
+# different measure won the last tail slot. There are exactly two sampling seams and the tests below
+# cover one each — the default is the only thing those callers actually exercise.
+def test_unseeded_sampler_emits_repeatable():
+    """The SQL the sampler builds carries REPEATABLE even when no seed is passed."""
+    con = duckdb.connect()
+    con.execute("CREATE TABLE wide AS SELECT (i % 50) a, (i % 7) b, i c FROM range(40000) t(i)")
+    captured = []
+
+    class Spy:                      # DuckDBPyConnection attributes are read-only, so proxy it
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *a, **k):
+            captured.append(sql)
+            return self._inner.execute(sql, *a, **k)
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    engine.auto_sort_cols(Spy(con), "wide")       # no seed — the production call shape
+    sample_sql = [s for s in captured if "USING SAMPLE" in s]
+    assert sample_sql, "profiler did not sample"
+    assert "REPEATABLE" in sample_sql[0], sample_sql[0]
+
+
+def test_unseeded_sample_draws_the_same_rows_twice():
+    """The rows the reservoir actually draws are identical across two unseeded profiles.
+
+    Stronger than comparing the chosen key: a key can survive a different sample by luck, so this
+    checksums `_rle_src` itself, which is what the recommender reads. The table must be WIDE for
+    the reservoir to bite at all — `plan_sample` budgets 256 MiB over the estimated row width, so
+    4 narrow columns would plan 8M rows and simply take the whole table (no sampling, trivially
+    stable). 112 VARCHAR columns => 2,688 B/row => a 100,000-row plan against 150,000 rows."""
+    ncols, nrows = 112, 150_000
+    assert sortkey.plan_sample(None, sortkey.estimate_row_bytes(
+        {f"c{i}": "VARCHAR" for i in range(ncols)})) == (100_000, False)
+
+    con = duckdb.connect()
+    # c0..c2 are real candidates; the rest are constants the picker drops (ndv == 1). All VARCHAR
+    # so estimate_row_bytes sees the 24 B/column width the plan above assumes.
+    sel = ["(i % 97)::VARCHAR c0", "(i % 13)::VARCHAR c1", "(i % 3)::VARCHAR c2"]
+    sel += [f"'x' c{i}" for i in range(3, ncols)]
+    con.execute(f"CREATE TABLE wide AS SELECT {', '.join(sel)} FROM range({nrows}) t(i)")
+
+    sums = []
+
+    class Spy:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *a, **k):
+            out = self._inner.execute(sql, *a, **k)
+            if "USING SAMPLE" in sql:      # _rle_src now holds the draw — fingerprint it
+                sums.append(self._inner.execute(          # bit_xor: order-free and cannot overflow
+                    "SELECT count(*), bit_xor(hash(c0 || '|' || c1 || '|' || c2)) FROM _rle_src"
+                ).fetchone())
+            return out
+
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+    engine.auto_sort_cols(Spy(con), "wide")       # no seed, twice — the production call shape
+    engine.auto_sort_cols(Spy(con), "wide")
+    assert len(sums) == 2 and sums[0][0] == 100_000, sums
+    assert sums[0] == sums[1], f"reservoir drew different rows: {sums}"
+
+
+def test_get_rle_sample_is_seeded_by_default(session, capsys, monkeypatch):
+    """The OTHER sampling seam — `session._get_rle`, behind `SORTED BY AUTO` over a table.
+
+    `engine.auto_sort_cols` (above) and this are the only two places that build a `USING SAMPLE`,
+    and they are separate code. Without this, reverting half the fix would keep the suite green.
+
+    `plan_sample` floors at `min_rows=100_000`, so any table small enough to build in a unit test
+    profiles EXACTLY and never reaches the sampling branch — hence the monkeypatch, which is the
+    cheap way to force `exact=False` rather than materialising 100k+ rows of Delta just to get
+    there."""
+    session.sql("CREATE OR REPLACE TABLE rle_src AS "
+                "select (i % 50) a, (i % 7) b, i c from range(4000) t(i)")
+    monkeypatch.setattr(sortkey, "plan_sample", lambda *a, **k: (1000, False))
+
+    r1 = [tuple(row) for row in session._get_rle("rle_src").fetchall()]
+    capsys.readouterr()
+    r2 = [tuple(row) for row in session._get_rle("rle_src").fetchall()]
+    capsys.readouterr()
+    # ndv / skew / run estimates come straight off the draw, so two different 1000-of-4000
+    # reservoirs would show up here even when the chosen key happens to survive.
+    assert r1 == r2, "unseeded _get_rle sample: two profiles of one table disagree"
+
+
 # ── 17. Measure tail (step 6): a dim-correlated zero-heavy measure gets a TAIL slot, below the ──
 #        dim key — the nyc fare/tip/tolls shape (probe: tests/parquet_layout/nyc). ───────────────
 def test_measure_tail_zero_heavy():
@@ -293,7 +388,7 @@ def test_measure_tail_skipped_when_key_organized():
     assert not any("measure tail" in ln for ln in lines)
 
 
-# ── 16. decimal_narrow_target: a wide DECIMAL (p>18 → FLBA, no arrow-rs dictionary) narrows to ──
+# ── 18. decimal_narrow_target: a wide DECIMAL (p>18 → FLBA, no arrow-rs dictionary) narrows to ──
 #        DECIMAL(18,s) iff its EXACT max fits; scale is preserved. Pure — no DB. ──────────────────
 def test_decimal_narrow_target():
     from decimal import Decimal
