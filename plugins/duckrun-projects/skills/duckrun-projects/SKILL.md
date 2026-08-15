@@ -219,9 +219,16 @@ Patterns worth reusing from this:
 | `incremental` | Delta merge / append | Grow or upsert; strategy below |
 | `view` | in-memory DuckDB | Ephemeral staging within a run |
 | `seed` | in-memory DuckDB | CSV fixtures |
+| `external` | a parquet/csv/json **file** | Exporting to a tool that can't read Delta |
 
 `table`, `incremental` (and the `delta` alias) register a `delta_scan` view after
 writing, so downstream `ref()` sees fresh data immediately.
+
+`external` is dbt-duckdb's materialization, unchanged: `COPY … TO` writes the file at
+`location` (default `<external_root>/<identifier>.<format>`) and the model becomes a view
+over it. Because duckrun only rediscovers *Delta* tables in a fresh process, a run that
+reads an external model without rebuilding it needs
+`on-run-start: "{{ register_upstream_external_models() }}"`, same as upstream.
 
 ## Choosing an incremental strategy — the decision that matters most
 

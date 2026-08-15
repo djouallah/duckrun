@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`materialized='external'`** — the last materialization dbt-duckdb had and duckrun didn't. A
+  model can now be exported as a plain parquet/csv/json file (DuckDB `COPY … TO`) and is surfaced as
+  a view over that file, for hand-off to tools that don't read Delta. It is dbt-duckdb's macro
+  shipped under duckrun's adapter name — same configs (`location`, `format`, `options`,
+  `*_read_options`, `plugin`/`glue_register`), same defaults (`<external_root>/<identifier>.<format>`),
+  same output — because dbt resolves a materialization by exact adapter name and dbt-duckdb's
+  `adapter="duckdb"` one was simply unreachable from `type: duckrun`. External and Delta models
+  `ref()` each other freely within a run; as upstream, a run that reads an external model *without*
+  rebuilding it needs `on-run-start: "{{ register_upstream_external_models() }}"`, since duckrun's
+  disk discovery only rediscovers Delta tables.
+
 ### Changed
 - **Naive `TIMESTAMP` columns are written UTC-adjusted by default — Delta `timestamp`, not
   `timestamp_ntz`** (#42). Fabric's SQL analytics endpoint does not support `timestamp_ntz` and
