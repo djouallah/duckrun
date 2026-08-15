@@ -71,6 +71,45 @@ def test_near_fd_band_country_city():
     assert not recs["city"]["in_sort_key"]
 
 
+# ── 2b. R5 at REAL dimension cardinality: a strict FD still earns no slot. ──────────────────────
+# Tests 1 and 2 above profile 300-row tables at ndv 200, where `approx_count_distinct` is
+# near-exact — which is precisely why they never caught this. At the cardinality a real date column
+# lives at (10³–10⁵) the sketch is wrong by ±10–25%, so the ratio R5 tests against `fd_band` (12%)
+# was dominated by its own noise: measured on duckdb 1.5.5 for a TRUE ratio of exactly 1.0, the
+# sketched ratio ranged 0.88–1.48. Observed in production — aemo's `year`, joined from a calendar
+# dimension on `date` and therefore determined by it, took the second key slot on a real 142M-row
+# build (`ORDER BY date, year, time`). HLL is deterministic, so that was systematic: every build of
+# that table burned the same slot. `year` here is `year(date)` — an FD by construction, as the real
+# one is.
+@pytest.mark.parametrize("n_dates", [500, 2_000, 5_000, 20_000, 50_000])
+def test_strict_fd_takes_no_slot_at_real_cardinality(n_dates):
+    con = duckdb.connect()
+    recs, _ = _profile(con, f"""
+        select date '2000-01-01' + ((i % {n_dates})::INTEGER) as date,
+               year(date '2000-01-01' + ((i % {n_dates})::INTEGER)) as year,
+               (i % 24) as hour
+        from range(200000) t(i)""")
+    key = _key_order(recs)
+    assert "year" not in key, f"year is determined by date and must earn no slot; key={key}"
+    assert key[:1] == ["date"], f"the date should still lead; key={key}"
+
+
+def test_genuine_refiner_still_earns_its_slot():
+    """Control for the test above: the exact confirm must only DROP columns that are really FD.
+
+    A drop is permanent, so an over-eager R5 silently costs a real clustering dimension — the same
+    failure in the other direction. `hour` refines `date` genuinely (24 distinct values inside every
+    date, grain stays well under grain_frac·n), so it must survive."""
+    con = duckdb.connect()
+    recs, _ = _profile(con, """
+        select date '2000-01-01' + ((i % 2000)::INTEGER) as date,
+               year(date '2000-01-01' + ((i % 2000)::INTEGER)) as year,
+               (i % 24) as hour
+        from range(200000) t(i)""")
+    key = _key_order(recs)
+    assert key == ["date", "hour"], f"expected date then hour, got {key}"
+
+
 # ── 3. Ascending cardinality (R4): ndv 5 / 50 / 500 → key ordered by cardinality. ───────────────
 def test_ascending_cardinality():
     con = duckdb.connect()
