@@ -226,6 +226,7 @@ on-run-start:
 | `view`            | in-memory DuckDB         | Ephemeral staging within a run (inherited from dbt-duckdb).            |
 | `seed`            | Delta (overwrite)        | CSV loaded via DuckDB, then persisted as a Delta table — survives across processes like a model. |
 | `delta`           | Delta                    | Alias for `table`; honors `incremental=true`. Kept for convenience.   |
+| `external`        | a parquet / csv / json **file** | Not Delta: DuckDB `COPY … TO` writes the file, and the model is a view over it ([below](#external)). |
 
 The persisted materializations (`table`, `incremental`, `delta`, `seed`) register a `delta_scan` view
 over the new Delta table, so downstream `ref()` works — and because a seed is now a real Delta table,
@@ -372,6 +373,45 @@ whatever the previous attempt already loaded.
 > Earlier versions exposed this as a separate `append_if_unchanged` strategy. That's gone — the
 > behavior is now automatic on `append` whenever the model reads `{{ this }}`, so there's no strategy
 > to pick. First run (or `--full-refresh`, or a missing table) overwrites to create the table.
+
+### `external`
+
+The one materialization that doesn't write Delta. It is dbt-duckdb's, shipped verbatim under
+duckrun's adapter name, for exporting a model as a plain file — a hand-off to a tool that reads
+parquet/CSV/JSON but not Delta.
+
+```sql
+{{ config(materialized='external', location='exports/orders.parquet') }}
+
+select * from {{ ref('mart_orders') }}
+```
+
+DuckDB runs the SQL, `COPY … TO` writes the file, and the model relation becomes a view over that
+file — so downstream `ref()` works within the run, and a Delta `table` model can read an external one
+(and vice versa). Everything is upstream's: same config spelling, same defaults, same output.
+
+| option | description |
+|---|---|
+| `location` | output **file** path. Defaults to `<external_root>/<identifier>.<format>` (`external_root` is a profile key, `.` if unset). Note this is a *file*, unlike the `location` of a Delta materialization. |
+| `format` | `parquet` (default) \| `csv` \| `json`. Inferred from `location`'s extension when omitted. |
+| `options` | dict spliced into `COPY … TO (…)` — e.g. `{'partition_by': 'year,month'}`, `{'per_thread_output': true}`, `{'compression': 'zstd'}`. |
+| `delimiter` | legacy top-level alias, folded into `options`. |
+| `parquet_read_options` / `csv_read_options` / `json_read_options` | args for the `read_*` call the view is built from. |
+| `plugin`, `glue_register`, `glue_database`, `partition_columns` | register the written file with a dbt-duckdb plugin (e.g. the AWS Glue catalog) after the write. |
+
+Two things to know, both inherited from how duckrun stores state:
+
+- **The view doesn't survive the process.** duckrun's DuckDB is in-memory and its disk discovery
+  rebuilds Delta tables only, so a later run that reads an external model *without* rebuilding it
+  (`dbt run --select some_downstream`) needs upstream's hook — exactly as on dbt-duckdb:
+
+  ```yaml
+  # dbt_project.yml
+  on-run-start: "{{ register_upstream_external_models() }}"
+  ```
+
+- **`--full-refresh` means nothing here** — every run rewrites the file wholesale. There is no
+  incremental external model, upstream or here.
 
 ### Config options (`table` / `incremental` / `delta`)
 

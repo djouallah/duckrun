@@ -13,7 +13,6 @@ on duckrun, their own tests included. These are the places where it is *not* the
 |---|---|---|
 | `type: duckrun` is its own adapter type | an existing project's **profile** must say `type: duckrun`; a `type: duckdb` profile cannot be rerouted | dbt selects the adapter from `type`. The project itself needs no edit — in dbt the profile lives outside it (that's how the parity runs work, via `--profiles-dir`) |
 | `materialized='view'` | runs, but is a connection-scoped DuckDB view — nothing on storage, gone next session; swapping a model `table` ⇄ `view` isn't supported | Delta defines no view ([below](#materializations)) |
-| `materialized='external'` | **errors** — duckrun doesn't ship it | materializations dispatch by adapter name, so there's no fallback to dbt-duckdb's. Every duckrun model is already an external table, just in Delta |
 | `materialized='table_function'` | **errors** — duckrun doesn't ship it | a DuckDB table macro is catalog-only state, and duckrun's DuckDB is in-memory, so it could only ever live for the length of one run |
 | `threads` | honored, but concurrent writers share one memory budget; a microbatch model's batches still run in order | DuckDB's `memory_limit` is per database, not per model, and a microbatch model's batches all write the same table ([below](#dbt-incremental)) |
 | `on_schema_change='sync_all_columns'` | only *adds* columns | delta-rs can't drop columns ([below](#schema-constraints)) |
@@ -25,7 +24,8 @@ Everything else carries over: `DuckrunCredentials` subclasses dbt-duckdb's, so t
 surface (`attach`, `secrets`, `settings`, `extensions`, `plugins`, `filesystems`, `remote`, `retries`,
 `external_root`, `module_paths`, `disable_transactions`, …) is the same object, not a reimplementation.
 Seeds, snapshots, native `unit_tests:`, data tests, exposures, python models, `external_location`
-sources, and the full merge-config surface (`merge_clauses` — including `do_nothing`, the implicit
+sources, `materialized='external'` (dbt-duckdb's macro, shipped under duckrun's adapter name — see
+[below](#materializations)), and the full merge-config surface (`merge_clauses` — including `do_nothing`, the implicit
 clause defaults, `mode`, `by: source`, `insert: {columns, values}` — and
 `merge_update_set_expressions`) all behave as they do upstream. duckrun's own additions
 (`incremental_strategy='insert'`, `partition_by`, `sort_by`, `location`, `catalogs`) are a superset:
@@ -133,6 +133,14 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   rest of the session — but it lives only in that connection and vanishes when it closes; nothing is
   saved to storage, so the next session won't see it. (And swapping a model between `table` and
   `view` isn't supported.)
+- **`materialized='external'` needs an on-run-start hook to be visible to a later run.** External
+  models work as they do upstream — the model is written as a real parquet/csv/json file by DuckDB's
+  `COPY … TO` and surfaced as a view over that file — but duckrun's disk discovery only rebuilds
+  **Delta** tables, so the view is gone once the process ends. As on dbt-duckdb, a run that reads an
+  external model without rebuilding it (`dbt run --select some_downstream_model`) needs
+  `on-run-start: "{{ register_upstream_external_models() }}"` in `dbt_project.yml`. Note also that
+  `location` means the output **file** for an external model, and the **Delta table path** for
+  `table`/`incremental`.
 - **`DROP TABLE` is a soft tombstone, not a physical delete.** `conn.sql("drop table x")` unregisters
   the table and writes a tombstone marker but **does not reclaim the data files** (a deliberate
   precaution — you purge them when you're sure). Address dropped tables by name, not by path.
