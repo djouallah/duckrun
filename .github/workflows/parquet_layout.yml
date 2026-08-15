@@ -73,6 +73,10 @@ on:
         description: "[aemo] pin the data-page ROW cap for the auto_sort build. Empty = the 1M default (raised from 20k in d0d23b4, so the 1 MB byte cap is what shapes pages). Use with rebuild=true."
         type: string
         default: ""
+      dax:
+        description: "run the Direct Lake half — deploy the two semantic models, walk the DAX suite, read the VertiPaq DMVs. OFF = layout only (sort key, table stats, parquet geometry): no semantic model is created, so it costs no interactive CU and finishes in minutes. Turn it off when the question is 'what did the picker choose / what shape did it write', on when the question is 'is it faster'."
+        type: boolean
+        default: true
       rebuild:
         description: "rebuild the auto_sort (and, for contoso, the base) tables even if they already exist (else reuse). The aemo V-Order reference is NOT rebuilt by this — it never changes; see rebuild_vorder."
         type: boolean
@@ -166,6 +170,18 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/parquet_layout/aemo/check_tables.py
 
+      - name: 🔑 Show the resolved sort key
+        # The one decision this whole comparison exists to interrogate, as its own step: one
+        # profiling pass over the source, no build and no DAX, so it is readable on every dispatch
+        # (including dax=false) instead of only as a side effect of a full rebuild. Never blocks —
+        # this reports, it does not gate.
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+          OPT_SORT: ${{ inputs.opt_sort }}
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/sort_key.py
+
       - name: ⚡ Build Spark V-Order table (Livy, reads mart.fct_summary directly)
         # skip-if-exists inside the script; only rebuild_vorder forces it (the reference never
         # changes with duckrun knobs, so the geometry experiments' rebuild leaves it alone)
@@ -189,6 +205,7 @@ jobs:
         run: python tests/parquet_layout/aemo/build_auto_sort.py
 
       - name: 🚀 Deploy benchmark semantic models (auto_sort + vorder)
+        if: ${{ inputs.dax }}
         # duckrun's own workspace.deploy() repoints, creates and refreshes each model with its
         # self-acquired OIDC tokens — no Fabric CLI login.
         run: python tests/parquet_layout/aemo/deploy_vorder.py --env ${{ inputs.env }}
@@ -202,6 +219,7 @@ jobs:
       # No token re-mint before XMLA: xmla_compare.py self-acquires the Power BI token via duckrun,
       # which re-exchanges a fresh OIDC assertion (so a long rebuild can't hand back an expiring token).
       - name: 🔍 Benchmark both models over XMLA
+        if: ${{ inputs.dax }}
         env:
           PYTHONNET_RUNTIME: coreclr
           PYTHONIOENCODING: utf-8
@@ -213,6 +231,7 @@ jobs:
         run: python tests/parquet_layout/aemo/xmla_compare.py
 
       - name: 🧬 VertiPaq DMV readout (resident encodings per column/segment, both models)
+        if: ${{ inputs.dax }}
         continue-on-error: true   # diagnostic sidecar; never blocks the benchmark
         env:
           PYTHONNET_RUNTIME: coreclr
@@ -357,6 +376,7 @@ jobs:
         run: python tests/parquet_layout/contoso/build_auto_sort.py
 
       - name: 🚀 Deploy benchmark semantic models (auto_sort + vorder)
+        if: ${{ inputs.dax }}
         # duckrun's own workspace.deploy() repoints, creates and refreshes each model with its
         # self-acquired OIDC tokens — no Fabric CLI login.
         run: python tests/parquet_layout/contoso/deploy.py --env ${{ inputs.env }}
@@ -370,6 +390,7 @@ jobs:
       # No token re-mint before XMLA: xmla_compare.py self-acquires the Power BI token via duckrun,
       # which re-exchanges a fresh OIDC assertion (so a long rebuild can't hand back an expiring token).
       - name: 🔍 Benchmark both models over XMLA
+        if: ${{ inputs.dax }}
         env:
           PYTHONNET_RUNTIME: coreclr
           PYTHONIOENCODING: utf-8

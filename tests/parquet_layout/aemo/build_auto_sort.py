@@ -6,8 +6,9 @@ import duckrun
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
+import sort_key as sort_key_mod  # noqa: E402
 
-sort = (os.environ.get("OPT_SORT") or "auto").strip()
+sort = sort_key_mod.requested()
 clause = "sorted by auto" if sort.lower() == "auto" else f"sorted by ({sort})"
 force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 # OPT_RG: pin the row-group CEILING for this build (rows), e.g. 16000000 vs 8000000 — the harness
@@ -46,9 +47,8 @@ if OPT_PAGE_ROWS is not None:
           flush=True)
 # Read the source mart.fct_summary DIRECTLY (its own independent read, separate from the Spark
 # V-Order build's) with the same row cap. SORTED BY AUTO re-sorts regardless of input order.
-_lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
-N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
-_src = "mart.fct_summary" if N is None else f"(select * from mart.fct_summary limit {N})"
+# Shared with the sort-key step so the key it shows is the key this builds.
+_src = sort_key_mod.source_expr()
 
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"], read_only=False)
 try:
@@ -65,29 +65,6 @@ def _exists():
         return False
 
 
-def resolved_sort_key(body):
-    """The COLUMNS `clause` resolves to — so the report names the key rather than the string
-    "sorted by auto".
-
-    Without this the only record of what the picker chose is a log line, and a build that quietly
-    picks a different key produces a byte-for-byte identical report; working out that a 592M-row
-    nyc table had swapped one measure for another in the last tail slot took byte forensics across
-    four runs. This is the whole point of the comparison, so it belongs in the record.
-
-    Resolved with the same two calls `session._resolve_auto_sort` makes. It deliberately does NOT
-    substitute an explicit `sorted by (<cols>)` for `auto` in the CTAS: `_resolve_auto_sort` also
-    runs `_narrow_wide_decimals`, and it returns EARLY for any non-AUTO sort, so pinning the columns
-    here would silently drop the wide-DECIMAL narrowing (~1 GB and a 10x cold cliff on Contoso's
-    price columns). The cost is therefore one extra profiling pass, and it is sound only because the
-    profiling sample is seeded (#48): this resolve and the CTAS's own resolve draw the same sample
-    and so agree. Before that fix they could legitimately differ and this would have been a lie."""
-    if sort.lower() != "auto":
-        return [c.strip() for c in sort.split(",") if c.strip()]
-    tbl = con._auto_sort_single_table(body)
-    return (con._auto_sort_cols_from_table(tbl) if tbl is not None
-            else con._auto_sort_cols(con.con.sql(body)))
-
-
 _t0 = time.perf_counter()
 sort_key = None
 if not force and _exists():
@@ -97,8 +74,8 @@ if not force and _exists():
     status = "skipped"   # nothing was written, so no key was chosen — report null, not a guess
 else:
     body = f"select * from {_src}"
-    sort_key = resolved_sort_key(body)
-    print(f"sort key: {clause} -> {sort_key or '(no sort — nothing pays off)'}", flush=True)
+    sort_key = sort_key_mod.resolve(con, sort, body)
+    print(f"sort key: {clause} -> {sort_key_mod.label(sort_key)}", flush=True)
     print(f"Building tests.fct_summary_auto_sort with '{clause}' ...", flush=True)
     # Read mart.fct_summary directly (independent of the Spark V-Order build's read); SORTED BY AUTO
     # re-sorts regardless of the source's order.
