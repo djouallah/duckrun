@@ -245,9 +245,15 @@ _LAYOUT_COLS = ["table", "writer", "sort", "rows", "files", "row groups", "avg R
 
 
 def _sort_label(rep, t):
-    """The `sort` cell. Prefer build metadata (the actual columns AUTO picked); else the layout's
-    definitional intent, so auto_sort never shows an empty sort against its own name."""
+    """The `sort` cell. Prefer the RESOLVED key — the actual columns AUTO picked, which is the one
+    thing this comparison exists to show and which `sort` alone never carried (it is the requested
+    clause, so an AUTO build rendered as the literal "sorted by auto"). Fall back to that clause,
+    then to the layout's definitional intent, so auto_sort never shows an empty sort against its own
+    name. `sort_key` is `None` when nothing was built this cycle and `[]` when the picker declined."""
     b = rep.get("tables", {}).get(t, {}).get("build", {})
+    key = b.get("sort_key")
+    if key is not None:
+        return "sorted by (" + ", ".join(key) + ")" if key else "no sort (nothing paid off)"
     if b.get("sort"):
         return b["sort"]
     suf = t.removeprefix("fct_summary_")

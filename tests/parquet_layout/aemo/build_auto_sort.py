@@ -32,11 +32,11 @@ if OPT_TFS_MB is not None:
     from dbt.adapters.duckrun import engine as _engine
     _engine._TARGET_FILE_SIZE = OPT_TFS_MB * 1024 * 1024
     print(f"OPT_TFS_MB: target file size pinned to {OPT_TFS_MB} MB for this build", flush=True)
-# OPT_PAGE_ROWS: raise the data-page ROW cap (default 20k, see engine._DATA_PAGE_ROW_LIMIT) — the
-# page-granularity A/B vs the V-Order reference: its parquet-mr pages are ~1 MB / ~775k rows
-# (~61 data pages per 47M-row chunk) where duckrun's 20k-row cap makes ~2,350. With the cap
-# raised the 1 MB byte limit binds instead, landing pages at parquet-mr's shape. Same call-time
-# module-global seam as OPT_TFS_MB.
+# OPT_PAGE_ROWS: pin the data-page ROW cap (default 1M since d0d23b4, see
+# engine._DATA_PAGE_ROW_LIMIT) — the page-granularity A/B vs the V-Order reference, whose parquet-mr
+# pages are ~1 MB / ~775k rows (~61 data pages per 47M-row chunk). At the old 20k cap duckrun made
+# ~2,350 of them; at 1M the 1 MB byte limit binds instead and pages land at parquet-mr's shape.
+# Lower it here to reproduce the old geometry. Same call-time module-global seam as OPT_TFS_MB.
 _pr = os.environ.get("OPT_PAGE_ROWS", "").strip()
 OPT_PAGE_ROWS = int(_pr) if _pr.isdigit() and int(_pr) > 0 else None
 if OPT_PAGE_ROWS is not None:
@@ -65,24 +65,50 @@ def _exists():
         return False
 
 
+def resolved_sort_key(body):
+    """The COLUMNS `clause` resolves to — so the report names the key rather than the string
+    "sorted by auto".
+
+    Without this the only record of what the picker chose is a log line, and a build that quietly
+    picks a different key produces a byte-for-byte identical report; working out that a 592M-row
+    nyc table had swapped one measure for another in the last tail slot took byte forensics across
+    four runs. This is the whole point of the comparison, so it belongs in the record.
+
+    Resolved with the same two calls `session._resolve_auto_sort` makes. It deliberately does NOT
+    substitute an explicit `sorted by (<cols>)` for `auto` in the CTAS: `_resolve_auto_sort` also
+    runs `_narrow_wide_decimals`, and it returns EARLY for any non-AUTO sort, so pinning the columns
+    here would silently drop the wide-DECIMAL narrowing (~1 GB and a 10x cold cliff on Contoso's
+    price columns). The cost is therefore one extra profiling pass, and it is sound only because the
+    profiling sample is seeded (#48): this resolve and the CTAS's own resolve draw the same sample
+    and so agree. Before that fix they could legitimately differ and this would have been a lie."""
+    if sort.lower() != "auto":
+        return [c.strip() for c in sort.split(",") if c.strip()]
+    tbl = con._auto_sort_single_table(body)
+    return (con._auto_sort_cols_from_table(tbl) if tbl is not None
+            else con._auto_sort_cols(con.con.sql(body)))
+
+
 _t0 = time.perf_counter()
+sort_key = None
 if not force and _exists():
     rows = con.sql("select count(*) from tests.fct_summary_auto_sort").fetchone()[0]
     print(f"tests.fct_summary_auto_sort already exists ({rows:,} rows) — skipping "
           "(rebuild=true to rebuild)", flush=True)
-    status = "skipped"
+    status = "skipped"   # nothing was written, so no key was chosen — report null, not a guess
 else:
+    body = f"select * from {_src}"
+    sort_key = resolved_sort_key(body)
+    print(f"sort key: {clause} -> {sort_key or '(no sort — nothing pays off)'}", flush=True)
     print(f"Building tests.fct_summary_auto_sort with '{clause}' ...", flush=True)
     # Read mart.fct_summary directly (independent of the Spark V-Order build's read); SORTED BY AUTO
     # re-sorts regardless of the source's order.
-    con.sql(f"create or replace table tests.fct_summary_auto_sort {clause} "
-            f"as select * from {_src}")
+    con.sql(f"create or replace table tests.fct_summary_auto_sort {clause} as {body}")
     rows = con.sql("select count(*) from tests.fct_summary_auto_sort").fetchone()[0]
     print(f"done — tests.fct_summary_auto_sort built ({rows:,} rows)", flush=True)
     status = "rebuilt"
 
 report.merge({"tables": {"fct_summary_auto_sort": {"build": {
-    "engine": "delta_rs", "sort": clause, "vorder": False,
+    "engine": "delta_rs", "sort": clause, "sort_key": sort_key, "vorder": False,
     "row_group_ceiling": OPT_RG,     # None = adaptive (the default sizing)
     "target_file_size_mb": OPT_TFS_MB,  # None = the 256 MB default
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})
