@@ -15,8 +15,9 @@ Output → ``(rows, schema, lines)``: one row per column describing the recommen
          does no I/O). The caller wraps ``rows`` into a DataFrame.
 
 The model is a *deterministic function of the sample statistics*; the only run-to-run variance comes
-from the sample the caller materialises — seed that sample (the caller threads a ``REPEATABLE``
-seed) and this is reproducible.
+from the sample the caller materialises. That sample is therefore seeded by default
+(``DEFAULT_SAMPLE_SEED``, threaded as ``REPEATABLE`` by every caller), so the same table profiled
+twice returns the same key.
 
 The recommendation, in order:
   1. sample each column's cardinality (``approx_count_distinct`` HLL — never an exact
@@ -58,6 +59,14 @@ _TAIL_MIN_TABLE_FRAC = 0.005
 # more. These only decide how many rows the caller materializes to profile; they never feed a
 # recommendation.
 _SAMPLE_BYTE_BUDGET = 256 * 1024 * 1024   # 256 MiB target for the in-memory profiling sample
+# The REPEATABLE seed every caller threads into the profiling sample unless it asks for another one.
+# `recommend_sort_key` is a deterministic function of that sample, so an UNSEEDED sample is the only
+# thing that can make two runs of ONE config choose different keys — and it did: four benchmark runs
+# on one adapter version over an identical 592M-row table split 3/1 on which measure won the last
+# tail slot, an 8.8% (700 MB) spread from sample luck alone. A constant is enough; the value is
+# arbitrary and only its FIXEDNESS matters, so it is not configurable. Sizing only — this never
+# feeds the recommendation, so it is not a MODEL_VERSION concern.
+DEFAULT_SAMPLE_SEED = 0
 _DECOMPRESSION_FACTOR = 3.0               # parquet-on-disk → in-memory expansion, a rule of thumb
 # In-memory byte width per column type, for the relation path (no Delta log → no real file sizes).
 # Crude on purpose; VARCHAR/BLOB/INTERVAL/structured/unknown fall through to 24. Sizing only.

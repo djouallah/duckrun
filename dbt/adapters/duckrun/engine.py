@@ -1257,7 +1257,9 @@ def auto_sort_cols(cur, source, *, partition_cols=None, seed=None, label=("df", 
     Profiles a bounded reservoir sample sized by a schema-only width estimate (no Delta log to
     read real bytes), and NEVER exact — the source's row count is unknown without evaluating it,
     so uniqueness is never claimed here. ``partition_cols`` keeps declared partition columns from
-    burning a sort-key slot; ``seed`` makes the sample reproducible. The ``_rle_src`` temp table
+    burning a sort-key slot; ``seed`` overrides the ``REPEATABLE`` seed, which defaults to
+    ``sortkey.DEFAULT_SAMPLE_SEED`` so that one config profiled twice picks the same key — an
+    unseeded sample was measured swinging a 592M-row table's size 8.8%. The ``_rle_src`` temp table
     is connection-local (each dbt worker thread has its own cursor), so concurrent models don't
     collide."""
     desc = cur.sql(f"DESCRIBE SELECT * FROM {source}").fetchall()
@@ -1266,8 +1268,8 @@ def auto_sort_cols(cur, source, *, partition_cols=None, seed=None, label=("df", 
     if not cols:
         return [], []
     plan_rows, exact = sortkey.plan_sample(None, sortkey.estimate_row_bytes(types))
-    samp = (f"reservoir({plan_rows} ROWS) REPEATABLE ({int(seed)})"
-            if seed is not None else f"{plan_rows} ROWS")
+    samp = (f"reservoir({plan_rows} ROWS) "
+            f"REPEATABLE ({int(sortkey.DEFAULT_SAMPLE_SEED if seed is None else seed)})")
     src = "_rle_src"
     cur.execute(f"CREATE OR REPLACE TEMP TABLE {src} AS "
                 f"SELECT * FROM {source} USING SAMPLE {samp}")
