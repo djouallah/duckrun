@@ -2269,6 +2269,35 @@ def test_auto_geometry_sizes_off_the_exact_count_at_the_low_floor(conn):
     assert geom["bytes_per_row"] > 0
 
 
+@pytest.mark.parametrize("n,ceiling,expect", [
+    # 142M at the 16M ceiling: packing to the ceiling gives 8 full groups and a 4M runt; spreading
+    # over the 9 groups that implies gives 9 equal ones. This is the aemo fact's real shape.
+    (142_000_000, 16_000_000, 15_777_778),
+    (20_000_000, 2_500_000, 2_500_000),      # already exact — the even split changes nothing
+    (17_000_000, 16_000_000, 8_500_000),     # 1 full + 1M runt -> two equal halves
+    (5_000_000, 16_000_000, 5_000_000),      # fits in one group
+])
+def test_auto_geometry_spreads_rows_evenly_over_its_groups(n, ceiling, expect):
+    # Every row group the same size, and never above the ceiling: dividing by a group COUNT can only
+    # lower the target. A short trailing segment costs a whole transcode lane, which is the point.
+    groups = max(1, -(-n // ceiling))
+    assert -(-n // groups) == expect
+    assert expect <= ceiling
+
+
+def test_auto_geometry_target_is_even_not_ceiling_packed(conn):
+    # The same rule, through the real seam rather than arithmetic.
+    from dbt.adapters.duckrun import engine
+    cur = conn._connection
+    cur.execute("CREATE OR REPLACE TEMP TABLE staged_odd AS "
+                "select i as j, (i%97)::int k from range(17000000) t(i)")
+    _key, _lines, geom = engine.auto_sort_cols(cur, "staged_odd")
+    # 17M rows, ceiling ceil(17M/8)=2.125M -> 9 groups (not 8 packed + a 875k runt).
+    ceiling = engine.rg_for(17_000_000, floor=engine._RG_MIN)
+    groups = max(1, -(-17_000_000 // ceiling))
+    assert geom["rg_target"] == -(-17_000_000 // groups) <= ceiling
+
+
 def test_auto_ctas_lands_exactly_one_row_group_per_file(conn):
     # The whole point: with the row ceiling out of reach, the byte target is the only boundary, so
     # every file closes with exactly one row group and no ragged trailing group.
