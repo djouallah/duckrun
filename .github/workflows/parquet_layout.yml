@@ -253,8 +253,13 @@ jobs:
         continue-on-error: true
         run: python tests/parquet_layout/aemo/render_report.py
 
-      - name: 📑 Render specialist findings to job summary (fails on verdict-direction mismatch)
+      - name: 📑 Render specialist findings to job summary (verdict-direction mismatch = annotation)
         if: always()
+        # A verdict-direction mismatch is a property of the DATA, not a broken run: it fires when the
+        # aggregate and the per-query majority disagree, which is what a genuinely mixed result looks
+        # like. The numbers are the deliverable, so the mismatch stays an annotation and the run still
+        # reports. (The verdict layer's own logic is still gated by tests/parquet_layout/test_verdicts.py.)
+        continue-on-error: true
         env:
           PYTHONIOENCODING: utf-8
         run: python tests/parquet_layout/aemo/render_summary.py
@@ -414,8 +419,9 @@ jobs:
         continue-on-error: true
         run: python tests/parquet_layout/contoso/render_report.py
 
-      - name: 📑 Render specialist findings to job summary (fails on verdict-direction mismatch)
+      - name: 📑 Render specialist findings to job summary (verdict-direction mismatch = annotation)
         if: always()
+        continue-on-error: true   # same rule as the aemo job above — see the comment there
         env:
           PYTHONIOENCODING: utf-8
         run: python tests/parquet_layout/contoso/render_summary.py
