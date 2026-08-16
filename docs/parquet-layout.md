@@ -87,6 +87,10 @@ Two honest caveats:
   near 0 bytes/row, which without a floor produces a few-hundred-byte target; measured, that
   shattered a 4M-row table into 490 files. It only binds when the model has collapsed.
 
+Both AUTO routes are sized this way — a derived query and the bare
+`SELECT * FROM <table>` re-cluster, which profiles through the Delta log for null shares and
+cardinality caps but runs the same recommender underneath.
+
 Every write logs what actually landed (`rows per row group vs target`), and warns when the ratio is
 off by 2× either way. An explicit `max_row_group_size` or `target_file_size_mb` disables all of this
 for that model — a declared geometry is not a guess to improve on.

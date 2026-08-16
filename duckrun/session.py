@@ -941,9 +941,10 @@ class DuckSession:
         Returns ``(query, staged, geom)``. ``staged`` is a temp table holding the body's rows, or
         ``None`` when nothing was staged (any non-AUTO statement). The CALLER must drop it after the
         statement runs — :meth:`sql` does, in a ``finally``. ``geom`` is the one-row-group-per-file
-        write geometry the profile paid for, or ``None`` to keep the default adaptive layout — which
-        is what the ``_get_rle`` branch below returns, since it profiles by a different route and
-        produces no byte model.
+        write geometry the profile paid for, or ``None`` to keep the default adaptive layout. BOTH
+        profiling branches produce one: ``_get_rle`` runs the same recommender and returns the same
+        schema, so re-clustering a table (the bare ``SELECT * FROM <delta table>`` case, and the one
+        the layout benchmark exercises) is sized exactly like a derived query.
 
         When the body is a bare ``SELECT * FROM <one delta table>`` (the re-cluster-this-table case)
         the key comes from :meth:`_get_rle`, which also reads the table's Delta log for per-column
@@ -971,7 +972,7 @@ class DuckSession:
             # A bare `SELECT * FROM <delta table>` still profiles via _get_rle, for the Delta-log
             # stats — it re-reads the table, but only that case, and only because the log carries
             # signal the staged copy does not.
-            cols = (self._auto_sort_cols_from_table(src) if src is not None
+            cols = (self._auto_sort_cols_from_table(src, staged=staged) if src is not None
                     else self._auto_sort_cols(staged))
             # Decimal narrowing stays gated on the ORIGINAL body being `SELECT *`: an explicit
             # projection (including a user-written CAST) is an instruction and is left alone. The
@@ -1474,12 +1475,23 @@ class DuckSession:
                 print(line)
         return cols
 
-    def _auto_sort_cols_from_table(self, source_table: str) -> List[str]:
+    def _auto_sort_cols_from_table(self, source_table: str, *, staged: str = None) -> List[str]:
         """Sort key for a source TABLE, via ``_get_rle`` — it reads the Delta **log** for null shares
         and NDV caps that a bare relation profile can't get. Returns the recommended ORDER BY
-        columns, or ``[]`` if nothing pays off."""
+        columns, or ``[]`` if nothing pays off.
+
+        ``staged`` is the temp table the write will read, and asking for it also computes the
+        one-row-group-per-file geometry onto ``self._auto_geom`` (see :meth:`_auto_sort_cols` for why
+        it is an attribute and not a return value). ``_get_rle`` runs the SAME
+        ``sortkey.recommend_sort_key`` as the relation path and hands back its full result schema, so
+        the byte model needs nothing extra — only the row count, which comes from ``staged`` rather
+        than the source so it counts exactly the rows being written. Keyword-only so the
+        parquet_layout build scripts, which call this with one positional argument, keep working."""
         prof = self._get_rle(source_table)
-        recs = [dict(zip(prof.columns, row)) for row in prof.fetchall()]
+        raw = prof.fetchall()          # already in sortkey._SCHEMA order — what the byte model wants
+        recs = [dict(zip(prof.columns, row)) for row in raw]
+        if staged is not None:
+            self._auto_geom = engine._auto_geometry(self.con, staged, raw, narrow_decimals=True)
         return [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
                                             key=lambda x: x["sort_position"])]
 

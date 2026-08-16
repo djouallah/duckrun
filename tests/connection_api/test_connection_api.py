@@ -2298,6 +2298,21 @@ def test_auto_ctas_stays_one_row_group_per_file_when_the_model_is_wrong(conn, mo
     assert all(rgs == 1 for _f, rgs in per_file), f"ragged file(s): {per_file}"
 
 
+def test_auto_recluster_of_a_table_is_sized_too(conn):
+    # `SORTED BY AUTO AS SELECT * FROM <delta table>` — re-cluster this table — profiles via
+    # _get_rle (the Delta log carries null shares and NDV caps a bare relation profile cannot get),
+    # NOT the staged-relation path. It runs the same recommender underneath, so it must get the same
+    # geometry: this is the shape the layout benchmark builds, and it was silently unsized at first.
+    conn.sql("CREATE OR REPLACE TABLE recluster_src AS "
+             "select i as j, (i%1000)::int k, ('s'||(i%9973)) s from range(20000000) t(i)")
+    conn.sql("CREATE OR REPLACE TABLE recluster_src SORTED BY AUTO AS select * from recluster_src")
+    live = _live_files(conn, "recluster_src")
+    per_file = conn.sql(f"select file_name, count(distinct row_group_id) "
+                        f"from parquet_metadata({live!r}) group by 1").fetchall()
+    assert len(per_file) > 1, f"test needs a multi-file table to be meaningful: {per_file}"
+    assert all(rgs == 1 for _f, rgs in per_file), f"ragged file(s): {per_file}"
+
+
 def test_auto_geometry_never_reaches_a_plain_ctas(conn):
     # Scope guard: only SORTED BY AUTO gets the byte-derived geometry. A plain CTAS keeps the
     # adaptive planner-estimate path (and its 8M floor), so it still lands multi-group files.

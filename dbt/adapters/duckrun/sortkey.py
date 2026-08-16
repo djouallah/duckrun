@@ -205,7 +205,11 @@ def bytes_per_row(rows, n, *, narrow_decimals=False):
 
     This is an ENCODED-bytes model: no Snappy, no page headers, no footer, no file overhead. It is NOT
     a file-size prediction and must not be read as one. ``policy.tfs_for`` holds the one measured
-    constant that turns it into a byte target."""
+    constant that turns it into a byte target.
+
+    ``rows`` is whatever ``recommend_sort_key`` returned, so both AUTO profiling routes feed this:
+    the staged-relation one and ``session._get_rle`` (re-cluster an existing table), which runs the
+    same recommender and hands back the same schema."""
     if not rows or not n:
         return None
     total = 0.0
