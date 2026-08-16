@@ -17,6 +17,30 @@ All notable changes to this project will be documented in this file.
   disk discovery only rediscovers Delta tables.
 
 ### Changed
+- **The auto sort-key picker reads the source ONCE and profiles every row — sampling is gone**
+  (sort-key model `v5`; picked keys will move). It profiled a seeded reservoir sample, which turned
+  out to cost more than it saved on every axis. `USING SAMPLE reservoir(N ROWS)` is superlinear in
+  `N`, and the sample sizer aimed at the worst end of it: measured on DuckDB 1.5.5 over a 20M-row
+  parquet table where materializing the *whole* table took 0.68 s, `reservoir(1M)` took 7.2 s,
+  `reservoir(5M)` 56 s, and `reservoir(8M)` — the sizer's own ceiling — **83 s, 122× the cost of not
+  sampling**. It also saved no I/O (reservoir and bernoulli both scan everything; DuckDB pushes
+  sampling only into its native storage, never `read_parquet`/`delta_scan`) and no memory (the
+  cardinality sketches are fixed KB per column at any table size; the historical OOM was a *batched
+  exact* `COUNT(DISTINCT)`, removed long ago).
+  - Both surfaces now stage the source into one local temp table, and the profile, the wide-`DECIMAL`
+    max scan and the write all read that. `CREATE TABLE … SORTED BY AUTO` went from up to four reads
+    of OneLake to one; a dbt `sort_by: auto` model no longer re-runs its joins three extra times.
+  - **Reproducibility is now structural rather than patched.** #48 made the reservoir `REPEATABLE`
+    after an unseeded draw swung a 592M-row table's size 8.8% (700 MB). That fix never covered a
+    model whose SQL contains a `GROUP BY`: DuckDB only guarantees a repeatable sample at
+    `threads=1`, and parallel hash aggregation reorders the rows reaching the sampler. Reading every
+    row removes the failure mode instead of narrowing it. No seed remains anywhere.
+  - Better inputs, same rules: `n` and every in-group count are real, and **uniqueness is now claimed
+    on tables of any size** — a sample saturates at its own size, so the claim had to be suppressed
+    on anything past the 256 MiB budget, which meant the key-organized branch never fired in
+    production. The measure tail's group-stratified source read is deleted with the sample that
+    forced it: over every row, `distinct(prefix, measure)` *is* the measure's run count.
+  - Cost moves from remote I/O to local disk — the staged copy spills to `temp_directory`.
 - **`sort_by: 'auto'` no longer profiles on write paths that discard the key.** Resolving `'auto'`
   means profiling the staged model result — the expensive part of the feature — but `sort_by` is a
   DuckDB `ORDER BY` applied to the relation the write reads, and three branches never read it: the

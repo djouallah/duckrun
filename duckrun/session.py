@@ -80,13 +80,12 @@ _TXN_WRITE_MSG = (
     "then run the write; or run the write outside BEGIN … COMMIT."
 )
 
-# _get_rle profiles a reservoir SAMPLE of the table, not the whole thing: key selection only needs to
-# rank columns by cardinality/skew and test functional dependencies, all of which survive sampling.
-# The sample size is a byte-budgeted, width-aware plan (``sortkey.plan_sample``): a byte budget over
-# the table's real average row width (from the Delta log), so a wide table samples fewer rows and a
-# narrow one more, and a table that fits the budget is profiled EXACTLY (no sampling at all). This
-# turns the ~dozen profiling scans from full-table passes (minutes on a remote 142M-row table) into
-# millisecond local-temp-table scans.
+# The sort-key profilers materialize their source into a LOCAL temp table once and run every scan
+# against that, so the model's ~dozen passes cost local disk instead of repeated OneLake round trips.
+# They used to materialize a seeded reservoir SAMPLE instead; that was removed — the sample cost more
+# than reading everything (a `reservoir(8M ROWS)` draw measured 122x a full materialization), saved no
+# I/O, saved no memory, and was not reliably reproducible over an aggregating source. See the
+# `sortkey` module docstring for the numbers.
 _READ_ONLY_MSG = (
     "catalog '{catalog}' is read-only — cannot {op}. duckrun opens read-only by default; enable "
     "Delta writes (INSERT / UPDATE / DELETE / MERGE / REPLACE WHERE / CREATE / DROP / VACUUM) "
@@ -901,16 +900,23 @@ class DuckSession:
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)
-        query = self._resolve_auto_sort(query)
-        # A Delta write is routed with the DuckDB memory_limit clamped (and restored after); a read runs
-        # handle() unwrapped — it returns False for non-DML and falls through to DuckDB below. is_write
-        # implies entry is not None here (the None case raised above).
-        if entry is not None:
-            handled = (self._handle_delta_write(entry, query) if is_write else
-                       delta_dml.handle(self.con, entry.root_path, entry.storage_options,
-                                        query, default_schema=self._current_database))
-        else:
-            handled = False
+        # SORTED BY AUTO stages its source into a temp table and rewrites the statement to read that,
+        # so the profile and the write below share ONE evaluation of the source. staged is that temp
+        # table's name (or None) and this owns its lifetime — hence the try/finally.
+        query, staged = self._resolve_auto_sort(query)
+        try:
+            # A Delta write is routed with the DuckDB memory_limit clamped (and restored after); a read runs
+            # handle() unwrapped — it returns False for non-DML and falls through to DuckDB below. is_write
+            # implies entry is not None here (the None case raised above).
+            if entry is not None:
+                handled = (self._handle_delta_write(entry, query) if is_write else
+                           delta_dml.handle(self.con, entry.root_path, entry.storage_options,
+                                            query, default_schema=self._current_database))
+            else:
+                handled = False
+        finally:
+            if staged is not None:
+                self.con.execute(f"DROP TABLE IF EXISTS {staged}")
         if handled:
             # No catalog rescan here: the DML router already registered/dropped the one view this
             # statement touched (_refresh_view/_drop), exactly like the dbt surface, and no peer
@@ -922,35 +928,57 @@ class DuckSession:
             raise ValueError(_delta_write_message(query))
         return self.con.sql(query)
 
-    def _resolve_auto_sort(self, query: str) -> str:
+    def _resolve_auto_sort(self, query: str):
         """Resolve ``CREATE TABLE … SORTED BY AUTO AS <query>`` (a duckrun extension) into an explicit
         ``SORTED BY (cols)`` by profiling the query's result with the sort-key recommender, so the
         router only ever handles explicit layout clauses. If nothing pays off, the clause is dropped.
         ``SORTED BY (cols)`` / ``PARTITIONED BY (cols)`` (native DuckDB syntax) and every non-CREATE
         statement pass straight through untouched.
 
-        When the body is a bare ``SELECT * FROM <one delta table>`` (the re-cluster-this-table case),
-        the key is profiled EXACTLY from that table's Delta log — real row width, per-column null
-        stats, and uniqueness (a unique key is left PLAIN and picked as the ORDER BY key) — which a
-        sampled relation profile can't assert. Any filter / projection / join / non-Delta source falls
-        back to sampling the result relation, whose distribution isn't a table's on-disk layout."""
+        Returns ``(query, staged)``. ``staged`` is a temp table holding the body's rows, or ``None``
+        when nothing was staged (any non-AUTO statement). The CALLER must drop it after the statement
+        runs — :meth:`sql` does, in a ``finally``.
+
+        When the body is a bare ``SELECT * FROM <one delta table>`` (the re-cluster-this-table case)
+        the key comes from :meth:`_get_rle`, which also reads the table's Delta log for per-column
+        null shares and NDV caps a bare relation profile can't get. Any filter / projection / join /
+        non-Delta source profiles the result relation instead, whose distribution isn't the table's
+        on-disk layout.
+
+        Either way the body is materialized ONCE and the rewritten statement reads that temp table,
+        so the ~dozen profiling scans, the wide-DECIMAL max scan and the CTAS's own read all share a
+        single evaluation of the source. On OneLake that is the difference between four remote reads
+        and one."""
         stripped = delta_dml._strip_comments(delta_dml._strip_leading(query)).rstrip().rstrip(";").rstrip()
         m = delta_dml._CREATE_AS.fullmatch(stripped)
         if not m:
-            return query
+            return query, None
         _rel, sort, _part = delta_dml._split_create_layout(m.group("rel").strip())
         if sort != "AUTO":
-            return query
+            return query, None
         body = m.group("body")
-        src = self._auto_sort_single_table(body)
-        cols = (self._auto_sort_cols_from_table(src) if src is not None
-                else self._auto_sort_cols(self.con.sql(body)))
-        new_body = self._narrow_wide_decimals(body)
-        if new_body != body:
-            bstart, bend = m.span("body")
-            stripped = stripped[:bstart] + new_body + stripped[bend:]
+        staged = "_duckrun_auto_src"
+        self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS {body}")
+        try:
+            src = self._auto_sort_single_table(body)
+            # A bare `SELECT * FROM <delta table>` still profiles via _get_rle, for the Delta-log
+            # stats — it re-reads the table, but only that case, and only because the log carries
+            # signal the staged copy does not.
+            cols = (self._auto_sort_cols_from_table(src) if src is not None
+                    else self._auto_sort_cols(staged))
+            # Decimal narrowing stays gated on the ORIGINAL body being `SELECT *`: an explicit
+            # projection (including a user-written CAST) is an instruction and is left alone. The
+            # staged table always LOOKS like SELECT *, so testing it instead would silently widen
+            # the rule to every body.
+            new_body = (self._narrow_wide_decimals(f"SELECT * FROM {staged}")
+                        if _SELECT_STAR_BODY.match(body.strip()) else f"SELECT * FROM {staged}")
+        except Exception:
+            self.con.execute(f"DROP TABLE IF EXISTS {staged}")
+            raise
+        bstart, bend = m.span("body")
+        stripped = stripped[:bstart] + new_body + stripped[bend:]
         replacement = ("SORTED BY (" + ", ".join(_qid(c) for c in cols) + ")") if cols else ""
-        return delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1)
+        return delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1), staged
 
     def _narrow_wide_decimals(self, body: str) -> str:
         """Rewrite a ``SELECT *`` body to narrow wide-``DECIMAL`` columns so they regain dictionary
@@ -1323,23 +1351,18 @@ class DuckSession:
 
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
                  key_sort_below_pct: float = 10.0, null_excl: float = 0.5,
-                 fd_band: float = 0.12, grain_frac: float = 0.5,
-                 seed: Optional[int] = None) -> "duckdb.DuckDBPyRelation":
+                 fd_band: float = 0.12, grain_frac: float = 0.5) -> "duckdb.DuckDBPyRelation":
         """EXPERIMENTAL / PRIVATE — parked, not part of the public API. Recommend a short Delta **sort
         key** that minimises a table's estimated **in-memory columnar** footprint, and
         return a per-column :class:`DataFrame`. Recommendation-only — it never rewrites the table.
 
-        Profiled on a reservoir SAMPLE (materialised once into a temp table) rather than the whole
-        table: the key model only ranks columns by cardinality/skew and tests functional
-        dependencies, which survive sampling, and this keeps the ~dozen profiling scans off the
-        (possibly remote) full table. The sample size is a byte-budgeted, width-aware plan
-        (``sortkey.plan_sample`` over the Delta log's real average row width), so a table that fits
-        the byte budget is profiled EXACTLY (no ``USING SAMPLE`` at all) and larger ones sample fewer
-        rows the wider they are. ``ndv``/``skew``/``current_runs`` are SAMPLE estimates otherwise.
-        Uniqueness is only asserted when the profile was exact — a sample can't tell a unique key from
-        a merely higher-than-sample-cardinality column. The reservoir sample is always
-        ``REPEATABLE`` — seeded with ``sortkey.DEFAULT_SAMPLE_SEED`` unless ``seed`` overrides it —
-        so two runs on the same table return byte-identical rows.
+        The table is materialised into a local temp table ONCE and every profiling scan reads that,
+        so a remote table is read exactly once no matter how many passes the model makes. It used to
+        materialise a seeded reservoir SAMPLE instead; that was removed because the sample cost more
+        than reading everything, saved no I/O, saved no memory, and was not reliably reproducible
+        (see the ``sortkey`` module docstring for the measurements). ``n``, run counts and
+        uniqueness are therefore real; ``ndv`` remains an HLL sketch by design. Two runs over one
+        table version return byte-identical rows, with nothing seeded to make that true.
 
         The target is an in-memory columnar encoding, **not** parquet-on-disk: each column is value- or hash/dictionary-encoded
         (indices bit-packed at ``ceil(log2 ndv)`` bits) and then RLE is kept only when it beats the
@@ -1381,16 +1404,10 @@ class DuckSession:
         # Partition columns lead the physical ORDER BY but are NOT compression-key candidates: Delta
         # strips them from the data files (zero RLE value), yet ordering by them first keeps ~one
         # delta-rs partition writer open at a time (less write memory). Discover them from the Delta
-        # metadata; best-effort — an unreadable log just means "treat as unpartitioned". The same
-        # add_actions carry each file's size_bytes; sum them here (in the SAME best-effort block, no
-        # extra open) to size the profiling sample below by the table's real average row width.
-        file_bytes = 0
+        # metadata; best-effort — an unreadable log just means "treat as unpartitioned".
         try:
             _dt = engine._delta_table(path, self._catalog_storage_options(cat))
             partition_cols = list(_dt.metadata().partition_columns or [])
-            add_actions = _dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan
-            file_bytes = int(self.con.sql(
-                "select coalesce(sum(size_bytes), 0)::bigint from add_actions").fetchone()[0] or 0)
         except Exception:
             partition_cols = []
         desc = self.con.sql(f"DESCRIBE SELECT * FROM delta_scan('{plit}')").fetchall()
@@ -1400,72 +1417,50 @@ class DuckSession:
         if not cols:
             raise ValueError(f"_get_rle: table '{table}' has no columns.")
 
-        # Delta-LOG column stats (no data scan): the sample gives ndv/skew but not each column's null
+        # Delta-LOG column stats (no data scan): the profile gives ndv/skew but not each column's null
         # share, so a mostly-null column can wrongly win a scarce sort-key slot. get_add_actions carries
         # per-file null_count/min/max — sum them once here and hand the profiler a per-column null_frac
         # (and constancy, reserved). Best-effort: an unreadable/statless log just yields {} and the
-        # profiler runs exactly as before. total_rows also sizes the sample below.
-        stats, _, total_rows = engine.delta_column_stats(
+        # profiler runs exactly as before.
+        stats, _, _total = engine.delta_column_stats(
             self.con, path, cols, types, self._catalog_storage_options(cat))
-        # Byte-budgeted, width-aware sample plan. avg_row_bytes = real on-disk bytes/row × a
-        # decompression factor (the in-memory form is larger than parquet); fall back to a schema
-        # width estimate when the log gave nothing. plan_sample returns the row count AND whether the
-        # table fits the budget — if it does, profile it EXACTLY (no USING SAMPLE) so small tables
-        # stay exact and uniqueness can be trusted.
-        avg_row_bytes = ((file_bytes / total_rows) * sortkey._DECOMPRESSION_FACTOR
-                         if file_bytes and total_rows else sortkey.estimate_row_bytes(types))
-        plan_rows, exact = sortkey.plan_sample(total_rows or None, avg_row_bytes)
+        # ONE read of the (possibly remote) table. Every profiling scan below then reads this local
+        # materialization, so the model's dozen-odd passes cost local disk, not OneLake round trips.
+        # It spills to temp_directory like any DuckDB result.
         src = "_rle_src"
-        if exact:
-            self.con.execute(
-                f"CREATE OR REPLACE TEMP TABLE {src} AS SELECT * FROM delta_scan('{plit}')")
-        else:
-            samp = (f"reservoir({plan_rows} ROWS) "
-                    f"REPEATABLE ({int(sortkey.DEFAULT_SAMPLE_SEED if seed is None else seed)})")
-            self.con.execute(
-                f"CREATE OR REPLACE TEMP TABLE {src} AS "
-                f"SELECT * FROM delta_scan('{plit}') USING SAMPLE {samp}")
+        self.con.execute(
+            f"CREATE OR REPLACE TEMP TABLE {src} AS SELECT * FROM delta_scan('{plit}')")
         try:
             rows, schema, lines = sortkey.recommend_sort_key(
                 self.con, sch, tbl, src, cols, types, partition_cols,
                 sort_key_cap=sort_key_cap, min_gain_pct=min_gain_pct,
                 key_sort_below_pct=key_sort_below_pct, stats=stats, null_excl=null_excl,
-                fd_band=fd_band, grain_frac=grain_frac, sample_rows=plan_rows, exact=exact,
-                # The measure tail reads whole dim GROUPS from here when the sample is too thin per
-                # group to see in-group structure (sortkey._GROUP_STARVED_FRAC) — the aemo `price`
-                # case. Sample-only counts cannot answer that question at any precision.
-                full_src=f"delta_scan('{plit}')", total_rows=total_rows or None)
+                fd_band=fd_band, grain_frac=grain_frac)
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
         for line in lines:   # the module is pure; the caller prints the advisory
             print(line)
         return self._relation_from(rows, schema)
 
-    def _auto_sort_cols(self, relation, seed: Optional[int] = None) -> List[str]:
-        """Run the sort-key recommender over an arbitrary relation (no Delta table behind it, so no
-        partitions and no log stats) and return the recommended ORDER BY columns, or ``[]`` if
-        nothing pays off. Backs ``SORTED BY AUTO`` over a derived query. Thin delegate: registers
-        the relation as a view and hands it to :func:`engine.auto_sort_cols` — the shared sampler
-        behind this path and dbt's ``sort_by='auto'`` — so both surfaces profile identically.
-        ``seed`` overrides the default ``REPEATABLE`` seed; the sample is seeded either way."""
-        view = "_rle_relation_src"
-        relation.create_view(view, replace=True)
-        try:
-            cols, lines = engine.auto_sort_cols(self.con, view, seed=seed)
-        finally:
-            self.con.execute(f"DROP VIEW IF EXISTS {view}")
-        # The no-arg sort() path prints ONLY the ORDER BY line (not the full advisory block).
+    def _auto_sort_cols(self, staged: str) -> List[str]:
+        """Sort key for an arbitrary query's result (no Delta table behind it, so no partitions and no
+        log stats), or ``[]`` if nothing pays off. Backs ``SORTED BY AUTO`` over a derived query.
+
+        ``staged`` is the temp table the CALLER has already materialized the result into — the
+        recommender scans it a dozen or so times, and it is the same table the CTAS then writes from,
+        so an arbitrary query is evaluated exactly once for profile + write together."""
+        cols, lines = engine.auto_sort_cols(self.con, staged)
+        # This path prints ONLY the ORDER BY line (not the full advisory block).
         for line in lines:
             if line.strip().startswith("ORDER BY"):
                 print(line)
         return cols
 
-    def _auto_sort_cols_from_table(self, source_table: str, seed: Optional[int] = None) -> List[str]:
-        """No-arg ``df.sort()`` key for a frame that carries a source TABLE: profile it via ``_get_rle``,
-        which sizes its sample from the Delta **log**'s real row width (exact when the table fits the
-        byte budget) rather than a schema-only estimate — the same profiler the sort rewrite uses.
-        Returns the recommended ORDER BY columns, or ``[]`` if nothing pays off."""
-        prof = self._get_rle(source_table, seed=seed)
+    def _auto_sort_cols_from_table(self, source_table: str) -> List[str]:
+        """Sort key for a source TABLE, via ``_get_rle`` — it reads the Delta **log** for null shares
+        and NDV caps that a bare relation profile can't get. Returns the recommended ORDER BY
+        columns, or ``[]`` if nothing pays off."""
+        prof = self._get_rle(source_table)
         recs = [dict(zip(prof.columns, row)) for row in prof.fetchall()]
         return [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
                                             key=lambda x: x["sort_position"])]

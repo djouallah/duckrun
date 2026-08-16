@@ -1,16 +1,16 @@
 """Property tests for the sort-key recommender (``dbt/adapters/duckrun/sortkey.py``).
 
 Pure-local and network-free: each test plants a small DuckDB table with a KNOWN structure, calls
-``sortkey.recommend_sort_key`` / ``sortkey.plan_sample`` directly, and asserts the R-rule outcome.
-No Delta table is needed — ``stats`` (null-heavy) and ``partition_cols`` are passed as literals.
+``sortkey.recommend_sort_key`` directly, and asserts the R-rule outcome. No Delta table is needed —
+``stats`` (null-heavy) and ``partition_cols`` are passed as literals.
 
-The recommender is a deterministic function of its sample, so an ``exact`` profile (the whole table
-handed in, ``exact=True``) is fully reproducible with no sampling at all — that is what most tests
-use. Two tests exercise the seeded reservoir sample and the session plumbing.
+The recommender profiles every row it is handed — there is no sampling and nothing seeded — so it is
+a deterministic function of the data alone. The reproducibility tests below therefore assert the
+strong form: two profiles of one table agree with no seed in the picture, including over a source
+whose row order is not stable.
 
 Every outcome asserted here is the CURRENT R-rule behaviour (the fixtures are tuned so today's code
-passes) EXCEPT the two the work order fixes: INTERVAL eligibility (test 12) and module purity
-(test 15) fail before their task and pass after.
+passes).
 """
 import duckdb
 import pytest
@@ -27,17 +27,17 @@ def _con():
     return duckdb.connect()
 
 
-def _profile(con, select_sql, *, table="t", partition_cols=(), stats=None, exact=True, **kw):
+def _profile(con, select_sql, *, table="t", partition_cols=(), stats=None, **kw):
     """Materialize ``select_sql`` as ``table``, profile it, and return ``(recs, lines)`` where
-    ``recs`` is ``{column: {field: value}}`` over ``_COLS``. ``exact`` defaults True (whole table)."""
+    ``recs`` is ``{column: {field: value}}`` over ``_COLS``. Mirrors production: the profiler is
+    always handed a materialized relation holding every row."""
     con.execute(f"CREATE OR REPLACE TABLE {table} AS {select_sql}")
     desc = con.sql(f"DESCRIBE {table}").fetchall()
     cols = [r[0] for r in desc]
     types = {r[0]: r[1] for r in desc}
-    n = con.sql(f"SELECT count(*) FROM {table}").fetchone()[0]
     rows, _schema, lines = sortkey.recommend_sort_key(
         con, "sch", "tbl", table, cols, types, list(partition_cols),
-        stats=stats, sample_rows=n, exact=exact, **kw)
+        stats=stats, **kw)
     recs = {r[3]: dict(zip(_COLS, r)) for r in rows}
     return recs, lines
 
@@ -192,13 +192,16 @@ def test_key_organized_exact():
     assert any("key-organized" in ln for ln in lines)
 
 
-# ── 9. Sampled uniqueness refusal: same table, exact=False → no unique flags, no key-organized. ─
-def test_sampled_uniqueness_refused():
+# ── 9. Uniqueness is claimed on EVERY profile (model v5). ───────────────────────────────────────
+# It used to be suppressed whenever the profile was a sample, because a column whose true ndv exceeds
+# the sample size saturates to ndv≈n and looks unique. With the whole table profiled there is no such
+# failure mode, so the key-organized branch is reachable on a table of any size — where before, with
+# a 256 MiB sample budget, it could only ever fire on a small one.
+def test_uniqueness_is_claimed_on_every_profile():
     con = duckdb.connect()
-    recs, lines = _profile(con, "select i as pk, i * 2 as a, i * 3 as b from range(500) t(i)",
-                           exact=False)
-    assert not any(r["is_unique"] for r in recs.values())       # a sample cannot claim uniqueness
-    assert not any("key-organized" in ln for ln in lines)
+    recs, lines = _profile(con, "select i as pk, i * 2 as a, i * 3 as b from range(500) t(i)")
+    assert recs["pk"]["is_unique"]
+    assert any("key-organized" in ln for ln in lines)
 
 
 # ── 10. Null-heavy exclusion (S1): a 80%-null column (from the log) is dropped and named. ────────
@@ -234,30 +237,14 @@ def test_interval_ineligible():
     assert recs["region"]["in_sort_key"] and recs["region"]["sort_position"] == 1
 
 
-# ── 13. Determinism: a seeded reservoir sample gives byte-identical recommendation rows. ────────
-def test_seeded_sample_is_deterministic():
+# ── 13. Determinism: two profiles of one table are byte-identical, with nothing seeded. ─────────
+def test_two_profiles_of_one_table_agree():
     con = duckdb.connect()
     con.execute("CREATE TABLE big AS SELECT (i % 50) a, (i % 7) b, i c FROM range(5000) t(i)")
-    con.execute("CREATE TABLE s1 AS SELECT * FROM big USING SAMPLE reservoir(1000 ROWS) REPEATABLE (42)")
-    con.execute("CREATE TABLE s2 AS SELECT * FROM big USING SAMPLE reservoir(1000 ROWS) REPEATABLE (42)")
     cols, types = ["a", "b", "c"], {"a": "BIGINT", "b": "BIGINT", "c": "BIGINT"}
-    r1, _, _ = sortkey.recommend_sort_key(con, "s", "s1", "s1", cols, types, [],
-                                          sample_rows=1000, exact=False)
-    r2, _, _ = sortkey.recommend_sort_key(con, "s", "s2", "s2", cols, types, [],
-                                          sample_rows=1000, exact=False)
-    # only the column-1 label ("s1"/"s2") differs by construction; strip it before comparing.
-    assert [r[1:] for r in r1] == [r[1:] for r in r2]
-
-
-# ── 14. plan_sample math. ───────────────────────────────────────────────────────────────────────
-def test_plan_sample_math():
-    budget = 256 * 1024 * 1024
-    assert sortkey.plan_sample(10_000, 100) == (10_000, True)          # small → exact, no sampling
-    assert sortkey.plan_sample(1_000_000_000, 40) == (budget // 40, False)      # 6,710,886, in range
-    assert sortkey.plan_sample(1_000_000_000, 4096) == (100_000, False)         # budget/4096 < min → min
-    assert sortkey.plan_sample(None, 100) == (budget // 100, False)             # unknown total → sample
-    # width clamps the high end: a very narrow row cannot pull more than max_rows.
-    assert sortkey.plan_sample(1_000_000_000, 1) == (8_000_000, False)
+    r1, _, _ = sortkey.recommend_sort_key(con, "s", "big", "big", cols, types, [])
+    r2, _, _ = sortkey.recommend_sort_key(con, "s", "big", "big", cols, types, [])
+    assert r1 == r2
 
 
 # ── 15a. Purity: recommend_sort_key itself prints nothing (fails before Task 4). ────────────────
@@ -280,110 +267,80 @@ def test_optimize_analyze_prints_order_by(session, capsys):
     assert "ORDER BY" in capsys.readouterr().out
 
 
-def test_optimize_analyze_seed_is_deterministic(session, capsys):
-    # Seeded advisory over a table is reproducible run-to-run (small table → exact, but the seed
-    # path must at least run and stay stable).
+def test_optimize_analyze_is_deterministic(session, capsys):
     session.sql("CREATE OR REPLACE TABLE seeded AS "
                 "select (i % 50) a, (i % 7) b, i c from range(4000) t(i)")
-    r1 = [tuple(row) for row in session._get_rle("seeded", seed=7).fetchall()]
+    r1 = [tuple(row) for row in session._get_rle("seeded").fetchall()]
     capsys.readouterr()
-    r2 = [tuple(row) for row in session._get_rle("seeded", seed=7).fetchall()]
+    r2 = [tuple(row) for row in session._get_rle("seeded").fetchall()]
     assert r1 == r2
 
 
-# ── 16. The DEFAULT (no seed passed) sample is seeded too. ──────────────────────────────────────
-# Regression: every production caller reaches the sampler WITHOUT a seed — dbt's `sort_by='auto'`
-# (delta_plugin) and the connection API's `SORTED BY AUTO`, over a relation (engine.auto_sort_cols)
-# or over a table (session._get_rle). That used to mean an UNSEEDED reservoir, so one config could
-# pick a different key on every build: measured at 8.8% (700 MB) of a 592M-row table when a
-# different measure won the last tail slot. There are exactly two sampling seams and the tests below
-# cover one each — the default is the only thing those callers actually exercise.
-def test_unseeded_sampler_emits_repeatable():
-    """The SQL the sampler builds carries REPEATABLE even when no seed is passed."""
+# ── 16. Nothing is sampled, anywhere, and reproducibility no longer rests on a seed. ────────────
+# These replace the #48 seed-regression trio. That fix made the reservoir `REPEATABLE` because an
+# unseeded draw could pick a different key on every build (measured at 8.8% / 700 MB of a 592M-row
+# table when a different measure won the last tail slot). Sampling is now gone entirely, so the
+# invariant is stronger and simpler: the profilers emit no `USING SAMPLE` at all, and two profiles of
+# one table agree because they read the same rows — not because a constant made them.
+class _Spy:                         # DuckDBPyConnection attributes are read-only, so proxy it
+    def __init__(self, inner):
+        self._inner, self.sql_seen = inner, []
+
+    def execute(self, sql, *a, **k):
+        self.sql_seen.append(sql)
+        return self._inner.execute(sql, *a, **k)
+
+    def sql(self, sql, *a, **k):
+        self.sql_seen.append(sql)
+        return self._inner.sql(sql, *a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+
+def test_profiler_never_samples():
+    """The relation seam (`engine.auto_sort_cols`, behind dbt's sort_by='auto')."""
     con = duckdb.connect()
     con.execute("CREATE TABLE wide AS SELECT (i % 50) a, (i % 7) b, i c FROM range(40000) t(i)")
-    captured = []
-
-    class Spy:                      # DuckDBPyConnection attributes are read-only, so proxy it
-        def __init__(self, inner):
-            self._inner = inner
-
-        def execute(self, sql, *a, **k):
-            captured.append(sql)
-            return self._inner.execute(sql, *a, **k)
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-    engine.auto_sort_cols(Spy(con), "wide")       # no seed — the production call shape
-    sample_sql = [s for s in captured if "USING SAMPLE" in s]
-    assert sample_sql, "profiler did not sample"
-    assert "REPEATABLE" in sample_sql[0], sample_sql[0]
+    spy = _Spy(con)
+    engine.auto_sort_cols(spy, "wide")
+    assert not [s for s in spy.sql_seen if "USING SAMPLE" in s.upper()]
 
 
-def test_unseeded_sample_draws_the_same_rows_twice():
-    """The rows the reservoir actually draws are identical across two unseeded profiles.
+def test_no_profiling_seam_builds_a_sample():
+    """The OTHER seam — `session._get_rle`, behind `SORTED BY AUTO` over a table — plus the model
+    itself. It and `auto_sort_cols` are separate code, so ripping sampling out of one must not leave
+    it in the other, and #48 showed exactly that failure mode (one seam fixed, one missed).
 
-    Stronger than comparing the chosen key: a key can survive a different sample by luck, so this
-    checksums `_rle_src` itself, which is what the recommender reads. The table must be WIDE for
-    the reservoir to bite at all — `plan_sample` budgets 256 MiB over the estimated row width, so
-    4 narrow columns would plan 8M rows and simply take the whole table (no sampling, trivially
-    stable). 112 VARCHAR columns => 2,688 B/row => a 100,000-row plan against 150,000 rows."""
-    ncols, nrows = 112, 150_000
-    assert sortkey.plan_sample(None, sortkey.estimate_row_bytes(
-        {f"c{i}": "VARCHAR" for i in range(ncols)})) == (100_000, False)
+    Asserted on the source rather than by spying the cursor: `_get_rle` hands its connection to
+    `engine.delta_column_stats`, which resolves `add_actions` through DuckDB's replacement scan of
+    the CALLING frame — a proxy object in between silently breaks that lookup."""
+    import inspect
+    from duckrun import session as session_mod
+    for mod in (session_mod, engine, sortkey):
+        src = inspect.getsource(mod)
+        offenders = [ln.strip() for ln in src.splitlines()
+                     if "USING SAMPLE" in ln.upper() and not ln.strip().startswith(("#", "*"))
+                     and "``" not in ln]
+        assert not offenders, f"{mod.__name__} still samples: {offenders}"
 
+
+def test_profile_is_stable_over_an_unordered_source():
+    """Two profiles agree even when the source's row ORDER is not stable between reads.
+
+    This is the case the seed could never cover: DuckDB only guarantees `REPEATABLE` at
+    `threads=1`, and over a view containing a `GROUP BY` — i.e. any aggregating dbt model — parallel
+    hash aggregation emits groups in a different order each time, so a seeded reservoir drew
+    different rows anyway. Reading every row is order-insensitive by construction."""
     con = duckdb.connect()
-    # c0..c2 are real candidates; the rest are constants the picker drops (ndv == 1). All VARCHAR
-    # so estimate_row_bytes sees the 24 B/column width the plan above assumes.
-    sel = ["(i % 97)::VARCHAR c0", "(i % 13)::VARCHAR c1", "(i % 3)::VARCHAR c2"]
-    sel += [f"'x' c{i}" for i in range(3, ncols)]
-    con.execute(f"CREATE TABLE wide AS SELECT {', '.join(sel)} FROM range({nrows}) t(i)")
-
-    sums = []
-
-    class Spy:
-        def __init__(self, inner):
-            self._inner = inner
-
-        def execute(self, sql, *a, **k):
-            out = self._inner.execute(sql, *a, **k)
-            if "USING SAMPLE" in sql:      # _rle_src now holds the draw — fingerprint it
-                sums.append(self._inner.execute(          # bit_xor: order-free and cannot overflow
-                    "SELECT count(*), bit_xor(hash(c0 || '|' || c1 || '|' || c2)) FROM _rle_src"
-                ).fetchone())
-            return out
-
-        def __getattr__(self, name):
-            return getattr(self._inner, name)
-
-    engine.auto_sort_cols(Spy(con), "wide")       # no seed, twice — the production call shape
-    engine.auto_sort_cols(Spy(con), "wide")
-    assert len(sums) == 2 and sums[0][0] == 100_000, sums
-    assert sums[0] == sums[1], f"reservoir drew different rows: {sums}"
-
-
-def test_get_rle_sample_is_seeded_by_default(session, capsys, monkeypatch):
-    """The OTHER sampling seam — `session._get_rle`, behind `SORTED BY AUTO` over a table.
-
-    `engine.auto_sort_cols` (above) and this are the only two places that build a `USING SAMPLE`,
-    and they are separate code. Without this, reverting half the fix would keep the suite green.
-
-    `plan_sample` floors at `min_rows=100_000`, so any table small enough to build in a unit test
-    profiles EXACTLY and never reaches the sampling branch — hence the monkeypatch, which is the
-    cheap way to force `exact=False` rather than materialising 100k+ rows of Delta just to get
-    there."""
-    session.sql("CREATE OR REPLACE TABLE rle_src AS "
-                "select (i % 50) a, (i % 7) b, i c from range(4000) t(i)")
-    monkeypatch.setattr(sortkey, "plan_sample", lambda *a, **k: (1000, False))
-
-    r1 = [tuple(row) for row in session._get_rle("rle_src").fetchall()]
-    capsys.readouterr()
-    r2 = [tuple(row) for row in session._get_rle("rle_src").fetchall()]
-    capsys.readouterr()
-    # ndv / skew / run estimates come straight off the draw, so two different 1000-of-4000
-    # reservoirs would show up here even when the chosen key happens to survive.
-    assert r1 == r2, "unseeded _get_rle sample: two profiles of one table disagree"
+    con.execute("SET threads=8")
+    con.execute("SET preserve_insertion_order=false")
+    con.execute("CREATE TABLE base AS SELECT (i % 400) g, (i % 7) b, i * 1.5 amt "
+                "FROM range(200000) t(i)")
+    con.execute("CREATE VIEW agg AS SELECT g, b, sum(amt) amt FROM base GROUP BY g, b")
+    k1, _ = engine.auto_sort_cols(con, "agg")
+    k2, _ = engine.auto_sort_cols(con, "agg")
+    assert k1 == k2, f"profile of an aggregating source disagreed: {k1} vs {k2}"
 
 
 # ── 17. Measure tail (step 6): a dim-correlated zero-heavy measure gets a TAIL slot, below the ──
@@ -416,13 +373,17 @@ def test_measure_tail_fd_and_uncorrelated_refused():
     assert not any("measure tail" in ln for ln in lines)
 
 
-# ── 17d. Group-starved sample: the tail is recovered from a stratified read of the SOURCE. ──────
-# The aemo case. A uniform ROW sample cannot answer "how many distinct values does this measure take
-# INSIDE one dim group" once the dim prefix is fine: the real mart is 142M rows over ~2.6M
-# (date, time) groups against an 8M-row sample — 3.1 rows per group, so every measure reads as
-# ~unique per group and no tail is ever awarded. `price` is a regional price (exactly 5 values per
-# interval) and `date, time, price` measures 596 MB against `date, time`'s 779 MB: a 23% saving the
-# picker could not see. Reading whole groups instead separates price (5/group) from mw (450/group).
+# ── 17d. The aemo tail, measured directly off every row. ────────────────────────────────────────
+# `price` is a regional price — exactly 5 values per (date, time) interval — while `mw` is per-DUID
+# (450 per interval). On the real 142M-row mart `date, time, price` measures 596 MB against
+# `date, time`'s 779 MB, a 23% saving.
+#
+# The picker could not see it while it profiled a SAMPLE: 2.6M groups against an 8M-row draw is 3.1
+# rows per group, so every measure read as ~unique per group and no tail was ever awarded. That is
+# what the group-stratified read of the source existed to recover, and it is why these tests used to
+# build a starved sample on purpose. Profiling every row answers the question directly —
+# distinct(date, time, price) IS price's run count under the sorted layout — so the slice, its K and
+# the run-fraction arithmetic are gone and these tests assert the outcome on the table itself.
 def _aemo_shaped(con, days=20, times=288, duids=450):
     """One row per (date, time, DUID); price regional (5 per interval), mw per-DUID."""
     con.execute(f"""create or replace table full_t as
@@ -430,53 +391,38 @@ def _aemo_shaped(con, days=20, times=288, duids=450):
                ((u*7+d*3+t) % 9973 * 0.11)::DECIMAL(18,4) as mw,
                (((d*288+t)*31 + (u%5)*977) % 4001 * 0.05)::DECIMAL(18,4) as price
         from range({days}) tt(d), range({times}) t2(t), range({duids}) u2(u)""")
-    n = con.sql("select count(*) from full_t").fetchone()[0]
-    groups = con.sql("select count(distinct hash(date, time)) from full_t").fetchone()[0]
-    s = int(groups * 3.1)          # the production density that hides the tail
-    con.execute(f"create or replace table samp as select * from full_t "
-                f"using sample reservoir({s} ROWS) REPEATABLE (0)")
-    return n, con.sql("select count(*) from samp").fetchone()[0]
 
 
-def _key_of(con, table, sample_rows, **kw):
+def _key_of(con, table, **kw):
     desc = con.sql(f"describe {table}").fetchall()
     rows, _, _ = sortkey.recommend_sort_key(
-        con, "m", "t", table, [r[0] for r in desc], {r[0]: str(r[1]) for r in desc}, [],
-        sample_rows=sample_rows, exact=False, **kw)
+        con, "m", "t", table, [r[0] for r in desc], {r[0]: str(r[1]) for r in desc}, [], **kw)
     return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
 
 
-def test_group_starved_sample_loses_the_tail_without_the_source():
-    """Baseline: this is what the sample alone can see, and why full_src exists."""
+def test_measure_tail_awarded_on_a_real_fact_shape():
+    """price (5 per interval) earns the tail slot; mw (450 per interval) does not."""
     con = duckdb.connect()
-    _n, s = _aemo_shaped(con)
-    assert _key_of(con, "samp", s) == ["date", "time"]
+    _aemo_shaped(con)
+    assert _key_of(con, "full_t") == ["date", "time", "price"]
 
 
-def test_group_starved_sample_recovers_the_tail_from_the_source():
+def test_measure_tail_refuses_a_prefix_determined_measure():
+    """The tail must not just award everything: a measure the dim prefix DETERMINES takes one value
+    per group, so it clusters for free under the dim sort and a slot on it orders nothing."""
     con = duckdb.connect()
-    n, s = _aemo_shaped(con)
-    assert _key_of(con, "samp", s, full_src="full_t", total_rows=n) == ["date", "time", "price"]
-
-
-def test_stratified_tail_still_refuses_a_prefix_determined_measure():
-    """The stratified path must not just award everything: a measure the dim prefix DETERMINES takes
-    one value per group, so its run fraction collapses onto the prefix's own and it earns no slot."""
-    con = duckdb.connect()
-    n, s = _aemo_shaped(con)
+    _aemo_shaped(con)
     # one price per interval (FD of date,time) instead of five — nothing left for a slot to order.
     con.execute("create or replace table full_t as select date, time, DUID, mw, "
                 "(((date - date '2024-01-01')*288 + time) % 4001 * 0.05)::DECIMAL(18,4) as price "
                 "from full_t")
-    con.execute(f"create or replace table samp as select * from full_t "
-                f"using sample reservoir({s} ROWS) REPEATABLE (0)")
-    assert "price" not in _key_of(con, "samp", s, full_src="full_t", total_rows=n)
+    assert "price" not in _key_of(con, "full_t")
 
 
-def test_stratified_read_leaves_no_temp_table_behind():
+def test_profiling_leaves_no_temp_table_behind():
     con = duckdb.connect()
-    n, s = _aemo_shaped(con)
-    _key_of(con, "samp", s, full_src="full_t", total_rows=n)
+    _aemo_shaped(con)
+    _key_of(con, "full_t")
     assert not [r[0] for r in con.sql("show tables").fetchall() if r[0].startswith("_rle")]
 
 
