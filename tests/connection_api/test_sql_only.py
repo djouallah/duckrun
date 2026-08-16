@@ -190,23 +190,67 @@ def test_create_sorted_by_auto(w):
     assert w.sql("select count(*) from a").fetchone()[0] == 20000
 
 
-def test_sorted_by_auto_single_table_profiles_exactly(w, monkeypatch):
-    """SORTED BY AUTO over a bare `SELECT * FROM <delta table>` (re-cluster this table) profiles the
-    table EXACTLY from the Delta log; a filtered/projected body samples the result relation instead."""
+def test_sorted_by_auto_single_table_profiles_from_the_log(w, monkeypatch):
+    """SORTED BY AUTO over a bare `SELECT * FROM <delta table>` (re-cluster this table) routes to the
+    profiler that also reads the Delta LOG (null shares, NDV caps); a filtered/projected body has no
+    table behind it and profiles the staged result instead."""
     w.sql("CREATE OR REPLACE TABLE t AS SELECT (i%5) region, i id FROM range(100) t(i)")
     calls = []
     monkeypatch.setattr(type(w), "_auto_sort_cols_from_table",
-                        lambda self, name, **k: calls.append(("exact", name)) or [])
+                        lambda self, name, **k: calls.append(("table", name)) or [])
     monkeypatch.setattr(type(w), "_auto_sort_cols",
-                        lambda self, rel, **k: calls.append(("sample", None)) or [])
+                        lambda self, rel, **k: calls.append(("relation", None)) or [])
     w.sql("CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t")
-    assert calls == [("exact", "t")]                             # single bare Delta table → exact
+    assert calls == [("table", "t")]                             # single bare Delta table
     calls.clear()
     w.sql("CREATE OR REPLACE TABLE t2 SORTED BY AUTO AS SELECT * FROM t WHERE id > 10")
-    assert calls == [("sample", None)]                           # filtered body → sampler
+    assert calls == [("relation", None)]                         # filtered body
     calls.clear()
     w.sql("CREATE OR REPLACE TABLE t3 SORTED BY AUTO AS SELECT region, id FROM t")
-    assert calls == [("sample", None)]                           # projection (no `*`) → sampler
+    assert calls == [("relation", None)]                         # projection (no `*`)
+
+
+def test_sorted_by_auto_reads_the_source_once(w):
+    """The point of staging: `SORTED BY AUTO` evaluates its source ONCE, then profiles and writes
+    from that staged copy.
+
+    Before this, the body was re-evaluated for the profiling sample, for a row count, for the
+    stratified tail read and again for the write — on OneLake, four remote reads for one statement,
+    and on a dbt model four re-runs of its joins. So: count the statements that name the SOURCE."""
+    import re
+    w.sql("CREATE OR REPLACE TABLE src AS SELECT (i%5) region, (i%97) sub, i id FROM range(3000) t(i)")
+
+    seen = []
+    inner = w.con
+
+    class Spy:                      # DuckDBPyConnection attributes are read-only, so proxy it
+        def execute(self, sql, *a, **k):
+            seen.append(sql)
+            return inner.execute(sql, *a, **k)
+
+        def sql(self, sql, *a, **k):
+            seen.append(sql)
+            return inner.sql(sql, *a, **k)
+
+        def __getattr__(self, name):
+            return getattr(inner, name)
+
+    w.con = Spy()
+    try:
+        # A derived body (not a bare table), so the whole thing goes through the staged path.
+        w.sql("CREATE OR REPLACE TABLE out1 SORTED BY AUTO AS SELECT * FROM src WHERE id > 5")
+    finally:
+        w.con = inner
+    # `\bsrc\b` does not match inside `_duckrun_auto_src` — `_` is a word character, so there is no
+    # boundary before `src` there. Exactly one statement may name the source: the staging CTAS.
+    touch = [" ".join(s.split()) for s in seen if re.search(r"\bsrc\b", s)]
+    assert len(touch) == 1, f"source read {len(touch)} times, expected 1:\n" + "\n".join(touch)
+    assert touch[0].upper().startswith("CREATE OR REPLACE TEMP TABLE"), touch[0]
+    # …and the profile plus the write both went to the staged copy.
+    staged = [s for s in seen if "_duckrun_auto_src" in s]
+    assert len(staged) > 5, staged
+    assert any("ORDER BY" in s for s in staged), "the write did not read the staged copy"
+    assert w.sql("select count(*) from out1").fetchone()[0] == 2994
 
 
 # ─────────────────────────────────────────────────────── shared engine seam + fencing (GREEN)
