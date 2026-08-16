@@ -208,22 +208,6 @@ class Plugin(BasePlugin):
         # stays valid while deltalake consumes it.
         cur = self._cursor()
         name = self._relation_name(target_config.relation)
-        # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
-        # honored here — the staged relation is read through a wrapper SELECT *, and with
-        # preserve_insertion_order=false DuckDB may reorder any result lacking a top-level ORDER BY.
-        # A top-level ORDER BY on this read IS honored, so long RLE runs / dictionary locality (the
-        # point of the Parquet tuning) are deterministic regardless of the global flag.
-        # sort_by='auto' resolves here to concrete columns (or None); rewrite cfg so every
-        # downstream cfg.get('sort_by') reader (the merge branch) sees the resolved value too.
-        sort_by = self._resolve_sort_by(cur, name, cfg.get("sort_by"), partition_by)
-        cfg["sort_by"] = sort_by
-        if sort_by:
-            cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
-            order = ", ".join(engine.quote_ident(c) for c in cols)
-            data = cur.sql(f"SELECT * FROM {name} ORDER BY {order}")
-        else:
-            data = cur.sql(f"SELECT * FROM {name}")
-
         dt0 = engine.open_if_exists(path, storage_options)
         exists = dt0 is not None
 
@@ -251,6 +235,33 @@ class Plugin(BasePlugin):
                 "--full-refresh if the table was deliberately deleted."
             )
 
+        _resolved_strategy = strategy or ("merge" if unique_key else "append")
+        # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
+        # honored here — the staged relation is read through a wrapper SELECT *, and with
+        # preserve_insertion_order=false DuckDB may reorder any result lacking a top-level ORDER BY.
+        # A top-level ORDER BY on this read IS honored, so long RLE runs / dictionary locality (the
+        # point of the Parquet tuning) are deterministic regardless of the global flag.
+        # sort_by='auto' resolves here to concrete columns (or None); rewrite cfg so every
+        # downstream cfg.get('sort_by') reader (the merge branch) sees the resolved value too.
+        #
+        # Resolved HERE, after `exists` and the tombstone adjustment, rather than at the top of
+        # store(): `_sort_by_is_inert` needs the branch this write will actually take, because
+        # resolving 'auto' means PROFILING the staged relation and three branches then throw the
+        # answer away (see that method). A project-wide `+sort_by: auto` used to pay that profile on
+        # every incremental run of every merge model.
+        sort_by = self._resolve_sort_by(
+            cur, name, cfg.get("sort_by"), partition_by,
+            profile=not self._sort_by_is_inert(
+                cfg, incremental, full_refresh, exists, _resolved_strategy),
+        )
+        cfg["sort_by"] = sort_by
+        if sort_by:
+            cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
+            order = ", ".join(engine.quote_ident(c) for c in cols)
+            data = cur.sql(f"SELECT * FROM {name} ORDER BY {order}")
+        else:
+            data = cur.sql(f"SELECT * FROM {name}")
+
         # Contract NOT NULL enforcement (config(contract={enforced:true}) with a not_null column
         # constraint). duckrun writes via delta_rs, not SQL DDL, so dbt-core's column-constraint
         # DDL never runs. Guard the staged rows BEFORE any write: a null in a not-null column
@@ -267,7 +278,6 @@ class Plugin(BasePlugin):
         # stays the default (memory behavior unchanged) for merges without a guard. The temp is bounded
         # by the write memory clamp + spill dir like any other DuckDB result.
         src_tmp = None
-        _resolved_strategy = strategy or ("merge" if unique_key else "append")
         _merge_path = (incremental and not full_refresh and exists
                        and _resolved_strategy in ("merge", "insert"))
         if _merge_path and (cfg.get("merge_materialize_source") or not_null_columns):
@@ -413,13 +423,50 @@ class Plugin(BasePlugin):
             return val.strip().lower() == "true"
         raise ValueError(f"timestamp_ntz must be true or false, got {val!r}")
 
-    def _resolve_sort_by(self, cur, name, sort_by, partition_by):
+    @staticmethod
+    def _sort_by_is_inert(cfg, incremental, full_refresh, exists, resolved_strategy) -> bool:
+        """True when the branch this write will take never reads ``sort_by``, so resolving
+        ``'auto'`` would profile the staged relation and throw the answer away.
+
+        ``sort_by`` is not a delta_rs option — it is a DuckDB ``ORDER BY`` baked into the ``data``
+        relation in :meth:`store`. Three branches never read ``data``: ``_store_microbatch`` and
+        ``_store_delete_insert`` take the staged relation NAME instead, and the plain
+        ``engine.merge_delta`` branch writes into the target's existing layout (documented in
+        ``docs/dbt-adapter.md`` and in :meth:`_store_merge`'s docstring). A ``+sort_by: auto`` set
+        project-wide therefore used to pay a full profile on every incremental run of every merge
+        model for a value that was discarded on the next line.
+
+        Deliberately CONSERVATIVE — it returns True only for branches proven inert, so anything
+        unrecognised keeps today's behavior (profile). In particular a custom clause list
+        (``merge_clauses`` / ``merge_update_set_expressions``) may route to the insert-only
+        anti-join + append inside ``engine.merge_delta_clauses``, which DOES honor ``sort_by``, so
+        those keep profiling. The key presence test mirrors ``_custom_merge_clauses``'s own dispatch
+        without calling the spec builders — they can raise, and validation must stay where it is."""
+        # Microbatch first: its dispatch is `incremental and strategy == 'microbatch'` alone — it
+        # deliberately bypasses the overwrite/merge routing below (dbt marks every batch
+        # full_refresh under --full-refresh, which would otherwise clobber each one).
+        if incremental and resolved_strategy == "microbatch":
+            return True
+        if not (incremental and not full_refresh and exists):
+            return False                                    # overwrite branch — honors sort_by
+        if resolved_strategy in ("delete+insert", "delete_insert"):
+            return True
+        if resolved_strategy == "merge":
+            return not (cfg.get("merge_clauses") or cfg.get("merge_update_set_expressions"))
+        return False                                        # append / insert / unknown — honors it
+
+    def _resolve_sort_by(self, cur, name, sort_by, partition_by, *, profile=True):
         """Resolve ``sort_by='auto'`` (case-insensitive scalar) into concrete columns by profiling
         the staged relation via :func:`engine.auto_sort_cols` — the dbt spelling of the connection
         API's ``CREATE TABLE … SORTED BY AUTO``, backed by the same sampler. No payoff resolves to
         ``None`` (unsorted write, exactly as connect() drops the clause). ``'auto'`` inside a list
         is rejected — which also means a column literally named ``auto`` can't be addressed here.
-        Every other config value passes through untouched."""
+        Every other config value passes through untouched.
+
+        ``profile=False`` (see :meth:`_sort_by_is_inert`) resolves ``'auto'`` to ``None`` WITHOUT
+        profiling, for a write branch that would discard the key anyway. Validation is deliberately
+        NOT gated on it: ``['auto']`` still raises on every path, so a typo can't go quiet just
+        because the model happens to be a merge."""
         if isinstance(sort_by, (list, tuple)):
             if any(isinstance(c, str) and c.strip().lower() == "auto" for c in sort_by):
                 raise ValueError(
@@ -429,6 +476,10 @@ class Plugin(BasePlugin):
             return sort_by
         if not (isinstance(sort_by, str) and sort_by.strip().lower() == "auto"):
             return sort_by
+        if not profile:
+            engine.logger.debug(
+                f"duckrun: sort_by=auto skipped for {name} — this write path does not sort")
+            return None
         pcols = (list(partition_by) if isinstance(partition_by, (list, tuple))
                  else [partition_by] if partition_by else [])
         key, lines = engine.auto_sort_cols(cur, name, partition_cols=pcols,

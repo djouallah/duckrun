@@ -479,6 +479,60 @@ def test_clause_merge_forwards_partition_by_and_sort_by(tmp_path, monkeypatch):
     assert seen.get("partition_by") == ["id"] and seen.get("sort_by") == ["a"]
 
 
+# `sort_by='auto'` PROFILES the staged relation to pick a key — the expensive part of the whole
+# feature. Three branches then discard the answer (see the test below), so with a project-wide
+# `+sort_by: auto` every incremental run of every merge model used to pay that profile for nothing.
+# Each row: (cfg extras, does the branch this resolves to actually honor sort_by?).
+@pytest.mark.parametrize("cfg_extra, profiles", [
+    # Inert — the branch reads the staged relation NAME, or writes into the target's existing layout.
+    ({"incremental_strategy": "merge", "unique_key": "id"}, False),
+    ({"incremental_strategy": None, "unique_key": "id"}, False),          # None => merge
+    ({"incremental_strategy": "delete+insert", "unique_key": "id"}, False),
+    ({"incremental_strategy": "microbatch", "unique_key": "id"}, False),
+    # Honored — these lay out the rows they write, so the key has to be picked.
+    ({"incremental_strategy": "insert", "unique_key": "id"}, True),
+    ({"incremental_strategy": "append"}, True),
+    # A custom clause list may route to the insert-only anti-join + append, which DOES sort. The
+    # gate is deliberately conservative and keeps profiling rather than reasoning about the clauses.
+    ({"incremental_strategy": "merge", "unique_key": "id",
+      "merge_clauses": {"when_matched": [{"action": "do_nothing"}]}}, True),
+])
+def test_sort_by_auto_only_profiles_when_the_write_path_sorts(tmp_path, monkeypatch, cfg_extra,
+                                                              profiles):
+    path = (tmp_path / "t").as_posix()
+    write_deltalake(path, pa.table({"id": ["1"], "a": ["x"]}))
+    con = duckdb.connect()
+    con.execute("create view increment as select '2' as id, 'y' as a")
+
+    called = []
+    monkeypatch.setattr(engine, "auto_sort_cols",
+                        lambda *a, **k: called.append(a[1]) or ([], []))
+    # Stop at the dispatch: this asserts what the ROUTING decided, not what each branch writes.
+    for meth in ("_store_merge", "_store_insert", "_store_delete_insert", "_store_microbatch",
+                 "_store_append"):
+        monkeypatch.setattr(Plugin, meth, lambda self, *a, **k: None)
+
+    cfg = {"incremental": True, "full_refresh": False, "dbt_believes_exists": True,
+           "sort_by": "auto", "read_version": DeltaTable(path).version(), **cfg_extra}
+    _store_plugin(con).store(_store_target_config(path, "increment", cfg))
+    assert bool(called) is profiles, f"auto_sort_cols called={called!r}, expected profiles={profiles}"
+
+
+def test_sort_by_auto_in_a_list_still_raises_on_an_inert_path(tmp_path):
+    """Skipping the PROFILE must not skip the VALIDATION: `sort_by: ['auto']` is a typo on every
+    path, and a merge model happening not to sort is no reason to let it through quietly."""
+    path = (tmp_path / "t").as_posix()
+    write_deltalake(path, pa.table({"id": ["1"], "a": ["x"]}))
+    con = duckdb.connect()
+    con.execute("create view increment as select '2' as id, 'y' as a")
+    with pytest.raises(ValueError, match="must be the scalar value"):
+        _store_plugin(con).store(_store_target_config(path, "increment", {
+            "incremental": True, "full_refresh": False, "dbt_believes_exists": True,
+            "incremental_strategy": "merge", "unique_key": "id", "sort_by": ["auto"],
+            "read_version": DeltaTable(path).version(),
+        }))
+
+
 def test_probe_filters_fall_back_to_a_range_over_the_value_cap(cur):
     """Past the IN-list cap the exact set stops helping, but a min/max bound still does — so the
     column degrades to a range rather than contributing nothing."""

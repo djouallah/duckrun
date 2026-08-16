@@ -17,6 +17,18 @@ All notable changes to this project will be documented in this file.
   disk discovery only rediscovers Delta tables.
 
 ### Changed
+- **`sort_by: 'auto'` no longer profiles on write paths that discard the key.** Resolving `'auto'`
+  means profiling the staged model result — the expensive part of the feature — but `sort_by` is a
+  DuckDB `ORDER BY` applied to the relation the write reads, and three branches never read it: the
+  delta_rs `merge` (it writes into the target's existing layout), `microbatch` and `delete+insert`
+  (both take the staged relation by name). The profile ran before the strategy was resolved, so a
+  project-wide `+sort_by: auto` in `dbt_project.yml` paid a full profile on *every* incremental run
+  of *every* merge model and threw the answer away on the next line. Resolution now happens after
+  the branch is known and is skipped when that branch cannot use the result. No written table
+  changes; the inert behaviour itself is unchanged and still documented. Validation is deliberately
+  not gated — `sort_by: ['auto']` still raises on every path. A `merge_clauses` /
+  `merge_update_set_expressions` list keeps profiling, since it may route to the insert-only
+  anti-join + append, which does honour `sort_by`.
 - **Naive `TIMESTAMP` columns are written UTC-adjusted by default — Delta `timestamp`, not
   `timestamp_ntz`** (#42). Fabric's SQL analytics endpoint does not support `timestamp_ntz` and
   silently omits such columns — the table appears, every other column queries fine, and the first
