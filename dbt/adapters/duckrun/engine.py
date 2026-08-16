@@ -1304,8 +1304,6 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     table — a metadata read on a DuckDB base table, not a scan, and not the DuckDB planner estimate
     ``write_delta`` falls back to. That is why ``rg_for`` gets the low ``RG_MIN`` floor here: the 8M
     ``RG_MIN_ESTIMATED`` floor exists to survive an untrustworthy guess, and this is a measurement.
-    Knowing the count exactly is also what lets the rows be spread EVENLY rather than packed to the
-    ceiling with a runt left over (see ``_auto_geometry``).
 
     ``source`` MUST be cheap to scan repeatedly — the recommender reads it a dozen or so times. The
     CALLER is responsible for that: both surfaces materialize the staged relation into a local temp
@@ -1338,14 +1336,7 @@ def _auto_geometry(cur, source, rows, *, narrow_decimals=False):
         n = cur.sql(f"SELECT count(*) FROM {source}").fetchone()[0]
         bpr = sortkey.bytes_per_row(rows, n, narrow_decimals=narrow_decimals)
         # An exact count takes rg_for's LOW floor — see the docstring above and policy.RG_MIN_ESTIMATED.
-        ceiling = rg_for(n, floor=RG_MIN)
-        # Then spread the rows EVENLY over the groups that ceiling implies, instead of filling each to
-        # the ceiling and leaving the remainder as a runt. 142M rows at a 16M ceiling is 8 full groups
-        # and a 4M tail; over 9 groups it is 9 x 15.8M, all equal. Segments transcode on their own
-        # lanes, so an even split is the point — one short lane is the whole cost of a ragged tail.
-        # Dividing by a group COUNT can only lower the target, so this can never breach RG_MAX either.
-        groups = max(1, -(-n // ceiling))
-        rows_target = -(-n // groups)
+        rows_target = rg_for(n, floor=RG_MIN)
         tfs = tfs_for(rows_target, bpr)
         if tfs is None:
             return None
