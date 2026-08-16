@@ -50,8 +50,17 @@ def resolved_sort_key(body):
     if sort.lower() != "auto":
         return [c.strip() for c in sort.split(",") if c.strip()]
     tbl = con._auto_sort_single_table(body)
-    return (con._auto_sort_cols_from_table(tbl) if tbl is not None
-            else con._auto_sort_cols(con.con.sql(body)))
+    if tbl is not None:
+        return con._auto_sort_cols_from_table(tbl)
+    # A derived body is profiled from a STAGED copy: the picker reads its source once and every
+    # pass after that is local. `_auto_sort_cols` therefore takes that table's NAME, not a
+    # relation — mirror what `session._resolve_auto_sort` does around it.
+    staged = "_bench_auto_src"
+    con.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS {body}")
+    try:
+        return con._auto_sort_cols(staged)
+    finally:
+        con.con.execute(f"DROP TABLE IF EXISTS {staged}")
 
 
 _t0 = time.perf_counter()
