@@ -85,6 +85,10 @@ on:
         description: "[aemo] also rebuild the Spark V-Order reference table (only needed when the source or row_limit changed — it depends on no duckrun knob)"
         type: boolean
         default: false
+      rebuild_base:
+        description: "[contoso] also regenerate the Contoso BASE from the SQLBI generator (~2h). The base is input data and depends on no duckrun knob, so a picker/layout change never needs it — same split as aemo's rebuild_vorder. Only set when `orders` changed."
+        type: boolean
+        default: false
       probe_rows:
         description: "[order_probe] rows in the seed table (20M ≈ 2 row groups per result; plenty to detect a permutation)"
         type: string
@@ -345,11 +349,15 @@ jobs:
         # (self-acquired OIDC token). Emits WS_ID / LH_ID / WS_NAME / ONELAKE_TABLES_PATH / PBI_WORKSPACE.
         run: python tests/parquet_layout/contoso/resolve_env.py --env ${{ inputs.env }}
 
+      # The base is INPUT DATA — no duckrun knob affects it, and regenerating it is ~2h. So it is
+      # gated on its own flag, not on `rebuild`: exactly the split aemo already has between
+      # `rebuild` (the table under test) and `rebuild_vorder` (the reference). Without this, testing
+      # a picker change meant paying two hours to rebuild data the change cannot touch.
       - name: 🏭 Generate Contoso base (SQLBI generator → contoso.* Delta tables)
         env:
           PYTHONIOENCODING: utf-8
           CONTOSO_ORDERS: ${{ inputs.orders }}
-          FORCE_REBUILD: ${{ inputs.rebuild }}
+          FORCE_REBUILD: ${{ inputs.rebuild_base }}
         run: python tests/parquet_layout/contoso/build_base.py
 
       - name: 🔎 Check existing tables (one duckrun connection gates the build phase)
