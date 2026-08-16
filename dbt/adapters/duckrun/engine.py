@@ -1247,47 +1247,29 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
         return {}, 0, 0
 
 
-def auto_sort_cols(cur, source, *, partition_cols=None, seed=None, label=("df", "sort()")):
-    """Run the sort-key recommender over any FROM-able ``source`` (a staged relation/view — no
-    Delta table behind it, so no partitions on disk and no log stats) and return
-    ``(cols, lines)``: the recommended ORDER BY columns (``[]`` if nothing pays off) and the
-    advisory lines for the CALLER to print/log. The one seam behind dbt's ``sort_by='auto'`` and
-    the connection API's relation fallback for ``SORTED BY AUTO``.
+def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by=auto")):
+    """Run the sort-key recommender over any FROM-able ``source`` and return ``(cols, lines)``: the
+    recommended ORDER BY columns (``[]`` if nothing pays off) and the advisory lines for the CALLER
+    to print/log. The one seam behind dbt's ``sort_by='auto'`` and the connection API's relation
+    fallback for ``SORTED BY AUTO``.
 
-    Profiles a bounded reservoir sample sized by a schema-only width estimate (no Delta log to
-    read real bytes), and NEVER exact — the source's row count is unknown without evaluating it,
-    so uniqueness is never claimed here. ``partition_cols`` keeps declared partition columns from
-    burning a sort-key slot; ``seed`` overrides the ``REPEATABLE`` seed, which defaults to
-    ``sortkey.DEFAULT_SAMPLE_SEED`` so that one config profiled twice picks the same key — an
-    unseeded sample was measured swinging a 592M-row table's size 8.8%. The ``_rle_src`` temp table
-    is connection-local (each dbt worker thread has its own cursor), so concurrent models don't
-    collide."""
+    ``source`` MUST be cheap to scan repeatedly — the recommender reads it a dozen or so times. The
+    CALLER is responsible for that: both surfaces materialize the staged relation into a local temp
+    table exactly once and pass that in, so a remote table (or a view over model SQL, which re-runs
+    its joins on every scan) is evaluated once and everything after it is local. This function
+    deliberately does NOT make its own copy — it used to, in the form of a seeded reservoir sample,
+    and that sample cost more than reading everything (see the ``sortkey`` module docstring).
+
+    ``partition_cols`` keeps declared partition columns from burning a sort-key slot. No Delta-log
+    stats are passed here (there is no table behind a staged relation), so null shares and NDV caps
+    come out empty and the profile rests on the data alone."""
     desc = cur.sql(f"DESCRIBE SELECT * FROM {source}").fetchall()
     cols = [d[0] for d in desc]
     types = {d[0]: str(d[1]) for d in desc}
     if not cols:
         return [], []
-    plan_rows, exact = sortkey.plan_sample(None, sortkey.estimate_row_bytes(types))
-    samp = (f"reservoir({plan_rows} ROWS) "
-            f"REPEATABLE ({int(sortkey.DEFAULT_SAMPLE_SEED if seed is None else seed)})")
-    src = "_rle_src"
-    cur.execute(f"CREATE OR REPLACE TEMP TABLE {src} AS "
-                f"SELECT * FROM {source} USING SAMPLE {samp}")
-    # Row count for the measure tail's group-stratified read (sortkey._GROUP_STARVED_FRAC): it only
-    # needs a K to slice groups by, so a failure just costs the tail that path, never the profile.
-    # One aggregate over an already-staged relation, against a write that is about to sort every row
-    # of it — noise. Not a `plan_sample` input: that ran above, and its answer must not move.
-    try:
-        source_rows = cur.sql(f"SELECT count(*) FROM {source}").fetchone()[0]
-    except Exception:
-        source_rows = None
-    try:
-        rows, _, lines = sortkey.recommend_sort_key(
-            cur, label[0], label[1], src, cols, types, list(partition_cols or []),
-            sample_rows=plan_rows, exact=exact,
-            full_src=source, total_rows=source_rows)
-    finally:
-        cur.execute(f"DROP TABLE IF EXISTS {src}")
+    rows, _, lines = sortkey.recommend_sort_key(
+        cur, label[0], label[1], source, cols, types, list(partition_cols or []))
     # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
     key = [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
     return key, lines

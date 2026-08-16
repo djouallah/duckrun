@@ -156,6 +156,11 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   workload sample. When you know your grain and query patterns, prefer an explicit `SORTED BY (cols)`,
   and always compare `conn.get_stats()` before and after. See
   [Automatic sorting](parquet-layout.md#automatic-sorting).
+- **Profiling stages the whole source into a local temp table.** It reads the source once and every
+  pass scans that copy, which is what keeps the cost off remote storage — but it does mean a full
+  local copy of the table (or model result) exists for the duration of the write. It spills to
+  DuckDB's `temp_directory` like any other result, so the ceiling is disk rather than RAM; on a very
+  large table plan for that disk. An explicit `SORTED BY (cols)` skips profiling entirely.
 - **Adaptive row-group sizing is a heuristic too, tuned on one dataset.** Row groups are sized from a
   planner row estimate (`ceil(rows / 8)`, capped at 16M) grounded against that same single benchmark —
   a rough rule, not a broadly tested optimum. A table with unusual width, cardinality, or skew may well

@@ -1,26 +1,49 @@
 """The sort-key recommender — the one heuristic in duckrun.
 
 Everything else in this codebase is deterministic plumbing over DuckDB and delta-rs. This file is
-the exception: given a Delta table (as a materialized sample plus its Delta-log statistics) it
+the exception: given a Delta table (materialized in full, plus its Delta-log statistics) it
 *decides* a short physical sort key that should minimise the table's in-memory columnar footprint.
 There is no exact, checkable answer — the optimal ordering is an NP-hard search — so this is a fast
 model-and-rank heuristic, not an optimiser. It is the only place in the repo where "a better
 algorithm" is a meaningful ask, which is exactly why it lives on its own.
 
-Input  → a DuckDB connection + the name of a temp table holding a random sample of the Delta table,
-         the column list/types, the partition columns, and optional Delta-log column stats.
+Input  → a DuckDB connection + the name of a LOCAL relation holding the rows to profile (the caller
+         materialises the source into a temp table exactly once — see below), the column list/types,
+         the partition columns, and optional Delta-log column stats.
 Output → ``(rows, schema, lines)``: one row per column describing the recommendation
          (``in_sort_key`` / ``sort_position`` are the decision; the rest is the profile that
          justifies it), and ``lines`` — the human-readable advisory the CALLER prints (this module
          does no I/O). The caller wraps ``rows`` into a DataFrame.
 
-The model is a *deterministic function of the sample statistics*; the only run-to-run variance comes
-from the sample the caller materialises. That sample is therefore seeded by default
-(``DEFAULT_SAMPLE_SEED``, threaded as ``REPEATABLE`` by every caller), so the same table profiled
-twice returns the same key.
+The model is a deterministic function of the rows it is given, and it is given ALL of them, so the
+same data profiled twice returns the same key — no seed, no sampling, nothing probabilistic.
+
+This used to profile a seeded reservoir SAMPLE. That was removed because it cost more than it saved
+on every axis:
+  * ``USING SAMPLE reservoir(N ROWS)`` is superlinear in N. Measured on DuckDB 1.5.5 over a 20M-row
+    parquet table where materialising the WHOLE table took 0.68 s: ``reservoir(1M)`` 7.2 s,
+    ``reservoir(5M)`` 56 s, ``reservoir(8M)`` 83 s — and 8M was the sample sizer's own ceiling. The
+    sample was 122x more expensive than not sampling.
+  * It saved no I/O. Reservoir and bernoulli are both full scans; DuckDB's sampling pushdown only
+    fires for ``system`` sampling over its native storage, never ``read_parquet``/``delta_scan``.
+  * It saved no memory. ``approx_count_distinct`` is fixed KB of state per column at any table size,
+    and the two ``O(NDV)`` steps are separately capped (``_SKEW_EXACT_NDV``, and the FD checks which
+    run one column at a time). The historical OOM was a BATCHED exact ``COUNT(DISTINCT)`` over every
+    column simultaneously — long gone, and not what sampling was protecting.
+  * It was not even reproducible where it mattered. DuckDB only guarantees ``REPEATABLE`` at
+    ``threads=1``; over a view containing a ``GROUP BY`` (i.e. any aggregating dbt model) parallel
+    hash aggregation reorders the input and the seeded sample drifts anyway.
+
+What that changes here: ``n`` is the table's real row count, in-group counts are the real ones, and
+uniqueness can be trusted (a sample saturates at its own size, so a merely-high-cardinality column
+looked unique and the claim had to be suppressed). What it does NOT change: per-column cardinality is
+still an ``approx_count_distinct`` HLL sketch. That is deliberate — the sketch is fixed KB of state
+per column at any table size, whereas the batched exact ``COUNT(DISTINCT)`` it replaced was the OOM
+lever. So the sketch's error is still real (±10-25% at the cardinalities real dimensions live at) and
+the FD screen-then-confirm below still earns its keep.
 
 The recommendation, in order:
-  1. sample each column's cardinality (``approx_count_distinct`` HLL — never the BATCHED exact
+  1. each column's cardinality (``approx_count_distinct`` HLL — never the BATCHED exact
      ``COUNT(DISTINCT)`` over every column at once, which was the OOM lever), capped by the
      Delta-log value range.
   2. per-column skew Σp² (Simpson index) — exact histogram for low-card columns, ``1/ndv`` above.
@@ -44,15 +67,21 @@ import re
 _SKEW_EXACT_NDV = 100_000
 
 # MODEL_VERSION: bump on ANY change to an R-rule, a threshold default, or the byte model. Pure
-# plumbing — sample sizing, the explicit exact flag, seeding, returning lines instead of printing —
-# does NOT bump it. Appended to the recommendation header so a recommendation is attributable to the
-# model that produced it, making future threshold churn traceable.
+# plumbing — returning lines instead of printing — does NOT bump it. Appended to the recommendation
+# header so a recommendation is attributable to the model that produced it, making future threshold
+# churn traceable.
 # v3: measure tail slots (step 6) — measures may now FOLLOW the dim key, never hold a dim slot.
 # v4: R5 decides on EXACT counts inside the noise zone (see _FD_CONFIRM_BELOW) — the HLL ratio it
 #     used to trust is worth ±25% at the cardinalities real date columns live at. Step 6 measures
-#     in-group cardinality on whole GROUPS read from the source when the sample is too thin per
-#     group to see any (see _GROUP_STARVED_FRAC) — it was awarding no tail at all on a real fact.
-MODEL_VERSION = "4"
+#     in-group cardinality on whole GROUPS read from the source when the sample was too thin per
+#     group to see any — it was awarding no tail at all on a real fact. (v5 removed that machinery
+#     along with the sample: over every row, distinct(prefix, measure) answers it directly.)
+# v5: profiles the WHOLE table, not a seeded reservoir sample (see the module docstring). Sampling
+#     was removed rather than replaced, so `n` and every in-group count are now real, and uniqueness
+#     is claimed on every table instead of only on ones small enough to profile exactly — which
+#     switches the key-organized branch (step 5) on for large tables for the first time. Same rules,
+#     better inputs: keys WILL move on real tables, hence the bump.
+MODEL_VERSION = "5"
 
 # R5's FD ratio SCREENS on HLL and DECIDES on exact counts below this multiple of the kept grain.
 # `approx_count_distinct` is a sketch, and at the NDV where real dimensions live (10²–10⁵) it is
@@ -64,8 +93,7 @@ MODEL_VERSION = "4"
 # every build. A candidate the sketch says does not even ~double the grain is therefore unresolved,
 # not FD, and earns one exact confirming scan; above 2.0 the sketch's error cannot flip the verdict
 # and it is trusted as-is. This is NOT the exact COUNT(DISTINCT) that was the OOM lever: that
-# batched every high-card column at once, this is one column at a time, only near the grain, over a
-# sample already byte-budgeted by `plan_sample`.
+# batched every high-card column at once, this is one column at a time and only near the grain.
 _FD_CONFIRM_BELOW = 2.0
 
 # A tail slot must pay for itself twice over: save at least ``tail_gain_frac`` of the measure's own
@@ -73,44 +101,6 @@ _FD_CONFIRM_BELOW = 2.0
 # this fraction of the whole table's modeled bytes (a near-empty column can pass the relative test
 # on savings nobody would ever notice — nyc mta_tax/improvement_surcharge are the measured case).
 _TAIL_MIN_TABLE_FRAC = 0.005
-
-# A tail slot asks "how many distinct values does this measure take INSIDE one dim group" — and a
-# uniform ROW sample cannot answer that once the dim prefix is fine enough, because it leaves only a
-# handful of rows in each group. Measured on the real aemo mart: 142M rows, ~2.6M (date, time)
-# groups, an 8M-row sample ⇒ 3.1 sampled rows per group, so EVERY measure looks ~unique per group and
-# the tail awards nothing. `price` (a regional price — exactly 5 values per interval) was the case:
-# `date, time, price` measures 596 MB against `date, time`'s 779 MB, a 23% saving the picker could
-# not see. At that density the uniform sample reads price at 2.68 distinct/group vs mw's 3.63 (both
-# saturating the 3.1 rows available); taking WHOLE groups instead reads 5.00 vs 450.00 — the truth.
-# So when groups get denser than this fraction of the sample, in-group counts come from a
-# GROUP-stratified read of the source (all rows of a 1-in-K slice of groups) rather than the sample.
-_GROUP_STARVED_FRAC = 0.05
-# Rows to aim for in that stratified read. Whole groups, so it is a hash slice of the SOURCE, not a
-# row sample: on the aemo mart K lands ~70 and the read touches ~1.4% of the table, one pass, once
-# per profile. Materialized to a temp table so every tail level regroups it locally.
-_STRAT_TARGET_ROWS = 2_000_000
-
-# Sample-sizing knobs — NOT the recommendation byte model. A byte budget divided by an estimated
-# in-memory row width gives a width-aware row count: a wide table samples fewer rows, a narrow one
-# more. These only decide how many rows the caller materializes to profile; they never feed a
-# recommendation.
-_SAMPLE_BYTE_BUDGET = 256 * 1024 * 1024   # 256 MiB target for the in-memory profiling sample
-# The REPEATABLE seed every caller threads into the profiling sample unless it asks for another one.
-# `recommend_sort_key` is a deterministic function of that sample, so an UNSEEDED sample is the only
-# thing that can make two runs of ONE config choose different keys — and it did: four benchmark runs
-# on one adapter version over an identical 592M-row table split 3/1 on which measure won the last
-# tail slot, an 8.8% (700 MB) spread from sample luck alone. A constant is enough; the value is
-# arbitrary and only its FIXEDNESS matters, so it is not configurable. Sizing only — this never
-# feeds the recommendation, so it is not a MODEL_VERSION concern.
-DEFAULT_SAMPLE_SEED = 0
-_DECOMPRESSION_FACTOR = 3.0               # parquet-on-disk → in-memory expansion, a rule of thumb
-# In-memory byte width per column type, for the relation path (no Delta log → no real file sizes).
-# Crude on purpose; VARCHAR/BLOB/INTERVAL/structured/unknown fall through to 24. Sizing only.
-_TYPE_WIDTHS = (
-    ("BOOL", 1), ("TINYINT", 1), ("UTINYINT", 1), ("SMALLINT", 2), ("USMALLINT", 2),
-    ("INTEGER", 4), ("UINTEGER", 4), ("BIGINT", 8), ("UBIGINT", 8), ("HUGEINT", 16),
-    ("UHUGEINT", 16), ("FLOAT", 4), ("REAL", 4), ("DOUBLE", 8), ("DECIMAL", 8), ("NUMERIC", 8),
-    ("DATE", 4), ("TIMESTAMP", 8), ("TIME", 8), ("UUID", 16))
 
 _SCHEMA = (
     "table string, in_sort_key boolean, sort_position int, column string, data_type string, "
@@ -156,55 +146,20 @@ def decimal_narrow_target(type_str, max_abs):
     return f"DECIMAL({_DECIMAL_NARROW_PRECISION},{s})"
 
 
-def plan_sample(total_rows, avg_row_bytes, *, byte_budget=_SAMPLE_BYTE_BUDGET,
-                min_rows=100_000, max_rows=8_000_000):
-    """Rows to materialize for profiling, and whether that profile will be EXACT (the whole table).
-
-    ``rows = clamp(byte_budget // max(avg_row_bytes, 1), min_rows, max_rows)`` — a byte budget over
-    an estimated in-memory row width, so a wide table samples fewer rows and a narrow one more.
-    ``exact`` is True only when the table is known to fit within that many rows (then ``rows``
-    collapses to ``total_rows`` and the caller skips sampling entirely — no ``USING SAMPLE`` at all).
-    ``total_rows=None`` (an unknown size, e.g. a derived relation) is never exact. Pure — no I/O."""
-    rows = int(byte_budget // max(avg_row_bytes, 1))
-    rows = max(min_rows, min(rows, max_rows))
-    if total_rows is not None and total_rows <= rows:
-        return int(total_rows), True
-    return rows, False
-
-
-def estimate_row_bytes(types):
-    """A crude in-memory row width (bytes) from the schema ALONE — no data read. Used only to size
-    the profiling sample on the relation path, where there is no Delta log to give real file sizes.
-    Value types map to their fixed width; VARCHAR/BLOB/INTERVAL/anything unknown to 24. Crude on
-    purpose — the point is that a 300-column frame no longer samples like a 5-column one. This never
-    feeds the recommendation byte model, so it is not a ``MODEL_VERSION`` concern. ``types`` may be a
-    ``{col: type}`` mapping or an iterable of type strings."""
-    total = 0.0
-    for t in (types.values() if isinstance(types, dict) else types):
-        u = str(t).upper()
-        for prefix, width in _TYPE_WIDTHS:
-            if u.startswith(prefix):
-                total += width
-                break
-        else:
-            total += 24.0   # VARCHAR / BLOB / INTERVAL / structured / unknown
-    return total
-
-
 def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        sort_key_cap=4, min_gain_pct=1.0, key_sort_below_pct=10.0,
                        stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,
-                       *, sample_rows, exact, tail_cap=4, tail_gain_frac=0.25,
-                       full_src=None, total_rows=None):
-    """The sort-key model, run against the materialized sample ``src`` on connection ``con``. All
-    counts (``n``, ``ndv``, run estimates) are SAMPLE estimates — enough to rank candidates and test
-    functional dependencies, not exact table cardinalities.
+                       *, tail_cap=4, tail_gain_frac=0.25):
+    """The sort-key model, run against ``src`` on connection ``con``. ``src`` holds EVERY row of the
+    table being profiled — the caller materializes the source into a local temp table once, and this
+    module only ever reads that (see the module docstring for why sampling was removed). So ``n`` is
+    the real row count, run counts are real, and a uniqueness claim can be trusted.
 
-    Every count is an ``approx_count_distinct`` HLL sketch (fixed KB of state) — never a batched
-    exact ``COUNT(DISTINCT)`` over every high-card column at once, which was the OOM lever (an
-    O(NDV·width) hash table per column, all live together). The functional-dependency ratio is the
-    one place that is not settled on a sketch: hashing both sides does NOT cancel HLL's error (the
-    two sides are different value domains with independent bias), and at real dimension
+    Per-column cardinality remains an ``approx_count_distinct`` HLL sketch (fixed KB of state) rather
+    than a batched exact ``COUNT(DISTINCT)`` over every high-card column at once, which was the OOM
+    lever (an O(NDV·width) hash table per column, all live together). The functional-dependency ratio
+    is the one place that is not settled on a sketch: hashing both sides does NOT cancel HLL's error
+    (the two sides are different value domains with independent bias), and at real dimension
     cardinalities that error dwarfs ``fd_band`` — so R5 screens on the sketch and confirms a
     near-grain candidate with one exact scan for that column alone (see ``_FD_CONFIRM_BELOW``). ``stats``
     is the optional Delta-log column profile (``engine.delta_column_stats``): ``null_frac`` drops
@@ -213,19 +168,8 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     stats". ``fd_band`` is the near-FD tolerance and ``grain_frac`` the stop-at-grain fraction for key
     selection (step 4). This is all heuristic ranking, not exact science.
 
-    ``full_src`` (a FROM-able spelling of the table the sample was drawn from) and ``total_rows``
-    are optional and used ONLY by the measure tail (step 6): together they let it read whole dim
-    GROUPS from the source when the sample has too few rows per group to see in-group structure at
-    all (see ``_GROUP_STARVED_FRAC``). Omit either and the tail falls back to sample-only counts —
-    correct on a table whose groups the sample covers densely, blind to a tail slot on one whose
-    groups it does not.
-
-    ``sample_rows`` is the number of rows the caller materialized, and ``exact`` says whether that
-    sample IS the whole table (the caller knows — it planned the sample). ``exact`` gates the
-    uniqueness claim (a sample can't tell a unique key from a merely higher-than-sample column) and
-    the "profiled a N-row sample" advisory line. ``tail_cap`` bounds the measure tail (step 6) and
-    ``tail_gain_frac`` is its keep-the-slot relative byte gate — tail slots are IN ADDITION to
-    ``sort_key_cap``, which stays a dim-only budget.
+    ``tail_cap`` bounds the measure tail (step 6) and ``tail_gain_frac`` is its keep-the-slot relative
+    byte gate — tail slots are IN ADDITION to ``sort_key_cap``, which stays a dim-only budget.
 
     Returns ``(rows, schema, lines)`` — one row per column, ``schema`` a DuckDB DDL string, and
     ``lines`` the advisory text for the CALLER to print (this module prints nothing)."""
@@ -234,8 +178,9 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # approx_count_distinct can overshoot, and a value range caps it exactly.
     ndv_cap = {c: stats[c]["ndv_cap"] for c in cols
                if c in stats and stats[c].get("ndv_cap")}
-    # 1) sample ndv per column, one pass, with HLL sketches. NOTE: a random sample has no physical
-    # row order, so the table's *actual* current run count can't be measured. current_runs is set
+    # 1) ndv per column, one pass, with HLL sketches. NOTE: `src` is a materialization, so it has no
+    # meaningful physical row order and the table's *actual* current run count can't be measured
+    # from it. current_runs is set
     # below (once skew is known) to the iid / arbitrary-order estimate — the honest neutral for an
     # unknown layout, which matches a freshly-appended unsorted table and drives "does sorting help?".
     agg_sel = ", ".join(
@@ -315,7 +260,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     def _iid_runs(c):  # runs of a column left in ~arbitrary order (skew-governed)
         return min(float(n), max(float(ndv[c]), n * (1.0 - simpson[c])))
 
-    # current layout is unknown from a sample → assume arbitrary (iid) order. For an unsorted table
+    # current layout is not observable here → assume arbitrary (iid) order. For an unsorted table
     # this matches the real physical runs; it drives comp_saved (how much sorting would help) below.
     current_runs = {c: _iid_runs(c) for c in cols}
 
@@ -370,14 +315,14 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     candidates = sorted(
         (c for c in cols if _elig(c)),
         key=lambda c: (0 if c == lead_temporal else 1, ndv[c]))
-    # Greedy prefix build. Each level issues ONE batched sample scan:
+    # Greedy prefix build. Each level issues ONE batched scan of `src`:
     # approx_count_distinct(hash(kept_prefix, c)) for EVERY remaining candidate at once (fixed KB of
     # state per sketch, so batching over high-card columns can't OOM). That sketch RANKS and SCREENS;
     # it does not settle R5 — below _FD_CONFIRM_BELOW × the grain the sketch's own error exceeds
     # fd_band, so the candidate gets one exact confirming scan for itself alone. Scans = one batched
     # per key column kept (≤ sort_key_cap), plus at most one exact per candidate examined near grain.
     def _exact_pair(prefix_cols, c):
-        """Exact (distinct(prefix), distinct(prefix, c)) over the sample — the FD verdict's inputs.
+        """Exact (distinct(prefix), distinct(prefix, c)) over `src` — the FD verdict's inputs.
 
         Both sides hashed exactly as the sketch spells them, so the confirm answers the same question
         the screen asked. One column at a time and only near the grain: the OOM lever was the BATCHED
@@ -433,8 +378,8 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         remaining.remove(chosen)
 
     # 5) assemble. "current" uses current_runs — the iid / arbitrary-order estimate, because a random
-    # sample has no physical order to measure (see step 1); it is the honest neutral for an unknown
-    # layout. A column in the key uses its prefix runs; everything else its iid estimate.
+    # materialization has no physical order to measure (see step 1); it is the honest neutral for an
+    # unknown layout. A column in the key uses its prefix runs; everything else its iid estimate.
     est_current = {c: _col_bytes(c, current_runs[c]) for c in cols}
     current_total = sum(est_current.values())
 
@@ -449,16 +394,13 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # compress meaningfully (a real fact) we keep the compression key.
     _, comp_total = _bytes_for(sorted_runs)
     comp_saved = 100.0 * (current_total - comp_total) / current_total if current_total else 0.0
-    # is_unique can't be judged from a sample: any column whose true ndv exceeds the sample size
-    # saturates to ndv≈n and looks unique, so a high-cardinality measure (an INT64 price) would be
-    # falsely flagged and could hijack the key-organized branch below as the sort key. Only trust
-    # uniqueness when the profile was EXACT — the caller sampled nothing and handed us the whole
-    # table (``exact`` is an explicit argument now: the caller planned the sample and KNOWS whether
-    # it covered the table, rather than us inferring it from ``n < sample_rows``, which conflated "the
-    # sample covered the table" with "the table is smaller than a constant"). When it truly sampled,
-    # claim no unique column — the conservative direction: fall back to the compression key.
-    unique_cols = ([c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols]
-                   if exact else [])
+    # is_unique used to be unanswerable: any column whose true ndv exceeded the SAMPLE size saturated
+    # to ndv≈n and looked unique, so a high-cardinality measure (an INT64 price) would be falsely
+    # flagged and could hijack the key-organized branch below as the sort key. The claim was therefore
+    # suppressed on every sampled profile — which, with a 256 MiB sample budget, meant every table big
+    # enough to care about. The profile now covers all n rows, so ndv≈n really does mean unique and
+    # the branch is live for the first time on a large table.
+    unique_cols = [c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols]
     note = None
     if unique_cols and comp_saved < key_sort_below_pct:
         pk, comp_alt = unique_cols[0], list(sort_key)  # schema-order first unique col (usually the PK)
@@ -490,50 +432,6 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        and c not in null_heavy and c not in partition_cols]
         t_grain = kept_ndv                    # grain of the kept dim prefix (dim loop invariant)
         t_prefix = list(sort_key)
-        # Group-stratified read of the SOURCE, when the sample is too thin per dim group to measure
-        # in-group structure (see _GROUP_STARVED_FRAC). Takes ALL rows of a 1-in-K hash slice of
-        # groups — whole groups are the point; a row sample of the same size answers the wrong
-        # question. Materialized once here so every tail level regroups it locally instead of
-        # re-reading the source. Best-effort: any failure leaves strat None and the tail falls back
-        # to the sample-only counts it used before.
-        strat = None
-        if full_src and total_rows and kept_ndv > _GROUP_STARVED_FRAC * n:
-            k = max(1, -(-int(total_rows) // _STRAT_TARGET_ROWS))
-            gpfx = ", ".join(_qid(x) for x in sort_key)
-            # Only the columns the tail actually groups by or counts — a fact table is mostly columns
-            # this phase never looks at, and materializing them would be the memory cost this whole
-            # path is supposed to avoid.
-            need = ", ".join(_qid(x) for x in list(dict.fromkeys(sort_key + t_remaining)))
-            try:
-                con.execute(f"CREATE OR REPLACE TEMP TABLE _rle_strat AS SELECT {need} "
-                            f"FROM {full_src} WHERE hash({gpfx}) % {k} = 0")
-                if con.sql("SELECT count(*) FROM _rle_strat").fetchone()[0] > 0:
-                    strat = "_rle_strat"
-            except Exception:
-                strat = None
-
-        def _run_fracs(prefix_cols, candidates):
-            """Run count as a FRACTION of rows for each candidate, ordered by ``prefix_cols`` then
-            itself — plus that same fraction for the bare prefix, read from ``strat``.
-
-            A fraction, not a count, because the byte model works in SAMPLE units while ``strat``
-            holds whole groups from the SOURCE: the two have different row counts and a raw count
-            would not survive the trip (an earlier cut multiplied group count by per-group distincts
-            and saturated at n, hiding the very slot this exists to find). ``strat`` holds every row
-            of a 1-in-K slice of groups, so ``Σ distinct-per-group / Σ rows`` is exactly the sorted
-            layout's run fraction and **K cancels** — no extrapolation anywhere.
-
-            aemo: price → 5 values in each of 5,760 intervals over 2.59M rows ⇒ ~1.1%, against an
-            iid ~100%. mw → 450 per interval ⇒ 100%, no saving, no slot. That is the whole
-            discrimination the sample could not make."""
-            gb = ", ".join(_qid(x) for x in prefix_cols)
-            inner = ", ".join(f"count(DISTINCT {_qid(c)}) AS g{j}" for j, c in enumerate(candidates))
-            sel = ", ".join(f"sum(g{j})::DOUBLE / nullif(sum(k), 0) AS f{j}"
-                            for j in range(len(candidates)))
-            row = con.sql(f"SELECT {sel}, count(*)::DOUBLE / nullif(sum(k), 0) "
-                          f"FROM (SELECT {inner}, count(*) AS k FROM {strat} "
-                          f"GROUP BY {gb})").fetchone()
-            return [float(v) if v is not None else 1.0 for v in row[:-1]], float(row[-1] or 1.0)
 
         while t_remaining and len(tail) < tail_cap:
             pfx = ", ".join(_qid(x) for x in t_prefix)
@@ -542,32 +440,25 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                 f"approx_count_distinct(hash({pfx}, {_qid(c)})) AS t{j}"
                 for j, c in enumerate(scan))
             trow = con.sql(f"SELECT {sel} FROM {src}").fetchone()
-            # Where a stratified read exists, take runs from the layout's true run FRACTION and
-            # scale it into the sample units the byte model speaks. `pfrac` is the bare prefix's own
-            # fraction — the floor a measure hits when the prefix already determines it.
-            fracs, pfrac = _run_fracs(t_prefix, scan) if strat else (None, None)
             best, best_runs, best_save = None, None, 0.0
             for j, c in enumerate(scan):
+                # distinct(prefix, c) over the WHOLE table IS c's run count under the sorted layout.
+                # This is the measurement the old group-stratified read of the source existed to
+                # recover: on the aemo mart it reads price at 37,812 runs (1.5% of 2.59M rows — the
+                # 5-values-per-interval regional price) against mw's 2,350,544 (91%, no saving), the
+                # exact discrimination a 3-rows-per-group sample could not make. With every row in
+                # `src` the plain count says it directly, so the slice, its K, and the run-FRACTION
+                # arithmetic that carried it back into sample units are all gone.
                 runs = max(int(trow[j] or 0), 1)
                 # FD of the prefix → clusters for free, permanently out (FD survives prefix growth).
-                if fracs:
-                    # The stratified read answers the FD question directly: a measure the prefix
-                    # determines takes ONE value inside every group, so its run fraction collapses
-                    # onto the prefix's own. No sketch, no confirm — and no clobbering these numbers
-                    # with sample counts that cannot see in-group structure in the first place.
-                    if fracs[j] < pfrac * (1.0 + fd_band):
-                        t_remaining.remove(c)
-                        continue
-                    runs = max(1, min(int(n), int(round(n * fracs[j]))))
-                else:
-                    # Sample-only path: same screen-then-confirm as the dim loop, because the sketch
-                    # cannot resolve fd_band near the grain, and here a false FD reading drops the
-                    # candidate PERMANENTLY — it could bin a measure that deserved a tail slot.
-                    if runs < _FD_CONFIRM_BELOW * t_grain:
-                        t_grain, runs = _exact_pair(t_prefix, c)
-                    if runs < t_grain * (1.0 + fd_band):
-                        t_remaining.remove(c)
-                        continue
+                # Same screen-then-confirm as the dim loop, because the sketch cannot resolve fd_band
+                # near the grain, and here a false FD reading drops the candidate PERMANENTLY — it
+                # could bin a measure that deserved a tail slot.
+                if runs < _FD_CONFIRM_BELOW * t_grain:
+                    t_grain, runs = _exact_pair(t_prefix, c)
+                if runs < t_grain * (1.0 + fd_band):
+                    t_remaining.remove(c)
+                    continue
                 save = iid_bytes[c] - _col_bytes(c, runs)
                 if save > best_save:
                     best, best_runs, best_save = c, runs, save
@@ -580,8 +471,6 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             t_grain = best_runs
             t_prefix.append(best)
             t_remaining.remove(best)
-        if strat:   # connection-local temp table; this module owns it, so this module clears it
-            con.execute("DROP TABLE IF EXISTS _rle_strat")
 
     # Partition columns lead the physical order, so they end up perfectly grouped (runs = ndv) —
     # and Delta stores them in the path, not the data file. Reflect that clustered state so they
@@ -611,8 +500,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     order_cols = partition_cols + [c for c in sort_key + tail if c not in partition_cols]
     lines = [f"\nrecommend_sort_key('{sch}.{tbl}') — sort-key recommendation (experimental) "
              f"[model v{MODEL_VERSION}]:"]
-    if not exact:
-        lines.append(f"  (profiled a {sample_rows:,}-row sample — ndv/skew/runs are estimates)")
+    lines.append(f"  (profiled all {n:,} rows; cardinalities are HLL sketches)")
     lines.append(f"  ORDER BY {', '.join(order_cols) if order_cols else '(no key pays off)'}")
     if partition_cols:
         lines.append(f"  (partition columns lead the sort but carry no compression weight: "
