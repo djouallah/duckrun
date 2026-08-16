@@ -17,6 +17,34 @@ All notable changes to this project will be documented in this file.
   disk discovery only rediscovers Delta tables.
 
 ### Changed
+- **An automatically sorted write now lands exactly ONE row group per file.** `SORTED BY AUTO` (and
+  dbt's `sort_by: 'auto'`) stages its source before profiling, so unlike every other write path it
+  knows the exact row count — and the profile it already paid for carries a per-column byte model. It
+  now spends both: `max_row_group_size` goes to an unreachable `2³¹-1` and `target_file_size` becomes
+  `rows_per_group × bytes/row`, leaving the byte target as the only boundary in the writer. Every file
+  therefore closes with a single row group and no ragged trailing one — a short row group is a short
+  Direct Lake segment. This holds unconditionally, including when the byte model is wrong: a bad
+  bytes/row moves how many *rows* land in the group, never how many *groups* land in the file.
+  - The row target uses the full **1M–16M** band (`rg_for` at the exact-count floor). The 8M floor
+    exists to survive an untrustworthy planner estimate and has no business on a measured count.
+  - `bytes_per_row` is a new pure function over the profile's own result rows — no extra scan. It
+    corrects the one place the sort-key model and Parquet genuinely disagree: `_col_bytes` prices a
+    value column as bit-packed dictionary *indices* and charges nothing for the dictionary, which is
+    right for an in-memory columnar engine but not for Parquet, where the dictionary lives in the
+    column chunk and a near-unique column falls back to PLAIN. Measured on a unique BIGINT: modelled
+    2.75 B/row, landed 6.38.
+  - Measured across int, star-schema, string-heavy and 10-column shapes at 40M rows, row groups land
+    within ~**0.5–1.5×** of target. The spread is not tunable away — the target sets the group size,
+    a bigger group compresses better, and better compression fits more rows under the same target.
+  - An 8 MB floor guards against model collapse: a perfectly compressible column models near 0 B/row,
+    which without it produced a few-hundred-byte target and shattered a 4M-row table into 490 files.
+  - Every write logs rows-per-row-group against target and warns at 2× drift either way.
+    `DUCKRUN_AUTO_TFS_FACTOR=0` disables the byte target; an explicit `max_row_group_size` /
+    `target_file_size_mb` still wins verbatim. Other write paths are untouched.
+  - Corrects a stale claim in `policy.py`/`engine.py` that the 16M row-group ceiling was also the
+    write-memory ceiling. It is not: delta_rs closes the file once its *buffered* size reaches
+    `target_file_size`, so the writer's footprint is bounded by the byte target regardless of the row
+    ceiling — which is what makes an unreachable ceiling safe.
 - **The auto sort-key picker reads the source ONCE and profiles every row — sampling is gone**
   (sort-key model `v5`; picked keys will move). It profiled a seeded reservoir sample, which turned
   out to cost more than it saved on every axis. `USING SAMPLE reservoir(N ROWS)` is superlinear in

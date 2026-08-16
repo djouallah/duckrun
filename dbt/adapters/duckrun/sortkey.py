@@ -146,6 +146,81 @@ def decimal_narrow_target(type_str, max_abs):
     return f"DECIMAL({_DECIMAL_NARROW_PRECISION},{s})"
 
 
+# Parquet PLAIN width per DuckDB type: the physical bytes/row a column costs once the writer gives up
+# on the dictionary. Prefix-matched, longest-lived-prefix first is NOT needed (every colliding pair
+# shares a width: TIMESTAMP/TIME both 8, INT/UINT/INTEGER all 4) — except INTERVAL, which starts with
+# "INT" and is not fixed width, so it is rejected before the table is consulted.
+_PLAIN_WIDTH = (
+    (("BIGINT", "UBIGINT", "DOUBLE", "TIMESTAMP", "TIME"), 8),
+    (("HUGEINT", "UHUGEINT", "UUID"), 16),
+    (("TINYINT", "UTINYINT", "SMALLINT", "USMALLINT", "INT", "UINT", "DATE", "FLOAT", "REAL"), 4),
+    (("BOOL",), 1),
+)
+
+
+def plain_width(type_str, *, narrow_decimals=False):
+    """Bytes/row this column costs when Parquet writes it PLAIN — the physical ceiling no encoding can
+    exceed. ``None`` for a variable-width or unrecognised type (meaning: no ceiling known). Pure.
+
+    ``narrow_decimals`` prices a wide DECIMAL at the width that will actually land: the connection API
+    narrows ``DECIMAL(p>18,s)`` to ``DECIMAL(18,s)`` (16-byte FLBA -> INT64) AFTER profiling, so the
+    profile's own type string is the pre-narrowing one. Reuses ``decimal_narrow_target`` rather than
+    re-deriving the rule; a ``None`` max_abs there means "assume it fits", which is exactly the
+    assumption a caller who narrows is making."""
+    t = str(type_str).strip().upper()
+    m = _DECIMAL_RE.fullmatch(t)
+    if m:
+        if narrow_decimals:
+            narrowed = decimal_narrow_target(t, None)
+            if narrowed:
+                m = _DECIMAL_RE.fullmatch(narrowed)
+        p = int(m.group(1))
+        return 4 if p <= 9 else (8 if p <= 18 else 16)
+    if t.startswith("INTERVAL"):
+        return None
+    for names, width in _PLAIN_WIDTH:
+        if t.startswith(names):
+            return width
+    return None
+
+
+def bytes_per_row(rows, n, *, narrow_decimals=False):
+    """Modeled bytes/row of the SORTED layout ``recommend_sort_key`` just profiled — or ``None``.
+
+    Pure: it re-reads that call's own result ``rows``, so it costs no scan and no second pass over the
+    data. The one correction it applies to ``est_kb_sorted`` is CHARGING VALUE COLUMNS FOR THEIR
+    DICTIONARY, because that is where the sort-key model and Parquet genuinely disagree.
+
+    ``_col_bytes`` prices a value column as ``min(bitpack, rle)`` and adds nothing for the dictionary
+    (``_dict_bytes`` returns 0 for value encodings). That is right for an in-memory columnar engine,
+    which can hold one dictionary per column and bit-pack indices against it. Parquet stores the
+    dictionary IN the column chunk, so a value column pays for it too — and when the values are near
+    unique the dictionary is as large as the data, so PLAIN wins and the writer falls back to it.
+    Measured on a unique BIGINT at 4M rows: the model says 2.75 B/row (22 bit-packed index bits) and
+    6.38 lands, which is an 8-byte INT64 written PLAIN and Snappy'd.
+
+    So a value column is charged ``model + ndv * plain_width``, capped at ``n * plain_width`` — the
+    PLAIN ceiling no encoding can exceed. Hash columns are left alone: ``_dict_bytes`` already charges
+    them ``ndv * avg_width``, so that side is already right.
+
+    This is an ENCODED-bytes model: no Snappy, no page headers, no footer, no file overhead. It is NOT
+    a file-size prediction and must not be read as one. ``policy.tfs_for`` holds the one measured
+    constant that turns it into a byte target."""
+    if not rows or not n:
+        return None
+    total = 0.0
+    for r in rows:
+        est_kb, dtype, encoding, ndv = r[11], r[4], r[5], r[6]
+        if est_kb is None:      # an incomplete profile is not a number to guess from
+            return None
+        b = float(est_kb) * 1024.0
+        w = plain_width(dtype, narrow_decimals=narrow_decimals) if encoding == "value" else None
+        if w is not None:
+            b = min(b + (ndv or 0) * float(w), n * float(w))
+        total += b
+    return (total / n) or None
+
+
 def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        sort_key_cap=4, min_gain_pct=1.0, key_sort_below_pct=10.0,
                        stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,

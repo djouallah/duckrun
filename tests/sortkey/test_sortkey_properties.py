@@ -338,8 +338,8 @@ def test_profile_is_stable_over_an_unordered_source():
     con.execute("CREATE TABLE base AS SELECT (i % 400) g, (i % 7) b, i * 1.5 amt "
                 "FROM range(200000) t(i)")
     con.execute("CREATE VIEW agg AS SELECT g, b, sum(amt) amt FROM base GROUP BY g, b")
-    k1, _ = engine.auto_sort_cols(con, "agg")
-    k2, _ = engine.auto_sort_cols(con, "agg")
+    k1, _, _ = engine.auto_sort_cols(con, "agg")
+    k2, _, _ = engine.auto_sort_cols(con, "agg")
     assert k1 == k2, f"profile of an aggregating source disagreed: {k1} vs {k2}"
 
 
@@ -464,3 +464,96 @@ def test_decimal_narrow_target():
     assert f("DECIMAL(38)", 100) == "DECIMAL(18,0)"
     assert f("NUMERIC(38)", 10 ** 18) is None                  # same exact-fit rule applies
     assert f("NUMERIC(18,2)", 5) is None                       # p <= 18 still nothing to narrow
+
+
+# ── 9. bytes/row: the byte model behind the one-row-group-per-file write geometry. ──────────────
+
+def _row(dtype, encoding, ndv, est_kb_sorted, column="c"):
+    """One profile row in sortkey._SCHEMA order — the shape `bytes_per_row` consumes."""
+    return ("sch.tbl", False, 0, column, dtype, encoding, ndv, 0.0, 0, False,
+            est_kb_sorted, est_kb_sorted, 0.0)
+
+
+def test_plain_width_prices_the_type_parquet_actually_writes():
+    f = sortkey.plain_width
+    assert f("BIGINT") == 8 and f("DOUBLE") == 8 and f("TIMESTAMP") == 8
+    assert f("INTEGER") == 4 and f("DATE") == 4 and f("FLOAT") == 4 and f("SMALLINT") == 4
+    assert f("HUGEINT") == 16 and f("UUID") == 16
+    assert f("BOOLEAN") == 1
+    # DECIMAL is priced by precision — the three Parquet physical types it maps onto.
+    assert f("DECIMAL(9,2)") == 4 and f("DECIMAL(18,2)") == 8 and f("DECIMAL(38,4)") == 16
+    # Variable-width and unrecognised types have no PLAIN ceiling to cap with.
+    assert f("VARCHAR") is None and f("BLOB") is None and f("STRUCT(a INT)") is None
+    # INTERVAL starts with "INT" but is not a fixed-width number — it must not be priced as one.
+    assert f("INTERVAL") is None
+
+
+def test_plain_width_prices_a_narrowed_decimal_at_its_landed_width():
+    # The connection API narrows DECIMAL(p>18,s) -> DECIMAL(18,s) AFTER profiling, so the profile's
+    # type string is the 16-byte one while an 8-byte INT64 is what actually lands.
+    assert sortkey.plain_width("DECIMAL(38,4)") == 16
+    assert sortkey.plain_width("DECIMAL(38,4)", narrow_decimals=True) == 8
+    # A scale that leaves no integer digit cannot be narrowed, so it stays 16 either way.
+    assert sortkey.plain_width("DECIMAL(38,18)", narrow_decimals=True) == 16
+
+
+def test_bytes_per_row_charges_a_value_column_for_its_dictionary():
+    # THE correction this function exists for. `_col_bytes` prices a unique BIGINT as bit-packed
+    # dictionary INDICES and adds nothing for the dictionary itself (_dict_bytes is 0 for value
+    # encodings) — 2.75 B/row at 4M rows. Parquet stores the dictionary in the column chunk, so a
+    # near-unique column pays for both and the writer falls back to PLAIN. Measured: 6.38 B/row.
+    n = 4_000_000
+    rows = [_row("BIGINT", "value", n, n * 2.75 / 1024.0)]
+    assert sortkey.bytes_per_row(rows, n) == 8.0          # the PLAIN ceiling, not the 2.75 model
+
+
+def test_bytes_per_row_keeps_a_low_cardinality_value_column_cheap():
+    # The dictionary charge must not flatten every value column to PLAIN: a small dictionary is
+    # genuinely cheap, so the model's own number survives.
+    n = 4_000_000
+    rows = [_row("INTEGER", "value", 500, n * 1.125 / 1024.0)]
+    bpr = sortkey.bytes_per_row(rows, n)
+    assert 1.12 < bpr < 1.13, bpr                          # ~bitpack + 500*4/n, well under PLAIN 4
+
+
+def test_bytes_per_row_never_exceeds_the_plain_ceiling():
+    # An over-modelled column is capped: Parquet cannot spend more than the physical width.
+    n = 1_000_000
+    rows = [_row("INTEGER", "value", 999_999, n * 50.0 / 1024.0)]
+    assert sortkey.bytes_per_row(rows, n) == 4.0
+
+
+def test_bytes_per_row_leaves_hash_columns_to_the_model():
+    # A hash column's dictionary is already charged by _dict_bytes, so it must pass through
+    # untouched — and it has no PLAIN width to cap against anyway.
+    n = 1_000_000
+    rows = [_row("VARCHAR", "hash", 250_000, n * 3.5 / 1024.0)]
+    assert abs(sortkey.bytes_per_row(rows, n) - 3.5) < 1e-9
+
+
+def test_bytes_per_row_is_pure_and_deterministic():
+    n = 100_000
+    rows = [_row("BIGINT", "value", 1000, 12.0, "a"), _row("VARCHAR", "hash", 50, 30.0, "b")]
+    assert sortkey.bytes_per_row(rows, n) == sortkey.bytes_per_row(rows, n)
+    assert sortkey.bytes_per_row(list(reversed(rows)), n) == sortkey.bytes_per_row(rows, n)
+
+
+def test_bytes_per_row_refuses_to_guess_from_an_incomplete_profile():
+    # No rows, no row count, or a column carrying no modelled size -> None ("no geometry"), which
+    # the engine reads as "change nothing" rather than sizing a write off a hole.
+    assert sortkey.bytes_per_row([], 1000) is None
+    assert sortkey.bytes_per_row([_row("BIGINT", "value", 10, 1.0)], 0) is None
+    assert sortkey.bytes_per_row([_row("BIGINT", "value", 10, None)], 1000) is None
+
+
+def test_bytes_per_row_over_a_real_profile_is_in_the_right_order_of_magnitude():
+    # End to end against a real profile: a 6-column star-schema fact is single-digit bytes/row.
+    # Deliberately a band, not a number — the model is calibrated to ~0.5-1.5x (see policy).
+    con = duckdb.connect()
+    recs, _ = _profile(con, "select (DATE '2020-01-01' + INTERVAL (i%1500) DAY) d, (i%400)::int store, "
+                            "(i%9000)::int product, (i%13)::int channel, "
+                            "((i%9973)/100.0)::DECIMAL(18,2) amount, (i%97)::int qty "
+                            "from range(200000) t(i)")
+    rows = [tuple(r[c] for c in _COLS) for r in recs.values()]
+    bpr = sortkey.bytes_per_row(rows, 200_000)
+    assert 0.5 < bpr < 40.0, bpr

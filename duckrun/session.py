@@ -788,12 +788,15 @@ class DuckSession:
             return
         self._catalogs[name] = entry._replace(storage_options=so)
 
-    def _handle_delta_write(self, entry, query: str) -> bool:
+    def _handle_delta_write(self, entry, query: str, *, geometry=None) -> bool:
         """Route a Delta write through ``delta_dml.handle``. Memory is already handled: the session's
         ``memory_limit`` was pinned once at connect (``configure_duckdb_session``), and a ``MERGE``'s
-        delta_rs pool is bounded by its own spill caps behind the merge gate in the engine."""
+        delta_rs pool is bounded by its own spill caps behind the merge gate in the engine.
+
+        ``geometry`` carries a ``SORTED BY AUTO`` profile's one-row-group-per-file write geometry
+        (see :meth:`_resolve_auto_sort`); ``None`` on every other statement."""
         return delta_dml.handle(self.con, entry.root_path, entry.storage_options,
-                                query, default_schema=self._current_database)
+                                query, default_schema=self._current_database, geometry=geometry)
 
     def sql(self, query: str) -> duckdb.DuckDBPyRelation:
         """Run a query and return DuckDB's native ``DuckDBPyRelation`` — unwrapped, with all of its
@@ -903,13 +906,13 @@ class DuckSession:
         # SORTED BY AUTO stages its source into a temp table and rewrites the statement to read that,
         # so the profile and the write below share ONE evaluation of the source. staged is that temp
         # table's name (or None) and this owns its lifetime — hence the try/finally.
-        query, staged = self._resolve_auto_sort(query)
+        query, staged, geom = self._resolve_auto_sort(query)
         try:
             # A Delta write is routed with the DuckDB memory_limit clamped (and restored after); a read runs
             # handle() unwrapped — it returns False for non-DML and falls through to DuckDB below. is_write
             # implies entry is not None here (the None case raised above).
             if entry is not None:
-                handled = (self._handle_delta_write(entry, query) if is_write else
+                handled = (self._handle_delta_write(entry, query, geometry=geom) if is_write else
                            delta_dml.handle(self.con, entry.root_path, entry.storage_options,
                                             query, default_schema=self._current_database))
             else:
@@ -935,9 +938,12 @@ class DuckSession:
         ``SORTED BY (cols)`` / ``PARTITIONED BY (cols)`` (native DuckDB syntax) and every non-CREATE
         statement pass straight through untouched.
 
-        Returns ``(query, staged)``. ``staged`` is a temp table holding the body's rows, or ``None``
-        when nothing was staged (any non-AUTO statement). The CALLER must drop it after the statement
-        runs — :meth:`sql` does, in a ``finally``.
+        Returns ``(query, staged, geom)``. ``staged`` is a temp table holding the body's rows, or
+        ``None`` when nothing was staged (any non-AUTO statement). The CALLER must drop it after the
+        statement runs — :meth:`sql` does, in a ``finally``. ``geom`` is the one-row-group-per-file
+        write geometry the profile paid for, or ``None`` to keep the default adaptive layout — which
+        is what the ``_get_rle`` branch below returns, since it profiles by a different route and
+        produces no byte model.
 
         When the body is a bare ``SELECT * FROM <one delta table>`` (the re-cluster-this-table case)
         the key comes from :meth:`_get_rle`, which also reads the table's Delta log for per-column
@@ -952,12 +958,13 @@ class DuckSession:
         stripped = delta_dml._strip_comments(delta_dml._strip_leading(query)).rstrip().rstrip(";").rstrip()
         m = delta_dml._CREATE_AS.fullmatch(stripped)
         if not m:
-            return query, None
+            return query, None, None
         _rel, sort, _part = delta_dml._split_create_layout(m.group("rel").strip())
         if sort != "AUTO":
-            return query, None
+            return query, None, None
         body = m.group("body")
         staged = "_duckrun_auto_src"
+        self._auto_geom = None
         self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS {body}")
         try:
             src = self._auto_sort_single_table(body)
@@ -978,7 +985,8 @@ class DuckSession:
         bstart, bend = m.span("body")
         stripped = stripped[:bstart] + new_body + stripped[bend:]
         replacement = ("SORTED BY (" + ", ".join(_qid(c) for c in cols) + ")") if cols else ""
-        return delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1), staged
+        return (delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1), staged,
+                getattr(self, "_auto_geom", None))
 
     def _narrow_wide_decimals(self, body: str) -> str:
         """Rewrite a ``SELECT *`` body to narrow wide-``DECIMAL`` columns so they regain dictionary
@@ -1448,8 +1456,18 @@ class DuckSession:
 
         ``staged`` is the temp table the CALLER has already materialized the result into — the
         recommender scans it a dozen or so times, and it is the same table the CTAS then writes from,
-        so an arbitrary query is evaluated exactly once for profile + write together."""
-        cols, lines = engine.auto_sort_cols(self.con, staged)
+        so an arbitrary query is evaluated exactly once for profile + write together.
+
+        The same profile also yields the one-row-group-per-file write geometry, which is left on
+        ``self._auto_geom`` for :meth:`_resolve_auto_sort` rather than returned: the return type is
+        load-bearing (the parquet_layout build scripts call this directly, and the SQL tests
+        monkeypatch it), and a patched stand-in that never sets the attribute correctly yields "no
+        geometry". Safe against a shared session because the fixed ``_duckrun_auto_src`` staging name
+        already serializes this path — two concurrent AUTO statements would clobber that table long
+        before they raced on this attribute."""
+        self._auto_geom = None
+        cols, lines, geom = engine.auto_sort_cols(self.con, staged, narrow_decimals=True)
+        self._auto_geom = geom
         # This path prints ONLY the ORDER BY line (not the full advisory block).
         for line in lines:
             if line.strip().startswith("ORDER BY"):
