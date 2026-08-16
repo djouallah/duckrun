@@ -38,7 +38,7 @@ With that frame in place, the table below is the full configuration; the [reason
 | **Dictionary page limit** | 32 MB | Caps how large a column's dictionary grows before the column overflows to **PLAIN**. Mid- and high-cardinality columns (dictionary < 32 MB) stay dictionary-encoded — compact and directly remappable by a columnar reader. Truly unique columns still overflow to PLAIN, the correct outcome: their dictionary would be nearly as large as the data itself, pure overhead. This bound is the main lever on merge memory — a merge *reading* the table materializes those dictionaries, so a larger limit means a larger merge working set. Measured on an 18M-row merge: a 128 MB limit hit ~25 GB, 8 MB ~4 GB, 16 MB ~8.7 GB — 32 MB is a deliberate step up that curve, traded for denser read-layout segments and held in check by the merge spill tests. The exact crossover depends on your column cardinalities. |
 | **Data page size** | 1 MB, **1M-row cap** | Bounded pages. The row-count cap is the important safeguard: without it, a highly compressible column buffers its entire row group as a single page — roughly 10× write memory and oversized pages that strain a reader's memory ([arrow-rs #5797](https://github.com/apache/arrow-rs/issues/5797)). |
 | **Statistics** | chunk-level, truncated | Row-group min/max is all a reader needs to skip row groups; page-level statistics only bloat the footer. Long strings are truncated in the statistics. |
-| **Target file size** | 256 MB | A row group cannot span files, so this byte cap is effectively a segment cap. A narrow fact reaches a full 16M-row segment well under 256 MB; a wide fact fills 256 MB before 16M rows, so there the file size — not the row count — sets the segment. It is deliberately well below **1 GB**, which forced whole-file copy-on-write and inflated merge cost on disk. (File size is not the dominant merge-memory lever — the dictionary limit is.) |
+| **Target file size** | 256 MB · derived on `SORTED BY AUTO` | A row group cannot span files, so this byte cap is effectively a segment cap. A narrow fact reaches a full 16M-row segment well under 256 MB; a wide fact fills 256 MB before 16M rows, so there the file size — not the row count — sets the segment. It is deliberately well below **1 GB**, which forced whole-file copy-on-write and inflated merge cost on disk. (File size is not the dominant merge-memory lever — the dictionary limit is.) An **automatically sorted** write derives this number instead of taking the constant — see [one row group per file](#one-row-group-per-file) below. |
 
 **Per-model overrides.** The adaptive sizing above depends on a planner row estimate, which can
 under-shoot on the *first* build of a big joined/aggregated model (a rebuild of an existing table
@@ -47,6 +47,53 @@ its own size can declare its geometry instead: `max_row_group_size` (rows) and
 `target_file_size_mb` (MB) pin the row-group ceiling and file size for that model's writes — the
 explicit value bypasses the estimate entirely and is preserved by post-write compaction. See the
 [model config reference](dbt-adapter.md#config-options-table--incremental--delta).
+
+### One row group per file
+
+An automatically sorted write (`SORTED BY AUTO`, or dbt's `sort_by: 'auto'`) sizes itself
+differently, because it already knows things a normal write does not.
+
+Everywhere else, two independent boundaries decide the layout: `max_row_group_size` closes a row
+group at a row count, and `target_file_size` closes the file at a byte count. Whichever comes first
+wins, so a file can hold one full group and a short trailing one — and a short group is a short
+Direct Lake segment.
+
+An AUTO write removes one of the two boundaries. It stages its source into a temp table before
+profiling, so it has an exact `COUNT(*)` rather than a planner estimate, plus a per-column byte model
+from the profile it already paid for. From those it computes
+
+```
+rows per group  = clamp(ceil(rows / 8), 1M, 16M)      # rg_for, at the exact-count floor
+target file size = rows per group × modelled bytes/row  # clamped to [8 MB, 256 MB]
+max row group    = 2³¹-1                                # deliberately out of reach
+```
+
+With the row ceiling unreachable, **the byte target is the only boundary left, so every file holds
+exactly one row group.** That holds unconditionally — it does not depend on the byte model being
+right. Because the count is a measurement rather than a guess, the row target also uses the full
+**1M–16M** band instead of the 8M estimate floor.
+
+Two honest caveats:
+
+- **Bytes/row is modelled, not measured.** It is the sort-key model's encoded-byte estimate,
+  corrected for the fact that Parquet — unlike an in-memory columnar engine — stores a value
+  column's dictionary alongside its indices, so a near-unique column falls back to PLAIN. Measured
+  across int, star-schema, string-heavy and wide shapes at 40M rows, row groups land within roughly
+  **0.5–1.5×** of target. That spread is not a tuning failure: the target sets the group size, a
+  bigger group compresses better, and better compression fits more rows under the same byte target.
+  What the model buys is the right order of magnitude with exactly one group per file — not
+  sub-percent placement.
+- **The 8 MB floor is a collapse guard, not a size policy.** A perfectly compressible column models
+  near 0 bytes/row, which without a floor produces a few-hundred-byte target; measured, that
+  shattered a 4M-row table into 490 files. It only binds when the model has collapsed.
+
+Both AUTO routes are sized this way — a derived query and the bare
+`SELECT * FROM <table>` re-cluster, which profiles through the Delta log for null shares and
+cardinality caps but runs the same recommender underneath.
+
+Every write logs what actually landed (`rows per row group vs target`), and warns when the ratio is
+off by 2× either way. An explicit `max_row_group_size` or `target_file_size_mb` disables all of this
+for that model — a declared geometry is not a guess to improve on.
 
 ### The logic behind the numbers
 
@@ -83,6 +130,8 @@ One caveat dominates everything here, and it is the reason this whole page is fr
 `CREATE OR REPLACE TABLE <t> SORTED BY AUTO AS SELECT * FROM <t>` selects the sort key **for you**. You do not pass a column list — duckrun profiles the table (each column's cardinality, skew, null density, and functional dependencies), chooses a short key from that profile, and rewrites every file physically ordered by it.
 
 The selection is a heuristic built on statistical estimates of your data. It is usually a reasonable key; it is never guaranteed to be the best one, and on some data distributions it will not help at all. See [the picker rules](#how-the-automatic-picker-chooses) and their failure modes below. From dbt, the same picker is reachable as the model config `sort_by: auto` — it profiles the staged model result and writes unsorted when nothing pays off.
+
+Because it stages and profiles the whole result, an AUTO write also sizes its own files so that each one holds exactly one row group — see [one row group per file](#one-row-group-per-file).
 
 ```sql
 -- auto: profile the table, pick the key, rewrite clustered by it

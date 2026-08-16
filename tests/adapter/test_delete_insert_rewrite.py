@@ -506,7 +506,7 @@ def test_sort_by_auto_only_profiles_when_the_write_path_sorts(tmp_path, monkeypa
 
     called = []
     monkeypatch.setattr(engine, "auto_sort_cols",
-                        lambda *a, **k: called.append(a[1]) or ([], []))
+                        lambda *a, **k: called.append(a[1]) or ([], [], None))
     # Stop at the dispatch: this asserts what the ROUTING decided, not what each branch writes.
     for meth in ("_store_merge", "_store_insert", "_store_delete_insert", "_store_microbatch",
                  "_store_append"):

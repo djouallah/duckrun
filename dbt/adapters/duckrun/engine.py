@@ -21,7 +21,7 @@ from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, DEFAULT_TARGET_FILE_SIZE,
                                          ROW_GROUP_MAX_ROWS, RG_LANES, RG_MIN, RG_MIN_ESTIMATED,
-                                         RG_MAX, rg_for)
+                                         RG_MAX, RG_UNREACHABLE, rg_for, tfs_for)
 from dbt.adapters.duckrun import sortkey
 
 logger = AdapterLogger("Duckrun")
@@ -248,6 +248,47 @@ def _warn_if_estimate_was_far_off(cur, dt, est, row_group_rows):
             )
     except Exception as exc:
         logger.debug(f"duckrun: estimate-accuracy check skipped: {exc}")
+
+
+# An AUTO write whose landed row groups miss the target by this factor either way gets a warning —
+# and, on the benchmark, IS the calibration reading for policy.AUTO_TFS_FACTOR.
+_AUTO_GEOM_WARN_FACTOR = 2.0
+
+
+def _log_auto_geometry(cur, dt):
+    """Report what an AUTO write actually laid down, and how far the byte model was off.
+
+    Free and exact: with one row group per file the log's per-file ``num_records`` IS the row-group
+    size, so no footer read is needed. The target it compares against is recomputed from the landed
+    row count rather than threaded down from the caller — ``rg_for`` is pure, so the two agree by
+    construction and this needs no extra parameter on the write seam.
+
+    ``median(rows per full file) / rg_target`` is the one number that calibrates
+    ``policy.AUTO_TFS_FACTOR``: multiply the factor by it to move the next write onto target. The
+    short trailing file is excluded — it closed on end-of-input, not on the byte target, so it
+    carries no information about the model. Best-effort; never raises, never touches the commit."""
+    if cur is None:
+        return
+    try:
+        add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
+        rows = cur.sql("select num_records from add_actions where num_records is not null").fetchall()
+        counts = sorted(int(r[0]) for r in rows if r[0])
+        if not counts:
+            return
+        total = sum(counts)
+        rg_target = rg_for(total, floor=RG_MIN)
+        full = [c for c in counts if c > 0.5 * counts[-1]] or counts
+        landed = full[len(full) // 2]           # median of the files the byte target actually closed
+        ratio = landed / rg_target if rg_target else 0.0
+        msg = (f"duckrun: auto geometry landed {len(counts)} file(s), {landed:,} rows per row group "
+               f"vs a {rg_target:,} target ({ratio:.2f}x) over {total:,} rows")
+        if ratio and (ratio >= _AUTO_GEOM_WARN_FACTOR or ratio <= 1.0 / _AUTO_GEOM_WARN_FACTOR):
+            logger.warning(f"{msg} — the bytes/row model is off; recalibrate "
+                           f"DUCKRUN_AUTO_TFS_FACTOR by {1.0 / ratio:.2f}x")
+        else:
+            logger.info(msg)
+    except Exception as exc:
+        logger.debug(f"duckrun: auto geometry readout skipped: {exc}")
 
 
 def _writer_properties(row_group_rows=None):
@@ -1247,11 +1288,22 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
         return {}, 0, 0
 
 
-def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by=auto")):
-    """Run the sort-key recommender over any FROM-able ``source`` and return ``(cols, lines)``: the
-    recommended ORDER BY columns (``[]`` if nothing pays off) and the advisory lines for the CALLER
-    to print/log. The one seam behind dbt's ``sort_by='auto'`` and the connection API's relation
-    fallback for ``SORTED BY AUTO``.
+def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by=auto"),
+                   narrow_decimals=False):
+    """Run the sort-key recommender over any FROM-able ``source`` and return ``(cols, lines, geom)``:
+    the recommended ORDER BY columns (``[]`` if nothing pays off), the advisory lines for the CALLER
+    to print/log, and the write GEOMETRY that lands one row group per file. The one seam behind dbt's
+    ``sort_by='auto'`` and the connection API's relation fallback for ``SORTED BY AUTO``.
+
+    ``geom`` is ``{"row_group_rows", "target_file_size", "rows", "bytes_per_row"}`` or ``None`` when
+    the byte target cannot be computed (empty profile, or ``AUTO_TFS_FACTOR`` disabled) — ``None``
+    means "change nothing", so the caller keeps today's adaptive ceiling and 256 MB files. It is
+    computed HERE, not per surface, so the SQL and dbt paths cannot size a write two different ways.
+
+    The row count behind it is an exact ``count(*)`` over the caller's already-materialized temp
+    table — a metadata read on a DuckDB base table, not a scan, and not the DuckDB planner estimate
+    ``write_delta`` falls back to. That is why ``rg_for`` gets the low ``RG_MIN`` floor here: the 8M
+    ``RG_MIN_ESTIMATED`` floor exists to survive an untrustworthy guess, and this is a measurement.
 
     ``source`` MUST be cheap to scan repeatedly — the recommender reads it a dozen or so times. The
     CALLER is responsible for that: both surfaces materialize the staged relation into a local temp
@@ -1267,12 +1319,34 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     cols = [d[0] for d in desc]
     types = {d[0]: str(d[1]) for d in desc}
     if not cols:
-        return [], []
+        return [], [], None
     rows, _, lines = sortkey.recommend_sort_key(
         cur, label[0], label[1], source, cols, types, list(partition_cols or []))
     # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
     key = [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
-    return key, lines
+    return key, lines, _auto_geometry(cur, source, rows, narrow_decimals=narrow_decimals)
+
+
+def _auto_geometry(cur, source, rows, *, narrow_decimals=False):
+    """The one-row-group-per-file write geometry for an AUTO write, or ``None`` to change nothing.
+
+    Best-effort throughout: a geometry is an optimization, so every failure degrades to ``None`` and
+    the write proceeds on the default layout rather than breaking on a sizing problem."""
+    try:
+        n = cur.sql(f"SELECT count(*) FROM {source}").fetchone()[0]
+        bpr = sortkey.bytes_per_row(rows, n, narrow_decimals=narrow_decimals)
+        # An exact count takes rg_for's LOW floor — see the docstring above and policy.RG_MIN_ESTIMATED.
+        rows_target = rg_for(n, floor=RG_MIN)
+        tfs = tfs_for(rows_target, bpr)
+        if tfs is None:
+            return None
+        logger.debug(f"duckrun: auto geometry rows={n:,} bytes/row={bpr:.2f} "
+                     f"rg_target={rows_target:,} target_file_size={tfs:,}")
+        return {"row_group_rows": RG_UNREACHABLE, "target_file_size": tfs,
+                "rows": int(n), "bytes_per_row": bpr, "rg_target": int(rows_target)}
+    except Exception as exc:
+        logger.debug(f"duckrun: auto geometry unavailable: {exc}")
+        return None
 
 
 # Delta column-metadata key under which we stash a dbt column description, and the dollar-quote
@@ -1645,7 +1719,12 @@ def write_delta(
 
     if mode == "overwrite":
         dt = _delta_table(path, storage_options)
-        _warn_if_estimate_was_far_off(cur, dt, est, row_group_rows)
+        if row_group_rows == RG_UNREACHABLE:
+            # An AUTO write: the row ceiling is out of reach, so the byte target alone shaped the
+            # layout and the landed row groups are the only readout of whether the model was right.
+            _log_auto_geometry(cur, dt)
+        else:
+            _warn_if_estimate_was_far_off(cur, dt, est, row_group_rows)
         # A fresh table (this overwrite created v0) has no prior versions — nothing for vacuum or
         # cleanup_metadata to reclaim, so skip both store-listing operations on a brand-new create.
         if dt.version() > 0:

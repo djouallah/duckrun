@@ -34,12 +34,16 @@ DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
 
 # ------------------------------------------------------------------------- write-layout geometry
 # A Parquet row group maps 1:1 to a Direct Lake column segment: any size from 1M to 16M rows is a fine
-# segment, 16M is the ceiling (kept under 2^24 so one row group stays one segment), and 16M is also the
-# write-memory ceiling (arrow-rs buffers a full uncompressed row group per open writer). This is a
+# segment and 16M is the ceiling (kept under 2^24 so one row group stays one segment). This is a
 # CEILING, not a size: the 256 MB file roll usually closes the group first, so a write left at RG_MAX
 # still lands well inside the band. A SMALL write shrinks the ceiling so the table still yields
 # ~RG_LANES groups — each segment transcodes on its own lane, so 2 groups cold-load on 2 lanes.
 # Only max_row_group_size moves — never bytes.
+#
+# NOT a write-memory ceiling, despite what this comment used to claim: delta_rs closes the file as
+# soon as its buffered size reaches target_file_size (checked every write batch), so the writer's
+# footprint is bounded by the BYTE target no matter how large max_row_group_size is. That is what lets
+# the AUTO path below set the row ceiling out of reach entirely (see RG_UNREACHABLE).
 ROW_GROUP_MAX_ROWS = 16_000_000
 RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # target row groups for a small overwrite
 RG_MIN = 1_000_000
@@ -56,6 +60,10 @@ RG_MIN = 1_000_000
 # under-estimate floor-pinned every segment). This costs the ~RG_LANES target below
 # RG_LANES × RG_MIN_ESTIMATED rows, which is the deliberate trade: fewer lanes on a small table,
 # no floor-pinning on a large one.
+#
+# A SORTED BY AUTO write is exempt and passes the low RG_MIN floor instead: it stages its source into
+# a temp table and the profiler counts every row (sortkey.recommend_sort_key), so its row count is a
+# measurement, not a guess, and the whole reason this floor exists does not apply.
 RG_MIN_ESTIMATED = 8_000_000
 RG_MAX = ROW_GROUP_MAX_ROWS  # big/unknown estimates keep this exactly
 
@@ -72,6 +80,67 @@ def rg_for(est, floor=RG_MIN):
     if est is None or est >= RG_LANES * RG_MAX:
         return RG_MAX
     return max(floor, min(RG_MAX, -(-est // RG_LANES)))   # ceil(est / RG_LANES)
+
+
+# ------------------------------------------------------------ one row group per file (SORTED BY AUTO)
+# max_row_group_size for an AUTO write: deliberately out of reach, so the byte target below is the ONLY
+# boundary and every file holds exactly one row group. A row ceiling can only fire EARLY here and leave
+# a runt trailing group in the same file — the raggedness this path exists to remove. 2^31-1 rather
+# than a u64 maximum because engine._writer_properties degrades silently when the pinned wheel rejects
+# a parameter, and its last rung drops max_row_group_size altogether, landing Parquet's 1M default.
+RG_UNREACHABLE = 2 ** 31 - 1
+
+# Turns the sortkey byte model (sortkey.bytes_per_row) into a target_file_size. It folds TWO effects
+# that pull in opposite directions, which is why ONE constant covers both:
+#   - the model counts ENCODED bytes — no Snappy, no page headers, no footer — so it reads high;
+#   - delta_rs rolls the file on its BUFFERED size, which over-counts the final compressed file
+#     (measured 0.50-0.64 actual/target across int, low-cardinality, string and 10-column shapes).
+# Calibrated on ROWS PER ROW GROUP landed vs rows_target, never on bytes: rows are what a Direct Lake
+# segment is made of, and with one row group per file the Delta log's num_records IS the segment size,
+# so engine._log_auto_geometry can measure the ratio for free after every write.
+#
+# 1.0 — the model's bytes/row IS the target — because the measurements do not support a more precise
+# number. Landing 40M-row tables through the real connection API and reading the row groups back out
+# of the footers: at this factor a unique-key fact lands 0.75x of its row target, a star-schema fact
+# 1.51x and a 10-column mixed fact 1.25x. Sweeping the factor to 0.8 moves those to 0.60 / 1.19 / 0.68,
+# and extrapolating each shape onto 1.0x independently lands on 0.89 and 1.02 — i.e. the two estimates
+# disagree by more than the correction either would make. So 1.0 it is.
+#
+# The residual per-shape spread is roughly +/-50% and is NOT reducible by tuning this constant: the
+# target sets the row-group size, a bigger row group compresses better, and better compression fits
+# more rows under the same byte target. That feedback makes the mapping non-linear and shape-dependent
+# (the same shapes measured at 4M rows came out near half their 40M ratio). What the model buys is the
+# right order of magnitude — row groups land inside ~0.5-1.5x of target, always exactly one per file,
+# and for a realistic fact always inside the 1M-16M segment band. That is the win over ragged
+# multi-group files; sub-percent placement was never on offer.
+# 0 disables the byte target entirely and the write keeps DEFAULT_TARGET_FILE_SIZE.
+AUTO_TFS_FACTOR = float(os.environ.get("DUCKRUN_AUTO_TFS_FACTOR", "1.0"))
+
+
+# Floor for the computed byte target. NOT a hedge against a slightly-off model — it exists because the
+# byte model can collapse toward ZERO and take the file target with it. A perfectly compressible column
+# (a cyclic low-cardinality int, sorted) models at ~0 B/row, so rows_target x bpr is a few hundred
+# BYTES; measured, that shattered a 4M-row table into 490 files of 8,192 rows. rg_for's RG_MIN bounds
+# rows_target, but nothing bounds the byte target, so the collapse is unbounded without this.
+# Deliberately small: it is a COLLAPSE guard, not a size policy. Set it at the "healthy file" mark
+# (256/RG_LANES = 32 MB) and it stops being a guard and starts being the layout — measured at 40M
+# rows, a 32 MB floor governed the well-compressing shapes outright and pinned them to ~2.4x their
+# row target, which is the opposite of the exact row group this path exists to produce. 8 MB still
+# collapses the pathological case to a single file while leaving every realistic shape to the model.
+TFS_MIN = int(os.environ.get("DUCKRUN_AUTO_TFS_MIN", DEFAULT_TARGET_FILE_SIZE // 32))
+
+
+def tfs_for(rows_target, bytes_per_row):
+    """Byte target that makes ONE row group of ~``rows_target`` rows fill exactly one file, or ``None``
+    to keep ``DEFAULT_TARGET_FILE_SIZE``.
+
+    Capped at ``DEFAULT_TARGET_FILE_SIZE``: a fact wide enough that ``rows_target`` would need a bigger
+    file keeps the global 256 MB policy and lands a smaller — still single — row group. Floored at
+    ``TFS_MIN``, which binds only when the byte model has collapsed (see there)."""
+    if not rows_target or not bytes_per_row or AUTO_TFS_FACTOR <= 0:
+        return None
+    want = rows_target * bytes_per_row * AUTO_TFS_FACTOR
+    return int(min(DEFAULT_TARGET_FILE_SIZE, max(TFS_MIN, want)))
 
 
 class MaintenancePolicy:

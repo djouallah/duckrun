@@ -1639,12 +1639,19 @@ def _row_groups(conn, table):
         f"from parquet_metadata({files!r}))").fetchone()[0]
 
 
+def _live_files(conn, table):
+    # The table's LIVE parquet files, from the Delta log. An overwrite tombstones the previous
+    # version's files without deleting them (vacuum keeps the 168h retention), so anything counting
+    # per-file layout must read the log rather than glob the directory.
+    from dbt.adapters.duckrun import engine
+    return engine._delta_table(conn.root_path + "/dbo/" + table, conn.storage_options).file_uris()
+
+
 def _live_row_groups(conn, table):
     # Same count, but over the table's LIVE files only. An overwrite tombstones the previous version's
     # parquet without deleting it (vacuum keeps the 168h retention), so a table written more than once
     # must not be counted with the raw glob _row_groups uses — the retired files would be counted too.
-    from dbt.adapters.duckrun import engine
-    live = engine._delta_table(conn.root_path + "/dbo/" + table, conn.storage_options).file_uris()
+    live = _live_files(conn, table)
     return conn.sql(f"select count(*) from (select distinct file_name, row_group_id "
                     f"from parquet_metadata({live!r}))").fetchone()[0]
 
@@ -2220,6 +2227,99 @@ def test_rg_for_floors_a_planner_estimate_higher_than_an_exact_count():
     assert engine.rg_for(None, floor=engine._RG_MIN_ESTIMATED) == engine._RG_MAX
     assert engine.rg_for(engine._RG_LANES * engine._RG_MAX,
                          floor=engine._RG_MIN_ESTIMATED) == engine._RG_MAX
+
+
+def test_tfs_for_clamps_between_the_collapse_guard_and_the_policy_cap():
+    from dbt.adapters.duckrun import policy
+    # In band: the byte target IS rows x bytes/row x the calibration factor.
+    assert policy.tfs_for(1_000_000, 100.0) == int(1_000_000 * 100.0 * policy.AUTO_TFS_FACTOR)
+    # Over the 256 MB policy: a fact wide enough to need a bigger file keeps the global cap and
+    # lands a smaller — still single — row group.
+    assert policy.tfs_for(16_000_000, 500.0) == policy.DEFAULT_TARGET_FILE_SIZE
+    # Under the collapse guard: a perfectly compressible table models near 0 B/row, which without
+    # this floor gives a few-hundred-BYTE target and shatters the table into hundreds of files.
+    assert policy.tfs_for(1_000_000, 0.0001) == policy.TFS_MIN
+    assert policy.TFS_MIN < policy.DEFAULT_TARGET_FILE_SIZE
+
+
+def test_tfs_for_is_inert_without_a_model_or_with_the_factor_off(monkeypatch):
+    # None means "change nothing" — the caller keeps DEFAULT_TARGET_FILE_SIZE and today's layout.
+    from dbt.adapters.duckrun import policy
+    assert policy.tfs_for(1_000_000, None) is None
+    assert policy.tfs_for(None, 10.0) is None
+    monkeypatch.setattr(policy, "AUTO_TFS_FACTOR", 0.0)
+    assert policy.tfs_for(1_000_000, 10.0) is None      # the kill switch
+
+
+def test_auto_geometry_sizes_off_the_exact_count_at_the_low_floor(conn):
+    # A SORTED BY AUTO write stages its source and counts every row, so its row count is a
+    # MEASUREMENT and takes rg_for's low RG_MIN floor. The 8M RG_MIN_ESTIMATED floor exists only to
+    # survive an untrustworthy planner guess, and must not apply here — at 20M rows it would pin the
+    # target to 8M where the exact count asks for 2.5M.
+    from dbt.adapters.duckrun import engine
+    cur = conn._connection
+    cur.execute("CREATE OR REPLACE TEMP TABLE staged AS select i as j, (i%97)::int k "
+                "from range(20000000) t(i)")
+    _key, _lines, geom = engine.auto_sort_cols(cur, "staged")
+    assert geom is not None
+    assert geom["rows"] == 20_000_000                            # exact, not a planner estimate
+    assert geom["rg_target"] == engine.rg_for(20_000_000, floor=engine._RG_MIN) == 2_500_000
+    assert geom["rg_target"] < engine._RG_MIN_ESTIMATED         # the estimate floor did not apply
+    assert geom["row_group_rows"] == engine.RG_UNREACHABLE      # no row bound; bytes decide
+    assert geom["bytes_per_row"] > 0
+
+
+def test_auto_ctas_lands_exactly_one_row_group_per_file(conn):
+    # The whole point: with the row ceiling out of reach, the byte target is the only boundary, so
+    # every file closes with exactly one row group and no ragged trailing group.
+    conn.sql("CREATE OR REPLACE TABLE auto_geo SORTED BY AUTO AS "
+             "select i as j, (i%1000)::int k, ('s'||(i%9973)) s from range(20000000) t(i)")
+    live = _live_files(conn, "auto_geo")
+    per_file = conn.sql(f"select file_name, count(distinct row_group_id) "
+                        f"from parquet_metadata({live!r}) group by 1").fetchall()
+    assert len(per_file) > 1, f"test needs a multi-file table to be meaningful: {per_file}"
+    assert all(rgs == 1 for _f, rgs in per_file), f"ragged file(s): {per_file}"
+
+
+@pytest.mark.parametrize("wrongness", [0.05, 20.0])
+def test_auto_ctas_stays_one_row_group_per_file_when_the_model_is_wrong(conn, monkeypatch, wrongness):
+    # The invariant must not depend on the byte model being right. A bad bytes/row moves how many
+    # ROWS land in the group — never how many groups land in the file. This is the test a row-count
+    # backstop would fail: a ceiling firing mid-file is exactly what re-introduces a runt group.
+    from dbt.adapters.duckrun import sortkey
+    real = sortkey.bytes_per_row
+    monkeypatch.setattr(sortkey, "bytes_per_row",
+                        lambda rows, n, **k: (real(rows, n, **k) or 1.0) * wrongness)
+    conn.sql(f"CREATE OR REPLACE TABLE auto_bad_{int(wrongness * 100)} SORTED BY AUTO AS "
+             f"select i as j, (i%1000)::int k from range(8000000) t(i)")
+    live = _live_files(conn, f"auto_bad_{int(wrongness * 100)}")
+    per_file = conn.sql(f"select file_name, count(distinct row_group_id) "
+                        f"from parquet_metadata({live!r}) group by 1").fetchall()
+    assert all(rgs == 1 for _f, rgs in per_file), f"ragged file(s): {per_file}"
+
+
+def test_auto_recluster_of_a_table_is_sized_too(conn):
+    # `SORTED BY AUTO AS SELECT * FROM <delta table>` — re-cluster this table — profiles via
+    # _get_rle (the Delta log carries null shares and NDV caps a bare relation profile cannot get),
+    # NOT the staged-relation path. It runs the same recommender underneath, so it must get the same
+    # geometry: this is the shape the layout benchmark builds, and it was silently unsized at first.
+    conn.sql("CREATE OR REPLACE TABLE recluster_src AS "
+             "select i as j, (i%1000)::int k, ('s'||(i%9973)) s from range(20000000) t(i)")
+    conn.sql("CREATE OR REPLACE TABLE recluster_src SORTED BY AUTO AS select * from recluster_src")
+    live = _live_files(conn, "recluster_src")
+    per_file = conn.sql(f"select file_name, count(distinct row_group_id) "
+                        f"from parquet_metadata({live!r}) group by 1").fetchall()
+    assert len(per_file) > 1, f"test needs a multi-file table to be meaningful: {per_file}"
+    assert all(rgs == 1 for _f, rgs in per_file), f"ragged file(s): {per_file}"
+
+
+def test_auto_geometry_never_reaches_a_plain_ctas(conn):
+    # Scope guard: only SORTED BY AUTO gets the byte-derived geometry. A plain CTAS keeps the
+    # adaptive planner-estimate path (and its 8M floor), so it still lands multi-group files.
+    conn.sql("CREATE OR REPLACE TABLE plain_geo AS select i as j from range(20000000) t(i)")
+    live = _live_files(conn, "plain_geo")
+    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchone()[0]
+    assert mx > 2_500_000, f"plain CTAS picked up the AUTO geometry: max group {mx}"
 
 
 def test_estimated_rows_sums_every_union_branch(conn):

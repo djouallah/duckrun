@@ -275,7 +275,7 @@ class Plugin(BasePlugin):
         # resolving 'auto' means PROFILING the staged relation and three branches then throw the
         # answer away (see that method). A project-wide `+sort_by: auto` used to pay that profile on
         # every incremental run of every merge model.
-        sort_by = self._resolve_sort_by(
+        sort_by, auto_geom = self._resolve_sort_by(
             cur, name, cfg.get("sort_by"), partition_by, profile=_profile_sort)
         cfg["sort_by"] = sort_by
         if sort_by:
@@ -314,10 +314,18 @@ class Plugin(BasePlugin):
                 # Table-like (non-incremental) models always overwrite. Incremental models
                 # overwrite on first run / full-refresh, then apply the incremental strategy.
                 if not incremental or full_refresh or not exists:
+                    # The AUTO profile's geometry lands ONLY on this branch: it measures the whole
+                    # result, so it describes a full rewrite and nothing else — an append or an
+                    # incremental increment knows nothing about the table it joins. An explicit
+                    # per-model geometry wins verbatim, and declaring EITHER knob backs this off
+                    # entirely rather than half-honoring a declared layout.
+                    _rg, _tfs = row_group_rows, target_file_size
+                    if auto_geom and _rg is None and _tfs is None:
+                        _rg, _tfs = auto_geom["row_group_rows"], auto_geom["target_file_size"]
                     self._store_overwrite(path, cur, data, partition_by, merge_schema, exists,
                                           storage_options,
-                                          row_group_rows=row_group_rows,
-                                          target_file_size=target_file_size,
+                                          row_group_rows=_rg,
+                                          target_file_size=_tfs,
                                           timestamp_ntz=timestamp_ntz, existing_dt=dt0)
                     return
 
@@ -479,30 +487,35 @@ class Plugin(BasePlugin):
         ``profile=False`` (see :meth:`_sort_by_is_inert`) resolves ``'auto'`` to ``None`` WITHOUT
         profiling, for a write branch that would discard the key anyway. Validation is deliberately
         NOT gated on it: ``['auto']`` still raises on every path, so a typo can't go quiet just
-        because the model happens to be a merge."""
+        because the model happens to be a merge.
+
+        Returns ``(sort_by, geom)``. ``geom`` is the one-row-group-per-file write geometry the same
+        profile paid for (see :func:`engine.auto_sort_cols`), or ``None`` on every path that did not
+        profile — an explicit column list, a non-auto value, or an inert branch — which is what keeps
+        the geometry tied to a real profile instead of leaking onto writes that never had one."""
         if isinstance(sort_by, (list, tuple)):
             if any(isinstance(c, str) and c.strip().lower() == "auto" for c in sort_by):
                 raise ValueError(
                     "sort_by: 'auto' must be the scalar value (sort_by='auto'), not a list "
                     "element. Use an explicit column list otherwise."
                 )
-            return sort_by
+            return sort_by, None
         if not (isinstance(sort_by, str) and sort_by.strip().lower() == "auto"):
-            return sort_by
+            return sort_by, None
         if not profile:
             engine.logger.debug(
                 f"duckrun: sort_by=auto skipped for {name} — this write path does not sort")
-            return None
+            return None, None
         pcols = (list(partition_by) if isinstance(partition_by, (list, tuple))
                  else [partition_by] if partition_by else [])
-        key, lines = engine.auto_sort_cols(cur, name, partition_cols=pcols,
-                                           label=("model", name))
+        key, lines, geom = engine.auto_sort_cols(cur, name, partition_cols=pcols,
+                                                 label=("model", name))
         for line in lines:  # full advisory (model version, per-column verdicts) at debug
             engine.logger.debug(line)
         engine.logger.info(
             f"duckrun: sort_by=auto for {name} -> "
             + (", ".join(key) if key else "no sort (nothing pays off)"))
-        return key or None
+        return key or None, geom
 
     def _store_overwrite(self, path, cur, data, partition_by, merge_schema, exists,
                          storage_options, row_group_rows=None, target_file_size=None,
