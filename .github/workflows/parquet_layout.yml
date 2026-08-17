@@ -78,11 +78,11 @@ on:
         type: boolean
         default: true
       rebuild:
-        description: "rebuild the auto_sort (and, for contoso, the base) tables even if they already exist (else reuse). The aemo V-Order reference is NOT rebuilt by this — it never changes; see rebuild_vorder."
+        description: "rebuild the auto_sort table (the table under test) even if it already exists (else reuse). The V-Order reference is NOT rebuilt by this on either benchmark — it never changes; see rebuild_vorder."
         type: boolean
         default: false
       rebuild_vorder:
-        description: "[aemo] also rebuild the Spark V-Order reference table (only needed when the source or row_limit changed — it depends on no duckrun knob)"
+        description: "also rebuild the Spark V-Order reference table (aemo or contoso; only needed when the source or row_limit changed — it depends on no duckrun knob)"
         type: boolean
         default: false
       rebuild_base:
@@ -372,10 +372,12 @@ jobs:
         run: python tests/parquet_layout/contoso/check_tables.py
 
       - name: ⚡ Build Spark V-Order table (Livy, reads contoso.sales directly)
-        if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
+        # Same split as aemo: the V-Order reference depends on no duckrun knob, so `rebuild` (the
+        # table under test) must never force it — only rebuild_vorder does, or a missing table.
+        if: ${{ inputs.rebuild_vorder || steps.check.outputs.build_needed == 'true' }}
         env:
           PYTHONIOENCODING: utf-8
-          FORCE_REBUILD: ${{ inputs.rebuild }}
+          FORCE_REBUILD: ${{ inputs.rebuild_vorder }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/contoso/build_spark_variant.py
 
