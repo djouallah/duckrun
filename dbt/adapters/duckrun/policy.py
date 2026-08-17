@@ -97,9 +97,16 @@ RG_UNREACHABLE = 2 ** 31 - 1
 # on the 591.7M-row nyc fact: a 16M target landed 21.7M-row groups (1.36x), i.e. more than one
 # Direct Lake segment per group. So the AUTO path never AIMS at the top: its rows target is capped
 # at RG_MAX / AUTO_RG_HEADROOM, so the worst measured overshoot still lands ~<= RG_MAX. This costs
-# a big accurate-model table its 16M ideal (it lands ~10.7M nominal), which is the deliberate
-# trade: a smaller in-band segment over an out-of-band one. <= 1 disables the derate.
-AUTO_RG_HEADROOM = float(os.environ.get("DUCKRUN_AUTO_RG_HEADROOM", "1.5"))
+# a big accurate-model table its 16M ideal, which is the deliberate trade: a smaller in-band
+# segment over an out-of-band one. <= 1 disables the derate.
+#
+# 2.0, not the 1.5 first shipped: the same nyc fact measured landed/target at 1.39x when the
+# profile covered every row and 1.74x when it ran on the v6 ~30M substrate (substrate-scale
+# ndv/cnt_bits price bytes/row ~25% higher — inside the model's documented spread, but past a
+# 1.5 headroom: 40 x 14.8M vs 32 x 18.6M-row groups). 2.0 covers the worst measured overshoot
+# (1.74 x 8M ≈ 13.9M) and puts the band top at 8M — Power BI's default segment size, so even a
+# derated write hands Direct Lake whole native segments.
+AUTO_RG_HEADROOM = float(os.environ.get("DUCKRUN_AUTO_RG_HEADROOM", "2.0"))
 
 
 def auto_rg_cap():

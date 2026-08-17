@@ -65,7 +65,8 @@ def _parse_log(log: str) -> dict:
             out["result"] = json.loads(m.group(1))
         except Exception:
             pass
-    m = re.search(r"sort profile of [^:]+: (\d+) scans over ([\d,]+) rows in ([\d.]+)s", log)
+    m = re.search(r"sort profile of [^:]+: (\d+) scans over ([\d,]+)(?: of [\d,]+)? rows "
+                  r"in ([\d.]+)s", log)
     if m:
         out["profile"] = {"scans": int(m.group(1)), "rows": int(m.group(2).replace(",", "")),
                           "seconds": float(m.group(3))}

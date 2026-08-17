@@ -2270,16 +2270,17 @@ def test_auto_geometry_sizes_off_the_exact_count_at_the_low_floor(conn):
 
 
 def test_auto_rg_cap_derates_the_top_of_the_band(monkeypatch):
-    # The byte model's landed/target spread is measured at 0.75-1.51x per shape. Mid-band that is
-    # noise; at the TOP of the band it exits the 16M segment band (nyc: a 16M target landed
-    # 21.7M-row groups). So the AUTO rows target never aims at the top: it is capped at
-    # RG_MAX / AUTO_RG_HEADROOM.
+    # The byte model's landed/target spread is measured at 0.75-1.74x per shape and profile mode
+    # (nyc: 1.39x on the full profile, 1.74x on the v6 substrate). Mid-band that is noise; at the
+    # TOP of the band it exits the 16M segment band (nyc on 0.4.54: a 16M target landed 21.7M-row
+    # groups). So the AUTO rows target never aims at the top: it is capped at
+    # RG_MAX / AUTO_RG_HEADROOM — 8M at the 2.0 default, Power BI's own default segment size.
     from dbt.adapters.duckrun import policy
-    assert policy.auto_rg_cap() == int(policy.RG_MAX / policy.AUTO_RG_HEADROOM) == 10_666_666
+    assert policy.auto_rg_cap() == int(policy.RG_MAX / policy.AUTO_RG_HEADROOM) == 8_000_000
     monkeypatch.setattr(policy, "AUTO_RG_HEADROOM", 1.0)
     assert policy.auto_rg_cap() == policy.RG_MAX        # <= 1 disables (the harness escape hatch)
-    monkeypatch.setattr(policy, "AUTO_RG_HEADROOM", 2.0)
-    assert policy.auto_rg_cap() == 8_000_000
+    monkeypatch.setattr(policy, "AUTO_RG_HEADROOM", 1.5)
+    assert policy.auto_rg_cap() == 10_666_666
 
 
 def test_auto_geometry_and_readout_share_the_derate(conn, monkeypatch):
@@ -2294,7 +2295,7 @@ def test_auto_geometry_and_readout_share_the_derate(conn, monkeypatch):
     cur.execute("CREATE OR REPLACE TEMP TABLE staged AS "
                 "select i as j, (i%97)::int k from range(100000) t(i)")
     _key, _lines, geom = engine.auto_sort_cols(cur, "staged")
-    assert geom is not None and geom["rg_target"] == policy.auto_rg_cap() == 10_666_666
+    assert geom is not None and geom["rg_target"] == policy.auto_rg_cap() == 8_000_000
     assert geom["row_group_rows"] == engine.RG_UNREACHABLE   # still one row group per file
 
     conn.sql("CREATE OR REPLACE TABLE derate_t SORTED BY AUTO AS "
@@ -2304,7 +2305,7 @@ def test_auto_geometry_and_readout_share_the_derate(conn, monkeypatch):
     monkeypatch.setattr(engine.logger, "info", lambda m: got.append(m))
     monkeypatch.setattr(engine.logger, "warning", lambda m: got.append(m))
     engine._log_auto_geometry(cur, dt)
-    assert any("10,666,666 target" in m for m in got), got
+    assert any("8,000,000 target" in m for m in got), got
 
 
 def test_auto_geometry_prices_bytes_per_row_at_the_profile_scale(conn):
