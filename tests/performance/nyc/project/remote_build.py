@@ -69,7 +69,17 @@ def main():
     os.chdir(here)
     env = dict(os.environ)
     env.setdefault("DBT_PROFILES_DIR", here)
-    spill_dir = env.setdefault("DUCKDB_TEMP_DIR", "/tmp/duckdb_spill")
+    # Spill MUST live beside the unpacked project: the run_python harness unpacks onto the
+    # ~135 GiB work disk, while the container's /tmp is a ~19 GiB overlay — the first dispatch
+    # defaulted there and the msrc CTAS filled it in 3 minutes (max_temp_directory_size is sized
+    # from the temp dir's free space). The dbt_project.yml hook reads the same env var.
+    spill_dir = env.setdefault("DUCKDB_TEMP_DIR", os.path.join(here, "duckdb_spill"))
+    try:
+        du = shutil.disk_usage(here)
+        print(f"[nyc_build] spill={spill_dir} disk total={_gib(du.total)} free={_gib(du.free)}",
+              flush=True)
+    except Exception:
+        pass
 
     stop = threading.Event()
     threading.Thread(target=_ticker, args=(stop, spill_dir), daemon=True).start()
