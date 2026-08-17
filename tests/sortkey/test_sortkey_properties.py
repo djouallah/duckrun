@@ -557,3 +557,103 @@ def test_bytes_per_row_over_a_real_profile_is_in_the_right_order_of_magnitude():
     rows = [tuple(r[c] for c in _COLS) for r in recs.values()]
     bpr = sortkey.bytes_per_row(rows, 200_000)
     assert 0.5 < bpr < 40.0, bpr
+
+
+# ── 19. Refactor goldens: the scan-consolidated profiler must return IDENTICAL answers. ──────────
+# The profiler's queries were consolidated (widths folded into the NDV scan, per-column skew GROUP
+# BYs replaced by chunked GROUPING SETS, near-grain FD confirms prefetched in pairs) purely to cut
+# passes over the staged table — measured on a 591.7M-row fact the old shape spent ~49 minutes
+# re-reading a 38 GB spill ~25 times. These two fixtures were captured against the PRE-consolidation
+# code and pin the full output rows, so any consolidation that changes a single count, byte estimate
+# or key decision goes red here. The broader R-rule tests above are the semantic goldens; these are
+# the byte-for-byte ones. (Deterministic by construction: HLL and the exact confirms are
+# deterministic, so exact float equality is expected; approx() only absorbs FP association noise.)
+
+# Exercises every consolidated path at once: strings + NULLs + an all-NULL column (width merge and
+# GROUPING SETS NULL groups), year/month both FD of the leading date (two CONSECUTIVE dim-loop
+# confirms at one level), and three near-FD measures (three consecutive tail-loop confirms, all
+# refused). 9 low-NDV columns → two GROUPING SETS chunks at the chunk size of 8.
+_COMPOSITE_FIXTURE = """
+select
+  date '2000-01-01' + ((i % 2000)::INTEGER)                        as sale_date,
+  year(date '2000-01-01' + ((i % 2000)::INTEGER))                  as sale_year,
+  month(date '2000-01-01' + ((i % 2000)::INTEGER))                 as sale_month,
+  (i % 24)                                                         as hour,
+  case when i % 7 = 0 then null else chr(65 + (i % 5)::INTEGER) end as region,
+  cast(null as varchar)                                            as dead,
+  (((i % 2000) * 3 + (i % 2)) / 100.0)::DOUBLE                     as price,
+  (((i % 24) * 7 + (i % 3)) * 1.5)::DOUBLE                         as amount,
+  ((i % 2000) * 100 + (i % 24))::DOUBLE                            as total
+from range(200000) t(i)
+"""
+
+_COMPOSITE_GOLDEN = [
+    ('sch.tbl', True, 1, 'sale_date', 'DATE', 'value', 1600, 0.05, 199900.0, False, 268.6, 7.5, 97.2),
+    ('sch.tbl', True, 2, 'region', 'VARCHAR', 'hash', 5, 16.73, 166530.64489, False, 73.2, 10.3, 86.0),
+    ('sch.tbl', True, 3, 'hour', 'BIGINT', 'value', 24, 4.17, 191666.66664, False, 122.1, 30.2, 75.3),
+    ('sch.tbl', False, 0, 'total', 'DOUBLE', 'value', 5467, 0.02, 199966.66, False, 317.4, 317.4, 0.0),
+    ('sch.tbl', False, 0, 'price', 'DOUBLE', 'value', 1978, 0.05, 199900.0, False, 268.6, 268.6, 0.0),
+    ('sch.tbl', False, 0, 'amount', 'DOUBLE', 'value', 25, 4.17, 191666.66664, False, 122.1, 122.1, 0.0),
+    ('sch.tbl', False, 0, 'sale_month', 'BIGINT', 'value', 13, 8.39, 183211.4, False, 97.7, 97.7, 0.0),
+    ('sch.tbl', False, 0, 'sale_year', 'BIGINT', 'value', 6, 17.44, 165124.19999999998, False, 73.2, 73.2, 0.0),
+    ('sch.tbl', False, 0, 'dead', 'VARCHAR', 'hash', 0, 100.0, 0.0, False, 0.0, 0.0, 0.0),
+]
+
+# A tail slot won THROUGH a confirm: price grows the (date, time) grain by exactly 1.5x — inside
+# the _FD_CONFIRM_BELOW zone (so the exact confirm fires) but outside the fd_band (so it survives)
+# — and then clears both byte gates. The aemo-shaped tests above award their tails outside the
+# confirm zone, so without this fixture the confirm-then-keep path had no golden.
+_TAIL_CONFIRM_FIXTURE = """
+select date '2024-01-01' + (d)::INTEGER as date, (t*5) as time,
+       ((u*7+d*3+t) % 997 * 0.11)::DOUBLE as mw,
+       (((d*96+t)*31 % 4001) * 0.05 + case when u % 3 = 0 and t % 2 = 0 then 7.77 else 0 end)::DOUBLE as price
+from range(10) tt(d), range(96) t2(t), range(60) u2(u)
+"""
+
+_TAIL_CONFIRM_GOLDEN = [
+    ('sch.tbl', True, 1, 'date', 'DATE', 'value', 11, 10.0, 51840.0, False, 28.1, 0.0, 99.9),
+    ('sch.tbl', True, 2, 'time', 'BIGINT', 'value', 108, 1.04, 57000.0, False, 49.2, 2.6, 94.8),
+    ('sch.tbl', True, 3, 'price', 'DOUBLE', 'value', 1657, 0.08, 57553.333333333336, False, 77.3, 4.7, 93.9),
+    ('sch.tbl', False, 0, 'mw', 'DOUBLE', 'value', 627, 0.22, 57473.75173611111, False, 70.3, 70.3, 0.0),
+]
+
+
+def _assert_rows_equal(rows, golden):
+    assert len(rows) == len(golden), f"row count {len(rows)} != {len(golden)}"
+    for actual, expected in zip(rows, golden):
+        for a, e in zip(actual, expected):
+            if isinstance(e, float):
+                assert a == pytest.approx(e, rel=1e-9), (actual, expected)
+            else:
+                assert a == e, (actual, expected)
+
+
+def test_consolidated_profile_composite_golden():
+    con = duckdb.connect()
+    recs, _ = _profile(con, _COMPOSITE_FIXTURE)
+    assert _key_order(recs) == ["sale_date", "region", "hour"]
+    _assert_rows_equal([tuple(r[c] for c in _COLS) for r in recs.values()], _COMPOSITE_GOLDEN)
+
+
+def test_consolidated_profile_tail_confirm_golden():
+    con = duckdb.connect()
+    recs, lines = _profile(con, _TAIL_CONFIRM_FIXTURE)
+    assert _key_order(recs) == ["date", "time", "price"]
+    assert any("measure tail" in ln and "price" in ln for ln in lines)
+    _assert_rows_equal([tuple(r[c] for c in _COLS) for r in recs.values()], _TAIL_CONFIRM_GOLDEN)
+
+
+def test_skew_sigma_p2_matches_per_column_group_by():
+    """The exact Σp² skew must equal the per-column GROUP BY reference for every low-NDV column —
+    including NULL-bearing and all-NULL columns, where a grouping-sets rewrite could silently
+    diverge (NULL groups as one value, empty set as zero). The reference below IS the
+    pre-consolidation query, run by the test itself, so this stays green on either implementation
+    only if the numbers agree."""
+    con = duckdb.connect()
+    recs, _ = _profile(con, _COMPOSITE_FIXTURE)
+    n = con.sql("SELECT count(*) FROM t").fetchone()[0]
+    for c, r in recs.items():
+        s = con.sql(
+            f'SELECT COALESCE(SUM(cnt * cnt), 0)::DOUBLE FROM '
+            f'(SELECT COUNT(*) AS cnt FROM t GROUP BY "{c}")').fetchone()[0]
+        assert r["skew_pct"] == pytest.approx(round(100.0 * s / (n * n), 2)), c
