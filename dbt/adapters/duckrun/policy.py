@@ -90,6 +90,23 @@ def rg_for(est, floor=RG_MIN):
 # a parameter, and its last rung drops max_row_group_size altogether, landing Parquet's 1M default.
 RG_UNREACHABLE = 2 ** 31 - 1
 
+# Headroom derate for the AUTO rows target. The byte model's landed-rows/target ratio is shape-
+# dependent and measured at 0.75x / 1.25x / 1.36x / 1.51x (see AUTO_TFS_FACTOR below — the spread
+# is real and NOT tunable away). Mid-band that residual is fine, but a rows target already at the
+# TOP of the band (RG_MAX) times any overshoot exits the 16M one-segment band entirely — measured
+# on the 591.7M-row nyc fact: a 16M target landed 21.7M-row groups (1.36x), i.e. more than one
+# Direct Lake segment per group. So the AUTO path never AIMS at the top: its rows target is capped
+# at RG_MAX / AUTO_RG_HEADROOM, so the worst measured overshoot still lands ~<= RG_MAX. This costs
+# a big accurate-model table its 16M ideal (it lands ~10.7M nominal), which is the deliberate
+# trade: a smaller in-band segment over an out-of-band one. <= 1 disables the derate.
+AUTO_RG_HEADROOM = float(os.environ.get("DUCKRUN_AUTO_RG_HEADROOM", "1.5"))
+
+
+def auto_rg_cap():
+    """Rows-target ceiling for the AUTO one-row-group-per-file path (a function, not a constant,
+    so tests can monkeypatch ``AUTO_RG_HEADROOM`` and both engine seams stay in agreement)."""
+    return int(RG_MAX / AUTO_RG_HEADROOM) if AUTO_RG_HEADROOM > 1.0 else RG_MAX
+
 # Turns the sortkey byte model (sortkey.bytes_per_row) into a target_file_size. It folds TWO effects
 # that pull in opposite directions, which is why ONE constant covers both:
 #   - the model counts ENCODED bytes — no Snappy, no page headers, no footer — so it reads high;

@@ -21,7 +21,7 @@ from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, DEFAULT_TARGET_FILE_SIZE,
                                          ROW_GROUP_MAX_ROWS, RG_LANES, RG_MIN, RG_MIN_ESTIMATED,
-                                         RG_MAX, RG_UNREACHABLE, rg_for, tfs_for)
+                                         RG_MAX, RG_UNREACHABLE, auto_rg_cap, rg_for, tfs_for)
 from dbt.adapters.duckrun import sortkey
 
 logger = AdapterLogger("Duckrun")
@@ -276,7 +276,9 @@ def _log_auto_geometry(cur, dt):
         if not counts:
             return
         total = sum(counts)
-        rg_target = rg_for(total, floor=RG_MIN)
+        # Same derate as _auto_geometry's rows_target — the readout must recompute the SAME target
+        # the write aimed at, or the landed/target ratio (the AUTO_TFS_FACTOR calibration) lies.
+        rg_target = min(rg_for(total, floor=RG_MIN), auto_rg_cap())
         full = [c for c in counts if c > 0.5 * counts[-1]] or counts
         landed = full[len(full) // 2]           # median of the files the byte target actually closed
         ratio = landed / rg_target if rg_target else 0.0
@@ -1343,7 +1345,9 @@ def _auto_geometry(cur, source, rows, *, narrow_decimals=False):
         n = cur.sql(f"SELECT count(*) FROM {source}").fetchone()[0]
         bpr = sortkey.bytes_per_row(rows, n, narrow_decimals=narrow_decimals)
         # An exact count takes rg_for's LOW floor — see the docstring above and policy.RG_MIN_ESTIMATED.
-        rows_target = rg_for(n, floor=RG_MIN)
+        # Capped below the top of the band (policy.auto_rg_cap): with one row group per file the byte
+        # model's measured overshoot spread would otherwise push a 16M target past the segment band.
+        rows_target = min(rg_for(n, floor=RG_MIN), auto_rg_cap())
         tfs = tfs_for(rows_target, bpr)
         if tfs is None:
             return None
