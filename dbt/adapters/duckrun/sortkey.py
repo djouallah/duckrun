@@ -122,7 +122,12 @@ _SKEW_SETS_PER_SCAN = 8
 #     uniqueness claims are suppressed again (v5's key-organized win survives only below the
 #     cap, where the profile is still exact over every row — dimensions live there). Decisions
 #     on big tables can move, hence the bump.
-MODEL_VERSION = "6"
+# v7: the measure tail (step 6) is priced at FULL scale on a substrate. Its `runs` is a distinct
+#     count, nearly unchanged by 1-in-K thinning, but v6 compared it against iid/baseline bytes
+#     computed from the substrate's n — understating every tail's save ~K× and dropping money
+#     columns the full profile keeps (contoso: UnitPrice tail lost, 1686 → 1836 MB, flipping the
+#     table from 2.6% under the V-Order reference to 6% over). Full-profile behavior unchanged.
+MODEL_VERSION = "7"
 
 # R5's FD ratio SCREENS on HLL and DECIDES on exact counts below this multiple of the kept grain.
 # `approx_count_distinct` is a sketch, and at the NDV where real dimensions live (10²–10⁵) it is
@@ -624,6 +629,26 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         t_grain = kept_ndv                    # grain of the kept dim prefix (dim loop invariant)
         t_prefix = list(sort_key)
 
+        # On a v6 substrate the loop's `runs` is a distinct count — 1-in-K thinning leaves it
+        # nearly unchanged (a combo with >=K rows still shows up) — while iid_bytes/baseline_total
+        # shrank with the substrate's n. Priced at substrate scale, every tail's save reads ~K×
+        # too small and the gates drop money columns the full profile keeps (contoso lost its
+        # UnitPrice tail: 1686 → 1836 MB, from 2.6% under the V-Order reference to 6% over). So
+        # the TAIL is priced at FULL scale: the exact total is known, and `runs` transfers as a
+        # conservative full-scale estimate (an undercount only overstates the save — the cheap
+        # direction, since a kept junk tail costs sort time while a lost tail costs the money
+        # column). Not sampled → t_n = n and this block is byte-identical to the v5 arithmetic.
+        t_n = float(total_rows) if sampled else float(n)
+        t_cnt_bits = max(1, math.ceil(math.log2(t_n))) if t_n > 1 else 1
+
+        def _t_bytes(c, runs):
+            b = _bits(ndv[c])
+            return min(t_n * b / 8.0, runs * (b + t_cnt_bits) / 8.0) + _dict_bytes(c)
+
+        t_iid = {c: _t_bytes(c, min(t_n, max(float(ndv[c]), t_n * (1.0 - simpson[c]))))
+                 for c in t_remaining}
+        t_baseline = baseline_total * (t_n / n) if n else baseline_total
+
         while t_remaining and len(tail) < tail_cap:
             pfx = ", ".join(_qid(x) for x in t_prefix)
             scan = list(t_remaining)          # trow is indexed by THIS order; t_remaining mutates
@@ -664,12 +689,12 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                 if runs < t_grain * (1.0 + fd_band):
                     t_remaining.remove(c)
                     continue
-                save = iid_bytes[c] - _col_bytes(c, runs)
+                save = t_iid[c] - _t_bytes(c, runs)
                 if save > best_save:
                     best, best_runs, best_save = c, runs, save
             if (best is None
-                    or best_save < tail_gain_frac * iid_bytes[best]
-                    or best_save < _TAIL_MIN_TABLE_FRAC * baseline_total):
+                    or best_save < tail_gain_frac * t_iid[best]
+                    or best_save < _TAIL_MIN_TABLE_FRAC * t_baseline):
                 break
             tail.append(best)
             sorted_runs[best] = best_runs

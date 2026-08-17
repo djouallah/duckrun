@@ -747,3 +747,31 @@ def test_sampled_profile_is_deterministic_and_matches_full_key():
     assert a == b, "same substrate, same answers — nothing seeded"
     assert _key(a) == _key(full) == ["sale_date", "region", "hour"]
     assert info["rows"] < info["total_rows"] == 200_000
+
+
+def test_sampled_profile_prices_the_tail_at_full_scale():
+    """Model v7: the tail's `runs` is a distinct count — 1-in-K thinning barely moves it (every
+    combo with >=K rows survives) — while v6 priced the save against the substrate's n,
+    understating it ~K× and dropping the money tail the full profile keeps (contoso lost its
+    UnitPrice tail: 1686 → 1836 MB, flipping the table above the V-Order reference). Fixture:
+    price repeats for 10-row stretches inside each grp, so distinct(grp, price) = n/10 — a clear
+    tail at full scale whose save prices to ~zero at substrate scale unless the gates scale.
+    `fill` de-duplicates the rows so hash-thinning shortens runs the way it does on a real table
+    (identical rows share a hash bucket and would drop whole combos instead); it stays out of the
+    key itself via the grain stop. Verified red on model v6: the substrate leg returns ['grp']."""
+    con = duckdb.connect()
+    con.execute("CREATE OR REPLACE TABLE ft AS "
+                "select (i // 1000)::int as grp, ((i // 10) % 2000)::double as price, "
+                "(i % 977)::int as fill from range(200000) t(i)")
+    desc = con.sql("DESCRIBE ft").fetchall()
+    cols, types = [r[0] for r in desc], {r[0]: r[1] for r in desc}
+
+    def _key(rows):
+        return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+
+    full, _, _ = sortkey.recommend_sort_key(con, "s", "ft", "ft", cols, types, [])
+    assert _key(full) == ["grp", "price"], "the money tail must be kept at full scale"
+    con.execute("CREATE OR REPLACE TEMP TABLE ftsub AS SELECT * FROM ft _r WHERE hash(_r) % 7 = 0")
+    samp, _, _ = sortkey.recommend_sort_key(con, "s", "ft", "ftsub", cols, types, [],
+                                            total_rows=200_000)
+    assert _key(samp) == ["grp", "price"], "the substrate must not drop the tail (model v7)"
