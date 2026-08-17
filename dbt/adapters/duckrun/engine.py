@@ -1320,8 +1320,15 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     types = {d[0]: str(d[1]) for d in desc}
     if not cols:
         return [], [], None
+    cost = {}
     rows, _, lines = sortkey.recommend_sort_key(
-        cur, label[0], label[1], source, cols, types, list(partition_cols or []))
+        cur, label[0], label[1], source, cols, types, list(partition_cols or []),
+        profile_info=cost)
+    # The profile is the expensive half of an AUTO write (measured: ~2/3 of a 591.7M-row build),
+    # so its cost gets one INFO line here — the shared seam — like _log_auto_geometry's readout.
+    if cost:
+        logger.info(f"duckrun: sort profile of {label[1]}: {cost['scans']} scans over "
+                    f"{cost['rows']:,} rows in {cost['seconds']}s")
     # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
     key = [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
     return key, lines, _auto_geometry(cur, source, rows, narrow_decimals=narrow_decimals)

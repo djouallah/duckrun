@@ -657,3 +657,37 @@ def test_skew_sigma_p2_matches_per_column_group_by():
             f'SELECT COALESCE(SUM(cnt * cnt), 0)::DOUBLE FROM '
             f'(SELECT COUNT(*) AS cnt FROM t GROUP BY "{c}")').fetchone()[0]
         assert r["skew_pct"] == pytest.approx(round(100.0 * s / (n * n), 2)), c
+
+
+def test_consolidated_profile_scan_budget():
+    """The consolidation's whole point is passes over the staged table, so the count is pinned:
+    the composite runs in exactly 12 scans (was 21 under the per-column spelling) — 1 merged
+    ndv+width+count scan, 2 GROUPING SETS skew chunks (9 low-NDV columns at a chunk size of 8),
+    4 level scans, and 5 confirms (two levels' first confirms measure their prefix via
+    _exact_pair; the consecutive ones ride _exact_confirms in pairs). No single-column skew
+    GROUP BY may survive."""
+
+    class _Spy:
+        def __init__(self, con):
+            self._con, self.queries = con, []
+
+        def sql(self, q):
+            self.queries.append(q)
+            return self._con.sql(q)
+
+        def __getattr__(self, item):
+            return getattr(self._con, item)
+
+    con = duckdb.connect()
+    con.execute(f"CREATE OR REPLACE TABLE t AS {_COMPOSITE_FIXTURE}")
+    desc = con.sql("DESCRIBE t").fetchall()
+    spy, info = _Spy(con), {}
+    sortkey.recommend_sort_key(
+        spy, "sch", "tbl", "t", [r[0] for r in desc], {r[0]: str(r[1]) for r in desc}, [],
+        profile_info=info)
+    per_col_skew = [q for q in spy.queries if "GROUP BY" in q and "GROUPING SETS" not in q]
+    gsets = [q for q in spy.queries if "GROUPING SETS" in q]
+    assert per_col_skew == [], per_col_skew
+    assert len(gsets) == 2, gsets
+    assert len(spy.queries) == 12, [q[:80] for q in spy.queries]
+    assert info == {"scans": 12, "seconds": info["seconds"], "rows": 200_000}

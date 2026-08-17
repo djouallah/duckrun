@@ -60,11 +60,18 @@ The recommendation, in order:
 """
 import math
 import re
+import time
 
 # Above this distinct-value count the exact Σp² histogram (a GROUP BY = O(NDV) hash table) is skipped
 # for the uniform approximation Σp² ≈ 1/ndv — a high-card column is ~uniform and its runs are
 # ndv-bound, so the skew term barely moves, and this keeps the skew pass from rebuilding an OOM.
 _SKEW_EXACT_NDV = 100_000
+
+# How many exact-skew columns share one GROUPING SETS scan. Internal batching width, not a policy
+# knob: each set is its own ≤_SKEW_EXACT_NDV-group hash table inside ONE pass over the source, so
+# the ceiling is per-scan aggregate state (8 × 100k groups is trivial), and the win is passes — on
+# a 591.7M-row staged fact the per-column spelling re-read a 38 GB spill once per low-NDV column.
+_SKEW_SETS_PER_SCAN = 8
 
 # MODEL_VERSION: bump on ANY change to an R-rule, a threshold default, or the byte model. Pure
 # plumbing — returning lines instead of printing — does NOT bump it. Appended to the recommendation
@@ -228,7 +235,7 @@ def bytes_per_row(rows, n, *, narrow_decimals=False):
 def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        sort_key_cap=4, min_gain_pct=1.0, key_sort_below_pct=10.0,
                        stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,
-                       *, tail_cap=4, tail_gain_frac=0.25):
+                       *, tail_cap=4, tail_gain_frac=0.25, profile_info=None):
     """The sort-key model, run against ``src`` on connection ``con``. ``src`` holds EVERY row of the
     table being profiled — the caller materializes the source into a local temp table once, and this
     module only ever reads that (see the module docstring for why sampling was removed). So ``n`` is
@@ -250,30 +257,28 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     ``tail_cap`` bounds the measure tail (step 6) and ``tail_gain_frac`` is its keep-the-slot relative
     byte gate — tail slots are IN ADDITION to ``sort_key_cap``, which stays a dim-only budget.
 
+    ``profile_info``, if a dict, is filled with the profile's own cost — ``{"scans": N,
+    "seconds": s, "rows": n}`` — so the caller can log what the recommendation cost without
+    parsing lines.
+
     Returns ``(rows, schema, lines)`` — one row per column, ``schema`` a DuckDB DDL string, and
     ``lines`` the advisory text for the CALLER to print (this module prints nothing)."""
     stats = stats or {}
+    _t0, _scans = time.perf_counter(), 0
+
+    def _q(sql):
+        # Every read of ``src`` funnels through here so the profile can report its own scan count —
+        # the one number that says whether the consolidated query shapes below are actually holding.
+        nonlocal _scans
+        _scans += 1
+        return con.sql(sql)
     # Exact NDV upper bound per discrete column, straight from the Delta log (zero data read) —
     # approx_count_distinct can overshoot, and a value range caps it exactly.
     ndv_cap = {c: stats[c]["ndv_cap"] for c in cols
                if c in stats and stats[c].get("ndv_cap")}
-    # 1) ndv per column, one pass, with HLL sketches. NOTE: `src` is a materialization, so it has no
-    # meaningful physical row order and the table's *actual* current run count can't be measured
-    # from it. current_runs is set
-    # below (once skew is known) to the iid / arbitrary-order estimate — the honest neutral for an
-    # unknown layout, which matches a freshly-appended unsorted table and drives "does sorting help?".
-    agg_sel = ", ".join(
-        f"approx_count_distinct({_qid(c)}) AS n{i}" for i, c in enumerate(cols))
-    row = con.sql(f"SELECT {agg_sel}, COUNT(*) AS total FROM {src}").fetchone()
-    n = row[-1] or 0
-    ndv = {}
-    for i, c in enumerate(cols):
-        v = int(row[i] or 0)
-        cap = ndv_cap.get(c)
-        ndv[c] = min(v, cap) if cap is not None else v
-
     # value-encoded = numeric/temporal (no dictionary); hash = strings/blobs (dictionary of ndv
     # distinct values). An in-memory engine may force hash for relationship columns too, but we can't see that.
+    # (Defined before step 1 because the merged first scan needs to know the hash columns up front.)
     def _encoding(t):
         t = t.upper()
         # INTERVAL starts with "INT" but is NOT a value-encoded fixed-width number — it is a
@@ -285,6 +290,27 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             "TINYINT", "UTINYINT", "SMALLINT", "USMALLINT", "INT", "UINT", "BIGINT", "UBIGINT",
             "HUGEINT", "UHUGEINT", "BOOL", "FLOAT", "DOUBLE", "REAL", "DEC", "NUMERIC",
             "DATE", "TIME", "TIMESTAMP")) else "hash"
+
+    # 1) ndv per column, average serialised width per hash column (drives dictionary cost), and the
+    # row count — ONE pass, all independent aggregates. The widths used to be their own scan; hash
+    # columns are known from ``types`` alone, so both rides share the read. NOTE: `src` is a
+    # materialization, so it has no meaningful physical row order and the table's *actual* current
+    # run count can't be measured from it. current_runs is set
+    # below (once skew is known) to the iid / arbitrary-order estimate — the honest neutral for an
+    # unknown layout, which matches a freshly-appended unsorted table and drives "does sorting help?".
+    hash_cols = [c for c in cols if _encoding(types[c]) == "hash"]
+    agg_sel = ", ".join(
+        [f"approx_count_distinct({_qid(c)}) AS n{i}" for i, c in enumerate(cols)]
+        + [f"avg(octet_length(encode({_qid(c)}::VARCHAR))) AS w{j}"
+           for j, c in enumerate(hash_cols)])
+    row = _q(f"SELECT {agg_sel}, COUNT(*) AS total FROM {src}").fetchone()
+    n = row[-1] or 0
+    ndv = {}
+    for i, c in enumerate(cols):
+        v = int(row[i] or 0)
+        cap = ndv_cap.get(c)
+        ndv[c] = min(v, cap) if cap is not None else v
+    avg_width = {c: (row[len(cols) + j] or 1.0) for j, c in enumerate(hash_cols)}
 
     # A continuous/additive **measure** (DECIMAL/FLOAT/DOUBLE) is an output you aggregate, not a key
     # you organise by: no query filters an exact price, and sorting a fact by a measure just scrambles
@@ -303,28 +329,38 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     def _is_interval(t):
         return t.upper().startswith("INTERVAL")
 
-    # 2) per-column skew term Σp_v² (Simpson index, from the value histogram) and, for hash
-    # columns, average serialised value width (drives dictionary cost).
-    simpson, avg_width = {}, {}
-    hash_cols = [c for c in cols if _encoding(types[c]) == "hash"]
-    if hash_cols:
-        wsel = ", ".join(
-            f"avg(octet_length(encode({_qid(c)}::VARCHAR))) AS w{j}"
-            for j, c in enumerate(hash_cols))
-        wr = con.sql(f"SELECT {wsel} FROM {src}").fetchone()
-        avg_width = {c: (wr[j] or 1.0) for j, c in enumerate(hash_cols)}
+    # 2) per-column skew term Σp_v² (Simpson index, from the value histogram).
     # The exact Σp² is a GROUP BY that materialises one row per distinct value — an O(NDV) hash table,
     # the same OOM lever the exact COUNT(DISTINCT) was. Skew only matters (and the histogram is only
     # cheap) for LOW-cardinality columns; a high-card column is ~uniform, so Σp² ≈ 1/ndv (its runs are
     # ndv-bound anyway). Cap the exact histogram at _SKEW_EXACT_NDV distinct values; approximate above.
+    #
+    # The low-NDV columns share scans via GROUPING SETS — one pass feeding one ≤_SKEW_EXACT_NDV-group
+    # hash table per set, chunked at _SKEW_SETS_PER_SCAN. Each result row belongs to exactly one set;
+    # the per-column GROUPING(c) flag (0 = this row's set) names it with no bit-order assumption.
+    # NULLs group as one value inside a set, exactly as the old per-column ``GROUP BY c`` grouped
+    # them, and an empty table yields no rows at all — both pinned by the goldens in
+    # tests/sortkey/test_sortkey_properties.py.
+    simpson = {}
+    low = [c for c in cols if ndv[c] <= _SKEW_EXACT_NDV]
     for c in cols:
-        if ndv[c] > _SKEW_EXACT_NDV:
+        if c not in low:
             simpson[c] = 1.0 / ndv[c] if ndv[c] else 1.0
-            continue
-        s = con.sql(
-            f"SELECT COALESCE(SUM(cnt * cnt), 0)::DOUBLE FROM "
-            f"(SELECT COUNT(*) AS cnt FROM {src} GROUP BY {_qid(c)})").fetchone()[0]
-        simpson[c] = (s / (n * n)) if n else 1.0
+    for chunk_at in range(0, len(low), _SKEW_SETS_PER_SCAN):
+        chunk = low[chunk_at:chunk_at + _SKEW_SETS_PER_SCAN]
+        flags = ", ".join(f"GROUPING({_qid(c)}) AS f{j}" for j, c in enumerate(chunk))
+        sets = ", ".join(f"({_qid(c)})" for c in chunk)
+        fnames = ", ".join(f"f{j}" for j in range(len(chunk)))
+        res = _q(
+            f"SELECT {fnames}, SUM(cnt * cnt)::DOUBLE AS s2 FROM "
+            f"(SELECT {flags}, COUNT(*) AS cnt FROM {src} GROUP BY GROUPING SETS ({sets})) "
+            f"GROUP BY {fnames}").fetchall()
+        s2 = {}
+        for r in res:
+            s2[r[:len(chunk)].index(0)] = r[len(chunk)]
+        for j, c in enumerate(chunk):
+            s = s2.get(j, 0.0)  # a missing set only happens at n = 0, where COALESCE said 0 too
+            simpson[c] = (s / (n * n)) if n else 1.0
 
     # 3) in-memory columnar byte model. A column stores min(bit-packed indices, RLE runs) + a dictionary
     # (hash only). RLE run entry ≈ one index (ceil(log2 ndv) bits) + a run length (up to N).
@@ -407,9 +443,25 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         the screen asked. One column at a time and only near the grain: the OOM lever was the BATCHED
         exact count over every high-card column simultaneously, not a single bounded one."""
         pfx = ", ".join(_qid(x) for x in prefix_cols)
-        row = con.sql(f"SELECT count(DISTINCT hash({pfx})), "
-                      f"count(DISTINCT hash({pfx}, {_qid(c)})) FROM {src}").fetchone()
+        row = _q(f"SELECT count(DISTINCT hash({pfx})), "
+                 f"count(DISTINCT hash({pfx}, {_qid(c)})) FROM {src}").fetchone()
         return int(row[0] or 1), int(row[1] or 1)
+
+    def _exact_confirms(prefix_cols, cs):
+        """Exact distinct(prefix, c) for up to TWO candidates in one scan — the prefix side is
+        already known when this runs, so both aggregate slots go to candidates.
+
+        Confirms cluster: consecutive calendar FDs in the dim loop and every near-FD measure in a
+        tail level share one prefix, and under the sequential spelling each burned its own full
+        scan. Once the first `_exact_pair` of a level has fixed the exact grain P, which candidates
+        will need confirming is decided (their SKETCHED runs against P — the very test the visit
+        will apply), so the next one is prefetched alongside the current one. Two exact-distinct
+        hash tables per scan — exactly `_exact_pair`'s footprint, so the OOM posture is unchanged —
+        and the counts are deterministic, so WHEN they are computed cannot move any decision."""
+        pfx = ", ".join(_qid(x) for x in prefix_cols)
+        sel = ", ".join(f"count(DISTINCT hash({pfx}, {_qid(c)}))" for c in cs)
+        row = _q(f"SELECT {sel} FROM {src}").fetchone()
+        return {c: int(row[j] or 1) for j, c in enumerate(cs)}
 
     sort_key, sorted_runs = [], {}
     remaining = list(candidates)  # ranked (one temporal lead, then ascending ndv), consumed as decided
@@ -419,10 +471,13 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         sel = ", ".join(
             f"approx_count_distinct(hash({pfx + ', ' if pfx else ''}{_qid(c)})) AS m{j}"
             for j, c in enumerate(remaining))
-        mrow = con.sql(f"SELECT {sel} FROM {src}").fetchone()
+        mrow = _q(f"SELECT {sel} FROM {src}").fetchone()
         marg = {c: max(int(mrow[j] or 0), kept_ndv) for j, c in enumerate(remaining)}
+        visit = list(remaining)   # the level's visit order, fixed — prefetch pairing indexes into it
+        exact_p = None            # exact distinct(prefix) once any confirm ran at this level
+        prefetched = {}           # candidate -> exact distinct(prefix, candidate), from _exact_confirms
         chosen, stop = None, False
-        for c in list(remaining):
+        for i0, c in enumerate(visit):
             runs = marg[c]
             # R5 — threshold functional dependency: adding c grows the grain by less than fd_band ⇒ c
             # is ≥ ~(1−fd_band) determined by the prefix (year ← date; subcategory ← category, and now
@@ -432,9 +487,19 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             # The sketched `runs` only SCREENS here: inside the noise zone its error is several times
             # fd_band, which is how a strict FD (aemo `year` ← `date`) read as independent and took a
             # slot. Confirm exactly, then decide — and adopt the exact grain for the levels below, so
-            # a sketch's error can't compound down the prefix.
+            # a sketch's error can't compound down the prefix. The FIRST confirm of a level measures
+            # the prefix too (_exact_pair); later ones ride _exact_confirms in pairs against the now-
+            # known exact grain — same counts, computed early, so no decision can move.
             if sort_key and runs < _FD_CONFIRM_BELOW * kept_ndv:
-                kept_ndv, runs = _exact_pair(sort_key, c)
+                if exact_p is None:
+                    exact_p, runs = _exact_pair(sort_key, c)
+                else:
+                    if c not in prefetched:
+                        mate = next((x for x in visit[i0 + 1:]
+                                     if marg[x] < _FD_CONFIRM_BELOW * exact_p), None)
+                        prefetched.update(_exact_confirms(sort_key, [c] + ([mate] if mate else [])))
+                    runs = prefetched.pop(c)
+                kept_ndv = exact_p
                 marg[c] = runs
             if sort_key and runs < kept_ndv * (1.0 + fd_band):
                 remaining.remove(c)
@@ -518,7 +583,9 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             sel = ", ".join(
                 f"approx_count_distinct(hash({pfx}, {_qid(c)})) AS t{j}"
                 for j, c in enumerate(scan))
-            trow = con.sql(f"SELECT {sel} FROM {src}").fetchone()
+            trow = _q(f"SELECT {sel} FROM {src}").fetchone()
+            exact_tp = None       # exact distinct(prefix) once any confirm ran at this level
+            prefetched = {}       # candidate -> exact distinct(prefix, candidate)
             best, best_runs, best_save = None, None, 0.0
             for j, c in enumerate(scan):
                 # distinct(prefix, c) over the WHOLE table IS c's run count under the sorted layout.
@@ -532,9 +599,21 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                 # FD of the prefix → clusters for free, permanently out (FD survives prefix growth).
                 # Same screen-then-confirm as the dim loop, because the sketch cannot resolve fd_band
                 # near the grain, and here a false FD reading drops the candidate PERMANENTLY — it
-                # could bin a measure that deserved a tail slot.
+                # could bin a measure that deserved a tail slot. Confirms after the level's first
+                # ride _exact_confirms in prefetched pairs, exactly as in the dim loop.
                 if runs < _FD_CONFIRM_BELOW * t_grain:
-                    t_grain, runs = _exact_pair(t_prefix, c)
+                    if exact_tp is None:
+                        exact_tp, runs = _exact_pair(t_prefix, c)
+                    else:
+                        if c not in prefetched:
+                            mate = next(
+                                (x for k, x in enumerate(scan) if k > j
+                                 and max(int(trow[k] or 0), 1) < _FD_CONFIRM_BELOW * exact_tp),
+                                None)
+                            prefetched.update(
+                                _exact_confirms(t_prefix, [c] + ([mate] if mate else [])))
+                        runs = prefetched.pop(c)
+                    t_grain = exact_tp
                 if runs < t_grain * (1.0 + fd_band):
                     t_remaining.remove(c)
                     continue
@@ -577,9 +656,16 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # module PRINTS NOTHING — it collects the advisory into ``lines`` and the caller prints them
     # (``_get_rle`` prints all; the no-arg ``sort()`` path prints only the ORDER BY line).
     order_cols = partition_cols + [c for c in sort_key + tail if c not in partition_cols]
+    _elapsed = time.perf_counter() - _t0
+    if profile_info is not None:
+        profile_info["scans"] = _scans
+        profile_info["seconds"] = round(_elapsed, 1)
+        profile_info["rows"] = int(n)
     lines = [f"\nrecommend_sort_key('{sch}.{tbl}') — sort-key recommendation (experimental) "
              f"[model v{MODEL_VERSION}]:"]
     lines.append(f"  (profiled all {n:,} rows; cardinalities are HLL sketches)")
+    # Advisory only — the profile's own cost, so a slow AUTO write attributes itself from the log.
+    lines.append(f"  (profile cost: {_scans} scans, {_elapsed:.1f}s)")
     lines.append(f"  ORDER BY {', '.join(order_cols) if order_cols else '(no key pays off)'}")
     if partition_cols:
         lines.append(f"  (partition columns lead the sort but carry no compression weight: "
