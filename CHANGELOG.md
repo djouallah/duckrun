@@ -69,6 +69,16 @@ All notable changes to this project will be documented in this file.
     production. The measure tail's group-stratified source read is deleted with the sample that
     forced it: over every row, `distinct(prefix, measure)` *is* the measure's run count.
   - Cost moves from remote I/O to local disk — the staged copy spills to `temp_directory`.
+- **Above ~30M rows the picker profiles a bounded deterministic substrate** (sort-key models
+  `v6`–`v9`). v5's every-row profile cost passes × table size — measured 49 minutes of a 72-minute
+  592M-row build — so profiling now reads only the rows whose whole-row hash lands in one of K
+  residue classes (~30M rows kept; no seed, no order dependence; `DUCKRUN_PROFILE_ROWS` moves the
+  cap, `0` disables it), and uniqueness claims are suppressed again above the cap (`v6`). On a
+  substrate the measure tail is priced at full scale (`v7`), near-tied tail argmaxes are settled on
+  exact counts over the substrate (`v8`), and substrate run counts are de-thinned through the
+  survival model `1-(1-p)^m` before pricing (`v9`) — 1-in-K thinning starves a many-small-combos
+  measure's distinct count far more than a thick-combo peer's, which had been handing the tail slot
+  to the wrong money column.
 - **`sort_by: 'auto'` no longer profiles on write paths that discard the key.** Resolving `'auto'`
   means profiling the staged model result — the expensive part of the feature — but `sort_by` is a
   DuckDB `ORDER BY` applied to the relation the write reads, and three branches never read it: the
