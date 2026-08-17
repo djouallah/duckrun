@@ -117,6 +117,13 @@ docs/tpch_card.md
 # docs/*-benchmark-history.md files (which ARE committed) and then discards these.
 docs/merge_history_row.md
 docs/tpch_history_row.md
+docs/nyc_history_row.md
+# The NYC benchmark run card (step-summary only; the tracked page is the history file)
+docs/nyc_card.md
+# The nyc benchmark's shipped dbt project builds remotely, but a local dry run leaves these
+tests/performance/nyc/project/target/
+tests/performance/nyc/project/logs/
+tests/performance/nyc/project/dbt_packages/
 # The NYC-taxi demo HTML report the runner writes (published as taxi.html in CI)
 taxi_run.html
 # CI-only scorecards: rendered from test XML and injected into the docs/*.md beside them

@@ -1,0 +1,20 @@
+version: 2
+
+models:
+  - name: fct_trips
+    description: >
+      NYC TLC yellow-taxi trip records — the wide raw fact under layout test. No grain assertion
+      is possible (no natural unique key); assert_fct_trips_matches_archive_log checks the
+      file-level write guard held.
+  - name: dim_date
+    columns:
+      - name: date
+        data_tests:
+          - unique
+          - not_null
+  - name: dim_zone
+    columns:
+      - name: LocationID
+        data_tests:
+          - unique
+          - not_null

@@ -1,0 +1,64 @@
+name: nyc_bench
+
+# The nyc full-scale write benchmark: build the 591.7M-row fct_trips (17 columns, skewed
+# categoricals, SORTED BY AUTO) with duckrun@HEAD on remote Fabric compute, and record the build
+# time, the sort-profile cost and the landed row-group geometry as one permanent history row.
+#
+# MANUAL ONLY, and deliberately NOT a release gate (like aemo): it spends real Fabric capacity
+# (~30-60 min of an 8-vcore notebook). The runner only orchestrates — duckrun.run_python ships
+# tests/performance/nyc/project to a throwaway notebook, streams the log back and tears it down;
+# the raw data is the persistent nyc archive the direct-lake-parquet-layout repo landed.
+#
+# Auth: GitHub OIDC only (duckrun self-acquires the Fabric control-plane + OneLake tokens from
+# AZURE_CLIENT_ID / AZURE_TENANT_ID + id-token: write). No azure/login, no tokens in env.
+
+on:
+  workflow_dispatch:
+    inputs:
+      pip_spec:
+        description: "Override what the notebook installs (default: duckrun @ git+…@<this commit>)"
+        required: false
+        default: ""
+      files_path:
+        description: "Override the raw-archive Files path (default: deploy_config.yml files_path)"
+        required: false
+        default: ""
+
+# contents: write so the history row can be committed back to main.
+permissions:
+  id-token: write
+  contents: write
+
+concurrency:
+  group: nyc-bench
+  cancel-in-progress: false
+
+env:
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+jobs:
+  nyc-bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-duckrun
+
+      - name: Build fct_trips on Fabric and read the layout back
+        env:
+          NYC_PIP_SPEC: ${{ inputs.pip_spec }}
+          FILES_PATH: ${{ inputs.files_path }}
+        run: python tests/performance/nyc/nyc_bench.py
+
+      - name: Append this run's result to the benchmark history
+        # One permanent row per run in docs/nyc-benchmark-history.md — the trend log the profiler
+        # and geometry work is judged against. Never fail on a git hiccup; [skip ci].
+        if: always() && hashFiles('docs/nyc_history_row.md') != ''
+        continue-on-error: true
+        uses: ./.github/actions/commit-docs
+        with:
+          checkout-main: 'true'
+          prepare: |
+            cat docs/nyc_history_row.md >> docs/nyc-benchmark-history.md
+          paths: docs/nyc-benchmark-history.md
+          message: "docs: record NYC benchmark result [skip ci]"

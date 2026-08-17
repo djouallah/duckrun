@@ -1,0 +1,16 @@
+# Where the nyc benchmark runs. Same shape as tests/parquet_layout/aemo/deploy_config.yml.
+#
+# workspace/lakehouse: the shared CI workspace and its `duckrun` lakehouse — the benchmark WRITES
+# there (schemas nyc_landing / nyc_mart via DBT_SCHEMA=nyc, so it never touches the aemo CI's
+# landing/mart in the same lakehouse).
+#
+# files_path: the RAW yellow-taxi archive (41 months, ~6.8 GB) landed once by
+# djouallah/direct-lake-parquet-layout's downloader into its persistent landing lakehouse — this
+# benchmark only reads it. Friendly-name abfss form (workspace display name @ lakehouse.Lakehouse),
+# the same spelling integration_tests_onelake.yml uses. Prerequisite: the CI principal must be a
+# member of that workspace (it is — the layout repo's CI runs under the same app).
+workspace: "1c52481c-0523-4a5a-bbde-fdc932bd77c2"
+lakehouse: "duckrun"
+files_path: "abfss://testing@onelake.dfs.fabric.microsoft.com/dbt_nyc_landing.Lakehouse/Files"
+schema: "nyc"
+cores: 8

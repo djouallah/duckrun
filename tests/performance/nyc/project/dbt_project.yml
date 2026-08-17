@@ -1,0 +1,33 @@
+# The nyc full-scale benchmark project: the duckdb/duckrun leg of
+# djouallah/direct-lake-parquet-layout's models/nyc tree, ported so duckrun@HEAD can be
+# benchmarked at 591.7M rows from THIS repo (nyc_bench.py ships it to a Fabric notebook via
+# duckrun.run_python and runs `dbt build --full-refresh` there). Model SQL is kept verbatim where
+# possible; the other engines' trees, the DATASET gating and the fabric-only hooks are not ported.
+name: 'nyc_bench'
+version: '1.0.0'
+
+profile: 'nyc_bench'
+
+model-paths: ["models"]
+macro-paths: ["macros"]
+test-paths: ["tests"]
+
+clean-targets:
+  - "target"
+  - "dbt_packages"
+
+on-run-start:
+  # DuckDB azure transport — only when explicitly configured (cloud runners set 'curl');
+  # skipped on a local/offline run where the azure extension isn't loaded and the SET would raise.
+  - "{% if env_var('AZURE_TRANSPORT_OPTION_TYPE', 'default') != 'default' %}SET GLOBAL azure_transport_option_type = '{{ env_var('AZURE_TRANSPORT_OPTION_TYPE') }}'{% endif %}"
+  - "SET GLOBAL preserve_insertion_order = false"
+  - "SET GLOBAL temp_directory = '{{ env_var('DUCKDB_TEMP_DIR', '/tmp/duckdb_spill') }}'"
+
+models:
+  nyc_bench:
+    staging:
+      +schema: landing
+    dimensions:
+      +schema: mart
+    marts:
+      +schema: mart

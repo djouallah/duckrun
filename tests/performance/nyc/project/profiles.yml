@@ -1,0 +1,12 @@
+# The benchmark's profile. WAREHOUSE_PATH is the output lakehouse Tables URL (nyc_bench.py
+# resolves and forwards it); DBT_SCHEMA defaults to 'nyc' so generate_schema_name lands the
+# models in nyc_landing / nyc_mart — isolated from the aemo CI's landing/mart in the same
+# shared `duckrun` lakehouse. threads: 8 matches the 8-vcore notebook this runs on.
+nyc_bench:
+  target: dev
+  outputs:
+    dev:
+      type: duckrun
+      threads: 8
+      schema: "{{ env_var('DBT_SCHEMA', 'nyc') }}"
+      root_path: "{{ env_var('WAREHOUSE_PATH') }}"
