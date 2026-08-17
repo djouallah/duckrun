@@ -246,38 +246,44 @@ class Plugin(BasePlugin):
             and not self._sort_by_is_inert(
                 cfg, incremental, full_refresh, exists, _resolved_strategy))
 
-        # ONE evaluation of the model SQL, shared by everything downstream. The staged relation is
-        # a VIEW over the model SQL (_delta_core.sql), so every scan of it re-runs the joins and
-        # aggregations — staging protects an aggregating model from being executed once for the
-        # profile and again for the write, and (#14) makes the not-null guard, the merge
-        # cardinality guard and delta_rs's source collection all see IDENTICAL rows.
+        # MERGE-path materialization (#14): the not-null guard, the merge cardinality guard and
+        # delta_rs's source collection must all see IDENTICAL rows, or a nondeterministic model
+        # (now(), a moved external source) lets the guards vouch for rows that aren't the ones
+        # written. Merge-only: the profiled overwrite path stages its own substrate below.
         src_tmp = None
         psub = None
         model_name = name           # the RELATION's name — survives the temp-table rebinds below so
         #                             logs and the profile label keep naming the model, not a
         #                             staging table (the benchmark history records the label, and
         #                             0.4.54 briefly recorded the temp name).
-        if _profile_sort or (_merge_path and (cfg.get("merge_materialize_source")
-                                              or not_null_columns)):
+        if _merge_path and (cfg.get("merge_materialize_source") or not_null_columns):
             src_tmp = '"' + engine.tmp_name("msrc", path) + '"'
             cur.execute(f"CREATE OR REPLACE TEMP TABLE {src_tmp} AS SELECT * FROM {name}")
-            name = src_tmp          # profile, guards and write all read the one materialization
+            name = src_tmp          # guards and write all read the one materialization
 
-        # sort_by='auto' profiling SUBSTRATE (sortkey v6). Profiling every row of the staging was
-        # the defect at scale — each pass re-read a 38 GB spill, ~49 min of a 72-min 591.7M-row
-        # build. Above sortkey.SUBSTRATE_CAP rows the profiler reads a deterministic
-        # hash(row) % K subset (~cap rows, one cheap LOCAL pass off the staging — the count on a
-        # base table is metadata-free); at/below the cap it reads the staging itself, exactly the
-        # v5 behavior. The write always reads the full staging either way.
+        # sort_by='auto' profiling SUBSTRATE (sortkey v6). The staged relation is a VIEW over the
+        # model SQL, so every scan re-runs it — and the profiler scans its source several times.
+        # Copying ALL rows first (0.4.54's msrc) was the defect at scale: materializing 591.7M rows
+        # cost ~5 min and every profile pass re-read a 38 GB spill (~49 min of a 72-min build). Now:
+        #   - exact COUNT(*) off the view first (footer metadata for scan models — near-free);
+        #   - at/below sortkey.SUBSTRATE_CAP: a FULL local copy — it doubles as the staging table
+        #     (guards + write read it; one model evaluation), byte-identical to the old behavior;
+        #   - above the cap: a deterministic hash(row) % K subset (~cap rows) for the profile ONLY,
+        #     and the write reads the VIEW directly (re-evaluating a bare scan is far cheaper than
+        #     copying the world; a nondeterministic model at worst gets a marginally stale key).
         profile_src, full_rows = name, None
         if _profile_sort:
-            n_full = int(cur.sql(f"SELECT count(*) FROM {name}").fetchone()[0] or 0)
-            k = sortkey.substrate_modulus(n_full)
-            if k > 1:
-                psub = '"' + engine.tmp_name("psub", path) + '"'
+            full_rows = int(cur.sql(f"SELECT count(*) FROM {name}").fetchone()[0] or 0)
+            k = sortkey.substrate_modulus(full_rows)
+            psub = '"' + engine.tmp_name("psub", path) + '"'
+            if k == 1:
+                cur.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS SELECT * FROM {name}")
+                name = psub         # the full copy IS the staging table
+                full_rows = None    # profile covers every row — exact semantics, v5-identical
+            else:
                 cur.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS "
                             f"SELECT * FROM {name} _r WHERE hash(_r) % {k} = 0")
-                profile_src, full_rows = psub, n_full
+            profile_src = psub
 
         # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
         # honored here — the staged relation is read through a wrapper SELECT *, and with

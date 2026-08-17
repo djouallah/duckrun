@@ -952,15 +952,12 @@ class DuckSession:
         non-Delta source profiles the result relation instead, whose distribution isn't the table's
         on-disk layout.
 
-        The body is materialized ONCE and the rewritten statement reads that temp table, so the
-        profiling scans, the wide-DECIMAL max scan and the CTAS's own read all share a single
-        evaluation of the source — pinned by test_sorted_by_auto_reads_the_source_once, and the
-        reason the substrate gate lives BEHIND the staging rather than before it: a count-first
-        design would re-execute an aggregating body once for the count and again for the write.
-        ABOVE ``sortkey.SUBSTRATE_CAP`` rows the profiling scans read a deterministic
-        ``hash(row) % K`` substrate built FROM the staged copy (one cheap local pass), not the
-        staged copy itself — profiling every row of a 591.7M-row staging was the measured defect
-        (~49 min of a 72-min build); the write still reads the full staged copy."""
+        At/below ``sortkey.SUBSTRATE_CAP`` rows the body is materialized ONCE and the rewritten
+        statement reads that temp table, so the profiling scans, the wide-DECIMAL max scan and the
+        CTAS's own read all share a single evaluation of the source. ABOVE the cap the staged
+        table is a deterministic ``hash(row) % K`` SUBSTRATE for the profile only (copying the
+        whole body was the measured defect at 591.7M rows) and the rewritten statement re-reads
+        the ORIGINAL body — two evaluations of the source, exactly the pre-staging behavior."""
         stripped = delta_dml._strip_comments(delta_dml._strip_leading(query)).rstrip().rstrip(";").rstrip()
         m = delta_dml._CREATE_AS.fullmatch(stripped)
         if not m:
@@ -971,32 +968,29 @@ class DuckSession:
         body = m.group("body")
         staged = "_duckrun_auto_src"
         self._auto_geom = None
-        self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS {body}")
+        n_full = int(self.con.sql(f"SELECT count(*) FROM ({body}) _c").fetchone()[0] or 0)
+        k = sortkey.substrate_modulus(n_full)
+        if k == 1:
+            self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS {body}")
+        else:
+            self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS "
+                             f"SELECT * FROM ({body}) _r WHERE hash(_r) % {k} = 0")
         try:
-            n_full = int(self.con.sql(f"SELECT count(*) FROM {staged}").fetchone()[0] or 0)
-            k = sortkey.substrate_modulus(n_full)
             src = self._auto_sort_single_table(body)
             # A bare `SELECT * FROM <delta table>` still profiles via _get_rle, for the Delta-log
             # stats — it re-reads the table, but only that case, and only because the log carries
             # signal the staged copy does not.
-            if src is not None:
-                cols = self._auto_sort_cols_from_table(src, staged=staged)
-            elif k == 1:
-                cols = self._auto_sort_cols(staged)
-            else:
-                psub = "_duckrun_auto_psub"
-                self.con.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS "
-                                 f"SELECT * FROM {staged} _r WHERE hash(_r) % {k} = 0")
-                try:
-                    cols = self._auto_sort_cols(psub, full_rows=n_full)
-                finally:
-                    self.con.execute(f"DROP TABLE IF EXISTS {psub}")
+            cols = (self._auto_sort_cols_from_table(src, staged=staged) if src is not None
+                    else self._auto_sort_cols(staged, full_rows=(n_full if k > 1 else None)))
             # Decimal narrowing stays gated on the ORIGINAL body being `SELECT *`: an explicit
             # projection (including a user-written CAST) is an instruction and is left alone. The
             # staged table always LOOKS like SELECT *, so testing it instead would silently widen
-            # the rule to every body.
-            new_body = (self._narrow_wide_decimals(f"SELECT * FROM {staged}")
-                        if _SELECT_STAR_BODY.match(body.strip()) else f"SELECT * FROM {staged}")
+            # the rule to every body. Above the cap the write reads the ORIGINAL body (the staged
+            # table is a partial substrate), so the narrowing rewrite wraps the body itself — its
+            # exact max(abs) scan runs over the full data either way.
+            write_src = f"SELECT * FROM {staged}" if k == 1 else body
+            new_body = (self._narrow_wide_decimals(write_src)
+                        if _SELECT_STAR_BODY.match(body.strip()) else write_src)
         except Exception:
             self.con.execute(f"DROP TABLE IF EXISTS {staged}")
             raise
