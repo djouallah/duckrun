@@ -92,6 +92,29 @@ def substrate_modulus(n):
     return -(-int(n) // SUBSTRATE_CAP)
 
 
+def de_thin_runs(runs_sub, profile_rows, total_rows):
+    """Full-scale distinct-combo count recovered from a substrate count. A combo holding m
+    full-scale rows survives 1-in-K thinning with probability 1-(1-p)**m (p = profile/total),
+    so small combos vanish while thick ones survive — the asymmetry that flipped contoso's
+    tail argmax (see the v9 changelog). Inverting needs m, and m = total/runs_full needs the
+    answer, so a short fixed point: seed runs_full = runs_sub, then runs_full = runs_sub /
+    (1-(1-p)**m). The iterate is monotone increasing and bounded (m >= 1 keeps survival >= p,
+    so r <= runs_sub/p); four rounds settle the thick-combo regime and merely under-correct —
+    the conservative direction — as combos thin toward singletons. Identity when the profile
+    is exact. Pure, like substrate_modulus, so the arithmetic is unit-testable without a
+    table."""
+    if not total_rows or not profile_rows or total_rows <= profile_rows or runs_sub <= 0:
+        return runs_sub
+    p = float(profile_rows) / float(total_rows)
+    r = float(runs_sub)
+    for _ in range(4):
+        surv = 1.0 - (1.0 - p) ** max(1.0, float(total_rows) / r)
+        if surv <= 0.0:              # p underflowed to 0.0 — cannot invert, stay at the floor
+            break
+        r = float(runs_sub) / surv
+    return min(max(r, float(runs_sub)), float(total_rows))
+
+
 # How many exact-skew columns share one GROUPING SETS scan. Internal batching width, not a policy
 # knob: each set is its own ≤_SKEW_EXACT_NDV-group hash table inside ONE pass over the source, so
 # the ceiling is per-scan aggregate state (8 × 100k groups is trivial), and the win is passes — on
@@ -131,7 +154,17 @@ _SKEW_SETS_PER_SCAN = 8
 #     decided on EXACT counts over the substrate (one extra scan, tied levels only). v7 restored
 #     the tail but the sketch flipped contoso's near-tied UnitPrice/NetPrice argmax (1785 vs the
 #     full profile's 1686-MB UnitPrice pick). Full-profile behavior unchanged.
-MODEL_VERSION = "8"
+# v9: the substrate tail's runs are DE-THINNED before pricing. v7 transferred the substrate's
+#     distinct count to full-scale prices raw, but thinning is not uniform across candidates: a
+#     combo with m full-scale rows survives 1-in-K thinning with probability 1-(1-p)^m, so a
+#     many-small-combos measure loses far more of its count than a thick-combo peer, deflating
+#     exactly its RLE bytes and inflating its save. v8's exact tie-break proved the resulting
+#     argmax flip is thinning itself, not sketch noise (contoso: NetPrice over UnitPrice on
+#     exact substrate counts too — 1784 vs 1686 MB). `de_thin_runs` inverts the survival model
+#     by fixed point wherever `save` is priced — sketch path and exact tie-break alike; the FD
+#     screens, t_grain and the output rows stay in substrate units (like compared with like).
+#     Full-profile behavior unchanged: de-thin is the identity on an exact profile.
+MODEL_VERSION = "9"
 
 # R5's FD ratio SCREENS on HLL and DECIDES on exact counts below this multiple of the kept grain.
 # `approx_count_distinct` is a sketch, and at the NDV where real dimensions live (10²–10⁵) it is
@@ -651,6 +684,9 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         # conservative full-scale estimate (an undercount only overstates the save — the cheap
         # direction, since a kept junk tail costs sort time while a lost tail costs the money
         # column). Not sampled → t_n = n and this block is byte-identical to the v5 arithmetic.
+        # The undercount is NOT uniform across candidates, though — small combos vanish under
+        # thinning while thick ones survive — so since v9 the transfer runs through
+        # `de_thin_runs` first (see the changelog).
         t_n = float(total_rows) if sampled else float(n)
         t_cnt_bits = max(1, math.ceil(math.log2(t_n))) if t_n > 1 else 1
 
@@ -703,7 +739,10 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                 if runs < t_grain * (1.0 + fd_band):
                     t_remaining.remove(c)
                     continue
-                save = t_iid[c] - _t_bytes(c, runs)
+                # v9: de-thin before pricing — thinning is not uniform across candidates
+                # (survival 1-(1-p)^m), so a raw substrate count deflates a small-combo
+                # candidate's RLE bytes more than a thick-combo peer's (see de_thin_runs).
+                save = t_iid[c] - _t_bytes(c, de_thin_runs(runs, n, t_n))
                 scored.append((save, runs, c))
                 if save > best_save:
                     best, best_runs, best_save = c, runs, save
@@ -716,7 +755,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                     best, best_runs, best_save = None, None, 0.0
                     for c in [c for _s, _r, c in scored if c in ex]:   # stable candidate order
                         runs = ex[c]
-                        save = t_iid[c] - _t_bytes(c, runs)
+                        save = t_iid[c] - _t_bytes(c, de_thin_runs(runs, n, t_n))
                         if save > best_save:
                             best, best_runs, best_save = c, runs, save
             if (best is None

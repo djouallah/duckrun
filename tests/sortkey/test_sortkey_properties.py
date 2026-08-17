@@ -705,6 +705,24 @@ def test_substrate_modulus_gate(monkeypatch):
     assert sortkey.substrate_modulus(10**12) == 1                         # kill switch: always exact
 
 
+def test_de_thin_runs_inverts_the_survival_model():
+    # identity off-substrate (full profile, missing total) and on degenerate inputs
+    assert sortkey.de_thin_runs(5000, 200_000, None) == 5000
+    assert sortkey.de_thin_runs(5000, 200_000, 200_000) == 5000
+    assert sortkey.de_thin_runs(0, 28_571, 200_000) == 0
+    # exact inversion on uniform combos: 10,000 combos of 20 rows at p=1/7 thin to
+    # 10,000*(1-(1-p)^20) ≈ 9,541 — four fixed-point rounds recover 10,000 within 1%
+    p = 28_571 / 200_000
+    thinned = 10_000 * (1.0 - (1.0 - p) ** 20)
+    assert sortkey.de_thin_runs(thinned, 28_571, 200_000) == pytest.approx(10_000, rel=0.01)
+    # monotone in runs_sub; clamped to [runs_sub, total_rows]; the near-distinct degenerate
+    # end (runs_sub == profile rows has no finite fixed point) never diverges past the clamp
+    a = sortkey.de_thin_runs(9_541, 28_571, 200_000)
+    b = sortkey.de_thin_runs(23_000, 28_571, 200_000)
+    assert 9_541 <= a < b <= 200_000
+    assert sortkey.de_thin_runs(28_571, 28_571, 200_000) <= 200_000
+
+
 def test_sampled_profile_suppresses_uniqueness():
     """Above the cap the profile is a substrate, and a substrate can overclaim column uniqueness
     (a value duplicated across rows can land in different hash buckets) — so is_unique must never
@@ -803,3 +821,34 @@ def test_sampled_tail_tie_decided_on_exact_counts():
                                             total_rows=200_000)
     assert _key(full) == ["grp", "price"], _key(full)
     assert _key(samp) == _key(full), "the substrate's tie-break must match the full profile"
+
+
+def test_sampled_tail_argmax_is_de_thinned_before_pricing():
+    """Model v9: thinning is not uniform across candidates — a combo with m full-scale rows
+    survives 1-in-K thinning with probability 1-(1-p)^m, so netprice's 4-row combos lose ~54%
+    of their distinct count under 1-in-7 thinning while price's 20-row combos lose ~5%. Priced
+    raw at full scale (v7), the deflated count shrinks exactly netprice's RLE bytes and hands
+    it the slot — and v8's exact counts agree, because the distortion IS the thinning, not the
+    sketch (contoso: NetPrice over UnitPrice, 1784 vs 1686 MB). de_thin_runs inverts the
+    survival model wherever `save` is priced. Fixture: price repeats in 20-row stretches
+    (thick, survival ~0.95), netprice in 4-row stretches (thin, survival ~0.46); both scales
+    must rank price first and then keep netprice as the second tail slot — on v8 the substrate
+    instead commits netprice and FD-bins price (each 4-block determines its 20-block).
+    Verified red on model v8: the substrate leg returned ['grp', 'netprice']."""
+    con = duckdb.connect()
+    con.execute("CREATE OR REPLACE TABLE dt AS "
+                "select (i // 1000)::int as grp, ((i // 20) % 2000)::double as price, "
+                "((i // 4) % 50000)::double as netprice, "
+                "(i % 977)::int as fill from range(200000) t(i)")
+    desc = con.sql("DESCRIBE dt").fetchall()
+    cols, types = [r[0] for r in desc], {r[0]: r[1] for r in desc}
+
+    def _key(rows):
+        return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+
+    full, _, _ = sortkey.recommend_sort_key(con, "s", "dt", "dt", cols, types, [])
+    assert _key(full) == ["grp", "price", "netprice"], _key(full)
+    con.execute("CREATE OR REPLACE TEMP TABLE dtsub AS SELECT * FROM dt _r WHERE hash(_r) % 7 = 0")
+    samp, _, _ = sortkey.recommend_sort_key(con, "s", "dt", "dtsub", cols, types, [],
+                                            total_rows=200_000)
+    assert _key(samp) == _key(full), "the de-thinned argmax must match the full profile (model v9)"
