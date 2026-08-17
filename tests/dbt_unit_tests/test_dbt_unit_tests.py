@@ -207,6 +207,21 @@ def test_sort_by_auto_writes_clustered(tmp_path):
     assert not res.success, "sort_by=['auto'] should fail the run"
 
 
+def test_sort_by_auto_narrows_wide_decimals(tmp_path):
+    """The sorted-auto overwrite narrows wide DECIMALs like the connection API's SORTED BY AUTO
+    (session._narrow_wide_decimals): DECIMAL(38,2) whose exact max fits lands as DECIMAL(18,2)
+    (INT64, dictionary-encodable) while one whose max does not fit stays wide. Through a REAL dbt
+    run — the narrowing sits in the plugin's write path, not the engine."""
+    from deltalake import DeltaTable
+
+    wh = _wh(tmp_path)
+    assert _dbt(wh, "run", "--select", "sorted_auto_narrow").success
+    schema = {f.name: str(f.type)
+              for f in DeltaTable(f"{wh}/{SCHEMA}/sorted_auto_narrow").schema().to_arrow()}
+    assert "Decimal128(18, 2)" in schema["wide_price"], schema
+    assert "Decimal128(38, 2)" in schema["wide_keep"], schema
+
+
 # Per-strategy two-run expectations: load 1 = events 1-3 @ original amounts, load 2 = events 1-3
 # RE-EMITTED @ changed amounts + new 4-6. The final {event_id: amount} below is what each strategy's
 # real Delta table must hold after both runs — the row content is what distinguishes the strategies.

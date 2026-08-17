@@ -17,6 +17,7 @@ from dbt.adapters.duckdb.utils import SourceConfig, TargetConfig
 from . import delta_dml
 from . import engine
 from . import secret
+from . import sortkey
 from . import sqlscan
 
 try:  # raise on_schema_change='fail' as a dbt compilation error (matches dbt semantics)
@@ -283,12 +284,21 @@ class Plugin(BasePlugin):
             cur, name, cfg.get("sort_by"), partition_by, profile=_profile_sort,
             display_name=model_name)
         cfg["sort_by"] = sort_by
+        # Wide-DECIMAL narrowing, the dbt spelling of session._narrow_wide_decimals: a
+        # DECIMAL(p>18) maps to a 16-byte FLBA that arrow-rs never dictionary-encodes, so a
+        # SORTED BY AUTO write narrows it back to INT64 territory when the exact column max fits.
+        # Overwrite branch ONLY — an append/merge increment must keep the existing table's schema —
+        # and only on the profiled path, whose geometry already prices the narrowed width
+        # (auto_sort_cols narrow_decimals=True in _resolve_sort_by).
+        select_body = f"SELECT * FROM {name}"
+        if _profile_sort and (not incremental or full_refresh or not exists):
+            select_body = self._narrow_wide_decimals_select(cur, name)
         if sort_by:
             cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
             order = ", ".join(engine.quote_ident(c) for c in cols)
-            data = cur.sql(f"SELECT * FROM {name} ORDER BY {order}")
+            data = cur.sql(f"{select_body} ORDER BY {order}")
         else:
-            data = cur.sql(f"SELECT * FROM {name}")
+            data = cur.sql(select_body)
 
         # Contract NOT NULL enforcement (config(contract={enforced:true}) with a not_null column
         # constraint). duckrun writes via delta_rs, not SQL DDL, so dbt-core's column-constraint
@@ -481,6 +491,51 @@ class Plugin(BasePlugin):
             return not (cfg.get("merge_clauses") or cfg.get("merge_update_set_expressions"))
         return False                                        # append / insert / unknown — honors it
 
+    @staticmethod
+    def _narrow_wide_decimals_select(cur, name):
+        """``SELECT * [REPLACE (…)] FROM name`` that narrows wide-DECIMAL columns so they regain
+        dictionary encoding, or the plain passthrough when there is nothing to narrow.
+
+        The dbt port of :meth:`duckrun.session.DuckSession._narrow_wide_decimals` — same rule
+        (``DECIMAL(p>18, s)`` → ``DECIMAL(18, s)`` via :func:`sortkey.decimal_narrow_target`), same
+        exact ``max(abs(c))`` guard (one aggregate scan over just the wide columns, so the
+        unconditional cast can never overflow at write time), same ``DUCKRUN_NARROW_DECIMALS``
+        kill switch. Advisories go to the adapter log instead of stdout. Best-effort: any failure
+        returns the passthrough — narrowing is an optimization, never a reason to fail a model."""
+        default = f"SELECT * FROM {name}"
+        if os.environ.get("DUCKRUN_NARROW_DECIMALS", "1") == "0":
+            return default
+        try:
+            desc = cur.sql(f"DESCRIBE SELECT * FROM {name}").fetchall()
+            wide = []
+            for row in desc:
+                col, typ = row[0], str(row[1])
+                dm = sortkey._DECIMAL_RE.fullmatch(typ.strip())
+                if dm and int(dm.group(1)) > sortkey._DECIMAL_NARROW_PRECISION:
+                    wide.append((col, typ))
+            if not wide:
+                return default
+            aggs = ", ".join(f"max(abs({engine.quote_ident(c)}))" for c, _ in wide)
+            maxes = cur.sql(f"SELECT {aggs} FROM {name}").fetchone()
+            repl = []
+            for (col, typ), mv in zip(wide, maxes):
+                target = sortkey.decimal_narrow_target(typ, mv)
+                if target:
+                    repl.append(f"CAST({engine.quote_ident(col)} AS {target}) "
+                                f"AS {engine.quote_ident(col)}")
+                    engine.logger.info(
+                        f"duckrun: {col} {typ} -> {target} "
+                        f"(max {mv if mv is not None else 'NULL'}; FLBA has no dictionary in arrow-rs)")
+                else:
+                    engine.logger.info(
+                        f"duckrun: {col} {typ} kept: max too large to narrow - no dictionary encoding")
+            if not repl:
+                return default
+            return f"SELECT * REPLACE ({', '.join(repl)}) FROM {name}"
+        except Exception as exc:
+            engine.logger.debug(f"duckrun: decimal narrowing skipped: {exc}")
+            return default
+
     def _resolve_sort_by(self, cur, name, sort_by, partition_by, *, profile=True,
                          display_name=None):
         """Resolve ``sort_by='auto'`` (case-insensitive scalar) into concrete columns by profiling
@@ -521,7 +576,7 @@ class Plugin(BasePlugin):
         pcols = (list(partition_by) if isinstance(partition_by, (list, tuple))
                  else [partition_by] if partition_by else [])
         key, lines, geom = engine.auto_sort_cols(cur, name, partition_cols=pcols,
-                                                 label=("model", disp))
+                                                 label=("model", disp), narrow_decimals=True)
         for line in lines:  # full advisory (model version, per-column verdicts) at debug
             engine.logger.debug(line)
         engine.logger.info(

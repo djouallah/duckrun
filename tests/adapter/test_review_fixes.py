@@ -623,3 +623,35 @@ def test_resolve_sort_by_display_name_defaults_to_name(monkeypatch):
     plugin = object.__new__(Plugin)
     plugin._resolve_sort_by(con, "plainrel", "auto", None, profile=True)
     assert any("plainrel" in m for m in infos)
+
+
+# ------------------------------------------ wide-DECIMAL narrowing on the dbt sorted-auto path
+
+def test_narrow_wide_decimals_select_narrows_when_the_max_fits():
+    con = duckdb.connect()
+    con.execute("create table t as select (i/100.0)::DECIMAL(38,2) p, i::DECIMAL(18,2) ok, i n "
+                "from range(100) t(i)")
+    body = Plugin._narrow_wide_decimals_select(con, "t")
+    assert 'CAST("p" AS DECIMAL(18,2)) AS "p"' in body
+    assert '"ok"' not in body                       # p<=18 already — never touched
+    got = con.sql(f"DESCRIBE {body}").fetchall()
+    assert dict((r[0], str(r[1])) for r in got)["p"] == "DECIMAL(18,2)"
+
+
+def test_narrow_wide_decimals_select_keeps_a_too_large_max():
+    con = duckdb.connect()
+    con.execute("create table t as select (10.0::DECIMAL(38,2) * 10**16 + i) p from range(3) t(i)")
+    assert Plugin._narrow_wide_decimals_select(con, "t") == "SELECT * FROM t"
+
+
+def test_narrow_wide_decimals_select_kill_switch(monkeypatch):
+    con = duckdb.connect()
+    con.execute("create table t as select (i/100.0)::DECIMAL(38,2) p from range(10) t(i)")
+    monkeypatch.setenv("DUCKRUN_NARROW_DECIMALS", "0")
+    assert Plugin._narrow_wide_decimals_select(con, "t") == "SELECT * FROM t"
+
+
+def test_narrow_wide_decimals_select_passthrough_without_wide_columns():
+    con = duckdb.connect()
+    con.execute("create table t as select i::DECIMAL(18,2) p, i n from range(10) t(i)")
+    assert Plugin._narrow_wide_decimals_select(con, "t") == "SELECT * FROM t"
