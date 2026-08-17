@@ -210,14 +210,22 @@ def test_sorted_by_auto_single_table_profiles_from_the_log(w, monkeypatch):
     assert calls == [("relation", None)]                         # projection (no `*`)
 
 
-def test_sorted_by_auto_reads_the_source_once(w):
-    """The point of staging: `SORTED BY AUTO` evaluates its source ONCE, then profiles and writes
-    from that staged copy.
+def test_sorted_by_auto_reads_the_source_once(w, monkeypatch):
+    """`SORTED BY AUTO` evaluates its source the MINIMUM number of times (sortkey v6):
 
-    Before this, the body was re-evaluated for the profiling sample, for a row count, for the
-    stratified tail read and again for the write — on OneLake, four remote reads for one statement,
-    and on a dbt model four re-runs of its joins. So: count the statements that name the SOURCE."""
+    - one exact ``count(*)`` first — it sizes the substrate modulus K and the write geometry;
+    - at/below ``sortkey.SUBSTRATE_CAP``: one full staging CTAS, and the profile, guards and
+      write all read that copy — TWO evaluations of the body, total;
+    - above the cap: one deterministic ``hash(row) % K`` substrate CTAS for the profile ONLY,
+      and the write re-reads the original body — THREE evaluations. Copying the whole body
+      first instead (0.4.54's msrc) was the measured defect: ~12 min of spilled CTAS at 591.7M
+      rows that told the profiler nothing. 0.4.52 itself read the source 3-4x (sample + count +
+      tail + write), so this is the floor, not a regression.
+
+    So: count the statements that NAME the source, on both sides of the cap. Plan-only
+    statements (DESCRIBE) never evaluate the body and are excluded."""
     import re
+    from dbt.adapters.duckrun import sortkey as sk
     w.sql("CREATE OR REPLACE TABLE src AS SELECT (i%5) region, (i%97) sub, i id FROM range(3000) t(i)")
 
     seen = []
@@ -235,22 +243,45 @@ def test_sorted_by_auto_reads_the_source_once(w):
         def __getattr__(self, name):
             return getattr(inner, name)
 
+    def _touches():
+        # `\bsrc\b` does not match inside `_duckrun_auto_src` — `_` is a word character, so there
+        # is no boundary before `src` there.
+        return [" ".join(s.split()) for s in seen
+                if re.search(r"\bsrc\b", s) and not s.lstrip().upper().startswith("DESCRIBE")]
+
+    # ── at/below the cap: count + full staging CTAS; profile and write read the staged copy.
     w.con = Spy()
     try:
         # A derived body (not a bare table), so the whole thing goes through the staged path.
         w.sql("CREATE OR REPLACE TABLE out1 SORTED BY AUTO AS SELECT * FROM src WHERE id > 5")
     finally:
         w.con = inner
-    # `\bsrc\b` does not match inside `_duckrun_auto_src` — `_` is a word character, so there is no
-    # boundary before `src` there. Exactly one statement may name the source: the staging CTAS.
-    touch = [" ".join(s.split()) for s in seen if re.search(r"\bsrc\b", s)]
-    assert len(touch) == 1, f"source read {len(touch)} times, expected 1:\n" + "\n".join(touch)
-    assert touch[0].upper().startswith("CREATE OR REPLACE TEMP TABLE"), touch[0]
-    # …and the profile plus the write both went to the staged copy.
+    touch = _touches()
+    assert len(touch) == 2, f"source read {len(touch)} times, expected 2:\n" + "\n".join(touch)
+    assert "COUNT(*)" in touch[0].upper(), touch[0]
+    assert touch[1].upper().startswith("CREATE OR REPLACE TEMP TABLE"), touch[1]
     staged = [s for s in seen if "_duckrun_auto_src" in s]
     assert len(staged) > 5, staged
     assert any("ORDER BY" in s for s in staged), "the write did not read the staged copy"
     assert w.sql("select count(*) from out1").fetchone()[0] == 2994
+
+    # ── above the cap: count + substrate CTAS; the WRITE is the only other read of the body.
+    monkeypatch.setattr(sk, "SUBSTRATE_CAP", 1000)     # n=2994 → K=3
+    seen.clear()
+    w.con = Spy()
+    try:
+        w.sql("CREATE OR REPLACE TABLE out2 SORTED BY AUTO AS SELECT * FROM src WHERE id > 5")
+    finally:
+        w.con = inner
+    touch = _touches()
+    assert len(touch) == 3, f"source read {len(touch)} times, expected 3:\n" + "\n".join(touch)
+    assert "COUNT(*)" in touch[0].upper(), touch[0]
+    assert touch[1].upper().startswith("CREATE OR REPLACE TEMP TABLE"), touch[1]
+    assert "% 3 = 0" in touch[1], touch[1]             # deterministic hash substrate, no sample
+    # The write reads the ORIGINAL body (the staged table is a partial substrate) — it reaches
+    # the connection as the SELECT feeding the Delta write, sorted by the resolved key.
+    assert touch[2].upper().startswith("SELECT"), touch[2]
+    assert w.sql("select count(*) from out2").fetchone()[0] == 2994
 
 
 # ─────────────────────────────────────────────────────── shared engine seam + fencing (GREEN)
