@@ -15,3 +15,4 @@ target; 0.4.54 landed 21.7M).
 | 2026-08-17 | [#5](https://github.com/djouallah/duckrun/actions/runs/32016992949) | 736e6b5 | 0.4.54 | 1.5.5 | 1.5.0 | ? | 1623s | 19 scans / 86s | ? | ? | ? | ❌ |
 | 2026-08-17 | [#6](https://github.com/djouallah/duckrun/actions/runs/32019720102) | f9b9d66 | 0.4.54 | 1.5.5 | 1.5.0 | 591,729,858 | 1530s | 19 scans / 84s | 43 | 13,761,159 | 6483 | ✅ |
 | 2026-08-17 | [#7](https://github.com/djouallah/duckrun/actions/runs/32024940277) | 0881661 | 0.4.55 | 1.5.5 | 1.5.0 | 591,729,858 | 788s | 19 scans / 73s | 43 | 13,761,159 | 6483 | ✅ |
+| 2026-08-17 | [#8](https://github.com/djouallah/duckrun/actions/runs/32040040958) | 474e399 | 0.4.56 | 1.5.5 | 1.5.0 | 591,729,858 | 866s | 22 scans / 83s | 40 | 14,793,246 | 6056 | ✅ |
