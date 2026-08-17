@@ -15,11 +15,17 @@ Output → ``(rows, schema, lines)``: one row per column describing the recommen
          justifies it), and ``lines`` — the human-readable advisory the CALLER prints (this module
          does no I/O). The caller wraps ``rows`` into a DataFrame.
 
-The model is a deterministic function of the rows it is given, and it is given ALL of them, so the
-same data profiled twice returns the same key — no seed, no sampling, nothing probabilistic.
+The model is a deterministic function of the rows it is given — no seed, nothing probabilistic, so
+the same data profiled twice returns the same key. What it is GIVEN is the caller's choice: every
+row below the substrate cap (~30M — the exact profile), or a bounded DETERMINISTIC substrate above
+it (``WHERE hash(row) % K = 0`` — order-independent, seed-free; see ``total_rows`` and the v6
+changelog). The cap exists because profiling cost is passes x rows-read: at 591.7M rows the
+every-row profile measured 49 minutes of a 72-minute build, while its output — a slightly better
+key — is worth single-digit minutes at most.
 
 This used to profile a seeded reservoir SAMPLE. That was removed because it cost more than it saved
-on every axis:
+on every axis (and the hash substrate above shares none of these failures — it is one cheap pass,
+deterministic under threads, and sized so real fact grains keep ~10+ rows per group):
   * ``USING SAMPLE reservoir(N ROWS)`` is superlinear in N. Measured on DuckDB 1.5.5 over a 20M-row
     parquet table where materialising the WHOLE table took 0.68 s: ``reservoir(1M)`` 7.2 s,
     ``reservoir(5M)`` 56 s, ``reservoir(8M)`` 83 s — and 8M was the sample sizer's own ceiling. The
@@ -59,6 +65,7 @@ The recommendation, in order:
      alone). Tails refine order INSIDE each dim group, so the dims queries filter on are untouched.
 """
 import math
+import os
 import re
 import time
 
@@ -66,6 +73,24 @@ import time
 # for the uniform approximation Σp² ≈ 1/ndv — a high-card column is ~uniform and its runs are
 # ndv-bound, so the skew term barely moves, and this keeps the skew pass from rebuilding an OOM.
 _SKEW_EXACT_NDV = 100_000
+
+# Above this many rows the CALLER profiles a deterministic substrate instead of every row —
+# `WHERE hash(<row>) % K = 0` with K from `substrate_modulus` — and passes `total_rows` so the
+# model suppresses uniqueness claims (see the v6 changelog). Sized by group thickness, not to a
+# dataset: ~30M keeps 10+ rows per group at real fact grains (aemo's 2.6M groups → ~11.5/group;
+# the sampling era's tail starvation was 3/group at 8M). 0 disables the cap (always exact).
+SUBSTRATE_CAP = int(os.environ.get("DUCKRUN_PROFILE_ROWS", "30000000"))
+
+
+def substrate_modulus(n):
+    """``K`` for the deterministic profiling substrate over an ``n``-row source: keep the rows
+    whose whole-row hash lands in one of K residue classes (``WHERE hash(row) % K = 0``), giving
+    an expected ~SUBSTRATE_CAP rows. 1 means "profile everything" (n at/below the cap, or the
+    cap disabled). Pure, so the gate is unit-testable without a table."""
+    if not SUBSTRATE_CAP or not n or n <= SUBSTRATE_CAP:
+        return 1
+    return -(-int(n) // SUBSTRATE_CAP)
+
 
 # How many exact-skew columns share one GROUPING SETS scan. Internal batching width, not a policy
 # knob: each set is its own ≤_SKEW_EXACT_NDV-group hash table inside ONE pass over the source, so
@@ -88,7 +113,16 @@ _SKEW_SETS_PER_SCAN = 8
 #     is claimed on every table instead of only on ones small enough to profile exactly — which
 #     switches the key-organized branch (step 5) on for large tables for the first time. Same rules,
 #     better inputs: keys WILL move on real tables, hence the bump.
-MODEL_VERSION = "5"
+# v6: v5's every-row profile turned out to cost passes x table size — measured 49 minutes of a
+#     72-minute 591.7M-row build (each pass reads a ~38 GB spilled staging table at ~2 min,
+#     sketch or exact alike; HLL saves memory, not I/O). The caller now profiles a bounded
+#     DETERMINISTIC substrate above ~30M rows (`WHERE hash(row) % K = 0` — no seed, no order
+#     dependence; NOT the deleted reservoir, whose superlinear cost stands un-relitigated) and
+#     passes `total_rows` so this module knows the substrate is partial. Above the cap,
+#     uniqueness claims are suppressed again (v5's key-organized win survives only below the
+#     cap, where the profile is still exact over every row — dimensions live there). Decisions
+#     on big tables can move, hence the bump.
+MODEL_VERSION = "6"
 
 # R5's FD ratio SCREENS on HLL and DECIDES on exact counts below this multiple of the kept grain.
 # `approx_count_distinct` is a sketch, and at the NDV where real dimensions live (10²–10⁵) it is
@@ -235,7 +269,8 @@ def bytes_per_row(rows, n, *, narrow_decimals=False):
 def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                        sort_key_cap=4, min_gain_pct=1.0, key_sort_below_pct=10.0,
                        stats=None, null_excl=0.5, fd_band=0.12, grain_frac=0.5,
-                       *, tail_cap=4, tail_gain_frac=0.25, profile_info=None):
+                       *, tail_cap=4, tail_gain_frac=0.25, profile_info=None,
+                       total_rows=None):
     """The sort-key model, run against ``src`` on connection ``con``. ``src`` holds EVERY row of the
     table being profiled — the caller materializes the source into a local temp table once, and this
     module only ever reads that (see the module docstring for why sampling was removed). So ``n`` is
@@ -258,8 +293,17 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     byte gate — tail slots are IN ADDITION to ``sort_key_cap``, which stays a dim-only budget.
 
     ``profile_info``, if a dict, is filled with the profile's own cost — ``{"scans": N,
-    "seconds": s, "rows": n}`` — so the caller can log what the recommendation cost without
-    parsing lines.
+    "seconds": s, "rows": n, "total_rows": …}`` — so the caller can log what the recommendation
+    cost without parsing lines.
+
+    ``total_rows`` is the FULL table's exact row count when ``src`` is a bounded deterministic
+    substrate of it (the caller's hash-modulo filter — see the v6 changelog). When it exceeds the
+    profiled count, the model treats the profile as SAMPLED: every ratio test works unchanged
+    (fd_band, grain_frac and the tail gates are scale-free, and a strict FD in the full table
+    holds in every subset, so the exact confirms stay sound), but uniqueness is NOT claimed —
+    a substrate can overclaim column uniqueness and hijack the key-organized branch, which is
+    the measured failure that suppressed the claim in the sampling era too. ``None`` (or equal
+    to the profiled count) means the profile is exact and everything behaves as v5.
 
     Returns ``(rows, schema, lines)`` — one row per column, ``schema`` a DuckDB DDL string, and
     ``lines`` the advisory text for the CALLER to print (this module prints nothing)."""
@@ -305,6 +349,8 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
            for j, c in enumerate(hash_cols)])
     row = _q(f"SELECT {agg_sel}, COUNT(*) AS total FROM {src}").fetchone()
     n = row[-1] or 0
+    # `src` is a bounded substrate of a bigger table iff the caller says so — see the docstring.
+    sampled = bool(total_rows and total_rows > n)
     ndv = {}
     for i, c in enumerate(cols):
         v = int(row[i] or 0)
@@ -538,13 +584,14 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
     # compress meaningfully (a real fact) we keep the compression key.
     _, comp_total = _bytes_for(sorted_runs)
     comp_saved = 100.0 * (current_total - comp_total) / current_total if current_total else 0.0
-    # is_unique used to be unanswerable: any column whose true ndv exceeded the SAMPLE size saturated
-    # to ndv≈n and looked unique, so a high-cardinality measure (an INT64 price) would be falsely
-    # flagged and could hijack the key-organized branch below as the sort key. The claim was therefore
-    # suppressed on every sampled profile — which, with a 256 MiB sample budget, meant every table big
-    # enough to care about. The profile now covers all n rows, so ndv≈n really does mean unique and
-    # the branch is live for the first time on a large table.
-    unique_cols = [c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols]
+    # is_unique is unanswerable from a partial profile: any column whose true ndv exceeds the
+    # substrate size saturates to ndv≈n and looks unique, so a high-cardinality measure (an INT64
+    # price) would be falsely flagged and could hijack the key-organized branch below as the sort
+    # key. So the claim is made only when the profile covered EVERY row (below the caller's
+    # substrate cap — where dimensions, the tables key-organization exists for, actually live);
+    # a sampled profile suppresses it, exactly as the sampling era did.
+    unique_cols = ([] if sampled else
+                   [c for c in cols if n and ndv[c] >= 0.9 * n and c not in partition_cols])
     note = None
     if unique_cols and comp_saved < key_sort_below_pct:
         pk, comp_alt = unique_cols[0], list(sort_key)  # schema-order first unique col (usually the PK)
@@ -661,9 +708,14 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         profile_info["scans"] = _scans
         profile_info["seconds"] = round(_elapsed, 1)
         profile_info["rows"] = int(n)
+        profile_info["total_rows"] = int(total_rows) if total_rows else int(n)
     lines = [f"\nrecommend_sort_key('{sch}.{tbl}') — sort-key recommendation (experimental) "
              f"[model v{MODEL_VERSION}]:"]
-    lines.append(f"  (profiled all {n:,} rows; cardinalities are HLL sketches)")
+    if sampled:
+        lines.append(f"  (profiled {n:,} of {total_rows:,} rows — deterministic hash substrate; "
+                     f"uniqueness not claimed)")
+    else:
+        lines.append(f"  (profiled all {n:,} rows; cardinalities are HLL sketches)")
     # Advisory only — the profile's own cost, so a slow AUTO write attributes itself from the log.
     lines.append(f"  (profile cost: {_scans} scans, {_elapsed:.1f}s)")
     lines.append(f"  ORDER BY {', '.join(order_cols) if order_cols else '(no key pays off)'}")

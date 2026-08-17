@@ -952,10 +952,12 @@ class DuckSession:
         non-Delta source profiles the result relation instead, whose distribution isn't the table's
         on-disk layout.
 
-        Either way the body is materialized ONCE and the rewritten statement reads that temp table,
-        so the ~dozen profiling scans, the wide-DECIMAL max scan and the CTAS's own read all share a
-        single evaluation of the source. On OneLake that is the difference between four remote reads
-        and one."""
+        At/below ``sortkey.SUBSTRATE_CAP`` rows the body is materialized ONCE and the rewritten
+        statement reads that temp table, so the profiling scans, the wide-DECIMAL max scan and the
+        CTAS's own read all share a single evaluation of the source. ABOVE the cap the staged
+        table is a deterministic ``hash(row) % K`` SUBSTRATE for the profile only (copying the
+        whole body was the measured defect at 591.7M rows) and the rewritten statement re-reads
+        the ORIGINAL body — two evaluations of the source, exactly the pre-staging behavior."""
         stripped = delta_dml._strip_comments(delta_dml._strip_leading(query)).rstrip().rstrip(";").rstrip()
         m = delta_dml._CREATE_AS.fullmatch(stripped)
         if not m:
@@ -966,20 +968,29 @@ class DuckSession:
         body = m.group("body")
         staged = "_duckrun_auto_src"
         self._auto_geom = None
-        self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS {body}")
+        n_full = int(self.con.sql(f"SELECT count(*) FROM ({body}) _c").fetchone()[0] or 0)
+        k = sortkey.substrate_modulus(n_full)
+        if k == 1:
+            self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS {body}")
+        else:
+            self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS "
+                             f"SELECT * FROM ({body}) _r WHERE hash(_r) % {k} = 0")
         try:
             src = self._auto_sort_single_table(body)
             # A bare `SELECT * FROM <delta table>` still profiles via _get_rle, for the Delta-log
             # stats — it re-reads the table, but only that case, and only because the log carries
             # signal the staged copy does not.
             cols = (self._auto_sort_cols_from_table(src, staged=staged) if src is not None
-                    else self._auto_sort_cols(staged))
+                    else self._auto_sort_cols(staged, full_rows=(n_full if k > 1 else None)))
             # Decimal narrowing stays gated on the ORIGINAL body being `SELECT *`: an explicit
             # projection (including a user-written CAST) is an instruction and is left alone. The
             # staged table always LOOKS like SELECT *, so testing it instead would silently widen
-            # the rule to every body.
-            new_body = (self._narrow_wide_decimals(f"SELECT * FROM {staged}")
-                        if _SELECT_STAR_BODY.match(body.strip()) else f"SELECT * FROM {staged}")
+            # the rule to every body. Above the cap the write reads the ORIGINAL body (the staged
+            # table is a partial substrate), so the narrowing rewrite wraps the body itself — its
+            # exact max(abs) scan runs over the full data either way.
+            write_src = f"SELECT * FROM {staged}" if k == 1 else body
+            new_body = (self._narrow_wide_decimals(write_src)
+                        if _SELECT_STAR_BODY.match(body.strip()) else write_src)
         except Exception:
             self.con.execute(f"DROP TABLE IF EXISTS {staged}")
             raise
@@ -1433,31 +1444,48 @@ class DuckSession:
         # profiler runs exactly as before.
         stats, _, _total = engine.delta_column_stats(
             self.con, path, cols, types, self._catalog_storage_options(cat))
-        # ONE read of the (possibly remote) table. Every profiling scan below then reads this local
-        # materialization, so the model's dozen-odd passes cost local disk, not OneLake round trips.
-        # It spills to temp_directory like any DuckDB result.
+        # ONE read of the (possibly remote) table builds the profiling substrate every scan below
+        # reads: the whole table at/below sortkey.SUBSTRATE_CAP rows, a deterministic
+        # hash(row) % K subset above it (see the sortkey v6 changelog — copying 591.7M rows and
+        # re-reading the spill per pass was the measured defect). The exact total comes from the
+        # Delta log for free; count(*) over the scan (footer metadata) is the statless fallback.
+        n_full = int(_total or 0) or int(self.con.sql(
+            f"SELECT count(*) FROM delta_scan('{plit}')").fetchone()[0] or 0)
+        k = sortkey.substrate_modulus(n_full)
         src = "_rle_src"
-        self.con.execute(
-            f"CREATE OR REPLACE TEMP TABLE {src} AS SELECT * FROM delta_scan('{plit}')")
+        if k == 1:
+            self.con.execute(
+                f"CREATE OR REPLACE TEMP TABLE {src} AS SELECT * FROM delta_scan('{plit}')")
+        else:
+            self.con.execute(
+                f"CREATE OR REPLACE TEMP TABLE {src} AS "
+                f"SELECT * FROM delta_scan('{plit}') _r WHERE hash(_r) % {k} = 0")
+        info: Dict[str, int] = {}
         try:
             rows, schema, lines = sortkey.recommend_sort_key(
                 self.con, sch, tbl, src, cols, types, partition_cols,
                 sort_key_cap=sort_key_cap, min_gain_pct=min_gain_pct,
                 key_sort_below_pct=key_sort_below_pct, stats=stats, null_excl=null_excl,
-                fd_band=fd_band, grain_frac=grain_frac)
+                fd_band=fd_band, grain_frac=grain_frac, profile_info=info,
+                total_rows=(n_full if k > 1 else None))
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
+        # The substrate's own scale, for _auto_sort_cols_from_table's geometry (an attribute for
+        # the same reason _auto_geom is one — see that docstring).
+        self._rle_profile_info = info
         for line in lines:   # the module is pure; the caller prints the advisory
             print(line)
         return self._relation_from(rows, schema)
 
-    def _auto_sort_cols(self, staged: str) -> List[str]:
+    def _auto_sort_cols(self, staged: str, *, full_rows: Optional[int] = None) -> List[str]:
         """Sort key for an arbitrary query's result (no Delta table behind it, so no partitions and no
         log stats), or ``[]`` if nothing pays off. Backs ``SORTED BY AUTO`` over a derived query.
 
-        ``staged`` is the temp table the CALLER has already materialized the result into — the
-        recommender scans it a dozen or so times, and it is the same table the CTAS then writes from,
-        so an arbitrary query is evaluated exactly once for profile + write together.
+        ``staged`` is the temp table the CALLER has already materialized — the full result at/below
+        ``sortkey.SUBSTRATE_CAP`` rows (the CTAS then writes from it too: one evaluation for
+        profile + write together), or a deterministic hash substrate above it, in which case
+        ``full_rows`` carries the body's exact total for the geometry and the sampled-profile
+        contract (keyword-only, so the parquet_layout build scripts' positional calls keep working).
 
         The same profile also yields the one-row-group-per-file write geometry, which is left on
         ``self._auto_geom`` for :meth:`_resolve_auto_sort` rather than returned: the return type is
@@ -1467,7 +1495,8 @@ class DuckSession:
         already serializes this path — two concurrent AUTO statements would clobber that table long
         before they raced on this attribute."""
         self._auto_geom = None
-        cols, lines, geom = engine.auto_sort_cols(self.con, staged, narrow_decimals=True)
+        cols, lines, geom = engine.auto_sort_cols(self.con, staged, narrow_decimals=True,
+                                                  full_rows=full_rows)
         self._auto_geom = geom
         # This path prints ONLY the ORDER BY line (not the full advisory block).
         for line in lines:
@@ -1491,7 +1520,12 @@ class DuckSession:
         raw = prof.fetchall()          # already in sortkey._SCHEMA order — what the byte model wants
         recs = [dict(zip(prof.columns, row)) for row in raw]
         if staged is not None:
-            self._auto_geom = engine._auto_geometry(self.con, staged, raw, narrow_decimals=True)
+            # _get_rle profiled its own substrate; its scale prices bytes/row, the exact total
+            # (from the Delta log) sizes the rows target. Below the cap the two coincide.
+            info = getattr(self, "_rle_profile_info", None) or {}
+            self._auto_geom = engine._auto_geometry(
+                self.con, staged, raw, narrow_decimals=True,
+                full_rows=info.get("total_rows"), profile_rows=info.get("rows"))
         return [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
                                             key=lambda x: x["sort_position"])]
 

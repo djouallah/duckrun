@@ -246,26 +246,44 @@ class Plugin(BasePlugin):
             and not self._sort_by_is_inert(
                 cfg, incremental, full_refresh, exists, _resolved_strategy))
 
-        # ONE evaluation of the model SQL, shared by everything downstream. The staged relation is a
-        # VIEW over the model SQL (_delta_core.sql), so every scan of it re-runs the joins and
-        # aggregations. sort_by='auto' scans it ~a dozen times to profile, and the write scans it
-        # again — on Fabric that is the dominant cost, and it is all remote I/O.
-        #
-        # #14 wanted the same materialization for a different reason: the not-null guard, the merge
-        # cardinality guard and delta_rs's source collection must all see IDENTICAL rows, or a
-        # nondeterministic model (now(), a moved external source) lets the guards vouch for rows that
-        # aren't the ones written. Same temp table serves both; it is bounded by the write memory
-        # clamp + spill dir like any other DuckDB result.
+        # MERGE-path materialization (#14): the not-null guard, the merge cardinality guard and
+        # delta_rs's source collection must all see IDENTICAL rows, or a nondeterministic model
+        # (now(), a moved external source) lets the guards vouch for rows that aren't the ones
+        # written. Merge-only: the profiled overwrite path stages its own substrate below.
         src_tmp = None
-        model_name = name           # the RELATION's name — survives the temp-table rebind below so
-        #                             logs and the profile label keep naming the model, not the
-        #                             __duckrun_msrc_* staging table (the benchmark history records
-        #                             the label, and 0.4.54 briefly recorded the temp name).
-        if _profile_sort or (_merge_path and (cfg.get("merge_materialize_source")
-                                              or not_null_columns)):
+        psub = None
+        model_name = name           # the RELATION's name — survives the temp-table rebinds below so
+        #                             logs and the profile label keep naming the model, not a
+        #                             staging table (the benchmark history records the label, and
+        #                             0.4.54 briefly recorded the temp name).
+        if _merge_path and (cfg.get("merge_materialize_source") or not_null_columns):
             src_tmp = '"' + engine.tmp_name("msrc", path) + '"'
             cur.execute(f"CREATE OR REPLACE TEMP TABLE {src_tmp} AS SELECT * FROM {name}")
-            name = src_tmp          # profile, guards and write all read the one materialization
+            name = src_tmp          # guards and write all read the one materialization
+
+        # sort_by='auto' profiling SUBSTRATE (sortkey v6). The staged relation is a VIEW over the
+        # model SQL, so every scan re-runs it — and the profiler scans its source several times.
+        # Copying ALL rows first (0.4.54's msrc) was the defect at scale: materializing 591.7M rows
+        # cost ~5 min and every profile pass re-read a 38 GB spill (~49 min of a 72-min build). Now:
+        #   - exact COUNT(*) off the view first (footer metadata for scan models — near-free);
+        #   - at/below sortkey.SUBSTRATE_CAP: a FULL local copy — it doubles as the staging table
+        #     (guards + write read it; one model evaluation), byte-identical to the old behavior;
+        #   - above the cap: a deterministic hash(row) % K subset (~cap rows) for the profile ONLY,
+        #     and the write reads the VIEW directly (re-evaluating a bare scan is far cheaper than
+        #     copying the world; a nondeterministic model at worst gets a marginally stale key).
+        profile_src, full_rows = name, None
+        if _profile_sort:
+            full_rows = int(cur.sql(f"SELECT count(*) FROM {name}").fetchone()[0] or 0)
+            k = sortkey.substrate_modulus(full_rows)
+            psub = '"' + engine.tmp_name("psub", path) + '"'
+            if k == 1:
+                cur.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS SELECT * FROM {name}")
+                name = psub         # the full copy IS the staging table
+                full_rows = None    # profile covers every row — exact semantics, v5-identical
+            else:
+                cur.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS "
+                            f"SELECT * FROM {name} _r WHERE hash(_r) % {k} = 0")
+            profile_src = psub
 
         # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
         # honored here — the staged relation is read through a wrapper SELECT *, and with
@@ -281,8 +299,8 @@ class Plugin(BasePlugin):
         # answer away (see that method). A project-wide `+sort_by: auto` used to pay that profile on
         # every incremental run of every merge model.
         sort_by, auto_geom = self._resolve_sort_by(
-            cur, name, cfg.get("sort_by"), partition_by, profile=_profile_sort,
-            display_name=model_name)
+            cur, profile_src, cfg.get("sort_by"), partition_by, profile=_profile_sort,
+            display_name=model_name, full_rows=full_rows)
         cfg["sort_by"] = sort_by
         # Wide-DECIMAL narrowing, the dbt spelling of session._narrow_wide_decimals: a
         # DECIMAL(p>18) maps to a 16-byte FLBA that arrow-rs never dictionary-encodes, so a
@@ -421,6 +439,8 @@ class Plugin(BasePlugin):
         finally:
             if src_tmp is not None:
                 cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")
+            if psub is not None:
+                cur.execute(f"DROP TABLE IF EXISTS {psub}")
 
     @staticmethod
     def _geometry_config(cfg):
@@ -537,7 +557,7 @@ class Plugin(BasePlugin):
             return default
 
     def _resolve_sort_by(self, cur, name, sort_by, partition_by, *, profile=True,
-                         display_name=None):
+                         display_name=None, full_rows=None):
         """Resolve ``sort_by='auto'`` (case-insensitive scalar) into concrete columns by profiling
         the staged relation via :func:`engine.auto_sort_cols` — the dbt spelling of the connection
         API's ``CREATE TABLE … SORTED BY AUTO``, backed by the same sampler. No payoff resolves to
@@ -576,7 +596,8 @@ class Plugin(BasePlugin):
         pcols = (list(partition_by) if isinstance(partition_by, (list, tuple))
                  else [partition_by] if partition_by else [])
         key, lines, geom = engine.auto_sort_cols(cur, name, partition_cols=pcols,
-                                                 label=("model", disp), narrow_decimals=True)
+                                                 label=("model", disp), narrow_decimals=True,
+                                                 full_rows=full_rows)
         for line in lines:  # full advisory (model version, per-column verdicts) at debug
             engine.logger.debug(line)
         engine.logger.info(

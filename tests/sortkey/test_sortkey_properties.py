@@ -690,4 +690,60 @@ def test_consolidated_profile_scan_budget():
     assert per_col_skew == [], per_col_skew
     assert len(gsets) == 2, gsets
     assert len(spy.queries) == 12, [q[:80] for q in spy.queries]
-    assert info == {"scans": 12, "seconds": info["seconds"], "rows": 200_000}
+    assert info == {"scans": 12, "seconds": info["seconds"], "rows": 200_000,
+                    "total_rows": 200_000}
+
+
+# ── 20. v6 substrate gate: exact below the cap, deterministic hash subset above it. ──────────────
+def test_substrate_modulus_gate(monkeypatch):
+    assert sortkey.substrate_modulus(0) == 1
+    assert sortkey.substrate_modulus(None) == 1
+    assert sortkey.substrate_modulus(sortkey.SUBSTRATE_CAP) == 1          # at the cap: exact
+    assert sortkey.substrate_modulus(sortkey.SUBSTRATE_CAP + 1) == 2      # just above: halve
+    assert sortkey.substrate_modulus(sortkey.SUBSTRATE_CAP * 10) == 10
+    monkeypatch.setattr(sortkey, "SUBSTRATE_CAP", 0)                      # DUCKRUN_PROFILE_ROWS=0
+    assert sortkey.substrate_modulus(10**12) == 1                         # kill switch: always exact
+
+
+def test_sampled_profile_suppresses_uniqueness():
+    """Above the cap the profile is a substrate, and a substrate can overclaim column uniqueness
+    (a value duplicated across rows can land in different hash buckets) — so is_unique must never
+    be claimed and the key-organized branch must stay inert, exactly the sampling-era semantics.
+    Below the cap (the full profile) the claim keeps working — that is where dimensions live."""
+    con = duckdb.connect()
+    con.execute("CREATE OR REPLACE TABLE u AS "
+                "select i as id, (i%5) as cat, (i%7)::double as m from range(200000) t(i)")
+    desc = con.sql("DESCRIBE u").fetchall()
+    cols, types = [r[0] for r in desc], {r[0]: r[1] for r in desc}
+    full, _, _ = sortkey.recommend_sort_key(con, "s", "u", "u", cols, types, [])
+    assert any(r[9] for r in full if r[3] == "id"), "full profile must claim the unique id"
+    con.execute("CREATE OR REPLACE TEMP TABLE usub AS SELECT * FROM u _r WHERE hash(_r) % 7 = 0")
+    samp, _, lines = sortkey.recommend_sort_key(con, "s", "u", "usub", cols, types, [],
+                                                total_rows=200_000)
+    assert not any(r[9] for r in samp), "a sampled profile must not claim uniqueness"
+    assert any("uniqueness not claimed" in ln for ln in lines)
+    assert any("of 200,000 rows" in ln for ln in lines)
+
+
+def test_sampled_profile_is_deterministic_and_matches_full_key():
+    """The substrate is a hash-modulo filter — no seed, no order dependence — so two profiles of
+    the same substrate are byte-identical, and on a well-separated fixture the substrate picks the
+    SAME key the full profile picks (the ratio tests are scale-free)."""
+    con = duckdb.connect()
+    con.execute(f"CREATE OR REPLACE TABLE t AS {_COMPOSITE_FIXTURE}")
+    desc = con.sql("DESCRIBE t").fetchall()
+    cols, types = [r[0] for r in desc], {r[0]: r[1] for r in desc}
+
+    def _key(rows):
+        return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+
+    full, _, _ = sortkey.recommend_sort_key(con, "s", "t", "t", cols, types, [])
+    con.execute("CREATE OR REPLACE TEMP TABLE psub AS SELECT * FROM t _r WHERE hash(_r) % 7 = 0")
+    info = {}
+    a, _, _ = sortkey.recommend_sort_key(con, "s", "t", "psub", cols, types, [],
+                                         total_rows=200_000, profile_info=info)
+    b, _, _ = sortkey.recommend_sort_key(con, "s", "t", "psub", cols, types, [],
+                                         total_rows=200_000)
+    assert a == b, "same substrate, same answers — nothing seeded"
+    assert _key(a) == _key(full) == ["sale_date", "region", "hour"]
+    assert info["rows"] < info["total_rows"] == 200_000

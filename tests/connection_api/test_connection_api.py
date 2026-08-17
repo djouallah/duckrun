@@ -2307,6 +2307,39 @@ def test_auto_geometry_and_readout_share_the_derate(conn, monkeypatch):
     assert any("10,666,666 target" in m for m in got), got
 
 
+def test_auto_geometry_prices_bytes_per_row_at_the_profile_scale(conn):
+    # v6: above the substrate cap the profile's est_kb are at SUBSTRATE scale. bytes_per_row must
+    # divide by the rows the profile actually covered (profile_rows), while the rows target sizes
+    # from the FULL exact count — dividing substrate-scale bytes by the full count would understate
+    # bytes/row by the substrate factor and shrink every file by the same.
+    from dbt.adapters.duckrun import engine, policy
+    cur = conn._connection
+    cur.execute("CREATE OR REPLACE TEMP TABLE staged AS "
+                "select i as j, (i%97)::int k from range(100000) t(i)")
+    _k, _l, g_full = engine.auto_sort_cols(cur, "staged")
+    _k, _l, g_sub = engine.auto_sort_cols(cur, "staged", full_rows=1_000_000)
+    assert g_full is not None and g_sub is not None
+    assert g_sub["rows"] == 1_000_000                                     # full count drives rows
+    assert g_sub["bytes_per_row"] == pytest.approx(g_full["bytes_per_row"])  # profile scale drives bpr
+    assert g_sub["rg_target"] == min(engine.rg_for(1_000_000, floor=engine._RG_MIN),
+                                     policy.auto_rg_cap())
+
+
+def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
+    # v6 end-to-end above the cap: the profile reads a hash-modulo substrate, but the WRITE must
+    # read the original body — writing the substrate would silently drop ~ (1 - 1/K) of the table.
+    from dbt.adapters.duckrun import sortkey as sk
+    monkeypatch.setattr(sk, "SUBSTRATE_CAP", 50_000)
+    conn.sql("CREATE OR REPLACE TABLE big_auto SORTED BY AUTO AS "
+             "select (i % 40) as region, (i % 997) as store, ((i * 31) % 100000)::double as amt "
+             "from range(200000) t(i)")
+    assert conn.sql("select count(*) from big_auto").fetchone()[0] == 200_000
+    assert conn.sql("select count(distinct region) from big_auto").fetchone()[0] == 40
+    leftovers = [r[0] for r in conn.sql("show tables").fetchall()
+                 if "_duckrun_auto_src" in r[0] or "_rle" in r[0]]
+    assert not leftovers, leftovers
+
+
 def test_auto_ctas_lands_exactly_one_row_group_per_file(conn):
     # The whole point: with the row ceiling out of reach, the byte target is the only boundary, so
     # every file closes with exactly one row group and no ragged trailing group.

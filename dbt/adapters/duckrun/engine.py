@@ -1291,7 +1291,7 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
 
 
 def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by=auto"),
-                   narrow_decimals=False):
+                   narrow_decimals=False, full_rows=None):
     """Run the sort-key recommender over any FROM-able ``source`` and return ``(cols, lines, geom)``:
     the recommended ORDER BY columns (``[]`` if nothing pays off), the advisory lines for the CALLER
     to print/log, and the write GEOMETRY that lands one row group per file. The one seam behind dbt's
@@ -1302,17 +1302,15 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     means "change nothing", so the caller keeps today's adaptive ceiling and 256 MB files. It is
     computed HERE, not per surface, so the SQL and dbt paths cannot size a write two different ways.
 
-    The row count behind it is an exact ``count(*)`` over the caller's already-materialized temp
-    table — a metadata read on a DuckDB base table, not a scan, and not the DuckDB planner estimate
-    ``write_delta`` falls back to. That is why ``rg_for`` gets the low ``RG_MIN`` floor here: the 8M
-    ``RG_MIN_ESTIMATED`` floor exists to survive an untrustworthy guess, and this is a measurement.
-
-    ``source`` MUST be cheap to scan repeatedly — the recommender reads it a dozen or so times. The
-    CALLER is responsible for that: both surfaces materialize the staged relation into a local temp
-    table exactly once and pass that in, so a remote table (or a view over model SQL, which re-runs
-    its joins on every scan) is evaluated once and everything after it is local. This function
-    deliberately does NOT make its own copy — it used to, in the form of a seeded reservoir sample,
-    and that sample cost more than reading everything (see the ``sortkey`` module docstring).
+    ``source`` MUST be cheap to scan repeatedly — the recommender reads it several times. The
+    CALLER is responsible for that: both surfaces materialize a PROFILING SUBSTRATE (a full local
+    copy at/below ``sortkey.SUBSTRATE_CAP`` rows, a deterministic ``hash(row) % K`` subset above
+    it — see ``sortkey.substrate_modulus``) and pass that in. When the substrate is partial, pass
+    the full table's exact count as ``full_rows``: the profile then reports/suppresses per the v6
+    contract, and the GEOMETRY sizes its rows target from the FULL count (a measurement — hence
+    ``rg_for``'s low ``RG_MIN`` floor) while pricing bytes/row from the substrate-scale profile.
+    This function deliberately does NOT make its own copy — the deleted reservoir sample is the
+    cautionary tale (see the ``sortkey`` module docstring).
 
     ``partition_cols`` keeps declared partition columns from burning a sort-key slot. No Delta-log
     stats are passed here (there is no table behind a staged relation), so null shares and NDV caps
@@ -1325,25 +1323,34 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     cost = {}
     rows, _, lines = sortkey.recommend_sort_key(
         cur, label[0], label[1], source, cols, types, list(partition_cols or []),
-        profile_info=cost)
+        profile_info=cost, total_rows=full_rows)
     # The profile is the expensive half of an AUTO write (measured: ~2/3 of a 591.7M-row build),
     # so its cost gets one INFO line here — the shared seam — like _log_auto_geometry's readout.
     if cost:
+        of = (f" of {cost['total_rows']:,}" if cost["total_rows"] > cost["rows"] else "")
         logger.info(f"duckrun: sort profile of {label[1]}: {cost['scans']} scans over "
-                    f"{cost['rows']:,} rows in {cost['seconds']}s")
+                    f"{cost['rows']:,}{of} rows in {cost['seconds']}s")
     # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
     key = [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
-    return key, lines, _auto_geometry(cur, source, rows, narrow_decimals=narrow_decimals)
+    return key, lines, _auto_geometry(cur, source, rows, narrow_decimals=narrow_decimals,
+                                      full_rows=full_rows, profile_rows=cost.get("rows"))
 
 
-def _auto_geometry(cur, source, rows, *, narrow_decimals=False):
+def _auto_geometry(cur, source, rows, *, narrow_decimals=False, full_rows=None, profile_rows=None):
     """The one-row-group-per-file write geometry for an AUTO write, or ``None`` to change nothing.
+
+    ``full_rows`` is the table's exact total (drives the rows target); ``profile_rows`` is how many
+    rows the profile behind ``rows`` actually covered (drives bytes/row — ``est_kb`` are at the
+    profile's scale, so dividing by the FULL count would understate bytes/row by the substrate
+    factor and shrink every file). Both default to a ``count(*)`` over ``source`` — exact and
+    correct whenever the profile covered the whole source, which is every call below the cap.
 
     Best-effort throughout: a geometry is an optimization, so every failure degrades to ``None`` and
     the write proceeds on the default layout rather than breaking on a sizing problem."""
     try:
-        n = cur.sql(f"SELECT count(*) FROM {source}").fetchone()[0]
-        bpr = sortkey.bytes_per_row(rows, n, narrow_decimals=narrow_decimals)
+        n = full_rows if full_rows is not None else cur.sql(
+            f"SELECT count(*) FROM {source}").fetchone()[0]
+        bpr = sortkey.bytes_per_row(rows, profile_rows or n, narrow_decimals=narrow_decimals)
         # An exact count takes rg_for's LOW floor — see the docstring above and policy.RG_MIN_ESTIMATED.
         # Capped below the top of the band (policy.auto_rg_cap): with one row group per file the byte
         # model's measured overshoot spread would otherwise push a 16M target past the segment band.
