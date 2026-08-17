@@ -76,6 +76,7 @@ conformance.xml
 # ...except dbt's auto-generated local user file (aemo, any integration project)
 tests/integration_tests/*/.user.yml
 tests/performance/*/.user.yml
+tests/performance/nyc/project/.user.yml
 tests/parity_tests/*/.user.yml
 
 # Delta output and dbt artifacts produced by the integration projects (runtime)
