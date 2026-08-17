@@ -775,3 +775,31 @@ def test_sampled_profile_prices_the_tail_at_full_scale():
     samp, _, _ = sortkey.recommend_sort_key(con, "s", "ft", "ftsub", cols, types, [],
                                             total_rows=200_000)
     assert _key(samp) == ["grp", "price"], "the substrate must not drop the tail (model v7)"
+
+
+def test_sampled_tail_tie_decided_on_exact_counts():
+    """Model v8: two correlated money columns are near-tied by construction (contoso's
+    NetPrice = f(UnitPrice)) and the HLL sketch's ±2-4% per runs estimate can flip which one
+    takes the tail slot at substrate scale — an asymmetric loss, because only the true winner's
+    ordering collapses its peer for free (NetPrice-led cost +98 MB on contoso). Within
+    _TAIL_TIE_BAND the argmax is settled by exact counts over the substrate. Fixture: price2
+    shadows price but splits every 10th stretch, so its runs land ~10% higher — inside the band,
+    ranked below price by exact counts, then FD-binned once price holds the slot. Both scales
+    must agree on the pick."""
+    con = duckdb.connect()
+    con.execute("CREATE OR REPLACE TABLE tt AS "
+                "select (i // 1000)::int as grp, ((i // 10) % 2000)::double as price, "
+                "(((i // 10) % 2000) + (i % 100 = 0)::int * 0.5)::double as price2, "
+                "(i % 977)::int as fill from range(200000) t(i)")
+    desc = con.sql("DESCRIBE tt").fetchall()
+    cols, types = [r[0] for r in desc], {r[0]: r[1] for r in desc}
+
+    def _key(rows):
+        return [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
+
+    full, _, _ = sortkey.recommend_sort_key(con, "s", "tt", "tt", cols, types, [])
+    con.execute("CREATE OR REPLACE TEMP TABLE ttsub AS SELECT * FROM tt _r WHERE hash(_r) % 7 = 0")
+    samp, _, _ = sortkey.recommend_sort_key(con, "s", "tt", "ttsub", cols, types, [],
+                                            total_rows=200_000)
+    assert _key(full) == ["grp", "price"], _key(full)
+    assert _key(samp) == _key(full), "the substrate's tie-break must match the full profile"

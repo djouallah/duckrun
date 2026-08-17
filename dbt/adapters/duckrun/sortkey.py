@@ -127,7 +127,11 @@ _SKEW_SETS_PER_SCAN = 8
 #     computed from the substrate's n — understating every tail's save ~K× and dropping money
 #     columns the full profile keeps (contoso: UnitPrice tail lost, 1686 → 1836 MB, flipping the
 #     table from 2.6% under the V-Order reference to 6% over). Full-profile behavior unchanged.
-MODEL_VERSION = "7"
+# v8: on a substrate, a tail level whose top candidates sit within _TAIL_TIE_BAND of each other is
+#     decided on EXACT counts over the substrate (one extra scan, tied levels only). v7 restored
+#     the tail but the sketch flipped contoso's near-tied UnitPrice/NetPrice argmax (1785 vs the
+#     full profile's 1686-MB UnitPrice pick). Full-profile behavior unchanged.
+MODEL_VERSION = "8"
 
 # R5's FD ratio SCREENS on HLL and DECIDES on exact counts below this multiple of the kept grain.
 # `approx_count_distinct` is a sketch, and at the NDV where real dimensions live (10²–10⁵) it is
@@ -147,6 +151,15 @@ _FD_CONFIRM_BELOW = 2.0
 # this fraction of the whole table's modeled bytes (a near-empty column can pass the relative test
 # on savings nobody would ever notice — nyc mta_tax/improvement_surcharge are the measured case).
 _TAIL_MIN_TABLE_FRAC = 0.005
+
+# On a substrate, a tail-level argmax between candidates whose modeled saves sit within this band
+# of each other is decided on EXACT counts, not the HLL sketch. Correlated money columns are near-
+# tied by construction (contoso NetPrice = f(UnitPrice)), the sketch's ±2-4% on each runs estimate
+# can flip their order, and the flip is not symmetric in outcome: the true winner's ordering
+# collapses its correlated peers for free, the loser's does not (contoso: NetPrice-led cost +98 MB
+# over UnitPrice-led). One exact scan over the substrate per TIED level; a clear winner pays
+# nothing, and full profiles are untouched (their sketches decided v4/v5 keys unflagged).
+_TAIL_TIE_BAND = 0.10
 
 _SCHEMA = (
     "table string, in_sort_key boolean, sort_position int, column string, data_type string, "
@@ -659,6 +672,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             exact_tp = None       # exact distinct(prefix) once any confirm ran at this level
             prefetched = {}       # candidate -> exact distinct(prefix, candidate)
             best, best_runs, best_save = None, None, 0.0
+            scored = []           # (save, runs, c) for every candidate that cleared the screens
             for j, c in enumerate(scan):
                 # distinct(prefix, c) over the WHOLE table IS c's run count under the sorted layout.
                 # This is the measurement the old group-stratified read of the source existed to
@@ -690,8 +704,21 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
                     t_remaining.remove(c)
                     continue
                 save = t_iid[c] - _t_bytes(c, runs)
+                scored.append((save, runs, c))
                 if save > best_save:
                     best, best_runs, best_save = c, runs, save
+            # v8: near-tied argmax on a substrate is settled by EXACT counts (see _TAIL_TIE_BAND).
+            if sampled and best is not None:
+                tied = [c for save, _r, c in scored
+                        if c != best and save >= (1.0 - _TAIL_TIE_BAND) * best_save]
+                if tied:
+                    ex = _exact_confirms(t_prefix, [best] + tied[:3])
+                    best, best_runs, best_save = None, None, 0.0
+                    for c in [c for _s, _r, c in scored if c in ex]:   # stable candidate order
+                        runs = ex[c]
+                        save = t_iid[c] - _t_bytes(c, runs)
+                        if save > best_save:
+                            best, best_runs, best_save = c, runs, save
             if (best is None
                     or best_save < tail_gain_frac * t_iid[best]
                     or best_save < _TAIL_MIN_TABLE_FRAC * t_baseline):
