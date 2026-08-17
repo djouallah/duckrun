@@ -581,3 +581,45 @@ def test_glob_listing_store_error_raises(tmp_path):
     con = duckdb.connect()
     with pytest.raises(duckdb.Error):
         remote.list_delta_tables_via_glob(con, "az://no-secret-container/x", "dbo")
+
+
+# ------------------------------------------------- sort_by=auto labels: model name, not temp table
+
+def test_resolve_sort_by_labels_the_model_not_the_staging_table(monkeypatch):
+    """The staged-profile rebind (store() points `name` at __duckrun_msrc_<hash> before resolving
+    sort_by) must not leak into logs: the INFO line is what the benchmark history keys on, and
+    0.4.54 briefly recorded the temp-table hash instead of the model. The temp table is still what
+    gets QUERIED; only the label and log lines carry the display name."""
+    con = duckdb.connect()
+    con.execute('CREATE TEMP TABLE "__duckrun_msrc_deadbeef" AS select 1 as id')
+    seen = {}
+
+    def fake_auto_sort_cols(cur, source, *, partition_cols=None, label=None, **kw):
+        seen["source"], seen["label"] = source, label
+        return ["id"], [], None
+
+    infos = []
+    monkeypatch.setattr(engine, "auto_sort_cols", fake_auto_sort_cols)
+    monkeypatch.setattr(engine.logger, "info", lambda m: infos.append(m))
+
+    plugin = object.__new__(Plugin)
+    key, geom = plugin._resolve_sort_by(
+        con, '"__duckrun_msrc_deadbeef"', "auto", None,
+        profile=True, display_name='"mart"."fct_trips"')
+    assert key == ["id"] and geom is None
+    assert seen["source"] == '"__duckrun_msrc_deadbeef"'      # queries the staging table …
+    assert seen["label"] == ("model", '"mart"."fct_trips"')   # … but names the model
+    assert any("fct_trips" in m for m in infos)
+    assert not any("msrc" in m for m in infos), infos
+
+
+def test_resolve_sort_by_display_name_defaults_to_name(monkeypatch):
+    con = duckdb.connect()
+    con.execute("CREATE TEMP TABLE plainrel AS select 1 as id")
+    monkeypatch.setattr(engine, "auto_sort_cols",
+                        lambda cur, source, **kw: (["id"], [], None))
+    infos = []
+    monkeypatch.setattr(engine.logger, "info", lambda m: infos.append(m))
+    plugin = object.__new__(Plugin)
+    plugin._resolve_sort_by(con, "plainrel", "auto", None, profile=True)
+    assert any("plainrel" in m for m in infos)

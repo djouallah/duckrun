@@ -256,6 +256,10 @@ class Plugin(BasePlugin):
         # aren't the ones written. Same temp table serves both; it is bounded by the write memory
         # clamp + spill dir like any other DuckDB result.
         src_tmp = None
+        model_name = name           # the RELATION's name — survives the temp-table rebind below so
+        #                             logs and the profile label keep naming the model, not the
+        #                             __duckrun_msrc_* staging table (the benchmark history records
+        #                             the label, and 0.4.54 briefly recorded the temp name).
         if _profile_sort or (_merge_path and (cfg.get("merge_materialize_source")
                                               or not_null_columns)):
             src_tmp = '"' + engine.tmp_name("msrc", path) + '"'
@@ -276,7 +280,8 @@ class Plugin(BasePlugin):
         # answer away (see that method). A project-wide `+sort_by: auto` used to pay that profile on
         # every incremental run of every merge model.
         sort_by, auto_geom = self._resolve_sort_by(
-            cur, name, cfg.get("sort_by"), partition_by, profile=_profile_sort)
+            cur, name, cfg.get("sort_by"), partition_by, profile=_profile_sort,
+            display_name=model_name)
         cfg["sort_by"] = sort_by
         if sort_by:
             cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
@@ -476,13 +481,19 @@ class Plugin(BasePlugin):
             return not (cfg.get("merge_clauses") or cfg.get("merge_update_set_expressions"))
         return False                                        # append / insert / unknown — honors it
 
-    def _resolve_sort_by(self, cur, name, sort_by, partition_by, *, profile=True):
+    def _resolve_sort_by(self, cur, name, sort_by, partition_by, *, profile=True,
+                         display_name=None):
         """Resolve ``sort_by='auto'`` (case-insensitive scalar) into concrete columns by profiling
         the staged relation via :func:`engine.auto_sort_cols` — the dbt spelling of the connection
         API's ``CREATE TABLE … SORTED BY AUTO``, backed by the same sampler. No payoff resolves to
         ``None`` (unsorted write, exactly as connect() drops the clause). ``'auto'`` inside a list
         is rejected — which also means a column literally named ``auto`` can't be addressed here.
         Every other config value passes through untouched.
+
+        ``display_name`` is what logs and the profile label call the relation; ``name`` is what
+        gets QUERIED. They diverge when the caller staged the model into a ``__duckrun_msrc_*``
+        temp table — the log line and the benchmark history keying off it must keep saying
+        ``mart.fct_trips``, not the staging table's hash.
 
         ``profile=False`` (see :meth:`_sort_by_is_inert`) resolves ``'auto'`` to ``None`` WITHOUT
         profiling, for a write branch that would discard the key anyway. Validation is deliberately
@@ -502,18 +513,19 @@ class Plugin(BasePlugin):
             return sort_by, None
         if not (isinstance(sort_by, str) and sort_by.strip().lower() == "auto"):
             return sort_by, None
+        disp = display_name or name
         if not profile:
             engine.logger.debug(
-                f"duckrun: sort_by=auto skipped for {name} — this write path does not sort")
+                f"duckrun: sort_by=auto skipped for {disp} — this write path does not sort")
             return None, None
         pcols = (list(partition_by) if isinstance(partition_by, (list, tuple))
                  else [partition_by] if partition_by else [])
         key, lines, geom = engine.auto_sort_cols(cur, name, partition_cols=pcols,
-                                                 label=("model", name))
+                                                 label=("model", disp))
         for line in lines:  # full advisory (model version, per-column verdicts) at debug
             engine.logger.debug(line)
         engine.logger.info(
-            f"duckrun: sort_by=auto for {name} -> "
+            f"duckrun: sort_by=auto for {disp} -> "
             + (", ".join(key) if key else "no sort (nothing pays off)"))
         return key or None, geom
 
