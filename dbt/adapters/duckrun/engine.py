@@ -1939,6 +1939,7 @@ def merge_delta(
     max_spill_size: Optional[int] = None,
     max_temp_directory_size: Optional[int] = None,
     streamed_exec: bool = False,
+    source_materialized: bool = False,
     read_version: Optional[int] = None,
     delete_unmatched_by_source=None,
     storage_options: Optional[Dict[str, str]] = None,
@@ -1994,6 +1995,12 @@ def merge_delta(
       collecting a small delta is cheap and the prune avoids a full-target scan. For a merge whose
       *source* is itself huge, pass streamed_exec=True (``merge_streamed_exec``) so it isn't
       materialized — at the cost of no pruning.
+    - source_materialized: tell the merge that ``data`` reads a table the caller already
+      materialized (the dbt plugin's temp-table staging), i.e. probing it is cheap and stable.
+      Enables the empty-source short-circuit in ``merge_delta_clauses``: a zero-row source with no
+      by-source clause skips the merge machinery (target open + pin, source collection, post-merge
+      maintenance) outright. Never set it for a lazy relation — the probe would re-evaluate the
+      model.
     - delete_unmatched_by_source: the "WHEN NOT MATCHED BY SOURCE THEN DELETE" form — also remove
       target rows the source doesn't carry. True deletes every unmatched target row (full sync); a
       string deletes only those matching that predicate; None (default, used by the dbt incremental
@@ -2043,6 +2050,7 @@ def merge_delta(
         merge_schema=merge_schema,
         existing_columns=existing_columns,
         streamed_exec=streamed_exec,
+        source_materialized=source_materialized,
         max_spill_size=max_spill_size,
         max_temp_directory_size=max_temp_directory_size,
         storage_options=storage_options,
@@ -2570,6 +2578,7 @@ def merge_delta_clauses(
     merge_schema: bool = False,
     existing_columns: Optional[List[str]] = None,
     streamed_exec: bool = False,
+    source_materialized: bool = False,
     max_spill_size: Optional[int] = None,
     max_temp_directory_size: Optional[int] = None,
     storage_options: Optional[Dict[str, str]] = None,
@@ -2645,6 +2654,24 @@ def merge_delta_clauses(
     _merge_cardinality_guard(data, predicate, clauses, streamed_exec)
     effective_version = _merge_evolve_schema(path, data, storage_options, read_version,
                                              merge_schema, existing_columns=existing_columns)
+
+    # Empty-source short-circuit (issue #61): a merge whose source has no rows touches no target
+    # row, so skip the whole merge machinery — the target open + version pin, delta_rs's source
+    # collection and join build, the merge gate, and the post-merge maintenance. (delta_rs itself
+    # declines to COMMIT an empty merge, but only after paying all of that — remote round-trips an
+    # unchanged snapshot re-run pays for nothing.) Only when the caller MATERIALIZED the source
+    # (``source_materialized`` — the dbt plugin's temp-table staging): probing it is then one
+    # LIMIT 1 off a local table, and the answer describes the same rows the merger would collect.
+    # A lazy source is never probed — the probe could cost a full model evaluation, and a
+    # nondeterministic model could answer "empty" for rows the merger would then see (the #14
+    # hazard). Placed AFTER the schema evolution so on_schema_change='append_new_columns' still
+    # lands a new column carried by a zero-row source, and skipped when a not_matched_by_source
+    # clause exists — for those an empty source matches EVERY target row: work, not a no-op.
+    if (source_materialized and hasattr(data, "limit")
+            and not any(c.get("clause") == "not_matched_by_source" for c in clauses)
+            and data.limit(1).fetchone() is None):
+        logger.info("merge: source has no rows and no by-source clause; nothing to do (no commit)")
+        return
 
     # Insert-only: divert to the DuckDB anti-join + plain append (see the docstring). Done AFTER the
     # cardinality guard and the decoupled schema evolution so both branches inherit them unchanged,

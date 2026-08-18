@@ -119,12 +119,23 @@
          SnapshotConfig.on_schema_change defaults to 'ignore', so a passthrough would silently keep
          dropping columns. The added column is evolved as a metadata-only commit BEFORE the merge
          (engine.merge_delta_clauses), so it reads NULL on the already-closed version — the close row's
-         update touches only dbt_valid_to — matching dbt-core's default snapshot exactly. --#}
+         update touches only dbt_valid_to — matching dbt-core's default snapshot exactly.
+
+         merge_materialize_source is hardcoded true, like on_schema_change (issue #61). The merge
+         source here is a lazy view stack (merge_src -> staging -> pinned delta_scan + the model SQL),
+         and dbt's staging SQL stamps snapshot_get_time() = now() into dbt_updated_at/dbt_valid_from —
+         and, under the check strategy, into dbt_scd_id. Left lazy, every consumer (the cardinality
+         guard, delta_rs's source collection) re-runs that stack against remote storage AND computes
+         different timestamps per evaluation, so the guards vouch for rows that are not the ones
+         written (the #14 hazard). One temp-table staging pins the rows once — dbt's own default
+         snapshot materializes its staging as a real table for the same reason — and lets the engine
+         skip the merge entirely (no commit) when an unchanged source stages zero rows. --#}
     {% do adapter.store_relation('duckrun', merge_src, columns, location, 'delta', {
         'incremental': true,
         'incremental_strategy': 'merge',
         'unique_key': snapshot_cols.dbt_scd_id,
         'merge_update_columns': [snapshot_cols.dbt_valid_to],
+        'merge_materialize_source': true,
         'read_version': read_version,
         'dbt_believes_exists': true,
         'full_refresh': false,

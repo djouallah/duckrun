@@ -680,6 +680,7 @@ class Plugin(BasePlugin):
                     max_spill_size=cfg.get("merge_max_spill_size"),
                     max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                     streamed_exec=(False if sx is None else bool(sx)),
+                    source_materialized=src_tmp is not None,
                     read_version=cfg.get("read_version"),
                     partition_by=cfg.get("partition_by"),
                     sort_by=cfg.get("sort_by"),
@@ -704,6 +705,7 @@ class Plugin(BasePlugin):
                     max_spill_size=cfg.get("merge_max_spill_size"),
                     max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
                     streamed_exec=(False if sx is None else bool(sx)),
+                    source_materialized=src_tmp is not None,
                     # Pin the merge target to the version the model read (vB, captured before it
                     # read {{ this }}), so OCC validates (vB, HEAD] — read and commit are one snapshot.
                     read_version=cfg.get("read_version"),

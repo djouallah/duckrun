@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **An unchanged snapshot no longer spends minutes evaluating a source the merge never touches**
+  (issue #61). The snapshot materialization now forwards `merge_materialize_source: true`: its merge
+  source was a lazy view stack (staging over a pinned remote `delta_scan` plus the model SQL) that
+  the cardinality guard and delta-rs's source collection each re-evaluated end to end — ~40 s of a
+  reported 122 s run re-reading remote data the merge then didn't use — and, because dbt's staging
+  stamps `now()` into the SCD2 columns, each evaluation produced *different* rows than the ones the
+  guards had vouched for. The source is now staged once into a local temp table and every merge
+  phase reads that one materialization. On top of that, when a materialized source stages **zero
+  rows** (nothing changed) the engine now skips the merge machinery outright — the target open and
+  version pin, delta-rs's source collection and join build, and the post-merge maintenance
+  (delta-rs already declined to *commit* an empty merge, but only after paying all of that). The
+  short-circuit applies to any merge whose source duckrun materialized (`merge_materialize_source`
+  or a `not_null` contract), never to a lazy source, and stands aside for
+  `WHEN NOT MATCHED BY SOURCE` clauses — an empty source matches every target row there.
+  `on_schema_change` still lands a new column carried by a zero-row source.
+
 ### Added
 - **`materialized='external'`** — the last materialization dbt-duckdb had and duckrun didn't. A
   model can now be exported as a plain parquet/csv/json file (DuckDB `COPY … TO`) and is surfaced as
