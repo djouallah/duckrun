@@ -31,8 +31,8 @@ Every still-failing test in the card below falls into one of three categories:
 
 ```
 ┌────────────────────────────────────────────────────────┐
-│ ✅ 152 passed   ❌ 4 failed   💥 0 errors   ⏭️ 10 skipped │
-│ 166 total · 92% passing                                │
+│ ✅ 153 passed   ❌ 4 failed   💥 0 errors   ⏭️ 10 skipped │
+│ 167 total · 92% passing                                │
 └────────────────────────────────────────────────────────┘
 ```
 
@@ -50,7 +50,7 @@ Every still-failing test in the card below falls into one of three categories:
 | `fast_seed` | `██████████` 100% | 4 | 0 | 0 | 0 | 4 |
 | `get_columns_in_relation` | `██████████` 100% | 2 | 0 | 0 | 0 | 2 |
 | `incremental_microbatch` | `██████████` 100% | 14 | 0 | 0 | 0 | 14 |
-| `simple_snapshot` | `██████████` 100% | 9 | 0 | 0 | 0 | 9 |
+| `simple_snapshot` | `██████████` 100% | 10 | 0 | 0 | 0 | 10 |
 | `store_test_failures` | `██████████` 100% | 1 | 0 | 0 | 0 | 1 |
 | `unit_testing` | `██████████` 100% | 5 | 0 | 0 | 0 | 5 |
 | `unit_testing_incremental` | `██████████` 100% | 15 | 0 | 0 | 0 | 15 |
@@ -59,7 +59,7 @@ Every still-failing test in the card below falls into one of three categories:
 | `persist_docs` | `████████░░` 80% | 4 | 0 | 0 | 1 | 5 |
 | `incremental` | `████████░░` 76% | 22 | 2 | 0 | 5 | 29 |
 | `changing_relation_type` | `░░░░░░░░░░` 0% | 0 | 1 | 0 | 0 | 1 |
-| **Total** | `█████████░` **92%** | **152** | **4** | **0** | **10** | **166** |
+| **Total** | `█████████░` **92%** | **153** | **4** | **0** | **10** | **167** |
 
 ### Incremental / write support
 
