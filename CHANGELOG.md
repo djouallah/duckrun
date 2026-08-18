@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **The merge disk-spill cap no longer strands most of a big disk.** The default
+  `max_temp_directory_size` was 80% of free space on the spill disk — a purely proportional
+  reserve that left ~15 GB unused on a 75 GB CI disk while the v0.4.58 release gate's update-only
+  merge was aborted at the cap (and would strand ~380 GB of the Fabric work disk). The reserve is
+  now `min(20% of free, 8 GiB)`: below 40 GiB free nothing changes; above it the cap is
+  free-minus-8-GiB. Explicit `merge_max_temp_directory_size` still wins verbatim.
 - **Column introspection no longer replays the Delta log on dbt-duckdb ≥ 1.11** (issue #59).
   dbt-duckdb 1.11.0 rewrote `get_columns_in_relation` to `describe {{ relation }}`, which under
   duckrun re-binds the `delta_scan` view — a remote `_delta_log` LIST + commit-JSON replay — on

@@ -494,3 +494,44 @@ def test_cleanup_gate_counts_commits_since_last_cleanup(monkeypatch):
     monkeypatch.setitem(engine._last_cleanup_version, path, 10)
     assert engine._cleanup_due(path, _MaintDT(version=12)) is False   # 12 - 10 = 2  < 50
     assert engine._cleanup_due(path, _MaintDT(version=60)) is True    # 60 - 10 = 50 >= 50
+
+
+# ------------------------------------------- disk spill cap: flat reserve on big disks
+
+def _fake_disk(monkeypatch, free_bytes):
+    import shutil as _shutil
+
+    class _Usage:
+        free = free_bytes
+    monkeypatch.setattr(_shutil, "disk_usage", lambda path: _Usage)
+
+
+def test_temp_dir_cap_small_disk_keeps_the_proportional_reserve(monkeypatch):
+    """Below 40 GiB free the old 80% rule holds unchanged — small disks keep the same slack."""
+    _fake_disk(monkeypatch, 10 * 2 ** 30)
+    assert engine._default_merge_temp_dir_size() == 8 * 2 ** 30
+
+
+def test_temp_dir_cap_big_disk_reserve_flattens_at_8gib(monkeypatch):
+    """Above 40 GiB free the reserve is a flat 8 GiB, not 20%: a proportional reserve stranded
+    ~15 GB on the 75 GB CI disk while the v0.4.58 gate's update-only merge died at the cap with
+    room left (and would strand ~380 GB on the Fabric work disk)."""
+    _fake_disk(monkeypatch, 75 * 2 ** 30)
+    assert engine._default_merge_temp_dir_size() == 67 * 2 ** 30
+    _fake_disk(monkeypatch, 2 * 2 ** 40)
+    assert engine._default_merge_temp_dir_size() == 2 * 2 ** 40 - 8 * 2 ** 30
+
+
+def test_temp_dir_cap_boundary_is_continuous(monkeypatch):
+    """At exactly 40 GiB free both formulas agree (reserve = 8 GiB = 20%)."""
+    _fake_disk(monkeypatch, 40 * 2 ** 30)
+    assert engine._default_merge_temp_dir_size() == 32 * 2 ** 30
+
+
+def test_temp_dir_cap_unreadable_disk_returns_none(monkeypatch):
+    import shutil as _shutil
+
+    def _boom(path):
+        raise OSError("no disk_usage here")
+    monkeypatch.setattr(_shutil, "disk_usage", _boom)
+    assert engine._default_merge_temp_dir_size() is None

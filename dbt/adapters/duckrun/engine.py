@@ -478,6 +478,7 @@ def mem_profile(label: str, con=None, interval: float = 0.1):
 # fit its working set), so the cap gets the bulk of the budget.
 _MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size (in-memory pool)
 _MERGE_TEMP_DIR_FRACTION = 0.8  # delta_rs merge max_temp_directory_size, as a share of free spill disk
+_MERGE_TEMP_DIR_RESERVE = 8 * 2 ** 30  # ceiling on the disk-spill reserve (see _default_merge_temp_dir_size)
 
 # The one DuckDB memory_limit pin, applied once per connection (see _pin_memory_limit). It exists
 # because DuckDB's own default memory_limit is 80% of *physical* RAM, and on a container
@@ -537,7 +538,8 @@ def _merge_spill_dir() -> str:
 
 
 def _default_merge_temp_dir_size() -> Optional[int]:
-    """delta_rs merge ``max_temp_directory_size`` default: ~80% of the FREE space on the spill disk.
+    """delta_rs merge ``max_temp_directory_size`` default: the FREE space on the spill disk minus a
+    reserve of ``min(20% of free, 8 GiB)``.
 
     DataFusion's DiskManager otherwise hard-caps on-disk merge spill at a flat 100 GB regardless of
     how big the disk is — so a wide-partition merge aborts with "Resources exhausted ... exceeded the
@@ -545,17 +547,25 @@ def _default_merge_temp_dir_size() -> Optional[int]:
     This is a SEPARATE limit from ``max_spill_size`` (which bounds the in-*memory* pool): this one
     bounds bytes on disk. Sizing it to the actual disk lets a big merge spill as far as the disk allows.
 
-    0.8, not all of it, because DuckDB spills to the same disk during the merge (source collection) and
-    the dbt target dir + delta_rs write staging also live there — leave ~20% slack. Not divided by the
-    thread count: ``_MERGE_GATE`` serializes delta_rs merges, so at most one is spilling at a time and
-    it gets the whole disk. None if free space can't be read (then delta_rs keeps its 100 GB default).
+    A reserve, not all of it, because DuckDB spills to the same disk during the merge (source
+    collection) and the dbt target dir + delta_rs write staging also live there. The reserve's job
+    needs gigabytes, not gigabytes-per-gigabyte: a purely proportional 20% stranded ~15 GB on a
+    75 GB CI disk while a merge died at the cap with room left (v0.4.58 release gate), and ~380 GB
+    on the Fabric work disk. So the proportional reserve holds below 40 GiB free (small disks keep
+    exactly the old slack) and flattens to 8 GiB above it. Not divided by the thread count:
+    ``_MERGE_GATE`` serializes delta_rs merges, so at most one is spilling at a time and it gets
+    the whole disk. None if free space can't be read (then delta_rs keeps its 100 GB default).
     Override with ``merge_max_temp_directory_size``."""
     import shutil
     try:
         free = shutil.disk_usage(_merge_spill_dir()).free
     except Exception:
         return None
-    return int(free * _MERGE_TEMP_DIR_FRACTION) or None
+    # Derived from the same int(free * 0.8) the proportional rule always used, so below the
+    # 40 GiB crossover the cap is byte-identical to the old behavior (no float-slop drift).
+    proportional_reserve = free - int(free * _MERGE_TEMP_DIR_FRACTION)
+    reserve = min(proportional_reserve, _MERGE_TEMP_DIR_RESERVE)
+    return (free - reserve) or None
 
 
 # Units DuckDB emits from current_setting('memory_limit') (e.g. "25.0 GiB"). Binary (GiB) and
@@ -1979,7 +1989,8 @@ def merge_delta(
       pass 0 (or any falsy non-None) to disable the cap and run unbounded.
     - max_temp_directory_size caps the merge's ON-DISK spill (bytes). delta_rs/DataFusion otherwise
       hard-caps it at a flat 100 GB regardless of disk size, aborting a wide merge on a terabyte disk.
-      None -> default to ~80% of free space on the spill disk (_default_merge_temp_dir_size).
+      None -> default to free space on the spill disk minus a min(20%, 8 GiB) reserve
+      (_default_merge_temp_dir_size).
     - read_version (REQUIRED): pin the merge TARGET to this Delta version (the model's ``vB``).
       delta_rs then validates OCC over ``(vB, HEAD]`` — the exact window the model's pinned read of
       ``{{ this }}`` could not have seen — so the read and the commit share one snapshot
@@ -2154,7 +2165,7 @@ def _merge_spill_caps(max_spill_size, max_temp_directory_size, streamed_exec):
     if temp_dir_kwargs:
         logger.info(
             f"merge disk spill cap: {max_temp_directory_size / 2**30:.2f} GiB "
-            f"({int(_MERGE_TEMP_DIR_FRACTION * 100)}% of free on {_merge_spill_dir()}) "
+            f"(free on {_merge_spill_dir()} minus a min(20%, 8 GiB) reserve) "
             f"— overrides delta_rs's 100 GB default"
         )
     else:
