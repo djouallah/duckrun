@@ -5,6 +5,14 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **Column introspection no longer replays the Delta log on dbt-duckdb ≥ 1.11** (issue #59).
+  dbt-duckdb 1.11.0 rewrote `get_columns_in_relation` to `describe {{ relation }}`, which under
+  duckrun re-binds the `delta_scan` view — a remote `_delta_log` LIST + commit-JSON replay — on
+  every column introspection, measured at +19% storage metadata round-trips per run on OneLake.
+  duckrun now ships `duckrun__get_columns_in_relation` carrying dbt-duckdb 1.10.1's catalog-only
+  `information_schema.columns` query; `adapter.dispatch` prefers the `duckrun__` prefix on either
+  dbt-duckdb version, so the dependency range stays open. The empty-catalog case
+  (`dbt run-operation`, issue #24) keeps its existing Python-side bind-and-retry fallback.
 - **An unchanged snapshot no longer spends minutes evaluating a source the merge never touches**
   (issue #61). The snapshot materialization now forwards `merge_materialize_source: true`: its merge
   source was a lazy view stack (staging over a pinned remote `delta_scan` plus the model SQL) that

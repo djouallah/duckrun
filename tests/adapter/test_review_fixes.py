@@ -757,3 +757,24 @@ def test_nonempty_materialized_source_upserts_normally(tmp_path):
     t = DeltaTable(path).to_pyarrow_table().sort_by("id")
     assert dict(zip(t.column("id").to_pylist(), t.column("value").to_pylist())) == \
         {1: 10, 2: 20, 3: 999, 4: 40}
+
+
+# --------------------------------------- issue #59: catalog-only column introspection
+
+def test_get_columns_in_relation_macro_is_catalog_only():
+    """dbt-duckdb 1.11.0 rewrote duckdb__get_columns_in_relation to `describe {{ relation }}`,
+    which under duckrun re-binds the delta_scan view — a remote Delta log replay — on EVERY
+    column introspection (+19% storage round-trips per run, issue #59). duckrun pins the
+    catalog-only 1.10.1 SQL under the duckrun__ prefix (dispatch resolves duckrun__ before
+    duckdb__, the same mechanism the timestamps.sql overrides rely on). Assert the override
+    exists and never DESCRIBEs, so a future upstream sync can't silently reintroduce the bind."""
+    from pathlib import Path
+
+    from dbt.adapters.duckrun import delta_plugin
+
+    src = (Path(delta_plugin.__file__).parents[2] / "include" / "duckrun" / "macros"
+           / "adapters.sql").read_text(encoding="utf-8")
+    assert "{% macro duckrun__get_columns_in_relation(relation) -%}" in src
+    body = src.split("macro duckrun__get_columns_in_relation", 1)[1].split("endmacro", 1)[0]
+    assert "system.information_schema.columns" in body
+    assert "describe" not in body.lower()
