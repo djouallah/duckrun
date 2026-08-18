@@ -2156,7 +2156,7 @@ def handle(cursor, root_path, storage_options, sql: str, default_schema=None,
 
     ``geometry`` is the one-row-group-per-file write geometry from a ``SORTED BY AUTO`` profile the
     caller already paid for (``engine.auto_sort_cols``); only the CTAS form consumes it. ``None``
-    (every other caller, and every non-AUTO statement) keeps the default adaptive layout. It is not
+    (every other caller, and every non-AUTO statement) keeps the default fixed layout. It is not
     forwarded to a multi-statement script: AUTO is single-statement by construction, and a geometry
     measured for one statement's result must not silently size another's.
     """

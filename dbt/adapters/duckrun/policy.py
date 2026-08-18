@@ -1,9 +1,9 @@
 """Layout policy — write-geometry (row-group sizing) + compact/vacuum decisions, in one place.
 
-Pure decisions, no I/O: the row-group ``rg_for`` sizing rule and the ``MaintenancePolicy`` compact/
-vacuum thresholds. The engine owns the *mechanism* (estimating rows, building WriterProperties, running
-the compaction); this module owns *what shape to aim for*, so both the write path and maintenance size
-row groups identically from one place. See ``rg_for`` below for the write-geometry half.
+Pure decisions, no I/O: the fixed write geometry, the AUTO ``rg_for`` sizing rule and the
+``MaintenancePolicy`` compact/vacuum thresholds. The engine owns the *mechanism* (building
+WriterProperties, running the compaction); this module owns *what shape to aim for*, so the write
+path and maintenance size row groups identically from one place.
 
 The maintenance half was extracted from the post-write upkeep that was inlined in ``engine._maintain``
 (and duplicated in the Tier-0 safe button) so the trigger thresholds live in one testable object
@@ -30,53 +30,41 @@ from dbt.adapters.events.logging import AdapterLogger
 logger = AdapterLogger("Duckrun")
 
 # The one read-layout target every file write, compaction, and sort-rewrite uses (see engine).
-DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
+DEFAULT_TARGET_FILE_SIZE = 128 * 1024 * 1024
+
+# Delta checkpoint cadence, stamped as `delta.checkpointInterval` on every table duckrun creates.
+# delta-rs's post-commit hook honors the property and writes the checkpoint itself; without it the
+# delta-rs default is 100 commits, which leaves an incrementally-written table replaying up to 99
+# JSON commits on every open. Creation-only: an existing table keeps whatever it has.
+CHECKPOINT_INTERVAL = 10
 
 # ------------------------------------------------------------------------- write-layout geometry
 # A Parquet row group maps 1:1 to a Direct Lake column segment: any size from 1M to 16M rows is a fine
-# segment and 16M is the ceiling (kept under 2^24 so one row group stays one segment). This is a
-# CEILING, not a size: the 256 MB file roll usually closes the group first, so a write left at RG_MAX
-# still lands well inside the band. A SMALL write shrinks the ceiling so the table still yields
-# ~RG_LANES groups — each segment transcodes on its own lane, so 2 groups cold-load on 2 lanes.
-# Only max_row_group_size moves — never bytes.
+# segment and 16M is the ceiling (kept under 2^24 so one row group stays one segment). These are
+# CEILINGS, not sizes: the 128 MB file roll usually closes the group first, so a write left at the
+# ceiling still lands well inside the band.
 #
-# NOT a write-memory ceiling, despite what this comment used to claim: delta_rs closes the file as
-# soon as its buffered size reaches target_file_size (checked every write batch), so the writer's
-# footprint is bounded by the BYTE target no matter how large max_row_group_size is. That is what lets
-# the AUTO path below set the row ceiling out of reach entirely (see RG_UNREACHABLE).
+# NOT a write-memory ceiling: delta_rs closes the file as soon as its buffered size reaches
+# target_file_size (checked every write batch), so the writer's footprint is bounded by the BYTE
+# target no matter how large max_row_group_size is. That is what lets the AUTO path below set the
+# row ceiling out of reach entirely (see RG_UNREACHABLE).
 ROW_GROUP_MAX_ROWS = 16_000_000
-RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # target row groups for a small overwrite
+# The FIXED row-group ceiling every normal (non-AUTO) write uses — 8M rows, Power BI's default
+# segment size. There is no derived sizing on the normal path: the planner-estimate machinery that
+# used to adapt the ceiling to the result (EXPLAIN cardinality, prior-log floors, accuracy warnings)
+# cost a plan/probe on every write for no measured read-side advantage, and is gone. The only write
+# that sizes itself from data is SORTED BY AUTO, whose profile already paid for an exact count.
+ROW_GROUP_DEFAULT_ROWS = 8_000_000
+RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # AUTO rows-target: aim for ~this many groups
 RG_MIN = 1_000_000
-# Floor for a row count that came from the DuckDB PLANNER rather than the Delta log. The planner's
-# estimate is not a measurement and can be an order of magnitude low: DuckDB applies a fixed 0.2
-# selectivity guess to filters and anti/semi joins, a set-op parent carries no cardinality of its own,
-# and a CSV is extrapolated from FILE SIZE (so a gzipped source is off by its compression ratio) —
-# none of which duckrun can fix without reimplementing a planner. The failure is asymmetric: an
-# over-estimate is harmless (it caps at RG_MAX and the file roll decides), while an under-estimate
-# pins a huge table to the bottom of the band permanently — measured on a 370M-row fact, a 9x
-# under-estimate produced 380 row groups where ~34 belong (issue #22). A guess therefore never drives
-# the ceiling below 8M — Power BI's default segment size, so a floor-bound write hands Direct Lake
-# its native segment rather than a fraction of one (measured on a 144M-row mart: a 9.7x planner
-# under-estimate floor-pinned every segment). This costs the ~RG_LANES target below
-# RG_LANES × RG_MIN_ESTIMATED rows, which is the deliberate trade: fewer lanes on a small table,
-# no floor-pinning on a large one.
-#
-# A SORTED BY AUTO write is exempt and passes the low RG_MIN floor instead: it stages its source into
-# a temp table and the profiler counts every row (sortkey.recommend_sort_key), so its row count is a
-# measurement, not a guess, and the whole reason this floor exists does not apply.
-RG_MIN_ESTIMATED = 8_000_000
-RG_MAX = ROW_GROUP_MAX_ROWS  # big/unknown estimates keep this exactly
+RG_MAX = ROW_GROUP_MAX_ROWS  # big/unknown counts keep this exactly
 
 
 def rg_for(est, floor=RG_MIN):
-    """Row-group CEILING for a write, from the result rows. Big/unknown -> the 16M constant (the
-    pre-adaptive layout, unchanged); a small result shrinks toward ~RG_LANES groups, floored at
-    ``floor``.
-
-    ``floor`` is how much the caller's row count can be trusted, and it is the only knob:
-    ``RG_MIN`` for an EXACT count read from the Delta log (compaction, ``optimize``), which can be
-    taken at face value, and ``RG_MIN_ESTIMATED`` for a DuckDB PLANNER estimate (the overwrite
-    path), which cannot — see RG_MIN_ESTIMATED for why."""
+    """Rows target for a SORTED BY AUTO write, from its exact row count. Big/unknown -> the 16M
+    constant; a small result shrinks toward ~RG_LANES groups, floored at ``floor`` (RG_MIN — the
+    count is a measurement, taken at face value). Only the AUTO geometry and its readout call this;
+    a normal write takes the fixed ROW_GROUP_DEFAULT_ROWS ceiling instead."""
     if est is None or est >= RG_LANES * RG_MAX:
         return RG_MAX
     return max(floor, min(RG_MAX, -(-est // RG_LANES)))   # ceil(est / RG_LANES)
@@ -147,11 +135,13 @@ AUTO_TFS_FACTOR = float(os.environ.get("DUCKRUN_AUTO_TFS_FACTOR", "1.0"))
 # BYTES; measured, that shattered a 4M-row table into 490 files of 8,192 rows. rg_for's RG_MIN bounds
 # rows_target, but nothing bounds the byte target, so the collapse is unbounded without this.
 # Deliberately small: it is a COLLAPSE guard, not a size policy. Set it at the "healthy file" mark
-# (256/RG_LANES = 32 MB) and it stops being a guard and starts being the layout — measured at 40M
+# (~32 MB) and it stops being a guard and starts being the layout — measured at 40M
 # rows, a 32 MB floor governed the well-compressing shapes outright and pinned them to ~2.4x their
 # row target, which is the opposite of the exact row group this path exists to produce. 8 MB still
 # collapses the pathological case to a single file while leaving every realistic shape to the model.
-TFS_MIN = int(os.environ.get("DUCKRUN_AUTO_TFS_MIN", DEFAULT_TARGET_FILE_SIZE // 32))
+# A literal, NOT derived from DEFAULT_TARGET_FILE_SIZE: the AUTO calibration was measured at 8 MB
+# and must not drift when the normal-write file target moves.
+TFS_MIN = int(os.environ.get("DUCKRUN_AUTO_TFS_MIN", 8 * 1024 * 1024))
 
 
 def tfs_for(rows_target, bytes_per_row):
@@ -159,7 +149,7 @@ def tfs_for(rows_target, bytes_per_row):
     to keep ``DEFAULT_TARGET_FILE_SIZE``.
 
     Capped at ``DEFAULT_TARGET_FILE_SIZE``: a fact wide enough that ``rows_target`` would need a bigger
-    file keeps the global 256 MB policy and lands a smaller — still single — row group. Floored at
+    file keeps the global 128 MB policy and lands a smaller — still single — row group. Floored at
     ``TFS_MIN``, which binds only when the byte model has collapsed (see there)."""
     if not rows_target or not bytes_per_row or AUTO_TFS_FACTOR <= 0:
         return None

@@ -8,7 +8,6 @@ pyarrow dependency.
 """
 import ctypes
 import hashlib
-import json
 import os
 import re
 import threading
@@ -19,8 +18,9 @@ from dbt.adapters.events.logging import AdapterLogger
 from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_deltalake
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
-from dbt.adapters.duckrun.policy import (MaintenancePolicy, DEFAULT_TARGET_FILE_SIZE,
-                                         ROW_GROUP_MAX_ROWS, RG_LANES, RG_MIN, RG_MIN_ESTIMATED,
+from dbt.adapters.duckrun.policy import (MaintenancePolicy, CHECKPOINT_INTERVAL,
+                                         DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS,
+                                         RG_LANES, RG_MIN,
                                          RG_MAX, RG_UNREACHABLE, auto_rg_cap, rg_for, tfs_for)
 from dbt.adapters.duckrun import sortkey
 
@@ -43,10 +43,10 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# Row-group size (16M rows) + the adaptive sizing rule live in policy.py now (see policy.rg_for). This
-# alias is the default max_row_group_size _writer_properties uses when no adaptive size is passed; it is
-# also the write-memory ceiling (arrow-rs buffers a full uncompressed row group per open writer).
-_ROW_GROUP_SIZE = ROW_GROUP_MAX_ROWS
+# The FIXED row-group ceiling (8M rows) every normal write uses — see policy.ROW_GROUP_DEFAULT_ROWS.
+# This alias is the default max_row_group_size _writer_properties uses when no explicit ceiling is
+# passed; only a per-model max_row_group_size config or the AUTO geometry (RG_UNREACHABLE) moves it.
+_ROW_GROUP_SIZE = ROW_GROUP_DEFAULT_ROWS
 # Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
 # overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
 # shrinks the written files and gives the columnar reader denser, more uniform segments — the read
@@ -63,7 +63,7 @@ _DICT_PAGE_SIZE_LIMIT = 32 * 1024 * 1024
 # column, so it can't cap the page on its own.
 _DATA_PAGE_SIZE_LIMIT = 1_048_576
 # Data page ROW-COUNT limit — the backstop for columns the byte cap can't see: the byte cap is checked
-# on ENCODED page bytes, so a highly compressible column would otherwise buffer its whole 16M-row group
+# on ENCODED page bytes, so a highly compressible column would otherwise buffer its whole row group
 # as a single page (~10x write memory, and giant pages blow the merge's read-side spill cap → out of
 # disk; arrow-rs #5797 / #4973). At 20k (arrow-rs's intended default) this cap fired FIRST on every
 # column, overriding the 1 MB byte cap into ~20k-row micro-pages — and page count is pure read-side
@@ -73,13 +73,12 @@ _DATA_PAGE_SIZE_LIMIT = 1_048_576
 # layout benchmark (tests/parquet_layout/aemo): ~40x fewer pages per chunk, cold column loads
 # consistently faster, write memory unchanged (dense pages are bounded by bytes, not rows).
 _DATA_PAGE_ROW_LIMIT = 1_000_000
-# Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a segment
-# cap: it lets more of a table reach the full 16M-row group before the file rolls (a narrow fact fits a
-# 16M-row segment well under 256 MB; a wide fact like lineitem is capped by the file size first), giving
-# larger, more uniform Direct Lake segments. It
+# Target file size: 128 MB. A Parquet row group can't span files, so this byte cap is really a segment
+# cap: a narrow fact reaches the full 8M-row ceiling well under 128 MB; a wide fact is capped by the
+# file size first. It
 # is NOT a merge-memory lever — that was the dictionary page limit (see _DICT_PAGE_SIZE_LIMIT); with that
 # bounded, 128/256/512 MB all merge in ~16s at ~4.5-5.2 GB (measured), so file size is free to serve the
-# read layout. Still deliberately far below 1 GB, which forced the whole-file copy-on-write that blew up
+# read layout. Deliberately far below 1 GB, which forced the whole-file copy-on-write that blew up
 # merges on disk. Applied by every file write (build_write_deltalake_args) and the routine post-write
 # compaction. MERGE is the exception — it sets no target_file_size. Defined in policy.py (the one
 # read-layout target); aliased here so the many in-module references stay put.
@@ -89,165 +88,12 @@ _TARGET_FILE_SIZE = DEFAULT_TARGET_FILE_SIZE
 # IN list stops buying pruning (the source spans most of the table) and we let delta_rs plan on its own.
 _PART_PRUNE_MAX = 400
 
-# The adaptive row-group sizing rule (policy.rg_for) and its constants live in policy.py. Aliased here
-# so in-module callers and the tests keep referring to engine._RG_*. The overwrite geometry is computed
-# from policy.rg_for(estimated_rows(...), floor=_RG_MIN_ESTIMATED) in write_delta — the higher floor
-# because that row count is a planner GUESS; compaction and optimize size off the exact log count and
-# keep _RG_MIN. An append is not sized at all: it passes row_group_rows=None, so the ceiling stays
-# _ROW_GROUP_SIZE and the 256 MB file roll picks the group.
-_RG_LANES, _RG_MIN, _RG_MIN_ESTIMATED, _RG_MAX = RG_LANES, RG_MIN, RG_MIN_ESTIMATED, RG_MAX
-
-
-def _walk_cardinality(plan):
-    v = plan.get("extra_info", {}).get("Estimated Cardinality")
-    if v is not None and int(v) > 0:      # MUST skip 0: the projection above an ORDER_BY reports
-        return int(v)                      # 0 (verified) — descend to the first non-zero (SEQ_SCAN)
-    children = plan.get("children", [])
-    # A UNION ALL parent carries NO cardinality of its own (verified: name "UNION", card None) while
-    # each branch carries its own, so the plain first-child descent below would return ONE branch and
-    # silently drop the rest — an N-feed union reporting 1/N of its rows. Its result spans every
-    # branch, so sum them; for UNION ALL that is exact. Only this node sums: DuckDB collapses UNION
-    # (distinct), EXCEPT and INTERSECT into a single-child PROJECTION over HASH_GROUP_BY, so they
-    # never reach here and can't be over-summed, and summing a JOIN's inputs would be meaningless.
-    if len(children) > 1 and (plan.get("name") or "").upper() == "UNION":
-        parts = [r for r in (_walk_cardinality(c) for c in children) if r is not None]
-        return sum(parts) if parts else None
-    for c in children:
-        r = _walk_cardinality(c)
-        if r is not None:
-            return r
-    return None
-
-
-def _plan_has_limit(plan):
-    """True if the plan tree contains a LIMIT / STREAMING_LIMIT node. DuckDB's EXPLAIN annotates that
-    node with NOTHING (empty extra_info — no limit value, no reduced cardinality), so a limited query's
-    estimate falls through _walk_cardinality to the pre-limit SEQ_SCAN count. The node's mere presence
-    is our only signal that the estimate is untrustworthy and an exact count is needed."""
-    if "LIMIT" in (plan.get("name") or "").upper():
-        return True
-    return any(_plan_has_limit(c) for c in plan.get("children", []))
-
-
-def estimated_rows(cur, data):
-    """Estimated result rows for a DuckDB relation. None on any failure.
-
-    Registers the relation on its connection and reads the planner's Estimated Cardinality (EXPLAIN,
-    no execution). This is the single overwrite seam the SQL CTAS path and the dbt table path both flow
-    through, so they size identically. ``cur`` must be the connection that produced ``data``; ``None``
-    skips the estimate (the write keeps the 16M profile).
-
-    A LIMIT is invisible to the estimate — DuckDB exposes neither its value nor a reduced cardinality,
-    so the walk would report the whole source and the row groups would be sized for the pre-limit count
-    (a ``… LIMIT 50M`` off a 140M table sizes as 140M). When the plan carries a limit we take an exact
-    ``count(*)`` instead; the limit short-circuits the scan, so it stays cheap."""
-    if cur is None:
-        return None
-    # Per-thread, per-relation name: a fixed one would have two concurrent writes sharing a connection
-    # (the notebook API driven from user threads, or the shared-connection fallback in delta_plugin)
-    # clobber each other's registration mid-estimate.
-    name = tmp_name("rgest", (threading.get_ident(), id(data)))
-    try:
-        cur.register(name, data)
-        try:
-            raw = cur.execute(f"EXPLAIN (FORMAT JSON) SELECT * FROM {name}").fetchall()[0][1]
-            plan = json.loads(raw)[0]
-            if _plan_has_limit(plan):
-                row = cur.execute(f"SELECT count(*) FROM {name}").fetchone()
-                return int(row[0]) if row and row[0] is not None else _walk_cardinality(plan)
-            return _walk_cardinality(plan)
-        finally:
-            cur.unregister(name)
-    except Exception as exc:
-        logger.debug(f"duckrun: row estimate unavailable: {exc}")
-        return None
-
-
-def table_num_records(cur, dt):
-    """Total live rows of an EXISTING table from the Delta **log** (sum of per-file num_records) — free,
-    no data scan. This is the exact size compaction is about to rewrite, so compaction sizes its row
-    groups from it directly (no planner estimate needed). None if unavailable (no cursor, or a stat-less
-    log) so the caller keeps the 16M profile. 0 rows -> None (an empty table has nothing to size).
-
-    A log where only SOME live files carry stats reports None too, not the partial sum: SQL ``sum``
-    ignores NULLs, so such a log would answer with a fraction of the table and the caller (compaction,
-    which trusts this count at the LOW RG_MIN floor) would size its row groups off that fraction. An
-    unknown count keeps the 16M ceiling; a silently-low one pins the table to the bottom of the band —
-    the issue-#22 failure shape, reached from the other direction. delta-rs always writes num_records,
-    so this only fires on a foreign-written log.
-
-    Counts PHYSICAL rows: deletion vectors are not subtracted (that costs a DV read — see
-    deleted_row_count). An over-count is the harmless direction here, so this is deliberate."""
-    if cur is None:
-        return None
-    try:
-        add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
-        row = cur.sql(
-            "select coalesce(sum(num_records), 0)::bigint, "
-            "count(*) filter (where num_records is null) from add_actions"
-        ).fetchone()
-    except Exception as exc:
-        logger.debug(f"duckrun: log row count unavailable: {exc}")
-        return None
-    if not row:
-        return None
-    total, missing = row[0], row[1]
-    if missing:
-        logger.debug(f"duckrun: {missing} file(s) carry no num_records — row count unknown, keeping 16M")
-        return None
-    return int(total) if total else None   # 0 rows -> unknown -> keep 16M
-
-
-def prior_row_count(cur, path, storage_options=None):
-    """Exact live rows of the table an overwrite is ABOUT TO REPLACE, read from the Delta log — a free
-    lower bound on a planner estimate that cannot be trusted (see policy.RG_MIN_ESTIMATED). None on ANY
-    failure: no cursor, no table yet, a stat-less log, or a transient store error.
-
-    Deliberately NOT ``open_if_exists``'s fail-loud contract. That one re-raises a transient store error
-    because a wrong EXISTENCE answer is data loss (a 503 must not look like "no table" and overwrite an
-    increment over a real one). This is only SIZING — a wrong answer costs segment shape, never
-    correctness — so every error degrades to "unknown" and the write proceeds untouched. Keep the two
-    separate; do not route this through open_if_exists."""
-    if cur is None:
-        return None
-    try:
-        dt = _delta_table(path, storage_options)
-    except Exception as exc:
-        logger.debug(f"duckrun: prior row count unavailable for {path!r}: {exc}")
-        return None
-    return table_num_records(cur, dt)
-
-
-# An overwrite whose row estimate was low by this factor or more gets a warning. 4x is well outside
-# normal planner error and comfortably inside the ~9x that produced issue #22.
-_RG_EST_WARN_FACTOR = 4
-
-
-def _warn_if_estimate_was_far_off(cur, dt, est, row_group_rows):
-    """Tell the user when an overwrite's row estimate turned out badly low — the issue-#22 field
-    detector. The rows that actually landed are exact and free (the just-committed log), so this closes
-    the loop the planner estimate opens: without it, a table pinned to the bottom of the row-group band
-    is invisible until someone inspects the Parquet footers.
-
-    NOT a realized-layout check: the Delta log carries no row-group information at all, only per-file
-    num_records / size_bytes. It compares what we SIZED FOR against what LANDED, nothing more.
-
-    Only the under-estimate direction warns (an over-estimate is harmless by design — it caps at RG_MAX
-    and the file roll decides) and only when the ceiling was actually shrunk, so a correctly-sized write
-    is silent. A table that merely grows run-over-run does not trip it either: the planner sees the new
-    data. Best-effort — never raises, never touches the committed write."""
-    if cur is None or not est or not row_group_rows or row_group_rows >= _RG_MAX:
-        return
-    try:
-        actual = table_num_records(cur, dt)
-        if actual and actual >= _RG_EST_WARN_FACTOR * est:
-            logger.warning(
-                f"duckrun: row-group geometry was sized for ~{est:,} rows but {actual:,} landed "
-                f"({actual / est:.1f}x) — segments are smaller than intended. Compact the table "
-                f"(VACUUM <table> / optimize) to re-lay it out from its exact row count."
-            )
-    except Exception as exc:
-        logger.debug(f"duckrun: estimate-accuracy check skipped: {exc}")
+# The AUTO sizing rule (policy.rg_for) and its constants live in policy.py. Aliased here so
+# in-module callers and the tests keep referring to engine._RG_*. A normal write is NOT sized at
+# all: overwrite, append and replaceWhere alike pass row_group_rows=None, keep the fixed
+# _ROW_GROUP_SIZE ceiling, and let the 128 MB file roll pick the group. Only SORTED BY AUTO derives
+# a geometry (see _auto_geometry), and only a per-model max_row_group_size overrides the ceiling.
+_RG_LANES, _RG_MIN, _RG_MAX = RG_LANES, RG_MIN, RG_MAX
 
 
 # An AUTO write whose landed row groups miss the target by this factor either way gets a warning —
@@ -295,14 +141,14 @@ def _log_auto_geometry(cur, dt):
 
 def _writer_properties(row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, 16M-row row groups, a 32 MB dictionary page limit
+    # compaction, and the optimize sort-rewrite: SNAPPY, the fixed 8M-row group ceiling, a 32 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
     # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap that shapes
     # dense columns into ~1 MB pages (the 1M-row cap only backstops ultra-compressible columns — see
     # _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
     # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults) so a
     # merge stays quick and never rewrites fat files, and so the known OOM-prone path does not also
-    # take on a 16M-row write buffer; post-merge compaction folds merged files up into this layout
+    # take on a large write buffer; post-merge compaction folds merged files up into this layout
     # later. That exemption covers only a merge that actually reaches delta_rs: an insert-only merge
     # is routed to a DuckDB anti-join + plain append (see insert_delta) and IS written with this
     # profile. Degrade gracefully if the pinned wheel rejects a newer parameter (last rung:
@@ -848,7 +694,7 @@ def build_write_deltalake_args(
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
     EVERY write through here — overwrite, replace-where and append alike — gets the one read-layout
-    profile: the tuned writer properties plus the 256 MB ``target_file_size``. MERGE does not go
+    profile: the tuned writer properties plus the 128 MB ``target_file_size``. MERGE does not go
     through here at all and keeps delta_rs defaults.
 
     Append used to be excluded on the theory that appends are transient increments which
@@ -857,15 +703,15 @@ def build_write_deltalake_args(
     ``policy.MaintenancePolicy``), so append files that are already a healthy size are invisible to
     the trigger and keep delta_rs's 1,048,576-row groups and 100 MB files forever — the bottom of
     the segment band, permanently, on exactly the append-only fact tables that can least afford it
-    (issue #22). Sizing the append correctly at write time is what closes that, and it costs
+    (issue #22). Writing the append with the profile is what closes that, and it costs
     nothing on a small append: ``max_row_group_size`` is a CEILING, and an increment that never
     reaches it is written exactly as before.
 
-    ``row_group_rows`` is the adaptive overwrite geometry (see ``write_delta`` / ``rg_for``). It is
-    meaningless on append — an increment knows nothing about the table it lands in — so append
-    passes ``None`` and keeps the ``_ROW_GROUP_SIZE`` ceiling, letting the file roll pick the group.
+    ``row_group_rows`` is an EXPLICIT ceiling only (a per-model ``max_row_group_size``, or the AUTO
+    geometry's ``RG_UNREACHABLE``). ``None`` — every normal write — keeps the fixed
+    ``_ROW_GROUP_SIZE`` ceiling and lets the file roll pick the group; nothing is derived.
 
-    ``target_file_size`` (bytes) overrides the 256 MB default for THIS write — the per-model
+    ``target_file_size`` (bytes) overrides the 128 MB default for THIS write — the per-model
     ``target_file_size_mb`` dbt config lands here. ``None`` keeps ``_TARGET_FILE_SIZE``.
     """
     args: Dict[str, Any] = {
@@ -882,7 +728,10 @@ def build_write_deltalake_args(
     if schema_mode in ("merge", "overwrite"):
         args["schema_mode"] = schema_mode
     args["target_file_size"] = target_file_size if target_file_size is not None else _TARGET_FILE_SIZE
-    # append passes row_group_rows=None → the _ROW_GROUP_SIZE ceiling, file roll decides (see above)
+    # Applied only when this write CREATES the table; delta-rs ignores it on an existing one
+    # (verified on the pinned wheel — an existing table's configuration is never touched, so a
+    # user-set property can't be clobbered from here).
+    args["configuration"] = {"delta.checkpointInterval": str(CHECKPOINT_INTERVAL)}
     wp = _writer_properties(row_group_rows=row_group_rows)
     if wp is not None:
         args["writer_properties"] = wp
@@ -981,7 +830,7 @@ def coerce_naive_timestamps(data, *, path: str,
     microseconds; nanoseconds truncate).
 
     The result is another DuckDB relation (``data.query``), never an Arrow-level cast — the
-    downstream seams keep relying on relation behavior (``estimated_rows``, ``.columns``,
+    downstream seams keep relying on relation behavior (``.columns``,
     ``.limit(0)``, ``.create_view``).
 
     ``timestamp_ntz`` True keeps NTZ (the per-model escape hatch); None falls back to the
@@ -1299,7 +1148,7 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
 
     ``geom`` is ``{"row_group_rows", "target_file_size", "rows", "bytes_per_row"}`` or ``None`` when
     the byte target cannot be computed (empty profile, or ``AUTO_TFS_FACTOR`` disabled) — ``None``
-    means "change nothing", so the caller keeps today's adaptive ceiling and 256 MB files. It is
+    means "change nothing", so the caller keeps the fixed 8M ceiling and 128 MB files. It is
     computed HERE, not per surface, so the SQL and dbt paths cannot size a write two different ways.
 
     ``source`` MUST be cheap to scan repeatedly — the recommender reads it several times. The
@@ -1351,7 +1200,7 @@ def _auto_geometry(cur, source, rows, *, narrow_decimals=False, full_rows=None, 
         n = full_rows if full_rows is not None else cur.sql(
             f"SELECT count(*) FROM {source}").fetchone()[0]
         bpr = sortkey.bytes_per_row(rows, profile_rows or n, narrow_decimals=narrow_decimals)
-        # An exact count takes rg_for's LOW floor — see the docstring above and policy.RG_MIN_ESTIMATED.
+        # The count is a measurement, so it takes rg_for's low RG_MIN floor at face value.
         # Capped below the top of the band (policy.auto_rg_cap): with one row group per file the byte
         # model's measured overshoot spread would otherwise push a 16M target past the segment band.
         rows_target = min(rg_for(n, floor=RG_MIN), auto_rg_cap())
@@ -1552,10 +1401,9 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
 
     The compaction trigger matches the Tier-0 safe button exactly (compaction_debt: at least 8 files
     under half the target AND at least 2x the target in small bytes). compact() reuses the same
-    _writer_properties() read layout and _TARGET_FILE_SIZE every file write uses — with the row-group
-    size adapted to the table's live row count (free from the log) so a small table compacts to
-    ~_RG_LANES groups, not one 16M group — so maintenance (including the consolidation of files a lean
-    MERGE left behind) keeps the uniform Direct Lake layout.
+    _writer_properties() read layout (the fixed 8M-row ceiling) and _TARGET_FILE_SIZE every file
+    write uses, so maintenance (including the consolidation of files a lean MERGE left behind) keeps
+    the uniform Direct Lake layout.
 
     The byte debt is measured with the DuckDB cursor ``cur`` (a replacement scan over the Delta log's
     add-actions); a caller with no cursor to lend — a bare engine write outside a session — simply
@@ -1564,7 +1412,7 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
 
     ``target_file_size`` / ``row_group_cap`` carry a model's EXPLICIT write geometry (the
     ``target_file_size_mb`` / ``max_row_group_size`` dbt configs) into maintenance: without them, the
-    very next compaction would re-fold the model's files back into the global 256 MB / adaptive-16M
+    very next compaction would re-fold the model's files back into the global 128 MB / fixed-8M
     layout, silently undoing the config the write just honored. ``None`` = the defaults, unchanged."""
     if cur is None:
         return
@@ -1573,11 +1421,9 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
     _target = target_file_size if target_file_size is not None else _TARGET_FILE_SIZE
     policy = MaintenancePolicy(target_file_size=_target)
 
-    # Adaptive row-group geometry: compaction rewrites the whole table into the read layout, and the
-    # table's live row count is free in the log — so a small table compacts to ~_RG_LANES small groups
-    # instead of one fat 16M group (big/unknown -> 16M). Same knob as the overwrite path. An explicit
-    # per-model ceiling wins verbatim — it IS the declared layout, not an estimate to improve on.
-    _compact_rg = row_group_cap if row_group_cap is not None else rg_for(table_num_records(cur, dt))
+    # An explicit per-model ceiling wins verbatim — it IS the declared layout; None keeps the fixed
+    # _ROW_GROUP_SIZE ceiling, same as every write (no derived sizing, no log row count taken).
+    _compact_rg = row_group_cap
 
     def _compact():
         dt.optimize.compact(target_size=_target,
@@ -1637,13 +1483,14 @@ def write_delta(
     ONE Delta write seam), so a fenced write is pinned to the caller's snapshot and fails loudly on a
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
-    Every write lands in the one read-layout profile (tuned writer properties + 256 MB files) —
-    append included. Only the row-group CEILING differs: an overwrite sizes it from the result (see
-    ``rg_for``), an append leaves it at the maximum and lets the file roll pick the group.
+    Every write lands in the one read-layout profile (tuned writer properties + 128 MB files) —
+    append included, with the same fixed 8M row-group ceiling everywhere. Nothing is derived from
+    the result: no planner estimate, no count, no prior-log probe (the only self-sizing write is
+    SORTED BY AUTO, whose profile already paid for an exact count).
 
-    An EXPLICIT ``row_group_rows`` (the ``max_row_group_size`` dbt config) bypasses the estimator
-    entirely — a declared geometry is not a guess to second-guess — and, with ``target_file_size``
-    (bytes), is carried into post-write maintenance so compaction preserves it.
+    An EXPLICIT ``row_group_rows`` (the ``max_row_group_size`` dbt config) overrides the fixed
+    ceiling verbatim and, with ``target_file_size`` (bytes), is carried into post-write maintenance
+    so compaction preserves it.
     """
     if mode not in {"overwrite", "append", "ignore"}:
         raise ValueError(f"Invalid mode '{mode}'. Use: overwrite, append, or ignore")
@@ -1660,59 +1507,14 @@ def write_delta(
             return
         mode = "overwrite"
 
-    # Naive-timestamp coercion (issue #42) at the seam, BEFORE the geometry estimate so the
-    # estimate sees the relation that is actually written. A schema-replacing overwrite may
-    # retype freely; anything else must keep matching an existing NTZ target (target-aware skip).
+    # Naive-timestamp coercion (issue #42) at the seam, so every surface writes the same relation.
+    # A schema-replacing overwrite may retype freely; anything else must keep matching an existing
+    # NTZ target (target-aware skip).
     data = coerce_naive_timestamps(
         data, path=path, storage_options=storage_options,
         retype_ok=(schema_mode == "overwrite"),
         timestamp_ntz=timestamp_ntz, existing_dt=existing_dt,
     )
-
-    # Adaptive row-group geometry for a full-table overwrite, computed HERE so the SQL CTAS path and the
-    # dbt table / full-refresh path (delta_plugin) share one seam and behave identically. A small result
-    # yields ~_RG_LANES groups; big/unknown keeps 16M. Needs the producing connection (cur); never break
-    # a write on the planner estimate.
-    #
-    # This is the ONE rg_for caller whose row count is a planner estimate rather than a measurement, so
-    # it is also the one that passes the higher _RG_MIN_ESTIMATED floor — an estimate that is an order
-    # of magnitude low must not be able to pin the table to the bottom of the band (issue #22).
-    #
-    # When the table already EXISTS, its prior version's exact log row count is a free second signal, and
-    # a far better one than the guess. The composition rule is MONOTONE: the prior count may only ever
-    # RAISE an estimate that already exists, never create one. That makes it provably non-regressive — no
-    # input yields a smaller ceiling than the estimate alone would. (A plain max(planner or 0, prior or 0)
-    # would LOWER the ceiling when EXPLAIN itself failed, replacing today's safe None -> RG_MAX fallback
-    # with a new under-sizing path: a first big load replacing a stub table would size off the stub.)
-    # An overwrite that deliberately SHRINKS a table over-estimates and keeps a larger ceiling — harmless
-    # by the documented asymmetry (policy.RG_MIN_ESTIMATED): the 256 MB file roll closes the group anyway.
-    est, est_src = None, "none"
-    explicit_rg = row_group_rows   # a caller-declared ceiling (per-model config); None = adaptive
-    if mode == "overwrite" and row_group_rows is None:
-        try:
-            est = estimated_rows(cur, data)
-            est_src = "planner" if est is not None else "none"
-            row_group_rows = rg_for(est, floor=_RG_MIN_ESTIMATED)
-        except Exception as exc:  # never break a write on a sizing failure
-            logger.debug(f"duckrun: overwrite geometry unavailable: {exc}")
-            est, est_src, row_group_rows = None, "none", None
-        # The prior-count floor gets its OWN guard: it only ever IMPROVES a ceiling we already have, so
-        # a failure here must keep the estimate's answer rather than discard it back to _RG_MAX. And a
-        # prior count can only help a ceiling that was SHRUNK — at _RG_MAX there is nothing to fix, so
-        # skip the log read entirely (and with it the 404-shaped probe on a fresh CREATE).
-        if est is not None and row_group_rows is not None and row_group_rows < _RG_MAX:
-            try:
-                prior = prior_row_count(cur, path, storage_options)
-                if prior and prior > est:
-                    est, est_src = prior, "prior-log"
-                    row_group_rows = rg_for(est, floor=_RG_MIN_ESTIMATED)
-            except Exception as exc:
-                logger.debug(f"duckrun: prior-count floor skipped: {exc}")
-        bound = ("none" if row_group_rows is None else
-                 "max" if row_group_rows >= _RG_MAX else
-                 "floor" if row_group_rows <= _RG_MIN_ESTIMATED else "lanes")
-        logger.debug(f"duckrun: overwrite geometry rg={row_group_rows} est={est} "
-                     f"src={est_src} bound={bound}")
 
     args = build_write_deltalake_args(
         path, data, mode,
@@ -1741,8 +1543,6 @@ def write_delta(
             # An AUTO write: the row ceiling is out of reach, so the byte target alone shaped the
             # layout and the landed row groups are the only readout of whether the model was right.
             _log_auto_geometry(cur, dt)
-        else:
-            _warn_if_estimate_was_far_off(cur, dt, est, row_group_rows)
         # A fresh table (this overwrite created v0) has no prior versions — nothing for vacuum or
         # cleanup_metadata to reclaim, so skip both store-listing operations on a brand-new create.
         if dt.version() > 0:
@@ -1750,7 +1550,7 @@ def write_delta(
             dt.cleanup_metadata()
     else:  # append
         _maintain(cur, path, storage_options=storage_options,
-                  target_file_size=target_file_size, row_group_cap=explicit_rg)
+                  target_file_size=target_file_size, row_group_cap=row_group_rows)
 
 
 def create_empty_delta(
@@ -1767,7 +1567,8 @@ def create_empty_delta(
     should record. ``mode`` follows delta-rs: ``error`` (fail if the table exists), ``overwrite``
     (replace an existing table or drop-tombstone), or ``ignore`` (no-op if it exists).
     """
-    DeltaTable.create(path, schema, mode=mode, storage_options=storage_options)
+    DeltaTable.create(path, schema, mode=mode, storage_options=storage_options,
+                      configuration={"delta.checkpointInterval": str(CHECKPOINT_INTERVAL)})
 
 
 def append_if_unchanged(
@@ -1850,10 +1651,8 @@ def overwrite_if_unchanged(
     brand-new table's first write goes through ``write_delta``, not here. Then the same vacuum +
     metadata cleanup as the plain overwrite path.
 
-    ``cur`` is the connection that produced ``data`` — forwarded so this path gets the same adaptive
-    row-group geometry as every other overwrite. Without it (the old signature) a ``delete+insert``
-    rebuild, which is a genuine full-table rewrite AND the one path where a prior exact row count is
-    guaranteed to exist, silently wrote at the flat 16M ceiling."""
+    ``cur`` is the connection that produced ``data`` — forwarded so the post-write hooks (the AUTO
+    geometry readout) behave exactly as on every other overwrite."""
     if read_version is None:
         raise ValueError(
             "overwrite_if_unchanged requires read_version (the version the caller read). A fenced "
@@ -1907,16 +1706,8 @@ def replace_where(
             "replace_where requires read_version (the version the caller read). A replaceWhere is "
             "a read-modify-write and must be pinned to its snapshot."
         )
-    # No DERIVED row_group_rows and no estimate — DELIBERATE, not an oversight in the one overwrite
-    # sizing seam (write_delta). A replaceWhere writes a SLICE, not a table: ceil(slice_rows / RG_LANES)
-    # sizes this window's segments off a number that says nothing about the table's segment budget, and
-    # would leave a table with 16M-row groups everywhere except the last-replaced window. The estimate
-    # floor would also make it inert for any window under RG_LANES x RG_MIN_ESTIMATED rows (the common
-    # microbatch), so it could only ever distort the large-window case. And the bypass is what
-    # structurally keeps write_delta's prior-count
-    # floor (see prior_row_count) away from a partial replace, where "rows in the table" is a meaningless
-    # proxy for "rows in this slice". A microbatch's FIRST batch does go through write_delta and IS
-    # sized — correct, because at that instant the table is just that window.
+    # No DERIVED row_group_rows — like every write now: a replaceWhere keeps the fixed
+    # _ROW_GROUP_SIZE ceiling and lets the file roll pick the group.
     # An EXPLICIT row_group_rows (per-model config) is different in kind: a declared CEILING, not a
     # derived size — it applies to a slice exactly as it applies to an append.
     # A replaceWhere writes INTO an existing schema, never replaces it — target-aware skip applies.
@@ -2084,16 +1875,15 @@ def optimize(
     cur=None,
 ) -> Dict:
     """Compact small files into larger ones (delta_rs ``optimize.compact``) and return the operation
-    metrics. Reuses the one ``_writer_properties()`` read layout, adapting the row-group size to the
-    table's live row count (free from the log via ``cur``) so a small table compacts to ~_RG_LANES
-    small groups rather than one 16M group. A lexicographic ``ORDER BY`` at write time
+    metrics. Reuses the one ``_writer_properties()`` read layout (the fixed 8M-row ceiling — same as
+    every write; ``cur`` is accepted for API compatibility and unused). A lexicographic ``ORDER BY``
+    at write time
     (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a columnar reader wants;
     there is no z-order path — bit-interleaving destroys the run-length runs the in-memory reader
     relies on."""
     dt = _delta_table(path, storage_options)
-    rg = rg_for(table_num_records(cur, dt))
     return dt.optimize.compact(target_size=target_size,
-                               writer_properties=_writer_properties(row_group_rows=rg))
+                               writer_properties=_writer_properties())
 
 
 def compaction_debt(cur, path: str, *, dt: Optional[DeltaTable] = None,

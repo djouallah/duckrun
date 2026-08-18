@@ -181,7 +181,7 @@ class Plugin(BasePlugin):
         cfg = target_config.config or {}
 
         partition_by = cfg.get("partition_by")
-        # Per-model write geometry (both optional; None = the adaptive defaults). Explicit ceilings
+        # Per-model write geometry (both optional; None = the fixed defaults). Explicit ceilings
         # like sort_by/partition_by: duckrun-only configs upstream parses and ignores. Validated
         # loudly HERE, before any Delta access, so a typo fails the model cleanly.
         row_group_rows, target_file_size = self._geometry_config(cfg)
@@ -447,9 +447,8 @@ class Plugin(BasePlugin):
         """The per-model write-geometry overrides: ``max_row_group_size`` (rows — deltalake's own
         ``WriterProperties`` spelling) and ``target_file_size_mb`` (megabytes; converted to bytes
         HERE — everything below the plugin speaks bytes). Returns ``(row_group_rows, target_bytes)``,
-        each ``None`` when unset (the adaptive estimator / 16M ceiling / 256 MB roll stay in charge).
-        Explicit values are CEILINGS the engine honors verbatim — an explicit row-group size also
-        bypasses the planner estimate entirely (a declared geometry is not a guess to second-guess).
+        each ``None`` when unset (the fixed 8M ceiling / 128 MB roll stay in charge).
+        Explicit values are CEILINGS the engine honors verbatim.
         Ints or digit-strings accepted (YAML quoting); anything else fails the model loudly."""
         def _pos_int(key):
             val = cfg.get(key)
