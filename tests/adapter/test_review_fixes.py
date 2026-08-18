@@ -655,3 +655,105 @@ def test_narrow_wide_decimals_select_passthrough_without_wide_columns():
     con = duckdb.connect()
     con.execute("create table t as select i::DECIMAL(18,2) p, i n from range(10) t(i)")
     assert Plugin._narrow_wide_decimals_select(con, "t") == "SELECT * FROM t"
+
+
+# ------------------------------------------------ issue #61: empty-source merge short-circuit
+
+def test_snapshot_macro_materializes_the_merge_source():
+    """Issue #61, macro half: the snapshot materialization MUST forward
+    'merge_materialize_source': true. Its merge source is a lazy view stack whose staging SQL
+    stamps now() into the SCD2 columns, so every un-materialized consumer (cardinality guard,
+    delta_rs collection) re-runs the remote reads AND computes different rows per evaluation.
+    The reporter of #61 set the config on the snapshot and it silently went nowhere — pin the
+    forwarding the same way test_delta_core_macro_forwards_every_config_key_the_plugin_reads
+    pins _delta_core.sql's dict."""
+    from pathlib import Path
+
+    from dbt.adapters.duckrun import delta_plugin
+
+    macro = (Path(delta_plugin.__file__).parents[2] / "include" / "duckrun" / "macros"
+             / "materializations" / "snapshot.sql").read_text(encoding="utf-8")
+    # The merge-branch store_relation dict (the first-run branch overwrites; it has no merge).
+    block = macro.split("'incremental_strategy': 'merge'", 1)[1].split("}", 1)[0]
+    assert "'merge_materialize_source': true" in block, (
+        "snapshot.sql's merge store_relation dict no longer forwards "
+        "'merge_materialize_source': true — the snapshot merge source is lazy+nondeterministic "
+        "again (issue #61)"
+    )
+
+
+def _merge_target(tmp_path):
+    import pyarrow as pa
+
+    path = str(tmp_path / "t")
+    engine.write_delta(path, pa.table({
+        "id": pa.array([1, 2, 3], pa.int64()),
+        "value": pa.array([10, 20, 30], pa.int64()),
+    }), "overwrite")
+    return path
+
+
+def _empty_source(con):
+    return con.sql("SELECT 1::BIGINT AS id, 1::BIGINT AS value WHERE 1 = 0")
+
+
+def test_empty_materialized_source_merge_commits_nothing(tmp_path):
+    """The engine half of issue #61: a zero-row source the caller materialized upserts nothing,
+    so nothing is committed — no empty MERGE commit, no maintenance — and the version stays put
+    (an unchanged snapshot re-run must not grow the Delta log)."""
+    from deltalake import DeltaTable
+
+    path = _merge_target(tmp_path)
+    con = duckdb.connect()
+    engine.merge_delta(path, _empty_source(con), "id",
+                       source_materialized=True, read_version=0, cur=con)
+    dt = DeltaTable(path)
+    assert dt.version() == 0
+    assert dt.to_pyarrow_table().num_rows == 3
+
+
+def test_empty_lazy_source_still_runs_the_full_merge(tmp_path):
+    """source_materialized=False (the default — a lazy relation): probing could re-evaluate the
+    model, and a nondeterministic one could answer 'empty' for rows the merger would then see.
+    So no probe — the merge runs through delta_rs unchanged and the table stays correct. (delta_rs
+    itself declines to commit an empty merge, so the version stays put on BOTH paths; what the
+    short-circuit saves is the machinery — target open, version pin, source collection,
+    post-merge maintenance — not the commit.)"""
+    from deltalake import DeltaTable
+
+    path = _merge_target(tmp_path)
+    con = duckdb.connect()
+    engine.merge_delta(path, _empty_source(con), "id", read_version=0)
+    dt = DeltaTable(path)
+    assert dt.version() == 0
+    assert dt.to_pyarrow_table().num_rows == 3
+
+
+def test_empty_source_with_by_source_clause_still_merges(tmp_path):
+    """An empty source under WHEN NOT MATCHED BY SOURCE matches EVERY target row — work, not a
+    no-op. The short-circuit must stand aside and let the delete land."""
+    from deltalake import DeltaTable
+
+    path = _merge_target(tmp_path)
+    con = duckdb.connect()
+    engine.merge_delta(path, _empty_source(con), "id",
+                       source_materialized=True, delete_unmatched_by_source=True,
+                       read_version=0)
+    dt = DeltaTable(path)
+    assert dt.version() >= 1
+    assert dt.to_pyarrow_table().num_rows == 0
+
+
+def test_nonempty_materialized_source_upserts_normally(tmp_path):
+    """source_materialized with actual rows: the probe sees a row and the merge proceeds
+    unchanged — byte-identical upsert semantics."""
+    from deltalake import DeltaTable
+
+    path = _merge_target(tmp_path)
+    con = duckdb.connect()
+    src = con.sql("SELECT 3::BIGINT AS id, 999::BIGINT AS value "
+                  "UNION ALL SELECT 4::BIGINT, 40::BIGINT")
+    engine.merge_delta(path, src, "id", source_materialized=True, read_version=0)
+    t = DeltaTable(path).to_pyarrow_table().sort_by("id")
+    assert dict(zip(t.column("id").to_pylist(), t.column("value").to_pylist())) == \
+        {1: 10, 2: 20, 3: 999, 4: 40}

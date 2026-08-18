@@ -204,3 +204,41 @@ class TestSnapshotSchemaEvolutionNoVersionChange:
         assert rows[0][0] == 10
         assert rows[0][1] is None
         assert rows[0][2] is True
+
+
+class TestUnchangedSnapshotCommitsNothing:
+    """Issue #61: re-running a snapshot whose source has not changed must not create a Delta
+    commit. The staging query yields zero rows; the materialized merge source makes that knowable
+    with one cheap probe, and the engine then skips the merge AND its post-merge maintenance —
+    the table's version stays put instead of the log growing (and every open slowing) with each
+    scheduled no-op run."""
+
+    @pytest.fixture(scope="class")
+    def models(self):
+        return {"snap_source.sql": _source_v1}
+
+    @pytest.fixture(scope="class")
+    def snapshots(self):
+        return {"col_snapshot.sql": _snapshot_sql}
+
+    def test_rerun_without_changes_leaves_the_version_alone(self, project, dbt_profile_target):
+        from deltalake import DeltaTable
+
+        run_dbt(["run"])
+        results = run_dbt(["snapshot"])
+        assert all(r.status == "success" for r in results)
+
+        path = f"{dbt_profile_target['root_path']}/{project.test_schema}/col_snapshot"
+        version_after_first_snapshot = DeltaTable(path).version()
+
+        # Source unchanged — the second snapshot run must succeed AND commit nothing.
+        results = run_dbt(["snapshot"])
+        assert all(r.status == "success" for r in results)
+        assert DeltaTable(path).version() == version_after_first_snapshot
+
+        # And the SCD2 content is untouched: one open version, nothing closed.
+        relation = relation_from_name(project.adapter, "col_snapshot")
+        counts = project.run_sql(
+            f"select count(*), count(dbt_valid_to) from {relation}", fetch="one"
+        )
+        assert tuple(counts) == (1, 0)
