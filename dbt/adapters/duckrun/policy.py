@@ -30,7 +30,11 @@ from dbt.adapters.events.logging import AdapterLogger
 logger = AdapterLogger("Duckrun")
 
 # The one read-layout target every file write, compaction, and sort-rewrite uses (see engine).
-DEFAULT_TARGET_FILE_SIZE = 128 * 1024 * 1024
+# 256, not 128: the 0.4.58 release gate measured the halved file target directly — the merge-spill
+# update-only scenario (whole-table rewrite over the ~2x file count) needed >67 GiB of DataFusion
+# disk spill vs <59 GiB at 256 MB, failing two tags in a row. File size is NOT merge-neutral at
+# scale, so the file target stays 256 MB.
+DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
 
 # Delta checkpoint cadence, stamped as `delta.checkpointInterval` on every table duckrun creates.
 # delta-rs's post-commit hook honors the property and writes the checkpoint itself; without it the
@@ -41,7 +45,7 @@ CHECKPOINT_INTERVAL = 10
 # ------------------------------------------------------------------------- write-layout geometry
 # A Parquet row group maps 1:1 to a Direct Lake column segment: any size from 1M to 16M rows is a fine
 # segment and 16M is the ceiling (kept under 2^24 so one row group stays one segment). These are
-# CEILINGS, not sizes: the 128 MB file roll usually closes the group first, so a write left at the
+# CEILINGS, not sizes: the 256 MB file roll usually closes the group first, so a write left at the
 # ceiling still lands well inside the band.
 #
 # NOT a write-memory ceiling: delta_rs closes the file as soon as its buffered size reaches
@@ -149,7 +153,7 @@ def tfs_for(rows_target, bytes_per_row):
     to keep ``DEFAULT_TARGET_FILE_SIZE``.
 
     Capped at ``DEFAULT_TARGET_FILE_SIZE``: a fact wide enough that ``rows_target`` would need a bigger
-    file keeps the global 128 MB policy and lands a smaller — still single — row group. Floored at
+    file keeps the global 256 MB policy and lands a smaller — still single — row group. Floored at
     ``TFS_MIN``, which binds only when the byte model has collapsed (see there)."""
     if not rows_target or not bytes_per_row or AUTO_TFS_FACTOR <= 0:
         return None

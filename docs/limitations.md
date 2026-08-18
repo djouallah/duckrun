@@ -163,7 +163,7 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   large table plan for that disk. An explicit `SORTED BY (cols)` skips profiling entirely.
 - **The write geometry is fixed, not adaptive.** Every normal write — overwrite, append,
   `replaceWhere`, and compaction alike — uses the same constants: an **8M-row** row-group ceiling
-  (Power BI's native segment size) and a **128 MB** target file size. Nothing is derived from the
+  (Power BI's native segment size) and a **256 MB** target file size. Nothing is derived from the
   result: no planner estimate, no `count(*)`, no prior-log probe. The cost of the fixed rule is that a
   small table lands fewer, larger segments than an adaptive scheme would give it; the win is that no
   write pays a plan walk or a count, and no bad estimate can mis-size a table. The two exceptions:

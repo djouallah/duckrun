@@ -447,7 +447,7 @@ class Plugin(BasePlugin):
         """The per-model write-geometry overrides: ``max_row_group_size`` (rows — deltalake's own
         ``WriterProperties`` spelling) and ``target_file_size_mb`` (megabytes; converted to bytes
         HERE — everything below the plugin speaks bytes). Returns ``(row_group_rows, target_bytes)``,
-        each ``None`` when unset (the fixed 8M ceiling / 128 MB roll stay in charge).
+        each ``None`` when unset (the fixed 8M ceiling / 256 MB roll stay in charge).
         Explicit values are CEILINGS the engine honors verbatim.
         Ints or digit-strings accepted (YAML quoting); anything else fails the model loudly."""
         def _pos_int(key):

@@ -48,16 +48,19 @@ All notable changes to this project will be documented in this file.
   disk discovery only rediscovers Delta tables.
 
 ### Changed
-- **The write geometry is now fixed: 8M-row groups, 128 MB files — the result-size estimator is
+- **The write geometry is now fixed: 8M-row groups, 256 MB files — the result-size estimator is
   gone.** Every normal write (overwrite, append, `replaceWhere`) and post-write compaction uses the
   same constants: a **8M-row** `max_row_group_size` ceiling (was an adaptive 1M–16M sized from a
-  DuckDB planner estimate with prior-log floors and accuracy warnings) and a **128 MB**
-  `target_file_size` (was 256 MB). Nothing is derived from the result anymore — no
+  DuckDB planner estimate with prior-log floors and accuracy warnings) and the existing **256 MB**
+  `target_file_size`. Nothing is derived from the result anymore — no
   `EXPLAIN` walk, no `count(*)`, no prior-version log probe — so every write and every compaction
   skips that work entirely. The only self-sizing write is `SORTED BY AUTO` / `sort_by: 'auto'`,
   whose profile already pays for an exact count (its derived geometry, headroom derate and 8 MB
   collapse floor are unchanged). Explicit `max_row_group_size` / `target_file_size_mb` still win
-  verbatim, on the write and through maintenance.
+  verbatim, on the write and through maintenance. (A 128 MB file target shipped briefly in the
+  unreleased 0.4.58/0.4.59 tags and was walked back before release: the doubled file count pushed
+  the release gate's whole-table update-only merge from <59 GiB to >67 GiB of DataFusion disk
+  spill — file size is not merge-neutral at scale.)
 - **Every table duckrun creates is stamped `delta.checkpointInterval = 10`.** delta-rs's post-commit
   hook honors the property and writes a Delta log checkpoint every 10 commits (its default is 100),
   so an incrementally-written table no longer replays up to 99 JSON commits on every open.
