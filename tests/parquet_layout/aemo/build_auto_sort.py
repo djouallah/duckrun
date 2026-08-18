@@ -87,5 +87,5 @@ else:
 report.merge({"tables": {"fct_summary_auto_sort": {"build": {
     "engine": "delta_rs", "sort": clause, "sort_key": sort_key, "vorder": False,
     "row_group_ceiling": OPT_RG,     # None = adaptive (the default sizing)
-    "target_file_size_mb": OPT_TFS_MB,  # None = the 256 MB default
+    "target_file_size_mb": OPT_TFS_MB,  # None = the 128 MB default
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})
