@@ -1,7 +1,7 @@
 """Layout policy — write-geometry (row-group sizing) + compact/vacuum decisions, in one place.
 
-Pure decisions, no I/O: the fixed write geometry, the AUTO ``rg_for`` sizing rule and the
-``MaintenancePolicy`` compact/vacuum thresholds. The engine owns the *mechanism* (building
+Pure decisions, no I/O: the fixed write geometry and the ``MaintenancePolicy`` compact/vacuum
+thresholds. The engine owns the *mechanism* (building
 WriterProperties, running the compaction); this module owns *what shape to aim for*, so the write
 path and maintenance size row groups identically from one place.
 
@@ -20,7 +20,6 @@ A raw file COUNT is deliberately not the trigger: a healthy big table sits at hu
 target-sized files forever and must never be compacted, while a hot small table earns a compaction on
 its byte debt, not its file count.
 """
-import os
 from typing import Callable, Iterable, Set, Tuple
 
 from deltalake.exceptions import CommitFailedError
@@ -43,122 +42,16 @@ DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
 CHECKPOINT_INTERVAL = 10
 
 # ------------------------------------------------------------------------- write-layout geometry
-# A Parquet row group maps 1:1 to a Direct Lake column segment: any size from 1M to 16M rows is a fine
-# segment and 16M is the ceiling (kept under 2^24 so one row group stays one segment). These are
-# CEILINGS, not sizes: the 256 MB file roll usually closes the group first, so a write left at the
-# ceiling still lands well inside the band.
-#
-# NOT a write-memory ceiling: delta_rs closes the file as soon as its buffered size reaches
-# target_file_size (checked every write batch), so the writer's footprint is bounded by the BYTE
-# target no matter how large max_row_group_size is. That is what lets the AUTO path below set the
-# row ceiling out of reach entirely (see RG_UNREACHABLE).
-ROW_GROUP_MAX_ROWS = 16_000_000
-# The FIXED row-group ceiling every normal (non-AUTO) write uses — 8M rows, Power BI's default
-# segment size. There is no derived sizing on the normal path: the planner-estimate machinery that
-# used to adapt the ceiling to the result (EXPLAIN cardinality, prior-log floors, accuracy warnings)
-# cost a plan/probe on every write for no measured read-side advantage, and is gone. The only write
-# that sizes itself from data is SORTED BY AUTO, whose profile already paid for an exact count.
-ROW_GROUP_DEFAULT_ROWS = 8_000_000
-RG_LANES = int(os.environ.get("DUCKRUN_RG_LANES", "8"))  # AUTO rows-target: aim for ~this many groups
-RG_MIN = 1_000_000
-RG_MAX = ROW_GROUP_MAX_ROWS  # big/unknown counts keep this exactly
-
-
-def rg_for(est, floor=RG_MIN):
-    """Rows target for a SORTED BY AUTO write, from its exact row count. Big/unknown -> the 16M
-    constant; a small result shrinks toward ~RG_LANES groups, floored at ``floor`` (RG_MIN — the
-    count is a measurement, taken at face value). Only the AUTO geometry and its readout call this;
-    a normal write takes the fixed ROW_GROUP_DEFAULT_ROWS ceiling instead."""
-    if est is None or est >= RG_LANES * RG_MAX:
-        return RG_MAX
-    return max(floor, min(RG_MAX, -(-est // RG_LANES)))   # ceil(est / RG_LANES)
-
-
-# ------------------------------------------------------------ one row group per file (SORTED BY AUTO)
-# max_row_group_size for an AUTO write: deliberately out of reach, so the byte target below is the ONLY
-# boundary and every file holds exactly one row group. A row ceiling can only fire EARLY here and leave
-# a runt trailing group in the same file — the raggedness this path exists to remove. 2^31-1 rather
-# than a u64 maximum because engine._writer_properties degrades silently when the pinned wheel rejects
-# a parameter, and its last rung drops max_row_group_size altogether, landing Parquet's 1M default.
-RG_UNREACHABLE = 2 ** 31 - 1
-
-# Headroom derate for the AUTO rows target. The byte model's landed-rows/target ratio is shape-
-# dependent and measured at 0.75x / 1.25x / 1.36x / 1.51x (see AUTO_TFS_FACTOR below — the spread
-# is real and NOT tunable away). Mid-band that residual is fine, but a rows target already at the
-# TOP of the band (RG_MAX) times any overshoot exits the 16M one-segment band entirely — measured
-# on the 591.7M-row nyc fact: a 16M target landed 21.7M-row groups (1.36x), i.e. more than one
-# Direct Lake segment per group. So the AUTO path never AIMS at the top: its rows target is capped
-# at RG_MAX / AUTO_RG_HEADROOM, so the worst measured overshoot still lands ~<= RG_MAX. This costs
-# a big accurate-model table its 16M ideal, which is the deliberate trade: a smaller in-band
-# segment over an out-of-band one. <= 1 disables the derate.
-#
-# 2.0, not the 1.5 first shipped: the same nyc fact measured landed/target at 1.39x when the
-# profile covered every row and 1.74x when it ran on the v6 ~30M substrate (substrate-scale
-# ndv/cnt_bits price bytes/row ~25% higher — inside the model's documented spread, but past a
-# 1.5 headroom: 40 x 14.8M vs 32 x 18.6M-row groups). 2.0 covers the worst measured overshoot
-# (1.74 x 8M ≈ 13.9M) and puts the band top at 8M — Power BI's default segment size, so even a
-# derated write hands Direct Lake whole native segments.
-AUTO_RG_HEADROOM = float(os.environ.get("DUCKRUN_AUTO_RG_HEADROOM", "2.0"))
-
-
-def auto_rg_cap():
-    """Rows-target ceiling for the AUTO one-row-group-per-file path (a function, not a constant,
-    so tests can monkeypatch ``AUTO_RG_HEADROOM`` and both engine seams stay in agreement)."""
-    return int(RG_MAX / AUTO_RG_HEADROOM) if AUTO_RG_HEADROOM > 1.0 else RG_MAX
-
-# Turns the sortkey byte model (sortkey.bytes_per_row) into a target_file_size. It folds TWO effects
-# that pull in opposite directions, which is why ONE constant covers both:
-#   - the model counts ENCODED bytes — no Snappy, no page headers, no footer — so it reads high;
-#   - delta_rs rolls the file on its BUFFERED size, which over-counts the final compressed file
-#     (measured 0.50-0.64 actual/target across int, low-cardinality, string and 10-column shapes).
-# Calibrated on ROWS PER ROW GROUP landed vs rows_target, never on bytes: rows are what a Direct Lake
-# segment is made of, and with one row group per file the Delta log's num_records IS the segment size,
-# so engine._log_auto_geometry can measure the ratio for free after every write.
-#
-# 1.0 — the model's bytes/row IS the target — because the measurements do not support a more precise
-# number. Landing 40M-row tables through the real connection API and reading the row groups back out
-# of the footers: at this factor a unique-key fact lands 0.75x of its row target, a star-schema fact
-# 1.51x and a 10-column mixed fact 1.25x. Sweeping the factor to 0.8 moves those to 0.60 / 1.19 / 0.68,
-# and extrapolating each shape onto 1.0x independently lands on 0.89 and 1.02 — i.e. the two estimates
-# disagree by more than the correction either would make. So 1.0 it is.
-#
-# The residual per-shape spread is roughly +/-50% and is NOT reducible by tuning this constant: the
-# target sets the row-group size, a bigger row group compresses better, and better compression fits
-# more rows under the same byte target. That feedback makes the mapping non-linear and shape-dependent
-# (the same shapes measured at 4M rows came out near half their 40M ratio). What the model buys is the
-# right order of magnitude — row groups land inside ~0.5-1.5x of target, always exactly one per file,
-# and for a realistic fact always inside the 1M-16M segment band. That is the win over ragged
-# multi-group files; sub-percent placement was never on offer.
-# 0 disables the byte target entirely and the write keeps DEFAULT_TARGET_FILE_SIZE.
-AUTO_TFS_FACTOR = float(os.environ.get("DUCKRUN_AUTO_TFS_FACTOR", "1.0"))
-
-
-# Floor for the computed byte target. NOT a hedge against a slightly-off model — it exists because the
-# byte model can collapse toward ZERO and take the file target with it. A perfectly compressible column
-# (a cyclic low-cardinality int, sorted) models at ~0 B/row, so rows_target x bpr is a few hundred
-# BYTES; measured, that shattered a 4M-row table into 490 files of 8,192 rows. rg_for's RG_MIN bounds
-# rows_target, but nothing bounds the byte target, so the collapse is unbounded without this.
-# Deliberately small: it is a COLLAPSE guard, not a size policy. Set it at the "healthy file" mark
-# (~32 MB) and it stops being a guard and starts being the layout — measured at 40M
-# rows, a 32 MB floor governed the well-compressing shapes outright and pinned them to ~2.4x their
-# row target, which is the opposite of the exact row group this path exists to produce. 8 MB still
-# collapses the pathological case to a single file while leaving every realistic shape to the model.
-# A literal, NOT derived from DEFAULT_TARGET_FILE_SIZE: the AUTO calibration was measured at 8 MB
-# and must not drift when the normal-write file target moves.
-TFS_MIN = int(os.environ.get("DUCKRUN_AUTO_TFS_MIN", 8 * 1024 * 1024))
-
-
-def tfs_for(rows_target, bytes_per_row):
-    """Byte target that makes ONE row group of ~``rows_target`` rows fill exactly one file, or ``None``
-    to keep ``DEFAULT_TARGET_FILE_SIZE``.
-
-    Capped at ``DEFAULT_TARGET_FILE_SIZE``: a fact wide enough that ``rows_target`` would need a bigger
-    file keeps the global 256 MB policy and lands a smaller — still single — row group. Floored at
-    ``TFS_MIN``, which binds only when the byte model has collapsed (see there)."""
-    if not rows_target or not bytes_per_row or AUTO_TFS_FACTOR <= 0:
-        return None
-    want = rows_target * bytes_per_row * AUTO_TFS_FACTOR
-    return int(min(DEFAULT_TARGET_FILE_SIZE, max(TFS_MIN, want)))
+# The FIXED row-group ceiling EVERY write uses — 6M rows. A Parquet row group maps 1:1 to a Direct
+# Lake column segment; anything in the 1M-16M band is a healthy segment (Power BI's own default
+# segment size is 8M), and 6M trades a little per-segment density for one more group to scan in
+# parallel per file. A CEILING, not a size: the 256 MB file roll usually closes the group first.
+# There is no derived sizing anywhere: the planner-estimate machinery (EXPLAIN cardinality,
+# prior-log floors) and, later, the SORTED BY AUTO byte-model geometry (rg_for / tfs_for / one row
+# group per file) each cost plan walks, counts and a calibrated bytes/row model for no measured
+# read-side advantage over the fixed constants. SORTED BY AUTO now only picks the sort key; the
+# write is shaped like any other.
+ROW_GROUP_DEFAULT_ROWS = 6_000_000
 
 
 class MaintenancePolicy:

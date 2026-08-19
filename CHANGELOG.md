@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`SORTED BY AUTO` / `sort_by: auto` now does exactly one thing: pick the sort key.** The
+  self-sizing write geometry it used to derive (the one-row-group-per-file byte target:
+  `rg_for`'s `ceil(rows/8)` band, the `bytes_per_row` model, `tfs_for`, the headroom derate, the
+  post-write calibration readout) is deleted — an AUTO write now lands on the same fixed layout as
+  every other write, and the geometry-sizing `count(*)` is gone with it. The profiling substrate
+  (the pre-count + `hash(row) % K` staging that bounds profiler cost) is unchanged. The
+  `DUCKRUN_AUTO_TFS_FACTOR`, `DUCKRUN_AUTO_TFS_MIN`, `DUCKRUN_AUTO_RG_HEADROOM` and
+  `DUCKRUN_RG_LANES` env knobs no longer exist; explicit `max_row_group_size` /
+  `target_file_size_mb` model configs are unaffected.
+- **The fixed row-group ceiling is now 6M rows** (was 8M; `target_file_size` stays 256 MB). One
+  row group is one Direct Lake segment, and anything in the 1–16M band is a healthy segment — 6M
+  trades a little per-segment density for one more group per file to scan in parallel. Applies to
+  every write and to post-write compaction; a per-model `max_row_group_size` still wins verbatim.
+
 ### Fixed
 - **The merge disk-spill cap no longer strands most of a big disk.** The default
   `max_temp_directory_size` was 80% of free space on the spill disk — a purely proportional

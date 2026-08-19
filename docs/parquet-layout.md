@@ -24,7 +24,7 @@ The distinction is between two formats that happen to describe the same data:
 A scan engine bridges the two formats transiently, per query, and throws the result away. Direct Lake bridges them **once, on cold load**: it reads the Parquet, converts each row group into a resident column segment, remaps dictionaries where it can, and then serves every subsequent query from the in-memory form without touching the file again until the data changes. That one-time conversion — **transcoding** — is the operation this layout exists to make fast and faithful, and it explains settings that would look odd through a scan-engine lens:
 
 - **SNAPPY over ZSTD** — transcoding is decode-bound; a slightly larger file that decodes faster wins, because the size difference is paid once in storage while the decode cost is paid on every cold load.
-- **Fixed 8M-row row groups** — a row group becomes a segment as-is, so row-group sizing *is* segment sizing; anything from **1M to 16M rows is a fine segment**, a property of the in-memory engine, not of Parquet. Every normal write — overwrite, append, and compaction alike — uses the same fixed **8M-row** ceiling (Power BI's native segment size): nothing is derived from the result, so no write pays a plan walk or a row count. Only a `SORTED BY AUTO` write sizes itself, from the exact count its profile already paid for.
+- **Fixed 6M-row row groups** — a row group becomes a segment as-is, so row-group sizing *is* segment sizing; anything from **1M to 16M rows is a fine segment**, a property of the in-memory engine, not of Parquet. Every write — overwrite, append, `SORTED BY AUTO`, and compaction alike — uses the same fixed **6M-row** ceiling: nothing is derived from the result, so no write pays a plan walk or a row count.
 - **Dictionaries retained where sensible** — a Parquet dictionary can be remapped into the engine's dictionary rather than rebuilt from raw values, so keeping mid-cardinality columns dictionary-encoded makes the transcode a cheap remap instead of a full re-encode.
 
 The general point: the "right" Parquet layout depends on **which engine's in-memory format it will be turned into, and how often**. A layout tuned for one-shot scans, for a different segment size, or for a different memory model would legitimately choose different values. This is one more sense in which everything on this page is a heuristic tied to a specific consumer, not a universal recommendation.
@@ -34,64 +34,17 @@ With that frame in place, the table below is the full configuration; the [reason
 | Property | Value | Rationale |
 | --- | --- | --- |
 | **Compression** | `SNAPPY` | Fast to decode, which is what a columnar reader (Direct Lake) needs on cold load — it transcodes Parquet dictionaries into its own encoding. On representative data, SNAPPY output is only ~1.3× the size of ZSTD; the sort and the dictionary do most of the shrinking, so the codec is chosen for decode speed rather than maximum ratio. The 1.3× figure is empirical and will vary with your data. |
-| **Row group size** | fixed · 8M rows | **A max, not a constant — and a fixed one.** Every write (overwrite, append, `replaceWhere`) and post-write compaction uses the same **8M-row** ceiling; the 256 MB file roll usually closes the group first. Nothing is sized from the result — the planner-estimate machinery that used to adapt the ceiling cost a plan walk (and sometimes a count) on every write for no measured read-side advantage. 8M is Power BI's own default segment size, so a full group hands Direct Lake exactly one native segment; one Parquet row group maps to one column segment in a Direct Lake reader, and Fabric prefers segments in the **8–16M** row band. arrow-rs's ~1M default would produce thousands of small segments instead. A good **sort key** remains the larger lever on read performance (see [Automatic sorting](#automatic-sorting)) — order of priority is sort key first, row-group size second. |
+| **Row group size** | fixed · 6M rows | **A max, not a constant — and a fixed one.** Every write (overwrite, append, `replaceWhere`, `SORTED BY AUTO`) and post-write compaction uses the same **6M-row** ceiling; the 256 MB file roll usually closes the group first. Nothing is sized from the result — the planner-estimate machinery and, later, the `SORTED BY AUTO` byte-model geometry that used to adapt the layout each cost plan walks, counts, and a calibrated bytes/row model on every write for no measured read-side advantage. One Parquet row group maps to one column segment in a Direct Lake reader; anything in the **1–16M** row band is a healthy segment (Power BI's own default segment size is 8M), and 6M keeps segments comfortably inside the band while giving a scan one more group per file to parallelize over. arrow-rs's ~1M default would produce thousands of small segments instead. A good **sort key** remains the larger lever on read performance (see [Automatic sorting](#automatic-sorting)) — order of priority is sort key first, row-group size second. |
 | **Dictionary page limit** | 32 MB | Caps how large a column's dictionary grows before the column overflows to **PLAIN**. Mid- and high-cardinality columns (dictionary < 32 MB) stay dictionary-encoded — compact and directly remappable by a columnar reader. Truly unique columns still overflow to PLAIN, the correct outcome: their dictionary would be nearly as large as the data itself, pure overhead. This bound is the main lever on merge memory — a merge *reading* the table materializes those dictionaries, so a larger limit means a larger merge working set. Measured on an 18M-row merge: a 128 MB limit hit ~25 GB, 8 MB ~4 GB, 16 MB ~8.7 GB — 32 MB is a deliberate step up that curve, traded for denser read-layout segments and held in check by the merge spill tests. The exact crossover depends on your column cardinalities. |
 | **Data page size** | 1 MB, **1M-row cap** | Bounded pages. The row-count cap is the important safeguard: without it, a highly compressible column buffers its entire row group as a single page — roughly 10× write memory and oversized pages that strain a reader's memory ([arrow-rs #5797](https://github.com/apache/arrow-rs/issues/5797)). |
 | **Statistics** | chunk-level, truncated | Row-group min/max is all a reader needs to skip row groups; page-level statistics only bloat the footer. Long strings are truncated in the statistics. |
-| **Target file size** | 256 MB · derived on `SORTED BY AUTO` | A row group cannot span files, so this byte cap is effectively a segment cap. A narrow fact reaches a full 8M-row segment well under 256 MB; a wide fact fills 256 MB first, so there the file size — not the row count — sets the segment. It is deliberately well below **1 GB**, which forced whole-file copy-on-write and inflated merge cost on disk. (Not the dominant merge-*memory* lever — the dictionary limit is — but halving it to 128 MB doubled the file count and pushed a whole-table merge's disk spill past the release gate's cap, so it is a merge-*disk* lever at scale.) An **automatically sorted** write derives this number instead of taking the constant — see [one row group per file](#one-row-group-per-file) below. |
+| **Target file size** | 256 MB | A row group cannot span files, so this byte cap is effectively a segment cap. A narrow fact reaches a full 6M-row segment well under 256 MB; a wide fact fills 256 MB first, so there the file size — not the row count — sets the segment. It is deliberately well below **1 GB**, which forced whole-file copy-on-write and inflated merge cost on disk. (Not the dominant merge-*memory* lever — the dictionary limit is — but halving it to 128 MB doubled the file count and pushed a whole-table merge's disk spill past the release gate's cap, so it is a merge-*disk* lever at scale.) |
 
 **Per-model overrides.** A dbt model that knows better than the fixed defaults can declare its
 geometry: `max_row_group_size` (rows) and `target_file_size_mb` (MB) pin the row-group ceiling and
 file size for that model's writes — the explicit value is honored verbatim and preserved by
 post-write compaction. See the
 [model config reference](dbt-adapter.md#config-options-table--incremental--delta).
-
-### One row group per file
-
-An automatically sorted write (`SORTED BY AUTO`, or dbt's `sort_by: 'auto'`) sizes itself
-differently, because it already knows things a normal write does not.
-
-Everywhere else, two independent boundaries decide the layout: `max_row_group_size` closes a row
-group at a row count, and `target_file_size` closes the file at a byte count. Whichever comes first
-wins, so a file can hold one full group and a short trailing one — and a short group is a short
-Direct Lake segment.
-
-An AUTO write removes one of the two boundaries. It stages its source into a temp table before
-profiling, so it has an exact `COUNT(*)`, plus a per-column byte model
-from the profile it already paid for. From those it computes
-
-```
-rows per group  = clamp(ceil(rows / 8), 1M, 16M)      # rg_for, at the exact-count floor
-target file size = rows per group × modelled bytes/row  # clamped to [8 MB, 256 MB]
-max row group    = 2³¹-1                                # deliberately out of reach
-```
-
-With the row ceiling unreachable, **the byte target is the only boundary left, so every file holds
-exactly one row group.** That holds unconditionally — it does not depend on the byte model being
-right. Because the count is a measurement the profile already paid for, the row target uses the full
-**1M–16M** band instead of the fixed 8M ceiling of a normal write.
-
-Two honest caveats:
-
-- **Bytes/row is modelled, not measured.** It is the sort-key model's encoded-byte estimate,
-  corrected for the fact that Parquet — unlike an in-memory columnar engine — stores a value
-  column's dictionary alongside its indices, so a near-unique column falls back to PLAIN. Measured
-  across int, star-schema, string-heavy and wide shapes at 40M rows, row groups land within roughly
-  **0.5–1.5×** of target. That spread is not a tuning failure: the target sets the group size, a
-  bigger group compresses better, and better compression fits more rows under the same byte target.
-  What the model buys is the right order of magnitude with exactly one group per file — not
-  sub-percent placement.
-- **The 8 MB floor is a collapse guard, not a size policy.** A perfectly compressible column models
-  near 0 bytes/row, which without a floor produces a few-hundred-byte target; measured, that
-  shattered a 4M-row table into 490 files. It only binds when the model has collapsed.
-
-Both AUTO routes are sized this way — a derived query and the bare
-`SELECT * FROM <table>` re-cluster, which profiles through the Delta log for null shares and
-cardinality caps but runs the same recommender underneath.
-
-Every write logs what actually landed (`rows per row group vs target`), and warns when the ratio is
-off by 2× either way. An explicit `max_row_group_size` or `target_file_size_mb` disables all of this
-for that model — a declared geometry is not a guess to improve on.
 
 ### The logic behind the numbers
 
@@ -105,13 +58,13 @@ If those two consumers were equals, the values would sit in the middle. They are
 - **ETL compute is cheap and invisible.** Merge and compaction run in the background, on a schedule, with no one watching. If a merge takes four minutes instead of three, nothing happens — no user notices, no report stalls. Batch work tolerates being slow; the only hard constraint is that it must *finish* within its memory budget.
 - **BI compute is interactive and user-facing.** A Power BI report is a person clicking a slicer and waiting. Latency there is the product: a cold load that takes seconds instead of milliseconds is felt by every user of every report built on the table, on every visual interaction. Worse, interactive compute cannot be amortized or rescheduled — it happens exactly when the user acts, at whatever concurrency the users generate.
 
-So a second of latency is not worth the same on both sides. The layout therefore optimizes for the reader first and concedes to merge only what merge strictly *needs* — not what would make merge fastest, but what keeps it from failing. Each number is set to the **largest value that still passes the merge spill tests**: large enough to serve Direct Lake well, small enough that merge remains stable. 8M-row groups, 128 MB files, a 32 MB dictionary cap, a 1M-row page cap — each is pushed toward the reader as far as the merge spill tests still tolerate, not to the theoretical ideal for read speed. These specific values were validated against duckrun's test workloads — tables with very different width, cardinality, or update patterns may find their own sweet spot elsewhere.
+So a second of latency is not worth the same on both sides. The layout therefore optimizes for the reader first and concedes to merge only what merge strictly *needs* — not what would make merge fastest, but what keeps it from failing. Each number is set to the **largest value that still passes the merge spill tests**: large enough to serve Direct Lake well, small enough that merge remains stable. 6M-row groups, 256 MB files, a 32 MB dictionary cap, a 1M-row page cap — each is pushed toward the reader as far as the merge spill tests still tolerate, not to the theoretical ideal for read speed. These specific values were validated against duckrun's test workloads — tables with very different width, cardinality, or update patterns may find their own sweet spot elsewhere.
 
 **MERGE takes the compromise one step further and opts out entirely**: it writes with none of these properties (delta_rs defaults), so a merge stays lean and never rewrites large files or materializes large dictionaries to touch a few rows. Merged files are transient — threshold-gated compaction folds them back into this layout on a later pass. Note this covers only a merge that genuinely reaches delta_rs: an *insert-only* merge is routed to a DuckDB anti-join and committed as a plain append, so it gets the full profile.
 
 **Appends do get the profile.** They used to be exempt on the same "compaction will fold it in later" reasoning, but that fold only happens for files small enough to trip the compaction trigger, which is small-file **byte debt**. An append-only fact table writes files that are already a healthy size, so it never trips the trigger, and its row groups stayed at delta_rs's ~1M default permanently — the bottom of the segment band, on exactly the tables that can least afford it. Sizing the append at write time costs nothing on a small increment, because the row-group size is a *ceiling*: an append that never reaches it is written exactly as before.
 
-There is nothing left that differs between them: overwrite, append, and a **`replaceWhere`** write (the microbatch strategy, `INSERT … REPLACE WHERE`) all keep the same fixed 8M ceiling and let the 256 MB file roll pick the actual group.
+There is nothing left that differs between them: overwrite, append, a **`replaceWhere`** write (the microbatch strategy, `INSERT … REPLACE WHERE`), and a **`SORTED BY AUTO`** rewrite all keep the same fixed 6M ceiling and let the 256 MB file roll pick the actual group.
 
 ### How the numbers are grounded
 
@@ -127,7 +80,7 @@ One caveat dominates everything here, and it is the reason this whole page is fr
 
 The selection is a heuristic built on statistical estimates of your data. It is usually a reasonable key; it is never guaranteed to be the best one, and on some data distributions it will not help at all. See [the picker rules](#how-the-automatic-picker-chooses) and their failure modes below. From dbt, the same picker is reachable as the model config `sort_by: auto` — it profiles the staged model result and writes unsorted when nothing pays off.
 
-Because it stages and profiles the whole result, an AUTO write also sizes its own files so that each one holds exactly one row group — see [one row group per file](#one-row-group-per-file).
+The profile decides only the **key**: the write itself lands in [the same fixed Parquet layout](#parquet-layout-the-file-format) as every other write.
 
 ```sql
 -- auto: profile the table, pick the key, rewrite clustered by it
