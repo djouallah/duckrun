@@ -25,20 +25,26 @@ runs:
   steps:
     - name: Commit to main (retrying past concurrent card commits)
       shell: bash
+      env:                      # env-var indirection: values reach bash as data, never as script text
+        CHECKOUT_MAIN: ${{ inputs.checkout-main }}
+        PREPARE: ${{ inputs.prepare }}
+        PATHS: ${{ inputs.paths }}
+        MESSAGE: ${{ inputs.message }}
       run: |
-        if [ "${{ inputs.checkout-main }}" = "true" ]; then
+        if [ "$CHECKOUT_MAIN" = "true" ]; then
           git fetch origin main
           git checkout -B main origin/main
         fi
-        ${{ inputs.prepare }}
-        if git diff --quiet -- ${{ inputs.paths }}; then
-          echo "Nothing changed under: ${{ inputs.paths }}"
+        eval "$PREPARE"
+        # $PATHS deliberately unquoted: the input is a space-separated path list
+        if git diff --quiet -- $PATHS; then
+          echo "Nothing changed under: $PATHS"
           exit 0
         fi
         git config user.name "djouallah"
         git config user.email "mimoune.djouallah@gmail.com"
-        git add ${{ inputs.paths }}
-        git commit -m "${{ inputs.message }}"
+        git add $PATHS
+        git commit -m "$MESSAGE"
         for i in 1 2 3; do
           git pull --rebase origin main && git push origin main && break
           sleep 3
