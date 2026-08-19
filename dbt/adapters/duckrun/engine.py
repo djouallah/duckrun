@@ -19,9 +19,7 @@ from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, CHECKPOINT_INTERVAL,
-                                         DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS,
-                                         RG_LANES, RG_MIN,
-                                         RG_MAX, RG_UNREACHABLE, auto_rg_cap, rg_for, tfs_for)
+                                         DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS)
 from dbt.adapters.duckrun import sortkey
 
 logger = AdapterLogger("Duckrun")
@@ -43,9 +41,9 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# The FIXED row-group ceiling (8M rows) every normal write uses — see policy.ROW_GROUP_DEFAULT_ROWS.
+# The FIXED row-group ceiling (6M rows) every write uses — see policy.ROW_GROUP_DEFAULT_ROWS.
 # This alias is the default max_row_group_size _writer_properties uses when no explicit ceiling is
-# passed; only a per-model max_row_group_size config or the AUTO geometry (RG_UNREACHABLE) moves it.
+# passed; only a per-model max_row_group_size config moves it.
 _ROW_GROUP_SIZE = ROW_GROUP_DEFAULT_ROWS
 # Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
 # overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
@@ -74,7 +72,7 @@ _DATA_PAGE_SIZE_LIMIT = 1_048_576
 # consistently faster, write memory unchanged (dense pages are bounded by bytes, not rows).
 _DATA_PAGE_ROW_LIMIT = 1_000_000
 # Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a segment
-# cap: a narrow fact reaches the full 8M-row ceiling well under 256 MB; a wide fact is capped by the
+# cap: a narrow fact reaches the full 6M-row ceiling well under 256 MB; a wide fact is capped by the
 # file size first. Not a merge-MEMORY lever (that was the dictionary page limit, see
 # _DICT_PAGE_SIZE_LIMIT; 128/256/512 MB all merged in ~16s at ~4.5-5.2 GB RSS in the small-scale
 # measurement) — but it IS a merge-DISK lever at scale: halving it to 128 MB doubled the file count
@@ -90,60 +88,9 @@ _TARGET_FILE_SIZE = DEFAULT_TARGET_FILE_SIZE
 # IN list stops buying pruning (the source spans most of the table) and we let delta_rs plan on its own.
 _PART_PRUNE_MAX = 400
 
-# The AUTO sizing rule (policy.rg_for) and its constants live in policy.py. Aliased here so
-# in-module callers and the tests keep referring to engine._RG_*. A normal write is NOT sized at
-# all: overwrite, append and replaceWhere alike pass row_group_rows=None, keep the fixed
-# _ROW_GROUP_SIZE ceiling, and let the 256 MB file roll pick the group. Only SORTED BY AUTO derives
-# a geometry (see _auto_geometry), and only a per-model max_row_group_size overrides the ceiling.
-_RG_LANES, _RG_MIN, _RG_MAX = RG_LANES, RG_MIN, RG_MAX
-
-
-# An AUTO write whose landed row groups miss the target by this factor either way gets a warning —
-# and, on the benchmark, IS the calibration reading for policy.AUTO_TFS_FACTOR.
-_AUTO_GEOM_WARN_FACTOR = 2.0
-
-
-def _log_auto_geometry(cur, dt):
-    """Report what an AUTO write actually laid down, and how far the byte model was off.
-
-    Free and exact: with one row group per file the log's per-file ``num_records`` IS the row-group
-    size, so no footer read is needed. The target it compares against is recomputed from the landed
-    row count rather than threaded down from the caller — ``rg_for`` is pure, so the two agree by
-    construction and this needs no extra parameter on the write seam.
-
-    ``median(rows per full file) / rg_target`` is the one number that calibrates
-    ``policy.AUTO_TFS_FACTOR``: multiply the factor by it to move the next write onto target. The
-    short trailing file is excluded — it closed on end-of-input, not on the byte target, so it
-    carries no information about the model. Best-effort; never raises, never touches the commit."""
-    if cur is None:
-        return
-    try:
-        add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
-        rows = cur.sql("select num_records from add_actions where num_records is not null").fetchall()
-        counts = sorted(int(r[0]) for r in rows if r[0])
-        if not counts:
-            return
-        total = sum(counts)
-        # Same derate as _auto_geometry's rows_target — the readout must recompute the SAME target
-        # the write aimed at, or the landed/target ratio (the AUTO_TFS_FACTOR calibration) lies.
-        rg_target = min(rg_for(total, floor=RG_MIN), auto_rg_cap())
-        full = [c for c in counts if c > 0.5 * counts[-1]] or counts
-        landed = full[len(full) // 2]           # median of the files the byte target actually closed
-        ratio = landed / rg_target if rg_target else 0.0
-        msg = (f"duckrun: auto geometry landed {len(counts)} file(s), {landed:,} rows per row group "
-               f"vs a {rg_target:,} target ({ratio:.2f}x) over {total:,} rows")
-        if ratio and (ratio >= _AUTO_GEOM_WARN_FACTOR or ratio <= 1.0 / _AUTO_GEOM_WARN_FACTOR):
-            logger.warning(f"{msg} — the bytes/row model is off; recalibrate "
-                           f"DUCKRUN_AUTO_TFS_FACTOR by {1.0 / ratio:.2f}x")
-        else:
-            logger.info(msg)
-    except Exception as exc:
-        logger.debug(f"duckrun: auto geometry readout skipped: {exc}")
-
-
 def _writer_properties(row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, the fixed 8M-row group ceiling, a 32 MB dictionary page limit
+    # compaction, and the optimize sort-rewrite: SNAPPY, the fixed 6M-row group ceiling, a 32 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
     # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap that shapes
     # dense columns into ~1 MB pages (the 1M-row cap only backstops ultra-compressible columns — see
@@ -719,9 +666,9 @@ def build_write_deltalake_args(
     nothing on a small append: ``max_row_group_size`` is a CEILING, and an increment that never
     reaches it is written exactly as before.
 
-    ``row_group_rows`` is an EXPLICIT ceiling only (a per-model ``max_row_group_size``, or the AUTO
-    geometry's ``RG_UNREACHABLE``). ``None`` — every normal write — keeps the fixed
-    ``_ROW_GROUP_SIZE`` ceiling and lets the file roll pick the group; nothing is derived.
+    ``row_group_rows`` is an EXPLICIT ceiling only (a per-model ``max_row_group_size``).
+    ``None`` — every normal write — keeps the fixed ``_ROW_GROUP_SIZE`` ceiling and lets the
+    file roll pick the group; nothing is derived.
 
     ``target_file_size`` (bytes) overrides the 256 MB default for THIS write — the per-model
     ``target_file_size_mb`` dbt config lands here. ``None`` keeps ``_TARGET_FILE_SIZE``.
@@ -1152,26 +1099,20 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
 
 
 def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by=auto"),
-                   narrow_decimals=False, full_rows=None):
-    """Run the sort-key recommender over any FROM-able ``source`` and return ``(cols, lines, geom)``:
-    the recommended ORDER BY columns (``[]`` if nothing pays off), the advisory lines for the CALLER
-    to print/log, and the write GEOMETRY that lands one row group per file. The one seam behind dbt's
-    ``sort_by='auto'`` and the connection API's relation fallback for ``SORTED BY AUTO``.
-
-    ``geom`` is ``{"row_group_rows", "target_file_size", "rows", "bytes_per_row"}`` or ``None`` when
-    the byte target cannot be computed (empty profile, or ``AUTO_TFS_FACTOR`` disabled) — ``None``
-    means "change nothing", so the caller keeps the fixed 8M ceiling and 256 MB files. It is
-    computed HERE, not per surface, so the SQL and dbt paths cannot size a write two different ways.
+                   full_rows=None):
+    """Run the sort-key recommender over any FROM-able ``source`` and return ``(cols, lines)``:
+    the recommended ORDER BY columns (``[]`` if nothing pays off) and the advisory lines for the
+    CALLER to print/log. The one seam behind dbt's ``sort_by='auto'`` and the connection API's
+    relation fallback for ``SORTED BY AUTO``. The write itself is NOT sized here — an AUTO write
+    lands on the same fixed geometry (6M-row ceiling, 256 MB files) as every other write.
 
     ``source`` MUST be cheap to scan repeatedly — the recommender reads it several times. The
     CALLER is responsible for that: both surfaces materialize a PROFILING SUBSTRATE (a full local
     copy at/below ``sortkey.SUBSTRATE_CAP`` rows, a deterministic ``hash(row) % K`` subset above
     it — see ``sortkey.substrate_modulus``) and pass that in. When the substrate is partial, pass
     the full table's exact count as ``full_rows``: the profile then reports/suppresses per the v6
-    contract, and the GEOMETRY sizes its rows target from the FULL count (a measurement — hence
-    ``rg_for``'s low ``RG_MIN`` floor) while pricing bytes/row from the substrate-scale profile.
-    This function deliberately does NOT make its own copy — the deleted reservoir sample is the
-    cautionary tale (see the ``sortkey`` module docstring).
+    contract. This function deliberately does NOT make its own copy — the deleted reservoir sample
+    is the cautionary tale (see the ``sortkey`` module docstring).
 
     ``partition_cols`` keeps declared partition columns from burning a sort-key slot. No Delta-log
     stats are passed here (there is no table behind a staged relation), so null shares and NDV caps
@@ -1180,52 +1121,20 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     cols = [d[0] for d in desc]
     types = {d[0]: str(d[1]) for d in desc}
     if not cols:
-        return [], [], None
+        return [], []
     cost = {}
     rows, _, lines = sortkey.recommend_sort_key(
         cur, label[0], label[1], source, cols, types, list(partition_cols or []),
         profile_info=cost, total_rows=full_rows)
     # The profile is the expensive half of an AUTO write (measured: ~2/3 of a 591.7M-row build),
-    # so its cost gets one INFO line here — the shared seam — like _log_auto_geometry's readout.
+    # so its cost gets one INFO line here — the shared seam.
     if cost:
         of = (f" of {cost['total_rows']:,}" if cost["total_rows"] > cost["rows"] else "")
         logger.info(f"duckrun: sort profile of {label[1]}: {cost['scans']} scans over "
                     f"{cost['rows']:,}{of} rows in {cost['seconds']}s")
     # rows follow sortkey._SCHEMA: [1]=in_sort_key, [2]=sort_position, [3]=column.
     key = [r[3] for r in sorted((x for x in rows if x[1]), key=lambda x: x[2])]
-    return key, lines, _auto_geometry(cur, source, rows, narrow_decimals=narrow_decimals,
-                                      full_rows=full_rows, profile_rows=cost.get("rows"))
-
-
-def _auto_geometry(cur, source, rows, *, narrow_decimals=False, full_rows=None, profile_rows=None):
-    """The one-row-group-per-file write geometry for an AUTO write, or ``None`` to change nothing.
-
-    ``full_rows`` is the table's exact total (drives the rows target); ``profile_rows`` is how many
-    rows the profile behind ``rows`` actually covered (drives bytes/row — ``est_kb`` are at the
-    profile's scale, so dividing by the FULL count would understate bytes/row by the substrate
-    factor and shrink every file). Both default to a ``count(*)`` over ``source`` — exact and
-    correct whenever the profile covered the whole source, which is every call below the cap.
-
-    Best-effort throughout: a geometry is an optimization, so every failure degrades to ``None`` and
-    the write proceeds on the default layout rather than breaking on a sizing problem."""
-    try:
-        n = full_rows if full_rows is not None else cur.sql(
-            f"SELECT count(*) FROM {source}").fetchone()[0]
-        bpr = sortkey.bytes_per_row(rows, profile_rows or n, narrow_decimals=narrow_decimals)
-        # The count is a measurement, so it takes rg_for's low RG_MIN floor at face value.
-        # Capped below the top of the band (policy.auto_rg_cap): with one row group per file the byte
-        # model's measured overshoot spread would otherwise push a 16M target past the segment band.
-        rows_target = min(rg_for(n, floor=RG_MIN), auto_rg_cap())
-        tfs = tfs_for(rows_target, bpr)
-        if tfs is None:
-            return None
-        logger.debug(f"duckrun: auto geometry rows={n:,} bytes/row={bpr:.2f} "
-                     f"rg_target={rows_target:,} target_file_size={tfs:,}")
-        return {"row_group_rows": RG_UNREACHABLE, "target_file_size": tfs,
-                "rows": int(n), "bytes_per_row": bpr, "rg_target": int(rows_target)}
-    except Exception as exc:
-        logger.debug(f"duckrun: auto geometry unavailable: {exc}")
-        return None
+    return key, lines
 
 
 # Delta column-metadata key under which we stash a dbt column description, and the dollar-quote
@@ -1413,7 +1322,7 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
 
     The compaction trigger matches the Tier-0 safe button exactly (compaction_debt: at least 8 files
     under half the target AND at least 2x the target in small bytes). compact() reuses the same
-    _writer_properties() read layout (the fixed 8M-row ceiling) and _TARGET_FILE_SIZE every file
+    _writer_properties() read layout (the fixed 6M-row ceiling) and _TARGET_FILE_SIZE every file
     write uses, so maintenance (including the consolidation of files a lean MERGE left behind) keeps
     the uniform Direct Lake layout.
 
@@ -1424,7 +1333,7 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
 
     ``target_file_size`` / ``row_group_cap`` carry a model's EXPLICIT write geometry (the
     ``target_file_size_mb`` / ``max_row_group_size`` dbt configs) into maintenance: without them, the
-    very next compaction would re-fold the model's files back into the global 256 MB / fixed-8M
+    very next compaction would re-fold the model's files back into the global 256 MB / fixed-6M
     layout, silently undoing the config the write just honored. ``None`` = the defaults, unchanged."""
     if cur is None:
         return
@@ -1496,7 +1405,7 @@ def write_delta(
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
     Every write lands in the one read-layout profile (tuned writer properties + 256 MB files) —
-    append included, with the same fixed 8M row-group ceiling everywhere. Nothing is derived from
+    append included, with the same fixed 6M row-group ceiling everywhere. Nothing is derived from
     the result: no planner estimate, no count, no prior-log probe (the only self-sizing write is
     SORTED BY AUTO, whose profile already paid for an exact count).
 
@@ -1551,10 +1460,6 @@ def write_delta(
 
     if mode == "overwrite":
         dt = _delta_table(path, storage_options)
-        if row_group_rows == RG_UNREACHABLE:
-            # An AUTO write: the row ceiling is out of reach, so the byte target alone shaped the
-            # layout and the landed row groups are the only readout of whether the model was right.
-            _log_auto_geometry(cur, dt)
         # A fresh table (this overwrite created v0) has no prior versions — nothing for vacuum or
         # cleanup_metadata to reclaim, so skip both store-listing operations on a brand-new create.
         if dt.version() > 0:
@@ -1663,8 +1568,8 @@ def overwrite_if_unchanged(
     brand-new table's first write goes through ``write_delta``, not here. Then the same vacuum +
     metadata cleanup as the plain overwrite path.
 
-    ``cur`` is the connection that produced ``data`` — forwarded so the post-write hooks (the AUTO
-    geometry readout) behave exactly as on every other overwrite."""
+    ``cur`` is the connection that produced ``data`` — forwarded so the post-write hooks behave
+    exactly as on every other overwrite."""
     if read_version is None:
         raise ValueError(
             "overwrite_if_unchanged requires read_version (the version the caller read). A fenced "
@@ -1887,7 +1792,7 @@ def optimize(
     cur=None,
 ) -> Dict:
     """Compact small files into larger ones (delta_rs ``optimize.compact``) and return the operation
-    metrics. Reuses the one ``_writer_properties()`` read layout (the fixed 8M-row ceiling — same as
+    metrics. Reuses the one ``_writer_properties()`` read layout (the fixed 6M-row ceiling — same as
     every write; ``cur`` is accepted for API compatibility and unused). A lexicographic ``ORDER BY``
     at write time
     (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a columnar reader wants;

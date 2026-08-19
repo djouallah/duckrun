@@ -788,15 +788,12 @@ class DuckSession:
             return
         self._catalogs[name] = entry._replace(storage_options=so)
 
-    def _handle_delta_write(self, entry, query: str, *, geometry=None) -> bool:
+    def _handle_delta_write(self, entry, query: str) -> bool:
         """Route a Delta write through ``delta_dml.handle``. Memory is already handled: the session's
         ``memory_limit`` was pinned once at connect (``configure_duckdb_session``), and a ``MERGE``'s
-        delta_rs pool is bounded by its own spill caps behind the merge gate in the engine.
-
-        ``geometry`` carries a ``SORTED BY AUTO`` profile's one-row-group-per-file write geometry
-        (see :meth:`_resolve_auto_sort`); ``None`` on every other statement."""
+        delta_rs pool is bounded by its own spill caps behind the merge gate in the engine."""
         return delta_dml.handle(self.con, entry.root_path, entry.storage_options,
-                                query, default_schema=self._current_database, geometry=geometry)
+                                query, default_schema=self._current_database)
 
     def sql(self, query: str) -> duckdb.DuckDBPyRelation:
         """Run a query and return DuckDB's native ``DuckDBPyRelation`` — unwrapped, with all of its
@@ -906,13 +903,13 @@ class DuckSession:
         # SORTED BY AUTO stages its source into a temp table and rewrites the statement to read that,
         # so the profile and the write below share ONE evaluation of the source. staged is that temp
         # table's name (or None) and this owns its lifetime — hence the try/finally.
-        query, staged, geom = self._resolve_auto_sort(query)
+        query, staged = self._resolve_auto_sort(query)
         try:
             # A Delta write is routed with the DuckDB memory_limit clamped (and restored after); a read runs
             # handle() unwrapped — it returns False for non-DML and falls through to DuckDB below. is_write
             # implies entry is not None here (the None case raised above).
             if entry is not None:
-                handled = (self._handle_delta_write(entry, query, geometry=geom) if is_write else
+                handled = (self._handle_delta_write(entry, query) if is_write else
                            delta_dml.handle(self.con, entry.root_path, entry.storage_options,
                                             query, default_schema=self._current_database))
             else:
@@ -938,13 +935,11 @@ class DuckSession:
         ``SORTED BY (cols)`` / ``PARTITIONED BY (cols)`` (native DuckDB syntax) and every non-CREATE
         statement pass straight through untouched.
 
-        Returns ``(query, staged, geom)``. ``staged`` is a temp table holding the body's rows, or
+        Returns ``(query, staged)``. ``staged`` is a temp table holding the body's rows, or
         ``None`` when nothing was staged (any non-AUTO statement). The CALLER must drop it after the
-        statement runs — :meth:`sql` does, in a ``finally``. ``geom`` is the one-row-group-per-file
-        write geometry the profile paid for, or ``None`` to keep the default adaptive layout. BOTH
-        profiling branches produce one: ``_get_rle`` runs the same recommender and returns the same
-        schema, so re-clustering a table (the bare ``SELECT * FROM <delta table>`` case, and the one
-        the layout benchmark exercises) is sized exactly like a derived query.
+        statement runs — :meth:`sql` does, in a ``finally``. The write itself is NOT sized here:
+        an AUTO write lands on the same fixed geometry (6M-row ceiling, 256 MB files) as every
+        other write — AUTO's one job is picking the sort key.
 
         When the body is a bare ``SELECT * FROM <one delta table>`` (the re-cluster-this-table case)
         the key comes from :meth:`_get_rle`, which also reads the table's Delta log for per-column
@@ -961,13 +956,12 @@ class DuckSession:
         stripped = delta_dml._strip_comments(delta_dml._strip_leading(query)).rstrip().rstrip(";").rstrip()
         m = delta_dml._CREATE_AS.fullmatch(stripped)
         if not m:
-            return query, None, None
+            return query, None
         _rel, sort, _part = delta_dml._split_create_layout(m.group("rel").strip())
         if sort != "AUTO":
-            return query, None, None
+            return query, None
         body = m.group("body")
         staged = "_duckrun_auto_src"
-        self._auto_geom = None
         n_full = int(self.con.sql(f"SELECT count(*) FROM ({body}) _c").fetchone()[0] or 0)
         k = sortkey.substrate_modulus(n_full)
         if k == 1:
@@ -980,7 +974,7 @@ class DuckSession:
             # A bare `SELECT * FROM <delta table>` still profiles via _get_rle, for the Delta-log
             # stats — it re-reads the table, but only that case, and only because the log carries
             # signal the staged copy does not.
-            cols = (self._auto_sort_cols_from_table(src, staged=staged) if src is not None
+            cols = (self._auto_sort_cols_from_table(src) if src is not None
                     else self._auto_sort_cols(staged, full_rows=(n_full if k > 1 else None)))
             # Decimal narrowing stays gated on the ORIGINAL body being `SELECT *`: an explicit
             # projection (including a user-written CAST) is an instruction and is left alone. The
@@ -997,8 +991,7 @@ class DuckSession:
         bstart, bend = m.span("body")
         stripped = stripped[:bstart] + new_body + stripped[bend:]
         replacement = ("SORTED BY (" + ", ".join(_qid(c) for c in cols) + ")") if cols else ""
-        return (delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1), staged,
-                getattr(self, "_auto_geom", None))
+        return delta_dml._SORTED_BY_RE.sub(replacement, stripped, count=1), staged
 
     def _narrow_wide_decimals(self, body: str) -> str:
         """Rewrite a ``SELECT *`` body to narrow wide-``DECIMAL`` columns so they regain dictionary
@@ -1460,19 +1453,15 @@ class DuckSession:
             self.con.execute(
                 f"CREATE OR REPLACE TEMP TABLE {src} AS "
                 f"SELECT * FROM delta_scan('{plit}') _r WHERE hash(_r) % {k} = 0")
-        info: Dict[str, int] = {}
         try:
             rows, schema, lines = sortkey.recommend_sort_key(
                 self.con, sch, tbl, src, cols, types, partition_cols,
                 sort_key_cap=sort_key_cap, min_gain_pct=min_gain_pct,
                 key_sort_below_pct=key_sort_below_pct, stats=stats, null_excl=null_excl,
-                fd_band=fd_band, grain_frac=grain_frac, profile_info=info,
+                fd_band=fd_band, grain_frac=grain_frac,
                 total_rows=(n_full if k > 1 else None))
         finally:
             self.con.execute(f"DROP TABLE IF EXISTS {src}")
-        # The substrate's own scale, for _auto_sort_cols_from_table's geometry (an attribute for
-        # the same reason _auto_geom is one — see that docstring).
-        self._rle_profile_info = info
         for line in lines:   # the module is pure; the caller prints the advisory
             print(line)
         return self._relation_from(rows, schema)
@@ -1484,48 +1473,22 @@ class DuckSession:
         ``staged`` is the temp table the CALLER has already materialized — the full result at/below
         ``sortkey.SUBSTRATE_CAP`` rows (the CTAS then writes from it too: one evaluation for
         profile + write together), or a deterministic hash substrate above it, in which case
-        ``full_rows`` carries the body's exact total for the geometry and the sampled-profile
-        contract (keyword-only, so the parquet_layout build scripts' positional calls keep working).
-
-        The same profile also yields the one-row-group-per-file write geometry, which is left on
-        ``self._auto_geom`` for :meth:`_resolve_auto_sort` rather than returned: the return type is
-        load-bearing (the parquet_layout build scripts call this directly, and the SQL tests
-        monkeypatch it), and a patched stand-in that never sets the attribute correctly yields "no
-        geometry". Safe against a shared session because the fixed ``_duckrun_auto_src`` staging name
-        already serializes this path — two concurrent AUTO statements would clobber that table long
-        before they raced on this attribute."""
-        self._auto_geom = None
-        cols, lines, geom = engine.auto_sort_cols(self.con, staged, narrow_decimals=True,
-                                                  full_rows=full_rows)
-        self._auto_geom = geom
+        ``full_rows`` carries the body's exact total for the sampled-profile contract
+        (keyword-only, so the parquet_layout build scripts' positional calls keep working)."""
+        cols, lines = engine.auto_sort_cols(self.con, staged, full_rows=full_rows)
         # This path prints ONLY the ORDER BY line (not the full advisory block).
         for line in lines:
             if line.strip().startswith("ORDER BY"):
                 print(line)
         return cols
 
-    def _auto_sort_cols_from_table(self, source_table: str, *, staged: str = None) -> List[str]:
+    def _auto_sort_cols_from_table(self, source_table: str) -> List[str]:
         """Sort key for a source TABLE, via ``_get_rle`` — it reads the Delta **log** for null shares
         and NDV caps that a bare relation profile can't get. Returns the recommended ORDER BY
-        columns, or ``[]`` if nothing pays off.
-
-        ``staged`` is the temp table the write will read, and asking for it also computes the
-        one-row-group-per-file geometry onto ``self._auto_geom`` (see :meth:`_auto_sort_cols` for why
-        it is an attribute and not a return value). ``_get_rle`` runs the SAME
-        ``sortkey.recommend_sort_key`` as the relation path and hands back its full result schema, so
-        the byte model needs nothing extra — only the row count, which comes from ``staged`` rather
-        than the source so it counts exactly the rows being written. Keyword-only so the
-        parquet_layout build scripts, which call this with one positional argument, keep working."""
+        columns, or ``[]`` if nothing pays off. ``_get_rle`` runs the SAME
+        ``sortkey.recommend_sort_key`` as the relation path and hands back its full result schema."""
         prof = self._get_rle(source_table)
-        raw = prof.fetchall()          # already in sortkey._SCHEMA order — what the byte model wants
-        recs = [dict(zip(prof.columns, row)) for row in raw]
-        if staged is not None:
-            # _get_rle profiled its own substrate; its scale prices bytes/row, the exact total
-            # (from the Delta log) sizes the rows target. Below the cap the two coincide.
-            info = getattr(self, "_rle_profile_info", None) or {}
-            self._auto_geom = engine._auto_geometry(
-                self.con, staged, raw, narrow_decimals=True,
-                full_rows=info.get("total_rows"), profile_rows=info.get("rows"))
+        recs = [dict(zip(prof.columns, row)) for row in prof.fetchall()]
         return [r["column"] for r in sorted((x for x in recs if x["in_sort_key"]),
                                             key=lambda x: x["sort_position"])]
 

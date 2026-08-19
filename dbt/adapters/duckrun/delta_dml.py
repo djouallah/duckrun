@@ -1267,15 +1267,11 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str,
 class _DeltaDML:
     """One attempt to handle a statement; ``run()`` returns True if it was applied to Delta."""
 
-    def __init__(self, cursor, root_path: str, storage_options, default_schema=None, geometry=None):
+    def __init__(self, cursor, root_path: str, storage_options, default_schema=None):
         self.cursor = cursor
         self.root_path = root_path.rstrip("/")
         self.so = storage_options
         self.default_schema = default_schema
-        # One-row-group-per-file write geometry from a SORTED BY AUTO profile the CALLER already
-        # paid for (engine.auto_sort_cols), or None. Only _create_as consumes it: it measures the
-        # whole result, so it describes a full rewrite and nothing else.
-        self.geometry = geometry
         self._with_clause = ""  # a leading `WITH …` preceding an INSERT, prepended to the body
         self._opened = None     # (loc, DeltaTable) from this statement's _exists check — see _pinned
 
@@ -1440,17 +1436,12 @@ class _DeltaDML:
             body = f"SELECT * FROM ({body}) ORDER BY {order}"
         data = self.cursor.sql(body)
         # overwrite_schema so this replaces a prior table (or a drop-tombstone) wholesale — a live
-        # table is recreated with the real schema, clearing any tombstone marker. Adaptive row-group
-        # geometry for a small result is computed inside write_delta (the shared overwrite seam), so
-        # this SQL CTAS path and the dbt table path behave identically. A SORTED BY AUTO statement
-        # arrives with a measured geometry instead (self.geometry) — the same one the dbt surface
-        # applies on its overwrite branch, computed at the same engine seam.
-        geom = self.geometry or {}
+        # table is recreated with the real schema, clearing any tombstone marker. Every CTAS —
+        # SORTED BY AUTO included — lands on the fixed geometry (6M-row ceiling, 256 MB files),
+        # so this SQL path and the dbt table path behave identically.
         engine.write_delta(loc, data, "overwrite", overwrite_schema=True,
                            partition_by=partition_cols or None, storage_options=self.so,
-                           cur=self.cursor,
-                           row_group_rows=geom.get("row_group_rows"),
-                           target_file_size=geom.get("target_file_size"))
+                           cur=self.cursor)
         self._refresh_view(rel, schema, loc)
         return True
 
@@ -2122,7 +2113,7 @@ def _split_top_level(sql: str) -> List[str]:
     return stmts
 
 
-def _handle_one(cursor, root_path, storage_options, sql: str, default_schema, geometry=None) -> bool:
+def _handle_one(cursor, root_path, storage_options, sql: str, default_schema) -> bool:
     """Route ONE statement (already comment-stripped, leading junk removed) to Delta if it's a DML
     form against a duckrun-managed relation. True if applied to Delta; False to pass through."""
     with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
@@ -2130,13 +2121,12 @@ def _handle_one(cursor, root_path, storage_options, sql: str, default_schema, ge
     if not head.startswith(("delete", "update", "insert", "create", "alter", "drop", "merge",
                             "vacuum", "restore")):
         return False
-    dml = _DeltaDML(cursor, root_path, storage_options, default_schema, geometry=geometry)
+    dml = _DeltaDML(cursor, root_path, storage_options, default_schema)
     dml._with_clause = with_clause
     return dml.try_handle(body)
 
 
-def handle(cursor, root_path, storage_options, sql: str, default_schema=None,
-           geometry=None) -> bool:
+def handle(cursor, root_path, storage_options, sql: str, default_schema=None) -> bool:
     """Apply ``sql`` to Delta if it's a DML form targeting a duckrun-managed relation, using
     ``cursor`` to evaluate any SELECT body and to (re)create the ``delta_scan`` view.
 
@@ -2153,12 +2143,6 @@ def handle(cursor, root_path, storage_options, sql: str, default_schema=None,
     duckrun intercepts per-cursor, so a leading DELETE/INSERT against a Delta relation must not
     swallow the rest of the script as its own predicate/body. (The connection API rejects multi-
     statement upstream in session._unsupported_dml, so the split only fires on the dbt cursor path.)
-
-    ``geometry`` is the one-row-group-per-file write geometry from a ``SORTED BY AUTO`` profile the
-    caller already paid for (``engine.auto_sort_cols``); only the CTAS form consumes it. ``None``
-    (every other caller, and every non-AUTO statement) keeps the default fixed layout. It is not
-    forwarded to a multi-statement script: AUTO is single-statement by construction, and a geometry
-    measured for one statement's result must not silently size another's.
     """
     if not root_path:
         return False
@@ -2170,7 +2154,7 @@ def handle(cursor, root_path, storage_options, sql: str, default_schema=None,
     # statement so never hits this; duckrun re-embeds the body, so it must drop the terminator first.
     stmts = _split_top_level(sql)
     if len(stmts) <= 1:
-        return _handle_one(cursor, root_path, storage_options, sql, default_schema, geometry)
+        return _handle_one(cursor, root_path, storage_options, sql, default_schema)
     # Multi-statement script: route each statement; non-Delta ones run on the cursor as DuckDB would.
     for stmt in stmts:
         if not _handle_one(cursor, root_path, storage_options, stmt, default_schema):

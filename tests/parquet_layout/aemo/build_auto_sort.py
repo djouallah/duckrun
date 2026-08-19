@@ -11,16 +11,17 @@ import sort_key as sort_key_mod  # noqa: E402
 sort = sort_key_mod.requested()
 clause = "sorted by auto" if sort.lower() == "auto" else f"sorted by ({sort})"
 force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
-# OPT_RG: pin the row-group CEILING for this build (rows), e.g. 16000000 vs 8000000 — the harness
+# OPT_RG: pin the row-group CEILING for this build (rows), e.g. 16000000 vs 6000000 — the harness
 # spelling of the per-model `max_row_group_size` dbt config, for A/B-ing geometries in THIS CI.
 # The CTAS goes through the connection API (no dbt config to carry it), so pin it at the one
-# documented sizing seam every overwrite flows through: engine.rg_for. Same writer path
-# (row_group_rows -> WriterProperties) the dbt config feeds; empty = the adaptive default.
+# sizing seam every write reads at call time: engine._ROW_GROUP_SIZE (the module global behind
+# _writer_properties). Same writer path (row_group_rows -> WriterProperties) the dbt config
+# feeds; empty = the fixed 6M default.
 _rg = os.environ.get("OPT_RG", "").strip()
 OPT_RG = int(_rg) if _rg.isdigit() and int(_rg) > 0 else None
 if OPT_RG is not None:
     from dbt.adapters.duckrun import engine as _engine
-    _engine.rg_for = lambda est, floor=None, _v=OPT_RG: _v
+    _engine._ROW_GROUP_SIZE = OPT_RG
     print(f"OPT_RG: row-group ceiling pinned to {OPT_RG:,} rows for this build", flush=True)
 # OPT_TFS_MB: pin the target parquet FILE size (MB) — the harness spelling of the
 # `target_file_size_mb` model config, same seam (the module global every write reads at call
@@ -86,6 +87,6 @@ else:
 
 report.merge({"tables": {"fct_summary_auto_sort": {"build": {
     "engine": "delta_rs", "sort": clause, "sort_key": sort_key, "vorder": False,
-    "row_group_ceiling": OPT_RG,     # None = adaptive (the default sizing)
-    "target_file_size_mb": OPT_TFS_MB,  # None = the 128 MB default
+    "row_group_ceiling": OPT_RG,     # None = the fixed 6M default
+    "target_file_size_mb": OPT_TFS_MB,  # None = the 256 MB default
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})

@@ -298,7 +298,7 @@ class Plugin(BasePlugin):
         # resolving 'auto' means PROFILING the staged relation and three branches then throw the
         # answer away (see that method). A project-wide `+sort_by: auto` used to pay that profile on
         # every incremental run of every merge model.
-        sort_by, auto_geom = self._resolve_sort_by(
+        sort_by = self._resolve_sort_by(
             cur, profile_src, cfg.get("sort_by"), partition_by, profile=_profile_sort,
             display_name=model_name, full_rows=full_rows)
         cfg["sort_by"] = sort_by
@@ -306,8 +306,7 @@ class Plugin(BasePlugin):
         # DECIMAL(p>18) maps to a 16-byte FLBA that arrow-rs never dictionary-encodes, so a
         # SORTED BY AUTO write narrows it back to INT64 territory when the exact column max fits.
         # Overwrite branch ONLY — an append/merge increment must keep the existing table's schema —
-        # and only on the profiled path, whose geometry already prices the narrowed width
-        # (auto_sort_cols narrow_decimals=True in _resolve_sort_by).
+        # and only on the profiled path.
         select_body = f"SELECT * FROM {name}"
         if _profile_sort and (not incremental or full_refresh or not exists):
             select_body = self._narrow_wide_decimals_select(cur, name)
@@ -347,18 +346,10 @@ class Plugin(BasePlugin):
                 # Table-like (non-incremental) models always overwrite. Incremental models
                 # overwrite on first run / full-refresh, then apply the incremental strategy.
                 if not incremental or full_refresh or not exists:
-                    # The AUTO profile's geometry lands ONLY on this branch: it measures the whole
-                    # result, so it describes a full rewrite and nothing else — an append or an
-                    # incremental increment knows nothing about the table it joins. An explicit
-                    # per-model geometry wins verbatim, and declaring EITHER knob backs this off
-                    # entirely rather than half-honoring a declared layout.
-                    _rg, _tfs = row_group_rows, target_file_size
-                    if auto_geom and _rg is None and _tfs is None:
-                        _rg, _tfs = auto_geom["row_group_rows"], auto_geom["target_file_size"]
                     self._store_overwrite(path, cur, data, partition_by, merge_schema, exists,
                                           storage_options,
-                                          row_group_rows=_rg,
-                                          target_file_size=_tfs,
+                                          row_group_rows=row_group_rows,
+                                          target_file_size=target_file_size,
                                           timestamp_ntz=timestamp_ntz, existing_dt=dt0)
                     return
 
@@ -447,7 +438,7 @@ class Plugin(BasePlugin):
         """The per-model write-geometry overrides: ``max_row_group_size`` (rows — deltalake's own
         ``WriterProperties`` spelling) and ``target_file_size_mb`` (megabytes; converted to bytes
         HERE — everything below the plugin speaks bytes). Returns ``(row_group_rows, target_bytes)``,
-        each ``None`` when unset (the fixed 8M ceiling / 256 MB roll stay in charge).
+        each ``None`` when unset (the fixed 6M ceiling / 256 MB roll stay in charge).
         Explicit values are CEILINGS the engine honors verbatim.
         Ints or digit-strings accepted (YAML quoting); anything else fails the model loudly."""
         def _pos_int(key):
@@ -572,37 +563,31 @@ class Plugin(BasePlugin):
         ``profile=False`` (see :meth:`_sort_by_is_inert`) resolves ``'auto'`` to ``None`` WITHOUT
         profiling, for a write branch that would discard the key anyway. Validation is deliberately
         NOT gated on it: ``['auto']`` still raises on every path, so a typo can't go quiet just
-        because the model happens to be a merge.
-
-        Returns ``(sort_by, geom)``. ``geom`` is the one-row-group-per-file write geometry the same
-        profile paid for (see :func:`engine.auto_sort_cols`), or ``None`` on every path that did not
-        profile — an explicit column list, a non-auto value, or an inert branch — which is what keeps
-        the geometry tied to a real profile instead of leaking onto writes that never had one."""
+        because the model happens to be a merge."""
         if isinstance(sort_by, (list, tuple)):
             if any(isinstance(c, str) and c.strip().lower() == "auto" for c in sort_by):
                 raise ValueError(
                     "sort_by: 'auto' must be the scalar value (sort_by='auto'), not a list "
                     "element. Use an explicit column list otherwise."
                 )
-            return sort_by, None
+            return sort_by
         if not (isinstance(sort_by, str) and sort_by.strip().lower() == "auto"):
-            return sort_by, None
+            return sort_by
         disp = display_name or name
         if not profile:
             engine.logger.debug(
                 f"duckrun: sort_by=auto skipped for {disp} — this write path does not sort")
-            return None, None
+            return None
         pcols = (list(partition_by) if isinstance(partition_by, (list, tuple))
                  else [partition_by] if partition_by else [])
-        key, lines, geom = engine.auto_sort_cols(cur, name, partition_cols=pcols,
-                                                 label=("model", disp), narrow_decimals=True,
-                                                 full_rows=full_rows)
+        key, lines = engine.auto_sort_cols(cur, name, partition_cols=pcols,
+                                           label=("model", disp), full_rows=full_rows)
         for line in lines:  # full advisory (model version, per-column verdicts) at debug
             engine.logger.debug(line)
         engine.logger.info(
             f"duckrun: sort_by=auto for {disp} -> "
             + (", ".join(key) if key else "no sort (nothing pays off)"))
-        return key or None, geom
+        return key or None
 
     def _store_overwrite(self, path, cur, data, partition_by, merge_schema, exists,
                          storage_options, row_group_rows=None, target_file_size=None,

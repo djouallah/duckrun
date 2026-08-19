@@ -161,15 +161,14 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   local copy of the table (or model result) exists for the duration of the write. It spills to
   DuckDB's `temp_directory` like any other result, so the ceiling is disk rather than RAM; on a very
   large table plan for that disk. An explicit `SORTED BY (cols)` skips profiling entirely.
-- **The write geometry is fixed, not adaptive.** Every normal write — overwrite, append,
-  `replaceWhere`, and compaction alike — uses the same constants: an **8M-row** row-group ceiling
-  (Power BI's native segment size) and a **256 MB** target file size. Nothing is derived from the
-  result: no planner estimate, no `count(*)`, no prior-log probe. The cost of the fixed rule is that a
-  small table lands fewer, larger segments than an adaptive scheme would give it; the win is that no
-  write pays a plan walk or a count, and no bad estimate can mis-size a table. The two exceptions:
-  `SORTED BY AUTO` / `sort_by: auto` derives its geometry from the exact count its profile already
-  paid for, and the model configs `max_row_group_size` / `target_file_size_mb` declare a geometry
-  explicitly and are honored verbatim. See the
+- **The write geometry is fixed, not adaptive.** Every write — overwrite, append, `replaceWhere`,
+  `SORTED BY AUTO`, and compaction alike — uses the same constants: a **6M-row** row-group ceiling
+  and a **256 MB** target file size. Nothing is derived from the result: no planner estimate, no
+  `count(*)`, no prior-log probe, no bytes/row model. The cost of the fixed rule is that a small
+  table lands fewer, larger segments than an adaptive scheme would give it; the win is that no
+  write pays a plan walk or a count, and no bad estimate can mis-size a table. The one exception:
+  the model configs `max_row_group_size` / `target_file_size_mb` declare a geometry explicitly and
+  are honored verbatim. See the
   [model config reference](dbt-adapter.md#config-options-table--incremental--delta).
 
 ## Memory

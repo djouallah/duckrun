@@ -1648,18 +1648,18 @@ def _live_files(conn, table):
 
 
 def test_ctas_gets_the_fixed_row_group_ceiling(conn):
-    # Every normal write uses the FIXED 8M-row ceiling — nothing is derived from the result (the
-    # planner-estimate machinery is gone). 20M rows → 8M + 8M + 4M = 3 groups.
+    # Every normal write uses the FIXED 6M-row ceiling — nothing is derived from the result (the
+    # planner-estimate machinery is gone). 20M rows → 6M + 6M + 6M + 2M = 4 groups.
     conn.sql("CREATE OR REPLACE TABLE small_ctas AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "small_ctas")
-    assert 3 <= n <= 4, f"expected 3 row groups (20M at the fixed 8M ceiling), got {n}"
+    assert 4 <= n <= 5, f"expected 4 row groups (20M at the fixed 6M ceiling), got {n}"
 
 
 def test_ctas_sorted_result_gets_the_same_fixed_ceiling(conn):
     # SORTED BY (an explicit column list) changes the row ORDER, never the geometry.
     conn.sql("CREATE OR REPLACE TABLE sorted_ctas SORTED BY (j) AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "sorted_ctas")
-    assert 3 <= n <= 4, f"sorted CTAS changed the fixed geometry: {n} row groups"
+    assert 4 <= n <= 5, f"sorted CTAS changed the fixed geometry: {n} row groups"
 
 
 def test_ctas_geometry_is_independent_of_the_source_size(conn):
@@ -1669,12 +1669,12 @@ def test_ctas_geometry_is_independent_of_the_source_size(conn):
              "select * from (select i as j from range(200000000) t(i) limit 20000000)")
     assert conn.sql("select count(*) from limited_ctas").fetchone()[0] == 20000000
     n = _row_groups(conn, "limited_ctas")
-    assert 3 <= n <= 4, f"expected 3 row groups at the fixed 8M ceiling, got {n}"
+    assert 4 <= n <= 5, f"expected 4 row groups at the fixed 6M ceiling, got {n}"
 
 
 def test_estimator_machinery_is_gone():
     # The write path must take no planner estimate, no count(*), and no prior-log probe — the whole
-    # apparatus was deleted (fixed 8M/256MB geometry). Guards against it creeping back.
+    # apparatus was deleted (fixed 6M/256MB geometry). Guards against it creeping back.
     from dbt.adapters.duckrun import engine
     for name in ("estimated_rows", "prior_row_count", "table_num_records",
                  "_walk_cardinality", "_plan_has_limit", "_warn_if_estimate_was_far_off"):
@@ -1690,7 +1690,7 @@ def test_overwrite_seam_is_fixed_regardless_of_caller(conn):
     engine.write_delta(loc, data, "overwrite", storage_options=conn.storage_options,
                        cur=conn._connection)
     n = _row_groups(conn, "ow_direct")
-    assert 3 <= n <= 4, f"overwrite seam left the fixed geometry: {n} row groups"
+    assert 4 <= n <= 5, f"overwrite seam left the fixed geometry: {n} row groups"
 
 
 def test_created_table_gets_the_checkpoint_interval(conn):
@@ -1919,8 +1919,8 @@ def test_replace_window_into_tz_column(conn):
 
 
 def test_compaction_lands_the_fixed_read_layout(conn):
-    # Compaction rewrites fragmented appends into the same fixed read layout every write uses (8M
-    # ceiling, 256 MB target) — no row count is taken, no derived sizing. 20M rows → 3 groups.
+    # Compaction rewrites fragmented appends into the same fixed read layout every write uses (6M
+    # ceiling, 256 MB target) — no row count is taken, no derived sizing. 20M rows → 4 groups.
     from dbt.adapters.duckrun import engine
     conn.sql("CREATE OR REPLACE TABLE compact_me AS select i as j from range(4000000) t(i)")
     for k in range(1, 5):
@@ -1932,7 +1932,7 @@ def test_compaction_lands_the_fixed_read_layout(conn):
     live = engine._delta_table(loc, conn.storage_options).file_uris()
     n = conn.sql(f"select count(*) from (select distinct file_name, row_group_id "
                  f"from parquet_metadata({live!r}))").fetchone()[0]
-    assert 3 <= n <= 4, f"compaction left the fixed 8M layout: {n} row groups"
+    assert 4 <= n <= 5, f"compaction left the fixed 6M layout: {n} row groups"
 
 
 def test_deleted_row_count_gates_on_the_protocol(conn):
@@ -2072,109 +2072,6 @@ def test_logical_names_escapes_and_passes_unknown_segments_through(conn):
     assert session_mod._logical_names({}) == ""            # no mapping -> no clause at all
 
 
-def test_rg_for_clamps():
-    from dbt.adapters.duckrun import engine
-    assert engine.rg_for(100) == engine._RG_MIN                       # tiny → floor
-    assert engine.rg_for(100_000_000) < engine._RG_MAX               # large but below cutoff → adapts
-    assert engine.rg_for(None) == engine._RG_MAX                     # unknown → today's constant
-    assert engine.rg_for(engine._RG_LANES * engine._RG_MAX) == engine._RG_MAX  # at/above cutoff → 16M
-
-
-def test_tfs_for_clamps_between_the_collapse_guard_and_the_policy_cap():
-    from dbt.adapters.duckrun import policy
-    # In band: the byte target IS rows x bytes/row x the calibration factor.
-    assert policy.tfs_for(1_000_000, 100.0) == int(1_000_000 * 100.0 * policy.AUTO_TFS_FACTOR)
-    # Over the 256 MB policy: a fact wide enough to need a bigger file keeps the global cap and
-    # lands a smaller — still single — row group.
-    assert policy.tfs_for(16_000_000, 500.0) == policy.DEFAULT_TARGET_FILE_SIZE
-    # Under the collapse guard: a perfectly compressible table models near 0 B/row, which without
-    # this floor gives a few-hundred-BYTE target and shatters the table into hundreds of files.
-    assert policy.tfs_for(1_000_000, 0.0001) == policy.TFS_MIN
-    assert policy.TFS_MIN < policy.DEFAULT_TARGET_FILE_SIZE
-
-
-def test_tfs_for_is_inert_without_a_model_or_with_the_factor_off(monkeypatch):
-    # None means "change nothing" — the caller keeps DEFAULT_TARGET_FILE_SIZE and today's layout.
-    from dbt.adapters.duckrun import policy
-    assert policy.tfs_for(1_000_000, None) is None
-    assert policy.tfs_for(None, 10.0) is None
-    monkeypatch.setattr(policy, "AUTO_TFS_FACTOR", 0.0)
-    assert policy.tfs_for(1_000_000, 10.0) is None      # the kill switch
-
-
-def test_auto_geometry_sizes_off_the_exact_count_at_the_low_floor(conn):
-    # A SORTED BY AUTO write stages its source and counts every row, so its row count is a
-    # MEASUREMENT and takes rg_for's low RG_MIN floor — the fixed 8M ceiling of a normal write must
-    # not apply here: at 20M rows the exact count asks for 2.5M-row groups.
-    from dbt.adapters.duckrun import engine
-    cur = conn._connection
-    cur.execute("CREATE OR REPLACE TEMP TABLE staged AS select i as j, (i%97)::int k "
-                "from range(20000000) t(i)")
-    _key, _lines, geom = engine.auto_sort_cols(cur, "staged")
-    assert geom is not None
-    assert geom["rows"] == 20_000_000                            # exact — the profile counted it
-    assert geom["rg_target"] == engine.rg_for(20_000_000, floor=engine._RG_MIN) == 2_500_000
-    assert geom["row_group_rows"] == engine.RG_UNREACHABLE      # no row bound; bytes decide
-    assert geom["bytes_per_row"] > 0
-
-
-def test_auto_rg_cap_derates_the_top_of_the_band(monkeypatch):
-    # The byte model's landed/target spread is measured at 0.75-1.74x per shape and profile mode
-    # (nyc: 1.39x on the full profile, 1.74x on the v6 substrate). Mid-band that is noise; at the
-    # TOP of the band it exits the 16M segment band (nyc on 0.4.54: a 16M target landed 21.7M-row
-    # groups). So the AUTO rows target never aims at the top: it is capped at
-    # RG_MAX / AUTO_RG_HEADROOM — 8M at the 2.0 default, Power BI's own default segment size.
-    from dbt.adapters.duckrun import policy
-    assert policy.auto_rg_cap() == int(policy.RG_MAX / policy.AUTO_RG_HEADROOM) == 8_000_000
-    monkeypatch.setattr(policy, "AUTO_RG_HEADROOM", 1.0)
-    assert policy.auto_rg_cap() == policy.RG_MAX        # <= 1 disables (the harness escape hatch)
-    monkeypatch.setattr(policy, "AUTO_RG_HEADROOM", 1.5)
-    assert policy.auto_rg_cap() == 10_666_666
-
-
-def test_auto_geometry_and_readout_share_the_derate(conn, monkeypatch):
-    # Both seams must derate identically: the sizing (_auto_geometry) AND the calibration readout
-    # (_log_auto_geometry), or the landed/target ratio compares against a target the write never
-    # aimed at. rg_for is pinned to the 16M band top to simulate a huge table on a small one.
-    import os as _os
-    from deltalake import DeltaTable
-    from dbt.adapters.duckrun import engine, policy
-    monkeypatch.setattr(engine, "rg_for", lambda est, floor=None: engine._RG_MAX)
-    cur = conn._connection
-    cur.execute("CREATE OR REPLACE TEMP TABLE staged AS "
-                "select i as j, (i%97)::int k from range(100000) t(i)")
-    _key, _lines, geom = engine.auto_sort_cols(cur, "staged")
-    assert geom is not None and geom["rg_target"] == policy.auto_rg_cap() == 8_000_000
-    assert geom["row_group_rows"] == engine.RG_UNREACHABLE   # still one row group per file
-
-    conn.sql("CREATE OR REPLACE TABLE derate_t SORTED BY AUTO AS "
-             "select i as j, (i%97)::int k from range(100000) t(i)")
-    dt = DeltaTable(_os.path.join(conn.root_path, "dbo", "derate_t"))
-    got = []
-    monkeypatch.setattr(engine.logger, "info", lambda m: got.append(m))
-    monkeypatch.setattr(engine.logger, "warning", lambda m: got.append(m))
-    engine._log_auto_geometry(cur, dt)
-    assert any("8,000,000 target" in m for m in got), got
-
-
-def test_auto_geometry_prices_bytes_per_row_at_the_profile_scale(conn):
-    # v6: above the substrate cap the profile's est_kb are at SUBSTRATE scale. bytes_per_row must
-    # divide by the rows the profile actually covered (profile_rows), while the rows target sizes
-    # from the FULL exact count — dividing substrate-scale bytes by the full count would understate
-    # bytes/row by the substrate factor and shrink every file by the same.
-    from dbt.adapters.duckrun import engine, policy
-    cur = conn._connection
-    cur.execute("CREATE OR REPLACE TEMP TABLE staged AS "
-                "select i as j, (i%97)::int k from range(100000) t(i)")
-    _k, _l, g_full = engine.auto_sort_cols(cur, "staged")
-    _k, _l, g_sub = engine.auto_sort_cols(cur, "staged", full_rows=1_000_000)
-    assert g_full is not None and g_sub is not None
-    assert g_sub["rows"] == 1_000_000                                     # full count drives rows
-    assert g_sub["bytes_per_row"] == pytest.approx(g_full["bytes_per_row"])  # profile scale drives bpr
-    assert g_sub["rg_target"] == min(engine.rg_for(1_000_000, floor=engine._RG_MIN),
-                                     policy.auto_rg_cap())
-
-
 def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
     # v6 end-to-end above the cap: the profile reads a hash-modulo substrate, but the WRITE must
     # read the original body — writing the substrate would silently drop ~ (1 - 1/K) of the table.
@@ -2190,57 +2087,40 @@ def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
     assert not leftovers, leftovers
 
 
-def test_auto_ctas_lands_exactly_one_row_group_per_file(conn):
-    # The whole point: with the row ceiling out of reach, the byte target is the only boundary, so
-    # every file closes with exactly one row group and no ragged trailing group.
+def test_sorted_by_auto_uses_the_fixed_geometry(conn):
+    # AUTO's one job is picking the sort key — the write itself lands on the SAME fixed geometry
+    # as every other write (6M-row ceiling, 256 MB file roll). 20M rows → full 6M-row groups.
     conn.sql("CREATE OR REPLACE TABLE auto_geo SORTED BY AUTO AS "
-             "select i as j, (i%1000)::int k, ('s'||(i%9973)) s from range(20000000) t(i)")
+             "select i as j, (i%1000)::int k from range(20000000) t(i)")
     live = _live_files(conn, "auto_geo")
-    per_file = conn.sql(f"select file_name, count(distinct row_group_id) "
-                        f"from parquet_metadata({live!r}) group by 1").fetchall()
-    assert len(per_file) > 1, f"test needs a multi-file table to be meaningful: {per_file}"
-    assert all(rgs == 1 for _f, rgs in per_file), f"ragged file(s): {per_file}"
+    mx, total = conn.sql(
+        f"select max(row_group_num_rows), sum(row_group_num_rows) from (select distinct "
+        f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchone()
+    assert mx == 6_000_000, f"AUTO left the fixed 6M ceiling: max group {mx}"
+    assert total == 20_000_000
 
 
-@pytest.mark.parametrize("wrongness", [0.05, 20.0])
-def test_auto_ctas_stays_one_row_group_per_file_when_the_model_is_wrong(conn, monkeypatch, wrongness):
-    # The invariant must not depend on the byte model being right. A bad bytes/row moves how many
-    # ROWS land in the group — never how many groups land in the file. This is the test a row-count
-    # backstop would fail: a ceiling firing mid-file is exactly what re-introduces a runt group.
-    from dbt.adapters.duckrun import sortkey
-    real = sortkey.bytes_per_row
-    monkeypatch.setattr(sortkey, "bytes_per_row",
-                        lambda rows, n, **k: (real(rows, n, **k) or 1.0) * wrongness)
-    conn.sql(f"CREATE OR REPLACE TABLE auto_bad_{int(wrongness * 100)} SORTED BY AUTO AS "
-             f"select i as j, (i%1000)::int k from range(8000000) t(i)")
-    live = _live_files(conn, f"auto_bad_{int(wrongness * 100)}")
-    per_file = conn.sql(f"select file_name, count(distinct row_group_id) "
-                        f"from parquet_metadata({live!r}) group by 1").fetchall()
-    assert all(rgs == 1 for _f, rgs in per_file), f"ragged file(s): {per_file}"
-
-
-def test_auto_recluster_of_a_table_is_sized_too(conn):
+def test_auto_recluster_gets_the_fixed_geometry_too(conn):
     # `SORTED BY AUTO AS SELECT * FROM <delta table>` — re-cluster this table — profiles via
     # _get_rle (the Delta log carries null shares and NDV caps a bare relation profile cannot get),
-    # NOT the staged-relation path. It runs the same recommender underneath, so it must get the same
-    # geometry: this is the shape the layout benchmark builds, and it was silently unsized at first.
+    # NOT the staged-relation path. Same recommender, same write seam, same fixed geometry.
     conn.sql("CREATE OR REPLACE TABLE recluster_src AS "
-             "select i as j, (i%1000)::int k, ('s'||(i%9973)) s from range(20000000) t(i)")
+             "select i as j, (i%1000)::int k from range(20000000) t(i)")
     conn.sql("CREATE OR REPLACE TABLE recluster_src SORTED BY AUTO AS select * from recluster_src")
     live = _live_files(conn, "recluster_src")
-    per_file = conn.sql(f"select file_name, count(distinct row_group_id) "
-                        f"from parquet_metadata({live!r}) group by 1").fetchall()
-    assert len(per_file) > 1, f"test needs a multi-file table to be meaningful: {per_file}"
-    assert all(rgs == 1 for _f, rgs in per_file), f"ragged file(s): {per_file}"
+    mx, total = conn.sql(
+        f"select max(row_group_num_rows), sum(row_group_num_rows) from (select distinct "
+        f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchone()
+    assert mx == 6_000_000, f"AUTO re-cluster left the fixed 6M ceiling: max group {mx}"
+    assert total == 20_000_000
 
 
-def test_auto_geometry_never_reaches_a_plain_ctas(conn):
-    # Scope guard: only SORTED BY AUTO gets the byte-derived geometry. A plain CTAS keeps the fixed
-    # 8M ceiling, so 20M rows land full 8M-row groups.
+def test_plain_ctas_keeps_the_fixed_ceiling(conn):
+    # A plain CTAS keeps the fixed 6M ceiling, so 20M rows land full 6M-row groups.
     conn.sql("CREATE OR REPLACE TABLE plain_geo AS select i as j from range(20000000) t(i)")
     live = _live_files(conn, "plain_geo")
     mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchone()[0]
-    assert mx == 8_000_000, f"plain CTAS left the fixed 8M ceiling: max group {mx}"
+    assert mx == 6_000_000, f"plain CTAS left the fixed 6M ceiling: max group {mx}"
 
 
 # NOTE: sort / partition on write are covered by test_sql_only.py (CREATE TABLE … SORTED BY /
@@ -2385,7 +2265,7 @@ def test_explicit_target_file_size_overrides_the_constant():
 
 
 def test_explicit_row_group_overrides_the_fixed_ceiling_and_lands(conn):
-    # An explicit max_row_group_size is a DECLARED geometry: it overrides the fixed 8M ceiling
+    # An explicit max_row_group_size is a DECLARED geometry: it overrides the fixed 6M ceiling
     # verbatim and must land in the written parquet.
     from dbt.adapters.duckrun import engine
     data = conn._connection.sql("select i from range(1000) t(i)")

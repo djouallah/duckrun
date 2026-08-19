@@ -596,17 +596,17 @@ def test_resolve_sort_by_labels_the_model_not_the_staging_table(monkeypatch):
 
     def fake_auto_sort_cols(cur, source, *, partition_cols=None, label=None, **kw):
         seen["source"], seen["label"] = source, label
-        return ["id"], [], None
+        return ["id"], []
 
     infos = []
     monkeypatch.setattr(engine, "auto_sort_cols", fake_auto_sort_cols)
     monkeypatch.setattr(engine.logger, "info", lambda m: infos.append(m))
 
     plugin = object.__new__(Plugin)
-    key, geom = plugin._resolve_sort_by(
+    key = plugin._resolve_sort_by(
         con, '"__duckrun_msrc_deadbeef"', "auto", None,
         profile=True, display_name='"mart"."fct_trips"')
-    assert key == ["id"] and geom is None
+    assert key == ["id"]
     assert seen["source"] == '"__duckrun_msrc_deadbeef"'      # queries the staging table …
     assert seen["label"] == ("model", '"mart"."fct_trips"')   # … but names the model
     assert any("fct_trips" in m for m in infos)
@@ -617,7 +617,7 @@ def test_resolve_sort_by_display_name_defaults_to_name(monkeypatch):
     con = duckdb.connect()
     con.execute("CREATE TEMP TABLE plainrel AS select 1 as id")
     monkeypatch.setattr(engine, "auto_sort_cols",
-                        lambda cur, source, **kw: (["id"], [], None))
+                        lambda cur, source, **kw: (["id"], []))
     infos = []
     monkeypatch.setattr(engine.logger, "info", lambda m: infos.append(m))
     plugin = object.__new__(Plugin)
