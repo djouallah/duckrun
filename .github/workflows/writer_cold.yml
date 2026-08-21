@@ -30,6 +30,17 @@ on:
         description: "row cap on the shared source mart.fct_summary (142M ≈ full)"
         type: string
         default: "142000000"
+      order:
+        description: "which writer is measured FIRST. The two passes share one capacity, so the second can inherit smoothing/throttling from the first — swap this and re-run to prove an effect is the parquet and not the running order."
+        type: choice
+        default: deltars_first
+        options:
+          - deltars_first
+          - duckdb_first
+      gap_seconds:
+        description: "idle seconds between the two cold passes, so the first pass's capacity burst has smoothed out before the second is measured. 0 = back-to-back (not recommended)."
+        type: string
+        default: "300"
       keep:
         description: "skip teardown and leave the lakehouses + models standing (debugging). They bill storage until removed by hand."
         type: boolean
@@ -147,24 +158,46 @@ jobs:
           PYTHONIOENCODING: utf-8
         run: python tests/parquet_layout/writer_cold/deploy_models.py
 
-      - name: 🧊 Cold pass — delta-rs
+      - name: 🔀 Resolve measurement order
+        # Both passes share one capacity, so whichever runs second can inherit the first's
+        # smoothing. Order is an input precisely so a finding can be re-run the other way round:
+        # an effect that survives the swap is the parquet, one that flips is the running order.
+        if: ${{ inputs.settle_run == '' }}
+        run: |
+          if [ "${{ inputs.order }}" = "duckdb_first" ]; then
+            echo "FIRST_MODEL=$MODEL_DUCKDB"   >> "$GITHUB_ENV"
+            echo "FIRST_VARIANT=duckdb"        >> "$GITHUB_ENV"
+            echo "SECOND_MODEL=$MODEL_DELTARS" >> "$GITHUB_ENV"
+            echo "SECOND_VARIANT=deltars"      >> "$GITHUB_ENV"
+          else
+            echo "FIRST_MODEL=$MODEL_DELTARS"  >> "$GITHUB_ENV"
+            echo "FIRST_VARIANT=deltars"       >> "$GITHUB_ENV"
+            echo "SECOND_MODEL=$MODEL_DUCKDB"  >> "$GITHUB_ENV"
+            echo "SECOND_VARIANT=duckdb"       >> "$GITHUB_ENV"
+          fi
+
+      - name: 🧊 Cold pass — first writer
         if: ${{ inputs.settle_run == '' }}
         env:
           PYTHONNET_RUNTIME: coreclr
           PYTHONIOENCODING: utf-8
           PYTHONUNBUFFERED: "1"
-          MODEL: ${{ env.MODEL_DELTARS }}
-          VARIANT: deltars
+          MODEL: ${{ env.FIRST_MODEL }}
+          VARIANT: ${{ env.FIRST_VARIANT }}
         run: python tests/parquet_layout/writer_cold/cold_bench.py
 
-      - name: 🧊 Cold pass — DuckDB writer
+      - name: 😴 Idle gap so the first pass's burst smooths out
+        if: ${{ inputs.settle_run == '' && inputs.gap_seconds != '0' }}
+        run: sleep ${{ inputs.gap_seconds }}
+
+      - name: 🧊 Cold pass — second writer
         if: ${{ inputs.settle_run == '' }}
         env:
           PYTHONNET_RUNTIME: coreclr
           PYTHONIOENCODING: utf-8
           PYTHONUNBUFFERED: "1"
-          MODEL: ${{ env.MODEL_DUCKDB }}
-          VARIANT: duckdb
+          MODEL: ${{ env.SECOND_MODEL }}
+          VARIANT: ${{ env.SECOND_VARIANT }}
         run: python tests/parquet_layout/writer_cold/cold_bench.py
 
       - name: 💰 Read CU (lower bound — it accrues for ~70 min)
