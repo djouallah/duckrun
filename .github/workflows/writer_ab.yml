@@ -52,7 +52,7 @@ on:
         type: boolean
         default: false
       opt_dict_limit:
-        description: "[duckdb arm] DICTIONARY_SIZE_LIMIT — max distinct values per column that still dictionary-encodes. Empty = 16000000, i.e. NEVER fall out of dictionary. Set to 0 to use DuckDB's own default (ROW_GROUP_SIZE/5), which lets high-cardinality columns fall back like delta-rs does."
+        description: "[duckdb arm] DIAGNOSTIC ONLY — leave empty. DICTIONARY_SIZE_LIMIT, max distinct values per column that still dictionary-encodes. Empty = 16000000, i.e. never fall out of dictionary, which is what we want: the consuming engine remaps dictionary IDs cheaply and would have to re-encode plain values. Lowering it trades that away for ~36 MB."
         type: string
         default: ""
       rebuild:

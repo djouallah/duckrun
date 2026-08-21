@@ -61,10 +61,12 @@ import report  # noqa: E402
 TABLE = os.environ.get("OPT_TABLE") or "fct_summary_auto_sort"
 
 RG = int(os.environ.get("OPT_RG") or 6_000_000)
-# 16M (>= any row group) means NO column ever falls out of dictionary. OPT_DICT_LIMIT=0 omits the
-# option so DuckDB applies its own default (ROW_GROUP_SIZE/5) and high-cardinality columns fall
-# back off dictionary — which is what delta-rs does (its footers carry PLAIN alongside
-# RLE_DICTIONARY) and is worth 2.3x locally on a high-cardinality probe.
+# 16M (>= any row group) means NO column ever falls out of dictionary. KEEP IT THAT WAY: the
+# consuming engine's cheap path is a dictionary-ID remap, so plain values would have to be
+# re-encoded on load. delta-rs instead caps its dictionary PAGE at ~1MB of bytes and spills the
+# rest of the column to PLAIN, which is ~36 MB of why it writes a smaller file — a trade we are
+# deliberately NOT making. OPT_DICT_LIMIT=0 (DuckDB's own value-count default) exists to
+# reproduce that measurement, not as a configuration to ship.
 _dl = (os.environ.get("OPT_DICT_LIMIT") or "").strip()
 DICT_LIMIT = None if _dl == "0" else int(_dl or 16_000_000)
 PAGE_BYTES = int(os.environ.get("OPT_PAGE_BYTES") or 1_048_576)
