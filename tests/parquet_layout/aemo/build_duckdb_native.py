@@ -61,9 +61,20 @@ import report  # noqa: E402
 TABLE = os.environ.get("OPT_TABLE") or "fct_summary_auto_sort"
 
 RG = int(os.environ.get("OPT_RG") or 6_000_000)
-DICT_LIMIT = int(os.environ.get("OPT_DICT_LIMIT") or 16_000_000)
+# 16M (>= any row group) means NO column ever falls out of dictionary. OPT_DICT_LIMIT=0 omits the
+# option so DuckDB applies its own default (ROW_GROUP_SIZE/5) and high-cardinality columns fall
+# back off dictionary — which is what delta-rs does (its footers carry PLAIN alongside
+# RLE_DICTIONARY) and is worth 2.3x locally on a high-cardinality probe.
+_dl = (os.environ.get("OPT_DICT_LIMIT") or "").strip()
+DICT_LIMIT = None if _dl == "0" else int(_dl or 16_000_000)
 PAGE_BYTES = int(os.environ.get("OPT_PAGE_BYTES") or 1_048_576)
 FILE_BYTES = int(float(os.environ.get("OPT_TFS_MB") or 256) * 1024 * 1024)
+# V1 writes PLAIN_DICTIONARY, V2 writes RLE_DICTIONARY — the SAME physical encoding under two
+# spec names (V1's is the deprecated alias), measured byte-identical locally at both low and high
+# cardinality. Knob exists so that claim is testable on the real fact, not to tune anything.
+PQ_VERSION = (os.environ.get("OPT_PARQUET_VERSION") or "V1").strip().upper()
+if PQ_VERSION not in ("V1", "V2"):
+    raise SystemExit(f"build_duckdb_native: OPT_PARQUET_VERSION must be V1 or V2, got {PQ_VERSION!r}")
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -148,14 +159,16 @@ else:
     dd.execute("SET threads=1")
     print(f"{n_src:,} rows -> one sorted single-stream COPY, "
           f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
-          f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,}", flush=True)
+          f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,} x {PQ_VERSION} x DICTIONARY_SIZE_LIMIT "
+          f"{f'{DICT_LIMIT:,}' if DICT_LIMIT else 'duckdb default'}", flush=True)
+    _dict_opt = f"DICTIONARY_SIZE_LIMIT {DICT_LIMIT}," if DICT_LIMIT else ""
     t_s = time.perf_counter()
     dd.execute(f"""
         COPY (select {collist} from {src} order by {order})
         TO '{table_uri}'
         (FORMAT parquet, ROW_GROUP_SIZE {RG}, FILE_SIZE_BYTES {FILE_BYTES},
-         DICTIONARY_SIZE_LIMIT {DICT_LIMIT}, DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
-         COMPRESSION snappy,
+         {_dict_opt} DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
+         COMPRESSION snappy, PARQUET_VERSION {PQ_VERSION},
          FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
     """)
     print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
@@ -263,5 +276,6 @@ report.merge({"tables": {TABLE: {"build": {
     "engine": "duckdb_copy+delta_commit", "sort": f"sorted by ({sort})", "vorder": False,
     "row_group_ceiling": RG, "dictionary_size_limit": DICT_LIMIT,
     "data_page_size_limit": PAGE_BYTES, "file_size_bytes": FILE_BYTES,
+    "parquet_version": PQ_VERSION,
     "files": k, "rows": n,
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})

@@ -40,6 +40,17 @@ on:
         description: "[duckdb arm] DATA_PAGE_SIZE_LIMIT in bytes (duckdb#24645). Empty = 1048576, matching the ~1 MB pages the delta-rs arm writes."
         type: string
         default: ""
+      opt_parquet_version:
+        description: "[duckdb arm] PARQUET_VERSION. V1 writes PLAIN_DICTIONARY, V2 writes RLE_DICTIONARY — the same physical encoding under two spec names, measured byte-identical locally."
+        type: choice
+        default: V1
+        options:
+          - V1
+          - V2
+      opt_dict_limit:
+        description: "[duckdb arm] DICTIONARY_SIZE_LIMIT — max distinct values per column that still dictionary-encodes. Empty = 16000000, i.e. NEVER fall out of dictionary. Set to 0 to use DuckDB's own default (ROW_GROUP_SIZE/5), which lets high-cardinality columns fall back like delta-rs does."
+        type: string
+        default: ""
       rebuild:
         description: "rebuild both tables even if they already exist (else each builder skips)"
         type: boolean
@@ -102,6 +113,8 @@ jobs:
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_TFS_MB: ${{ inputs.opt_tfs_mb }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
+          OPT_PARQUET_VERSION: ${{ inputs.opt_parquet_version }}
+          OPT_DICT_LIMIT: ${{ inputs.opt_dict_limit }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_duckdb_native.py
