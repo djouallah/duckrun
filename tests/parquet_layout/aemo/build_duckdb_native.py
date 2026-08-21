@@ -48,7 +48,8 @@ threads), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (DATA_PAGE_SIZE_LIMI
 65536 is the value that lands page geometry near delta-rs's),
 OPT_TFS_MB (file rotation size, default 256 = duckrun's target_file_size_mb),
 OPT_PARQUET_VERSION (V1/V2, byte-identical), OPT_BLOOM (default false — delta-rs writes none,
-and they cost 29.2 MB here), BENCH_ROW_LIMIT, FORCE_REBUILD.
+and they cost 29.2 MB here), OPT_LOGICAL_TYPE (default false — rewrite each footer to add the
+modern LogicalType DuckDB omits), BENCH_ROW_LIMIT, FORCE_REBUILD.
 """
 import datetime as _dt
 import decimal as _dec
@@ -94,6 +95,11 @@ if PQ_VERSION not in ("V1", "V2"):
 # Direct Lake (which does not use parquet bloom filters) and because leaving them on makes the
 # writer A/B measure a feature delta-rs simply doesn't ship.
 BLOOM = (os.environ.get("OPT_BLOOM") or "false").strip().lower() in ("true", "1", "yes")
+# DIAGNOSTIC. DuckDB annotates VARCHAR/DATE with the DEPRECATED ConvertedType only; delta-rs writes
+# the modern LogicalType too. Post-processes each footer to add it, changing nothing else — see
+# footer_logical_type.py. This is a measurement knob, not a shipping feature: if it turns out to be
+# the cold-read gap, the fix belongs upstream in DuckDB, not in a footer rewrite.
+LOGICAL_TYPE = (os.environ.get("OPT_LOGICAL_TYPE") or "false").strip().lower() in ("true", "1", "yes")
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -199,14 +205,34 @@ else:
     from dbt.adapters.duckrun.objectstore import build_store
     import obstore
     store = build_store(table_uri, con.storage_options)
-    sizes = {}
-    for batch in obstore.list(store):
-        for obj in batch:
-            p = obj["path"]
-            if p.rsplit("/", 1)[-1].startswith(f"part-{run_tag}-"):
-                sizes[p.rsplit("/", 1)[-1]] = obj["size"]
+
+    def _listing():
+        out = {}
+        for batch in obstore.list(store):
+            for obj in batch:
+                p = obj["path"].rsplit("/", 1)[-1]
+                if p.startswith(f"part-{run_tag}-"):
+                    out[p] = obj["size"]
+        return out
+
+    sizes = _listing()
     if not sizes:
         raise SystemExit(f"listing returned no part-{run_tag}-* files")
+
+    # DIAGNOSTIC (OPT_LOGICAL_TYPE): promote ConvertedType-only annotations to the modern
+    # LogicalType. Must happen HERE — after the COPY, before the listing that feeds AddAction.size
+    # — because the rewrite makes each footer a few bytes longer, and a Delta size field that
+    # disagrees with the blob is a worse bug than the one being investigated.
+    if LOGICAL_TYPE:
+        import footer_logical_type
+        print(f"promoting ConvertedType -> LogicalType in {len(sizes)} footer(s)", flush=True)
+        cols = footer_logical_type.patch_remote(store, sorted(sizes))
+        if not cols:
+            raise SystemExit("OPT_LOGICAL_TYPE was set but no column needed promoting — "
+                             "duckdb may have started writing LogicalType itself, which would "
+                             "silently turn this run into a no-op control.")
+        sizes = _listing()          # footers grew; re-read the true sizes
+
     files = sorted(sizes)
     k = len(files)
 
