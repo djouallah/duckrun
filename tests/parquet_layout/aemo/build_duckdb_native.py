@@ -11,13 +11,13 @@ globally sorted, dictionary-encoded everywhere (Direct Lake's cheap transcode is
 ID remap; anything plain gets re-encoded).
 
 Shape mechanics, each measured in a local probe before this was written:
-  * ONE sorted SINGLE-THREADED COPY — no temp table, no manual slicing (the sort spills instead
-    of materializing the whole fact). Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's shipping
-    target) along the sorted stream, so adjacent files stay disjoint on the sort key. threads=1
-    is mandatory for that: a multi-threaded COPY writes several files at once and their key
-    ranges interleave no matter how the sink is configured (see the SET threads=1 comment for
-    the measurements). The PER_THREAD_OUTPUT + ROW_GROUPS_PER_FILE 1 variant was measured and
-    REJECTED — one RG per file buys nothing and ROW_GROUPS_PER_FILE is only exact under it.
+  * ONE sorted COPY — no temp table, no manual slicing (the sort spills instead of materializing
+    the whole fact). Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's shipping target) along
+    the sorted stream. Runs at 2 threads, purely so the runner does not OOM (each writer buffers
+    a full uncompressed row group); adjacent files therefore DO overlap on the sort key, which is
+    accepted — that clustering was measured worth 0.05% of the table and delta-rs overlaps too.
+    PER_THREAD_OUTPUT + ROW_GROUPS_PER_FILE 1 also measured and REJECTED — one RG per file buys
+    nothing, and ROW_GROUPS_PER_FILE is only exact under PER_THREAD_OUTPUT anyway.
   * AddAction stats come from the parquet footers CAST to each column's DuckDB type, then
     re-serialized in Delta JSON spelling — the raw footer stat strings used as-is poisoned
     delta_scan's pruning to zero rows.
@@ -37,7 +37,8 @@ Env: ONELAKE_TABLES_PATH (resolve_env), OPT_SORT (explicit columns, default 'dat
 default 6000000 = duckrun's fixed write geometry; the nightly OOM'd the 12.4GiB runner at 4
 threads), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (default 1048576),
 OPT_TFS_MB (file rotation size, default 256 = duckrun's target_file_size_mb),
-BENCH_ROW_LIMIT, FORCE_REBUILD.
+OPT_PARQUET_VERSION (V1/V2, byte-identical), OPT_BLOOM (default false — delta-rs writes none,
+and they cost 29.2 MB here), BENCH_ROW_LIMIT, FORCE_REBUILD.
 """
 import datetime as _dt
 import decimal as _dec
@@ -61,9 +62,28 @@ import report  # noqa: E402
 TABLE = os.environ.get("OPT_TABLE") or "fct_summary_auto_sort"
 
 RG = int(os.environ.get("OPT_RG") or 6_000_000)
-DICT_LIMIT = int(os.environ.get("OPT_DICT_LIMIT") or 16_000_000)
+# 16M (>= any row group) means NO column ever falls out of dictionary. KEEP IT THAT WAY: the
+# consuming engine's cheap path is a dictionary-ID remap, so plain values would have to be
+# re-encoded on load. delta-rs instead caps its dictionary PAGE at ~1MB of bytes and spills the
+# rest of the column to PLAIN, which is ~36 MB of why it writes a smaller file — a trade we are
+# deliberately NOT making. OPT_DICT_LIMIT=0 (DuckDB's own value-count default) exists to
+# reproduce that measurement, not as a configuration to ship.
+_dl = (os.environ.get("OPT_DICT_LIMIT") or "").strip()
+DICT_LIMIT = None if _dl == "0" else int(_dl or 16_000_000)
 PAGE_BYTES = int(os.environ.get("OPT_PAGE_BYTES") or 1_048_576)
 FILE_BYTES = int(float(os.environ.get("OPT_TFS_MB") or 256) * 1024 * 1024)
+# V1 writes PLAIN_DICTIONARY, V2 writes RLE_DICTIONARY — the SAME physical encoding under two
+# spec names (V1's is the deprecated alias), measured byte-identical locally at both low and high
+# cardinality. Knob exists so that claim is testable on the real fact, not to tune anything.
+PQ_VERSION = (os.environ.get("OPT_PARQUET_VERSION") or "V1").strip().upper()
+if PQ_VERSION not in ("V1", "V2"):
+    raise SystemExit(f"build_duckdb_native: OPT_PARQUET_VERSION must be V1 or V2, got {PQ_VERSION!r}")
+# DuckDB writes bloom filters by default; delta-rs does not. They live BETWEEN row groups and are
+# not counted in total_compressed_size, so a per-column footer sum cannot see them — on the real
+# fact they are ~32 MB of the 65 MB delta-rs wins by. Default off, because the reader here is
+# Direct Lake (which does not use parquet bloom filters) and because leaving them on makes the
+# writer A/B measure a feature delta-rs simply doesn't ship.
+BLOOM = (os.environ.get("OPT_BLOOM") or "false").strip().lower() in ("true", "1", "yes")
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -120,7 +140,11 @@ if not force and _exists():
           flush=True)
     status, k, n = "skipped", None, rows
 else:
-    src = "mart.fct_summary" if N_CAP is None else f"(select * from mart.fct_summary limit {N_CAP})"
+    # BENCH_SOURCE lets a caller read one lakehouse while writing into another (a full expression
+    # such as delta_scan('abfss://.../mart/fct_summary')); the cold benchmark needs that because
+    # its throwaway lakehouse has no mart schema. Same override the delta-rs builder honours.
+    _src_tbl = (os.environ.get("BENCH_SOURCE") or "mart.fct_summary").strip()
+    src = _src_tbl if N_CAP is None else f"(select * from {_src_tbl} limit {N_CAP})"
     n_src = dd.execute(f"select count(*) from {src}").fetchone()[0]
 
     # column types drive the typed stats casts below; the mart already stores decimal(18,4)
@@ -133,29 +157,30 @@ else:
     run_tag = uuid.uuid4().hex[:8]
 
     # threads=1 is the whole ballgame for cross-file clustering, and it is NOT about
-    # PER_THREAD_OUTPUT or preserve_insertion_order. ANY multi-threaded parquet COPY writes
-    # several files concurrently, so writer threads consume the sorted stream in parallel and
-    # their key ranges interleave. Measured locally (10M rows, rotation exercised):
-    #   threads=1 -> 7 files, overlap 0/6 (clean disjoint slices), 17.9s
-    #   threads=2 -> 7 files, overlap 6/6,                          9.2s
-    #   threads=4 -> 7 files, overlap 6/6
-    # preserve_insertion_order true vs false made NO difference to any of it — the ORDER BY
-    # governs, so duckrun's global false stays untouched. On the real fact the parallel variants
-    # measured 19/23 (PER_THREAD_OUTPUT, 24 files) and 2/2 (single stream, 3 files) overlapping
-    # pairs, costing ~70 MB vs V-Order (835 vs 765 MB, nearly all uncompressed `mw` bytes —
-    # dictionary indices that lost their runs). One writer also buffers one row group, so this
-    # is what fixes the 12.4GiB-runner OOM as well. ~2x slower; the layout is the point.
-    dd.execute("SET threads=1")
+    # threads=2 is a MEMORY guard, not a layout one. Each writer thread buffers a full
+    # uncompressed row group, so the runner's default 4 threads OOMs a 12.4GiB box on this fact —
+    # measured three times now: at 16M rows/group, at 6M, and again with no pin at all
+    # (run 32475734960, "failed to allocate 512.0 MiB (12.4/12.4 GiB used)"). 2 threads fits.
+    # It is deliberately NOT 1. Pinning to one writer is what makes rotated files disjoint on
+    # the sort key (locally 1 thread -> 0/6 overlapping pairs, 2 or 4 -> 6/6, because a
+    # multi-threaded COPY writes several files at once and the writers carve the sorted stream
+    # in parallel), but that clustering was measured worth 0.05% of the table here
+    # (19/23 -> 0/2 overlapping pairs moved it 835.08 -> 834.66 MB) and delta-rs, the writer
+    # this is compared against, ships 2/3 overlapping files itself. So overlap is accepted.
+    dd.execute("SET threads=2")
     print(f"{n_src:,} rows -> one sorted single-stream COPY, "
           f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
-          f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,}", flush=True)
+          f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,} x {PQ_VERSION} x DICTIONARY_SIZE_LIMIT "
+          f"{f'{DICT_LIMIT:,}' if DICT_LIMIT else 'duckdb default'} x bloom={BLOOM}", flush=True)
+    _dict_opt = f"DICTIONARY_SIZE_LIMIT {DICT_LIMIT}," if DICT_LIMIT else ""
     t_s = time.perf_counter()
     dd.execute(f"""
         COPY (select {collist} from {src} order by {order})
         TO '{table_uri}'
         (FORMAT parquet, ROW_GROUP_SIZE {RG}, FILE_SIZE_BYTES {FILE_BYTES},
-         DICTIONARY_SIZE_LIMIT {DICT_LIMIT}, DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
-         COMPRESSION snappy,
+         {_dict_opt} DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
+         COMPRESSION snappy, PARQUET_VERSION {PQ_VERSION},
+         WRITE_BLOOM_FILTER {str(BLOOM).lower()},
          FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
     """)
     print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
@@ -263,5 +288,6 @@ report.merge({"tables": {TABLE: {"build": {
     "engine": "duckdb_copy+delta_commit", "sort": f"sorted by ({sort})", "vorder": False,
     "row_group_ceiling": RG, "dictionary_size_limit": DICT_LIMIT,
     "data_page_size_limit": PAGE_BYTES, "file_size_bytes": FILE_BYTES,
+    "parquet_version": PQ_VERSION, "bloom_filter": BLOOM,
     "files": k, "rows": n,
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})

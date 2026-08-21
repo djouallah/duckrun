@@ -40,6 +40,21 @@ on:
         description: "[duckdb arm] DATA_PAGE_SIZE_LIMIT in bytes (duckdb#24645). Empty = 1048576, matching the ~1 MB pages the delta-rs arm writes."
         type: string
         default: ""
+      opt_parquet_version:
+        description: "[duckdb arm] PARQUET_VERSION. V1 writes PLAIN_DICTIONARY, V2 writes RLE_DICTIONARY — the same physical encoding under two spec names, measured byte-identical locally."
+        type: choice
+        default: V1
+        options:
+          - V1
+          - V2
+      opt_bloom:
+        description: "[duckdb arm] write parquet bloom filters. DuckDB does by default and delta-rs never does; they sit between row groups and are invisible to a per-column footer sum (~32 MB on the real fact). Default false so the A/B compares writers, not features."
+        type: boolean
+        default: false
+      opt_dict_limit:
+        description: "[duckdb arm] DIAGNOSTIC ONLY — leave empty. DICTIONARY_SIZE_LIMIT, max distinct values per column that still dictionary-encodes. Empty = 16000000, i.e. never fall out of dictionary, which is what we want: the consuming engine remaps dictionary IDs cheaply and would have to re-encode plain values. Lowering it trades that away for ~36 MB."
+        type: string
+        default: ""
       rebuild:
         description: "rebuild both tables even if they already exist (else each builder skips)"
         type: boolean
@@ -102,6 +117,9 @@ jobs:
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_TFS_MB: ${{ inputs.opt_tfs_mb }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
+          OPT_PARQUET_VERSION: ${{ inputs.opt_parquet_version }}
+          OPT_DICT_LIMIT: ${{ inputs.opt_dict_limit }}
+          OPT_BLOOM: ${{ inputs.opt_bloom }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_duckdb_native.py

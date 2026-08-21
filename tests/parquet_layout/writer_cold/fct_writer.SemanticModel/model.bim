@@ -1,0 +1,79 @@
+{
+  "compatibilityLevel": 1604,
+  "model": {
+    "culture": "en-US",
+    "defaultPowerBIDataSourceVersion": "powerBI_V3",
+    "directLakeBehavior": "directLakeOnly",
+    "expressions": [
+      {
+        "name": "DirectLake",
+        "kind": "m",
+        "description": "Direct Lake connection to OneLake. Both GUIDs are placeholders — duckrun's deploy() rewrites them to the target workspace and lakehouse.",
+        "expression": [
+          "let",
+          "    Source = AzureStorage.DataLake(\"https://onelake.dfs.fabric.microsoft.com/00000000-0000-0000-0000-000000000001/00000000-0000-0000-0000-000000000002\", [HierarchicalNavigation=true])",
+          "in",
+          "    Source"
+        ]
+      }
+    ],
+    "tables": [
+      {
+        "name": "fct_summary",
+        "description": "The table under test. Logical name is identical in both variants so one DAX suite runs unchanged; only the partition's entityName differs, which is the whole experiment.",
+        "columns": [
+          {
+            "name": "date",
+            "dataType": "dateTime",
+            "formatString": "yyyy-MM-dd",
+            "sourceColumn": "date",
+            "sourceLineageTag": "date",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "time",
+            "dataType": "int64",
+            "sourceColumn": "time",
+            "sourceLineageTag": "time",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "DUID",
+            "dataType": "string",
+            "sourceColumn": "DUID",
+            "sourceLineageTag": "DUID",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "mw",
+            "dataType": "decimal",
+            "formatString": "#,##0.00",
+            "sourceColumn": "mw",
+            "sourceLineageTag": "mw",
+            "summarizeBy": "sum"
+          },
+          {
+            "name": "price",
+            "dataType": "decimal",
+            "formatString": "$#,##0.00",
+            "sourceColumn": "price",
+            "sourceLineageTag": "price",
+            "summarizeBy": "none"
+          }
+        ],
+        "partitions": [
+          {
+            "name": "fct_summary",
+            "mode": "directLake",
+            "source": {
+              "type": "entity",
+              "entityName": "__FACT_TABLE__",
+              "expressionSource": "DirectLake",
+              "schemaName": "tests"
+            }
+          }
+        ]
+      }
+    ]
+  }
+}

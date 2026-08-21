@@ -29,10 +29,15 @@ def source_expr():
 
     A bare table name profiles from the Delta LOG (exact row width, and exact when the table fits
     the byte budget); the `limit` form is a subquery, so it falls back to sampling the result
-    relation. Kept identical to build_auto_sort.py's so the key shown is the key built."""
+    relation. Kept identical to build_auto_sort.py's so the key shown is the key built.
+
+    BENCH_SOURCE overrides the table — pass a full expression such as
+    ``delta_scan('abfss://.../mart/fct_summary')`` to read one lakehouse while writing into
+    another, which is what the cold benchmark does with its throwaway lakehouses."""
+    src = (os.environ.get("BENCH_SOURCE") or "mart.fct_summary").strip()
     lim = (os.environ.get("BENCH_ROW_LIMIT") or "").strip()
     n = int(lim) if lim.isdigit() and int(lim) > 0 else None
-    return "mart.fct_summary" if n is None else f"(select * from mart.fct_summary limit {n})"
+    return src if n is None else f"(select * from {src} limit {n})"
 
 
 def requested():
