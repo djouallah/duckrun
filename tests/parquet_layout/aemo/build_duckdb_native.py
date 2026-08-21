@@ -20,7 +20,7 @@ Shape mechanics, each measured in a local probe before this was written:
   * AddAction stats come from the parquet footers CAST to each column's DuckDB type, then
     re-serialized in Delta JSON spelling — the raw footer stat strings used as-is poisoned
     delta_scan's pruning to zero rows.
-  * DICTIONARY_SIZE_LIMIT is raised so no column falls out of dictionary at 16M-row groups —
+  * DICTIONARY_SIZE_LIMIT is raised so no column falls out of dictionary even at 16M-row groups —
     DuckDB's default is ROW_GROUP_SIZE/5, and 1.5.5 dictionary-encodes every type at any NDV
     under the limit. (Exception: DECIMAL(p>18) writes FLBA, never dictionary — the mart already
     stores decimal(18,4), and the post-commit WARN names any column that slips out.)
@@ -33,8 +33,9 @@ Shape mechanics, each measured in a local probe before this was written:
 
 Env: ONELAKE_TABLES_PATH (resolve_env), OPT_SORT (explicit columns, default 'date, time' —
 'auto' is the delta-rs builder's spelling and is rejected here), OPT_RG (rows/group+file,
-default 16000000), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (default 1048576),
-BENCH_ROW_LIMIT, FORCE_REBUILD.
+default 6000000 = duckrun's fixed write geometry; 4 threads each buffering a full 16M-row
+group OOM'd the 12.4GiB runner on 1.6.0.dev365), OPT_DICT_LIMIT (default 16000000),
+OPT_PAGE_BYTES (default 1048576), BENCH_ROW_LIMIT, FORCE_REBUILD.
 """
 import datetime as _dt
 import decimal as _dec
@@ -55,7 +56,7 @@ import report  # noqa: E402
 
 TABLE = "fct_summary_auto_sort"
 
-RG = int(os.environ.get("OPT_RG") or 16_000_000)
+RG = int(os.environ.get("OPT_RG") or 6_000_000)
 DICT_LIMIT = int(os.environ.get("OPT_DICT_LIMIT") or 16_000_000)
 PAGE_BYTES = int(os.environ.get("OPT_PAGE_BYTES") or 1_048_576)
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
