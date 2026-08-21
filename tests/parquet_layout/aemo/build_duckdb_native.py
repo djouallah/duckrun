@@ -11,13 +11,13 @@ globally sorted, dictionary-encoded everywhere (Direct Lake's cheap transcode is
 ID remap; anything plain gets re-encoded).
 
 Shape mechanics, each measured in a local probe before this was written:
-  * ONE sorted SINGLE-THREADED COPY — no temp table, no manual slicing (the sort spills instead
-    of materializing the whole fact). Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's shipping
-    target) along the sorted stream, so adjacent files stay disjoint on the sort key. threads=1
-    is mandatory for that: a multi-threaded COPY writes several files at once and their key
-    ranges interleave no matter how the sink is configured (see the SET threads=1 comment for
-    the measurements). The PER_THREAD_OUTPUT + ROW_GROUPS_PER_FILE 1 variant was measured and
-    REJECTED — one RG per file buys nothing and ROW_GROUPS_PER_FILE is only exact under it.
+  * ONE sorted COPY — no temp table, no manual slicing (the sort spills instead of materializing
+    the whole fact), no thread pinning. Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's
+    shipping target) along the sorted stream. Adjacent files WILL overlap on the sort key at
+    more than one thread, and that is accepted: the clustering it would buy was measured worth
+    0.05% of the table, and delta-rs ships overlapping files itself. PER_THREAD_OUTPUT +
+    ROW_GROUPS_PER_FILE 1 also measured and REJECTED — one RG per file buys nothing, and
+    ROW_GROUPS_PER_FILE is only exact under PER_THREAD_OUTPUT anyway.
   * AddAction stats come from the parquet footers CAST to each column's DuckDB type, then
     re-serialized in Delta JSON spelling — the raw footer stat strings used as-is poisoned
     delta_scan's pruning to zero rows.
@@ -37,7 +37,8 @@ Env: ONELAKE_TABLES_PATH (resolve_env), OPT_SORT (explicit columns, default 'dat
 default 6000000 = duckrun's fixed write geometry; the nightly OOM'd the 12.4GiB runner at 4
 threads), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (default 1048576),
 OPT_TFS_MB (file rotation size, default 256 = duckrun's target_file_size_mb),
-BENCH_ROW_LIMIT, FORCE_REBUILD.
+OPT_PARQUET_VERSION (V1/V2, byte-identical), OPT_BLOOM (default false — delta-rs writes none,
+and they cost 29.2 MB here), BENCH_ROW_LIMIT, FORCE_REBUILD.
 """
 import datetime as _dt
 import decimal as _dec
@@ -152,19 +153,16 @@ else:
     run_tag = uuid.uuid4().hex[:8]
 
     # threads=1 is the whole ballgame for cross-file clustering, and it is NOT about
-    # PER_THREAD_OUTPUT or preserve_insertion_order. ANY multi-threaded parquet COPY writes
-    # several files concurrently, so writer threads consume the sorted stream in parallel and
-    # their key ranges interleave. Measured locally (10M rows, rotation exercised):
-    #   threads=1 -> 7 files, overlap 0/6 (clean disjoint slices), 17.9s
-    #   threads=2 -> 7 files, overlap 6/6,                          9.2s
-    #   threads=4 -> 7 files, overlap 6/6
-    # preserve_insertion_order true vs false made NO difference to any of it — the ORDER BY
-    # governs, so duckrun's global false stays untouched. On the real fact the parallel variants
-    # measured 19/23 (PER_THREAD_OUTPUT, 24 files) and 2/2 (single stream, 3 files) overlapping
-    # pairs, costing ~70 MB vs V-Order (835 vs 765 MB, nearly all uncompressed `mw` bytes —
-    # dictionary indices that lost their runs). One writer also buffers one row group, so this
-    # is what fixes the 12.4GiB-runner OOM as well. ~2x slower; the layout is the point.
-    dd.execute("SET threads=1")
+    # No thread pinning: the writer runs at whatever duckrun's session set. Single-threaded
+    # writing buys DISJOINT files on the sort key (locally: 1 thread -> 0/6 overlapping pairs,
+    # 2 or 4 threads -> 6/6, because any multi-threaded parquet COPY writes several files at once
+    # and the writers carve the sorted stream in parallel) — but that clustering was measured to
+    # be worth ~nothing here: going from 19/23 to 0/2 overlapping pairs on the real fact moved
+    # the table 835.08 -> 834.66 MB, 0.05%. delta-rs, the writer this is compared against, ships
+    # 2/3 overlapping files itself. So the constraint is not worth paying for.
+    # NOTE if this OOMs the runner again, the fix is fewer threads: 1.6.0.dev365 died on a
+    # 12.4GiB runner at 4 threads at both 16M and 6M row groups (each writer buffers a full
+    # uncompressed row group), and 2 threads was fine.
     print(f"{n_src:,} rows -> one sorted single-stream COPY, "
           f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
           f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,} x {PQ_VERSION} x DICTIONARY_SIZE_LIMIT "
