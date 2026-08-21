@@ -16,7 +16,8 @@ Shape mechanics, each measured in a local probe before this was written:
     docs, per_thread_output makes ROW_GROUPS_PER_FILE accurate ("only one thread writes to
     each file"); without it a probe wrote an 8-row-group file. The cost is sort-key range
     overlap ACROSS files (threads split the sorted stream) — accepted; per-file clustering
-    holds. preserve_insertion_order=true because duckrun's session global is false.
+    holds. The explicit ORDER BY pins the written order on its own — no
+    preserve_insertion_order override (duckrun's session global stays false).
   * AddAction stats come from the parquet footers CAST to each column's DuckDB type, then
     re-serialized in Delta JSON spelling — the raw footer stat strings used as-is poisoned
     delta_scan's pruning to zero rows.
@@ -130,9 +131,11 @@ else:
     # PER_THREAD_OUTPUT makes ROW_GROUPS_PER_FILE exact ("only one thread writes to each file,
     # and it becomes accurate again" — DuckDB COPY docs; probed: N files x exactly 1 RG). The
     # trade-off is cross-file range overlap on the sort key (threads split the sorted stream);
-    # per-file clustering is kept and the overlap is accepted. preserve_insertion_order=true
-    # because duckrun's session global is false; throwaway session, no restore.
-    dd.execute("SET preserve_insertion_order=true")
+    # per-file clustering is kept and the overlap is accepted. No preserve_insertion_order
+    # override: the explicit ORDER BY pins the written order by itself (duckrun's global false
+    # stays), and threads=2 because 1.6.0.dev365's scan+sort OOM'd the 12.4GiB runner at 4
+    # threads regardless of row-group size (16M and 6M both died ~30s in; fit on 1.5.5).
+    dd.execute("SET threads=2")
     print(f"{n_src:,} rows -> one sorted parallel COPY, "
           f"PER_THREAD_OUTPUT x ROW_GROUPS_PER_FILE 1 x ROW_GROUP_SIZE {RG:,} "
           f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,}", flush=True)
