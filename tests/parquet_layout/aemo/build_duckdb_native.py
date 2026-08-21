@@ -24,19 +24,28 @@ Shape mechanics, each measured in a local probe before this was written:
     DuckDB's default is ROW_GROUP_SIZE/5, and 1.5.5 dictionary-encodes every type at any NDV
     under the limit. (Exception: DECIMAL(p>18) writes FLBA, never dictionary — the mart already
     stores decimal(18,4), and the post-commit WARN names any column that slips out.)
+  * DATA_PAGE_SIZE_LIMIT caps data pages at ~1MB uncompressed (duckdb#24645, nightly-only until
+    the next stable). This arm's first run died on the old hardcoded 100MB split: ONE giant page
+    per 16M-row column chunk, which the consumer transcodes 5-26x slower (duckdb#24507). ~1MB is
+    the measured sweet spot of the page-size U-curve, and matches what the delta-rs builder has
+    written since d0d23b4. A startup probe fails the build loudly on any duckdb without the
+    option — a stable build would silently write the broken layout and corrupt the A/B.
 
 Env: ONELAKE_TABLES_PATH (resolve_env), OPT_SORT (explicit columns, default 'date, time' —
 'auto' is the delta-rs builder's spelling and is rejected here), OPT_RG (rows/group+file,
-default 16000000), OPT_DICT_LIMIT (default 16000000), BENCH_ROW_LIMIT, FORCE_REBUILD.
+default 16000000), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (default 1048576),
+BENCH_ROW_LIMIT, FORCE_REBUILD.
 """
 import datetime as _dt
 import decimal as _dec
 import json
 import os
 import sys
+import tempfile
 import time
 import uuid
 
+import duckdb
 import duckrun
 from deltalake import DeltaTable, Schema
 from deltalake.transaction import AddAction, create_table_with_add_actions
@@ -48,6 +57,7 @@ TABLE = "fct_summary_auto_sort"
 
 RG = int(os.environ.get("OPT_RG") or 16_000_000)
 DICT_LIMIT = int(os.environ.get("OPT_DICT_LIMIT") or 16_000_000)
+PAGE_BYTES = int(os.environ.get("OPT_PAGE_BYTES") or 1_048_576)
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -62,6 +72,17 @@ table_uri = f"{tables_root}/tests/{TABLE}"
 
 con = duckrun.connect(tables_root, read_only=False)
 dd = con.con
+
+# Probe DATA_PAGE_SIZE_LIMIT before any expensive work: a duckdb without it (any stable <= 1.5.5)
+# would silently write the old broken layout — one ~100MB page per column chunk — and corrupt the A/B.
+_probe = os.path.join(tempfile.mkdtemp(prefix="duckrun_page_probe_"), "probe.parquet").replace("\\", "/")
+try:
+    dd.execute(f"COPY (select 1 as x) TO '{_probe}' (FORMAT parquet, DATA_PAGE_SIZE_LIMIT {PAGE_BYTES})")
+except Exception as ex:
+    raise SystemExit(
+        f"build_duckdb_native: this duckdb ({duckdb.__version__}) rejected DATA_PAGE_SIZE_LIMIT "
+        f"(duckdb#24645, nightlies only until the next stable; the workflow pins "
+        f"duckdb==1.6.0.dev365 for writer=duckdb_native): {ex}")
 try:
     con.sql("create schema if not exists tests")
 except Exception:
@@ -112,13 +133,15 @@ else:
     # because duckrun's session global is false; throwaway session, no restore.
     dd.execute("SET preserve_insertion_order=true")
     print(f"{n_src:,} rows -> one sorted parallel COPY, "
-          f"PER_THREAD_OUTPUT x ROW_GROUPS_PER_FILE 1 x ROW_GROUP_SIZE {RG:,}", flush=True)
+          f"PER_THREAD_OUTPUT x ROW_GROUPS_PER_FILE 1 x ROW_GROUP_SIZE {RG:,} "
+          f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,}", flush=True)
     t_s = time.perf_counter()
     dd.execute(f"""
         COPY (select {collist} from {src} order by {order})
         TO '{table_uri}'
         (FORMAT parquet, ROW_GROUP_SIZE {RG}, ROW_GROUPS_PER_FILE 1,
-         DICTIONARY_SIZE_LIMIT {DICT_LIMIT}, COMPRESSION snappy,
+         DICTIONARY_SIZE_LIMIT {DICT_LIMIT}, DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
+         COMPRESSION snappy,
          PER_THREAD_OUTPUT, FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
     """)
     print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
@@ -225,5 +248,6 @@ else:
 report.merge({"tables": {TABLE: {"build": {
     "engine": "duckdb_copy+delta_commit", "sort": f"sorted by ({sort})", "vorder": False,
     "row_group_ceiling": RG, "dictionary_size_limit": DICT_LIMIT,
+    "data_page_size_limit": PAGE_BYTES,
     "files": k, "rows": n,
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})

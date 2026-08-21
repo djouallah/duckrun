@@ -84,6 +84,10 @@ on:
         description: "[aemo] duckdb_native only: DICTIONARY_SIZE_LIMIT — max distinct values per column that still dictionary-encodes. Empty = 16000000."
         type: string
         default: ""
+      opt_page_bytes:
+        description: "[aemo] duckdb_native only: DATA_PAGE_SIZE_LIMIT in bytes (duckdb#24645). Empty = 1048576 (~1 MB, the measured sweet spot of the page-size U-curve)."
+        type: string
+        default: ""
       dax:
         description: "run the Direct Lake half — deploy the two semantic models, walk the DAX suite, read the VertiPaq DMVs. OFF = layout only (sort key, table stats, parquet geometry): no semantic model is created, so it costs no interactive CU and finishes in minutes. Turn it off when the question is 'what did the picker choose / what shape did it write', on when the question is 'is it faster'."
         type: boolean
@@ -143,6 +147,14 @@ jobs:
         run: |
           pip install pythonnet pyyaml
           pip install -e .
+
+      - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
+        # Stable duckdb (<= 1.5.5) still hard-splits data pages at 100MB uncompressed — the exact
+        # failure that killed this arm's first run (duckdb#24507). Its own step so the delta_rs
+        # path stays byte-identical to main; build_duckdb_native.py probes the option at startup
+        # and dies loudly if this pin ever stops carrying it.
+        if: ${{ inputs.writer == 'duckdb_native' }}
+        run: pip install duckdb==1.6.0.dev365
 
       - name: 🧾 Init run report
         env:
@@ -230,6 +242,7 @@ jobs:
           OPT_SORT: ${{ inputs.opt_sort == 'auto' && 'date, time' || inputs.opt_sort }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_DICT_LIMIT: ${{ inputs.opt_dict_limit }}
+          OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_duckdb_native.py
