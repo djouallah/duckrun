@@ -26,6 +26,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import re
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -103,12 +104,37 @@ def _query(conn, cols, capacity_id, since):
     return _rows(conn, dax)
 
 
+_GUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def _names(ws, model, token):
+    """XMLA addresses a workspace and a dataset by DISPLAY NAME, not GUID — `Data Source=…/myorg/
+    {workspace}` and `Initial Catalog={dataset}`. The secrets hold GUIDs (stable, unambiguous), so
+    resolve them here; anything that isn't a GUID is passed through as an already-correct name."""
+    import requests
+    api = "https://api.powerbi.com/v1.0/myorg"
+    h = {"Authorization": f"Bearer {token}"}
+    ws_name = ws
+    if _GUID.match(ws):
+        r = requests.get(f"{api}/groups/{ws}", headers=h, timeout=60)
+        r.raise_for_status()
+        ws_name = r.json()["name"]
+    model_name = model
+    if _GUID.match(model):
+        r = requests.get(f"{api}/groups/{ws}/datasets/{model}", headers=h, timeout=60)
+        r.raise_for_status()
+        model_name = r.json()["name"]
+    print(f"  metrics model: {model_name!r} in workspace {ws_name!r}", flush=True)
+    return ws_name, model_name
+
+
 def _collect(items, since):
     cold_bench._load_adomd(os.environ["ADOMD_DIR"])
     from duckrun import auth
     token = os.environ.get("PBI_TOKEN") or auth.get_powerbi_token()
-    conn = cold_bench.open_conn(os.environ["METRICS_WORKSPACE_ID"],
-                                os.environ["METRICS_MODEL_ID"], token)
+    ws_name, model_name = _names(os.environ["METRICS_WORKSPACE_ID"],
+                                 os.environ["METRICS_MODEL_ID"], token)
+    conn = cold_bench.open_conn(ws_name, model_name, token)
     try:
         cols = _resolve_columns(conn)
         print(f"  resolved columns: {cols}", flush=True)
