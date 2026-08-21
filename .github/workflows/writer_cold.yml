@@ -30,12 +30,16 @@ on:
         type: string
         default: "142000000"
       opt_parquet_version:
-        description: "[duckdb arm] PARQUET_VERSION. V1 tags dictionary data PLAIN_DICTIONARY, V2 tags the IDENTICAL bytes RLE_DICTIONARY (delta-rs always writes the latter). Byte-identical on disk — so if cold time moves, the reader is choosing its path from the tag, not the data."
+        description: "[duckdb arm] PARQUET_VERSION. V1 tags dictionary data PLAIN_DICTIONARY, V2 tags the IDENTICAL bytes RLE_DICTIONARY (delta-rs always writes the latter). MEASURED: the tag changes nothing — the string column cold-read 12492ms on V1 and 12312ms on V2, against delta-rs's 2293ms. Kept as a control."
         type: choice
         default: V1
         options:
           - V1
           - V2
+      opt_page_bytes:
+        description: "[duckdb arm] DATA_PAGE_SIZE_LIMIT. arrow-rs caps a data page at 20,000 ROWS; DuckDB caps by bytes and by a 524,288-row ceiling, so at the 1048576 default its pages hold ~25x more rows than delta-rs's. 65536 lands DuckDB at ~32,768 rows/page — near parity, and free in bytes."
+        type: string
+        default: "1048576"
       order:
         description: "which writer is measured FIRST. The two passes share one capacity, so the second can inherit smoothing/throttling from the first — swap this and re-run to prove an effect is the parquet and not the running order."
         type: choice
@@ -132,6 +136,7 @@ jobs:
           BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
           OPT_TABLE: ${{ env.TABLE_DUCKDB }}
           OPT_PARQUET_VERSION: ${{ inputs.opt_parquet_version }}
+          OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
