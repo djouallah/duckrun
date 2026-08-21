@@ -109,14 +109,16 @@ for n in names:
 # both tag VARCHAR with the DEPRECATED ConvertedType UTF8, but only delta-rs also writes the
 # modern LogicalType STRING, and DuckDB marks columns REQUIRED where delta-rs marks them OPTIONAL.
 # A consumer that reads LogicalType and finds none has a plain BYTE_ARRAY on its hands.
-_root = os.environ["ONELAKE_TABLES_PATH"].rstrip("/")
+# One file per table is enough — the schema element is written once per footer, identically.
+# It has to be an explicit path: OneLake rejects any glob that does not end in `**`.
+_one = dict(detail.aggregate('"table", any_value(file_name) as f').fetchall())
 _sch = {}
 for t in tables:
     try:
         _sch[t] = {r[0]: r[1:] for r in con.con.execute(f"""
-            select distinct name, repetition_type, converted_type,
+            select name, repetition_type, converted_type,
                    coalesce(logical_type::varchar, '—')
-            from parquet_schema('{_root}/tests/{t}/**/*.parquet')
+            from parquet_schema('{_one[t]}')
             where coalesce(num_children, 0) = 0""").fetchall()}
     except Exception as e:                      # a footer dump must never fail the layout report
         print(f"compare_writers: footer schema unavailable for {t}: {e}", flush=True)
