@@ -57,6 +57,7 @@ def _init():
             "row_limit": _int("BENCH_ROW_LIMIT"),
             "gap_seconds": _int("BENCH_GAP_SECONDS"),
             "opt_sort": os.environ.get("OPT_SORT"),
+            "writer": os.environ.get("BENCH_WRITER"),
             "rebuild": _bool("FORCE_REBUILD"),
         },
         "duckrun_version": dv,
