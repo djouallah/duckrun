@@ -104,6 +104,38 @@ for n in names:
     typ = next(c[2] for c in cols if c[0] == tables[0] and c[1] == n)
     out.append(f"| {n} | {typ} | " + " | ".join(cells) + " | " + "<br>".join(encs) + " |")
 
+# ---- Footer schema: what a consumer branches on BEFORE it reads a single page.
+# None of this shows up in a byte count, and it is where the two writers actually disagree:
+# both tag VARCHAR with the DEPRECATED ConvertedType UTF8, but only delta-rs also writes the
+# modern LogicalType STRING, and DuckDB marks columns REQUIRED where delta-rs marks them OPTIONAL.
+# A consumer that reads LogicalType and finds none has a plain BYTE_ARRAY on its hands.
+_root = os.environ["ONELAKE_TABLES_PATH"].rstrip("/")
+_sch = {}
+for t in tables:
+    try:
+        _sch[t] = {r[0]: r[1:] for r in con.con.execute(f"""
+            select distinct name, repetition_type, converted_type,
+                   coalesce(logical_type::varchar, '—')
+            from parquet_schema('{_root}/tests/{t}/**/*.parquet')
+            where coalesce(num_children, 0) = 0""").fetchall()}
+    except Exception as e:                      # a footer dump must never fail the layout report
+        print(f"compare_writers: footer schema unavailable for {t}: {e}", flush=True)
+
+if _sch:
+    out += ["", "### Footer schema — repetition / ConvertedType / LogicalType", ""]
+    out.append("| column | " + " | ".join(tables) + " |")
+    out.append("|---|" + "---|" * len(tables))
+    for n in names:
+        cells = []
+        for t in tables:
+            v = _sch.get(t, {}).get(n)
+            cells.append(" / ".join(str(x) for x in v) if v else "—")
+        out.append(f"| {n} | " + " | ".join(cells) + " |")
+    out += ["", "PageEncodingStats is absent from this table because DuckDB never writes it "
+                "(duckdb#12892, closed as not planned) and DuckDB's own `parquet_metadata` does "
+                "not expose it — delta-rs writes `DICTIONARY_PAGE/PLAIN x1 + "
+                "`DATA_PAGE/RLE_DICTIONARY xN` on every chunk."]
+
 text = "\n".join(out)
 print("\n" + text, flush=True)
 summary = os.environ.get("GITHUB_STEP_SUMMARY")
