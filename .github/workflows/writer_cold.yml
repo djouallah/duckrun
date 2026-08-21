@@ -30,6 +30,13 @@ on:
         description: "row cap on the shared source mart.fct_summary (142M ≈ full)"
         type: string
         default: "142000000"
+      opt_parquet_version:
+        description: "[duckdb arm] PARQUET_VERSION. V1 tags dictionary data PLAIN_DICTIONARY, V2 tags the IDENTICAL bytes RLE_DICTIONARY (delta-rs always writes the latter). Byte-identical on disk — so if cold time moves, the reader is choosing its path from the tag, not the data."
+        type: choice
+        default: V1
+        options:
+          - V1
+          - V2
       order:
         description: "which writer is measured FIRST. The two passes share one capacity, so the second can inherit smoothing/throttling from the first — swap this and re-run to prove an effect is the parquet and not the running order."
         type: choice
@@ -147,6 +154,7 @@ jobs:
           ONELAKE_TABLES_PATH: ${{ env.TABLES_DUCKDB }}
           BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
           OPT_TABLE: ${{ env.TABLE_DUCKDB }}
+          OPT_PARQUET_VERSION: ${{ inputs.opt_parquet_version }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
