@@ -75,6 +75,12 @@ FILE_BYTES = int(float(os.environ.get("OPT_TFS_MB") or 256) * 1024 * 1024)
 PQ_VERSION = (os.environ.get("OPT_PARQUET_VERSION") or "V1").strip().upper()
 if PQ_VERSION not in ("V1", "V2"):
     raise SystemExit(f"build_duckdb_native: OPT_PARQUET_VERSION must be V1 or V2, got {PQ_VERSION!r}")
+# DuckDB writes bloom filters by default; delta-rs does not. They live BETWEEN row groups and are
+# not counted in total_compressed_size, so a per-column footer sum cannot see them — on the real
+# fact they are ~32 MB of the 65 MB delta-rs wins by. Default off, because the reader here is
+# Direct Lake (which does not use parquet bloom filters) and because leaving them on makes the
+# writer A/B measure a feature delta-rs simply doesn't ship.
+BLOOM = (os.environ.get("OPT_BLOOM") or "false").strip().lower() in ("true", "1", "yes")
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -160,7 +166,7 @@ else:
     print(f"{n_src:,} rows -> one sorted single-stream COPY, "
           f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
           f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,} x {PQ_VERSION} x DICTIONARY_SIZE_LIMIT "
-          f"{f'{DICT_LIMIT:,}' if DICT_LIMIT else 'duckdb default'}", flush=True)
+          f"{f'{DICT_LIMIT:,}' if DICT_LIMIT else 'duckdb default'} x bloom={BLOOM}", flush=True)
     _dict_opt = f"DICTIONARY_SIZE_LIMIT {DICT_LIMIT}," if DICT_LIMIT else ""
     t_s = time.perf_counter()
     dd.execute(f"""
@@ -169,6 +175,7 @@ else:
         (FORMAT parquet, ROW_GROUP_SIZE {RG}, FILE_SIZE_BYTES {FILE_BYTES},
          {_dict_opt} DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
          COMPRESSION snappy, PARQUET_VERSION {PQ_VERSION},
+         WRITE_BLOOM_FILTER {str(BLOOM).lower()},
          FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
     """)
     print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
@@ -276,6 +283,6 @@ report.merge({"tables": {TABLE: {"build": {
     "engine": "duckdb_copy+delta_commit", "sort": f"sorted by ({sort})", "vorder": False,
     "row_group_ceiling": RG, "dictionary_size_limit": DICT_LIMIT,
     "data_page_size_limit": PAGE_BYTES, "file_size_bytes": FILE_BYTES,
-    "parquet_version": PQ_VERSION,
+    "parquet_version": PQ_VERSION, "bloom_filter": BLOOM,
     "files": k, "rows": n,
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})

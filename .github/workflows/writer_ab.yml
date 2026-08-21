@@ -47,6 +47,10 @@ on:
         options:
           - V1
           - V2
+      opt_bloom:
+        description: "[duckdb arm] write parquet bloom filters. DuckDB does by default and delta-rs never does; they sit between row groups and are invisible to a per-column footer sum (~32 MB on the real fact). Default false so the A/B compares writers, not features."
+        type: boolean
+        default: false
       opt_dict_limit:
         description: "[duckdb arm] DICTIONARY_SIZE_LIMIT — max distinct values per column that still dictionary-encodes. Empty = 16000000, i.e. NEVER fall out of dictionary. Set to 0 to use DuckDB's own default (ROW_GROUP_SIZE/5), which lets high-cardinality columns fall back like delta-rs does."
         type: string
@@ -115,6 +119,7 @@ jobs:
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_PARQUET_VERSION: ${{ inputs.opt_parquet_version }}
           OPT_DICT_LIMIT: ${{ inputs.opt_dict_limit }}
+          OPT_BLOOM: ${{ inputs.opt_bloom }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_duckdb_native.py
