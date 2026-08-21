@@ -12,12 +12,12 @@ ID remap; anything plain gets re-encoded).
 
 Shape mechanics, each measured in a local probe before this was written:
   * ONE sorted COPY — no temp table, no manual slicing (the sort spills instead of materializing
-    the whole fact), no thread pinning. Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's
-    shipping target) along the sorted stream. Adjacent files WILL overlap on the sort key at
-    more than one thread, and that is accepted: the clustering it would buy was measured worth
-    0.05% of the table, and delta-rs ships overlapping files itself. PER_THREAD_OUTPUT +
-    ROW_GROUPS_PER_FILE 1 also measured and REJECTED — one RG per file buys nothing, and
-    ROW_GROUPS_PER_FILE is only exact under PER_THREAD_OUTPUT anyway.
+    the whole fact). Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's shipping target) along
+    the sorted stream. Runs at 2 threads, purely so the runner does not OOM (each writer buffers
+    a full uncompressed row group); adjacent files therefore DO overlap on the sort key, which is
+    accepted — that clustering was measured worth 0.05% of the table and delta-rs overlaps too.
+    PER_THREAD_OUTPUT + ROW_GROUPS_PER_FILE 1 also measured and REJECTED — one RG per file buys
+    nothing, and ROW_GROUPS_PER_FILE is only exact under PER_THREAD_OUTPUT anyway.
   * AddAction stats come from the parquet footers CAST to each column's DuckDB type, then
     re-serialized in Delta JSON spelling — the raw footer stat strings used as-is poisoned
     delta_scan's pruning to zero rows.
@@ -153,16 +153,17 @@ else:
     run_tag = uuid.uuid4().hex[:8]
 
     # threads=1 is the whole ballgame for cross-file clustering, and it is NOT about
-    # No thread pinning: the writer runs at whatever duckrun's session set. Single-threaded
-    # writing buys DISJOINT files on the sort key (locally: 1 thread -> 0/6 overlapping pairs,
-    # 2 or 4 threads -> 6/6, because any multi-threaded parquet COPY writes several files at once
-    # and the writers carve the sorted stream in parallel) — but that clustering was measured to
-    # be worth ~nothing here: going from 19/23 to 0/2 overlapping pairs on the real fact moved
-    # the table 835.08 -> 834.66 MB, 0.05%. delta-rs, the writer this is compared against, ships
-    # 2/3 overlapping files itself. So the constraint is not worth paying for.
-    # NOTE if this OOMs the runner again, the fix is fewer threads: 1.6.0.dev365 died on a
-    # 12.4GiB runner at 4 threads at both 16M and 6M row groups (each writer buffers a full
-    # uncompressed row group), and 2 threads was fine.
+    # threads=2 is a MEMORY guard, not a layout one. Each writer thread buffers a full
+    # uncompressed row group, so the runner's default 4 threads OOMs a 12.4GiB box on this fact —
+    # measured three times now: at 16M rows/group, at 6M, and again with no pin at all
+    # (run 32475734960, "failed to allocate 512.0 MiB (12.4/12.4 GiB used)"). 2 threads fits.
+    # It is deliberately NOT 1. Pinning to one writer is what makes rotated files disjoint on
+    # the sort key (locally 1 thread -> 0/6 overlapping pairs, 2 or 4 -> 6/6, because a
+    # multi-threaded COPY writes several files at once and the writers carve the sorted stream
+    # in parallel), but that clustering was measured worth 0.05% of the table here
+    # (19/23 -> 0/2 overlapping pairs moved it 835.08 -> 834.66 MB) and delta-rs, the writer
+    # this is compared against, ships 2/3 overlapping files itself. So overlap is accepted.
+    dd.execute("SET threads=2")
     print(f"{n_src:,} rows -> one sorted single-stream COPY, "
           f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
           f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,} x {PQ_VERSION} x DICTIONARY_SIZE_LIMIT "
