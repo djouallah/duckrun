@@ -56,7 +56,9 @@ from deltalake.transaction import AddAction, create_table_with_add_actions
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
 
-TABLE = "fct_summary_auto_sort"
+# OPT_TABLE lets a caller aim this builder at its own slot (writer_ab.yml builds both writers
+# side by side); the default keeps parquet_layout.yml's shared-slot behaviour unchanged.
+TABLE = os.environ.get("OPT_TABLE") or "fct_summary_auto_sort"
 
 RG = int(os.environ.get("OPT_RG") or 6_000_000)
 DICT_LIMIT = int(os.environ.get("OPT_DICT_LIMIT") or 16_000_000)
