@@ -243,6 +243,7 @@ jobs:
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_DICT_LIMIT: ${{ inputs.opt_dict_limit }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
+          OPT_TFS_MB: ${{ inputs.opt_tfs_mb }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_duckdb_native.py

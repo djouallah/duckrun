@@ -11,13 +11,15 @@ globally sorted, dictionary-encoded everywhere (Direct Lake's cheap transcode is
 ID remap; anything plain gets re-encoded).
 
 Shape mechanics, each measured in a local probe before this was written:
-  * ONE sorted streaming COPY with PER_THREAD_OUTPUT + ROW_GROUPS_PER_FILE 1 — no temp table,
-    no manual slicing (the sort spills instead of materializing the whole fact). Per the COPY
-    docs, per_thread_output makes ROW_GROUPS_PER_FILE accurate ("only one thread writes to
-    each file"); without it a probe wrote an 8-row-group file. The cost is sort-key range
-    overlap ACROSS files (threads split the sorted stream) — accepted; per-file clustering
-    holds. The explicit ORDER BY pins the written order on its own — no
-    preserve_insertion_order override (duckrun's session global stays false).
+  * ONE sorted single-stream COPY — no temp table, no manual slicing (the sort spills instead of
+    materializing the whole fact). Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's shipping
+    target) ALONG the sorted stream, so adjacent files stay disjoint on the sort key. The earlier
+    PER_THREAD_OUTPUT + ROW_GROUPS_PER_FILE 1 variant was measured and REJECTED: writer threads
+    carve the stream arbitrarily, giving 19/23 overlapping adjacent file pairs and ~70 MB of
+    excess (835 vs 765 MB vs V-Order, nearly all uncompressed `mw` bytes). One RG per file buys
+    nothing, and ROW_GROUPS_PER_FILE is only exact under PER_THREAD_OUTPUT anyway.
+    The explicit ORDER BY pins the written order on its own — no preserve_insertion_order
+    override (duckrun's session global stays false).
   * AddAction stats come from the parquet footers CAST to each column's DuckDB type, then
     re-serialized in Delta JSON spelling — the raw footer stat strings used as-is poisoned
     delta_scan's pruning to zero rows.
@@ -33,10 +35,11 @@ Shape mechanics, each measured in a local probe before this was written:
     option — a stable build would silently write the broken layout and corrupt the A/B.
 
 Env: ONELAKE_TABLES_PATH (resolve_env), OPT_SORT (explicit columns, default 'date, time' —
-'auto' is the delta-rs builder's spelling and is rejected here), OPT_RG (rows/group+file,
-default 6000000 = duckrun's fixed write geometry; 4 threads each buffering a full 16M-row
-group OOM'd the 12.4GiB runner on 1.6.0.dev365), OPT_DICT_LIMIT (default 16000000),
-OPT_PAGE_BYTES (default 1048576), BENCH_ROW_LIMIT, FORCE_REBUILD.
+'auto' is the delta-rs builder's spelling and is rejected here), OPT_RG (rows per row group,
+default 6000000 = duckrun's fixed write geometry; the nightly OOM'd the 12.4GiB runner at 4
+threads), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (default 1048576),
+OPT_TFS_MB (file rotation size, default 256 = duckrun's target_file_size_mb),
+BENCH_ROW_LIMIT, FORCE_REBUILD.
 """
 import datetime as _dt
 import decimal as _dec
@@ -60,6 +63,7 @@ TABLE = "fct_summary_auto_sort"
 RG = int(os.environ.get("OPT_RG") or 6_000_000)
 DICT_LIMIT = int(os.environ.get("OPT_DICT_LIMIT") or 16_000_000)
 PAGE_BYTES = int(os.environ.get("OPT_PAGE_BYTES") or 1_048_576)
+FILE_BYTES = int(float(os.environ.get("OPT_TFS_MB") or 256) * 1024 * 1024)
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -128,25 +132,27 @@ else:
     order = ", ".join(f'"{c}"' for c in sort_cols)
     run_tag = uuid.uuid4().hex[:8]
 
-    # PER_THREAD_OUTPUT makes ROW_GROUPS_PER_FILE exact ("only one thread writes to each file,
-    # and it becomes accurate again" — DuckDB COPY docs; probed: N files x exactly 1 RG). The
-    # trade-off is cross-file range overlap on the sort key (threads split the sorted stream);
-    # per-file clustering is kept and the overlap is accepted. No preserve_insertion_order
-    # override: the explicit ORDER BY pins the written order by itself (duckrun's global false
-    # stays), and threads=2 because 1.6.0.dev365's scan+sort OOM'd the 12.4GiB runner at 4
-    # threads regardless of row-group size (16M and 6M both died ~30s in; fit on 1.5.5).
+    # ONE ordered output stream: no PER_THREAD_OUTPUT, so files rotate on FILE_SIZE_BYTES along
+    # the sorted stream instead of being split per writer thread. The per-thread variant measured
+    # 19/23 adjacent file pairs OVERLAPPING on the sort key (run 32462888170) — threads carve the
+    # stream arbitrarily, which destroys file-level clustering and cost ~70 MB (835 vs 765 MB vs
+    # V-Order, almost all of it uncompressed `mw` bytes). ROW_GROUPS_PER_FILE is dropped with it:
+    # it is only exact under PER_THREAD_OUTPUT, and one-RG-per-file buys nothing here.
+    # threads=2 stays as the OOM guard (1.6.0.dev365 died at 4 threads on the 12.4GiB runner at
+    # both 16M and 6M row groups). The explicit ORDER BY pins the written order — no
+    # preserve_insertion_order override (duckrun's global false stays).
     dd.execute("SET threads=2")
-    print(f"{n_src:,} rows -> one sorted parallel COPY, "
-          f"PER_THREAD_OUTPUT x ROW_GROUPS_PER_FILE 1 x ROW_GROUP_SIZE {RG:,} "
+    print(f"{n_src:,} rows -> one sorted single-stream COPY, "
+          f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
           f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,}", flush=True)
     t_s = time.perf_counter()
     dd.execute(f"""
         COPY (select {collist} from {src} order by {order})
         TO '{table_uri}'
-        (FORMAT parquet, ROW_GROUP_SIZE {RG}, ROW_GROUPS_PER_FILE 1,
+        (FORMAT parquet, ROW_GROUP_SIZE {RG}, FILE_SIZE_BYTES {FILE_BYTES},
          DICTIONARY_SIZE_LIMIT {DICT_LIMIT}, DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
          COMPRESSION snappy,
-         PER_THREAD_OUTPUT, FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
+         FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
     """)
     print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
 
@@ -228,12 +234,11 @@ else:
         from parquet_metadata({flist})
         group by 1 order by 3
     """).fetchall()
-    multi = [m[0] for m in meta if m[1] != 1]
-    if multi:
-        raise SystemExit(f"layout verification FAILED: multi-RG files={multi}")
+    rgs = sum(m[1] for m in meta)
     rng = [(m[2], m[3]) for m in meta]
     overlaps = sum(1 for a, b in zip(rng, rng[1:]) if b[0] < a[1])
-    # informational: PER_THREAD_OUTPUT trades cross-file ordering for parallel writes
+    # THE metric for the single-stream shape: files rotate along the sorted stream, so adjacent
+    # files should NOT overlap on the sort key. The PER_THREAD_OUTPUT variant scored 19/23.
     print(f"{sort_cols[0]} range overlap across files: {overlaps}/{max(len(rng) - 1, 1)} "
           f"adjacent pairs", flush=True)
     non_dict = dd.execute(f"""
@@ -246,12 +251,13 @@ else:
     n_back = dd.execute(f"select count(*) from delta_scan('{table_uri}')").fetchone()[0]
     if n_back != n_src:
         raise SystemExit(f"row count mismatch after commit: delta_scan {n_back:,} vs source {n_src:,}")
-    print(f"verified: {len(meta)} file(s) x 1 RG, {n_back:,} rows readable", flush=True)
+    print(f"verified: {len(meta)} file(s) / {rgs} row group(s), {n_back:,} rows readable",
+          flush=True)
     status = "rebuilt"
 
 report.merge({"tables": {TABLE: {"build": {
     "engine": "duckdb_copy+delta_commit", "sort": f"sorted by ({sort})", "vorder": False,
     "row_group_ceiling": RG, "dictionary_size_limit": DICT_LIMIT,
-    "data_page_size_limit": PAGE_BYTES,
+    "data_page_size_limit": PAGE_BYTES, "file_size_bytes": FILE_BYTES,
     "files": k, "rows": n,
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})
