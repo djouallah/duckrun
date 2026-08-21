@@ -11,15 +11,13 @@ globally sorted, dictionary-encoded everywhere (Direct Lake's cheap transcode is
 ID remap; anything plain gets re-encoded).
 
 Shape mechanics, each measured in a local probe before this was written:
-  * ONE sorted single-stream COPY — no temp table, no manual slicing (the sort spills instead of
-    materializing the whole fact). Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's shipping
-    target) ALONG the sorted stream, so adjacent files stay disjoint on the sort key. The earlier
-    PER_THREAD_OUTPUT + ROW_GROUPS_PER_FILE 1 variant was measured and REJECTED: writer threads
-    carve the stream arbitrarily, giving 19/23 overlapping adjacent file pairs and ~70 MB of
-    excess (835 vs 765 MB vs V-Order, nearly all uncompressed `mw` bytes). One RG per file buys
-    nothing, and ROW_GROUPS_PER_FILE is only exact under PER_THREAD_OUTPUT anyway.
-    The explicit ORDER BY pins the written order on its own — no preserve_insertion_order
-    override (duckrun's session global stays false).
+  * ONE sorted SINGLE-THREADED COPY — no temp table, no manual slicing (the sort spills instead
+    of materializing the whole fact). Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's shipping
+    target) along the sorted stream, so adjacent files stay disjoint on the sort key. threads=1
+    is mandatory for that: a multi-threaded COPY writes several files at once and their key
+    ranges interleave no matter how the sink is configured (see the SET threads=1 comment for
+    the measurements). The PER_THREAD_OUTPUT + ROW_GROUPS_PER_FILE 1 variant was measured and
+    REJECTED — one RG per file buys nothing and ROW_GROUPS_PER_FILE is only exact under it.
   * AddAction stats come from the parquet footers CAST to each column's DuckDB type, then
     re-serialized in Delta JSON spelling — the raw footer stat strings used as-is poisoned
     delta_scan's pruning to zero rows.
@@ -132,16 +130,20 @@ else:
     order = ", ".join(f'"{c}"' for c in sort_cols)
     run_tag = uuid.uuid4().hex[:8]
 
-    # ONE ordered output stream: no PER_THREAD_OUTPUT, so files rotate on FILE_SIZE_BYTES along
-    # the sorted stream instead of being split per writer thread. The per-thread variant measured
-    # 19/23 adjacent file pairs OVERLAPPING on the sort key (run 32462888170) — threads carve the
-    # stream arbitrarily, which destroys file-level clustering and cost ~70 MB (835 vs 765 MB vs
-    # V-Order, almost all of it uncompressed `mw` bytes). ROW_GROUPS_PER_FILE is dropped with it:
-    # it is only exact under PER_THREAD_OUTPUT, and one-RG-per-file buys nothing here.
-    # threads=2 stays as the OOM guard (1.6.0.dev365 died at 4 threads on the 12.4GiB runner at
-    # both 16M and 6M row groups). The explicit ORDER BY pins the written order — no
-    # preserve_insertion_order override (duckrun's global false stays).
-    dd.execute("SET threads=2")
+    # threads=1 is the whole ballgame for cross-file clustering, and it is NOT about
+    # PER_THREAD_OUTPUT or preserve_insertion_order. ANY multi-threaded parquet COPY writes
+    # several files concurrently, so writer threads consume the sorted stream in parallel and
+    # their key ranges interleave. Measured locally (10M rows, rotation exercised):
+    #   threads=1 -> 7 files, overlap 0/6 (clean disjoint slices), 17.9s
+    #   threads=2 -> 7 files, overlap 6/6,                          9.2s
+    #   threads=4 -> 7 files, overlap 6/6
+    # preserve_insertion_order true vs false made NO difference to any of it — the ORDER BY
+    # governs, so duckrun's global false stays untouched. On the real fact the parallel variants
+    # measured 19/23 (PER_THREAD_OUTPUT, 24 files) and 2/2 (single stream, 3 files) overlapping
+    # pairs, costing ~70 MB vs V-Order (835 vs 765 MB, nearly all uncompressed `mw` bytes —
+    # dictionary indices that lost their runs). One writer also buffers one row group, so this
+    # is what fixes the 12.4GiB-runner OOM as well. ~2x slower; the layout is the point.
+    dd.execute("SET threads=1")
     print(f"{n_src:,} rows -> one sorted single-stream COPY, "
           f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
           f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,}", flush=True)
