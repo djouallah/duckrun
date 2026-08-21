@@ -140,7 +140,11 @@ if not force and _exists():
           flush=True)
     status, k, n = "skipped", None, rows
 else:
-    src = "mart.fct_summary" if N_CAP is None else f"(select * from mart.fct_summary limit {N_CAP})"
+    # BENCH_SOURCE lets a caller read one lakehouse while writing into another (a full expression
+    # such as delta_scan('abfss://.../mart/fct_summary')); the cold benchmark needs that because
+    # its throwaway lakehouse has no mart schema. Same override the delta-rs builder honours.
+    _src_tbl = (os.environ.get("BENCH_SOURCE") or "mart.fct_summary").strip()
+    src = _src_tbl if N_CAP is None else f"(select * from {_src_tbl} limit {N_CAP})"
     n_src = dd.execute(f"select count(*) from {src}").fetchone()[0]
 
     # column types drive the typed stats casts below; the mart already stores decimal(18,4)

@@ -1,0 +1,198 @@
+name: Writer cold benchmark (Direct Lake + CU)
+
+# MANUAL ONLY, non-gating. Answers the one question the layout A/B cannot: is the DuckDB writer's
+# parquet actually good to READ COLD in Direct Lake, and what does it cost in capacity units.
+#
+# Cold-only by construction. There is no warm pass and no hot pass, and nothing is ever cleared:
+# a FRESH semantic model is the cold guarantee, because a new dataset is the only reliable way to
+# get an empty column store. Each query touches a column nothing has touched yet, so its duration
+# is that column's Delta->memory transcode. probe_rowcount runs last as the ~zero-column control.
+#
+# Every Fabric item here is created by the run and deleted at the end. That is the design, not
+# tidiness: fresh items mean fresh GUIDs, which is what makes the per-item CU read unambiguous.
+#
+#   wab_deltars.tests.fct_summary_deltars  <- build_auto_sort.py      (delta-rs writes)
+#   wab_duckdb.tests.fct_summary_duckdb    <- build_duckdb_native.py  (DuckDB COPY writes)
+#
+# THIS COSTS REAL CAPACITY. It writes ~1.6 GB, deploys two Direct Lake models and queries them.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "deploy_config.yml env whose workspace hosts the temp items (and the source mart)"
+        type: string
+        default: main
+      opt_sort:
+        description: "the FIXED sort key both writers use. Explicit columns only."
+        type: string
+        default: "date, time"
+      row_limit:
+        description: "row cap on the shared source mart.fct_summary (142M ≈ full)"
+        type: string
+        default: "142000000"
+      keep:
+        description: "skip teardown and leave the lakehouses + models standing (debugging). They bill storage until removed by hand."
+        type: boolean
+        default: false
+      settle_run:
+        description: "CU settle mode: re-read a past run's CU instead of benchmarking. Pass the ledger key (or 'all' for every unsettled run). Leave empty for a normal run."
+        type: string
+        default: ""
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  cold:
+    name: 🧊 Cold Direct Lake — delta-rs vs DuckDB
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      METRICS_WORKSPACE_ID: ${{ secrets.METRICS_WORKSPACE_ID }}
+      METRICS_MODEL_ID: ${{ secrets.METRICS_MODEL_ID }}
+      CAPACITY_ID: ${{ secrets.CAPACITY_ID }}
+      LH_DELTARS: wab_deltars
+      LH_DUCKDB: wab_duckdb
+      MODEL_DELTARS: writer_cold_deltars
+      MODEL_DUCKDB: writer_cold_duckdb
+      TABLE_DELTARS: fct_summary_deltars
+      TABLE_DUCKDB: fct_summary_duckdb
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install deps (duckrun from THIS tree)
+        run: |
+          pip install pythonnet pyyaml
+          pip install -e .
+
+      - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
+        run: pip install duckdb==1.6.0.dev365
+
+      - name: 🧩 Install ADOMD.NET client (.NET Core build, cross-platform)
+        run: |
+          set -euo pipefail
+          proj="$RUNNER_TEMP/adomd"
+          mkdir -p "$proj" && cd "$proj"
+          dotnet new console -o . --force >/dev/null
+          dotnet add package Microsoft.AnalysisServices.AdomdClient.NetCore.retail.amd64 >/dev/null
+          dotnet publish -c Release -o publish >/dev/null
+          test -f "$proj/publish/Microsoft.AnalysisServices.AdomdClient.dll"
+          echo "ADOMD_DIR=$proj/publish" >> "$GITHUB_ENV"
+
+      - name: 🔑 Resolve workspace + source lakehouse
+        run: |
+          echo "RUN_REPORT=$PWD/run_report.json" >> "$GITHUB_ENV"
+          python tests/parquet_layout/aemo/resolve_env.py --env ${{ inputs.env }}
+
+      - name: 📌 Pin the SOURCE tables path under its own name
+        # resolve_env sets ONELAKE_TABLES_PATH to the PERMANENT lakehouse (where mart.fct_summary
+        # lives). The build steps override that variable to point at their temp lakehouse, so the
+        # source must be captured under a different name first — a step cannot safely reference a
+        # variable it is itself overriding.
+        run: echo "SRC_TABLES=$ONELAKE_TABLES_PATH" >> "$GITHUB_ENV"
+
+      # ---- CU settle mode: re-read a past run and exit. No items are created.
+      - name: 💰 Settle CU for a past run
+        if: ${{ inputs.settle_run != '' }}
+        run: |
+          if [ "${{ inputs.settle_run }}" = "all" ]; then
+            python tests/parquet_layout/writer_cold/cu.py settle
+          else
+            python tests/parquet_layout/writer_cold/cu.py settle --run "${{ inputs.settle_run }}"
+          fi
+
+      - name: 🏗️ Provision the throwaway lakehouses
+        if: ${{ inputs.settle_run == '' }}
+        run: |
+          echo "RUN_START=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+          python tests/parquet_layout/writer_cold/provision.py create
+
+      - name: 🧭 Build the delta-rs table
+        if: ${{ inputs.settle_run == '' }}
+        env:
+          PYTHONIOENCODING: utf-8
+          # write into the temp lakehouse, read the permanent mart
+          ONELAKE_TABLES_PATH: ${{ env.TABLES_DELTARS }}
+          BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
+          OPT_TABLE: ${{ env.TABLE_DELTARS }}
+          OPT_SORT: ${{ inputs.opt_sort }}
+          FORCE_REBUILD: "true"
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/build_auto_sort.py
+
+      - name: 🦆 Build the DuckDB-writer table
+        if: ${{ inputs.settle_run == '' }}
+        env:
+          PYTHONIOENCODING: utf-8
+          ONELAKE_TABLES_PATH: ${{ env.TABLES_DUCKDB }}
+          BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
+          OPT_TABLE: ${{ env.TABLE_DUCKDB }}
+          OPT_SORT: ${{ inputs.opt_sort }}
+          FORCE_REBUILD: "true"
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/build_duckdb_native.py
+
+      - name: 🚀 Deploy the two fresh Direct Lake models
+        if: ${{ inputs.settle_run == '' }}
+        env:
+          PYTHONIOENCODING: utf-8
+        run: python tests/parquet_layout/writer_cold/deploy_models.py
+
+      - name: 🧊 Cold pass — delta-rs
+        if: ${{ inputs.settle_run == '' }}
+        env:
+          PYTHONNET_RUNTIME: coreclr
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"
+          MODEL: ${{ env.MODEL_DELTARS }}
+          VARIANT: deltars
+        run: python tests/parquet_layout/writer_cold/cold_bench.py
+
+      - name: 🧊 Cold pass — DuckDB writer
+        if: ${{ inputs.settle_run == '' }}
+        env:
+          PYTHONNET_RUNTIME: coreclr
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"
+          MODEL: ${{ env.MODEL_DUCKDB }}
+          VARIANT: duckdb
+        run: python tests/parquet_layout/writer_cold/cold_bench.py
+
+      - name: 💰 Read CU (lower bound — it accrues for ~70 min)
+        if: ${{ inputs.settle_run == '' }}
+        continue-on-error: true   # a CU read must never lose us the cold numbers
+        env:
+          PYTHONNET_RUNTIME: coreclr
+          PYTHONIOENCODING: utf-8
+        run: |
+          python tests/parquet_layout/writer_cold/cu.py read \
+            --items "{\"deltars_model\":\"$MODEL_ID_DELTARS\",\"duckdb_model\":\"$MODEL_ID_DUCKDB\",\"deltars_lakehouse\":\"$LH_ID_DELTARS\",\"duckdb_lakehouse\":\"$LH_ID_DUCKDB\"}" \
+            --since-iso "$RUN_START" --label "${{ github.run_id }}"
+
+      - name: 📊 Summary
+        if: ${{ always() && inputs.settle_run == '' }}
+        continue-on-error: true
+        run: python tests/parquet_layout/writer_cold/render_cold.py
+
+      - name: 🧹 Teardown (always — a leaked lakehouse bills forever)
+        if: ${{ always() && inputs.settle_run == '' && !inputs.keep }}
+        run: python tests/parquet_layout/writer_cold/provision.py drop
+
+      - name: 📎 Upload run report
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: writer-cold-report
+          path: |
+            run_report.json
+            tests/parquet_layout/writer_cold/cu_history.json
+          if-no-files-found: warn
