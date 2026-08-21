@@ -1,0 +1,122 @@
+name: Writer A/B (parquet layout)
+
+# MANUAL ONLY, non-gating. delta-rs vs DuckDB's own parquet writer, everything else held equal:
+# same source, same fixed sort key, same geometry knobs, same runner, same duckdb build. Two
+# coexisting tables in the aemo benchmark lakehouse, then a layout readout.
+#
+# Deliberately NOT this workflow's business: DAX, semantic models, XMLA, VertiPaq, V-Order. Those
+# live in parquet_layout.yml and cost interactive CU; this one answers "what parquet does each
+# writer emit" and nothing else, so it is cheap enough to run on every writer change.
+#
+#   tests.fct_summary_ab_deltars  <- build_auto_sort.py       (duckrun CTAS, delta-rs writes)
+#   tests.fct_summary_ab_duckdb   <- build_duckdb_native.py   (DuckDB COPY, delta-rs commits only)
+#
+# Both builders take their target from OPT_TABLE, so parquet_layout.yml's own shared slot
+# (tests.fct_summary_auto_sort) is untouched by anything here.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "deploy_config.yml env whose workspace/lakehouse to build in"
+        type: string
+        default: main
+      opt_sort:
+        description: "the FIXED sort key both writers use, e.g. 'date, time'. Explicit columns only — 'auto' would let the picker choose per writer, which is no longer an A/B."
+        type: string
+        default: "date, time"
+      row_limit:
+        description: "row cap on the shared source mart.fct_summary (142M ≈ full)"
+        type: string
+        default: "142000000"
+      opt_rg:
+        description: "row-group ceiling (rows) for BOTH writers. Empty = duckrun's fixed 6M."
+        type: string
+        default: ""
+      opt_tfs_mb:
+        description: "target parquet file size (MB) for BOTH writers. Empty = duckrun's 256 MB."
+        type: string
+        default: ""
+      opt_page_bytes:
+        description: "[duckdb arm] DATA_PAGE_SIZE_LIMIT in bytes (duckdb#24645). Empty = 1048576, matching the ~1 MB pages the delta-rs arm writes."
+        type: string
+        default: ""
+      rebuild:
+        description: "rebuild both tables even if they already exist (else each builder skips)"
+        type: boolean
+        default: true
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  writer_ab:
+    name: 🆚 delta-rs vs DuckDB writer
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      # duckrun mints every token it needs from this federated identity — no azure/login anywhere.
+      # NOTE a non-main branch needs its own federated credential on the app, or the mint fails
+      # with an unhelpful error (subject repo:djouallah/duckrun:ref:refs/heads/<branch>).
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install deps (duckrun from THIS tree)
+        run: |
+          pip install pyyaml
+          pip install -e .
+
+      - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
+        # Pinned for the WHOLE job, not just the duckdb arm: delta-rs writes its parquet through
+        # arrow-rs either way, so this cannot touch its output — and it means both arms read the
+        # source with the identical engine, which is the point of an A/B.
+        run: pip install duckdb==1.6.0.dev365
+
+      - name: 🔑 Resolve lakehouse + workspace (duckrun, no az)
+        run: python tests/parquet_layout/aemo/resolve_env.py --env ${{ inputs.env }}
+
+      - name: 🧭 Build the delta-rs table (duckrun CTAS)
+        env:
+          PYTHONIOENCODING: utf-8
+          OPT_TABLE: fct_summary_ab_deltars
+          OPT_SORT: ${{ inputs.opt_sort }}
+          OPT_RG: ${{ inputs.opt_rg }}
+          OPT_TFS_MB: ${{ inputs.opt_tfs_mb }}
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/build_auto_sort.py
+
+      - name: 🦆 Build the DuckDB-writer table (COPY writes, delta-rs commits)
+        env:
+          PYTHONIOENCODING: utf-8
+          OPT_TABLE: fct_summary_ab_duckdb
+          OPT_SORT: ${{ inputs.opt_sort }}
+          OPT_RG: ${{ inputs.opt_rg }}
+          OPT_TFS_MB: ${{ inputs.opt_tfs_mb }}
+          OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/build_duckdb_native.py
+
+      - name: 📊 Compare the two layouts
+        if: always()   # a failed build should still show whatever did land
+        env:
+          PYTHONIOENCODING: utf-8
+          OPT_SORT: ${{ inputs.opt_sort }}
+        run: python tests/parquet_layout/aemo/compare_writers.py
+
+      - name: 📎 Upload run report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: writer-ab-report
+          path: run_report.json
+          if-no-files-found: warn

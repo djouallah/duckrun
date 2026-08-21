@@ -73,6 +73,21 @@ on:
         description: "[aemo] pin the data-page ROW cap for the auto_sort build. Empty = the 1M default (raised from 20k in d0d23b4, so the 1 MB byte cap is what shapes pages). Use with rebuild=true."
         type: string
         default: ""
+      writer:
+        description: "[aemo] which writer builds the auto_sort table: delta_rs (CTAS, build_auto_sort.py) or duckdb_native (DuckDB COPY + delta-rs commit-only — exact 1-RG-per-file geometry, dictionary encoding control). Switch with rebuild=true or the existing table is reused."
+        type: choice
+        default: delta_rs
+        options:
+          - delta_rs
+          - duckdb_native
+      opt_dict_limit:
+        description: "[aemo] duckdb_native only: DICTIONARY_SIZE_LIMIT — max distinct values per column that still dictionary-encodes. Empty = 16000000."
+        type: string
+        default: ""
+      opt_page_bytes:
+        description: "[aemo] duckdb_native only: DATA_PAGE_SIZE_LIMIT in bytes (duckdb#24645). Empty = 1048576 (~1 MB, the measured sweet spot of the page-size U-curve)."
+        type: string
+        default: ""
       dax:
         description: "run the Direct Lake half — deploy the two semantic models, walk the DAX suite, read the VertiPaq DMVs. OFF = layout only (sort key, table stats, parquet geometry): no semantic model is created, so it costs no interactive CU and finishes in minutes. Turn it off when the question is 'what did the picker choose / what shape did it write', on when the question is 'is it faster'."
         type: boolean
@@ -133,6 +148,14 @@ jobs:
           pip install pythonnet pyyaml
           pip install -e .
 
+      - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
+        # Stable duckdb (<= 1.5.5) still hard-splits data pages at 100MB uncompressed — the exact
+        # failure that killed this arm's first run (duckdb#24507). Its own step so the delta_rs
+        # path stays byte-identical to main; build_duckdb_native.py probes the option at startup
+        # and dies loudly if this pin ever stops carrying it.
+        if: ${{ inputs.writer == 'duckdb_native' }}
+        run: pip install duckdb==1.6.0.dev365
+
       - name: 🧾 Init run report
         env:
           BENCH_ENV: ${{ inputs.env }}
@@ -142,6 +165,7 @@ jobs:
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
           BENCH_GAP_SECONDS: ${{ inputs.gap_seconds }}
           OPT_SORT: ${{ inputs.opt_sort }}
+          BENCH_WRITER: ${{ inputs.writer }}
           FORCE_REBUILD: ${{ inputs.rebuild }}
         run: |
           echo "RUN_REPORT=$PWD/run_report.json" >> "$GITHUB_ENV"
@@ -197,7 +221,7 @@ jobs:
         run: python tests/parquet_layout/aemo/build_spark_variant.py
 
       - name: 🧭 Build auto_sort summary table (duckrun sorted, reads mart.fct_summary directly)
-        if: ${{ inputs.rebuild || steps.check.outputs.build_needed == 'true' }}
+        if: ${{ inputs.writer != 'duckdb_native' && (inputs.rebuild || steps.check.outputs.build_needed == 'true') }}
         env:
           PYTHONIOENCODING: utf-8
           OPT_SORT: ${{ inputs.opt_sort }}
@@ -207,6 +231,22 @@ jobs:
           FORCE_REBUILD: ${{ inputs.rebuild }}
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_auto_sort.py
+
+      - name: 🦆 Build auto_sort summary table (DuckDB COPY writes, delta-rs commits)
+        # Same table slot (tests.fct_summary_auto_sort) so deploy/stats/XMLA/DMV run unchanged.
+        # 'auto' is the delta-rs builder's sort spelling; the native builder needs explicit
+        # columns, so the input's default remaps to the measured best key.
+        if: ${{ inputs.writer == 'duckdb_native' && (inputs.rebuild || steps.check.outputs.build_needed == 'true') }}
+        env:
+          PYTHONIOENCODING: utf-8
+          OPT_SORT: ${{ inputs.opt_sort == 'auto' && 'date, time' || inputs.opt_sort }}
+          OPT_RG: ${{ inputs.opt_rg }}
+          OPT_DICT_LIMIT: ${{ inputs.opt_dict_limit }}
+          OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
+          OPT_TFS_MB: ${{ inputs.opt_tfs_mb }}
+          FORCE_REBUILD: ${{ inputs.rebuild }}
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/build_duckdb_native.py
 
       - name: 🚀 Deploy benchmark semantic models (auto_sort + vorder)
         if: ${{ inputs.dax }}

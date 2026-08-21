@@ -8,6 +8,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import report  # noqa: E402
 import sort_key as sort_key_mod  # noqa: E402
 
+# OPT_TABLE lets a caller aim this builder at its own slot (writer_ab.yml builds delta-rs and the
+# DuckDB writer side by side); the default keeps parquet_layout.yml's behaviour unchanged.
+TABLE = os.environ.get("OPT_TABLE") or "fct_summary_auto_sort"
+QUALIFIED = f"tests.{TABLE}"
+
 sort = sort_key_mod.requested()
 clause = "sorted by auto" if sort.lower() == "auto" else f"sorted by ({sort})"
 force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
@@ -60,7 +65,7 @@ except Exception:
 
 def _exists():
     try:
-        con.sql("select 1 from tests.fct_summary_auto_sort limit 1").fetchone()
+        con.sql(f"select 1 from {QUALIFIED} limit 1").fetchone()
         return True
     except Exception:
         return False
@@ -69,23 +74,23 @@ def _exists():
 _t0 = time.perf_counter()
 sort_key = None
 if not force and _exists():
-    rows = con.sql("select count(*) from tests.fct_summary_auto_sort").fetchone()[0]
-    print(f"tests.fct_summary_auto_sort already exists ({rows:,} rows) — skipping "
+    rows = con.sql(f"select count(*) from {QUALIFIED}").fetchone()[0]
+    print(f"{QUALIFIED} already exists ({rows:,} rows) — skipping "
           "(rebuild=true to rebuild)", flush=True)
     status = "skipped"   # nothing was written, so no key was chosen — report null, not a guess
 else:
     body = f"select * from {_src}"
     sort_key = sort_key_mod.resolve(con, sort, body)
     print(f"sort key: {clause} -> {sort_key_mod.label(sort_key)}", flush=True)
-    print(f"Building tests.fct_summary_auto_sort with '{clause}' ...", flush=True)
+    print(f"Building {QUALIFIED} with '{clause}' ...", flush=True)
     # Read mart.fct_summary directly (independent of the Spark V-Order build's read); SORTED BY AUTO
     # re-sorts regardless of the source's order.
-    con.sql(f"create or replace table tests.fct_summary_auto_sort {clause} as {body}")
-    rows = con.sql("select count(*) from tests.fct_summary_auto_sort").fetchone()[0]
-    print(f"done — tests.fct_summary_auto_sort built ({rows:,} rows)", flush=True)
+    con.sql(f"create or replace table {QUALIFIED} {clause} as {body}")
+    rows = con.sql(f"select count(*) from {QUALIFIED}").fetchone()[0]
+    print(f"done — {QUALIFIED} built ({rows:,} rows)", flush=True)
     status = "rebuilt"
 
-report.merge({"tables": {"fct_summary_auto_sort": {"build": {
+report.merge({"tables": {TABLE: {"build": {
     "engine": "delta_rs", "sort": clause, "sort_key": sort_key, "vorder": False,
     "row_group_ceiling": OPT_RG,     # None = the fixed 6M default
     "target_file_size_mb": OPT_TFS_MB,  # None = the 256 MB default
