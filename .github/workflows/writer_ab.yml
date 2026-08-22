@@ -59,6 +59,10 @@ on:
         description: "rebuild both tables even if they already exist (else each builder skips)"
         type: boolean
         default: true
+      payload_diff_column:
+        description: "column whose PAYLOAD is decoded and compared at the end of the run — dictionary contents per row group, RLE/bit-packing run framing, and the decoded value sequence. This is the only tool here that decompresses a page rather than reading headers."
+        type: string
+        default: DUID
       page_diff_column:
         description: "column whose PAGE HEADERS are dumped side by side at the end of the run. DUID is the one that reads 11x slower cold; the numeric columns sit at the ~2x baseline."
         type: string
@@ -91,7 +95,7 @@ jobs:
       - name: 📦 Install deps (duckrun from THIS tree)
         run: |
           pip install pyyaml
-          pip install fastparquet          # page-header thrift reader for page_diff.py
+          pip install fastparquet cramjam  # page-header thrift reader + page decompression
           pip install -e .
 
       - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
@@ -146,6 +150,16 @@ jobs:
           PYTHONIOENCODING: utf-8
           PAGE_DIFF_COLUMN: ${{ inputs.page_diff_column }}
         run: python tests/parquet_layout/aemo/page_diff.py
+
+      - name: 🧬 Payload diff — decode the column, do not just read headers
+        # page_diff stops at the page header. This decompresses pages and decodes values, which is
+        # the only place left for two files with identical metadata to actually differ.
+        if: always()
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+          PAYLOAD_DIFF_COLUMN: ${{ inputs.payload_diff_column }}
+        run: python tests/parquet_layout/aemo/payload_diff.py
 
       - name: 📎 Upload run report
         if: always()
