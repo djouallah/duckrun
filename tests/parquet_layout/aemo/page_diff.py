@@ -164,6 +164,12 @@ def main():
             print(f"   chunk fields  : file_path={getattr(cc, 'file_path', None)!r}, "
                   f"file_offset={getattr(cc, 'file_offset', None)}, codec={m.codec}, "
                   f"index_page_offset={getattr(m, 'index_page_offset', None)}")
+            # dictionary_page_offset is how a reader asks "is there a dictionary here?" without
+            # cracking pages. A null one on a dictionary-encoded chunk sends it down the decode
+            # path even though the dictionary is right there.
+            print(f"   page offsets  : dictionary_page_offset={m.dictionary_page_offset}, "
+                  f"data_page_offset={m.data_page_offset}, "
+                  f"delta={(m.data_page_offset - m.dictionary_page_offset) if m.dictionary_page_offset else None}")
             print(f"   encodings     : {[_enc(e) for e in (m.encodings or [])]}")
             es = m.encoding_stats
             print(f"   encoding_stats: " + (
