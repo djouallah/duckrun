@@ -110,6 +110,11 @@ if WRITER not in ("duckdb", "pyarrow"):
 # these is the cold-read gap, the fix belongs upstream in DuckDB, not in a footer rewrite.
 FOOTER_INJECT = [f.strip() for f in (os.environ.get("OPT_FOOTER_INJECT") or "").split(",")
                  if f.strip()]
+# DIAGNOSTIC. Re-encode the dictionary indices at 63 groups per bit-packed run (504 values), which
+# is what parquet-rs and parquet-cpp both emit and DuckDB never does at any COPY setting. Set to a
+# column name to rewrite that column, or 'all'. Same values, same bit width, same dictionary, same
+# page boundaries — only the run boundaries move. See page_reframe.py.
+REFRAME = (os.environ.get("OPT_REFRAME") or "").strip()
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -314,6 +319,15 @@ else:
                              "needed injecting — duckdb may have started writing it, which would "
                              "silently turn this run into a no-op control.")
         sizes = _listing()          # files grew; re-read the true sizes
+
+    if REFRAME:
+        import page_reframe
+        col = None if REFRAME.lower() == "all" else REFRAME
+        print(f"re-framing bit-packed runs to {page_reframe.GROUPS} groups "
+              f"({page_reframe.GROUPS * 8} values) in {len(sizes)} file(s), "
+              f"column={col or 'ALL'}", flush=True)
+        page_reframe.reframe_remote(store, sorted(sizes), column=col)
+        sizes = _listing()          # every page changed size; re-read the true sizes
 
     files = sorted(sizes)
     k = len(files)

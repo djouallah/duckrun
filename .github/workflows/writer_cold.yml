@@ -44,6 +44,10 @@ on:
         description: "[duckdb arm] comma-separated footer metadata to add that DuckDB omits and delta-rs writes: encstats (PageEncodingStats), offsetindex (OffsetIndex), logical (LogicalType — already measured as a no-op). Empty writes DuckDB's footer untouched. A page-level diff proved the DATA is the same, so these are what is left."
         type: string
         default: ""
+      opt_reframe:
+        description: "[duckdb arm] re-encode this column's dictionary indices at 63 groups per bit-packed run (504 values) — what parquet-rs and parquet-cpp both emit and DuckDB never does at any COPY setting. Same values, same bit width, same dictionary, same page boundaries; only the run boundaries move. 'DUID', or 'all', or empty to leave the pages alone."
+        type: string
+        default: ""
       columns:
         description: "narrow both tables to these columns — a MINIMAL reproducer. 'date, time, DUID' writes ~1/5 the bytes of the full fact and measures exactly the same thing, because probing one column only transcodes that column. date and time are carried so the sort key stays intact and both writers receive an identically ordered stream; neither is ever probed. Empty = the full fact."
         type: string
@@ -170,6 +174,7 @@ jobs:
           OPT_PARQUET_VERSION: ${{ inputs.opt_parquet_version }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
+          OPT_REFRAME: ${{ inputs.opt_reframe }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
