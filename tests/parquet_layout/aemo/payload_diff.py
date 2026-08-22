@@ -187,6 +187,13 @@ def analyse(label, files, column, n_pages):
                 "first": [x.decode(errors="replace") for x in (d or [])[:3]],
                 "pages": pages, "idx_hash": _hash(idx[:100_000].tolist()) if len(idx) else "-",
                 "idx_head": idx[:12].tolist(),
+                # The INDEX sequence is not evidence of anything on its own: both writers assign
+                # dictionary IDs by first appearance, so both start 0,1,2,3... no matter which
+                # values those are. Only the resolved VALUES say whether the rows match.
+                "val_hash": _hash([d[i] for i in idx[:100_000]]) if (d is not None and len(idx))
+                            else "-",
+                "val_head": [d[i].decode(errors="replace") for i in idx[:6]] if (
+                    d is not None and len(idx)) else [],
             })
     print(f"\n{'=' * 108}\n{label}\n{'=' * 108}")
     print(f"{'rg':>3} {'dict':>5} {'dict order hash':>17} {'dict set hash':>15} {'bw':>3} "
@@ -202,8 +209,10 @@ def analyse(label, files, column, n_pages):
     print(f"  dictionary IDENTICAL across all {len(rows)} row groups (order-sensitive): "
           f"{len(order_hashes) == 1}")
     print(f"  dictionary identical as a SET: {len(set_hashes) == 1}")
-    print(f"  first page index sequence hash: {rows[0]['idx_hash'] if rows else '-'}  "
+    print(f"  rg0 index sequence hash: {rows[0]['idx_hash'] if rows else '-'}  "
           f"head={rows[0]['idx_head'] if rows else '-'}")
+    print(f"  rg0 VALUE sequence hash: {rows[0]['val_hash'] if rows else '-'}  "
+          f"head={rows[0]['val_head'] if rows else '-'}")
     return rows
 
 
@@ -241,12 +250,15 @@ def main():
         a, b = sorted(summary)
         ra, rb = summary[a][0], summary[b][0]
         print(f"\n{'=' * 108}\nDIFFERENCES — row group 0, column {COLUMN}\n{'=' * 108}")
+        print(f"first rows  {a}: {ra['val_head']}")
+        print(f"first rows  {b}: {rb['val_head']}")
         for key, desc in (("dict_n", "dictionary size"),
                           ("dict_order_hash", "dictionary VALUES IN ORDER"),
                           ("dict_set_hash", "dictionary as a set"),
-                          ("idx_hash", "decoded index sequence")):
+                          ("idx_hash", "decoded index sequence"),
+                          ("val_hash", "DECODED VALUES (the actual rows)")):
             same = ra[key] == rb[key]
-            print(f"{desc:<28}: {'IDENTICAL' if same else 'DIFFERENT'}"
+            print(f"{desc:<34}: {'IDENTICAL' if same else 'DIFFERENT'}"
                   + ("" if same else f"   {a}={ra[key]}  {b}={rb[key]}"))
         pa = ra["pages"][0] if ra["pages"] else {}
         pb = rb["pages"][0] if rb["pages"] else {}
