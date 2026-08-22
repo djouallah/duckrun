@@ -56,7 +56,7 @@ import struct
 
 MARKER = b"PAR1"
 FEATURES = ("logical", "encstats", "offsetindex", "encodings", "createdby", "nodistinct",
-            "nodeprecstats")
+            "nodeprecstats", "arrowschema")
 
 # Statistics field order, for rebuilding one WITHOUT a chosen field. None of these are I32:
 # null_count and distinct_count are both I64, so no i32list is needed.
@@ -96,6 +96,29 @@ FMD_FIELDS = ["version", "schema", "num_rows", "row_groups", "key_value_metadata
               "column_orders", "encryption_algorithm", "footer_signing_key_metadata"]
 
 DICTIONARY_PAGE, DATA_PAGE, DATA_PAGE_V2 = 2, 0, 3
+
+
+def _arrow_schema_value(blob):
+    """The ARROW:schema blob parquet-cpp would have written for THIS file's schema.
+
+    Derived rather than invented: read the parquet schema back, hand it to a real
+    ParquetWriter with store_schema on, and lift the key/value it produces. Both fast writers
+    carry this key and DuckDB carries none, so injecting it asks whether the consumer's fast
+    path is gated on an Arrow-specific footer entry rather than on anything in the spec.
+    """
+    import io
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    schema = pq.read_schema(io.BytesIO(blob))
+    sink = pa.BufferOutputStream()
+    pq.ParquetWriter(sink, schema, store_schema=True).close()
+    md = pq.ParquetFile(pa.BufferReader(sink.getvalue())).metadata.metadata or {}
+    value = md.get(b"ARROW:schema")
+    if not value:
+        raise SystemExit("footer_inject: pyarrow produced no ARROW:schema to copy")
+    return value
 
 
 def _obj(name, i32, src, fields, **override):
@@ -265,6 +288,15 @@ def patch_bytes(blob, features):
         if was != CREATED_BY:
             new_created_by = CREATED_BY.encode()
             notes.append(f"created_by {was!r} -> {CREATED_BY!r}")
+    new_kv = None
+    if "arrowschema" in features:
+        have = {(k.key if isinstance(k.key, bytes) else str(k.key).encode())
+                for k in (fmd.key_value_metadata or [])}
+        if b"ARROW:schema" not in have:
+            new_kv = list(fmd.key_value_metadata or [])
+            new_kv.append(ThriftObject.from_fields("KeyValue", key=b"ARROW:schema",
+                                                   value=_arrow_schema_value(blob)))
+            notes.append("added ARROW:schema key/value")
     if not notes:
         return blob, []
 
@@ -272,6 +304,8 @@ def patch_bytes(blob, features):
     kw["schema"], kw["row_groups"] = schema, row_groups
     if new_created_by is not None:
         kw["created_by"] = new_created_by
+    if new_kv is not None:
+        kw["key_value_metadata"] = new_kv
     footer = bytes(ThriftObject.from_fields("FileMetaData", i32list=[1], **kw).to_bytes())
     return (blob[:foot_start] + b"".join(indexes) + footer
             + struct.pack("<I", len(footer)) + MARKER), notes
