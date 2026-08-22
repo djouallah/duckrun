@@ -14,6 +14,11 @@ the diff exactly three differences remain:
                it, DuckDB has no page-index code at all (a code search for OffsetIndex across
                duckdb/duckdb returns one hit, in the Swift bindings). Without it a reader cannot
                locate page N without walking pages 0..N-1.
+  encodings    `ColumnMetaData.encodings` - the spec requires every encoding used in the chunk.
+               The page walk proves DuckDB uses three (dictionary page PLAIN, levels RLE, data
+               RLE_DICTIONARY) and declares one: `['RLE_DICTIONARY']`, against delta-rs's
+               `['PLAIN', 'RLE', 'RLE_DICTIONARY']`. Neither PLAIN nor PLAIN_DICTIONARY appears,
+               so a reader testing that list for a dictionary page finds none.
   logical      `LogicalType` - already MEASURED AND RULED OUT (probe_duid 12585ms with it,
                12312-13091ms without). Kept so the null result stays reproducible.
 
@@ -30,7 +35,7 @@ aborts unless the untouched rebuild is byte-identical.
 import struct
 
 MARKER = b"PAR1"
-FEATURES = ("logical", "encstats", "offsetindex")
+FEATURES = ("logical", "encstats", "offsetindex", "encodings")
 
 # ConvertedType ordinal -> the LogicalType union field that means the same thing.
 PROMOTE = {0: "STRING", 6: "DATE"}
@@ -86,8 +91,11 @@ def _walk(blob, start, length):
             break
         h = (getattr(ph, "data_page_header", None) or getattr(ph, "data_page_header_v2", None)
              or getattr(ph, "dictionary_page_header", None))
+        levels = [getattr(h, "definition_level_encoding", None),
+                  getattr(h, "repetition_level_encoding", None)]
         pages.append((ph.type, getattr(h, "encoding", None), start + pos,
-                      ph.compressed_page_size, getattr(h, "num_values", 0)))
+                      ph.compressed_page_size, getattr(h, "num_values", 0),
+                      [x for x in levels if x is not None]))
         io.seek(ph.compressed_page_size, 1)
     return pages
 
@@ -125,7 +133,7 @@ def patch_bytes(blob, features):
         notes.append(f"LogicalType on {', '.join(promoted)}")
 
     # ---- row groups: encoding_stats on the chunk, OffsetIndex appended after the data
-    indexes, n_es, n_oi = [], 0, 0
+    indexes, n_es, n_oi, n_enc = [], 0, 0, 0
     cursor = foot_start                       # where appended OffsetIndex structures will land
     row_groups = []
     for rg in fmd.row_groups:
@@ -133,24 +141,41 @@ def patch_bytes(blob, features):
         for cc in rg.columns:
             m = cc.meta_data
             need_pages = ("encstats" in features and not m.encoding_stats) or \
-                         ("offsetindex" in features and cc.offset_index_offset is None)
+                         ("offsetindex" in features and cc.offset_index_offset is None) or \
+                         ("encodings" in features)
             pages = _walk(blob, m.dictionary_page_offset or m.data_page_offset,
                           m.total_compressed_size) if need_pages else []
 
             es = None
             if "encstats" in features and not m.encoding_stats and pages:
                 counts = {}
-                for ptype, enc, _o, _s, _n in pages:
+                for ptype, enc, _o, _s, _n, _lv in pages:
                     counts[(ptype, enc)] = counts.get((ptype, enc), 0) + 1
                 es = [ThriftObject.from_fields("PageEncodingStats", i32list=PES_I32,
                                                page_type=p, encoding=e, count=c)
                       for (p, e), c in sorted(counts.items())]
                 n_es += 1
 
+            # The spec requires `encodings` to list EVERY encoding used in the chunk. DuckDB lists
+            # only the data-page encoding, omitting the dictionary page's PLAIN and the levels'
+            # RLE — so a reader asking "is there a dictionary here?" finds neither PLAIN nor
+            # PLAIN_DICTIONARY. Rebuild the list from what the pages actually use.
+            encs = None
+            if "encodings" in features and pages:
+                seen = set()
+                for _p, enc, _o, _s, _n, levels in pages:
+                    if enc is not None:
+                        seen.add(enc)
+                    seen.update(levels)
+                seen = sorted(seen)
+                if seen != sorted(m.encodings or []):
+                    encs = seen
+                    n_enc += 1
+
             oi_off = oi_len = None
             if "offsetindex" in features and cc.offset_index_offset is None and pages:
                 locs, row = [], 0
-                for ptype, _e, off, size, nvals in pages:
+                for ptype, _e, off, size, nvals, _lv in pages:
                     if ptype == DICTIONARY_PAGE:
                         continue
                     locs.append(ThriftObject.from_fields(
@@ -164,8 +189,9 @@ def patch_bytes(blob, features):
                 cursor += len(raw)
                 n_oi += 1
 
-            meta = _obj("ColumnMetaData", CMD_I32, m, CMD_FIELDS, encoding_stats=es)
-            if es is None and bytes(meta.to_bytes()) != bytes(m.to_bytes()):
+            meta = _obj("ColumnMetaData", CMD_I32, m, CMD_FIELDS, encoding_stats=es,
+                        encodings=encs)
+            if es is None and encs is None and bytes(meta.to_bytes()) != bytes(m.to_bytes()):
                 raise SystemExit("footer_inject: ColumnMetaData rebuild is not byte-identical "
                                  f"({m.path_in_schema}) — refusing to write it")
             new_cc = _obj("ColumnChunk", CC_I32, cc, CC_FIELDS, meta_data=meta,
@@ -176,6 +202,8 @@ def patch_bytes(blob, features):
         notes.append(f"encoding_stats on {n_es} chunk(s)")
     if n_oi:
         notes.append(f"OffsetIndex on {n_oi} chunk(s)")
+    if n_enc:
+        notes.append(f"completed encodings on {n_enc} chunk(s)")
     if not notes:
         return blob, []
 
