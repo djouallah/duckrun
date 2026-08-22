@@ -120,6 +120,13 @@ REFRAME = (os.environ.get("OPT_REFRAME") or "").strip()
 # store_schema=False strips it from the pyarrow file: if that file then cold-reads slow, the
 # consumer's fast path is gated on ARROW:schema, not on anything parquet-spec.
 STORE_SCHEMA = (os.environ.get("OPT_STORE_SCHEMA") or "true").strip().lower() in ("true", "1", "yes")
+# DIAGNOSTIC. Replace this column's page bytes with the ones another writer produced, keeping this
+# file's container. Every metadata difference has now been neutralised at once and the slow file is
+# still slow, so the cost is in the payload; this is what proves it. Needs OPT_TRANSPLANT_FROM (the
+# donor table URI), and both tables built at the same opt_rg with threads=1 so the row groups line
+# up — chimera refuses rather than write a footer that lies. See chimera.py.
+TRANSPLANT = (os.environ.get("OPT_TRANSPLANT") or "").strip()
+TRANSPLANT_FROM = (os.environ.get("OPT_TRANSPLANT_FROM") or "").strip().rstrip("/")
 # DIAGNOSTIC (duckdb arm). COPY thread count — 2 is the memory-fit default (see the SET threads
 # comment at the call site). 1 additionally makes row-group emission deterministic: the parallel
 # carve emits row groups OUT of stream order (rg0 holds mid-stream rows; payload_diff shows it),
@@ -324,6 +331,25 @@ else:
     # page_reframe rebuilds every ColumnChunk with NULLed index offsets (page_reframe.py), so an
     # OffsetIndex injected before it would be silently stripped; footer_inject walks the pages
     # itself, so injecting after the reframe describes the file as it now is.
+    # Transplant first: it swaps whole chunks, so any footer surgery must describe the result.
+    if TRANSPLANT:
+        import chimera
+        if not TRANSPLANT_FROM:
+            raise SystemExit("OPT_TRANSPLANT needs OPT_TRANSPLANT_FROM (the donor table URI)")
+        donor_store = build_store(TRANSPLANT_FROM, con.storage_options)
+        donor_keys = sorted(
+            obj["path"].rsplit("/", 1)[-1]
+            for batch in obstore.list(donor_store) for obj in batch
+            if obj["path"].rsplit("/", 1)[-1].endswith(".parquet"))
+        if len(donor_keys) != 1 or len(sizes) != 1:
+            raise SystemExit(
+                f"transplant needs exactly one file on each side — host has {len(sizes)}, "
+                f"donor has {len(donor_keys)}. Raise OPT_TFS_MB so neither rotates.")
+        print(f"transplanting {TRANSPLANT} pages from {TRANSPLANT_FROM.rsplit('/', 1)[-1]}",
+              flush=True)
+        chimera.transplant_remote(store, sorted(sizes)[0], donor_store, donor_keys[0], TRANSPLANT)
+        sizes = _listing()          # the chunk swap changed the length; re-read the true size
+
     if REFRAME:
         import page_reframe
         col = None if REFRAME.lower() == "all" else REFRAME
