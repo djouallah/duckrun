@@ -44,6 +44,11 @@ N_PAGES = int(os.environ.get("PAYLOAD_DIFF_PAGES") or 2)
 # benchmark puts each writer in its own throwaway lakehouse, and those are the files whose timing we
 # actually measured, so they are the ones worth decoding.
 URIS = [u.strip() for u in (os.environ.get("PAYLOAD_DIFF_URIS") or "").split(",") if u.strip()]
+# Which file to decode. Picking the alphabetically-first one compares delta-rs's part-00000 (the
+# first ROWS) against a random DuckDB part-<tag>-<uuid>, so the two sides describe different slices
+# of the table and every hash "differs" for no reason. Both tables are sorted, so the file holding
+# the first rows is the one with the smallest minimum on the leading sort column.
+ORDER_COL = os.environ.get("PAYLOAD_DIFF_ORDER_COL") or "date"
 
 DICTIONARY_PAGE, DATA_PAGE, DATA_PAGE_V2 = 2, 0, 3
 
@@ -160,6 +165,28 @@ def decode_chunk(read, meta, optional, phys_type, n_pages):
     return dictionary, pages, (np.concatenate(indices) if indices else np.empty(0, dtype=np.int64))
 
 
+def _stat_min(fmd, column):
+    """Row group 0's minimum for `column`, decoded by physical type — NOT compared as raw bytes."""
+    rg = fmd.row_groups[0]
+    cc = next((c for c in rg.columns
+               if ".".join(x.decode() if isinstance(x, bytes) else x
+                           for x in c.meta_data.path_in_schema) == column), None)
+    if cc is None or cc.meta_data.statistics is None:
+        return None
+    st = cc.meta_data.statistics
+    raw = getattr(st, "min_value", None) or getattr(st, "min", None)
+    if raw is None:
+        return None
+    t = cc.meta_data.type
+    if t in (1, 2):                                  # INT32 / INT64 — little-endian, signed
+        return int.from_bytes(raw, "little", signed=True)
+    if t == 4:
+        return struct.unpack("<f", raw)[0]
+    if t == 5:
+        return struct.unpack("<d", raw)[0]
+    return bytes(raw)
+
+
 def _hash(items):
     h = hashlib.sha256()
     for x in items:
@@ -246,7 +273,20 @@ def main():
                 if nm.endswith(".parquet"):
                     entries.append((nm, obj["size"]))
         entries.sort()
-        name, size = entries[0]                          # one file is enough: 8 row groups of it
+        if len(entries) > 1:                             # pick the file holding the FIRST rows
+            keyed = []
+            for nm, sz in entries:
+                try:
+                    mn = _stat_min(read_footer(store, nm, sz), ORDER_COL)
+                except Exception:
+                    mn = None
+                keyed.append((mn is None, mn, nm, sz))
+            keyed.sort(key=lambda k: (k[0], k[1] if k[1] is not None else 0, k[2]))
+            _, mn, name, size = keyed[0]
+            print(f"  {tbl}: {len(entries)} files, decoding the one starting at "
+                  f"{ORDER_COL}={mn!r} ({name})", flush=True)
+        else:
+            name, size = entries[0]
 
         def read(off, ln, _k=name, _s=store):
             return bytes(obstore.get_range(_s, _k, start=off, end=off + ln))
