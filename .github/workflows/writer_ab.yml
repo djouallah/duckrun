@@ -59,6 +59,10 @@ on:
         description: "rebuild both tables even if they already exist (else each builder skips)"
         type: boolean
         default: true
+      page_diff_column:
+        description: "column whose PAGE HEADERS are dumped side by side at the end of the run. DUID is the one that reads 11x slower cold; the numeric columns sit at the ~2x baseline."
+        type: string
+        default: DUID
 
 permissions:
   id-token: write
@@ -87,6 +91,7 @@ jobs:
       - name: 📦 Install deps (duckrun from THIS tree)
         run: |
           pip install pyyaml
+          pip install fastparquet          # page-header thrift reader for page_diff.py
           pip install -e .
 
       - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
@@ -130,6 +135,17 @@ jobs:
           PYTHONIOENCODING: utf-8
           OPT_SORT: ${{ inputs.opt_sort }}
         run: python tests/parquet_layout/aemo/compare_writers.py
+
+      - name: 🔬 Page-level diff of one column
+        # parquet_metadata() stops at the chunk. This walks the real page headers, which is the
+        # only place left for the two writers to differ once bloom filters, the encoding tag, page
+        # geometry, nullability and LogicalType have all been ruled out by measurement.
+        if: always()
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+          PAGE_DIFF_COLUMN: ${{ inputs.page_diff_column }}
+        run: python tests/parquet_layout/aemo/page_diff.py
 
       - name: 📎 Upload run report
         if: always()
