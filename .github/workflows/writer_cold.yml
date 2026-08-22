@@ -112,6 +112,15 @@ permissions:
   id-token: write
   contents: read
 
+# Every run provisions the SAME lakehouse and model names, and tears them down at the end, so two
+# runs at once destroy each other: the first to finish deletes the models the second is still
+# querying, and that surfaces as PowerBIEntityNotFound in the cold pass rather than as anything
+# resembling its real cause. Queue them instead - never cancel, because a cancelled run skips
+# teardown and leaks Fabric items that bill until removed by hand.
+concurrency:
+  group: writer-cold
+  cancel-in-progress: false
+
 jobs:
   cold:
     name: 🧊 Cold Direct Lake — delta-rs vs DuckDB
