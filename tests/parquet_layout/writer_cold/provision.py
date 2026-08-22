@@ -27,10 +27,12 @@ from duckrun.fabric_remote import _FABRIC_API, _http_request
 LH = {
     "deltars": os.environ.get("LH_DELTARS") or "wab_deltars",
     "duckdb": os.environ.get("LH_DUCKDB") or "wab_duckdb",
+    "pyarrow": os.environ.get("LH_PYARROW") or "wab_pyarrow",
 }
 MODELS = {
     "deltars": os.environ.get("MODEL_DELTARS") or "writer_cold_deltars",
     "duckdb": os.environ.get("MODEL_DUCKDB") or "writer_cold_duckdb",
+    "pyarrow": os.environ.get("MODEL_PYARROW") or "writer_cold_pyarrow",
 }
 WS_ID = os.environ["WS_ID"]
 # Which writer arms this run measures. delta-rs is a settled baseline (probe_duid 0.9-2.3s across

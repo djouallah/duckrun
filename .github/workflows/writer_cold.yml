@@ -59,7 +59,10 @@ on:
         options:
           - duckdb
           - deltars
+          - pyarrow
           - deltars,duckdb
+          - deltars,pyarrow
+          - deltars,duckdb,pyarrow
       order:
         description: "which writer is measured FIRST when arms builds both. The two passes share one capacity, so the second can inherit smoothing/throttling from the first — swap this and re-run to prove an effect is the parquet and not the running order."
         type: choice
@@ -94,6 +97,9 @@ jobs:
       MODEL_DUCKDB: writer_cold_duckdb
       TABLE_DELTARS: fct_summary_deltars
       TABLE_DUCKDB: fct_summary_duckdb
+      LH_PYARROW: wab_pyarrow
+      MODEL_PYARROW: writer_cold_pyarrow
+      TABLE_PYARROW: fct_summary_pyarrow
       ARMS: ${{ inputs.arms }}
     steps:
       - name: 📥 Checkout
@@ -106,7 +112,7 @@ jobs:
 
       - name: 📦 Install deps (duckrun from THIS tree)
         run: |
-          pip install pythonnet pyyaml
+          pip install pythonnet pyyaml pyarrow
           pip install fastparquet cramjam  # footer thrift + page decompression for the diffs
           pip install -e .
 
@@ -169,54 +175,60 @@ jobs:
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_duckdb_native.py
 
+      - name: 🏹 Build the pyarrow table (parquet-cpp writes, delta-rs commits)
+        # A third, independent encoder. Same rows, same order, same geometry; everything after the
+        # write - listing, typed footer stats, AddActions, commit - is the shared code path, so the
+        # only thing that varies is which library encoded the parquet.
+        if: ${{ contains(inputs.arms, 'pyarrow') }}
+        env:
+          PYTHONIOENCODING: utf-8
+          ONELAKE_TABLES_PATH: ${{ env.TABLES_PYARROW }}
+          BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
+          OPT_TABLE: ${{ env.TABLE_PYARROW }}
+          OPT_WRITER: pyarrow
+          OPT_COLUMNS: ${{ inputs.columns }}
+          OPT_SORT: ${{ inputs.opt_sort }}
+          FORCE_REBUILD: "true"
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/build_duckdb_native.py
+
       - name: 🚀 Deploy the two fresh Direct Lake models
         env:
           PYTHONIOENCODING: utf-8
           MODEL_COLUMNS: ${{ inputs.columns }}
         run: python tests/parquet_layout/writer_cold/deploy_models.py
 
-      - name: 🔀 Resolve measurement order
-        # Both passes share one capacity, so whichever runs second can inherit the first's
-        # smoothing. Order is an input precisely so a finding can be re-run the other way round:
-        # an effect that survives the swap is the parquet, one that flips is the running order.
+      - name: 🧊 Cold passes — one per arm, in order
+        # One loop instead of a hard-coded first/second: the arms list can hold three writers now.
+        # Each pass is a fresh model's first touch of the column, which is the cold guarantee.
+        env:
+          PYTHONNET_RUNTIME: coreclr
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"
+          PROBE_COLUMNS: ${{ inputs.probe_columns }}
         run: |
           set -euo pipefail
-          case "$ARMS" in
-            duckdb)  first=duckdb;  second="" ;;
-            deltars) first=deltars; second="" ;;
-            *) if [ "${{ inputs.order }}" = "duckdb_first" ]; then first=duckdb; second=deltars
-               else first=deltars; second=duckdb; fi ;;
-          esac
-          model() { if [ "$1" = duckdb ]; then echo "$MODEL_DUCKDB"; else echo "$MODEL_DELTARS"; fi; }
-          echo "FIRST_VARIANT=$first"          >> "$GITHUB_ENV"
-          echo "FIRST_MODEL=$(model "$first")" >> "$GITHUB_ENV"
-          echo "SECOND_VARIANT=$second"        >> "$GITHUB_ENV"
-          if [ -n "$second" ]; then echo "SECOND_MODEL=$(model "$second")" >> "$GITHUB_ENV"; fi
-
-      - name: 🧊 Cold pass — first writer
-        env:
-          PYTHONNET_RUNTIME: coreclr
-          PYTHONIOENCODING: utf-8
-          PYTHONUNBUFFERED: "1"
-          MODEL: ${{ env.FIRST_MODEL }}
-          VARIANT: ${{ env.FIRST_VARIANT }}
-          PROBE_COLUMNS: ${{ inputs.probe_columns }}
-        run: python tests/parquet_layout/writer_cold/cold_bench.py
-
-      - name: 😴 Idle gap so the first pass's burst smooths out
-        if: ${{ inputs.gap_seconds != '0' && env.SECOND_VARIANT != '' }}
-        run: sleep ${{ inputs.gap_seconds }}
-
-      - name: 🧊 Cold pass — second writer
-        if: ${{ env.SECOND_VARIANT != '' }}
-        env:
-          PYTHONNET_RUNTIME: coreclr
-          PYTHONIOENCODING: utf-8
-          PYTHONUNBUFFERED: "1"
-          MODEL: ${{ env.SECOND_MODEL }}
-          VARIANT: ${{ env.SECOND_VARIANT }}
-          PROBE_COLUMNS: ${{ inputs.probe_columns }}
-        run: python tests/parquet_layout/writer_cold/cold_bench.py
+          IFS=',' read -ra arms <<< "$ARMS"
+          if [ "${{ inputs.order }}" = "duckdb_first" ]; then
+            rev=(); for ((i=${#arms[@]}-1; i>=0; i--)); do rev+=("${arms[i]}"); done
+            arms=("${rev[@]}")
+          fi
+          first=1
+          for arm in "${arms[@]}"; do
+            arm="$(echo "$arm" | tr -d '[:space:]')"
+            case "$arm" in
+              deltars) model="$MODEL_DELTARS" ;;
+              duckdb)  model="$MODEL_DUCKDB"  ;;
+              pyarrow) model="$MODEL_PYARROW" ;;
+              *) echo "unknown arm '$arm'" >&2; exit 1 ;;
+            esac
+            if [ "$first" = 0 ] && [ "${{ inputs.gap_seconds }}" != "0" ]; then
+              echo "idling ${{ inputs.gap_seconds }}s so the previous burst smooths out"
+              sleep ${{ inputs.gap_seconds }}
+            fi
+            first=0
+            MODEL="$model" VARIANT="$arm" python tests/parquet_layout/writer_cold/cold_bench.py
+          done
 
       - name: 🧬 Payload diff — decode the files this run measured
         # Runs BEFORE teardown, against the exact tables the cold pass timed, rather than inferring

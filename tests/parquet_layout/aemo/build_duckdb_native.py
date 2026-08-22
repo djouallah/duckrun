@@ -95,6 +95,14 @@ if PQ_VERSION not in ("V1", "V2"):
 # Direct Lake (which does not use parquet bloom filters) and because leaving them on makes the
 # writer A/B measure a feature delta-rs simply doesn't ship.
 BLOOM = (os.environ.get("OPT_BLOOM") or "false").strip().lower() in ("true", "1", "yes")
+# OPT_WRITER picks which library encodes the parquet. Everything downstream — the listing, the
+# typed footer stats, the AddActions, the Delta commit — is shared, so this isolates the ENCODER.
+# 'pyarrow' is parquet-cpp, a third implementation independent of both DuckDB and the parquet-rs
+# that delta-rs writes through. It is the experiment that splits "DuckDB encodes something the
+# consumer dislikes" from "the consumer has a fast path only parquet-rs output hits".
+WRITER = (os.environ.get("OPT_WRITER") or "duckdb").strip().lower()
+if WRITER not in ("duckdb", "pyarrow"):
+    raise SystemExit(f"build_duckdb_native: OPT_WRITER must be duckdb or pyarrow, got {WRITER!r}")
 # DIAGNOSTIC. A page-level diff of the real tables showed the two writers emit the SAME data for
 # the slow column — same dictionary, same encoding, chunk sizes 0.2% apart — so what is left is
 # metadata. Comma-separated subset of footer_inject.FEATURES ('encstats,offsetindex,logical'),
@@ -139,6 +147,64 @@ def _exists():
         return True
     except Exception:
         return False
+
+
+def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
+    """Same rows, same order, same geometry — encoded by parquet-cpp instead of DuckDB.
+
+    Written locally then uploaded, because pyarrow has no OneLake filesystem here and the file is
+    small enough that a round trip through the runner's disk is cheaper than the plumbing.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from dbt.adapters.duckrun.objectstore import build_store, upload
+
+    local_dir = tempfile.mkdtemp(prefix="pyarrow_write_")
+    local = os.path.join(local_dir, f"part-{run_tag}-{uuid.uuid4()}.parquet")
+    rel = dd.sql(f"select {collist} from {src} order by {order}")
+    reader = rel.to_arrow_reader(65536) if hasattr(rel, "to_arrow_reader")         else rel.fetch_arrow_reader(65536)
+    t_s = time.perf_counter()
+    written, writer, buf, nbuf = 0, None, [], 0
+
+    def _flush(tbl, w):
+        # Slice to EXACTLY RG rows per group. Flushing on ">= RG" leaves a ragged tail row group
+        # behind every write, which is a geometry difference the comparison must not introduce.
+        while tbl.num_rows >= RG:
+            if w is None:
+                w = pq.ParquetWriter(local, tbl.schema, compression="snappy", use_dictionary=True,
+                                     data_page_size=PAGE_BYTES, version="1.0",
+                                     write_statistics=True)
+            w.write_table(tbl.slice(0, RG), row_group_size=RG)
+            tbl = tbl.slice(RG)
+        return tbl, w
+
+    try:
+        for batch in reader:
+            buf.append(batch)
+            nbuf += batch.num_rows
+            if nbuf >= RG:
+                tbl, writer = _flush(pa.Table.from_batches(buf), writer)
+                written += nbuf - tbl.num_rows
+                buf = tbl.to_batches() if tbl.num_rows else []
+                nbuf = tbl.num_rows
+        if nbuf:
+            tbl = pa.Table.from_batches(buf)
+            if writer is None:
+                writer = pq.ParquetWriter(local, tbl.schema, compression="snappy",
+                                          use_dictionary=True, data_page_size=PAGE_BYTES,
+                                          version="1.0", write_statistics=True)
+            writer.write_table(tbl, row_group_size=RG)
+            written += nbuf
+    finally:
+        if writer is not None:
+            writer.close()
+    size = os.path.getsize(local)
+    print(f"{written:,} rows -> pyarrow (parquet-cpp) {pa.__version__}, ROW_GROUP_SIZE {RG:,} "
+          f"x data_page_size {PAGE_BYTES:,} x snappy x v1.0 -> {size / 1048576:.1f} MB "
+          f"in {time.perf_counter() - t_s:.1f}s", flush=True)
+    store = build_store(table_uri, con.storage_options)
+    upload(store, os.path.basename(local), local, single_shot=True)
+    print(f"uploaded {os.path.basename(local)}", flush=True)
 
 
 def _delta_json(v):
@@ -196,22 +262,26 @@ else:
     # (19/23 -> 0/2 overlapping pairs moved it 835.08 -> 834.66 MB) and delta-rs, the writer
     # this is compared against, ships 2/3 overlapping files itself. So overlap is accepted.
     dd.execute("SET threads=2")
-    print(f"{n_src:,} rows -> one sorted single-stream COPY, "
-          f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
-          f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,} x {PQ_VERSION} x DICTIONARY_SIZE_LIMIT "
-          f"{f'{DICT_LIMIT:,}' if DICT_LIMIT else 'duckdb default'} x bloom={BLOOM}", flush=True)
-    _dict_opt = f"DICTIONARY_SIZE_LIMIT {DICT_LIMIT}," if DICT_LIMIT else ""
-    t_s = time.perf_counter()
-    dd.execute(f"""
-        COPY (select {collist} from {src} order by {order})
-        TO '{table_uri}'
-        (FORMAT parquet, ROW_GROUP_SIZE {RG}, FILE_SIZE_BYTES {FILE_BYTES},
-         {_dict_opt} DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
-         COMPRESSION snappy, PARQUET_VERSION {PQ_VERSION},
-         WRITE_BLOOM_FILTER {str(BLOOM).lower()},
-         FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
-    """)
-    print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
+    if WRITER == "pyarrow":
+        _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con)
+    else:
+        print(f"{n_src:,} rows -> one sorted single-stream COPY, "
+              f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
+              f"x DATA_PAGE_SIZE_LIMIT {PAGE_BYTES:,} x {PQ_VERSION} x DICTIONARY_SIZE_LIMIT "
+              f"{f'{DICT_LIMIT:,}' if DICT_LIMIT else 'duckdb default'} x bloom={BLOOM}",
+              flush=True)
+        _dict_opt = f"DICTIONARY_SIZE_LIMIT {DICT_LIMIT}," if DICT_LIMIT else ""
+        t_s = time.perf_counter()
+        dd.execute(f"""
+            COPY (select {collist} from {src} order by {order})
+            TO '{table_uri}'
+            (FORMAT parquet, ROW_GROUP_SIZE {RG}, FILE_SIZE_BYTES {FILE_BYTES},
+             {_dict_opt} DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
+             COMPRESSION snappy, PARQUET_VERSION {PQ_VERSION},
+             WRITE_BLOOM_FILTER {str(BLOOM).lower()},
+             FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
+        """)
+        print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
 
     # Sizes from a real listing (the AddAction size field should be true, not guessed).
     from dbt.adapters.duckrun.objectstore import build_store

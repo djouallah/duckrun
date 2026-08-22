@@ -33,6 +33,10 @@ VARIANTS = [
      "model": os.environ.get("MODEL_DUCKDB") or "writer_cold_duckdb",
      "lakehouse": os.environ.get("LH_NAME_DUCKDB") or "wab_duckdb",
      "table": os.environ.get("TABLE_DUCKDB") or "fct_summary_duckdb"},
+    {"key": "pyarrow",
+     "model": os.environ.get("MODEL_PYARROW") or "writer_cold_pyarrow",
+     "lakehouse": os.environ.get("LH_NAME_PYARROW") or "wab_pyarrow",
+     "table": os.environ.get("TABLE_PYARROW") or "fct_summary_pyarrow"},
 ]
 
 
