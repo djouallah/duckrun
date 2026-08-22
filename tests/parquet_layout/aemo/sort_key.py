@@ -33,11 +33,18 @@ def source_expr():
 
     BENCH_SOURCE overrides the table — pass a full expression such as
     ``delta_scan('abfss://.../mart/fct_summary')`` to read one lakehouse while writing into
-    another, which is what the cold benchmark does with its throwaway lakehouses."""
+    another, which is what the cold benchmark does with its throwaway lakehouses.
+
+    The cap orders before it limits. A bare ``limit`` takes whichever rows the scan happens to
+    produce first, so two builds of the "same" 142M-row subset get DIFFERENT rows — silently true
+    of every writer comparison here until a Delta-log diff caught the two arms disagreeing on
+    maxValues.date by a fortnight while their row counts matched exactly. Ordering first makes the
+    subset the FIRST n rows and identical for every arm; DuckDB runs it as a top-N, not a full
+    sort."""
     src = (os.environ.get("BENCH_SOURCE") or "mart.fct_summary").strip()
     lim = (os.environ.get("BENCH_ROW_LIMIT") or "").strip()
     n = int(lim) if lim.isdigit() and int(lim) > 0 else None
-    return src if n is None else f"(select * from {src} limit {n})"
+    return src if n is None else f"(select * from {src} order by all limit {n})"
 
 
 def requested():

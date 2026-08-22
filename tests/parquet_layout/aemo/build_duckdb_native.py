@@ -263,8 +263,19 @@ else:
     # such as delta_scan('abfss://.../mart/fct_summary')); the cold benchmark needs that because
     # its throwaway lakehouse has no mart schema. Same override the delta-rs builder honours.
     _src_tbl = (os.environ.get("BENCH_SOURCE") or "mart.fct_summary").strip()
-    src = _src_tbl if N_CAP is None else f"(select * from {_src_tbl} limit {N_CAP})"
+    # `order by all` before the cap, NOT a bare limit. A bare limit takes whichever rows the scan
+    # produces first, so two arms asking for the same 142M rows get DIFFERENT rows — which was
+    # silently true of every writer comparison here until a Delta-log diff caught the two arms
+    # disagreeing on maxValues.date by a fortnight while their row counts matched exactly. Ordering
+    # first makes the subset the FIRST n rows and identical for every arm; DuckDB runs it as a
+    # top-N rather than a full sort.
+    src = (_src_tbl if N_CAP is None
+           else f"(select * from {_src_tbl} order by all limit {N_CAP})")
     n_src = dd.execute(f"select count(*) from {src}").fetchone()[0]
+    if N_CAP is not None:
+        _total = dd.execute(f"select count(*) from {_src_tbl}").fetchone()[0]
+        print(f"source has {_total:,} rows; capped to the first {n_src:,} in `order by all` order"
+              + ("  (cap is a no-op)" if _total <= N_CAP else ""), flush=True)
 
     # column types drive the typed stats casts below; the mart already stores decimal(18,4)
     # (duckrun's write path narrows wide decimals), so everything here dictionary-encodes —
