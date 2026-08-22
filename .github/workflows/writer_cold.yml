@@ -233,13 +233,19 @@ jobs:
       - name: 🧬 Payload diff — decode the files this run measured
         # Runs BEFORE teardown, against the exact tables the cold pass timed, rather than inferring
         # structure from a different pair built by another workflow.
-        if: ${{ always() && contains(inputs.arms, 'deltars') && contains(inputs.arms, 'duckdb') }}
+        if: ${{ always() && contains(inputs.arms, 'duckdb') }}
         continue-on-error: true
         env:
           PYTHONIOENCODING: utf-8
           PAYLOAD_DIFF_COLUMN: DUID
-          PAYLOAD_DIFF_URIS: ${{ env.TABLES_DELTARS }}/tests/${{ env.TABLE_DELTARS }},${{ env.TABLES_DUCKDB }}/tests/${{ env.TABLE_DUCKDB }}
-        run: python tests/parquet_layout/aemo/payload_diff.py
+          ARMS: ${{ inputs.arms }}
+        run: |
+          set -euo pipefail
+          uris=""
+          case "$ARMS" in *deltars*) uris="$TABLES_DELTARS/tests/$TABLE_DELTARS" ;; esac
+          case "$ARMS" in *duckdb*)  uris="${uris:+$uris,}$TABLES_DUCKDB/tests/$TABLE_DUCKDB" ;; esac
+          case "$ARMS" in *pyarrow*) uris="${uris:+$uris,}$TABLES_PYARROW/tests/$TABLE_PYARROW" ;; esac
+          PAYLOAD_DIFF_URIS="$uris" python tests/parquet_layout/aemo/payload_diff.py
 
       - name: 📊 Summary
         if: ${{ always() }}

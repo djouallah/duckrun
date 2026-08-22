@@ -294,35 +294,53 @@ def main():
         fmd = read_footer(store, name, size)
         summary[tbl] = analyse(f"{tbl}  —  {name}", [(name, size, read, fmd)], COLUMN, N_PAGES)
 
-    if len(summary) == 2:
-        a, b = sorted(summary)
-        ra, rb = summary[a][0], summary[b][0]
-        print(f"\n{'=' * 108}\nDIFFERENCES — row group 0, column {COLUMN}\n{'=' * 108}")
-        print(f"first rows  {a}: {ra['val_head']}")
-        print(f"first rows  {b}: {rb['val_head']}")
+    if len(summary) >= 2:
+        names = sorted(summary)
+        base = names[0]
+        rb0 = summary[base][0]
+        bar = "=" * 108
+        print(f"\n{bar}\nDIFFERENCES vs {base} — row group 0, column {COLUMN}\n{bar}")
+        for n in names:
+            print(f"first rows  {n:<24}: {summary[n][0]['val_head']}")
         for key, desc in (("dict_n", "dictionary size"),
                           ("dict_order_hash", "dictionary VALUES IN ORDER"),
                           ("dict_set_hash", "dictionary as a set"),
-                          ("idx_hash", "decoded index sequence"),
                           ("val_hash", "DECODED VALUES (the actual rows)")):
-            same = ra[key] == rb[key]
-            print(f"{desc:<34}: {'IDENTICAL' if same else 'DIFFERENT'}"
-                  + ("" if same else f"   {a}={ra[key]}  {b}={rb[key]}"))
-        pa = ra["pages"][0] if ra["pages"] else {}
-        pb = rb["pages"][0] if rb["pages"] else {}
-        print(f"\n{'run framing (first data page)':<28}: {a} vs {b}")
+            cells = " | ".join(
+                f"{n}={'same' if summary[n][0][key] == rb0[key] else summary[n][0][key]}"
+                for n in names)
+            print(f"{desc:<34}: {cells}")
+        print("\nrun framing (first data page)")
+        print(f"   {'':<25} " + " ".join(f"{n[-18:]:>20}" for n in names))
         for k in ("bit_width", "num_values", "rle_runs", "bitpacked_runs",
                   "mean_rle_len", "mean_bitpacked_len"):
-            print(f"   {k:<25}: {pa.get(k)}   vs   {pb.get(k)}")
+            vals = []
+            for n in names:
+                pg = summary[n][0]["pages"][0] if summary[n][0]["pages"] else {}
+                vals.append(f"{pg.get(k)}")
+            print(f"   {k:<25} " + " ".join(f"{v:>20}" for v in vals))
+        # A property only ONE writer has is the interesting one now: two of these three read fast.
+        print("\nper-writer, across every row group decoded:")
+        for n in names:
+            rows = summary[n]
+            bws = sorted({r["pages"][0]["bit_width"] for r in rows if r["pages"]})
+            mbp = sorted({r["pages"][0]["mean_bitpacked_len"] for r in rows if r["pages"]})
+            rle = sum(r["pages"][0]["rle_runs"] for r in rows if r["pages"])
+            print(f"   {n:<26} row_groups={len(rows)} bit_widths={bws} "
+                  f"mean_bitpacked={mbp} total_rle_runs={rle}")
 
 
-def selftest(duck_path, delta_path):
-    """The decoder must reproduce pyarrow exactly, on BOTH files, or nothing it says is worth reading."""
+def selftest(*paths):
+    """The decoder must reproduce pyarrow exactly on EVERY writer's file, or nothing it says counts.
+
+    This is the gate on the whole tool: a decoder that mis-parses would MANUFACTURE a difference
+    between writers, which is precisely the kind of finding this is meant to produce.
+    """
     import fastparquet
     import pyarrow.parquet as pq
 
     ok = True
-    for label, path in (("duckdb", duck_path), ("delta-rs", delta_path)):
+    for path in paths:
         blob = open(path, "rb").read()
         fmd = fastparquet.ParquetFile(path).fmd
         se = next(s for s in fmd.schema
@@ -330,22 +348,23 @@ def selftest(duck_path, delta_path):
         cc = next(c for c in fmd.row_groups[0].columns
                   if ".".join(x.decode() if isinstance(x, bytes) else x
                               for x in c.meta_data.path_in_schema) == COLUMN)
-        d, pages, idx = decode_chunk(lambda o, l: blob[o:o + l], cc.meta_data,
+        d, pages, idx = decode_chunk(lambda o, ln: blob[o:o + ln], cc.meta_data,
                                      se.repetition_type == 1, se.type, 1)
         mine = [d[i].decode() for i in idx[:5000]]
         theirs = pq.read_table(path, columns=[COLUMN]).column(0).to_pylist()[:5000]
         match = mine == theirs
         ok &= match
-        print(f"{label:<9} dict={len(d)} bit_width={pages[0]['bit_width']} "
+        label = os.path.basename(path)[:38]
+        print(f"{label:<40} dict={len(d)} bit_width={pages[0]['bit_width']} "
               f"decoded={len(idx):,} round-trip vs pyarrow: {match}")
         if not match:
             bad = next(i for i in range(len(mine)) if mine[i] != theirs[i])
-            print(f"          first mismatch at {bad}: mine={mine[bad]!r} pyarrow={theirs[bad]!r}")
+            print(f"    first mismatch at {bad}: mine={mine[bad]!r} pyarrow={theirs[bad]!r}")
     print("\nDECODER VERIFIED" if ok else "\nDECODER IS WRONG — fix it before trusting any output")
     return 0 if ok else 1
 
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "selftest":
-        sys.exit(selftest(sys.argv[2], sys.argv[3]))
+        sys.exit(selftest(*sys.argv[2:]))
     main()
