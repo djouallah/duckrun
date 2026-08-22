@@ -52,6 +52,10 @@ on:
         description: "[pyarrow arm] pyarrow ParquetWriter store_schema. false strips the ARROW:schema footer key/value — the one footer property BOTH fast writers carry and DuckDB lacks. If the stripped pyarrow file cold-reads slow, the consumer's fast path is gated on ARROW:schema."
         type: boolean
         default: true
+      opt_dict_sorted:
+        description: "[duckdb arm] write the explicit is_sorted=False on dictionary page headers. Both fast writers emit it (17-byte header), DuckDB omits it (16 bytes), and no previous experiment could reach it — footer injection never touches page headers and the reframe copies dictionary headers through verbatim. The last page-internal property where the two fast writers agree and DuckDB differs. 'DUID', or 'all', or empty."
+        type: string
+        default: ""
       opt_transplant:
         description: "[pyarrow arm] replace this column's page bytes with the ones the DuckDB arm wrote, keeping pyarrow's container. Every metadata difference has been neutralised in one run with no effect, so the cost is in the payload — a slow read here proves it and a fast one refutes it. 'DUID', or empty. Requires arms=duckdb,pyarrow with opt_threads=1 and an opt_rg that is a multiple of 2048, so the row groups line up."
         type: string
@@ -192,6 +196,7 @@ jobs:
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
           OPT_REFRAME: ${{ inputs.opt_reframe }}
+          OPT_DICT_SORTED: ${{ inputs.opt_dict_sorted }}
           OPT_THREADS: ${{ inputs.opt_threads }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_SORT: ${{ inputs.opt_sort }}

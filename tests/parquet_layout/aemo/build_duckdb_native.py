@@ -125,6 +125,11 @@ STORE_SCHEMA = (os.environ.get("OPT_STORE_SCHEMA") or "true").strip().lower() in
 # still slow, so the cost is in the payload; this is what proves it. Needs OPT_TRANSPLANT_FROM (the
 # donor table URI), and both tables built at the same opt_rg with threads=1 so the row groups line
 # up — chimera refuses rather than write a footer that lies. See chimera.py.
+# DIAGNOSTIC. Write the explicit is_sorted=False on dictionary page headers. Both fast writers
+# emit it (17-byte header), DuckDB omits it (16 bytes), and NO previous experiment could reach it:
+# footer injection never touches page headers and the reframe copies dictionary headers verbatim.
+# Column name, or 'all'. See page_reframe.mark_dict_sorted_bytes.
+DICT_SORTED = (os.environ.get("OPT_DICT_SORTED") or "").strip()
 TRANSPLANT = (os.environ.get("OPT_TRANSPLANT") or "").strip()
 TRANSPLANT_FROM = (os.environ.get("OPT_TRANSPLANT_FROM") or "").strip().rstrip("/")
 # DIAGNOSTIC (duckdb arm). COPY thread count — 2 is the memory-fit default (see the SET threads
@@ -349,6 +354,14 @@ else:
               flush=True)
         chimera.transplant_remote(store, sorted(sizes)[0], donor_store, donor_keys[0], TRANSPLANT)
         sizes = _listing()          # the chunk swap changed the length; re-read the true size
+
+    if DICT_SORTED:
+        import page_reframe
+        col = None if DICT_SORTED.lower() == "all" else DICT_SORTED
+        print(f"marking is_sorted=False on dictionary pages in {len(sizes)} file(s), "
+              f"column={col or 'ALL'}", flush=True)
+        page_reframe.mark_dict_sorted_remote(store, sorted(sizes), column=col)
+        sizes = _listing()          # each dictionary header grew a byte; re-read the true sizes
 
     if REFRAME:
         import page_reframe

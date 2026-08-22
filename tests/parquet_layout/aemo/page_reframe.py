@@ -33,6 +33,8 @@ PH_FIELDS = ["type", "uncompressed_page_size", "compressed_page_size", "crc",
              "data_page_header", "index_page_header", "dictionary_page_header",
              "data_page_header_v2"]
 PH_I32 = [1, 2, 3, 4]
+DPH_FIELDS = ["num_values", "encoding", "is_sorted"]
+DPH_I32 = [1, 2]
 CMD_FIELDS = ["type", "encodings", "path_in_schema", "codec", "num_values",
               "total_uncompressed_size", "total_compressed_size", "key_value_metadata",
               "data_page_offset", "index_page_offset", "dictionary_page_offset", "statistics",
@@ -206,6 +208,109 @@ def reframe_bytes(blob, column=None, groups=GROUPS):
     out += footer + struct.pack("<I", len(footer)) + MARKER
     return bytes(out), {"pages": n_pages, "columns": n_cols,
                         "bytes_before": len(blob), "bytes_after": len(out)}
+
+
+def mark_dict_sorted_bytes(blob, column=None):
+    """Write the explicit ``is_sorted=False`` on every dictionary page that DuckDB omits.
+
+    The last page-internal difference between the slow writer and the two fast ones, and the one
+    every previous experiment structurally could not reach: footer injection never touches page
+    headers, and ``reframe_bytes`` copies dictionary page headers through verbatim. Both fast
+    writers emit the field (17-byte header); DuckDB leaves it unset (16 bytes). Absent and false
+    ought to mean the same thing to a reader, which is exactly why it is worth measuring rather
+    than assuming.
+
+    Only that one field changes. Page bodies, data pages, levels, dictionary values and row groups
+    are all copied byte for byte; the header grows by a byte, so the file is rebuilt and every
+    offset recomputed.
+    """
+    import numpy as np
+    from fastparquet.cencoding import NumpyIO, ThriftObject, from_buffer
+
+    if blob[:4] != MARKER or blob[-4:] != MARKER:
+        raise ValueError("not a parquet file")
+    flen = struct.unpack("<I", blob[-8:-4])[0]
+    foot_start = len(blob) - 8 - flen
+    fmd = from_buffer(NumpyIO(np.frombuffer(blob[foot_start:-8], dtype="uint8")), "FileMetaData")
+
+    out = bytearray(MARKER)
+    n_marked = 0
+    row_groups = []
+    for rg in fmd.row_groups:
+        rg_start = len(out)
+        columns = []
+        for cc in rg.columns:
+            m = cc.meta_data
+            name = ".".join(x.decode() if isinstance(x, bytes) else x for x in m.path_in_schema)
+            start = m.dictionary_page_offset or m.data_page_offset
+            chunk = blob[start:start + m.total_compressed_size]
+            io = NumpyIO(np.frombuffer(chunk, dtype="uint8"))
+            col_start = len(out)
+            dict_off = data_off = None
+            touched = column is None or name == column
+            while io.tell() < len(chunk) - 4:
+                ph = from_buffer(io, "PageHeader")
+                body = chunk[io.tell():io.tell() + ph.compressed_page_size]
+                io.seek(ph.compressed_page_size, 1)
+                if ph.type != DICTIONARY_PAGE:
+                    if data_off is None:
+                        data_off = len(out)
+                    out += bytes(ph.to_bytes()) + body
+                    continue
+                dict_off = len(out)
+                dph = ph.dictionary_page_header
+                if not touched or getattr(dph, "is_sorted", None) is not None:
+                    out += bytes(ph.to_bytes()) + body
+                    continue
+                new_dph = ThriftObject.from_fields("DictionaryPageHeader", i32list=DPH_I32,
+                                                   num_values=dph.num_values,
+                                                   encoding=dph.encoding, is_sorted=False)
+                new_ph = _obj("PageHeader", PH_I32, ph, PH_FIELDS, dictionary_page_header=new_dph)
+                # Round-trip it: a header that no longer parses, or that changed anything other
+                # than is_sorted, would be a silently different file rather than a measurement.
+                raw = bytes(new_ph.to_bytes())
+                back = from_buffer(NumpyIO(np.frombuffer(raw + body, dtype="uint8")), "PageHeader")
+                bd = back.dictionary_page_header
+                if (back.type != ph.type or back.compressed_page_size != ph.compressed_page_size
+                        or back.uncompressed_page_size != ph.uncompressed_page_size
+                        or bd.num_values != dph.num_values or bd.encoding != dph.encoding
+                        or bd.is_sorted is not False):
+                    raise SystemExit(f"page_reframe: dictionary page header rebuild changed more "
+                                     f"than is_sorted ({name}) — refusing to write")
+                out += raw + body
+                n_marked += 1
+            meta = _obj("ColumnMetaData", CMD_I32, m, CMD_FIELDS,
+                        dictionary_page_offset=dict_off,
+                        data_page_offset=data_off if data_off is not None else dict_off,
+                        total_compressed_size=len(out) - col_start)
+            columns.append(_obj("ColumnChunk", CC_I32, cc, CC_FIELDS, meta_data=meta,
+                                offset_index_offset=None, offset_index_length=None,
+                                column_index_offset=None, column_index_length=None))
+        row_groups.append(_obj("RowGroup", RG_I32, rg, RG_FIELDS, columns=columns,
+                               file_offset=rg_start, total_compressed_size=len(out) - rg_start))
+
+    kw = {f: getattr(fmd, f) for f in FMD_FIELDS if getattr(fmd, f, None) is not None}
+    kw["row_groups"] = row_groups
+    footer = bytes(ThriftObject.from_fields("FileMetaData", i32list=[1], **kw).to_bytes())
+    out += footer + struct.pack("<I", len(footer)) + MARKER
+    return bytes(out), {"dictionary_pages_marked": n_marked,
+                        "bytes_before": len(blob), "bytes_after": len(out)}
+
+
+def mark_dict_sorted_remote(store, keys, column=None):
+    """Download, mark and replace each key in place (single PUT — OneLake rejects multipart)."""
+    import obstore
+
+    for key in keys:
+        blob = bytes(obstore.get(store, key).bytes())
+        new, stats = mark_dict_sorted_bytes(blob, column=column)
+        if not stats["dictionary_pages_marked"]:
+            raise SystemExit(f"OPT_DICT_SORTED was set but {key} had nothing to mark — the writer "
+                             "may already emit is_sorted, which would make this a no-op control.")
+        obstore.put(store, key, new, use_multipart=False)
+        print(f"  [ok] {key}: is_sorted=False on "
+              f"{stats['dictionary_pages_marked']} dictionary page(s), "
+              f"{stats['bytes_before']:,} -> {stats['bytes_after']:,} bytes", flush=True)
 
 
 def reframe_remote(store, keys, column=None, groups=GROUPS):
