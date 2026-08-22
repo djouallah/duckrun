@@ -40,6 +40,10 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 PREFIX = os.environ.get("AB_PREFIX") or "fct_summary_ab"
 COLUMN = os.environ.get("PAYLOAD_DIFF_COLUMN") or "DUID"
 N_PAGES = int(os.environ.get("PAYLOAD_DIFF_PAGES") or 2)
+# Comma-separated full table URIs, for when the two tables do NOT live in one lakehouse — the cold
+# benchmark puts each writer in its own throwaway lakehouse, and those are the files whose timing we
+# actually measured, so they are the ones worth decoding.
+URIS = [u.strip() for u in (os.environ.get("PAYLOAD_DIFF_URIS") or "").split(",") if u.strip()]
 
 DICTIONARY_PAGE, DATA_PAGE, DATA_PAGE_V2 = 2, 0, 3
 
@@ -224,13 +228,17 @@ def main():
 
     root = os.environ["ONELAKE_TABLES_PATH"].rstrip("/")
     con = duckrun.connect(root, schema="tests")
-    tables = sorted(r[2] for r in con.get_stats(f"{PREFIX}_*").fetchall())
-    if not tables:
-        raise SystemExit(f"payload_diff: no tables matched tests.{PREFIX}_*")
+    if URIS:
+        targets = [(u.rstrip("/").rsplit("/", 1)[-1], u.rstrip("/")) for u in URIS]
+    else:
+        names = sorted(r[2] for r in con.get_stats(f"{PREFIX}_*").fetchall())
+        if not names:
+            raise SystemExit(f"payload_diff: no tables matched tests.{PREFIX}_*")
+        targets = [(n, f"{root}/tests/{n}") for n in names]
 
     summary = {}
-    for tbl in tables:
-        store = build_store(f"{root}/tests/{tbl}", con.storage_options)
+    for tbl, uri in targets:
+        store = build_store(uri, con.storage_options)
         entries = []
         for batch in obstore.list(store):
             for obj in batch:

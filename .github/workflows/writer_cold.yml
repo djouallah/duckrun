@@ -107,7 +107,7 @@ jobs:
       - name: 📦 Install deps (duckrun from THIS tree)
         run: |
           pip install pythonnet pyyaml
-          pip install fastparquet          # footer thrift read/write for opt_footer_inject
+          pip install fastparquet cramjam  # footer thrift + page decompression for the diffs
           pip install -e .
 
       - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
@@ -217,6 +217,17 @@ jobs:
           VARIANT: ${{ env.SECOND_VARIANT }}
           PROBE_COLUMNS: ${{ inputs.probe_columns }}
         run: python tests/parquet_layout/writer_cold/cold_bench.py
+
+      - name: 🧬 Payload diff — decode the files this run measured
+        # Runs BEFORE teardown, against the exact tables the cold pass timed, rather than inferring
+        # structure from a different pair built by another workflow.
+        if: ${{ always() && contains(inputs.arms, 'deltars') && contains(inputs.arms, 'duckdb') }}
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+          PAYLOAD_DIFF_COLUMN: DUID
+          PAYLOAD_DIFF_URIS: ${{ env.TABLES_DELTARS }}/tests/${{ env.TABLE_DELTARS }},${{ env.TABLES_DUCKDB }}/tests/${{ env.TABLE_DUCKDB }}
+        run: python tests/parquet_layout/aemo/payload_diff.py
 
       - name: 📊 Summary
         if: ${{ always() }}
