@@ -19,6 +19,12 @@ the diff exactly three differences remain:
                RLE_DICTIONARY) and declares one: `['RLE_DICTIONARY']`, against delta-rs's
                `['PLAIN', 'RLE', 'RLE_DICTIONARY']`. Neither PLAIN nor PLAIN_DICTIONARY appears,
                so a reader testing that list for a dictionary page finds none.
+  createdby    `created_by` - the writer's signature. Everything else has been eliminated: the
+               data is identical, every metadata difference has been injected with no effect,
+               running order is ruled out, and NEUTRAL READERS SHOW NO GAP AT ALL (pyarrow and
+               DuckDB decode the DuckDB-written file 0.85-1.04x, i.e. marginally FASTER). A file
+               that is fine by every normal measure but slow in one engine points at that engine
+               recognising the writer, and this is the only input left untested.
   logical      `LogicalType` - already MEASURED AND RULED OUT (probe_duid 12585ms with it,
                12312-13091ms without). Kept so the null result stays reproducible.
 
@@ -35,7 +41,12 @@ aborts unless the untouched rebuild is byte-identical.
 import struct
 
 MARKER = b"PAR1"
-FEATURES = ("logical", "encstats", "offsetindex", "encodings")
+FEATURES = ("logical", "encstats", "offsetindex", "encodings", "createdby")
+
+# What `createdby` rewrites the footer's created_by string to. Readers legitimately
+# branch on this: parquet-mr distrusts statistics from known-buggy writer versions, and
+# arrow does the same, so a writer allowlist for a fast path is entirely plausible.
+CREATED_BY = "parquet-rs version 57.3.0"
 
 # ConvertedType ordinal -> the LogicalType union field that means the same thing.
 PROMOTE = {0: "STRING", 6: "DATE"}
@@ -204,11 +215,22 @@ def patch_bytes(blob, features):
         notes.append(f"OffsetIndex on {n_oi} chunk(s)")
     if n_enc:
         notes.append(f"completed encodings on {n_enc} chunk(s)")
+    # created_by is decided BEFORE the early return: it is a whole-footer field, so it is the one
+    # feature that can be the only thing a run changes.
+    new_created_by = None
+    if "createdby" in features:
+        was = fmd.created_by
+        was = was.decode() if isinstance(was, bytes) else str(was)
+        if was != CREATED_BY:
+            new_created_by = CREATED_BY.encode()
+            notes.append(f"created_by {was!r} -> {CREATED_BY!r}")
     if not notes:
         return blob, []
 
     kw = {f: getattr(fmd, f) for f in FMD_FIELDS if getattr(fmd, f, None) is not None}
     kw["schema"], kw["row_groups"] = schema, row_groups
+    if new_created_by is not None:
+        kw["created_by"] = new_created_by
     footer = bytes(ThriftObject.from_fields("FileMetaData", i32list=[1], **kw).to_bytes())
     return (blob[:foot_start] + b"".join(indexes) + footer
             + struct.pack("<I", len(footer)) + MARKER), notes
