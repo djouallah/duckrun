@@ -158,3 +158,6 @@ optimize-delta-stats-plan*.md
 # (docs/taxi.html & docs/multicatalog.html are committed live-report fallbacks that
 # mkdocs copies into the site verbatim, then CI overwrites with the live run.)
 /site/
+
+# Investigation notes, kept local — handed to a dev rather than committed
+tests/parquet_layout/FINDINGS-*.md
