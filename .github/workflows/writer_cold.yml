@@ -52,6 +52,10 @@ on:
         description: "[pyarrow arm] pyarrow ParquetWriter store_schema. false strips the ARROW:schema footer key/value — the one footer property BOTH fast writers carry and DuckDB lacks. If the stripped pyarrow file cold-reads slow, the consumer's fast path is gated on ARROW:schema."
         type: boolean
         default: true
+      opt_bitwidth:
+        description: "[duckdb arm] re-encode the dictionary indices at a different bit width, as '<mode>:<column>' e.g. 'uniform:DUID'. DuckDB picks one width per chunk, so it flips 8 to 9 at row group 5 where the dictionary crosses 256, while the engine's resident segments are 9 bits for all 24 row groups. No COPY option reaches this. 'uniform' holds one width for the whole column so it never changes down the file; 'min' gives each page the narrowest width it can carry, which is what parquet-cpp does."
+        type: string
+        default: ""
       opt_dict_sorted:
         description: "[duckdb arm] write the explicit is_sorted=False on dictionary page headers. Both fast writers emit it (17-byte header), DuckDB omits it (16 bytes), and no previous experiment could reach it — footer injection never touches page headers and the reframe copies dictionary headers through verbatim. The last page-internal property where the two fast writers agree and DuckDB differs. 'DUID', or 'all', or empty."
         type: string
@@ -196,6 +200,7 @@ jobs:
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
           OPT_REFRAME: ${{ inputs.opt_reframe }}
+          OPT_BITWIDTH: ${{ inputs.opt_bitwidth }}
           OPT_DICT_SORTED: ${{ inputs.opt_dict_sorted }}
           OPT_THREADS: ${{ inputs.opt_threads }}
           OPT_RG: ${{ inputs.opt_rg }}

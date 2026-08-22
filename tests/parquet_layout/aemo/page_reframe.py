@@ -297,6 +297,174 @@ def mark_dict_sorted_bytes(blob, column=None):
                         "bytes_before": len(blob), "bytes_after": len(out)}
 
 
+def repack_bitwidth_bytes(blob, column=None, mode="uniform", groups=GROUPS):
+    """Re-encode a column's dictionary indices at a different bit width. Diagnostic only.
+
+    The width is not a free choice for the writer: it must cover the row group's dictionary, and
+    DuckDB picks one width per chunk while parquet-cpp picks one per page. On the real fact that
+    makes DuckDB flip 8 -> 9 at row group 5, exactly where the dictionary crosses 256 (251 values
+    in rg4, 264 in rg5), while the engine's resident segments are 9 bits for all 24. So for the
+    first five row groups the stored width disagrees with the resident width, and a consumer that
+    sizes a global dictionary from what it saw first would have to widen what it already built.
+
+    No COPY option reaches this, which is why it has never been measured. Two modes:
+
+      uniform  one width for the whole column - the widest any row group needs - so the width
+               never changes down the file (tests the "keep it consistent" reading)
+      min      the narrowest width each page can carry, which is what parquet-cpp does
+
+    Values, dictionary, definition levels and page boundaries are all preserved; only the width
+    byte and the packing change. Every page is decoded again and refused on mismatch.
+    """
+    import numpy as np
+    from fastparquet.cencoding import NumpyIO, ThriftObject, from_buffer
+
+    import payload_diff as PD
+
+    if mode not in ("uniform", "min"):
+        raise SystemExit(f"page_reframe: repack mode must be uniform or min, got {mode!r}")
+    if blob[:4] != MARKER or blob[-4:] != MARKER:
+        raise ValueError("not a parquet file")
+    flen = struct.unpack("<I", blob[-8:-4])[0]
+    foot_start = len(blob) - 8 - flen
+    fmd = from_buffer(NumpyIO(np.frombuffer(blob[foot_start:-8], dtype="uint8")), "FileMetaData")
+
+    by_name = {}
+    for se in fmd.schema:
+        by_name[se.name.decode() if isinstance(se.name, bytes) else se.name] = se
+
+    def _chunks():
+        for rg in fmd.row_groups:
+            for cc in rg.columns:
+                nm = ".".join(x.decode() if isinstance(x, bytes) else x
+                              for x in cc.meta_data.path_in_schema)
+                if column is None or nm == column:
+                    yield nm, cc.meta_data
+
+    # Pass one: the widest width the column needs anywhere, so `uniform` never truncates.
+    global_width = 0
+    if mode == "uniform":
+        for _nm, m in _chunks():
+            start = m.dictionary_page_offset or m.data_page_offset
+            chunk = blob[start:start + m.total_compressed_size]
+            io = NumpyIO(np.frombuffer(chunk, dtype="uint8"))
+            while io.tell() < len(chunk) - 4:
+                ph = from_buffer(io, "PageHeader")
+                body = chunk[io.tell():io.tell() + ph.compressed_page_size]
+                io.seek(ph.compressed_page_size, 1)
+                if ph.type != DATA_PAGE:
+                    continue
+                raw = PD._decompress(body, m.codec, ph.uncompressed_page_size)
+                global_width = max(global_width, raw[_levels_end(raw, blob, fmd, by_name, _nm)])
+        if not global_width:
+            raise SystemExit("page_reframe: found no data pages to repack")
+
+    out = bytearray(MARKER)
+    n_pages, widths = 0, {}
+    row_groups = []
+    for rg in fmd.row_groups:
+        rg_start = len(out)
+        columns = []
+        for cc in rg.columns:
+            m = cc.meta_data
+            name = ".".join(x.decode() if isinstance(x, bytes) else x for x in m.path_in_schema)
+            se = by_name.get(name)
+            optional = se is not None and se.repetition_type == 1
+            start = m.dictionary_page_offset or m.data_page_offset
+            chunk = blob[start:start + m.total_compressed_size]
+            io = NumpyIO(np.frombuffer(chunk, dtype="uint8"))
+            col_start = len(out)
+            dict_off = data_off = None
+            raw_total = 0
+            touched = column is None or name == column
+            while io.tell() < len(chunk) - 4:
+                ph = from_buffer(io, "PageHeader")
+                body = chunk[io.tell():io.tell() + ph.compressed_page_size]
+                io.seek(ph.compressed_page_size, 1)
+                if ph.type == DICTIONARY_PAGE:
+                    dict_off = len(out)
+                    out += bytes(ph.to_bytes()) + body
+                    raw_total += ph.uncompressed_page_size
+                    continue
+                if data_off is None:
+                    data_off = len(out)
+                if ph.type != DATA_PAGE or not touched:
+                    out += bytes(ph.to_bytes()) + body
+                    raw_total += ph.uncompressed_page_size
+                    continue
+
+                raw = PD._decompress(body, m.codec, ph.uncompressed_page_size)
+                pos = 0
+                if optional:
+                    (dl,) = struct.unpack_from("<I", raw, 0)
+                    pos = 4 + dl
+                levels, src_width = raw[:pos], raw[pos]
+                vals, st0 = PD.decode_hybrid(raw[pos + 1:], src_width,
+                                             ph.data_page_header.num_values)
+                if st0["rle_runs"]:
+                    raise SystemExit(f"page_reframe: {name} has RLE runs — repacking would change "
+                                     "two things at once. Refusing.")
+                hi = int(max(vals)) if len(vals) else 0
+                need = max(1, hi.bit_length())
+                width = global_width if mode == "uniform" else need
+                if width < need:
+                    raise SystemExit(f"page_reframe: width {width} cannot hold index {hi} ({name})")
+                new_raw = levels + bytes([width]) + encode_hybrid(vals, width, groups)
+                check, _ = PD.decode_hybrid(new_raw[pos + 1:], width, len(vals))
+                if not np.array_equal(check, vals):
+                    raise SystemExit(f"page_reframe: repacked page does not decode back to the "
+                                     f"same values ({name}) — refusing to write")
+                comp = _compress(new_raw, m.codec)
+                new_ph = _obj("PageHeader", PH_I32, ph, PH_FIELDS,
+                              uncompressed_page_size=len(new_raw), compressed_page_size=len(comp))
+                out += bytes(new_ph.to_bytes()) + comp
+                raw_total += len(new_raw)
+                widths[(src_width, width)] = widths.get((src_width, width), 0) + 1
+                n_pages += 1
+            meta = _obj("ColumnMetaData", CMD_I32, m, CMD_FIELDS,
+                        dictionary_page_offset=dict_off,
+                        data_page_offset=data_off if data_off is not None else dict_off,
+                        total_compressed_size=len(out) - col_start,
+                        total_uncompressed_size=raw_total)
+            columns.append(_obj("ColumnChunk", CC_I32, cc, CC_FIELDS, meta_data=meta,
+                                offset_index_offset=None, offset_index_length=None,
+                                column_index_offset=None, column_index_length=None))
+        row_groups.append(_obj("RowGroup", RG_I32, rg, RG_FIELDS, columns=columns,
+                               file_offset=rg_start, total_compressed_size=len(out) - rg_start))
+
+    kw = {f: getattr(fmd, f) for f in FMD_FIELDS if getattr(fmd, f, None) is not None}
+    kw["row_groups"] = row_groups
+    footer = bytes(ThriftObject.from_fields("FileMetaData", i32list=[1], **kw).to_bytes())
+    out += footer + struct.pack("<I", len(footer)) + MARKER
+    return bytes(out), {"pages": n_pages, "mode": mode, "uniform_width": global_width or None,
+                        "transitions": {f"{a}->{b}": c for (a, b), c in sorted(widths.items())},
+                        "bytes_before": len(blob), "bytes_after": len(out)}
+
+
+def _levels_end(raw, blob, fmd, by_name, name):
+    """Byte offset of the bit-width marker inside an uncompressed v1 data page."""
+    se = by_name.get(name)
+    if se is not None and se.repetition_type == 1:
+        (dl,) = struct.unpack_from("<I", raw, 0)
+        return 4 + dl
+    return 0
+
+
+def repack_bitwidth_remote(store, keys, column=None, mode="uniform"):
+    """Download, repack and replace each key in place (single PUT — OneLake rejects multipart)."""
+    import obstore
+
+    for key in keys:
+        blob = bytes(obstore.get(store, key).bytes())
+        new, stats = repack_bitwidth_bytes(blob, column=column, mode=mode)
+        if not stats["pages"]:
+            raise SystemExit(f"OPT_BITWIDTH was set but {key} had no data pages to repack.")
+        obstore.put(store, key, new, use_multipart=False)
+        print(f"  [ok] {key}: repacked {stats['pages']} page(s) mode={stats['mode']} "
+              f"width={stats['uniform_width']} transitions={stats['transitions']}, "
+              f"{stats['bytes_before']:,} -> {stats['bytes_after']:,} bytes", flush=True)
+
+
 def recompress_dict_bytes(blob, column=None):
     """Re-compress dictionary pages from the identical uncompressed values.
 

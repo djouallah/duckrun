@@ -129,6 +129,13 @@ STORE_SCHEMA = (os.environ.get("OPT_STORE_SCHEMA") or "true").strip().lower() in
 # emit it (17-byte header), DuckDB omits it (16 bytes), and NO previous experiment could reach it:
 # footer injection never touches page headers and the reframe copies dictionary headers verbatim.
 # Column name, or 'all'. See page_reframe.mark_dict_sorted_bytes.
+# DIAGNOSTIC. Re-encode the dictionary indices at a different bit width. DuckDB picks one width
+# per chunk, so on the real fact it flips 8 -> 9 at row group 5, exactly where the dictionary
+# crosses 256 - while the engine's resident segments are 9 bits for all 24 row groups. No COPY
+# option reaches this. 'uniform' holds one width for the whole column so it never changes down the
+# file; 'min' gives each page the narrowest width it can carry, which is what parquet-cpp does.
+# Format: '<mode>:<column>' e.g. 'uniform:DUID'. See page_reframe.repack_bitwidth_bytes.
+BITWIDTH = (os.environ.get("OPT_BITWIDTH") or "").strip()
 DICT_SORTED = (os.environ.get("OPT_DICT_SORTED") or "").strip()
 TRANSPLANT = (os.environ.get("OPT_TRANSPLANT") or "").strip()
 TRANSPLANT_FROM = (os.environ.get("OPT_TRANSPLANT_FROM") or "").strip().rstrip("/")
@@ -362,6 +369,16 @@ else:
               f"column={col or 'ALL'}", flush=True)
         page_reframe.mark_dict_sorted_remote(store, sorted(sizes), column=col)
         sizes = _listing()          # each dictionary header grew a byte; re-read the true sizes
+
+    if BITWIDTH:
+        import page_reframe
+        _mode, _, _col = BITWIDTH.partition(":")
+        col = _col.strip() or None
+        print(f"repacking bit width mode={_mode.strip()} in {len(sizes)} file(s), "
+              f"column={col or 'ALL'}", flush=True)
+        page_reframe.repack_bitwidth_remote(store, sorted(sizes), column=col,
+                                            mode=_mode.strip())
+        sizes = _listing()          # widths changed the packing; re-read the true sizes
 
     if REFRAME:
         import page_reframe
