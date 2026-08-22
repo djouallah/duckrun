@@ -48,8 +48,8 @@ threads), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (DATA_PAGE_SIZE_LIMI
 65536 is the value that lands page geometry near delta-rs's),
 OPT_TFS_MB (file rotation size, default 256 = duckrun's target_file_size_mb),
 OPT_PARQUET_VERSION (V1/V2, byte-identical), OPT_BLOOM (default false — delta-rs writes none,
-and they cost 29.2 MB here), OPT_LOGICAL_TYPE (default false — rewrite each footer to add the
-modern LogicalType DuckDB omits), BENCH_ROW_LIMIT, FORCE_REBUILD.
+and they cost 29.2 MB here), OPT_FOOTER_INJECT (comma-separated, default empty — add footer
+metadata DuckDB omits: encstats, offsetindex, logical), BENCH_ROW_LIMIT, FORCE_REBUILD.
 """
 import datetime as _dt
 import decimal as _dec
@@ -95,11 +95,13 @@ if PQ_VERSION not in ("V1", "V2"):
 # Direct Lake (which does not use parquet bloom filters) and because leaving them on makes the
 # writer A/B measure a feature delta-rs simply doesn't ship.
 BLOOM = (os.environ.get("OPT_BLOOM") or "false").strip().lower() in ("true", "1", "yes")
-# DIAGNOSTIC. DuckDB annotates VARCHAR/DATE with the DEPRECATED ConvertedType only; delta-rs writes
-# the modern LogicalType too. Post-processes each footer to add it, changing nothing else — see
-# footer_logical_type.py. This is a measurement knob, not a shipping feature: if it turns out to be
-# the cold-read gap, the fix belongs upstream in DuckDB, not in a footer rewrite.
-LOGICAL_TYPE = (os.environ.get("OPT_LOGICAL_TYPE") or "false").strip().lower() in ("true", "1", "yes")
+# DIAGNOSTIC. A page-level diff of the real tables showed the two writers emit the SAME data for
+# the slow column — same dictionary, same encoding, chunk sizes 0.2% apart — so what is left is
+# metadata. Comma-separated subset of footer_inject.FEATURES ('encstats,offsetindex,logical'),
+# empty to write DuckDB's footer untouched. A measurement knob, not a shipping feature: if one of
+# these is the cold-read gap, the fix belongs upstream in DuckDB, not in a footer rewrite.
+FOOTER_INJECT = [f.strip() for f in (os.environ.get("OPT_FOOTER_INJECT") or "").split(",")
+                 if f.strip()]
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -219,19 +221,19 @@ else:
     if not sizes:
         raise SystemExit(f"listing returned no part-{run_tag}-* files")
 
-    # DIAGNOSTIC (OPT_LOGICAL_TYPE): promote ConvertedType-only annotations to the modern
-    # LogicalType. Must happen HERE — after the COPY, before the listing that feeds AddAction.size
-    # — because the rewrite makes each footer a few bytes longer, and a Delta size field that
-    # disagrees with the blob is a worse bug than the one being investigated.
-    if LOGICAL_TYPE:
-        import footer_logical_type
-        print(f"promoting ConvertedType -> LogicalType in {len(sizes)} footer(s)", flush=True)
-        cols = footer_logical_type.patch_remote(store, sorted(sizes))
-        if not cols:
-            raise SystemExit("OPT_LOGICAL_TYPE was set but no column needed promoting — "
-                             "duckdb may have started writing LogicalType itself, which would "
+    # DIAGNOSTIC (OPT_FOOTER_INJECT): add the metadata delta-rs writes and DuckDB does not. Must
+    # happen HERE — after the COPY, before the listing that feeds AddAction.size — because the
+    # rewrite makes each file longer, and a Delta size field that disagrees with the blob is a
+    # worse bug than the one being investigated.
+    if FOOTER_INJECT:
+        import footer_inject
+        print(f"injecting {', '.join(FOOTER_INJECT)} into {len(sizes)} footer(s)", flush=True)
+        notes = footer_inject.patch_remote(store, sorted(sizes), FOOTER_INJECT)
+        if not notes:
+            raise SystemExit(f"OPT_FOOTER_INJECT={','.join(FOOTER_INJECT)} was set but nothing "
+                             "needed injecting — duckdb may have started writing it, which would "
                              "silently turn this run into a no-op control.")
-        sizes = _listing()          # footers grew; re-read the true sizes
+        sizes = _listing()          # files grew; re-read the true sizes
 
     files = sorted(sizes)
     k = len(files)
