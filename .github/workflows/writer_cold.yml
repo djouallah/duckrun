@@ -330,7 +330,11 @@ jobs:
         env:
           PYTHONIOENCODING: utf-8
           FULL_DIFF_COLUMN: DUID
-          FULL_DIFF_ROW_GROUPS: "2"
+          # Every row group, not the first two: the dictionary grows 217 -> 329 down the file and
+          # the bit width flips 8 -> 9 around row group 5, so the majority of the chunk lives in a
+          # regime the first two row groups never enter.
+          FULL_DIFF_ROW_GROUPS: "24"
+          FULL_DIFF_PAGES: "2"
         run: |
           set -euo pipefail
           uris=""
