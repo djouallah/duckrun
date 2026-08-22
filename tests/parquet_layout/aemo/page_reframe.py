@@ -297,6 +297,109 @@ def mark_dict_sorted_bytes(blob, column=None):
                         "bytes_before": len(blob), "bytes_after": len(out)}
 
 
+def recompress_dict_bytes(blob, column=None):
+    """Re-compress dictionary pages from the identical uncompressed values.
+
+    The other half of the same blind spot as is_sorted. Every rewrite so far leaves the dictionary
+    page body exactly as DuckDB's compressor emitted it: reframe copies it through verbatim, the
+    transplant moves the whole chunk, footer injection never touches pages. So DuckDB's own snappy
+    output for that page is present in every slow measurement and in none of the fast ones, and
+    nothing has separated "DuckDB's bytes" from "DuckDB's compressor" for it.
+
+    The values are provably unchanged - the page is decompressed, re-compressed, and decompressed
+    again to confirm it round-trips to the same bytes - so the only thing that moves is which
+    implementation produced the compressed stream.
+
+    MEASURED AND RULED OUT, kept so the null result stays reproducible: re-compressing through
+    cramjam reproduces DuckDB's dictionary page byte for byte (878 bytes on the local repro,
+    bytes_delta 0), so DuckDB's compressor is not doing anything unusual - parquet-cpp's 895 is
+    the outlier of the three. On the real fact the same page lands at 1462 (DuckDB), 1464
+    (parquet-rs) and 1469 (parquet-cpp) bytes, one fast and one slow within seven bytes of each
+    other, so the compressed dictionary bytes cannot be what the consumer reacts to.
+    """
+    import numpy as np
+    from fastparquet.cencoding import NumpyIO, ThriftObject, from_buffer
+
+    import payload_diff as PD
+
+    if blob[:4] != MARKER or blob[-4:] != MARKER:
+        raise ValueError("not a parquet file")
+    flen = struct.unpack("<I", blob[-8:-4])[0]
+    foot_start = len(blob) - 8 - flen
+    fmd = from_buffer(NumpyIO(np.frombuffer(blob[foot_start:-8], dtype="uint8")), "FileMetaData")
+
+    out = bytearray(MARKER)
+    n_done, saved = 0, 0
+    row_groups = []
+    for rg in fmd.row_groups:
+        rg_start = len(out)
+        columns = []
+        for cc in rg.columns:
+            m = cc.meta_data
+            name = ".".join(x.decode() if isinstance(x, bytes) else x for x in m.path_in_schema)
+            start = m.dictionary_page_offset or m.data_page_offset
+            chunk = blob[start:start + m.total_compressed_size]
+            io = NumpyIO(np.frombuffer(chunk, dtype="uint8"))
+            col_start = len(out)
+            dict_off = data_off = None
+            touched = column is None or name == column
+            while io.tell() < len(chunk) - 4:
+                ph = from_buffer(io, "PageHeader")
+                body = chunk[io.tell():io.tell() + ph.compressed_page_size]
+                io.seek(ph.compressed_page_size, 1)
+                if ph.type != DICTIONARY_PAGE:
+                    if data_off is None:
+                        data_off = len(out)
+                    out += bytes(ph.to_bytes()) + body
+                    continue
+                dict_off = len(out)
+                if not touched or m.codec == 0:
+                    out += bytes(ph.to_bytes()) + body
+                    continue
+                raw = PD._decompress(body, m.codec, ph.uncompressed_page_size)
+                comp = _compress(raw, m.codec)
+                if PD._decompress(comp, m.codec, len(raw)) != raw:
+                    raise SystemExit(f"page_reframe: re-compressed dictionary page does not "
+                                     f"round-trip ({name}) — refusing to write")
+                new_ph = _obj("PageHeader", PH_I32, ph, PH_FIELDS,
+                              uncompressed_page_size=len(raw), compressed_page_size=len(comp))
+                out += bytes(new_ph.to_bytes()) + comp
+                saved += len(body) - len(comp)
+                n_done += 1
+            meta = _obj("ColumnMetaData", CMD_I32, m, CMD_FIELDS,
+                        dictionary_page_offset=dict_off,
+                        data_page_offset=data_off if data_off is not None else dict_off,
+                        total_compressed_size=len(out) - col_start)
+            columns.append(_obj("ColumnChunk", CC_I32, cc, CC_FIELDS, meta_data=meta,
+                                offset_index_offset=None, offset_index_length=None,
+                                column_index_offset=None, column_index_length=None))
+        row_groups.append(_obj("RowGroup", RG_I32, rg, RG_FIELDS, columns=columns,
+                               file_offset=rg_start, total_compressed_size=len(out) - rg_start))
+
+    kw = {f: getattr(fmd, f) for f in FMD_FIELDS if getattr(fmd, f, None) is not None}
+    kw["row_groups"] = row_groups
+    footer = bytes(ThriftObject.from_fields("FileMetaData", i32list=[1], **kw).to_bytes())
+    out += footer + struct.pack("<I", len(footer)) + MARKER
+    return bytes(out), {"dictionary_pages_recompressed": n_done, "bytes_delta": -saved,
+                        "bytes_before": len(blob), "bytes_after": len(out)}
+
+
+def recompress_dict_remote(store, keys, column=None):
+    """Download, re-compress dictionary pages and replace each key in place (single PUT)."""
+    import obstore
+
+    for key in keys:
+        blob = bytes(obstore.get(store, key).bytes())
+        new, stats = recompress_dict_bytes(blob, column=column)
+        if not stats["dictionary_pages_recompressed"]:
+            raise SystemExit(f"OPT_DICT_RECOMPRESS was set but {key} had no compressed dictionary "
+                             "page to re-compress — that would be a silent no-op control.")
+        obstore.put(store, key, new, use_multipart=False)
+        print(f"  [ok] {key}: re-compressed "
+              f"{stats['dictionary_pages_recompressed']} dictionary page(s), "
+              f"{stats['bytes_before']:,} -> {stats['bytes_after']:,} bytes", flush=True)
+
+
 def mark_dict_sorted_remote(store, keys, column=None):
     """Download, mark and replace each key in place (single PUT — OneLake rejects multipart)."""
     import obstore
