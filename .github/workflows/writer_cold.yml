@@ -44,8 +44,16 @@ on:
         description: "[duckdb arm] comma-separated footer metadata to add that DuckDB omits and delta-rs writes: encstats (PageEncodingStats), offsetindex (OffsetIndex), logical (LogicalType — already measured as a no-op). Empty writes DuckDB's footer untouched. A page-level diff proved the DATA is the same, so these are what is left."
         type: string
         default: ""
+      arms:
+        description: "which writers to build and measure. delta-rs is a settled baseline (probe_duid 0.9-2.3s across nine runs) so re-measuring it costs capacity for a number we already have; 'duckdb' alone is also the cleanest order control, since nothing runs before it."
+        type: choice
+        default: duckdb
+        options:
+          - duckdb
+          - deltars
+          - deltars,duckdb
       order:
-        description: "which writer is measured FIRST. The two passes share one capacity, so the second can inherit smoothing/throttling from the first — swap this and re-run to prove an effect is the parquet and not the running order."
+        description: "which writer is measured FIRST when arms builds both. The two passes share one capacity, so the second can inherit smoothing/throttling from the first — swap this and re-run to prove an effect is the parquet and not the running order."
         type: choice
         default: deltars_first
         options:
@@ -78,6 +86,7 @@ jobs:
       MODEL_DUCKDB: writer_cold_duckdb
       TABLE_DELTARS: fct_summary_deltars
       TABLE_DUCKDB: fct_summary_duckdb
+      ARMS: ${{ inputs.arms }}
     steps:
       - name: 📥 Checkout
         uses: actions/checkout@v4
@@ -123,6 +132,7 @@ jobs:
         run: python tests/parquet_layout/writer_cold/provision.py create
 
       - name: 🧭 Build the delta-rs table
+        if: ${{ contains(inputs.arms, 'deltars') }}
         env:
           PYTHONIOENCODING: utf-8
           # write into the temp lakehouse, read the permanent mart
@@ -135,6 +145,7 @@ jobs:
         run: python tests/parquet_layout/aemo/build_auto_sort.py
 
       - name: 🦆 Build the DuckDB-writer table
+        if: ${{ contains(inputs.arms, 'duckdb') }}
         env:
           PYTHONIOENCODING: utf-8
           ONELAKE_TABLES_PATH: ${{ env.TABLES_DUCKDB }}
@@ -158,17 +169,18 @@ jobs:
         # smoothing. Order is an input precisely so a finding can be re-run the other way round:
         # an effect that survives the swap is the parquet, one that flips is the running order.
         run: |
-          if [ "${{ inputs.order }}" = "duckdb_first" ]; then
-            echo "FIRST_MODEL=$MODEL_DUCKDB"   >> "$GITHUB_ENV"
-            echo "FIRST_VARIANT=duckdb"        >> "$GITHUB_ENV"
-            echo "SECOND_MODEL=$MODEL_DELTARS" >> "$GITHUB_ENV"
-            echo "SECOND_VARIANT=deltars"      >> "$GITHUB_ENV"
-          else
-            echo "FIRST_MODEL=$MODEL_DELTARS"  >> "$GITHUB_ENV"
-            echo "FIRST_VARIANT=deltars"       >> "$GITHUB_ENV"
-            echo "SECOND_MODEL=$MODEL_DUCKDB"  >> "$GITHUB_ENV"
-            echo "SECOND_VARIANT=duckdb"       >> "$GITHUB_ENV"
-          fi
+          set -euo pipefail
+          case "$ARMS" in
+            duckdb)  first=duckdb;  second="" ;;
+            deltars) first=deltars; second="" ;;
+            *) if [ "${{ inputs.order }}" = "duckdb_first" ]; then first=duckdb; second=deltars
+               else first=deltars; second=duckdb; fi ;;
+          esac
+          model() { if [ "$1" = duckdb ]; then echo "$MODEL_DUCKDB"; else echo "$MODEL_DELTARS"; fi; }
+          echo "FIRST_VARIANT=$first"          >> "$GITHUB_ENV"
+          echo "FIRST_MODEL=$(model "$first")" >> "$GITHUB_ENV"
+          echo "SECOND_VARIANT=$second"        >> "$GITHUB_ENV"
+          if [ -n "$second" ]; then echo "SECOND_MODEL=$(model "$second")" >> "$GITHUB_ENV"; fi
 
       - name: 🧊 Cold pass — first writer
         env:
@@ -180,10 +192,11 @@ jobs:
         run: python tests/parquet_layout/writer_cold/cold_bench.py
 
       - name: 😴 Idle gap so the first pass's burst smooths out
-        if: ${{ inputs.gap_seconds != '0' }}
+        if: ${{ inputs.gap_seconds != '0' && env.SECOND_VARIANT != '' }}
         run: sleep ${{ inputs.gap_seconds }}
 
       - name: 🧊 Cold pass — second writer
+        if: ${{ env.SECOND_VARIANT != '' }}
         env:
           PYTHONNET_RUNTIME: coreclr
           PYTHONIOENCODING: utf-8
