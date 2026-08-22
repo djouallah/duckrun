@@ -37,6 +37,22 @@ VARIANTS = [
 
 
 ARMS = [a.strip() for a in (os.environ.get("ARMS") or "deltars,duckdb").split(",") if a.strip()]
+# The .bim declares every fact column. When OPT_COLUMNS narrowed the physical table, the model must
+# be narrowed to match or the Direct Lake partition fails to bind to columns that are not there.
+MODEL_COLUMNS = [c.strip() for c in (os.environ.get("MODEL_COLUMNS") or "").split(",") if c.strip()]
+
+
+def _narrow(bim):
+    if not MODEL_COLUMNS:
+        return bim
+    doc = json.loads(bim)
+    for t in doc["model"]["tables"]:
+        kept = [c for c in t["columns"] if c["name"] in MODEL_COLUMNS]
+        if not kept:
+            raise SystemExit(f"deploy_models: MODEL_COLUMNS {MODEL_COLUMNS} matched no column in "
+                             f"{[c['name'] for c in t['columns']]}")
+        t["columns"] = kept
+    return json.dumps(doc, indent=2)
 
 
 def main():
@@ -54,7 +70,7 @@ def main():
     ws = duckrun.workspace(os.environ["WS_ID"])
     out = {}
     for v in (v for v in VARIANTS if v["key"] in ARMS):
-        bim = raw.replace("__FACT_TABLE__", v["table"])
+        bim = _narrow(raw.replace("__FACT_TABLE__", v["table"]))
         path = os.path.join(tempfile.mkdtemp(prefix=f"bim_{v['key']}_"), "model.bim")
         with open(path, "w", encoding="utf-8") as f:
             f.write(bim)

@@ -55,6 +55,12 @@ if OPT_PAGE_ROWS is not None:
 # V-Order build's) with the same row cap. SORTED BY AUTO re-sorts regardless of input order.
 # Shared with the sort-key step so the key it shows is the key this builds.
 _src = sort_key_mod.source_expr()
+# OPT_COLUMNS narrows the table to a subset. The point is a MINIMAL reproducer: probing one column
+# only transcodes that column, so a small table measures the same thing as the wide one for far
+# less written bytes. Every sort column must stay in the projection — the `sorted by` clause sorts
+# the CTAS result, so it cannot reference a column the select does not produce.
+_COLUMNS = [c.strip() for c in (os.environ.get("OPT_COLUMNS") or "").split(",") if c.strip()]
+_PROJECT = ", ".join(f'"{c}"' for c in _COLUMNS) if _COLUMNS else "*"
 
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"], read_only=False)
 try:
@@ -79,7 +85,7 @@ if not force and _exists():
           "(rebuild=true to rebuild)", flush=True)
     status = "skipped"   # nothing was written, so no key was chosen — report null, not a guess
 else:
-    body = f"select * from {_src}"
+    body = f"select {_PROJECT} from {_src}"
     sort_key = sort_key_mod.resolve(con, sort, body)
     print(f"sort key: {clause} -> {sort_key_mod.label(sort_key)}", flush=True)
     print(f"Building {QUALIFIED} with '{clause}' ...", flush=True)

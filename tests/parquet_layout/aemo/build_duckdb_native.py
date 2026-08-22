@@ -170,6 +170,16 @@ else:
     # a DECIMAL(p>18) source would write FLBA, which never gets a dictionary (the WARN catches it)
     coltypes = dict(dd.execute(f"select column_name, column_type from (describe {src})").fetchall())
     cols = list(coltypes)
+    # OPT_COLUMNS narrows the table to a subset — a minimal reproducer writes far fewer bytes and
+    # measures the same thing, since probing one column only transcodes that column.
+    _want = [c.strip() for c in (os.environ.get("OPT_COLUMNS") or "").split(",") if c.strip()]
+    if _want:
+        missing = [c for c in _want if c not in coltypes]
+        if missing:
+            raise SystemExit(f"build_duckdb_native: OPT_COLUMNS names unknown column(s) {missing}; "
+                             f"source has {cols}")
+        cols = _want
+        coltypes = {c: coltypes[c] for c in cols}
     collist = ", ".join(f'"{c}"' for c in cols)
     order = ", ".join(f'"{c}"' for c in sort_cols)
     run_tag = uuid.uuid4().hex[:8]

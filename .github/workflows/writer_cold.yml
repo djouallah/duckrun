@@ -22,9 +22,9 @@ on:
         type: string
         default: main
       opt_sort:
-        description: "the FIXED sort key both writers use. Explicit columns only."
+        description: "the FIXED sort key both writers use. Explicit columns only, and every one of them must appear in `columns` — the sort is applied to the CTAS result. A full tie-break (date, time, DUID) makes the row order deterministic, so both writers receive an identical stream."
         type: string
-        default: "date, time"
+        default: "date, time, DUID"
       row_limit:
         description: "row cap on the shared source mart.fct_summary (142M ≈ full)"
         type: string
@@ -44,6 +44,14 @@ on:
         description: "[duckdb arm] comma-separated footer metadata to add that DuckDB omits and delta-rs writes: encstats (PageEncodingStats), offsetindex (OffsetIndex), logical (LogicalType — already measured as a no-op). Empty writes DuckDB's footer untouched. A page-level diff proved the DATA is the same, so these are what is left."
         type: string
         default: ""
+      columns:
+        description: "narrow both tables to these columns — a MINIMAL reproducer. 'date, time, DUID' writes ~1/5 the bytes of the full fact and measures exactly the same thing, because probing one column only transcodes that column. date and time are carried so the sort key stays intact and both writers receive an identically ordered stream; neither is ever probed. Empty = the full fact."
+        type: string
+        default: "date, time, DUID"
+      probe_columns:
+        description: "which columns the DAX suite probes (probe_rowcount always runs as the control). Must be a subset of `columns`."
+        type: string
+        default: "DUID"
       arms:
         description: "which writers to build and measure. delta-rs is a settled baseline (probe_duid 0.9-2.3s across nine runs) so re-measuring it costs capacity for a number we already have; 'duckdb' alone is also the cleanest order control, since nothing runs before it."
         type: choice
@@ -139,6 +147,7 @@ jobs:
           ONELAKE_TABLES_PATH: ${{ env.TABLES_DELTARS }}
           BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
           OPT_TABLE: ${{ env.TABLE_DELTARS }}
+          OPT_COLUMNS: ${{ inputs.columns }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
@@ -151,6 +160,7 @@ jobs:
           ONELAKE_TABLES_PATH: ${{ env.TABLES_DUCKDB }}
           BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
           OPT_TABLE: ${{ env.TABLE_DUCKDB }}
+          OPT_COLUMNS: ${{ inputs.columns }}
           OPT_PARQUET_VERSION: ${{ inputs.opt_parquet_version }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
@@ -162,6 +172,7 @@ jobs:
       - name: 🚀 Deploy the two fresh Direct Lake models
         env:
           PYTHONIOENCODING: utf-8
+          MODEL_COLUMNS: ${{ inputs.columns }}
         run: python tests/parquet_layout/writer_cold/deploy_models.py
 
       - name: 🔀 Resolve measurement order
@@ -189,6 +200,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           MODEL: ${{ env.FIRST_MODEL }}
           VARIANT: ${{ env.FIRST_VARIANT }}
+          PROBE_COLUMNS: ${{ inputs.probe_columns }}
         run: python tests/parquet_layout/writer_cold/cold_bench.py
 
       - name: 😴 Idle gap so the first pass's burst smooths out
@@ -203,6 +215,7 @@ jobs:
           PYTHONUNBUFFERED: "1"
           MODEL: ${{ env.SECOND_MODEL }}
           VARIANT: ${{ env.SECOND_VARIANT }}
+          PROBE_COLUMNS: ${{ inputs.probe_columns }}
         run: python tests/parquet_layout/writer_cold/cold_bench.py
 
       - name: 📊 Summary
