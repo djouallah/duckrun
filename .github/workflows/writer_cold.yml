@@ -319,6 +319,26 @@ jobs:
           case "$ARMS" in *pyarrow*) uris="${uris:+$uris,}$TABLES_PYARROW/tests/$TABLE_PYARROW" ;; esac
           PAGE_DIFF_URIS="$uris" python tests/parquet_layout/aemo/page_diff.py
 
+      - name: 🧷 Full diff — every difference between the two files, one column
+        # No rewrites and no measurement: it walks both files and prints every field that
+        # differs, including the definition-level blocks, the bit-packed padding and whether
+        # uncompressed_page_size matches the real decompressed length — none of which any
+        # other tool here reads. The point is to stop assuming the list of differences is
+        # complete and just enumerate it against the real files.
+        if: ${{ always() && contains(inputs.arms, 'duckdb') }}
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+          FULL_DIFF_COLUMN: DUID
+          FULL_DIFF_ROW_GROUPS: "2"
+        run: |
+          set -euo pipefail
+          uris=""
+          case "$ARMS" in *duckdb*)  uris="$TABLES_DUCKDB/tests/$TABLE_DUCKDB" ;; esac
+          case "$ARMS" in *pyarrow*) uris="${uris:+$uris,}$TABLES_PYARROW/tests/$TABLE_PYARROW" ;; esac
+          case "$ARMS" in *deltars*) uris="${uris:+$uris,}$TABLES_DELTARS/tests/$TABLE_DELTARS" ;; esac
+          FULL_DIFF_URIS="$uris" python tests/parquet_layout/aemo/full_diff.py
+
       - name: 📊 Summary
         if: ${{ always() }}
         continue-on-error: true
