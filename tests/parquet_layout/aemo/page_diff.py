@@ -12,6 +12,8 @@ PageEncodingStats.
 
 Env: ONELAKE_TABLES_PATH (resolve_env), AB_PREFIX (default 'fct_summary_ab'),
 PAGE_DIFF_COLUMN (default 'DUID'), PAGE_DIFF_ROW_GROUPS (default 1), PAGE_DIFF_PAGES (default 6).
+PAGE_DIFF_URIS (comma-separated full table URIs) overrides the AB_PREFIX discovery for tables that
+live in separate throwaway lakehouses — the cold benchmark's files, the ones actually timed.
 """
 import os
 import struct
@@ -27,6 +29,7 @@ PREFIX = os.environ.get("AB_PREFIX") or "fct_summary_ab"
 COLUMN = os.environ.get("PAGE_DIFF_COLUMN") or "DUID"
 N_RG = int(os.environ.get("PAGE_DIFF_ROW_GROUPS") or 1)
 N_PAGES = int(os.environ.get("PAGE_DIFF_PAGES") or 6)
+URIS = [u.strip() for u in (os.environ.get("PAGE_DIFF_URIS") or "").split(",") if u.strip()]
 
 PAGE_TYPE = {0: "DATA_PAGE", 1: "INDEX_PAGE", 2: "DICTIONARY_PAGE", 3: "DATA_PAGE_V2"}
 ENCODING = {0: "PLAIN", 2: "PLAIN_DICTIONARY", 3: "RLE", 4: "BIT_PACKED",
@@ -36,6 +39,11 @@ ENCODING = {0: "PLAIN", 2: "PLAIN_DICTIONARY", 3: "RLE", 4: "BIT_PACKED",
 
 def _enc(v):
     return ENCODING.get(v, str(v))
+
+
+def _sha(b):
+    import hashlib
+    return hashlib.sha256(b).hexdigest()[:16]
 
 
 def read_footer(store, key, size):
@@ -93,13 +101,16 @@ def main():
 
     root = os.environ["ONELAKE_TABLES_PATH"].rstrip("/")
     con = duckrun.connect(root, schema="tests")
-    tables = sorted(r[2] for r in con.get_stats(f"{PREFIX}_*").fetchall())
-    if not tables:
-        raise SystemExit(f"page_diff: no tables matched tests.{PREFIX}_*")
+    if URIS:
+        targets = [(u.rstrip("/").rsplit("/", 1)[-1], u.rstrip("/")) for u in URIS]
+    else:
+        names = sorted(r[2] for r in con.get_stats(f"{PREFIX}_*").fetchall())
+        if not names:
+            raise SystemExit(f"page_diff: no tables matched tests.{PREFIX}_*")
+        targets = [(n, f"{root}/tests/{n}") for n in names]
 
     out = []
-    for tbl in tables:
-        uri = f"{root}/tests/{tbl}"
+    for tbl, uri in targets:
         store = build_store(uri, con.storage_options)
         entries = []
         for batch in obstore.list(store):
@@ -116,8 +127,21 @@ def main():
         cb = fmd.created_by
         kv = [(k.key, k.value) for k in (fmd.key_value_metadata or [])]
         print(f"created_by         : {cb.decode() if isinstance(cb, bytes) else cb}")
-        print(f"footer key/value   : {[k.decode() if isinstance(k, bytes) else k for k, _ in kv]}")
-        print(f"column_orders      : {'set' if fmd.column_orders else 'ABSENT'}")
+        # Values, not just keys: ARROW:schema is a large blob, so length + hash is the
+        # comparable form across writers.
+        if kv:
+            for k, v in kv:
+                kk = k.decode() if isinstance(k, bytes) else k
+                vb = v if isinstance(v, bytes) else str(v or "").encode()
+                print(f"footer key/value   : {kk!r} = {len(vb)} bytes, "
+                      f"sha {_sha(vb)}, head {vb[:48]!r}")
+        else:
+            print("footer key/value   : NONE")
+        so = fmd.schema[0]
+        rname = so.name.decode() if isinstance(so.name, bytes) else so.name
+        print(f"format version     : {fmd.version}")
+        print(f"root schema element: name={rname!r}, num_children={getattr(so, 'num_children', None)}")
+        print(f"column_orders      : {fmd.column_orders!r}")
 
         for ri in range(min(N_RG, len(fmd.row_groups))):
             rg = fmd.row_groups[ri]
@@ -131,8 +155,15 @@ def main():
             start = m.dictionary_page_offset or m.data_page_offset
             print(f"\n-- row group {ri}: {rg.num_rows:,} rows, "
                   f"sorting_columns={getattr(rg, 'sorting_columns', None)}")
+            print(f"   rg fields     : file_offset={getattr(rg, 'file_offset', None)}, "
+                  f"total_byte_size={getattr(rg, 'total_byte_size', None)}, "
+                  f"total_compressed_size={getattr(rg, 'total_compressed_size', None)}, "
+                  f"ordinal={getattr(rg, 'ordinal', None)}")
             print(f"   chunk         : {m.total_compressed_size:,} comp / "
                   f"{m.total_uncompressed_size:,} raw bytes, {m.num_values:,} values")
+            print(f"   chunk fields  : file_path={getattr(cc, 'file_path', None)!r}, "
+                  f"file_offset={getattr(cc, 'file_offset', None)}, codec={m.codec}, "
+                  f"index_page_offset={getattr(m, 'index_page_offset', None)}")
             print(f"   encodings     : {[_enc(e) for e in (m.encodings or [])]}")
             es = m.encoding_stats
             print(f"   encoding_stats: " + (
@@ -140,8 +171,14 @@ def main():
                           for s in es) if es else "ABSENT"))
             st = m.statistics
             print(f"   statistics    : null_count={getattr(st, 'null_count', None)}, "
-                  f"distinct_count={getattr(st, 'distinct_count', None)}, "
-                  f"min/max set={st is not None and getattr(st, 'max_value', None) is not None}")
+                  f"distinct_count={getattr(st, 'distinct_count', None)}")
+            # Which Statistics fields are populated — a writer on deprecated min/max and one
+            # on min_value/max_value look identical in every other readout here.
+            shape = ("ABSENT" if st is None else
+                     ", ".join(f"{f}={'set' if getattr(st, f, None) is not None else '-'}"
+                               for f in ("min", "max", "min_value", "max_value",
+                                         "is_min_value_exact", "is_max_value_exact")))
+            print(f"   stats shape   : {shape}")
             print(f"   index offsets : column_index={cc.column_index_offset}, "
                   f"offset_index={cc.offset_index_offset}, bloom={m.bloom_filter_offset}")
 
@@ -149,6 +186,21 @@ def main():
                                            end=start + m.total_compressed_size))
             pages = walk_pages(blob)
             n_data = sum(1 for p in pages if p["page_type"].startswith("DATA"))
+            # Dictionary page BYTES, compressed and decompressed — the payload decoder only
+            # compares parsed values, which cannot see codec or serialization differences.
+            for p in pages:
+                if p["page_type"] == "DICTIONARY_PAGE" and "error" not in p:
+                    body = blob[p["offset"] + p["header_bytes"]:
+                                p["offset"] + p["header_bytes"] + p["comp"]]
+                    from payload_diff import _decompress
+                    try:
+                        raw_sha = _sha(_decompress(body, m.codec, p["uncomp"]))
+                    except SystemExit as e:
+                        raw_sha = f"undecodable ({e})"
+                    print(f"   dict page raw : comp {p['comp']:,}B sha {_sha(body)} | "
+                          f"uncomp {p['uncomp']:,}B sha {raw_sha} | "
+                          f"stored_uncompressed={p['comp'] == p['uncomp']}")
+                    break
             print(f"   pages walked  : {len(pages)} ({n_data} data), showing first {N_PAGES}")
             for p in pages[:N_PAGES]:
                 extra = " ".join(f"{k}={v}" for k, v in p.items()

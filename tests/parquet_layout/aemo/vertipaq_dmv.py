@@ -14,8 +14,11 @@ different under that sort (e.g. an RLE pick with ~unit-length runs) vs the unsor
 Compare the same column across the two models and the madness gets a method, one way or the other.
 
 Env in: PBI_WORKSPACE, ADOMD_DIR (PBI_TOKEN self-acquired via duckrun when absent), RUN_REPORT
-(optional — merged under `vertipaq:` when set). Prints per-model tables + the cross-model DUID
-comparison, and appends to GITHUB_STEP_SUMMARY.
+(optional — merged under `vertipaq:` when set). DMV_MODELS (comma list) names the models to read
+instead of discovering the aemo pair from disk; DMV_COLUMNS (comma list) replaces the wide-fact
+hydrate/render columns for models that pruned the fact (writer_cold narrows to `date, time, DUID`
+— the default HYDRATE would error on the missing columns). Prints per-model tables + the
+cross-model DUID comparison, and appends to GITHUB_STEP_SUMMARY.
 """
 import os
 import re
@@ -31,11 +34,14 @@ import report  # noqa: E402
 import xmla_compare as xc  # noqa: E402  — reuses _load_adomd/open_conn/warm_up/discover_models
 
 FACT = "fct_summary"
+DEFAULT_COLUMNS = ("date", "time", "DUID", "mw", "price", "cutoff")
+COLUMNS = tuple(c.strip() for c in (os.environ.get("DMV_COLUMNS") or "").split(",")
+                if c.strip()) or DEFAULT_COLUMNS
 # One query that touches EVERY fact column, so all segments are resident before the DMVs read.
-HYDRATE = ('EVALUATE ROW("r", COUNTROWS(fct_summary), "d", DISTINCTCOUNT(fct_summary[DUID]), '
-           '"dt", DISTINCTCOUNT(fct_summary[date]), "t", DISTINCTCOUNT(fct_summary[time]), '
-           '"m", SUM(fct_summary[mw]), "p", SUM(fct_summary[price]), '
-           '"c", MAX(fct_summary[cutoff]))')
+# DISTINCTCOUNT is type-agnostic, so the same shape works for any column list.
+HYDRATE = ('EVALUATE ROW("r", COUNTROWS(fct_summary), '
+           + ", ".join(f'"c{i}", DISTINCTCOUNT(fct_summary[{c}])'
+                       for i, c in enumerate(COLUMNS)) + ")")
 
 
 def dmv_rows(conn, sql):
@@ -117,7 +123,7 @@ def render(model, data, out):
     out.append("| column | encoding | dict MB | segs | resident MB | bits/seg | compression/seg |")
     out.append("|---|---|---|---|---|---|---|")
     rendered = 0
-    for col in ("date", "time", "DUID", "mw", "price", "cutoff"):
+    for col in COLUMNS:
         d = data.get(col)
         if not d:
             continue
@@ -137,7 +143,8 @@ def main():
     from duckrun import auth
     token = os.environ.get("PBI_TOKEN") or auth.get_powerbi_token()
     xc._load_adomd(os.environ.get("ADOMD_DIR", "."))
-    base, others = xc.discover_models()
+    named = [m.strip() for m in (os.environ.get("DMV_MODELS") or "").split(",") if m.strip()]
+    base, others = (named[0], named[1:]) if named else xc.discover_models()
     lines = ["## VertiPaq resident-encoding readout"]
     merged = {}
     for model in [base] + others:

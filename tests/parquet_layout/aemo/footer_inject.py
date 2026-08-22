@@ -33,6 +33,14 @@ the diff exactly three differences remain:
                recognising the writer, and this is the only input left untested.
   logical      `LogicalType` - already MEASURED AND RULED OUT (probe_duid 12585ms with it,
                12312-13091ms without). Kept so the null result stays reproducible.
+  nodeprecstats
+               deprecated `Statistics.min`/`max`. DuckDB writes BOTH the deprecated pair and the
+               modern `min_value`/`max_value`; parquet-cpp writes only the modern pair. These
+               fields were deprecated BECAUSE their ordering semantics are type-dependent and were
+               unspecified for BYTE_ARRAY, so a reader that finds them set on a string column has
+               reason to distrust or re-derive. That shape matches the measured penalty gradient
+               (no cost on INT32, ~1.5-2.9x on decimals, ~20x on the string) better than any
+               property ruled out so far. Drops the deprecated pair, keeps everything else.
 
 Everything here rewrites metadata only. Page data is never touched, every offset in a parquet
 footer is absolute from the start of the file, and new OffsetIndex structures are appended in the
@@ -47,7 +55,8 @@ aborts unless the untouched rebuild is byte-identical.
 import struct
 
 MARKER = b"PAR1"
-FEATURES = ("logical", "encstats", "offsetindex", "encodings", "createdby", "nodistinct")
+FEATURES = ("logical", "encstats", "offsetindex", "encodings", "createdby", "nodistinct",
+            "nodeprecstats")
 
 # Statistics field order, for rebuilding one WITHOUT a chosen field. None of these are I32:
 # null_count and distinct_count are both I64, so no i32list is needed.
@@ -155,7 +164,7 @@ def patch_bytes(blob, features):
         notes.append(f"LogicalType on {', '.join(promoted)}")
 
     # ---- row groups: encoding_stats on the chunk, OffsetIndex appended after the data
-    indexes, n_es, n_oi, n_enc, n_nd = [], 0, 0, 0, 0
+    indexes, n_es, n_oi, n_enc, n_nd, n_dep = [], 0, 0, 0, 0, 0
     cursor = foot_start                       # where appended OffsetIndex structures will land
     row_groups = []
     for rg in fmd.row_groups:
@@ -183,12 +192,21 @@ def patch_bytes(blob, features):
             # RLE — so a reader asking "is there a dictionary here?" finds neither PLAIN nor
             # PLAIN_DICTIONARY. Rebuild the list from what the pages actually use.
             stats = None
-            if "nodistinct" in features and m.statistics is not None                     and getattr(m.statistics, "distinct_count", None) is not None:
-                src_st = m.statistics
+            drop = set()
+            if "nodistinct" in features:
+                drop.add("distinct_count")
+            if "nodeprecstats" in features:
+                drop.update(("min", "max"))
+            src_st = m.statistics
+            if drop and src_st is not None                     and any(getattr(src_st, f, None) is not None for f in drop):
                 kw_st = {f: getattr(src_st, f) for f in STAT_FIELDS
-                         if f != "distinct_count" and getattr(src_st, f, None) is not None}
+                         if f not in drop and getattr(src_st, f, None) is not None}
                 stats = ThriftObject.from_fields("Statistics", **kw_st)
-                n_nd += 1
+                if getattr(src_st, "distinct_count", None) is not None and "distinct_count" in drop:
+                    n_nd += 1
+                if "min" in drop and (getattr(src_st, "min", None) is not None
+                                      or getattr(src_st, "max", None) is not None):
+                    n_dep += 1
 
             encs = None
             if "encodings" in features and pages:
@@ -236,6 +254,8 @@ def patch_bytes(blob, features):
         notes.append(f"completed encodings on {n_enc} chunk(s)")
     if n_nd:
         notes.append(f"dropped distinct_count on {n_nd} chunk(s)")
+    if n_dep:
+        notes.append(f"dropped deprecated min/max on {n_dep} chunk(s)")
     # created_by is decided BEFORE the early return: it is a whole-footer field, so it is the one
     # feature that can be the only thing a run changes.
     new_created_by = None

@@ -41,13 +41,21 @@ on:
         type: string
         default: "1048576"
       opt_footer_inject:
-        description: "[duckdb arm] comma-separated footer metadata to add that DuckDB omits and delta-rs writes: encstats (PageEncodingStats), offsetindex (OffsetIndex), logical (LogicalType — already measured as a no-op). Empty writes DuckDB's footer untouched. A page-level diff proved the DATA is the same, so these are what is left."
+        description: "[duckdb arm] comma-separated footer rewrites (footer_inject.FEATURES): logical (LogicalType), encstats (PageEncodingStats), offsetindex (OffsetIndex), encodings (complete the encodings list), createdby (masquerade as parquet-rs), nodistinct (drop distinct_count), nodeprecstats (drop the deprecated min/max pair DuckDB writes and parquet-cpp does not). The first six each measured flat ALONE; they all compose in ONE run — the conjunction no single-variable run can test. Empty writes DuckDB's footer untouched."
         type: string
         default: ""
       opt_reframe:
         description: "[duckdb arm] re-encode this column's dictionary indices at 63 groups per bit-packed run (504 values) — what parquet-rs and parquet-cpp both emit and DuckDB never does at any COPY setting. Same values, same bit width, same dictionary, same page boundaries; only the run boundaries move. 'DUID', or 'all', or empty to leave the pages alone."
         type: string
         default: ""
+      opt_store_schema:
+        description: "[pyarrow arm] pyarrow ParquetWriter store_schema. false strips the ARROW:schema footer key/value — the one footer property BOTH fast writers carry and DuckDB lacks. If the stripped pyarrow file cold-reads slow, the consumer's fast path is gated on ARROW:schema."
+        type: boolean
+        default: true
+      opt_threads:
+        description: "[duckdb arm] COPY thread count. 2 is the memory-fit default; 1 makes row-group emission deterministic (stream order) — with 2 threads the parallel carve emits row groups OUT of stream order, a real difference from the single-stream fast writers (payload_diff shows rg0 holding mid-stream rows)."
+        type: string
+        default: "2"
       columns:
         description: "narrow both tables to these columns — a MINIMAL reproducer. 'date, time, DUID' writes ~1/5 the bytes of the full fact and measures exactly the same thing, because probing one column only transcodes that column. date and time are carried so the sort key stays intact and both writers receive an identically ordered stream; neither is ever probed. Empty = the full fact."
         type: string
@@ -66,6 +74,7 @@ on:
           - pyarrow
           - deltars,duckdb
           - deltars,pyarrow
+          - duckdb,pyarrow
           - deltars,duckdb,pyarrow
       order:
         description: "which writer is measured FIRST when arms builds both. The two passes share one capacity, so the second can inherit smoothing/throttling from the first — swap this and re-run to prove an effect is the parquet and not the running order."
@@ -175,6 +184,7 @@ jobs:
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
           OPT_REFRAME: ${{ inputs.opt_reframe }}
+          OPT_THREADS: ${{ inputs.opt_threads }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
@@ -191,6 +201,7 @@ jobs:
           BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
           OPT_TABLE: ${{ env.TABLE_PYARROW }}
           OPT_WRITER: pyarrow
+          OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
           OPT_COLUMNS: ${{ inputs.columns }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
@@ -235,6 +246,26 @@ jobs:
             MODEL="$model" VARIANT="$arm" python tests/parquet_layout/writer_cold/cold_bench.py
           done
 
+      - name: 🔎 Storage DMV readout — what the transcode actually built
+        # Consumer-side visibility: per-column resident encoding (HASH/VALUE), dictionary size,
+        # and per-segment rows/bytes/compression/bits for each arm's model. Runs strictly AFTER
+        # the cold loop, so its hydrate cannot disturb any cold number — re-touching columns is
+        # exactly what the DMV read needs.
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          PYTHONNET_RUNTIME: coreclr
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"
+          DMV_COLUMNS: ${{ inputs.columns }}
+        run: |
+          set -euo pipefail
+          models=""
+          case "$ARMS" in *deltars*) models="$MODEL_DELTARS" ;; esac
+          case "$ARMS" in *duckdb*)  models="${models:+$models,}$MODEL_DUCKDB" ;; esac
+          case "$ARMS" in *pyarrow*) models="${models:+$models,}$MODEL_PYARROW" ;; esac
+          DMV_MODELS="$models" python tests/parquet_layout/aemo/vertipaq_dmv.py
+
       - name: 🧬 Payload diff — decode the files this run measured
         # Runs BEFORE teardown, against the exact tables the cold pass timed, rather than inferring
         # structure from a different pair built by another workflow.
@@ -251,6 +282,25 @@ jobs:
           case "$ARMS" in *duckdb*)  uris="${uris:+$uris,}$TABLES_DUCKDB/tests/$TABLE_DUCKDB" ;; esac
           case "$ARMS" in *pyarrow*) uris="${uris:+$uris,}$TABLES_PYARROW/tests/$TABLE_PYARROW" ;; esac
           PAYLOAD_DIFF_URIS="$uris" python tests/parquet_layout/aemo/payload_diff.py
+
+      - name: 🔬 Page + footer diff — headers and the never-compared footer fields
+        # walk_pages dumps DictionaryPageHeader encoding/is_sorted and PageHeader.crc; the footer
+        # dump covers format version, root schema name, column_orders contents, key/value VALUES
+        # (ARROW:schema), Statistics field shape, RowGroup/ColumnChunk offsets, and the dictionary
+        # page's raw bytes — everything no tool had printed for the exact files being timed.
+        if: ${{ always() && contains(inputs.arms, 'duckdb') }}
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+          PAGE_DIFF_COLUMN: DUID
+          PAGE_DIFF_ROW_GROUPS: "2"
+        run: |
+          set -euo pipefail
+          uris=""
+          case "$ARMS" in *deltars*) uris="$TABLES_DELTARS/tests/$TABLE_DELTARS" ;; esac
+          case "$ARMS" in *duckdb*)  uris="${uris:+$uris,}$TABLES_DUCKDB/tests/$TABLE_DUCKDB" ;; esac
+          case "$ARMS" in *pyarrow*) uris="${uris:+$uris,}$TABLES_PYARROW/tests/$TABLE_PYARROW" ;; esac
+          PAGE_DIFF_URIS="$uris" python tests/parquet_layout/aemo/page_diff.py
 
       - name: 📊 Summary
         if: ${{ always() }}

@@ -115,6 +115,16 @@ FOOTER_INJECT = [f.strip() for f in (os.environ.get("OPT_FOOTER_INJECT") or "").
 # column name to rewrite that column, or 'all'. Same values, same bit width, same dictionary, same
 # page boundaries — only the run boundaries move. See page_reframe.py.
 REFRAME = (os.environ.get("OPT_REFRAME") or "").strip()
+# DIAGNOSTIC (pyarrow arm). Both fast writers carry an ARROW:schema key/value in the footer;
+# DuckDB carries none — the one footer property the fast writers SHARE and DuckDB lacks.
+# store_schema=False strips it from the pyarrow file: if that file then cold-reads slow, the
+# consumer's fast path is gated on ARROW:schema, not on anything parquet-spec.
+STORE_SCHEMA = (os.environ.get("OPT_STORE_SCHEMA") or "true").strip().lower() in ("true", "1", "yes")
+# DIAGNOSTIC (duckdb arm). COPY thread count — 2 is the memory-fit default (see the SET threads
+# comment at the call site). 1 additionally makes row-group emission deterministic: the parallel
+# carve emits row groups OUT of stream order (rg0 holds mid-stream rows; payload_diff shows it),
+# which is a real difference from the single-stream fast writers.
+THREADS = int(os.environ.get("OPT_THREADS") or 2)
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -178,7 +188,7 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
             if w is None:
                 w = pq.ParquetWriter(local, tbl.schema, compression="snappy", use_dictionary=True,
                                      data_page_size=PAGE_BYTES, version="1.0",
-                                     write_statistics=True)
+                                     write_statistics=True, store_schema=STORE_SCHEMA)
             w.write_table(tbl.slice(0, RG), row_group_size=RG)
             tbl = tbl.slice(RG)
         return tbl, w
@@ -197,7 +207,8 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
             if writer is None:
                 writer = pq.ParquetWriter(local, tbl.schema, compression="snappy",
                                           use_dictionary=True, data_page_size=PAGE_BYTES,
-                                          version="1.0", write_statistics=True)
+                                          version="1.0", write_statistics=True,
+                                          store_schema=STORE_SCHEMA)
             writer.write_table(tbl, row_group_size=RG)
             written += nbuf
     finally:
@@ -205,8 +216,8 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
             writer.close()
     size = os.path.getsize(local)
     print(f"{written:,} rows -> pyarrow (parquet-cpp) {pa.__version__}, ROW_GROUP_SIZE {RG:,} "
-          f"x data_page_size {PAGE_BYTES:,} x snappy x v1.0 -> {size / 1048576:.1f} MB "
-          f"in {time.perf_counter() - t_s:.1f}s", flush=True)
+          f"x data_page_size {PAGE_BYTES:,} x snappy x v1.0 x store_schema={STORE_SCHEMA} "
+          f"-> {size / 1048576:.1f} MB in {time.perf_counter() - t_s:.1f}s", flush=True)
     store = build_store(table_uri, con.storage_options)
     upload(store, os.path.basename(local), local, single_shot=True)
     print(f"uploaded {os.path.basename(local)}", flush=True)
@@ -266,7 +277,8 @@ else:
     # in parallel), but that clustering was measured worth 0.05% of the table here
     # (19/23 -> 0/2 overlapping pairs moved it 835.08 -> 834.66 MB) and delta-rs, the writer
     # this is compared against, ships 2/3 overlapping files itself. So overlap is accepted.
-    dd.execute("SET threads=2")
+    # OPT_THREADS=1 exists as a diagnostic: it restores stream-order row-group emission.
+    dd.execute(f"SET threads={THREADS}")
     if WRITER == "pyarrow":
         _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con)
     else:
@@ -306,10 +318,22 @@ else:
     if not sizes:
         raise SystemExit(f"listing returned no part-{run_tag}-* files")
 
-    # DIAGNOSTIC (OPT_FOOTER_INJECT): add the metadata delta-rs writes and DuckDB does not. Must
-    # happen HERE — after the COPY, before the listing that feeds AddAction.size — because the
-    # rewrite makes each file longer, and a Delta size field that disagrees with the blob is a
-    # worse bug than the one being investigated.
+    # DIAGNOSTIC rewrites. Both must happen HERE — after the COPY, before the listing that feeds
+    # AddAction.size — because each rewrite changes file length, and a Delta size field that
+    # disagrees with the blob is a worse bug than the one being investigated. REFRAME runs FIRST:
+    # page_reframe rebuilds every ColumnChunk with NULLed index offsets (page_reframe.py), so an
+    # OffsetIndex injected before it would be silently stripped; footer_inject walks the pages
+    # itself, so injecting after the reframe describes the file as it now is.
+    if REFRAME:
+        import page_reframe
+        col = None if REFRAME.lower() == "all" else REFRAME
+        print(f"re-framing bit-packed runs to {page_reframe.GROUPS} groups "
+              f"({page_reframe.GROUPS * 8} values) in {len(sizes)} file(s), "
+              f"column={col or 'ALL'}", flush=True)
+        page_reframe.reframe_remote(store, sorted(sizes), column=col)
+        sizes = _listing()          # every page changed size; re-read the true sizes
+
+    # DIAGNOSTIC (OPT_FOOTER_INJECT): add the metadata delta-rs writes and DuckDB does not.
     if FOOTER_INJECT:
         import footer_inject
         print(f"injecting {', '.join(FOOTER_INJECT)} into {len(sizes)} footer(s)", flush=True)
@@ -319,15 +343,6 @@ else:
                              "needed injecting — duckdb may have started writing it, which would "
                              "silently turn this run into a no-op control.")
         sizes = _listing()          # files grew; re-read the true sizes
-
-    if REFRAME:
-        import page_reframe
-        col = None if REFRAME.lower() == "all" else REFRAME
-        print(f"re-framing bit-packed runs to {page_reframe.GROUPS} groups "
-              f"({page_reframe.GROUPS * 8} values) in {len(sizes)} file(s), "
-              f"column={col or 'ALL'}", flush=True)
-        page_reframe.reframe_remote(store, sorted(sizes), column=col)
-        sizes = _listing()          # every page changed size; re-read the true sizes
 
     files = sorted(sizes)
     k = len(files)
