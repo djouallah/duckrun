@@ -224,6 +224,80 @@ def read_table(name, uri, storage_options):
     return out
 
 
+def read_delta_log(uri, storage_options):
+    """The Delta commit both arms wrote. Direct Lake plans from this, not from the parquet.
+
+    The duckdb and pyarrow arms share one AddAction code path, which is why this was assumed
+    equal - but the stats inside come from parquet_metadata() over each writer's own footers,
+    and DuckDB's chunks carry distinct_count and the deprecated min/max that pyarrow's do not.
+    Nothing has ever diffed the two logs.
+    """
+    import json
+
+    import obstore
+    from dbt.adapters.duckrun.objectstore import build_store
+
+    store = build_store(uri + "/_delta_log", storage_options)
+    names = []
+    for batch in obstore.list(store):
+        for obj in batch:
+            nm = obj["path"].rsplit("/", 1)[-1]
+            if nm.endswith(".json"):
+                names.append(nm)
+    out = {"commits": len(names), "adds": [], "metadata": None, "protocol": None}
+    for nm in sorted(names):
+        raw = bytes(obstore.get(store, nm).bytes()).decode("utf8", "replace")
+        for line in raw.splitlines():
+            if not line.strip():
+                continue
+            act = json.loads(line)
+            if "add" in act:
+                add = dict(act["add"])
+                st = add.get("stats")
+                add["stats_parsed"] = json.loads(st) if isinstance(st, str) else st
+                add.pop("stats", None)
+                add.pop("modificationTime", None)     # wall clock, never comparable
+                add["path"] = "<file>"                # uuid per run, never comparable
+                out["adds"].append(add)
+            elif "metaData" in act:
+                md = dict(act["metaData"])
+                md.pop("id", None)
+                md.pop("createdTime", None)
+                out["metadata"] = md
+            elif "protocol" in act:
+                out["protocol"] = act["protocol"]
+    return out
+
+
+def diff_delta_log(a_name, a_log, b_name, b_log):
+    print(f"\n{'=' * 100}\nDELTA LOG\n{'=' * 100}")
+    shown = 0
+
+    def cmp(path, va, vb):
+        nonlocal shown
+        if va == vb:
+            return
+        shown += 1
+        print(f"  {path}")
+        print(f"      {a_name:<26} {va}")
+        print(f"      {b_name:<26} {vb}")
+
+    cmp("commits", a_log["commits"], b_log["commits"])
+    cmp("protocol", a_log["protocol"], b_log["protocol"])
+    for k in sorted(set(a_log["metadata"] or {}) | set(b_log["metadata"] or {})):
+        cmp(f"metaData.{k}", (a_log["metadata"] or {}).get(k), (b_log["metadata"] or {}).get(k))
+    cmp("n_add_actions", len(a_log["adds"]), len(b_log["adds"]))
+    for i, (aa, bb) in enumerate(zip(a_log["adds"], b_log["adds"])):
+        for k in sorted(set(aa) | set(bb)):
+            if k == "stats_parsed":
+                sa, sb = aa.get(k) or {}, bb.get(k) or {}
+                for sk in sorted(set(sa) | set(sb)):
+                    cmp(f"add[{i}].stats.{sk}", sa.get(sk), sb.get(sk))
+            else:
+                cmp(f"add[{i}].{k}", aa.get(k), bb.get(k))
+    print(f"  {shown} Delta-log field(s) differ" if shown else "  Delta logs are IDENTICAL")
+
+
 def diff(a, b):
     """Print every field that differs. Same-valued fields are summarised, not listed."""
     same, shown = 0, 0
@@ -277,8 +351,17 @@ def main():
     for t in tables:
         print(f"{t['name']:<28} {t['file']}  ({t['size'] / 1048576:.1f} MB, "
               f"{t['n_row_groups']} row groups, created_by={t['created_by']})")
-    for other in tables[1:]:
+    logs = []
+    for u in URIS:
+        try:
+            logs.append(read_delta_log(u.rstrip("/"), con.storage_options))
+        except Exception as ex:                       # never let the log read hide the byte diff
+            print(f"delta log unreadable for {u}: {type(ex).__name__}: {ex}")
+            logs.append(None)
+    for i, other in enumerate(tables[1:], start=1):
         diff(tables[0], other)
+        if logs[0] and logs[i]:
+            diff_delta_log(tables[0]["name"], logs[0], other["name"], logs[i])
 
 
 if __name__ == "__main__":
