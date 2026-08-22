@@ -52,6 +52,10 @@ on:
         description: "[pyarrow arm] pyarrow ParquetWriter store_schema. false strips the ARROW:schema footer key/value — the one footer property BOTH fast writers carry and DuckDB lacks. If the stripped pyarrow file cold-reads slow, the consumer's fast path is gated on ARROW:schema."
         type: boolean
         default: true
+      opt_rg:
+        description: "ROW_GROUP_SIZE for every arm. DuckDB rounds this UP to a multiple of its 2048-row vector (6000000 becomes 6000640) while pyarrow slices exactly, so the arms only share row-group boundaries when this is already a multiple of 2048 — which a chunk-for-chunk comparison between two files requires."
+        type: string
+        default: "6000000"
       opt_threads:
         description: "[duckdb arm] COPY thread count. 2 is the memory-fit default; 1 makes row-group emission deterministic (stream order) — with 2 threads the parallel carve emits row groups OUT of stream order, a real difference from the single-stream fast writers (payload_diff shows rg0 holding mid-stream rows)."
         type: string
@@ -185,6 +189,7 @@ jobs:
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
           OPT_REFRAME: ${{ inputs.opt_reframe }}
           OPT_THREADS: ${{ inputs.opt_threads }}
+          OPT_RG: ${{ inputs.opt_rg }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
@@ -202,6 +207,7 @@ jobs:
           OPT_TABLE: ${{ env.TABLE_PYARROW }}
           OPT_WRITER: pyarrow
           OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
+          OPT_RG: ${{ inputs.opt_rg }}
           OPT_COLUMNS: ${{ inputs.columns }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
