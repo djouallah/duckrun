@@ -56,7 +56,15 @@ import struct
 
 MARKER = b"PAR1"
 FEATURES = ("logical", "encstats", "offsetindex", "encodings", "createdby", "nodistinct",
-            "nodeprecstats", "arrowschema")
+            "nodeprecstats", "arrowschema", "schemaname")
+
+# What `schemaname` renames the ROOT schema element to. DuckDB writes 'duckdb_schema', parquet-cpp
+# writes 'schema', parquet-rs writes 'arrow_schema'. The name is arbitrary per the spec, which is
+# exactly why it is worth testing: `createdby` rewrote only created_by, and the seven-flag union
+# never touched this string, so a consumer recognising the writer by its schema name would have
+# survived every run so far. The two fast writers disagree on the value, so any name that is not
+# DuckDB's answers the question.
+SCHEMA_NAME = "schema"
 
 # Statistics field order, for rebuilding one WITHOUT a chosen field. None of these are I32:
 # null_count and distinct_count are both I64, so no i32list is needed.
@@ -121,8 +129,12 @@ def _arrow_schema_value(blob):
     return value
 
 
-def _obj(name, i32, src, fields, **override):
-    """Rebuild a thrift struct from a PARSED object, never from `_asdict()`."""
+def _obj(name, i32, src, fields, /, **override):
+    """Rebuild a thrift struct from a PARSED object, never from `_asdict()`.
+
+    The framing parameters are positional-only so that `name` stays available as an override:
+    SchemaElement has a field called `name`, and it would otherwise collide with this signature.
+    """
     from fastparquet.cencoding import ThriftObject
 
     kw = {f: getattr(src, f) for f in fields if getattr(src, f, None) is not None}
@@ -169,22 +181,28 @@ def patch_bytes(blob, features):
     fmd = from_buffer(NumpyIO(np.frombuffer(blob[foot_start:-8], dtype="uint8")), "FileMetaData")
     notes = []
 
-    # ---- schema: LogicalType
-    schema, promoted = [], []
-    for se in fmd.schema:
+    # ---- schema: LogicalType, and the root element's name
+    schema, promoted, renamed = [], [], None
+    for i, se in enumerate(fmd.schema):
         promo = (PROMOTE.get(se.converted_type)
                  if "logical" in features and se.logicalType is None else None)
         lt = ThriftObject.from_fields("LogicalType", **{promo: {}}) if promo else None
-        new = _obj("SchemaElement", SE_I32, se, SE_FIELDS, logicalType=lt)
+        was = se.name.decode() if isinstance(se.name, bytes) else str(se.name)
+        rename = (SCHEMA_NAME.encode()
+                  if i == 0 and "schemaname" in features and was != SCHEMA_NAME else None)
+        new = _obj("SchemaElement", SE_I32, se, SE_FIELDS, logicalType=lt, name=rename)
         if promo:
-            nm = se.name
-            promoted.append(nm.decode() if isinstance(nm, bytes) else str(nm))
-        elif bytes(new.to_bytes()) != bytes(se.to_bytes()):
+            promoted.append(was)
+        if rename is not None:
+            renamed = was
+        elif not promo and bytes(new.to_bytes()) != bytes(se.to_bytes()):
             raise SystemExit(f"footer_inject: SchemaElement rebuild is not byte-identical ({se.name})"
                              " — refusing to write a footer that differs from the writer's")
         schema.append(new)
     if promoted:
         notes.append(f"LogicalType on {', '.join(promoted)}")
+    if renamed is not None:
+        notes.append(f"root schema element {renamed!r} -> {SCHEMA_NAME!r}")
 
     # ---- row groups: encoding_stats on the chunk, OffsetIndex appended after the data
     indexes, n_es, n_oi, n_enc, n_nd, n_dep = [], 0, 0, 0, 0, 0
