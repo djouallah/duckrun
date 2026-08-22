@@ -36,6 +36,9 @@ VARIANTS = [
 ]
 
 
+ARMS = [a.strip() for a in (os.environ.get("ARMS") or "deltars,duckdb").split(",") if a.strip()]
+
+
 def main():
     raw = open(TEMPLATE, encoding="utf-8").read()
     if "__FACT_TABLE__" not in raw:
@@ -50,7 +53,7 @@ def main():
 
     ws = duckrun.workspace(os.environ["WS_ID"])
     out = {}
-    for v in VARIANTS:
+    for v in (v for v in VARIANTS if v["key"] in ARMS):
         bim = raw.replace("__FACT_TABLE__", v["table"])
         path = os.path.join(tempfile.mkdtemp(prefix=f"bim_{v['key']}_"), "model.bim")
         with open(path, "w", encoding="utf-8") as f:

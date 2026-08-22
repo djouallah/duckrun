@@ -33,6 +33,13 @@ MODELS = {
     "duckdb": os.environ.get("MODEL_DUCKDB") or "writer_cold_duckdb",
 }
 WS_ID = os.environ["WS_ID"]
+# Which writer arms this run measures. delta-rs is a settled baseline (probe_duid 0.9-2.3s across
+# nine runs), so re-provisioning and re-measuring it every time is pure cost. Teardown deliberately
+# still sweeps BOTH names - a lakehouse leaked by an earlier run bills forever.
+ARMS = [a.strip() for a in (os.environ.get("ARMS") or "deltars,duckdb").split(",") if a.strip()]
+_unknown = set(ARMS) - set(LH)
+if _unknown:
+    raise SystemExit(f"provision: unknown arm(s) {sorted(_unknown)}; known: {sorted(LH)}")
 
 
 def _ws():
@@ -44,7 +51,7 @@ def _ws():
 def create():
     ws = _ws()
     out = {}
-    for key, name in LH.items():
+    for key, name in ((k, LH[k]) for k in ARMS):
         lh_id = ws.create_lakehouse(name, schemas=True)
         out[f"LH_ID_{key.upper()}"] = lh_id
         out[f"LH_NAME_{key.upper()}"] = name
