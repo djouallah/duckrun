@@ -19,6 +19,12 @@ the diff exactly three differences remain:
                RLE_DICTIONARY) and declares one: `['RLE_DICTIONARY']`, against delta-rs's
                `['PLAIN', 'RLE', 'RLE_DICTIONARY']`. Neither PLAIN nor PLAIN_DICTIONARY appears,
                so a reader testing that list for a dictionary page finds none.
+  nodistinct   `Statistics.distinct_count` - DuckDB writes it, and BOTH fast writers omit it
+               entirely (parquet-rs and parquet-cpp both leave it null). After run framing was
+               re-encoded and measured as a no-op, this is the only known property the slow writer
+               has that neither fast writer has. The field is widely treated as unreliable, so a
+               consumer that trusts it - to pre-size a dictionary, say - would be sized from a
+               PER-ROW-GROUP count for a column with more values globally.
   createdby    `created_by` - the writer's signature. Everything else has been eliminated: the
                data is identical, every metadata difference has been injected with no effect,
                running order is ruled out, and NEUTRAL READERS SHOW NO GAP AT ALL (pyarrow and
@@ -41,7 +47,12 @@ aborts unless the untouched rebuild is byte-identical.
 import struct
 
 MARKER = b"PAR1"
-FEATURES = ("logical", "encstats", "offsetindex", "encodings", "createdby")
+FEATURES = ("logical", "encstats", "offsetindex", "encodings", "createdby", "nodistinct")
+
+# Statistics field order, for rebuilding one WITHOUT a chosen field. None of these are I32:
+# null_count and distinct_count are both I64, so no i32list is needed.
+STAT_FIELDS = ["max", "min", "null_count", "distinct_count", "max_value", "min_value",
+               "is_max_value_exact", "is_min_value_exact"]
 
 # What `createdby` rewrites the footer's created_by string to. Readers legitimately
 # branch on this: parquet-mr distrusts statistics from known-buggy writer versions, and
@@ -144,7 +155,7 @@ def patch_bytes(blob, features):
         notes.append(f"LogicalType on {', '.join(promoted)}")
 
     # ---- row groups: encoding_stats on the chunk, OffsetIndex appended after the data
-    indexes, n_es, n_oi, n_enc = [], 0, 0, 0
+    indexes, n_es, n_oi, n_enc, n_nd = [], 0, 0, 0, 0
     cursor = foot_start                       # where appended OffsetIndex structures will land
     row_groups = []
     for rg in fmd.row_groups:
@@ -171,6 +182,14 @@ def patch_bytes(blob, features):
             # only the data-page encoding, omitting the dictionary page's PLAIN and the levels'
             # RLE — so a reader asking "is there a dictionary here?" finds neither PLAIN nor
             # PLAIN_DICTIONARY. Rebuild the list from what the pages actually use.
+            stats = None
+            if "nodistinct" in features and m.statistics is not None                     and getattr(m.statistics, "distinct_count", None) is not None:
+                src_st = m.statistics
+                kw_st = {f: getattr(src_st, f) for f in STAT_FIELDS
+                         if f != "distinct_count" and getattr(src_st, f, None) is not None}
+                stats = ThriftObject.from_fields("Statistics", **kw_st)
+                n_nd += 1
+
             encs = None
             if "encodings" in features and pages:
                 seen = set()
@@ -201,8 +220,8 @@ def patch_bytes(blob, features):
                 n_oi += 1
 
             meta = _obj("ColumnMetaData", CMD_I32, m, CMD_FIELDS, encoding_stats=es,
-                        encodings=encs)
-            if es is None and encs is None and bytes(meta.to_bytes()) != bytes(m.to_bytes()):
+                        encodings=encs, statistics=stats)
+            if es is None and encs is None and stats is None                     and bytes(meta.to_bytes()) != bytes(m.to_bytes()):
                 raise SystemExit("footer_inject: ColumnMetaData rebuild is not byte-identical "
                                  f"({m.path_in_schema}) — refusing to write it")
             new_cc = _obj("ColumnChunk", CC_I32, cc, CC_FIELDS, meta_data=meta,
@@ -215,6 +234,8 @@ def patch_bytes(blob, features):
         notes.append(f"OffsetIndex on {n_oi} chunk(s)")
     if n_enc:
         notes.append(f"completed encodings on {n_enc} chunk(s)")
+    if n_nd:
+        notes.append(f"dropped distinct_count on {n_nd} chunk(s)")
     # created_by is decided BEFORE the early return: it is a whole-footer field, so it is the one
     # feature that can be the only thing a run changes.
     new_created_by = None
