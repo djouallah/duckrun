@@ -187,6 +187,18 @@ def _stat_min(fmd, column):
     return bytes(raw)
 
 
+def _run_stats(idx, cap=400_000):
+    """Runs of equal consecutive values — the structure a consumer would RLE."""
+    v = idx[:cap]
+    if not len(v):
+        return {"value_runs": 0, "mean_run": 0.0, "max_run": 0, "frac_len1": 0.0}
+    brk = np.flatnonzero(np.diff(v)) + 1
+    runs = np.diff(np.concatenate(([0], brk, [len(v)])))
+    return {"value_runs": int(len(runs)), "mean_run": round(float(runs.mean()), 2),
+            "max_run": int(runs.max()), "frac_len1": round(float((runs == 1).mean()), 3),
+            "run_values": int(len(v))}
+
+
 def _hash(items):
     h = hashlib.sha256()
     for x in items:
@@ -225,6 +237,12 @@ def analyse(label, files, column, n_pages):
                             else "-",
                 "val_head": [d[i].decode(errors="replace") for i in idx[:6]] if (
                     d is not None and len(idx)) else [],
+                # VALUE run lengths — not parquet's RLE runs, the runs of equal consecutive values.
+                # This is what the consumer can actually run-length encode: a column with runs is
+                # stored as (value, count) pairs, one without them gets a per-row hash lookup. The
+                # writer does not create runs, the SORT does, so if this differs between writers on
+                # the same source the two files do not hold the same physical order.
+                **_run_stats(idx),
             })
     print(f"\n{'=' * 108}\n{label}\n{'=' * 108}")
     print(f"{'rg':>3} {'dict':>5} {'dict order hash':>17} {'dict set hash':>15} {'bw':>3} "
@@ -328,6 +346,12 @@ def main():
             rle = sum(r["pages"][0]["rle_runs"] for r in rows if r["pages"])
             print(f"   {n:<26} row_groups={len(rows)} bit_widths={bws} "
                   f"mean_bitpacked={mbp} total_rle_runs={rle}")
+        print("\nVALUE runs (runs of equal consecutive values), row group 0:")
+        for n in names:
+            r = summary[n][0]
+            print(f"   {n:<26} over {r.get('run_values', 0):>7,} values: "
+                  f"runs={r.get('value_runs'):>7,} mean={r.get('mean_run')} "
+                  f"max={r.get('max_run')} frac_len1={r.get('frac_len1')}")
 
 
 def selftest(*paths):
