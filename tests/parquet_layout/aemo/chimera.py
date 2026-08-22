@@ -58,6 +58,27 @@ def transplant_bytes(host_blob, donor_blob, column):
                 f"{drg.num_rows:,} in the donor. A transplant would produce a footer that lies "
                 "about its own contents. Pass a multiple of 2048 as opt_rg so DuckDB's vector "
                 "rounding and pyarrow's exact slicing agree, and threads=1 so the order matches.")
+        # Matching row COUNTS are not matching ROWS. A bare `limit` over an unordered scan once
+        # gave the two arms different 142M-row subsets of the same source - same counts, different
+        # data - and two transplants were measured before a Delta-log diff caught it. The columns
+        # that are NOT being replaced must describe the same rows on both sides, or the result is
+        # one writer's column bolted onto another writer's unrelated rows.
+        for hcc in hrg.columns:
+            nm = _name(hcc)
+            if nm == column:
+                continue
+            dcc = next((d for d in drg.columns if _name(d) == nm), None)
+            hs, ds = hcc.meta_data.statistics, dcc.meta_data.statistics if dcc else None
+            if hs is None or ds is None:
+                continue
+            for f in ("min_value", "max_value", "min", "max", "null_count"):
+                hv, dv = getattr(hs, f, None), getattr(ds, f, None)
+                if hv != dv:
+                    raise SystemExit(
+                        f"chimera: row group {i} column {nm!r} has {f}={hv!r} in the host and "
+                        f"{dv!r} in the donor — the two files do not hold the same rows, so a "
+                        "transplant would bolt one writer's column onto another writer's data. "
+                        "Check that the row cap is deterministic (order before limit).")
 
     out = bytearray(MARKER)
     row_groups, n_moved = [], 0
