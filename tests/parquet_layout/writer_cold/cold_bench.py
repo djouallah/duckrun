@@ -75,10 +75,13 @@ def open_conn(workspace, model, token, tries=5, delay=15):
 # PROBE_COLUMNS restricts the suite to columns the table actually has, so a narrowed reproducer
 # does not fail on a probe for a column that was never written. probe_rowcount always survives —
 # it is the control every marginal figure is measured against.
-_WANT = [c.strip() for c in (os.environ.get("PROBE_COLUMNS") or "").split(",") if c.strip()]
+# Case-folded: the probes are named for the column in lower case (probe_duid) while the column
+# itself is DUID, and an exact match silently leaves nothing to run.
+_WANT = {c.strip().casefold() for c in (os.environ.get("PROBE_COLUMNS") or "").split(",")
+         if c.strip()}
 if _WANT:
     QUERIES = [q for q in QUERIES
-               if q[0] == "probe_rowcount" or q[0][len("probe_"):] in _WANT]
+               if q[0] == "probe_rowcount" or q[0][len("probe_"):].casefold() in _WANT]
     if len(QUERIES) < 2:
         raise SystemExit(f"cold_bench: PROBE_COLUMNS {_WANT} left no column probe to run")
 
