@@ -41,8 +41,8 @@ on:
         description: "[duckdb arm] re-encode this column's dictionary indices at 63 groups per bit-packed run (504 values) — what parquet-rs and parquet-cpp both emit and DuckDB never does at any COPY setting. Same values, same bit width, same dictionary, same page boundaries; only the run boundaries move. 'DUID', or 'all', or empty to leave the pages alone."
         type: string
         default: ""
-      duckdb_pip:
-        description: "pip spec for the duckdb package every arm runs on, e.g. a wheel URL from a fork build. Empty = the pinned nightly (1.6.0.dev365). This is how the writer A/B tests an unreleased duckdb: same harness, same config, only the wheel differs. The DATA_PAGE_SIZE_LIMIT startup probe still gates whichever build lands."
+      duckdb_cli:
+        description: "[duckdb arm] URL of a DuckDB CLI binary (or .gz/.zip of one) to WRITE with instead of the pip package -- how an unreleased writer patch gets its DAX before/after: the fork's CI builds the CLI, the pip duckdb only stages source rows locally, the CLI does the sort+COPY with identical options, and the shared upload+commit+probe path is unchanged. Empty = the pip writer."
         type: string
         default: ""
       opt_write_statistics:
@@ -180,12 +180,7 @@ jobs:
           pip install -e .
 
       - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
-        if: ${{ inputs.duckdb_pip == '' }}
         run: pip install duckdb==1.6.0.dev365
-
-      - name: 🦆 Install a custom duckdb build instead (writer A/B against an unreleased patch)
-        if: ${{ inputs.duckdb_pip != '' }}
-        run: pip install --force-reinstall "${{ inputs.duckdb_pip }}"
 
       - name: 🧩 Install ADOMD.NET client (.NET Core build, cross-platform)
         run: |
@@ -273,6 +268,8 @@ jobs:
           OPT_DICT_SORTED: ${{ inputs.opt_dict_sorted }}
           OPT_PAGE_STATS: ${{ inputs.opt_page_stats }}
           OPT_DICT_LIMIT: ${{ inputs.opt_dict_limit }}
+          OPT_WRITER: ${{ inputs.duckdb_cli != '' && 'cli' || 'duckdb' }}
+          OPT_DUCKDB_CLI: ${{ inputs.duckdb_cli }}
           OPT_THREADS: ${{ inputs.opt_threads }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_SORT: ${{ inputs.opt_sort }}

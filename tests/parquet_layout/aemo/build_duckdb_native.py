@@ -110,8 +110,14 @@ _DD_CODEC = "uncompressed" if COMPRESSION in ("uncompressed", "none") else COMPR
 # that delta-rs writes through. It is the experiment that splits "DuckDB encodes something the
 # consumer dislikes" from "the consumer has a fast path only parquet-rs output hits".
 WRITER = (os.environ.get("OPT_WRITER") or "duckdb").strip().lower()
-if WRITER not in ("duckdb", "pyarrow"):
-    raise SystemExit(f"build_duckdb_native: OPT_WRITER must be duckdb or pyarrow, got {WRITER!r}")
+if WRITER not in ("duckdb", "pyarrow", "cli"):
+    raise SystemExit(f"build_duckdb_native: OPT_WRITER must be duckdb, pyarrow or cli, got {WRITER!r}")
+# DIAGNOSTIC. URL of a DuckDB CLI binary (or .gz/.zip of one) to write with instead of the pip
+# package -- how an UNRELEASED writer patch gets measured: the fork's CI builds the CLI, no wheel
+# needed. Requires OPT_WRITER=cli; refuses the combination gaps loudly below.
+DUCKDB_CLI = (os.environ.get("OPT_DUCKDB_CLI") or "").strip()
+if WRITER == "cli" and not DUCKDB_CLI:
+    raise SystemExit("build_duckdb_native: OPT_WRITER=cli needs OPT_DUCKDB_CLI (a binary URL)")
 # DIAGNOSTIC. A page-level diff of the real tables showed the two writers emit the SAME data for
 # the slow column — same dictionary, same encoding, chunk sizes 0.2% apart — so what is left is
 # metadata. Comma-separated subset of footer_inject.FEATURES ('encstats,offsetindex,logical'),
@@ -222,6 +228,64 @@ def _exists():
         return True
     except Exception:
         return False
+
+
+def _write_cli(dd, collist, src, order, table_uri, run_tag, con):
+    """Write with a DuckDB CLI binary instead of the pip package. Diagnostic only.
+
+    The point is measuring an UNRELEASED writer patch (a fork branch) with the same harness and
+    probe: the fork's own CI builds the CLI, and a CLI needs no wheel plumbing. The pip duckdb
+    stages the source rows to local disk (it holds the OneLake credentials; the reader side is not
+    what is being measured), the CLI re-sorts and writes the parquet locally with the exact COPY
+    options the pip arm uses, and the shared upload + delta-rs commit path takes it from there.
+    """
+    import subprocess
+    import urllib.request
+
+    from dbt.adapters.duckrun.objectstore import build_store, upload
+
+    cli_dir = tempfile.mkdtemp(prefix="duckdb_cli_")
+    archive = os.path.join(cli_dir, "cli.download")
+    urllib.request.urlretrieve(DUCKDB_CLI, archive)
+    if DUCKDB_CLI.endswith(".gz") or DUCKDB_CLI.endswith(".zip"):
+        import shutil
+        shutil.unpack_archive(archive, cli_dir, "gztar" if DUCKDB_CLI.endswith(".gz") else "zip")
+        cli = next(os.path.join(r, f) for r, _d, fs in os.walk(cli_dir) for f in fs if f == "duckdb")
+    else:
+        cli = archive
+    os.chmod(cli, 0o755)
+    ver = subprocess.run([cli, "-noheader", "-ascii", "-c", "PRAGMA version;"],
+                         capture_output=True, text=True, check=True).stdout.strip()
+    print(f"CLI writer: {ver.splitlines()[0]}", flush=True)
+
+    stage_dir = tempfile.mkdtemp(prefix="cli_stage_")
+    staged = os.path.join(stage_dir, "staged.parquet").replace("\\", "/")
+    t_s = time.perf_counter()
+    # Stage UNSORTED and let the CLI apply the ORDER BY itself: the writer under test must do its
+    # own sort-and-write exactly like the pip arm's COPY does, or the run measures a different
+    # code path than the one shipped.
+    dd.execute(f"COPY (select {collist} from {src}) TO '{staged}' "
+               f"(FORMAT parquet, COMPRESSION zstd)")
+    print(f"staged source locally in {time.perf_counter() - t_s:.1f}s "
+          f"({os.path.getsize(staged) / 1048576:.1f} MB)", flush=True)
+
+    out = os.path.join(stage_dir, f"part-{run_tag}-{uuid.uuid4()}.parquet").replace("\\", "/")
+    _dict_opt = f"DICTIONARY_SIZE_LIMIT {DICT_LIMIT}," if DICT_LIMIT else ""
+    spill = tempfile.mkdtemp(prefix="cli_spill_").replace("\\", "/")
+    sql = (f"SET threads={THREADS}; SET temp_directory='{spill}'; "
+           f"COPY (select {collist} from read_parquet('{staged}') order by {order}) "
+           f"TO '{out}' (FORMAT parquet, ROW_GROUP_SIZE {RG}, {_dict_opt} "
+           f"DATA_PAGE_SIZE_LIMIT {PAGE_BYTES}, COMPRESSION {_DD_CODEC}, "
+           f"PARQUET_VERSION {PQ_VERSION}, WRITE_BLOOM_FILTER {str(BLOOM).lower()})")
+    t_s = time.perf_counter()
+    subprocess.run([cli, "-c", sql], check=True)
+    print(f"CLI wrote {os.path.getsize(out) / 1048576:.1f} MB "
+          f"in {time.perf_counter() - t_s:.1f}s", flush=True)
+    os.remove(staged)
+
+    store = build_store(table_uri, con.storage_options)
+    upload(store, os.path.basename(out), out, single_shot=True)
+    print(f"uploaded {os.path.basename(out)}", flush=True)
 
 
 def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
@@ -385,6 +449,8 @@ else:
     dd.execute(f"SET threads={THREADS}")
     if WRITER == "pyarrow":
         _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con)
+    elif WRITER == "cli":
+        _write_cli(dd, collist, src, order, table_uri, run_tag, con)
     else:
         print(f"{n_src:,} rows -> one sorted single-stream COPY, "
               f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
