@@ -95,6 +95,14 @@ if PQ_VERSION not in ("V1", "V2"):
 # Direct Lake (which does not use parquet bloom filters) and because leaving them on makes the
 # writer A/B measure a feature delta-rs simply doesn't ship.
 BLOOM = (os.environ.get("OPT_BLOOM") or "false").strip().lower() in ("true", "1", "yes")
+# DIAGNOSTIC. The page compression codec. The byte verify showed the two writers' UNCOMPRESSED page
+# payloads are byte-identical at matched geometry and only the compressed representation differs,
+# so the cleanest way to ask whether compression matters at all is to remove it: an uncompressed
+# file has no snappy stream for the reader to react to. Costs ~3.5x the bytes, which is itself
+# informative - a much larger file reading FAST would be unambiguous.
+COMPRESSION = (os.environ.get("OPT_COMPRESSION") or "snappy").strip().lower()
+_PA_CODEC = "none" if COMPRESSION in ("uncompressed", "none") else COMPRESSION
+_DD_CODEC = "uncompressed" if COMPRESSION in ("uncompressed", "none") else COMPRESSION
 # OPT_WRITER picks which library encodes the parquet. Everything downstream — the listing, the
 # typed footer stats, the AddActions, the Delta commit — is shared, so this isolates the ENCODER.
 # 'pyarrow' is parquet-cpp, a third implementation independent of both DuckDB and the parquet-rs
@@ -215,7 +223,7 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
         # behind every write, which is a geometry difference the comparison must not introduce.
         while tbl.num_rows >= RG:
             if w is None:
-                w = pq.ParquetWriter(local, tbl.schema, compression="snappy", use_dictionary=True,
+                w = pq.ParquetWriter(local, tbl.schema, compression=_PA_CODEC, use_dictionary=True,
                                      data_page_size=PAGE_BYTES, version="1.0",
                                      write_statistics=WRITE_STATS, store_schema=STORE_SCHEMA)
             w.write_table(tbl.slice(0, RG), row_group_size=RG)
@@ -234,7 +242,7 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
         if nbuf:
             tbl = pa.Table.from_batches(buf)
             if writer is None:
-                writer = pq.ParquetWriter(local, tbl.schema, compression="snappy",
+                writer = pq.ParquetWriter(local, tbl.schema, compression=_PA_CODEC,
                                           use_dictionary=True, data_page_size=PAGE_BYTES,
                                           version="1.0", write_statistics=WRITE_STATS,
                                           store_schema=STORE_SCHEMA)
@@ -245,7 +253,7 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
             writer.close()
     size = os.path.getsize(local)
     print(f"{written:,} rows -> pyarrow (parquet-cpp) {pa.__version__}, ROW_GROUP_SIZE {RG:,} "
-          f"x data_page_size {PAGE_BYTES:,} x snappy x v1.0 x store_schema={STORE_SCHEMA} "
+          f"x data_page_size {PAGE_BYTES:,} x {_PA_CODEC} x v1.0 x store_schema={STORE_SCHEMA} "
           f"x write_statistics={WRITE_STATS} "
           f"-> {size / 1048576:.1f} MB in {time.perf_counter() - t_s:.1f}s", flush=True)
     store = build_store(table_uri, con.storage_options)
@@ -335,7 +343,7 @@ else:
             TO '{table_uri}'
             (FORMAT parquet, ROW_GROUP_SIZE {RG}, FILE_SIZE_BYTES {FILE_BYTES},
              {_dict_opt} DATA_PAGE_SIZE_LIMIT {PAGE_BYTES},
-             COMPRESSION snappy, PARQUET_VERSION {PQ_VERSION},
+             COMPRESSION {_DD_CODEC}, PARQUET_VERSION {PQ_VERSION},
              WRITE_BLOOM_FILTER {str(BLOOM).lower()},
              FILENAME_PATTERN 'part-{run_tag}-{{uuid}}', APPEND)
         """)
