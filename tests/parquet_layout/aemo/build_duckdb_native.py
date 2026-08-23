@@ -49,7 +49,8 @@ threads), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (DATA_PAGE_SIZE_LIMI
 OPT_TFS_MB (file rotation size, default 256 = duckrun's target_file_size_mb),
 OPT_PARQUET_VERSION (V1/V2, byte-identical), OPT_BLOOM (default false — delta-rs writes none,
 and they cost 29.2 MB here), OPT_FOOTER_INJECT (comma-separated, default empty — add footer
-metadata DuckDB omits: encstats, offsetindex, logical), BENCH_ROW_LIMIT, FORCE_REBUILD.
+metadata DuckDB omits: encstats, offsetindex, logical), OPT_PAGE_STATS (column or 'all' — stamp the
+per-page Statistics parquet-cpp writes and DuckDB does not), BENCH_ROW_LIMIT, FORCE_REBUILD.
 """
 import datetime as _dt
 import decimal as _dec
@@ -155,6 +156,13 @@ BITWIDTH = (os.environ.get("OPT_BITWIDTH") or "").strip()
 # on one with the deprecated spelling on the other. Column name, or 'all'.
 DICT_ENCODING = (os.environ.get("OPT_DICT_ENCODING") or "").strip()
 DICT_SORTED = (os.environ.get("OPT_DICT_SORTED") or "").strip()
+# DIAGNOSTIC (duckdb arm). Stamp per-page Statistics into every data page header. parquet-cpp writes
+# min_value/max_value/null_count on every page; DuckDB writes none and no COPY option produces them.
+# Findings §9.6 named this the weakest link in the whole record: it was only ever tested by REMOVAL
+# from pyarrow (443.8 ms, still fast), never by ADDITION to DuckDB, because until now nothing could
+# construct a DataPageHeader. Column name, or 'all'. The synthesizer refuses to run unless it first
+# reproduces parquet-cpp's own page-stats headers byte for byte. See page_reframe.add_page_stats_bytes.
+PAGE_STATS = (os.environ.get("OPT_PAGE_STATS") or "").strip()
 TRANSPLANT = (os.environ.get("OPT_TRANSPLANT") or "").strip()
 TRANSPLANT_FROM = (os.environ.get("OPT_TRANSPLANT_FROM") or "").strip().rstrip("/")
 # DIAGNOSTIC (duckdb arm). COPY thread count — 2 is the memory-fit default (see the SET threads
@@ -426,6 +434,19 @@ else:
               f"column={col or 'ALL'}", flush=True)
         page_reframe.reframe_remote(store, sorted(sizes), column=col)
         sizes = _listing()          # every page changed size; re-read the true sizes
+
+    # PAGE_STATS runs AFTER the payload rewrites and BEFORE footer_inject. After, because the
+    # stamped header carries uncompressed/compressed_page_size and must describe the FINAL bodies —
+    # the statistics values themselves are invariant under a re-framing, but the size fields are
+    # not. Before, because every stamped header grows ~20 bytes and moves every offset after it, so
+    # any footer surgery has to describe the file as it ends up.
+    if PAGE_STATS:
+        import page_reframe
+        col = None if PAGE_STATS.lower() == "all" else PAGE_STATS
+        print(f"stamping per-page statistics in {len(sizes)} file(s), "
+              f"column={col or 'ALL'}", flush=True)
+        page_reframe.add_page_stats_remote(store, sorted(sizes), column=col)
+        sizes = _listing()          # every data page header grew; re-read the true sizes
 
     # DIAGNOSTIC (OPT_FOOTER_INJECT): add the metadata delta-rs writes and DuckDB does not.
     if FOOTER_INJECT:

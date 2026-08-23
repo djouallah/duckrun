@@ -83,6 +83,10 @@ on:
         description: "[duckdb arm] write the explicit is_sorted=False on dictionary page headers. Both fast writers emit it (17-byte header), DuckDB omits it (16 bytes), and no previous experiment could reach it — footer injection never touches page headers and the reframe copies dictionary headers through verbatim. The last page-internal property where the two fast writers agree and DuckDB differs. 'DUID', or 'all', or empty."
         type: string
         default: ""
+      opt_page_stats:
+        description: "[duckdb arm] stamp the per-page Statistics (min_value/max_value/null_count/is_*_exact) that parquet-cpp writes into every data page header and DuckDB writes into none. The weakest link in the whole record: page statistics were only ever tested by REMOVAL from pyarrow (443.8 ms, still fast), never by ADDITION to DuckDB, because until now nothing here could construct a DataPageHeader. The synthesizer refuses to run unless it first reproduces parquet-cpp's own page-stats headers byte for byte. 'DUID', or 'all', or empty."
+        type: string
+        default: ""
       opt_transplant_duckdb:
         description: "[duckdb arm] the REVERSE transplant: replace this column's pages in the DuckDB file with the ones pyarrow wrote, keeping DuckDB's container. The forward direction is proven (pyarrow's file goes 560ms to 12123ms carrying DuckDB's chunk); this is the symmetric half. Fast here means the trigger is entirely chunk-local. Setting it builds the pyarrow arm BEFORE the duckdb arm so the donor exists, which is why it cannot be combined with opt_transplant. 'DUID', or empty."
         type: string
@@ -264,6 +268,7 @@ jobs:
           OPT_TRANSPLANT: ${{ inputs.opt_transplant_duckdb }}
           OPT_TRANSPLANT_FROM: ${{ env.TABLES_PYARROW }}/tests/${{ env.TABLE_PYARROW }}
           OPT_DICT_SORTED: ${{ inputs.opt_dict_sorted }}
+          OPT_PAGE_STATS: ${{ inputs.opt_page_stats }}
           OPT_THREADS: ${{ inputs.opt_threads }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_SORT: ${{ inputs.opt_sort }}

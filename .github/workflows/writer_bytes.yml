@@ -36,6 +36,21 @@ on:
         description: "columns to project"
         type: string
         default: "date, time, DUID"
+      compression:
+        description: "snappy reproduces what the benchmark writes. uncompressed is what makes byte IDENTITY reachable: the two writers' snappy encoders disagree by a byte or three on identical input, which drags the header size fields with it, and compression as a category is already dead by direct experiment (uncompressed on both arms, 11267.9 ms, flat)."
+        type: choice
+        default: snappy
+        options:
+          - snappy
+          - uncompressed
+      page_stats:
+        description: "stamp the per-page Statistics parquet-cpp writes and DuckDB does not. The synthesizer is calibrated against the pyarrow arm's OWN file first and refuses to run unless it reproduces its headers byte for byte."
+        type: boolean
+        default: true
+      require_identical:
+        description: "fail the job unless the chunks are byte-identical. Turn this on to use the run as a hard precondition for a Fabric run rather than a log to read."
+        type: boolean
+        default: false
 
 permissions:
   id-token: write
@@ -45,7 +60,9 @@ jobs:
   bytes:
     name: 🔬 Byte verify — DuckDB vs parquet-cpp, same rows, same geometry
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    # 60, not 30: the preflight for a Fabric run reads millions of rows and decodes every page of
+    # both writers' files, which the 30-minute budget was never sized for.
+    timeout-minutes: 60
     env:
       AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -68,6 +85,14 @@ jobs:
         # happens to emit on a laptop.
         run: pip install duckdb==1.6.0.dev365
 
+      - name: 🧪 Page-statistics synthesizer guards (offline)
+        # The synthesizer writes a DataPageHeader by hand, which is where this goes wrong quietly.
+        # These run in a second and need no network, so they gate the comparison below rather than
+        # letting a thrift bug surface as a "difference" between the writers.
+        run: |
+          pip install pytest
+          python -m pytest tests/parquet_layout/aemo/test_page_stats.py -q -p no:cacheprovider
+
       - name: 🔑 Resolve the source workspace
         run: python tests/parquet_layout/aemo/resolve_env.py --env ${{ inputs.env }}
 
@@ -82,5 +107,8 @@ jobs:
           BYTES_SKIP: ${{ inputs.skip }}
           BYTES_RG: ${{ inputs.rg }}
           BYTES_COLUMN: ${{ inputs.column }}
+          BYTES_COMPRESSION: ${{ inputs.compression }}
+          BYTES_PAGE_STATS: ${{ inputs.page_stats }}
+          BYTES_REQUIRE_IDENTICAL: ${{ inputs.require_identical }}
           OPT_COLUMNS: ${{ inputs.columns }}
         run: python tests/parquet_layout/aemo/byte_verify.py

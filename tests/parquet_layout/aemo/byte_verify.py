@@ -44,6 +44,20 @@ ROWS = int(os.environ.get("BYTES_ROWS") or 655_360)
 SKIP = int(os.environ.get("BYTES_SKIP") or 0)
 COLS = (os.environ.get("OPT_COLUMNS") or "date, time, DUID").strip()
 SORT = (os.environ.get("OPT_SORT") or "date, time, DUID").strip()
+# snappy reproduces what the benchmark writes; uncompressed is what makes byte IDENTITY reachable.
+# The two writers' compressors disagree by a byte or three on identical input (run 32619755844:
+# dictionary bodies 810 vs 813, data bodies 2944 vs 2943), and that difference drags the size
+# fields in the header along with it. Compression as a category is already dead by direct
+# experiment (findings §9.5: uncompressed on both arms, 11267.9 ms, flat), so dropping it removes
+# the last difference that is not a layout decision.
+COMPRESSION = (os.environ.get("BYTES_COMPRESSION") or "snappy").strip().lower()
+PAGE_STATS = (os.environ.get("BYTES_PAGE_STATS") or "true").strip().lower() not in ("false", "0")
+REQUIRE_IDENTICAL = (os.environ.get("BYTES_REQUIRE_IDENTICAL") or "").strip().lower() in ("1",
+                                                                                         "true")
+MAX_REPORT = int(os.environ.get("BYTES_MAX_REPORT") or 2)
+
+if COMPRESSION not in ("snappy", "uncompressed"):
+    raise SystemExit(f"BYTES_COMPRESSION must be snappy or uncompressed, got {COMPRESSION!r}")
 
 if RG % 2048:
     raise SystemExit(f"BYTES_RG must be a multiple of 2048 (DuckDB's vector), got {RG}")
@@ -118,14 +132,16 @@ def main():
            f"limit {ROWS} offset {SKIP})")
     con.execute(f"""
         COPY (select {COLS} from {sub} order by {SORT})
-        TO '{duck}' (FORMAT parquet, ROW_GROUP_SIZE {RG}, COMPRESSION snappy,
-                     PARQUET_VERSION V1, DICTIONARY_SIZE_LIMIT 16000000)
+        TO '{duck}' (FORMAT parquet, ROW_GROUP_SIZE {RG}, COMPRESSION {COMPRESSION},
+                     PARQUET_VERSION V1, DICTIONARY_SIZE_LIMIT 16000000,
+                     WRITE_BLOOM_FILTER false)
     """)
     tbl = con.execute(f"select {COLS} from {sub} order by {SORT}").arrow()
     if isinstance(tbl, pa.RecordBatchReader):
         tbl = tbl.read_all()
-    w = pq.ParquetWriter(arrow, tbl.schema, compression="snappy", use_dictionary=True,
-                         version="1.0", write_statistics=True)
+    w = pq.ParquetWriter(arrow, tbl.schema,
+                         compression="snappy" if COMPRESSION == "snappy" else "none",
+                         use_dictionary=True, version="1.0", write_statistics=True)
     for off in range(0, tbl.num_rows, RG):
         w.write_table(tbl.slice(off, RG), row_group_size=RG)
     w.close()
@@ -140,6 +156,13 @@ def main():
     db, s3 = PR.set_dict_encoding_bytes(db, column=COLUMN, encoding=2)
     print(f"normalised duckdb: reframe {s1['pages']} pages, is_sorted {s2['dictionary_pages_marked']}"
           f", retag {s3['dictionary_pages_retagged']}", flush=True)
+    if PAGE_STATS:
+        # The last structural difference. Calibrate against the pyarrow arm's OWN file first — the
+        # literal comparison target — so a synthesizer that does not reproduce parquet-cpp's bytes
+        # can never reach the comparison below and quietly report a near-miss as a difference.
+        fields = PR.calibrate_page_stats(ab, COLUMN)
+        db, s4 = PR.add_page_stats_bytes(db, column=COLUMN, fields=fields)
+        print(f"normalised duckdb: page statistics on {s4['pages_stamped']} page(s)", flush=True)
 
     ca, cb = chunks(db, COLUMN), chunks(ab, COLUMN)
     print(f"row groups: duckdb {len(ca)}, pyarrow {len(cb)}", flush=True)
@@ -165,18 +188,27 @@ def main():
             if p["hdr"] != q["hdr"]:
                 n_diff += report(f"rg{i}.page{pi}[{kind}] HEADER",
                                  p["hdr"], q["hdr"], "duckdb", "pyarrow")
-        if n_diff and i >= 2:
-            print(f"\n  (stopping after row group {i}; the pattern repeats)")
+        if n_diff and MAX_REPORT and i >= MAX_REPORT:
+            print(f"\n  (stopping after row group {i}; the pattern repeats. "
+                  f"Set BYTES_MAX_REPORT=0 to enumerate every row group.)")
             break
 
+    normalised = ["run framing", "is_sorted", "the dictionary tag"]
+    if PAGE_STATS:
+        normalised.append("page statistics")
     print(f"\n{'=' * 90}")
     if n_diff:
         print(f"VERDICT: the two writers' {COLUMN} bytes DIFFER at matched geometry "
-              f"({n_diff} difference(s) shown)")
+              f"({n_diff} difference(s) shown, {COMPRESSION})")
     else:
-        print(f"VERDICT: {COLUMN} chunk bytes are IDENTICAL across all {len(ca)} row groups "
-              f"once run framing, is_sorted and the dictionary tag are normalised")
+        print(f"VERDICT: {COLUMN} chunk bytes are IDENTICAL — page HEADERS and payloads — across "
+              f"all {len(ca)} row groups at {COMPRESSION}, once "
+              f"{', '.join(normalised[:-1])} and {normalised[-1]} are normalised")
     print(f"{'=' * 90}")
+    if n_diff and REQUIRE_IDENTICAL:
+        # A Fabric run costs 30 minutes of capacity and its whole argument rests on the chunk being
+        # byte-identical. Make that a gate rather than a line in a log somebody has to read.
+        raise SystemExit(f"BYTES_REQUIRE_IDENTICAL was set and {n_diff} difference(s) remain")
 
 
 if __name__ == "__main__":
