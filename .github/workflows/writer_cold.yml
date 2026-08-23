@@ -255,7 +255,9 @@ jobs:
           # V1 vs V2 is the same bytes with a different encoding tag, measured flat
           # (12492 vs 12312 ms). Pinned, not an input: github caps workflow_dispatch
           # at 25 inputs and a dead knob is not worth one of them.
-          OPT_PARQUET_VERSION: V1
+          # (Temporarily V2 for one probe: that flat result predates encoding_stats,
+          # both arms were on the slow path. Retest against the 689.3 ms V1 baseline.)
+          OPT_PARQUET_VERSION: V2
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
           OPT_CREATED_BY: parquet-cpp-arrow version 25.0.1
