@@ -52,6 +52,10 @@ on:
         description: "[pyarrow arm] pyarrow ParquetWriter store_schema. false strips the ARROW:schema footer key/value — the one footer property BOTH fast writers carry and DuckDB lacks. If the stripped pyarrow file cold-reads slow, the consumer's fast path is gated on ARROW:schema."
         type: boolean
         default: true
+      opt_write_statistics:
+        description: "[pyarrow arm] pyarrow ParquetWriter write_statistics. false strips the per-PAGE statistics parquet-cpp puts in every data page header, which DuckDB never writes. Set aside earlier because delta-rs writes none either and is fast - but that assumes ONE rule makes both fast writers fast, and DuckDB is the only writer with neither page statistics nor the RLE_DICTIONARY tag. Same shape of test that cleared ARROW:schema."
+        type: boolean
+        default: true
       opt_bitwidth:
         description: "[duckdb arm] re-encode the dictionary indices at a different bit width, as '<mode>:<column>' e.g. 'uniform:DUID'. DuckDB picks one width per chunk, so it flips 8 to 9 at row group 5 where the dictionary crosses 256, while the engine's resident segments are 9 bits for all 24 row groups. No COPY option reaches this. 'uniform' holds one width for the whole column so it never changes down the file; 'min' gives each page the narrowest width it can carry, which is what parquet-cpp does."
         type: string
@@ -230,6 +234,7 @@ jobs:
           OPT_TABLE: ${{ env.TABLE_PYARROW }}
           OPT_WRITER: pyarrow
           OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
+          OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_TRANSPLANT: ${{ inputs.opt_transplant }}
           OPT_TRANSPLANT_FROM: ${{ env.TABLES_DUCKDB }}/tests/${{ env.TABLE_DUCKDB }}

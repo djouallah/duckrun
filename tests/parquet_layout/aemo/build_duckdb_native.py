@@ -120,6 +120,12 @@ REFRAME = (os.environ.get("OPT_REFRAME") or "").strip()
 # store_schema=False strips it from the pyarrow file: if that file then cold-reads slow, the
 # consumer's fast path is gated on ARROW:schema, not on anything parquet-spec.
 STORE_SCHEMA = (os.environ.get("OPT_STORE_SCHEMA") or "true").strip().lower() in ("true", "1", "yes")
+# DIAGNOSTIC (pyarrow arm). parquet-cpp writes per-PAGE statistics into every data page header;
+# DuckDB writes none. It was set aside because delta-rs writes none either and is fast - but that
+# filter assumes ONE rule makes both fast writers fast, and DuckDB is the only writer with neither
+# page statistics NOR the RLE_DICTIONARY tag. Taking them away from pyarrow is the same shape of
+# test that cleared ARROW:schema: if the stripped file then reads slow, this is the trigger.
+WRITE_STATS = (os.environ.get("OPT_WRITE_STATISTICS") or "true").strip().lower() in ("true", "1", "yes")
 # DIAGNOSTIC. Replace this column's page bytes with the ones another writer produced, keeping this
 # file's container. Every metadata difference has now been neutralised at once and the slow file is
 # still slow, so the cost is in the payload; this is what proves it. Needs OPT_TRANSPLANT_FROM (the
@@ -207,7 +213,7 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
             if w is None:
                 w = pq.ParquetWriter(local, tbl.schema, compression="snappy", use_dictionary=True,
                                      data_page_size=PAGE_BYTES, version="1.0",
-                                     write_statistics=True, store_schema=STORE_SCHEMA)
+                                     write_statistics=WRITE_STATS, store_schema=STORE_SCHEMA)
             w.write_table(tbl.slice(0, RG), row_group_size=RG)
             tbl = tbl.slice(RG)
         return tbl, w
@@ -226,7 +232,7 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
             if writer is None:
                 writer = pq.ParquetWriter(local, tbl.schema, compression="snappy",
                                           use_dictionary=True, data_page_size=PAGE_BYTES,
-                                          version="1.0", write_statistics=True,
+                                          version="1.0", write_statistics=WRITE_STATS,
                                           store_schema=STORE_SCHEMA)
             writer.write_table(tbl, row_group_size=RG)
             written += nbuf
@@ -236,6 +242,7 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
     size = os.path.getsize(local)
     print(f"{written:,} rows -> pyarrow (parquet-cpp) {pa.__version__}, ROW_GROUP_SIZE {RG:,} "
           f"x data_page_size {PAGE_BYTES:,} x snappy x v1.0 x store_schema={STORE_SCHEMA} "
+          f"x write_statistics={WRITE_STATS} "
           f"-> {size / 1048576:.1f} MB in {time.perf_counter() - t_s:.1f}s", flush=True)
     store = build_store(table_uri, con.storage_options)
     upload(store, os.path.basename(local), local, single_shot=True)
