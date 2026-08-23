@@ -237,6 +237,7 @@ jobs:
           OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
           OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
           OPT_MAX_ROWS_PER_PAGE: ${{ inputs.opt_max_rows_per_page }}
+          OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_COLUMNS: ${{ inputs.columns }}
           OPT_SORT: ${{ inputs.opt_sort }}
@@ -293,6 +294,7 @@ jobs:
           OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
           OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
           OPT_MAX_ROWS_PER_PAGE: ${{ inputs.opt_max_rows_per_page }}
+          OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_TRANSPLANT: ${{ inputs.opt_transplant }}
           OPT_TRANSPLANT_FROM: ${{ env.TABLES_DUCKDB }}/tests/${{ env.TABLE_DUCKDB }}
