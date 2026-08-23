@@ -22,6 +22,7 @@ footer patch.
 Correctness is enforced, not assumed: every re-encoded page is decoded again and compared to the
 values that went in, and the run refuses to write a file if any page fails.
 """
+import os
 import struct
 
 MARKER = b"PAR1"
@@ -60,8 +61,23 @@ def _obj(name, i32, src, fields, **override):
 
 
 def _compress(raw, codec):
+    """Compress a page body. WHICH snappy matters, so it is a knob rather than an assumption.
+
+    Two valid snappy encoders can emit different bytes for the same input, and they do here: on the
+    real fact cramjam and parquet-cpp disagree by a byte or two per page (on synthetic data they
+    agree exactly, which is how this went unnoticed). Every re-framing run to date recompressed
+    through cramjam, so none of them ever produced parquet-cpp's bytes — which makes "the framing
+    is a no-op" a claim about cramjam's output, not about the framing.
+
+    pyarrow's compressor IS the one parquet-cpp writes through, so `pyarrow` reproduces the fast
+    writer's bytes exactly; `cramjam` is kept to reproduce the earlier null results.
+    """
     if codec == 0:
         return raw
+    impl = (os.environ.get("PAGE_COMPRESSOR") or "pyarrow").strip().lower()
+    if codec == 1 and impl == "pyarrow":
+        import pyarrow as pa
+        return bytes(pa.compress(raw, codec="snappy", asbytes=True))
     import cramjam
     if codec == 1:
         return bytes(cramjam.snappy.compress_raw(raw))
