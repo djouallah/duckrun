@@ -282,6 +282,11 @@ jobs:
           BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
           OPT_TABLE: ${{ env.TABLE_PYARROW }}
           OPT_WRITER: pyarrow
+          # Keep this env block in step with the donor-ordering copy above. The two differ ONLY in
+          # `if:` and in the transplant pair; every other knob must appear in both or an arm
+          # silently ignores it. opt_compression was added to one and not the other, and the
+          # uncompressed run measured a snappy pyarrow arm against an uncompressed duckdb one.
+          OPT_COMPRESSION: ${{ inputs.opt_compression }}
           OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
           OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
           OPT_RG: ${{ inputs.opt_rg }}
