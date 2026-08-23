@@ -329,12 +329,27 @@ else:
         coltypes = {c: coltypes[c] for c in cols}
     collist = ", ".join(f'"{c}"' for c in cols)
 
-    src = (_src_tbl if N_CAP is None
-           else f"(select {collist} from {_src_tbl} order by all limit {N_CAP})")
+    # The cap is a CUTOFF on the leading sort column, not `order by all limit N`. DuckDB's top-N is
+    # not a spillable operator, so a top-N carrying whole rows OOM'd a 12.4GiB runner four times
+    # (32627183898, 32627622202, 32628685053, 32628987366) at an 8.3M cap on a harness that
+    # survives 142M — a cap at roughly the source size degenerates to a stream, a cap well below it
+    # is a real heap. Taking the top-N over ONE column costs 4 bytes a row instead of a whole row,
+    # and the resulting cutoff is a plain predicate.
+    #
+    # It keeps what §9.1 actually needs — both arms evaluating ONE deterministic expression, so
+    # they read identical rows — and gives up only exactness of the count, since the cutoff rounds
+    # out to a whole value of the leading column. That is why n_src is printed rather than assumed.
+    if N_CAP is None:
+        src = _src_tbl
+    else:
+        _lead = f'"{sort_cols[0]}"'
+        _cut = dd.execute(f"select max(k) from (select {_lead} as k from {_src_tbl} "
+                          f"order by k limit {N_CAP})").fetchone()[0]
+        src = f"(select {collist} from {_src_tbl} where {_lead} <= '{_cut}')"
     n_src = dd.execute(f"select count(*) from {src}").fetchone()[0]
     if N_CAP is not None:
         _total = dd.execute(f"select count(*) from {_src_tbl}").fetchone()[0]
-        print(f"source has {_total:,} rows; capped to the first {n_src:,} in `order by all` order"
+        print(f"source has {_total:,} rows; capped to {n_src:,} at {sort_cols[0]} <= {_cut}"
               + ("  (cap is a no-op)" if _total <= N_CAP else ""), flush=True)
     order = ", ".join(f'"{c}"' for c in sort_cols)
     run_tag = uuid.uuid4().hex[:8]
