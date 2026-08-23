@@ -60,6 +60,10 @@ on:
         description: "[duckdb arm] re-encode the dictionary indices at a different bit width, as '<mode>:<column>' e.g. 'uniform:DUID'. DuckDB picks one width per chunk, so it flips 8 to 9 at row group 5 where the dictionary crosses 256, while the engine's resident segments are 9 bits for all 24 row groups. No COPY option reaches this. 'uniform' holds one width for the whole column so it never changes down the file; 'min' gives each page the narrowest width it can carry, which is what parquet-cpp does."
         type: string
         default: ""
+      opt_dict_encoding:
+        description: "[duckdb arm] retag the dictionary page encoding from PLAIN to PLAIN_DICTIONARY, which is what parquet-cpp writes. DuckDB is the only one of the three writers that mixes the modern spelling on the dictionary page with the deprecated spelling on the data pages. 'DUID', or 'all', or empty."
+        type: string
+        default: ""
       opt_dict_sorted:
         description: "[duckdb arm] write the explicit is_sorted=False on dictionary page headers. Both fast writers emit it (17-byte header), DuckDB omits it (16 bytes), and no previous experiment could reach it — footer injection never touches page headers and the reframe copies dictionary headers through verbatim. The last page-internal property where the two fast writers agree and DuckDB differs. 'DUID', or 'all', or empty."
         type: string
@@ -214,6 +218,7 @@ jobs:
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
           OPT_REFRAME: ${{ inputs.opt_reframe }}
           OPT_BITWIDTH: ${{ inputs.opt_bitwidth }}
+          OPT_DICT_ENCODING: ${{ inputs.opt_dict_encoding }}
           OPT_DICT_SORTED: ${{ inputs.opt_dict_sorted }}
           OPT_THREADS: ${{ inputs.opt_threads }}
           OPT_RG: ${{ inputs.opt_rg }}

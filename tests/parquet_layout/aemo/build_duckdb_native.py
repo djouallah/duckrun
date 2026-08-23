@@ -142,6 +142,10 @@ WRITE_STATS = (os.environ.get("OPT_WRITE_STATISTICS") or "true").strip().lower()
 # file; 'min' gives each page the narrowest width it can carry, which is what parquet-cpp does.
 # Format: '<mode>:<column>' e.g. 'uniform:DUID'. See page_reframe.repack_bitwidth_bytes.
 BITWIDTH = (os.environ.get("OPT_BITWIDTH") or "").strip()
+# DIAGNOSTIC. Retag the dictionary page encoding. DuckDB tags its dictionary page PLAIN and its
+# data pages PLAIN_DICTIONARY - the only one of the three writers that mixes the modern spelling
+# on one with the deprecated spelling on the other. Column name, or 'all'.
+DICT_ENCODING = (os.environ.get("OPT_DICT_ENCODING") or "").strip()
 DICT_SORTED = (os.environ.get("OPT_DICT_SORTED") or "").strip()
 TRANSPLANT = (os.environ.get("OPT_TRANSPLANT") or "").strip()
 TRANSPLANT_FROM = (os.environ.get("OPT_TRANSPLANT_FROM") or "").strip().rstrip("/")
@@ -379,6 +383,14 @@ else:
               flush=True)
         chimera.transplant_remote(store, sorted(sizes)[0], donor_store, donor_keys[0], TRANSPLANT)
         sizes = _listing()          # the chunk swap changed the length; re-read the true size
+
+    if DICT_ENCODING:
+        import page_reframe
+        col = None if DICT_ENCODING.lower() == "all" else DICT_ENCODING
+        print(f"retagging dictionary page encoding -> PLAIN_DICTIONARY in {len(sizes)} file(s), "
+              f"column={col or 'ALL'}", flush=True)
+        page_reframe.set_dict_encoding_remote(store, sorted(sizes), column=col, encoding=2)
+        sizes = _listing()          # header width changed; re-read the true sizes
 
     if DICT_SORTED:
         import page_reframe

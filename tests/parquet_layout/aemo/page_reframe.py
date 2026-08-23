@@ -568,6 +568,109 @@ def recompress_dict_remote(store, keys, column=None):
               f"{stats['bytes_before']:,} -> {stats['bytes_after']:,} bytes", flush=True)
 
 
+def set_dict_encoding_bytes(blob, column=None, encoding=2):
+    """Rewrite the dictionary page's ``encoding`` tag. Diagnostic only.
+
+    The other survivor alongside page statistics. DuckDB tags its dictionary page PLAIN (0) and
+    its data pages PLAIN_DICTIONARY (2); parquet-cpp tags BOTH PLAIN_DICTIONARY; parquet-rs tags
+    the dictionary PLAIN and the data RLE_DICTIONARY (8). So DuckDB is the only one of the three
+    that mixes the modern spelling on the dictionary page with the deprecated spelling on the data
+    pages, and a reader pairing the two to decide "does this chunk have a usable dictionary" would
+    see a combination neither fast writer produces.
+
+    It was set aside because parquet-rs also writes PLAIN and is fast - the same "both fast writers
+    disagree" filter that also discarded page statistics, which assumes one rule makes both fast.
+    Only the tag changes: page bodies, dictionary values, data pages and row groups are copied byte
+    for byte, and every rebuilt header is parsed back and rejected if anything else moved.
+    """
+    import numpy as np
+    from fastparquet.cencoding import NumpyIO, ThriftObject, from_buffer
+
+    if blob[:4] != MARKER or blob[-4:] != MARKER:
+        raise ValueError("not a parquet file")
+    flen = struct.unpack("<I", blob[-8:-4])[0]
+    foot_start = len(blob) - 8 - flen
+    fmd = from_buffer(NumpyIO(np.frombuffer(blob[foot_start:-8], dtype="uint8")), "FileMetaData")
+
+    out = bytearray(MARKER)
+    n_set = 0
+    row_groups = []
+    for rg in fmd.row_groups:
+        rg_start = len(out)
+        columns = []
+        for cc in rg.columns:
+            m = cc.meta_data
+            name = ".".join(x.decode() if isinstance(x, bytes) else x for x in m.path_in_schema)
+            start = m.dictionary_page_offset or m.data_page_offset
+            chunk = blob[start:start + m.total_compressed_size]
+            io = NumpyIO(np.frombuffer(chunk, dtype="uint8"))
+            col_start = len(out)
+            dict_off = data_off = None
+            touched = column is None or name == column
+            while io.tell() < len(chunk) - 4:
+                ph = from_buffer(io, "PageHeader")
+                body = chunk[io.tell():io.tell() + ph.compressed_page_size]
+                io.seek(ph.compressed_page_size, 1)
+                if ph.type != DICTIONARY_PAGE:
+                    if data_off is None:
+                        data_off = len(out)
+                    out += bytes(ph.to_bytes()) + body
+                    continue
+                dict_off = len(out)
+                dph = ph.dictionary_page_header
+                if not touched or dph.encoding == encoding:
+                    out += bytes(ph.to_bytes()) + body
+                    continue
+                kw = {"num_values": dph.num_values, "encoding": encoding}
+                if getattr(dph, "is_sorted", None) is not None:
+                    kw["is_sorted"] = dph.is_sorted
+                new_dph = ThriftObject.from_fields("DictionaryPageHeader", i32list=DPH_I32, **kw)
+                new_ph = _obj("PageHeader", PH_I32, ph, PH_FIELDS, dictionary_page_header=new_dph)
+                raw = bytes(new_ph.to_bytes())
+                back = from_buffer(NumpyIO(np.frombuffer(raw + body, dtype="uint8")), "PageHeader")
+                bd = back.dictionary_page_header
+                if (back.type != ph.type or back.compressed_page_size != ph.compressed_page_size
+                        or back.uncompressed_page_size != ph.uncompressed_page_size
+                        or bd.num_values != dph.num_values or bd.encoding != encoding
+                        or getattr(bd, "is_sorted", None) != getattr(dph, "is_sorted", None)):
+                    raise SystemExit(f"page_reframe: dictionary header rebuild changed more than "
+                                     f"the encoding tag ({name}) — refusing to write")
+                out += raw + body
+                n_set += 1
+            meta = _obj("ColumnMetaData", CMD_I32, m, CMD_FIELDS,
+                        dictionary_page_offset=dict_off,
+                        data_page_offset=data_off if data_off is not None else dict_off,
+                        total_compressed_size=len(out) - col_start)
+            columns.append(_obj("ColumnChunk", CC_I32, cc, CC_FIELDS, meta_data=meta,
+                                offset_index_offset=None, offset_index_length=None,
+                                column_index_offset=None, column_index_length=None))
+        row_groups.append(_obj("RowGroup", RG_I32, rg, RG_FIELDS, columns=columns,
+                               file_offset=rg_start, total_compressed_size=len(out) - rg_start))
+
+    kw = {f: getattr(fmd, f) for f in FMD_FIELDS if getattr(fmd, f, None) is not None}
+    kw["row_groups"] = row_groups
+    footer = bytes(ThriftObject.from_fields("FileMetaData", i32list=[1], **kw).to_bytes())
+    out += footer + struct.pack("<I", len(footer)) + MARKER
+    return bytes(out), {"dictionary_pages_retagged": n_set, "encoding": encoding,
+                        "bytes_before": len(blob), "bytes_after": len(out)}
+
+
+def set_dict_encoding_remote(store, keys, column=None, encoding=2):
+    """Download, retag and replace each key in place (single PUT — OneLake rejects multipart)."""
+    import obstore
+
+    for key in keys:
+        blob = bytes(obstore.get(store, key).bytes())
+        new, stats = set_dict_encoding_bytes(blob, column=column, encoding=encoding)
+        if not stats["dictionary_pages_retagged"]:
+            raise SystemExit(f"OPT_DICT_ENCODING was set but {key} had nothing to retag — the "
+                             "writer may already use that tag, a silent no-op control.")
+        obstore.put(store, key, new, use_multipart=False)
+        print(f"  [ok] {key}: dictionary page encoding -> {encoding} on "
+              f"{stats['dictionary_pages_retagged']} page(s), "
+              f"{stats['bytes_before']:,} -> {stats['bytes_after']:,} bytes", flush=True)
+
+
 def mark_dict_sorted_remote(store, keys, column=None):
     """Download, mark and replace each key in place (single PUT — OneLake rejects multipart)."""
     import obstore
