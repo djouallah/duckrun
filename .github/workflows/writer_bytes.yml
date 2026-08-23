@@ -1,0 +1,84 @@
+name: Writer byte verify (no Fabric)
+
+# Ground truth for the writer investigation, and it costs NOTHING but a runner.
+#
+# Every question about "do these two files actually differ" was being answered either locally
+# against DuckDB v1.5.5 (the only build with a Windows wheel) or as a step riding along on the
+# 30-minute Fabric cold benchmark. Neither is right: CI writes with the pinned nightly, and the
+# comparison needs no Fabric item at all. This reads the source lakehouse READ-ONLY, writes both
+# writers' files to the runner's own disk, and compares the column chunk byte for byte.
+#
+# No lakehouse is created, no semantic model is deployed, no capacity is consumed.
+on:
+  workflow_dispatch:
+    inputs:
+      env:
+        description: "deploy_config.yml env whose workspace holds the SOURCE mart (read-only)"
+        type: string
+        default: main
+      rows:
+        description: "rows to read. Small is fine — this compares encodings, not scale."
+        type: string
+        default: "655360"
+      skip:
+        description: "rows to skip before taking `rows`. The fleet grows down the fact, so a large skip reaches the wider-dictionary regime where the bit width is 9 rather than 8."
+        type: string
+        default: "0"
+      rg:
+        description: "ROW_GROUP_SIZE. Must be a multiple of DuckDB's 2048-row vector AND <= 20000 (parquet-cpp's page cap) so both writers emit exactly one data page per row group and the pages correspond one-to-one."
+        type: string
+        default: "16384"
+      column:
+        description: "column to compare"
+        type: string
+        default: "DUID"
+      columns:
+        description: "columns to project"
+        type: string
+        default: "date, time, DUID"
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  bytes:
+    name: 🔬 Byte verify — DuckDB vs parquet-cpp, same rows, same geometry
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+    steps:
+      - name: 📥 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 📦 Install deps
+        run: |
+          pip install pyyaml pyarrow fastparquet cramjam
+          pip install -e .
+
+      - name: 🦆 Pin duckdb to the nightly the benchmark writes with
+        # The whole point: compare the bytes THIS build emits, not the ones a different build
+        # happens to emit on a laptop.
+        run: pip install duckdb==1.6.0.dev365
+
+      - name: 🔑 Resolve the source workspace
+        run: python tests/parquet_layout/aemo/resolve_env.py --env ${{ inputs.env }}
+
+      - name: 🔬 Compare
+        env:
+          PYTHONIOENCODING: utf-8
+          PYTHONUNBUFFERED: "1"
+          BENCH_SOURCE: delta_scan('${{ env.ONELAKE_TABLES_PATH }}/mart/fct_summary')
+          BYTES_ROWS: ${{ inputs.rows }}
+          BYTES_SKIP: ${{ inputs.skip }}
+          BYTES_RG: ${{ inputs.rg }}
+          BYTES_COLUMN: ${{ inputs.column }}
+          OPT_COLUMNS: ${{ inputs.columns }}
+        run: python tests/parquet_layout/aemo/byte_verify.py
