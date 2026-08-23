@@ -185,6 +185,15 @@ table_uri = f"{tables_root}/tests/{TABLE}"
 con = duckrun.connect(tables_root, read_only=False)
 dd = con.con
 
+# Let the sort spill. BENCH_ROW_LIMIT caps with `select * from ... order by all limit N`, so the
+# top-N carries EVERY column of the fact, not the three OPT_COLUMNS projects — and with no temp
+# directory configured DuckDB cannot spill it and simply dies. Run 32627183898 OOM'd here at
+# 8.3M rows ("failed to allocate 768.0 MiB, 11.9/12.4 GiB used") on a build that survives 142M,
+# because a cap well below the source size is a real top-N heap while a cap at the source size
+# degenerates to a stream. Spilling changes nothing about what is written.
+_spill = tempfile.mkdtemp(prefix="duckdb_spill_")
+dd.execute(f"SET temp_directory='{_spill.replace(chr(92), '/')}'")
+
 # Probe DATA_PAGE_SIZE_LIMIT before any expensive work: a duckdb without it (any stable <= 1.5.5)
 # would silently write the old broken layout — one ~100MB page per column chunk — and corrupt the A/B.
 _probe = os.path.join(tempfile.mkdtemp(prefix="duckrun_page_probe_"), "probe.parquet").replace("\\", "/")
