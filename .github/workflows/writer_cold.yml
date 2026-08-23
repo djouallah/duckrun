@@ -41,10 +41,10 @@ on:
         description: "[duckdb arm] re-encode this column's dictionary indices at 63 groups per bit-packed run (504 values) — what parquet-rs and parquet-cpp both emit and DuckDB never does at any COPY setting. Same values, same bit width, same dictionary, same page boundaries; only the run boundaries move. 'DUID', or 'all', or empty to leave the pages alone."
         type: string
         default: ""
-      opt_store_schema:
-        description: "[pyarrow arm] pyarrow ParquetWriter store_schema. false strips the ARROW:schema footer key/value — the one footer property BOTH fast writers carry and DuckDB lacks. If the stripped pyarrow file cold-reads slow, the consumer's fast path is gated on ARROW:schema."
-        type: boolean
-        default: true
+      duckdb_pip:
+        description: "pip spec for the duckdb package every arm runs on, e.g. a wheel URL from a fork build. Empty = the pinned nightly (1.6.0.dev365). This is how the writer A/B tests an unreleased duckdb: same harness, same config, only the wheel differs. The DATA_PAGE_SIZE_LIMIT startup probe still gates whichever build lands."
+        type: string
+        default: ""
       opt_write_statistics:
         description: "[pyarrow arm] pyarrow ParquetWriter write_statistics. false strips the per-PAGE statistics parquet-cpp puts in every data page header, which DuckDB never writes. Set aside earlier because delta-rs writes none either and is fast - but that assumes ONE rule makes both fast writers fast, and DuckDB is the only writer with neither page statistics nor the RLE_DICTIONARY tag. Same shape of test that cleared ARROW:schema."
         type: boolean
@@ -180,7 +180,12 @@ jobs:
           pip install -e .
 
       - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
+        if: ${{ inputs.duckdb_pip == '' }}
         run: pip install duckdb==1.6.0.dev365
+
+      - name: 🦆 Install a custom duckdb build instead (writer A/B against an unreleased patch)
+        if: ${{ inputs.duckdb_pip != '' }}
+        run: pip install --force-reinstall "${{ inputs.duckdb_pip }}"
 
       - name: 🧩 Install ADOMD.NET client (.NET Core build, cross-platform)
         run: |
@@ -234,7 +239,6 @@ jobs:
           OPT_TABLE: ${{ env.TABLE_PYARROW }}
           OPT_WRITER: pyarrow
           OPT_COMPRESSION: ${{ inputs.opt_compression }}
-          OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
           OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
           OPT_MAX_ROWS_PER_PAGE: ${{ inputs.opt_max_rows_per_page }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
@@ -292,7 +296,6 @@ jobs:
           # silently ignores it. opt_compression was added to one and not the other, and the
           # uncompressed run measured a snappy pyarrow arm against an uncompressed duckdb one.
           OPT_COMPRESSION: ${{ inputs.opt_compression }}
-          OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
           OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
           OPT_MAX_ROWS_PER_PAGE: ${{ inputs.opt_max_rows_per_page }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
