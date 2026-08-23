@@ -68,6 +68,10 @@ on:
         description: "[duckdb arm] write the explicit is_sorted=False on dictionary page headers. Both fast writers emit it (17-byte header), DuckDB omits it (16 bytes), and no previous experiment could reach it — footer injection never touches page headers and the reframe copies dictionary headers through verbatim. The last page-internal property where the two fast writers agree and DuckDB differs. 'DUID', or 'all', or empty."
         type: string
         default: ""
+      opt_transplant_duckdb:
+        description: "[duckdb arm] the REVERSE transplant: replace this column's pages in the DuckDB file with the ones pyarrow wrote, keeping DuckDB's container. The forward direction is proven (pyarrow's file goes 560ms to 12123ms carrying DuckDB's chunk); this is the symmetric half. Fast here means the trigger is entirely chunk-local. Setting it builds the pyarrow arm BEFORE the duckdb arm so the donor exists, which is why it cannot be combined with opt_transplant. 'DUID', or empty."
+        type: string
+        default: ""
       opt_transplant:
         description: "[pyarrow arm] replace this column's page bytes with the ones the DuckDB arm wrote, keeping pyarrow's container. Every metadata difference has been neutralised in one run with no effect, so the cost is in the payload — a slow read here proves it and a fast one refutes it. 'DUID', or empty. Requires arms=duckdb,pyarrow with opt_threads=1 and an opt_rg that is a multiple of 2048, so the row groups line up."
         type: string
@@ -205,6 +209,26 @@ jobs:
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
         run: python tests/parquet_layout/aemo/build_auto_sort.py
 
+      - name: 🏹 Build the pyarrow table FIRST (donor for the reverse transplant)
+        # A third, independent encoder. Same rows, same order, same geometry; everything after the
+        # write - listing, typed footer stats, AddActions, commit - is the shared code path, so the
+        # only thing that varies is which library encoded the parquet.
+        if: ${{ contains(inputs.arms, 'pyarrow') && inputs.opt_transplant_duckdb != '' }}
+        env:
+          PYTHONIOENCODING: utf-8
+          ONELAKE_TABLES_PATH: ${{ env.TABLES_PYARROW }}
+          BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
+          OPT_TABLE: ${{ env.TABLE_PYARROW }}
+          OPT_WRITER: pyarrow
+          OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
+          OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
+          OPT_RG: ${{ inputs.opt_rg }}
+          OPT_COLUMNS: ${{ inputs.columns }}
+          OPT_SORT: ${{ inputs.opt_sort }}
+          FORCE_REBUILD: "true"
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/build_duckdb_native.py
+
       - name: 🦆 Build the DuckDB-writer table
         if: ${{ contains(inputs.arms, 'duckdb') }}
         env:
@@ -219,6 +243,8 @@ jobs:
           OPT_REFRAME: ${{ inputs.opt_reframe }}
           OPT_BITWIDTH: ${{ inputs.opt_bitwidth }}
           OPT_DICT_ENCODING: ${{ inputs.opt_dict_encoding }}
+          OPT_TRANSPLANT: ${{ inputs.opt_transplant_duckdb }}
+          OPT_TRANSPLANT_FROM: ${{ env.TABLES_PYARROW }}/tests/${{ env.TABLE_PYARROW }}
           OPT_DICT_SORTED: ${{ inputs.opt_dict_sorted }}
           OPT_THREADS: ${{ inputs.opt_threads }}
           OPT_RG: ${{ inputs.opt_rg }}
@@ -231,7 +257,7 @@ jobs:
         # A third, independent encoder. Same rows, same order, same geometry; everything after the
         # write - listing, typed footer stats, AddActions, commit - is the shared code path, so the
         # only thing that varies is which library encoded the parquet.
-        if: ${{ contains(inputs.arms, 'pyarrow') }}
+        if: ${{ contains(inputs.arms, 'pyarrow') && inputs.opt_transplant_duckdb == '' }}
         env:
           PYTHONIOENCODING: utf-8
           ONELAKE_TABLES_PATH: ${{ env.TABLES_PYARROW }}
