@@ -52,6 +52,7 @@ object, both produce a footer that still parses and is subtly not what the write
 structure is rebuilt and compared against the original serialization first, and the whole patch
 aborts unless the untouched rebuild is byte-identical.
 """
+import os
 import struct
 
 MARKER = b"PAR1"
@@ -74,7 +75,7 @@ STAT_FIELDS = ["max", "min", "null_count", "distinct_count", "max_value", "min_v
 # What `createdby` rewrites the footer's created_by string to. Readers legitimately
 # branch on this: parquet-mr distrusts statistics from known-buggy writer versions, and
 # arrow does the same, so a writer allowlist for a fast path is entirely plausible.
-CREATED_BY = "parquet-rs version 57.3.0"
+CREATED_BY = os.environ.get("OPT_CREATED_BY") or "parquet-rs version 57.3.0"
 
 # ConvertedType ordinal -> the LogicalType union field that means the same thing.
 PROMOTE = {0: "STRING", 6: "DATE"}
@@ -223,9 +224,14 @@ def patch_bytes(blob, features):
                 counts = {}
                 for ptype, enc, _o, _s, _n, _lv in pages:
                     counts[(ptype, enc)] = counts.get((ptype, enc), 0) + 1
+                # Dictionary page FIRST, which is the order parquet-cpp writes and the order the
+                # pages physically appear. sorted() puts DATA_PAGE (0) before DICTIONARY_PAGE (2),
+                # so the synthesized list had the right contents in the wrong order -- the last
+                # substantive field still differing once everything else is matched.
                 es = [ThriftObject.from_fields("PageEncodingStats", i32list=PES_I32,
                                                page_type=p, encoding=e, count=c)
-                      for (p, e), c in sorted(counts.items())]
+                      for (p, e), c in sorted(counts.items(),
+                                              key=lambda kv: (kv[0][0] != DICTIONARY_PAGE, kv[0]))]
                 n_es += 1
 
             # The spec requires `encodings` to list EVERY encoding used in the chunk. DuckDB lists

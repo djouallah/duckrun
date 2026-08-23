@@ -259,6 +259,7 @@ jobs:
           OPT_PARQUET_VERSION: V1
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_FOOTER_INJECT: ${{ inputs.opt_footer_inject }}
+          OPT_CREATED_BY: parquet-cpp-arrow version 25.0.1
           OPT_REFRAME: ${{ inputs.opt_reframe }}
           OPT_BITWIDTH: ${{ inputs.opt_bitwidth }}
           OPT_COMPRESSION: ${{ inputs.opt_compression }}
