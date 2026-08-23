@@ -61,13 +61,10 @@ on:
           - snappy
           - uncompressed
           - zstd
-      page_compressor:
-        description: "which snappy the page rewrites re-compress through. Two valid encoders emit different bytes for the same input, and on the real fact cramjam and parquet-cpp disagree by a byte or two per page (they agree exactly on synthetic data, which is how this went unnoticed). Every re-framing run to date used cramjam and therefore never produced parquet-cpp's bytes. 'pyarrow' is the compressor parquet-cpp itself writes through; 'cramjam' reproduces the earlier null results."
-        type: choice
-        default: pyarrow
-        options:
-          - pyarrow
-          - cramjam
+      opt_max_rows_per_page:
+        description: "[pyarrow arm] raise parquet-cpp's 20,000-row data page cap, e.g. 1048576 to match what DuckDB's byte cap lands on. This is the only way to match page boundaries WITHOUT shrinking the row group: every earlier attempt shrank DuckDB to parquet-cpp's 20,000 rows, which forces thousands of row groups for the full fact and buries the per-value penalty under per-segment overhead (509 row groups cost ~800ms on BOTH arms). Empty leaves parquet-cpp's default."
+        type: string
+        default: ""
       opt_dict_encoding:
         description: "[duckdb arm] retag the dictionary page encoding from PLAIN to PLAIN_DICTIONARY, which is what parquet-cpp writes. DuckDB is the only one of the three writers that mixes the modern spelling on the dictionary page with the deprecated spelling on the data pages. 'DUID', or 'all', or empty."
         type: string
@@ -239,6 +236,7 @@ jobs:
           OPT_COMPRESSION: ${{ inputs.opt_compression }}
           OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
           OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
+          OPT_MAX_ROWS_PER_PAGE: ${{ inputs.opt_max_rows_per_page }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_COLUMNS: ${{ inputs.columns }}
           OPT_SORT: ${{ inputs.opt_sort }}
@@ -263,7 +261,6 @@ jobs:
           OPT_REFRAME: ${{ inputs.opt_reframe }}
           OPT_BITWIDTH: ${{ inputs.opt_bitwidth }}
           OPT_COMPRESSION: ${{ inputs.opt_compression }}
-          PAGE_COMPRESSOR: ${{ inputs.page_compressor }}
           OPT_DICT_ENCODING: ${{ inputs.opt_dict_encoding }}
           OPT_TRANSPLANT: ${{ inputs.opt_transplant_duckdb }}
           OPT_TRANSPLANT_FROM: ${{ env.TABLES_PYARROW }}/tests/${{ env.TABLE_PYARROW }}
@@ -295,6 +292,7 @@ jobs:
           OPT_COMPRESSION: ${{ inputs.opt_compression }}
           OPT_STORE_SCHEMA: ${{ inputs.opt_store_schema }}
           OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
+          OPT_MAX_ROWS_PER_PAGE: ${{ inputs.opt_max_rows_per_page }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_TRANSPLANT: ${{ inputs.opt_transplant }}
           OPT_TRANSPLANT_FROM: ${{ env.TABLES_DUCKDB }}/tests/${{ env.TABLE_DUCKDB }}

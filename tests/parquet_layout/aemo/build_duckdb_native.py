@@ -163,6 +163,12 @@ DICT_SORTED = (os.environ.get("OPT_DICT_SORTED") or "").strip()
 # construct a DataPageHeader. Column name, or 'all'. The synthesizer refuses to run unless it first
 # reproduces parquet-cpp's own page-stats headers byte for byte. See page_reframe.add_page_stats_bytes.
 PAGE_STATS = (os.environ.get("OPT_PAGE_STATS") or "").strip()
+# DIAGNOSTIC (pyarrow arm). parquet-cpp caps a data page at 20,000 rows; DuckDB caps by bytes and
+# lands on 1,048,576. Raising parquet-cpp's cap to DuckDB's value is the only way to match page
+# boundaries WITHOUT shrinking the row group, and the row group has to stay large or the run
+# measures per-segment overhead instead of the per-value penalty.
+_mrp = (os.environ.get("OPT_MAX_ROWS_PER_PAGE") or "").strip()
+MAX_ROWS_PER_PAGE = int(_mrp) if _mrp.isdigit() and int(_mrp) > 0 else None
 TRANSPLANT = (os.environ.get("OPT_TRANSPLANT") or "").strip()
 TRANSPLANT_FROM = (os.environ.get("OPT_TRANSPLANT_FROM") or "").strip().rstrip("/")
 # DIAGNOSTIC (duckdb arm). COPY thread count — 2 is the memory-fit default (see the SET threads
@@ -240,9 +246,19 @@ def _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con):
         # behind every write, which is a geometry difference the comparison must not introduce.
         while tbl.num_rows >= RG:
             if w is None:
+                _kw = {}
+                if MAX_ROWS_PER_PAGE:
+                    # Make parquet-cpp write DuckDB's page geometry instead of the other way round.
+                    # Byte identity needs the two writers to agree on page boundaries, and every
+                    # attempt so far did that by shrinking DuckDB to parquet-cpp's 20,000-row pages
+                    # — which forces a row group small enough that thousands of them are needed for
+                    # the full fact, and per-segment overhead then swamps the very signal being
+                    # measured (509 row groups put ~800ms of fixed cost on BOTH arms). Going the
+                    # other way keeps 24 row groups and the 20x signal intact.
+                    _kw["max_rows_per_page"] = MAX_ROWS_PER_PAGE
                 w = pq.ParquetWriter(local, tbl.schema, compression=_PA_CODEC, use_dictionary=True,
                                      data_page_size=PAGE_BYTES, version="1.0",
-                                     write_statistics=WRITE_STATS, store_schema=STORE_SCHEMA)
+                                     write_statistics=WRITE_STATS, store_schema=STORE_SCHEMA, **_kw)
             w.write_table(tbl.slice(0, RG), row_group_size=RG)
             tbl = tbl.slice(RG)
         return tbl, w
