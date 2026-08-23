@@ -305,18 +305,17 @@ else:
     # disagreeing on maxValues.date by a fortnight while their row counts matched exactly. Ordering
     # first makes the subset the FIRST n rows and identical for every arm; DuckDB runs it as a
     # top-N rather than a full sort.
-    src = (_src_tbl if N_CAP is None
-           else f"(select * from {_src_tbl} order by all limit {N_CAP})")
-    n_src = dd.execute(f"select count(*) from {src}").fetchone()[0]
-    if N_CAP is not None:
-        _total = dd.execute(f"select count(*) from {_src_tbl}").fetchone()[0]
-        print(f"source has {_total:,} rows; capped to the first {n_src:,} in `order by all` order"
-              + ("  (cap is a no-op)" if _total <= N_CAP else ""), flush=True)
-
-    # column types drive the typed stats casts below; the mart already stores decimal(18,4)
-    # (duckrun's write path narrows wide decimals), so everything here dictionary-encodes —
-    # a DECIMAL(p>18) source would write FLBA, which never gets a dictionary (the WARN catches it)
-    coltypes = dict(dd.execute(f"select column_name, column_type from (describe {src})").fetchall())
+    #
+    # The projection goes INSIDE the cap, which is a memory fix, not a cosmetic one. DuckDB's
+    # top-N is not a spillable operator, so `select *` makes it hold N rows of EVERY column of the
+    # fact in memory — 8.3M of them OOM'd a 12.4GiB runner twice (runs 32627183898, 32627622202)
+    # on a harness that survives 142M, because a cap at roughly the source size degenerates to a
+    # stream while a cap well below it is a real heap. Projecting first is also what byte_verify
+    # does, so the Fabric arms now slice the source the same way the off-Fabric byte comparison
+    # does. Determinism is unaffected: rows tied on the projected columns are by definition
+    # identical in them, so which of them the cap takes cannot change the bytes written.
+    coltypes = dict(dd.execute(
+        f"select column_name, column_type from (describe select * from {_src_tbl})").fetchall())
     cols = list(coltypes)
     # OPT_COLUMNS narrows the table to a subset — a minimal reproducer writes far fewer bytes and
     # measures the same thing, since probing one column only transcodes that column.
@@ -329,6 +328,14 @@ else:
         cols = _want
         coltypes = {c: coltypes[c] for c in cols}
     collist = ", ".join(f'"{c}"' for c in cols)
+
+    src = (_src_tbl if N_CAP is None
+           else f"(select {collist} from {_src_tbl} order by all limit {N_CAP})")
+    n_src = dd.execute(f"select count(*) from {src}").fetchone()[0]
+    if N_CAP is not None:
+        _total = dd.execute(f"select count(*) from {_src_tbl}").fetchone()[0]
+        print(f"source has {_total:,} rows; capped to the first {n_src:,} in `order by all` order"
+              + ("  (cap is a no-op)" if _total <= N_CAP else ""), flush=True)
     order = ", ".join(f'"{c}"' for c in sort_cols)
     run_tag = uuid.uuid4().hex[:8]
 
