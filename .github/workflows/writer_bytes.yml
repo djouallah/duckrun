@@ -76,6 +76,8 @@ jobs:
           PYTHONIOENCODING: utf-8
           PYTHONUNBUFFERED: "1"
           BENCH_SOURCE: delta_scan('${{ env.ONELAKE_TABLES_PATH }}/mart/fct_summary')
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           BYTES_ROWS: ${{ inputs.rows }}
           BYTES_SKIP: ${{ inputs.skip }}
           BYTES_RG: ${{ inputs.rg }}

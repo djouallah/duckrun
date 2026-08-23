@@ -106,7 +106,11 @@ def main():
     duck = os.path.join(d, "duck.parquet").replace("\\", "/")
     arrow = os.path.join(d, "arrow.parquet").replace("\\", "/")
 
-    con = duckdb.connect()
+    # duckrun.connect wires the OIDC token into DuckDB's azure secret; a bare duckdb.connect()
+    # has no OneLake credentials and dies on the delta_scan with "Identity not found".
+    import duckrun
+    _c = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"].rstrip("/"), read_only=True)
+    con = _c.con
     con.execute("SET threads=1")
     print(f"duckdb {duckdb.__version__} | pyarrow {pa.__version__}", flush=True)
     # Deterministic slice: order first, then skip/limit, so both writers get identical rows.
