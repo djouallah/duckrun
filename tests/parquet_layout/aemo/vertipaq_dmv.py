@@ -77,7 +77,15 @@ def read_model(workspace, model, token):
     try:
         if not xc.warm_up(conn, model):
             return None
-        xc.run_query(conn, HYDRATE)   # make every fact column resident
+        # Hydrate per column, not in one ROW(): a single DAX statement is all-or-nothing, so one
+        # bad column (a type DISTINCTCOUNT rejects, a name that never bound) takes the whole
+        # hydrate down and every column then reads as "not resident" for the wrong reason. Per
+        # column, a failure is attributed to the column that caused it and the rest still load.
+        for c in COLUMNS:
+            try:
+                xc.run_query(conn, f'EVALUATE ROW("v", DISTINCTCOUNT(fct_summary[{c}]))')
+            except Exception as e:
+                print(f"  hydrate FAILED for {c}: {str(e).splitlines()[0][:140]}", flush=True)
         ccols, crows = dmv_rows(conn, "SELECT * FROM $SYSTEM.DISCOVER_STORAGE_TABLE_COLUMNS")
         scols, srows = dmv_rows(conn, "SELECT * FROM $SYSTEM.DISCOVER_STORAGE_TABLE_COLUMN_SEGMENTS")
     finally:
@@ -125,20 +133,33 @@ def render(model, data, out):
     out.append(f"\n### {model} — resident fact columns (VertiPaq DMVs)")
     out.append("| column | encoding | dict MB | segs | resident MB | bits/seg | compression/seg |")
     out.append("|---|---|---|---|---|---|---|")
-    rendered = 0
-    for col in COLUMNS:
+    # Show EVERY column, in this order: the ones asked for (so the table reads in schema order),
+    # then anything the DMV returned that was not asked for. A requested column with no DMV row
+    # gets a visible "not in DMV" row rather than vanishing.
+    #
+    # It used to `continue` past a missing column, which silently rendered a 5-row table for a
+    # 9-column model and looked exactly like a complete one. A readout whose whole job is "what
+    # did the transcode actually do" must never quietly drop a column.
+    extras = [c for c in sorted(data) if c not in COLUMNS]
+    for col in list(COLUMNS) + extras:
         d = data.get(col)
         if not d:
+            out.append(f"| {col} | _not in DMV_ | | | | | |")
             continue
         segs = d["segments"]
         used = round(sum(s["used_mb"] for s in segs), 1)
         bits = "/".join(str(s["bits"]) for s in segs)
         comp = "/".join(s["compression"] for s in segs)
-        out.append(f"| {col} | {d['encoding']} | {d['dictionary_mb']} | {len(segs)} "
-                   f"| {used} | {bits} | {comp} |")
-        rendered += 1
-    if not rendered:  # never render silently-empty tables again; show what the DMV actually keyed
-        out.append(f"| _no column matched; DMV keys were: {sorted(data)[:8]}_ | | | | | | |")
+        out.append(f"| {col}{' *' if col in extras else ''} | {d['encoding']} "
+                   f"| {d['dictionary_mb']} | {len(segs)} | {used} | {bits} | {comp} |")
+    missing = [c for c in COLUMNS if c not in data]
+    if missing or extras:
+        out.append("")
+        out.append(f"_requested but absent from the DMV: {missing or 'none'}; "
+                   f"present but not requested (\\*): {extras or 'none'}_")
+    print(f"  DMV returned {len(data)} fact column(s): {sorted(data)}", flush=True)
+    if missing:
+        print(f"  MISSING from the DMV: {missing}", flush=True)
 
 
 def main():
