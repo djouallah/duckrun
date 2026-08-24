@@ -124,6 +124,12 @@ def read_model(workspace, model, token):
             "encoding": {1: "HASH", 2: "VALUE"}.get(_pick(ccols, row, "COLUMN_ENCODING"),
                                                     str(_pick(ccols, row, "COLUMN_ENCODING"))),
             "dictionary_mb": round((_pick(ccols, row, "DICTIONARY_SIZE") or 0) / 1e6, 2),
+            # Direct Lake columns are PAGEABLE: the DMV describes every column whether or not its
+            # data is in memory, and a non-resident dictionary reports SIZE 0. Without these two
+            # flags a 0 is unreadable — it could mean "empty" or "not loaded" — which is what made
+            # the all-zero readout on run 32681270789 impossible to interpret.
+            "dictionary_resident": bool(_pick(ccols, row, "DICTIONARY_ISRESIDENT")),
+            "dictionary_pageable": bool(_pick(ccols, row, "DICTIONARY_ISPAGEABLE")),
             "segments": [],
         }
     if not out:  # filter matched nothing — dump reality so the next fix is fact-based
@@ -140,16 +146,38 @@ def read_model(workspace, model, token):
         out[col]["segments"].append({
             "rows": int(_pick(scols, row, "RECORDS_COUNT") or 0),
             "used_mb": round((_pick(scols, row, "USED_SIZE") or 0) / 1e6, 2),
+            "allocated_mb": round((_pick(scols, row, "ALLOCATED_SIZE") or 0) / 1e6, 2),
             "compression": str(_pick(scols, row, "COMPRESSION_TYPE", "")),
             "bits": int(_pick(scols, row, "BITS_COUNT") or 0),
+            # Same reason as the dictionary flags above. VERTIPAQ_STATE names what the engine has
+            # actually done with the segment, which is the difference between "the transcode chose
+            # this" and "nothing has been transcoded yet".
+            "state": str(_pick(scols, row, "VERTIPAQ_STATE", "")),
+            "resident": bool(_pick(scols, row, "ISRESIDENT")),
+            "pageable": bool(_pick(scols, row, "ISPAGEABLE")),
         })
     return out
 
 
+def _runs(values):
+    """'21x3/32x21' rather than 145 slash-separated numbers. At one row group the old spelling was
+    readable; at 145 it is a 700-character cell that hides the thing it is meant to show."""
+    out, prev, n = [], object(), 0
+    for v in list(values) + [object()]:
+        if v == prev:
+            n += 1
+            continue
+        if n:
+            out.append(f"{prev}x{n}" if n > 1 else f"{prev}")
+        prev, n = v, 1
+    return "/".join(out)
+
+
 def render(model, data, out):
     out.append(f"\n### {model} — resident fact columns (VertiPaq DMVs)")
-    out.append("| column | encoding | dict MB | segs | resident MB | bits/seg | compression/seg |")
-    out.append("|---|---|---|---|---|---|---|")
+    out.append("| column | encoding | dict MB | dict res | segs | resident | used MB | alloc MB "
+               "| bits/seg | compression/seg | state |")
+    out.append("|---|---|---|---|---|---|---|---|---|---|---|")
     # Show EVERY column, in this order: the ones asked for (so the table reads in schema order),
     # then anything the DMV returned that was not asked for. A requested column with no DMV row
     # gets a visible "not in DMV" row rather than vanishing.
@@ -163,14 +191,17 @@ def render(model, data, out):
         d = data.get(col)
         label = want.get(col) or (d or {}).get("name") or col
         if not d:
-            out.append(f"| {label} | _not in DMV_ | | | | | |")
+            out.append(f"| {label} | _not in DMV_ | | | | | | | | | |")
             continue
         segs = d["segments"]
         used = round(sum(s["used_mb"] for s in segs), 1)
-        bits = "/".join(str(s["bits"]) for s in segs)
-        comp = "/".join(s["compression"] for s in segs)
+        alloc = round(sum(s["allocated_mb"] for s in segs), 1)
+        res = sum(1 for s in segs if s["resident"])
         out.append(f"| {label}{' *' if col in extras else ''} | {d['encoding']} "
-                   f"| {d['dictionary_mb']} | {len(segs)} | {used} | {bits} | {comp} |")
+                   f"| {d['dictionary_mb']} | {'Y' if d['dictionary_resident'] else 'n'} "
+                   f"| {len(segs)} | {res}/{len(segs)} | {used} | {alloc} "
+                   f"| {_runs(s['bits'] for s in segs)} | {_runs(s['compression'] for s in segs)} "
+                   f"| {_runs(s['state'] for s in segs)} |")
     missing = [c for k, c in want.items() if k not in data]
     if missing or extras:
         out.append("")
