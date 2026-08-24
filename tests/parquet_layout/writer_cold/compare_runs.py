@@ -39,10 +39,18 @@ def fetch(run_id, repo):
 
 
 def _table(rep):
-    """The one built table in the report. Sweeps run a single arm, so this is unambiguous; with
-    several arms the first is taken and the caller sees it in the header."""
+    """The table this run BUILT.
+
+    Not simply the first one: the V-Order arm's byte ledger reads the source lakehouse, which also
+    holds every fct_summary_* left by past campaigns, so `tables` came back with nine entries and
+    taking sorted()[0] silently reported another campaign's table as the arm's result (769.57 MB /
+    25 row groups against the real 791.98 / 9). Only the builder writes a `build` section, so that
+    is the one key that identifies the arm's own table.
+    """
     tables = rep.get("tables") or {}
-    return (sorted(tables)[0], tables[sorted(tables)[0]]) if tables else (None, {})
+    built = sorted(t for t, v in tables.items() if v.get("build"))
+    pick = built or sorted(tables)
+    return (pick[0], tables[pick[0]]) if pick else (None, {})
 
 
 def _label(rep):
