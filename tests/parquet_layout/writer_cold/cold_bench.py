@@ -29,13 +29,21 @@ import report  # noqa: E402
 
 # One column per query, cheapest aggregate that still forces a full scan of that column.
 # probe_rowcount LAST: it is the control, and it must not warm anything.
+# The aggregate is matched ACROSS a comparison pair, never chosen per column: probe_duid and
+# probe_duid_id are both DISTINCTCOUNT so the string-vs-integer pair differs only in type, and
+# price / price_dec / price_dbl are all SUM so the three-way over identical values differs only in
+# the storage and model type. A pair measured with two different aggregates measures the aggregate.
 QUERIES = [
-    ("probe_mw",       'EVALUATE ROW("v", SUM(fct_summary[mw]))'),
-    ("probe_price",    'EVALUATE ROW("v", SUM(fct_summary[price]))'),
-    ("probe_duid",     'EVALUATE ROW("v", DISTINCTCOUNT(fct_summary[DUID]))'),
-    ("probe_date",     'EVALUATE ROW("v", MIN(fct_summary[date]))'),
-    ("probe_time",     'EVALUATE ROW("v", MAX(fct_summary[time]))'),
-    ("probe_rowcount", 'EVALUATE ROW("v", COUNTROWS(fct_summary))'),
+    ("probe_mw",        'EVALUATE ROW("v", SUM(fct_summary[mw]))'),
+    ("probe_price",     'EVALUATE ROW("v", SUM(fct_summary[price]))'),
+    ("probe_price_dec", 'EVALUATE ROW("v", SUM(fct_summary[price_dec]))'),
+    ("probe_price_dbl", 'EVALUATE ROW("v", SUM(fct_summary[price_dbl]))'),
+    ("probe_duid",      'EVALUATE ROW("v", DISTINCTCOUNT(fct_summary[DUID]))'),
+    ("probe_duid_id",   'EVALUATE ROW("v", DISTINCTCOUNT(fct_summary[duid_id]))'),
+    ("probe_year_int",  'EVALUATE ROW("v", SUM(fct_summary[year_int]))'),
+    ("probe_date",      'EVALUATE ROW("v", MIN(fct_summary[date]))'),
+    ("probe_time",      'EVALUATE ROW("v", MAX(fct_summary[time]))'),
+    ("probe_rowcount",  'EVALUATE ROW("v", COUNTROWS(fct_summary))'),
 ]
 
 

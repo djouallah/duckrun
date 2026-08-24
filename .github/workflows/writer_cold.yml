@@ -45,10 +45,10 @@ on:
         description: "[duckdb arm] URL of a DuckDB CLI binary (or .gz/.zip of one) to WRITE with instead of the pip package -- how an unreleased writer patch gets its DAX before/after: the fork's CI builds the CLI, the pip duckdb only stages source rows locally, the CLI does the sort+COPY with identical options, and the shared upload+commit+probe path is unchanged. Empty = the pip writer."
         type: string
         default: ""
-      opt_write_statistics:
-        description: "[pyarrow arm] pyarrow ParquetWriter write_statistics. false strips the per-PAGE statistics parquet-cpp puts in every data page header, which DuckDB never writes. Set aside earlier because delta-rs writes none either and is fast - but that assumes ONE rule makes both fast writers fast, and DuckDB is the only writer with neither page statistics nor the RLE_DICTIONARY tag. Same shape of test that cleared ARROW:schema."
-        type: boolean
-        default: true
+      opt_derived:
+        description: "[duckdb/pyarrow arms] COMPUTED columns the fact does not store — the only way to probe a type the source never had. `<expr> AS <alias>` entries separated by SEMICOLONS (the expressions contain commas). Referenced base columns come from the SOURCE, so they need not appear in `columns`. The type matrix: year(\"date\") AS year_int; cast(hash(\"DUID\") >> 1 as bigint) AS duid_id; cast(\"price\" as decimal(18,4)) AS price_dec; cast(\"price\" as double) AS price_dbl — duid_id is the cardinality-matched INTEGER partner for DUID (same 383 values, same 9-bit dictionary, type is the only difference), and price/price_dec/price_dbl is a three-way over identical values. Empty = the historical geometry, byte-comparable with every earlier run."
+        type: string
+        default: ""
       opt_bitwidth:
         description: "[duckdb arm] re-encode the dictionary indices at a different bit width, as '<mode>:<column>' e.g. 'uniform:DUID'. DuckDB picks one width per chunk, so it flips 8 to 9 at row group 5 where the dictionary crosses 256, while the engine's resident segments are 9 bits for all 24 row groups. No COPY option reaches this. 'uniform' holds one width for the whole column so it never changes down the file; 'min' gives each page the narrowest width it can carry, which is what parquet-cpp does."
         type: string
@@ -217,6 +217,7 @@ jobs:
           BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
           OPT_TABLE: ${{ env.TABLE_DELTARS }}
           OPT_COLUMNS: ${{ inputs.columns }}
+          OPT_DERIVED: ${{ inputs.opt_derived }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
@@ -234,11 +235,15 @@ jobs:
           OPT_TABLE: ${{ env.TABLE_PYARROW }}
           OPT_WRITER: pyarrow
           OPT_COMPRESSION: ${{ inputs.opt_compression }}
-          OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
+          # PINNED, not an input: stripping page statistics from pyarrow measured 443.8 ms
+          # (still fast, run 32626197402 / FINDINGS 9.5), so it is a settled knob and github
+          # caps workflow_dispatch at 25 inputs. true = parquet-cpp's own default.
+          OPT_WRITE_STATISTICS: "true"
           OPT_MAX_ROWS_PER_PAGE: ${{ inputs.opt_max_rows_per_page }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_COLUMNS: ${{ inputs.columns }}
+          OPT_DERIVED: ${{ inputs.opt_derived }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
@@ -252,6 +257,7 @@ jobs:
           BENCH_SOURCE: delta_scan('${{ env.SRC_TABLES }}/mart/fct_summary')
           OPT_TABLE: ${{ env.TABLE_DUCKDB }}
           OPT_COLUMNS: ${{ inputs.columns }}
+          OPT_DERIVED: ${{ inputs.opt_derived }}
           # V1 vs V2 is the same bytes with a different encoding tag, measured flat
           # (12492 vs 12312 ms). Pinned, not an input: github caps workflow_dispatch
           # at 25 inputs and a dead knob is not worth one of them.
@@ -293,13 +299,17 @@ jobs:
           # silently ignores it. opt_compression was added to one and not the other, and the
           # uncompressed run measured a snappy pyarrow arm against an uncompressed duckdb one.
           OPT_COMPRESSION: ${{ inputs.opt_compression }}
-          OPT_WRITE_STATISTICS: ${{ inputs.opt_write_statistics }}
+          # PINNED, not an input: stripping page statistics from pyarrow measured 443.8 ms
+          # (still fast, run 32626197402 / FINDINGS 9.5), so it is a settled knob and github
+          # caps workflow_dispatch at 25 inputs. true = parquet-cpp's own default.
+          OPT_WRITE_STATISTICS: "true"
           OPT_MAX_ROWS_PER_PAGE: ${{ inputs.opt_max_rows_per_page }}
           OPT_PAGE_BYTES: ${{ inputs.opt_page_bytes }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_TRANSPLANT: ${{ inputs.opt_transplant }}
           OPT_TRANSPLANT_FROM: ${{ env.TABLES_DUCKDB }}/tests/${{ env.TABLE_DUCKDB }}
           OPT_COLUMNS: ${{ inputs.columns }}
+          OPT_DERIVED: ${{ inputs.opt_derived }}
           OPT_SORT: ${{ inputs.opt_sort }}
           FORCE_REBUILD: "true"
           BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
@@ -308,7 +318,11 @@ jobs:
       - name: 🚀 Deploy the two fresh Direct Lake models
         env:
           PYTHONIOENCODING: utf-8
-          MODEL_COLUMNS: ${{ inputs.columns }}
+          # BUILT_COLUMNS is written to $GITHUB_ENV by build_duckdb_native and carries the
+          # OPT_DERIVED aliases; inputs.columns is the projection whitelist and by construction
+          # cannot name a derived column, so binding off it would write columns the model never
+          # sees and never probes. Falls back when no duckdb/pyarrow arm ran.
+          MODEL_COLUMNS: ${{ env.BUILT_COLUMNS || inputs.columns }}
         run: python tests/parquet_layout/writer_cold/deploy_models.py
 
       - name: 🧊 Cold passes — one per arm, in order
@@ -354,7 +368,7 @@ jobs:
           PYTHONNET_RUNTIME: coreclr
           PYTHONIOENCODING: utf-8
           PYTHONUNBUFFERED: "1"
-          DMV_COLUMNS: ${{ inputs.columns }}
+          DMV_COLUMNS: ${{ env.BUILT_COLUMNS || inputs.columns }}
         run: |
           set -euo pipefail
           models=""

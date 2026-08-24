@@ -59,6 +59,39 @@
             "sourceColumn": "price",
             "sourceLineageTag": "price",
             "summarizeBy": "none"
+          },
+          {
+            "name": "year_int",
+            "description": "OPT_DERIVED year(date). A HIGH-cardinality-free integer: ~2 distinct values against time's 288, so it prices the fixed per-column overhead with almost no per-value work.",
+            "dataType": "int64",
+            "sourceColumn": "year_int",
+            "sourceLineageTag": "year_int",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "duid_id",
+            "description": "OPT_DERIVED hash(DUID)>>1. The cardinality-matched INTEGER partner for DUID — same 383 distinct values, same 9-bit dictionary, differing only in type. This is the pair that isolates string-vs-int; probe it with the same DISTINCTCOUNT probe_duid uses.",
+            "dataType": "int64",
+            "sourceColumn": "duid_id",
+            "sourceLineageTag": "duid_id",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "price_dec",
+            "description": "OPT_DERIVED cast(price as decimal(18,4)). Fixed-point in PARQUET and fixed-point in the model — the only price column whose storage type and model type agree.",
+            "dataType": "decimal",
+            "formatString": "$#,##0.00",
+            "sourceColumn": "price_dec",
+            "sourceLineageTag": "price_dec",
+            "summarizeBy": "none"
+          },
+          {
+            "name": "price_dbl",
+            "description": "OPT_DERIVED cast(price as double). Same DOUBLE bytes as `price`, but declared `double` here instead of `decimal` — so price/price_dbl/price_dec is a three-way over identical values that isolates the model-side type conversion from the storage type.",
+            "dataType": "double",
+            "sourceColumn": "price_dbl",
+            "sourceLineageTag": "price_dbl",
+            "summarizeBy": "none"
           }
         ],
         "partitions": [

@@ -409,6 +409,48 @@ else:
         coltypes = {c: coltypes[c] for c in cols}
     collist = ", ".join(f'"{c}"' for c in cols)
 
+    # OPT_DERIVED adds COMPUTED columns the fact does not store — the only way to probe a type the
+    # source never had (an INTEGER year, a fixed-point DECIMAL alongside the DOUBLE it came from).
+    # Entries are `<expr> AS <alias>`, separated by SEMICOLONS, because the expressions themselves
+    # contain commas: `year("date") AS year_int; cast("price" as decimal(18,4)) AS price_dec`.
+    #
+    # Two projections fall out of this and they are NOT interchangeable:
+    #   sellist — the expressions, applied EXACTLY ONCE, against the source
+    #   collist — the resulting column NAMES, for every re-projection downstream
+    # _write_cli re-projects its own staged parquet, so handing it the expressions would re-derive
+    # from a base column the staged file may no longer carry.
+    _derived = [d.strip() for d in (os.environ.get("OPT_DERIVED") or "").split(";") if d.strip()]
+    sellist = collist
+    if _derived:
+        _base = set(cols)
+        sellist = collist + ", " + ", ".join(_derived)
+        # Ask the engine for the RESULT schema rather than guessing: the Delta stats below cast
+        # each footer stat to the column's DuckDB type, and only DuckDB can say what
+        # `cast(price as decimal(18,4))` actually came out as.
+        coltypes = dict(dd.execute(
+            f"select column_name, column_type from "
+            f"(describe select {sellist} from {_src_tbl})").fetchall())
+        cols = list(coltypes)
+        # An unaliased expression is named after its own text by DuckDB ('year("date")'), which then
+        # fails to match path_in_schema and cannot bind in the semantic model. Catch it here rather
+        # than thirty minutes into a Fabric run.
+        bad = [c for c in cols if c not in _base and not c.isidentifier()]
+        if bad:
+            raise SystemExit(f"build_duckdb_native: OPT_DERIVED produced non-identifier column "
+                             f"name(s) {bad} — every entry needs a trailing `AS <alias>`")
+        collist = ", ".join(f'"{c}"' for c in cols)
+        print(f"derived columns: {[c for c in cols if c not in _base]}", flush=True)
+
+    # Publish what was ACTUALLY written, so the deploy and DMV steps stop re-deriving it. They used
+    # to read `inputs.columns`, which is the projection whitelist and by construction cannot name a
+    # derived column — a column would then be written, never bound in the model, and silently never
+    # probed. This is the same failure the workflow already warns about twice for opt_compression
+    # and opt_page_bytes: one arm honouring a knob another arm ignores.
+    _gh_env = os.environ.get("GITHUB_ENV")
+    if _gh_env:
+        with open(_gh_env, "a", encoding="utf-8") as fh:
+            fh.write(f"BUILT_COLUMNS={', '.join(cols)}\n")
+
     # The cap is a CUTOFF on the leading sort column, not `order by all limit N`. DuckDB's top-N is
     # not a spillable operator, so a top-N carrying whole rows OOM'd a 12.4GiB runner four times
     # (32627183898, 32627622202, 32628685053, 32628987366) at an 8.3M cap on a harness that
@@ -419,13 +461,16 @@ else:
     # It keeps what §9.1 actually needs — both arms evaluating ONE deterministic expression, so
     # they read identical rows — and gives up only exactness of the count, since the cutoff rounds
     # out to a whole value of the leading column. That is why n_src is printed rather than assumed.
+    # The projection uses sellist — the expressions — and it is applied here, once. Everything
+    # downstream re-projects `src` by NAME. With no OPT_DERIVED, sellist IS collist and the
+    # uncapped branch stays the bare table exactly as before, so an unused feature changes nothing.
     if N_CAP is None:
-        src = _src_tbl
+        src = f"(select {sellist} from {_src_tbl})" if _derived else _src_tbl
     else:
         _lead = f'"{sort_cols[0]}"'
         _cut = dd.execute(f"select max(k) from (select {_lead} as k from {_src_tbl} "
                           f"order by k limit {N_CAP})").fetchone()[0]
-        src = f"(select {collist} from {_src_tbl} where {_lead} <= '{_cut}')"
+        src = f"(select {sellist} from {_src_tbl} where {_lead} <= '{_cut}')"
     n_src = dd.execute(f"select count(*) from {src}").fetchone()[0]
     if N_CAP is not None:
         _total = dd.execute(f"select count(*) from {_src_tbl}").fetchone()[0]

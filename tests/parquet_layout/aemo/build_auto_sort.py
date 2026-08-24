@@ -62,6 +62,17 @@ _src = sort_key_mod.source_expr()
 _COLUMNS = [c.strip() for c in (os.environ.get("OPT_COLUMNS") or "").split(",") if c.strip()]
 _PROJECT = ", ".join(f'"{c}"' for c in _COLUMNS) if _COLUMNS else "*"
 
+# This builder has no OPT_DERIVED. Failing loudly beats building a delta-rs table that is silently
+# missing the derived columns the duckdb/pyarrow arms wrote — a cross-arm mismatch is precisely the
+# failure writer_cold.yml already carries two warnings about (opt_compression and opt_page_bytes
+# each reached one arm and not the other, and one of them invalidated a whole run unnoticed).
+if (os.environ.get("OPT_DERIVED") or "").strip():
+    raise SystemExit(
+        "build_auto_sort: OPT_DERIVED is not supported by the delta-rs arm — it would build a table "
+        "without the derived columns the other arms have, and the comparison would be silently "
+        "unmatched. Run the type matrix with arms=duckdb (optionally +pyarrow), or add derivation "
+        "here first.")
+
 con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"], read_only=False)
 try:
     con.sql("create schema if not exists tests")

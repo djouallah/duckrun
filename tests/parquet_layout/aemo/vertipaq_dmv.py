@@ -34,7 +34,10 @@ import report  # noqa: E402
 import xmla_compare as xc  # noqa: E402  — reuses _load_adomd/open_conn/warm_up/discover_models
 
 FACT = "fct_summary"
-DEFAULT_COLUMNS = ("date", "time", "DUID", "mw", "price", "cutoff")
+DEFAULT_COLUMNS = ("date", "time", "DUID", "mw", "price", "cutoff",
+                   # OPT_DERIVED type-matrix columns (writer_cold): present only when that run
+                   # derived them, which is why DMV_COLUMNS overrides this list per run.
+                   "year_int", "duid_id", "price_dec", "price_dbl")
 COLUMNS = tuple(c.strip() for c in (os.environ.get("DMV_COLUMNS") or "").split(",")
                 if c.strip()) or DEFAULT_COLUMNS
 # One query that touches EVERY fact column, so all segments are resident before the DMVs read.
