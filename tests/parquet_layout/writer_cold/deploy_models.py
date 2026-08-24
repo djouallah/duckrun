@@ -37,6 +37,12 @@ VARIANTS = [
      "model": os.environ.get("MODEL_PYARROW") or "writer_cold_pyarrow",
      "lakehouse": os.environ.get("LH_NAME_PYARROW") or "wab_pyarrow",
      "table": os.environ.get("TABLE_PYARROW") or "fct_summary_pyarrow"},
+    # The V-Order reference reads the SOURCE lakehouse, not a throwaway: its table is built once and
+    # kept. Only the model is fresh, which is what the cold guarantee actually rests on.
+    {"key": "vorder",
+     "model": os.environ.get("MODEL_VORDER") or "writer_cold_vorder",
+     "lakehouse": os.environ.get("LH_NAME") or "",
+     "table": os.environ.get("TABLE_VORDER") or "fct_summary_vorder"},
 ]
 
 
@@ -74,6 +80,9 @@ def main():
     ws = duckrun.workspace(os.environ["WS_ID"])
     out = {}
     for v in (v for v in VARIANTS if v["key"] in ARMS):
+        if not v["lakehouse"]:
+            raise SystemExit(f"deploy_models: arm {v['key']} has no lakehouse name "
+                             f"(the vorder arm needs LH_NAME — the source lakehouse it reads)")
         bim = _narrow(raw.replace("__FACT_TABLE__", v["table"]))
         path = os.path.join(tempfile.mkdtemp(prefix=f"bim_{v['key']}_"), "model.bim")
         with open(path, "w", encoding="utf-8") as f:

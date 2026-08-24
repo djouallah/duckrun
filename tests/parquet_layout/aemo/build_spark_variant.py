@@ -23,11 +23,27 @@ FORCE = os.environ.get("FORCE_REBUILD_VORDER", "false").strip().lower() == "true
 # of the duckrun auto_sort build's own read.
 _lim = os.environ.get("BENCH_ROW_LIMIT", "").strip()
 N = int(_lim) if _lim.isdigit() and int(_lim) > 0 else None
-SOURCE = "mart.fct_summary" if N is None else f"(SELECT * FROM mart.fct_summary LIMIT {N})"
+# The cap is a CUTOFF on the leading sort column, exactly as build_duckdb_native computes it, NOT
+# `LIMIT N`. LIMIT takes an arbitrary N rows, so the reference would hold a different row SET than
+# the arms it is supposed to anchor — and a baseline measured on different data anchors nothing.
+# Same expression on both sides means the same cutoff value and therefore the same rows.
+_lead = (os.environ.get("OPT_SORT") or "date").split(",")[0].strip() or "date"
+SOURCE = "mart.fct_summary" if N is None else (
+    f"(SELECT * FROM mart.fct_summary WHERE `{_lead}` <= "
+    f"(SELECT max(k) FROM (SELECT `{_lead}` AS k FROM mart.fct_summary ORDER BY k LIMIT {N})))")
 
-VARIANTS = {"vorder": SOURCE}
+# The output table name is a knob because the row-set contract is baked into the table: the
+# historical `fct_summary_vorder` was built under LIMIT semantics, and skip-if-exists would keep
+# serving those rows forever. A different contract gets a different name rather than a rebuild flag
+# nobody remembers to set — and nothing existing is overwritten.
+VARIANT = (os.environ.get("VORDER_TABLE") or "fct_summary_vorder").strip()
+if not VARIANT.startswith("fct_summary_"):
+    raise SystemExit(f"build_spark_variant: VORDER_TABLE must start with 'fct_summary_', "
+                     f"got {VARIANT!r} — downstream get_stats globs on that prefix")
+_V = VARIANT[len("fct_summary_"):]
+VARIANTS = {_V: SOURCE}
 # Human-readable sort provenance for the build metadata / summary layout matrix.
-SORTS = {"vorder": "source order"}
+SORTS = {_V: "source order"}
 
 
 def _record_build(variant, seconds, status):
@@ -120,8 +136,11 @@ def main():
             print(f"{out} already exists — skipping (set rebuild=true to rebuild).", flush=True)
             _record_build(v, None, "skipped")
             continue
-        if not _table_exists(src):
-            print(f"source {src} not found — skipping {v}.", flush=True)
+        # Probe the TABLE, not the source expression: the expression now carries the cutoff
+        # subquery, and running it here just to answer "does the source exist" would make DuckDB
+        # sort the whole 143M-row fact over OneLake for nothing.
+        if not _table_exists("mart.fct_summary"):
+            print("source mart.fct_summary not found — skipping.", flush=True)
             continue
         todo[v] = src
     if not todo:

@@ -33,15 +33,20 @@ MODELS = {
     "deltars": os.environ.get("MODEL_DELTARS") or "writer_cold_deltars",
     "duckdb": os.environ.get("MODEL_DUCKDB") or "writer_cold_duckdb",
     "pyarrow": os.environ.get("MODEL_PYARROW") or "writer_cold_pyarrow",
+    # The V-Order reference has a MODEL here but no lakehouse. Its table is built once by Spark into
+    # the source lakehouse and kept, because rebuilding a fixed baseline on every run is a Livy
+    # session and several minutes spent re-deriving a number that cannot move. Only the model is
+    # throwaway — and the model is the whole cold guarantee, so nothing is lost.
+    "vorder": os.environ.get("MODEL_VORDER") or "writer_cold_vorder",
 }
 WS_ID = os.environ["WS_ID"]
 # Which writer arms this run measures. delta-rs is a settled baseline (probe_duid 0.9-2.3s across
 # nine runs), so re-provisioning and re-measuring it every time is pure cost. Teardown deliberately
 # still sweeps BOTH names - a lakehouse leaked by an earlier run bills forever.
 ARMS = [a.strip() for a in (os.environ.get("ARMS") or "deltars,duckdb").split(",") if a.strip()]
-_unknown = set(ARMS) - set(LH)
+_unknown = set(ARMS) - set(MODELS)
 if _unknown:
-    raise SystemExit(f"provision: unknown arm(s) {sorted(_unknown)}; known: {sorted(LH)}")
+    raise SystemExit(f"provision: unknown arm(s) {sorted(_unknown)}; known: {sorted(MODELS)}")
 
 
 def _ws():
@@ -53,7 +58,7 @@ def _ws():
 def create():
     ws = _ws()
     out = {}
-    for key, name in ((k, LH[k]) for k in ARMS):
+    for key, name in ((k, LH[k]) for k in ARMS if k in LH):
         lh_id = ws.create_lakehouse(name, schemas=True)
         out[f"LH_ID_{key.upper()}"] = lh_id
         out[f"LH_NAME_{key.upper()}"] = name

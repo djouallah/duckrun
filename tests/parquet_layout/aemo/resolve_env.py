@@ -33,6 +33,10 @@ out = {
     "WS_NAME": ws_name,
     "ONELAKE_TABLES_PATH": f"abfss://{ws.id}@onelake.dfs.fabric.microsoft.com/{lh_id}/Tables",
     "PBI_WORKSPACE": ws_name,
+    # The DISPLAY name, not just the id: a semantic model is deployed against a lakehouse by name,
+    # so a model pointed at the SOURCE lakehouse (the V-Order reference lives there permanently
+    # rather than in a per-run throwaway) has no other way to name it.
+    "LH_NAME": e["lakehouse_name"],
 }
 gh = os.environ.get("GITHUB_ENV")
 if gh:

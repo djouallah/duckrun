@@ -113,9 +113,11 @@ on:
           - duckdb
           - deltars
           - pyarrow
+          - vorder
           - deltars,duckdb
           - deltars,pyarrow
           - duckdb,pyarrow
+          - vorder,duckdb
           - deltars,duckdb,pyarrow
       order:
         description: "which writer is measured FIRST when arms builds both. The two passes share one capacity, so the second can inherit smoothing/throttling from the first — swap this and re-run to prove an effect is the parquet and not the running order."
@@ -163,6 +165,13 @@ jobs:
       LH_PYARROW: wab_pyarrow
       MODEL_PYARROW: writer_cold_pyarrow
       TABLE_PYARROW: fct_summary_pyarrow
+      # The V-Order reference. No lakehouse of its own: the table is built once by Spark into the
+      # SOURCE lakehouse and kept, so the arm provisions a model only. `_ref` rather than the
+      # historical `fct_summary_vorder` because the row-set contract differs — that table was built
+      # under `LIMIT N`, which takes an arbitrary N rows, and this one uses the same deterministic
+      # cutoff as every other arm. Nothing existing is touched or overwritten.
+      MODEL_VORDER: writer_cold_vorder
+      TABLE_VORDER: fct_summary_vorder_ref
       ARMS: ${{ inputs.arms }}
     steps:
       - name: 📥 Checkout
@@ -207,6 +216,25 @@ jobs:
 
       - name: 🏗️ Provision the throwaway lakehouses
         run: python tests/parquet_layout/writer_cold/provision.py create
+
+      - name: ⚡ Build the V-Order reference — ONCE, then never again
+        # The outside reference point: the writer this whole campaign is measured against, built by
+        # Spark with V-Order on, from the same rows under the same deterministic cutoff.
+        #
+        # It is deliberately NOT rebuilt per run. Nothing about it depends on a duckrun knob — not
+        # the sort key, not the row-group size, not the parquet options — so a rebuild would spend a
+        # Livy session and several minutes re-deriving a number that cannot have moved. The builder
+        # skips when the table is already there, so this step is a no-op on every run after the
+        # first. That also means it must NOT live in a throwaway lakehouse: it writes into the
+        # source lakehouse and stays, and only the semantic model is fresh — which is where the
+        # cold guarantee actually comes from.
+        if: ${{ contains(inputs.arms, 'vorder') }}
+        env:
+          PYTHONIOENCODING: utf-8
+          VORDER_TABLE: ${{ env.TABLE_VORDER }}
+          OPT_SORT: ${{ inputs.opt_sort }}
+          BENCH_ROW_LIMIT: ${{ inputs.row_limit }}
+        run: python tests/parquet_layout/aemo/build_spark_variant.py
 
       - name: 🧭 Build the delta-rs table
         if: ${{ contains(inputs.arms, 'deltars') }}
@@ -347,6 +375,7 @@ jobs:
               deltars) model="$MODEL_DELTARS" ;;
               duckdb)  model="$MODEL_DUCKDB"  ;;
               pyarrow) model="$MODEL_PYARROW" ;;
+              vorder)  model="$MODEL_VORDER"  ;;
               *) echo "unknown arm '$arm'" >&2; exit 1 ;;
             esac
             if [ "$first" = 0 ] && [ "${{ inputs.gap_seconds }}" != "0" ]; then
@@ -375,6 +404,7 @@ jobs:
           case "$ARMS" in *deltars*) models="$MODEL_DELTARS" ;; esac
           case "$ARMS" in *duckdb*)  models="${models:+$models,}$MODEL_DUCKDB" ;; esac
           case "$ARMS" in *pyarrow*) models="${models:+$models,}$MODEL_PYARROW" ;; esac
+          case "$ARMS" in *vorder*)  models="${models:+$models,}$MODEL_VORDER"  ;; esac
           DMV_MODELS="$models" python tests/parquet_layout/aemo/vertipaq_dmv.py
 
       - name: 📐 Parquet byte ledger — what each column WEIGHS, next to what it cost
@@ -393,6 +423,10 @@ jobs:
           case "$ARMS" in *deltars*) ONELAKE_TABLES_PATH="$TABLES_DELTARS" python tests/parquet_layout/aemo/table_stats.py ;; esac
           case "$ARMS" in *duckdb*)  ONELAKE_TABLES_PATH="$TABLES_DUCKDB"  python tests/parquet_layout/aemo/table_stats.py ;; esac
           case "$ARMS" in *pyarrow*) ONELAKE_TABLES_PATH="$TABLES_PYARROW" python tests/parquet_layout/aemo/table_stats.py ;; esac
+          # vorder reads the SOURCE lakehouse, which also holds every other fct_summary_* left by
+          # past campaigns — get_stats globs the prefix, so the extra tables come along. Harmless:
+          # the report is keyed by table name and only fct_summary_vorder_ref is read back.
+          case "$ARMS" in *vorder*)  ONELAKE_TABLES_PATH="$SRC_TABLES"     python tests/parquet_layout/aemo/table_stats.py ;; esac
 
       - name: 🧬 Payload diff — decode the files this run measured
         # Runs BEFORE teardown, against the exact tables the cold pass timed, rather than inferring
