@@ -103,8 +103,14 @@ def read_model(workspace, model, token):
     # Print the DMV's own field names ONCE, always. On run 32681270789 every column came back with
     # USED_SIZE / DICTIONARY_SIZE / RECORDS_COUNT = 0 while BITS_COUNT and COMPRESSION_TYPE were
     # populated and varying — so the rows are real and correctly matched, and only the SIZE fields
-    # are absent or spelled differently here. The dump below is how that gets settled from evidence
-    # instead of guessed; the old one only fired when NO column matched, so it never printed.
+    # read empty. The dump below is how that gets settled from evidence instead of guessed; the old
+    # one only fired when NO column matched, so it never printed.
+    #
+    # Those SIZE zeros are NOT a spelling problem and NOT a finding: the size fields are simply not
+    # reported for this table type, so there is no other field name to hunt for. RECORDS_COUNT = 0
+    # on a resident segment of a 142M-row table settles it — no segment holds zero records. Do not
+    # read the zeros as "nothing was built"; segment size and segment-side compression are open
+    # questions this readout cannot answer. BITS_COUNT and COLUMN_ENCODING are the usable fields.
     print(f"  column  DMV fields: {ccols}", flush=True)
     print(f"  segment DMV fields: {scols}", flush=True)
 
