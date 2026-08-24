@@ -94,7 +94,7 @@ on:
         type: string
         default: "6000000"
       opt_threads:
-        description: "[duckdb arm] COPY thread count. 2 is the memory-fit default; 1 makes row-group emission deterministic (stream order) — with 2 threads the parallel carve emits row groups OUT of stream order, a real difference from the single-stream fast writers (payload_diff shows rg0 holding mid-stream rows)."
+        description: "[duckdb arm, pip writer only] COPY thread count. 2 is the memory-fit default; 1 makes row-group emission deterministic (stream order) — with 2 threads the parallel carve emits row groups OUT of stream order, a real difference from the single-stream fast writers (payload_diff shows rg0 holding mid-stream rows). The CLI writer IGNORES this and pins 1: it copies to a single file with no FILE_SIZE_BYTES rotation to bound it, so a parallel order-preserving write buffers the whole stream and OOM'd the runner once the projection got wide (run 32680398240)."
         type: string
         default: "2"
       columns:

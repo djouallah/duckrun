@@ -177,11 +177,16 @@ _mrp = (os.environ.get("OPT_MAX_ROWS_PER_PAGE") or "").strip()
 MAX_ROWS_PER_PAGE = int(_mrp) if _mrp.isdigit() and int(_mrp) > 0 else None
 TRANSPLANT = (os.environ.get("OPT_TRANSPLANT") or "").strip()
 TRANSPLANT_FROM = (os.environ.get("OPT_TRANSPLANT_FROM") or "").strip().rstrip("/")
-# DIAGNOSTIC (duckdb arm). COPY thread count — 2 is the memory-fit default (see the SET threads
-# comment at the call site). 1 additionally makes row-group emission deterministic: the parallel
-# carve emits row groups OUT of stream order (rg0 holds mid-stream rows; payload_diff shows it),
-# which is a real difference from the single-stream fast writers.
+# DIAGNOSTIC (duckdb/pyarrow arms). COPY thread count — 2 is the memory-fit default (see the SET
+# threads comment at the call site). 1 additionally makes row-group emission deterministic: the
+# parallel carve emits row groups OUT of stream order (rg0 holds mid-stream rows; payload_diff
+# shows it), which is a real difference from the single-stream fast writers. The CLI arm pins its
+# own thread count and ignores this — see _write_cli.
 THREADS = int(os.environ.get("OPT_THREADS") or 2)
+# The CLI arm runs a SECOND DuckDB in a subprocess while this process is still holding its own
+# buffer pool, and neither one knows about the other: each defaults memory_limit to 80% of the
+# box. Pinning the child leaves the parent room instead of racing it for the same 16 GB.
+CLI_MEM_GB = 8
 sort = (os.environ.get("OPT_SORT") or "date, time").strip()
 if sort.lower() == "auto":
     raise SystemExit("build_duckdb_native: OPT_SORT must be explicit columns (e.g. 'date, time'); "
@@ -272,13 +277,33 @@ def _write_cli(dd, collist, src, order, table_uri, run_tag, con):
     out = os.path.join(stage_dir, f"part-{run_tag}-{uuid.uuid4()}.parquet").replace("\\", "/")
     _dict_opt = f"DICTIONARY_SIZE_LIMIT {DICT_LIMIT}," if DICT_LIMIT else ""
     spill = tempfile.mkdtemp(prefix="cli_spill_").replace("\\", "/")
-    sql = (f"SET threads={THREADS}; SET temp_directory='{spill}'; "
+    # ONE THREAD, and it is not the same call as the pip arm's OPT_THREADS=2. That default was
+    # measured against a COPY that rotates on FILE_SIZE_BYTES: the pip arm closes a file every
+    # ~256 MB, so its write-side working set is bounded no matter how long the stream is. This
+    # COPY targets a SINGLE file with no rotation, so an order-preserving parallel write has to
+    # buffer finished batches until their turn comes and the working set scales with
+    # rows x row width for the whole stream. That never bit while the CLI arm carried 3 narrow
+    # columns (run 32676506116 staged 147.6 MB); OPT_DERIVED took the projection to 9 columns,
+    # the staged source to 1155.3 MB, and run 32680398240 died at 12.3/12.4 GiB. One thread keeps
+    # exactly one row group in flight. It is also the more faithful arm — stream-order row-group
+    # emission is what the single-stream writers this is compared against do.
+    if THREADS != 1:
+        print(f"NOTE: OPT_THREADS={THREADS} does not apply to the CLI arm; pinned to 1 "
+              f"(single unrotated output file — see _write_cli)", flush=True)
+    sql = (f"SET threads=1; SET memory_limit='{CLI_MEM_GB}GB'; SET temp_directory='{spill}'; "
            f"COPY (select {collist} from read_parquet('{staged}') order by {order}) "
            f"TO '{out}' (FORMAT parquet, ROW_GROUP_SIZE {RG}, {_dict_opt} "
            f"DATA_PAGE_SIZE_LIMIT {PAGE_BYTES}, COMPRESSION {_DD_CODEC}, "
            f"PARQUET_VERSION {PQ_VERSION}, WRITE_BLOOM_FILTER {str(BLOOM).lower()})")
     t_s = time.perf_counter()
-    subprocess.run([cli, "-c", sql], check=True)
+    # Hand the box to the child. This process has just staged 142M rows and its buffer pool is
+    # still holding them; it needs nothing until the CLI returns.
+    _parent_mem = dd.execute("select current_setting('memory_limit')").fetchone()[0]
+    dd.execute("SET memory_limit='1GB'")
+    try:
+        subprocess.run([cli, "-c", sql], check=True)
+    finally:
+        dd.execute(f"SET memory_limit='{_parent_mem}'")
     print(f"CLI wrote {os.path.getsize(out) / 1048576:.1f} MB "
           f"in {time.perf_counter() - t_s:.1f}s", flush=True)
     os.remove(staged)
