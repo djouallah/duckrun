@@ -72,6 +72,15 @@ def _norm(ident):
     return re.sub(r" \(\d+\)$", "", ident)
 
 
+def _key(ident):
+    """Match key. The model spells the derived columns with SPACES where the parquet and
+    DMV_COLUMNS use underscores — the DMV returns 'duid id' for `duid_id` — so run 32681270789
+    reported all four OPT_DERIVED columns as `MISSING from the DMV` while listing the same four as
+    unrequested extras. They were there the whole time under a different spelling. Fold the two
+    apart-ness's that are purely cosmetic (separator, case) and nothing else."""
+    return _norm(ident).replace(" ", "_").casefold()
+
+
 def read_model(workspace, model, token):
     conn = xc.open_conn(workspace, model, token)
     try:
@@ -91,6 +100,14 @@ def read_model(workspace, model, token):
     finally:
         conn.Close()
 
+    # Print the DMV's own field names ONCE, always. On run 32681270789 every column came back with
+    # USED_SIZE / DICTIONARY_SIZE / RECORDS_COUNT = 0 while BITS_COUNT and COMPRESSION_TYPE were
+    # populated and varying — so the rows are real and correctly matched, and only the SIZE fields
+    # are absent or spelled differently here. The dump below is how that gets settled from evidence
+    # instead of guessed; the old one only fired when NO column matched, so it never printed.
+    print(f"  column  DMV fields: {ccols}", flush=True)
+    print(f"  segment DMV fields: {scols}", flush=True)
+
     out = {}
     for row in crows:
         # the table name lives in DIMENSION_NAME (VertiPaq Analyzer's key); TABLE_ID is the
@@ -99,17 +116,17 @@ def read_model(workspace, model, token):
         tid = str(_pick(ccols, row, "TABLE_ID", ""))
         if tname != FACT or tid.startswith(("H$", "R$", "U$")):
             continue
-        col = _norm(str(_pick(ccols, row, "COLUMN_ID", "")))
-        if col.startswith("RowNumber"):
+        raw = _norm(str(_pick(ccols, row, "COLUMN_ID", "")))
+        if raw.startswith("RowNumber"):
             continue
-        out[col] = {
+        out[_key(raw)] = {
+            "name": raw,  # the DMV's own spelling, so the readout can show what it really returned
             "encoding": {1: "HASH", 2: "VALUE"}.get(_pick(ccols, row, "COLUMN_ENCODING"),
                                                     str(_pick(ccols, row, "COLUMN_ENCODING"))),
             "dictionary_mb": round((_pick(ccols, row, "DICTIONARY_SIZE") or 0) / 1e6, 2),
             "segments": [],
         }
     if not out:  # filter matched nothing — dump reality so the next fix is fact-based
-        print(f"  DMV columns: {ccols}", flush=True)
         for r in crows[:6]:
             print(f"  DMV row sample: {r}", flush=True)
     for row in srows:
@@ -117,7 +134,7 @@ def read_model(workspace, model, token):
         tid = str(_pick(scols, row, "TABLE_ID", ""))
         if tname != FACT or tid.startswith(("H$", "R$", "U$")):
             continue
-        col = _norm(str(_pick(scols, row, "COLUMN_ID", "")))
+        col = _key(str(_pick(scols, row, "COLUMN_ID", "")))
         if col not in out:
             continue
         out[col]["segments"].append({
@@ -140,19 +157,21 @@ def render(model, data, out):
     # It used to `continue` past a missing column, which silently rendered a 5-row table for a
     # 9-column model and looked exactly like a complete one. A readout whose whole job is "what
     # did the transcode actually do" must never quietly drop a column.
-    extras = [c for c in sorted(data) if c not in COLUMNS]
-    for col in list(COLUMNS) + extras:
+    want = {_key(c): c for c in COLUMNS}
+    extras = [c for c in sorted(data) if c not in want]
+    for col in list(want) + extras:
         d = data.get(col)
+        label = want.get(col) or (d or {}).get("name") or col
         if not d:
-            out.append(f"| {col} | _not in DMV_ | | | | | |")
+            out.append(f"| {label} | _not in DMV_ | | | | | |")
             continue
         segs = d["segments"]
         used = round(sum(s["used_mb"] for s in segs), 1)
         bits = "/".join(str(s["bits"]) for s in segs)
         comp = "/".join(s["compression"] for s in segs)
-        out.append(f"| {col}{' *' if col in extras else ''} | {d['encoding']} "
+        out.append(f"| {label}{' *' if col in extras else ''} | {d['encoding']} "
                    f"| {d['dictionary_mb']} | {len(segs)} | {used} | {bits} | {comp} |")
-    missing = [c for c in COLUMNS if c not in data]
+    missing = [c for k, c in want.items() if k not in data]
     if missing or extras:
         out.append("")
         out.append(f"_requested but absent from the DMV: {missing or 'none'}; "

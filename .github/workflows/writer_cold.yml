@@ -377,6 +377,23 @@ jobs:
           case "$ARMS" in *pyarrow*) models="${models:+$models,}$MODEL_PYARROW" ;; esac
           DMV_MODELS="$models" python tests/parquet_layout/aemo/vertipaq_dmv.py
 
+      - name: 📐 Parquet byte ledger — what each column WEIGHS, next to what it cost
+        # The cold pass says what a column COST to transcode; nothing in this workflow said what it
+        # WEIGHS, so a run could show a 42% smaller file and a flat read time with no way to connect
+        # the two per column (runs 32681772436 vs 32681270789). table_stats already writes
+        # tables.<t>.parquet.{size_mb,row_groups,column_chunks,row_group_detail} — it was simply
+        # never wired into this workflow. Reads the parquet directly; touches no model, so it cannot
+        # disturb a cold number. Per arm, because each arm lives in its own lakehouse.
+        if: ${{ always() }}
+        continue-on-error: true
+        env:
+          PYTHONIOENCODING: utf-8
+        run: |
+          set -euo pipefail
+          case "$ARMS" in *deltars*) ONELAKE_TABLES_PATH="$TABLES_DELTARS" python tests/parquet_layout/aemo/table_stats.py ;; esac
+          case "$ARMS" in *duckdb*)  ONELAKE_TABLES_PATH="$TABLES_DUCKDB"  python tests/parquet_layout/aemo/table_stats.py ;; esac
+          case "$ARMS" in *pyarrow*) ONELAKE_TABLES_PATH="$TABLES_PYARROW" python tests/parquet_layout/aemo/table_stats.py ;; esac
+
       - name: 🧬 Payload diff — decode the files this run measured
         # Runs BEFORE teardown, against the exact tables the cold pass timed, rather than inferring
         # structure from a different pair built by another workflow.
