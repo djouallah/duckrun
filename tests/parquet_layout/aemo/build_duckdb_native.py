@@ -12,7 +12,7 @@ ID remap; anything plain gets re-encoded).
 
 Shape mechanics, each measured in a local probe before this was written:
   * ONE sorted COPY — no temp table, no manual slicing (the sort spills instead of materializing
-    the whole fact). Files rotate on FILE_SIZE_BYTES (~128MB, duckrun's shipping target) along
+    the whole fact). Files rotate on FILE_SIZE_BYTES (~256MB, duckrun's shipping target) along
     the sorted stream. Runs at 2 threads, purely so the runner does not OOM (each writer buffers
     a full uncompressed row group); adjacent files therefore DO overlap on the sort key, which is
     accepted — that clustering was measured worth 0.05% of the table and delta-rs overlaps too.
@@ -46,7 +46,7 @@ Env: ONELAKE_TABLES_PATH (resolve_env), OPT_SORT (explicit columns, default 'dat
 default 6000000 = duckrun's fixed write geometry; the nightly OOM'd the 12.4GiB runner at 4
 threads), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (DATA_PAGE_SIZE_LIMIT, default 1048576;
 65536 is the value that lands page geometry near delta-rs's),
-OPT_TFS_MB (file rotation size, default 128 = duckrun's target_file_size_mb),
+OPT_TFS_MB (file rotation size, default 256 = duckrun's target_file_size_mb),
 OPT_PARQUET_VERSION (V1/V2, byte-identical), OPT_BLOOM (default false — delta-rs writes none,
 and they cost 29.2 MB here), OPT_FOOTER_INJECT (comma-separated, default empty — add footer
 metadata DuckDB omits: encstats, offsetindex, logical), OPT_PAGE_STATS (column or 'all' — stamp the
@@ -83,7 +83,7 @@ RG = int(os.environ.get("OPT_RG") or 6_000_000)
 _dl = (os.environ.get("OPT_DICT_LIMIT") or "").strip()
 DICT_LIMIT = None if _dl == "0" else int(_dl or 16_000_000)
 PAGE_BYTES = int(os.environ.get("OPT_PAGE_BYTES") or 1_048_576)
-FILE_BYTES = int(float(os.environ.get("OPT_TFS_MB") or 128) * 1024 * 1024)
+FILE_BYTES = int(float(os.environ.get("OPT_TFS_MB") or 256) * 1024 * 1024)
 # V1 writes PLAIN_DICTIONARY, V2 writes RLE_DICTIONARY — the SAME physical encoding under two
 # spec names (V1's is the deprecated alias), measured byte-identical locally at both low and high
 # cardinality. Knob exists so that claim is testable on the real fact, not to tune anything.
@@ -279,7 +279,7 @@ def _write_cli(dd, collist, src, order, table_uri, run_tag, con):
     spill = tempfile.mkdtemp(prefix="cli_spill_").replace("\\", "/")
     # ONE THREAD, and it is not the same call as the pip arm's OPT_THREADS=2. That default was
     # measured against a COPY that rotates on FILE_SIZE_BYTES: the pip arm closes a file every
-    # ~FILE_BYTES (128 MB default), so its write-side working set is bounded no matter how long
+    # ~FILE_BYTES (256 MB default), so its write-side working set is bounded no matter how long
     # the stream is. This
     # COPY targets a SINGLE file with no rotation, so an order-preserving parallel write has to
     # buffer finished batches until their turn comes and the working set scales with

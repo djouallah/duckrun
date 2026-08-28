@@ -5,12 +5,21 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **The default target file size is back to 256 MB** (128 MB shipped only in 0.4.64). A Parquet
+  row group cannot span files, so every file's LAST row group is truncated wherever the byte roll
+  lands — halving the file size doubles the file count and with it the truncated tail segments:
+  measured on the 142M-row AEMO mart, 4 roll-truncated tails out of 25 groups at 128 MB (one a
+  1.25M-row runt at the bottom of the healthy Direct Lake segment band) vs ~2 at 256 MB. Revisit
+  when delta-rs can align the file roll to a row-group boundary (force full row groups). The
+  byte-debt compaction thresholds follow back (small file < 128 MB, byte floor 512 MB); a
+  per-model `target_file_size_mb` still wins verbatim.
 - **The default target file size is now 128 MB** (was 256 MB) — the same bin size Fabric Spark's
   optimize-write targets. Applies to every write and to post-write compaction, and the byte-debt
   compaction thresholds derived from it follow (small file < 64 MB, byte floor 256 MB). A
   per-model `target_file_size_mb` still wins verbatim. 256 MB was a hedge against the v0.4.58
   merge-spill gate failure, measured at the old 8M-row-group geometry; the shipping 6M-row-group
   geometry at 128 MB is revalidated by the SF=10 merge-spill gate before any release tags.
+  *(Shipped in 0.4.64; reverted above.)*
 - **`SORTED BY AUTO` / `sort_by: auto` now does exactly one thing: pick the sort key.** The
   self-sizing write geometry it used to derive (the one-row-group-per-file byte target:
   `rg_for`'s `ceil(rows/8)` band, the `bytes_per_row` model, `tfs_for`, the headroom derate, the

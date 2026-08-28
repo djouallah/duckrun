@@ -2254,11 +2254,11 @@ def test_connect_rejects_unknown_format(tmp_path):
 
 
 def test_explicit_target_file_size_overrides_the_constant():
-    # The per-model target_file_size_mb config lands here as bytes and overrides the 128 MB
+    # The per-model target_file_size_mb config lands here as bytes and overrides the 256 MB
     # constant for THIS write only; None keeps the default. Same for overwrite and append.
     from dbt.adapters.duckrun import engine
     default = engine.build_write_deltalake_args("p", None, "overwrite")
-    assert default["target_file_size"] == engine._TARGET_FILE_SIZE == 128 * 1024 * 1024
+    assert default["target_file_size"] == engine._TARGET_FILE_SIZE == 256 * 1024 * 1024
     custom = engine.build_write_deltalake_args(
         "p", None, "append", target_file_size=64 * 1024 * 1024)
     assert custom["target_file_size"] == 64 * 1024 * 1024

@@ -163,7 +163,7 @@ The full accepted/rejected matrix is in the [Connection API](connection-api.md#r
   large table plan for that disk. An explicit `SORTED BY (cols)` skips profiling entirely.
 - **The write geometry is fixed, not adaptive.** Every write — overwrite, append, `replaceWhere`,
   `SORTED BY AUTO`, and compaction alike — uses the same constants: a **6M-row** row-group ceiling
-  and a **128 MB** target file size. Nothing is derived from the result: no planner estimate, no
+  and a **256 MB** target file size. Nothing is derived from the result: no planner estimate, no
   `count(*)`, no prior-log probe, no bytes/row model. The cost of the fixed rule is that a small
   table lands fewer, larger segments than an adaptive scheme would give it; the win is that no
   write pays a plan walk or a count, and no bad estimate can mis-size a table. The one exception:

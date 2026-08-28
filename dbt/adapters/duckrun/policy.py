@@ -29,12 +29,14 @@ from dbt.adapters.events.logging import AdapterLogger
 logger = AdapterLogger("Duckrun")
 
 # The one read-layout target every file write, compaction, and sort-rewrite uses (see engine).
-# 128 MB — the same bin size Fabric Spark's optimize-write targets, and small enough that a
-# scattered-update MERGE never copy-on-writes fat files. 256 MB was a hedge against the v0.4.58
-# gate failure (>67 GiB of DataFusion disk spill at the then-8M-row-group/128 MB geometry vs
-# <59 GiB at 256 MB); the shipping 6M-row-group geometry is re-validated at 128 MB by the SF=10
-# merge-spill gate before any release tags.
-DEFAULT_TARGET_FILE_SIZE = 128 * 1024 * 1024
+# 256, not 128: a row group cannot span files, so every file's LAST group is truncated wherever
+# the byte roll lands — at 128 MB the aemo mart measured 4 roll-truncated tails out of 25 groups
+# (one a 1.25M-row runt, the bottom of the healthy 1-16M Direct Lake segment band) vs ~2 at
+# 256 MB. Shipped as 128 in 0.4.64, reverted in 0.4.65: fewer, larger files mean fewer truncated
+# tail segments. Revisit only when delta-rs can align the file roll to a row-group boundary
+# (force full row groups). 256 also keeps the merge-spill gate's disk demand lower (128 doubled
+# the file count and the update-only merge's DataFusion spill).
+DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
 
 # Delta checkpoint cadence, stamped as `delta.checkpointInterval` on every table duckrun creates.
 # delta-rs's post-commit hook honors the property and writes the checkpoint itself; without it the
@@ -46,7 +48,7 @@ CHECKPOINT_INTERVAL = 10
 # The FIXED row-group ceiling EVERY write uses — 6M rows. A Parquet row group maps 1:1 to a Direct
 # Lake column segment; anything in the 1M-16M band is a healthy segment (Power BI's own default
 # segment size is 8M), and 6M trades a little per-segment density for one more group to scan in
-# parallel per file. A CEILING, not a size: the 128 MB file roll usually closes the group first.
+# parallel per file. A CEILING, not a size: the 256 MB file roll usually closes the group first.
 # There is no derived sizing anywhere: the planner-estimate machinery (EXPLAIN cardinality,
 # prior-log floors) and, later, the SORTED BY AUTO byte-model geometry (rg_for / tfs_for / one row
 # group per file) each cost plan walks, counts and a calibrated bytes/row model for no measured

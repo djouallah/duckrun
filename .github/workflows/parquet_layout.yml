@@ -66,7 +66,7 @@ on:
         type: string
         default: ""
       opt_tfs_mb:
-        description: "[aemo] pin the auto_sort build's target file size (MB, e.g. 1024 for a single ~765 MB file; the harness spelling of target_file_size_mb). Empty = 128 MB default. Use with rebuild=true."
+        description: "[aemo] pin the auto_sort build's target file size (MB, e.g. 1024 for a single ~765 MB file; the harness spelling of target_file_size_mb). Empty = 256 MB default. Use with rebuild=true."
         type: string
         default: ""
       opt_page_rows:

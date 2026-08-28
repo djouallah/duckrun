@@ -340,7 +340,7 @@ don't run other writers against a microbatch table during its window.
 | `partition_by` | Delta partition column(s) |
 | `sort_by` | column(s) to physically ORDER the write by; the scalar `'auto'` (experimental) picks the key by profiling the model result — same heuristic as the connection API's `SORTED BY AUTO`, unsorted when nothing pays off. Inert on merge/microbatch/delete+insert |
 | `max_row_group_size` | explicit parquet row-group ceiling in **rows** for this model's writes (deltalake's spelling; default: the fixed 6M). Overrides the default verbatim — use it when a model must land 16M-row Direct Lake segments (e.g. `16000000`). Preserved by post-write compaction; the delta_rs merge write itself keeps defaults, post-merge compaction folds files into this geometry |
-| `target_file_size_mb` | per-model target parquet file size in **MB** (default 128). Same coverage and merge caveat as `max_row_group_size` |
+| `target_file_size_mb` | per-model target parquet file size in **MB** (default 256). Same coverage and merge caveat as `max_row_group_size` |
 | `merge_schema` | allow schema evolution on write |
 | `merge_max_spill_size` | bytes cap on delta-rs's merge pool before it spills to disk; sensible cgroup-aware default; `0` disables |
 | `merge_streamed_exec` | `true` streams a HUGE source instead of collecting it — at the cost of losing target-file pruning. Default `false` is right for the normal small-delta-into-big-table case |
@@ -418,7 +418,7 @@ Good fit for ingestion steps (downloads, unzipping, API calls) that end in a rel
 
 duckrun compacts and vacuums inline on every write: overwrite vacuums every run;
 append/merge compact on **byte debt**, not file count — a compaction fires once the
-table holds ≥8 small files (under half the 128 MB target size) carrying ≥256 MB of
+table holds ≥8 small files (under half the 256 MB target size) carrying ≥512 MB of
 small bytes combined, and only the partitions with offending files are rewritten (a
 healthy big table sitting at hundreds of target-sized files is never touched). Vacuum
 runs only after a compaction, at the safe 7-day retention, so concurrent readers are
