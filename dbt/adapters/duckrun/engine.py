@@ -71,13 +71,14 @@ _DATA_PAGE_SIZE_LIMIT = 1_048_576
 # layout benchmark (tests/parquet_layout/aemo): ~40x fewer pages per chunk, cold column loads
 # consistently faster, write memory unchanged (dense pages are bounded by bytes, not rows).
 _DATA_PAGE_ROW_LIMIT = 1_000_000
-# Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a segment
-# cap: a narrow fact reaches the full 6M-row ceiling well under 256 MB; a wide fact is capped by the
-# file size first. Not a merge-MEMORY lever (that was the dictionary page limit, see
-# _DICT_PAGE_SIZE_LIMIT; 128/256/512 MB all merged in ~16s at ~4.5-5.2 GB RSS in the small-scale
-# measurement) — but it IS a merge-DISK lever at scale: halving it to 128 MB doubled the file count
-# and a whole-table update-only merge at SF=10 then needed >67 GiB of DataFusion disk spill vs
-# <59 GiB at 256 MB, failing the v0.4.58/59 release gates. Deliberately far below 1 GB, which forced
+# Target file size: 128 MB — the bin size Fabric Spark's optimize-write targets. A Parquet row group
+# can't span files, so this byte cap is really a segment cap: a narrow fact reaches the full 6M-row
+# ceiling well under 128 MB; a wide fact is capped by the file size first. Not a merge-MEMORY lever
+# (that was the dictionary page limit, see _DICT_PAGE_SIZE_LIMIT; 128/256/512 MB all merged in ~16s
+# at ~4.5-5.2 GB RSS in the small-scale measurement) — but it IS a merge-DISK lever at scale: the
+# extra file count costs DataFusion disk spill (the v0.4.58 gate died at >67 GiB with the old
+# 8M-row-group/128 MB geometry vs <59 GiB at 256 MB; the shipping 6M geometry re-runs the SF=10
+# merge-spill gate at 128 MB before any release tags). Deliberately far below 1 GB, which forced
 # the whole-file copy-on-write that blew up merges on disk. Applied by every file write
 # (build_write_deltalake_args) and the routine post-write compaction. MERGE is the exception — it
 # sets no target_file_size. Defined in policy.py (the one read-layout target); aliased here so the
