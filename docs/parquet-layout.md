@@ -10,23 +10,21 @@ The rest of this page is the detail behind those three.
 
 ## Power BI transcodes — it doesn't scan
 
-Direct Lake does not scan Parquet the way DuckDB or Spark do, query after query. On the first query against cold data it **transcodes** the file — converts it once into **VertiPaq**, the in-memory format Power BI actually queries — and every query after that runs purely in memory, never touching the file again until the data changes.
+Direct Lake does not scan Parquet the way DuckDB or Spark do, query after query. It **transcodes** — and it transcodes **per column, on demand**, not per file. The first DAX query to touch a column that is not yet in memory converts *that column only* into **VertiPaq**, the in-memory format Power BI actually queries: the column's per-row-group Parquet **dictionaries** are merged into one global VertiPaq dictionary, then each **row group** of the column is loaded as one resident **column segment**, remapping Parquet data IDs onto VertiPaq IDs on the way in.
 
 ```mermaid
 flowchart LR
-    disk["Parquet on disk<br/>row groups · dictionaries · sorted runs"]
-    t(["transcoding<br/>cold load, once"])
-    mem["In-memory format (VertiPaq)<br/>column segments"]
-    disk --> t --> mem
+    q(["DAX query touches<br/>a cold column"]) --> chunks
+    chunks["that column on disk<br/>one chunk per row group<br/>dictionary + data IDs"] -->|"transcoding<br/>per column, on demand"| seg["that column in memory<br/>row group → one segment<br/>one global dictionary"]
 ```
 
-The conversion is direct: each **row group** becomes one resident **column segment**, and a Parquet **dictionary** can be remapped straight into the engine's own dictionary instead of being rebuilt from raw values. The whole layout is shaped so that this conversion is a cheap mechanical copy rather than a full re-encode.
+Columns no query touches are never transcoded at all, and a warm query on resident columns skips everything — it runs purely in memory, never touching the file until a reframe brings new data or memory pressure evicts segments. The whole layout is shaped so that this per-column conversion is a cheap dictionary **remap**, not a re-encode from raw values. The full mechanics and the measurements behind this page live in [direct-lake-parquet-layout](https://github.com/djouallah/direct-lake-parquet-layout).
 
 ## Cold and hot
 
-The layout is **mainly for cold**. The transcode is the big one-time cost — the seconds a report user feels on the first click — and the choices above (fast-decoding compression, dictionaries the engine can remap, row-group sizing) exist chiefly to make it fast.
+The layout is **mainly for cold**. The transcode is the big one-time cost — the seconds a report user feels on the first click — and the choices above (fast-decoding compression, dictionaries the engine can remap, row-group sizing) exist chiefly to make it fast. Cold cost scales with the row-group count **twice** — once merging the per-row-group dictionaries into the global one, once setting up the segments — which is why tiny row groups are poison: DuckDB's 122,880-row default made the same table **3.5× slower cold**.
 
-Hot runs are not indifferent to the layout, though. The file's geometry outlives the transcode: one row group becomes one resident segment and the sort order carries into it, so a good sort and a decent row-group size keep paying after the data is in memory. In the DAX comparisons, hot runs have tended to look better with smaller row groups — around **2M rows** — while very large row groups hurt them: treat **16M as the maximum**. duckrun's fixed **6M** sits inside that band, balancing the cold transcode (bigger groups are fine) against hot scans (smaller tends to look better). These are observed tendencies from the comparisons, not measured laws.
+Hot runs are not indifferent to the layout either. The geometry outlives the transcode — VertiPaq inherits the Parquet row order, and one row group becomes one resident segment — so the sort keeps paying (within a segment the scan is run-length driven), and so does the row-group size: a hot scan parallelizes over segments, and too few segments starve the scan pool. In the [benchmark sweeps](https://github.com/djouallah/direct-lake-parquet-layout), **2–6M rows per row group** measured healthiest, with hot leaning toward the small end (~2M); the ~1M band was the only one in a 60-run sweep with measurably worse capacity consumption, and very large groups starve the pool — treat **16M as the maximum**. duckrun's fixed **6M** sits at the top of the measured band, balancing cold (fewer, bigger groups are fine) against hot (more segments to scan across).
 
 ---
 
@@ -53,7 +51,7 @@ The distinction is between two formats that happen to describe the same data:
 - **The disk format (Parquet)** is built for storage and transport: compressed pages, dictionary and RLE encodings chosen per column, min/max statistics, immutable files on an object store. Its job is to be small and cheap to move.
 - **The engine's in-memory format (VertiPaq column segments)** is built for interactive query: columns held resident in memory in the engine's own encoding, sized and organized for vectorized scans over and over, thousands of times a day, with sub-second expectations.
 
-A scan engine bridges the two formats transiently, per query, and throws the result away. Direct Lake bridges them **once, on cold load**: it reads the Parquet, converts each row group into a resident column segment, remaps dictionaries where it can, and then serves every subsequent query from the in-memory form without touching the file again until the data changes. That one-time conversion — **transcoding** — is the operation this layout exists to make fast and faithful, and it explains settings that would look odd through a scan-engine lens:
+A scan engine bridges the two formats transiently, per query, and throws the result away. Direct Lake bridges them **once per column, on demand**: the first query to touch a column merges that column's per-row-group dictionaries into one global dictionary, converts each of its row groups into a resident column segment, and then serves every subsequent query from the in-memory form without touching the file again until the data changes. That one-time conversion — **transcoding** — is the operation this layout exists to make fast and faithful, and it explains settings that would look odd through a scan-engine lens:
 
 - **SNAPPY over ZSTD** — transcoding is decode-bound; a slightly larger file that decodes faster wins, because the size difference is paid once in storage while the decode cost is paid on every cold load.
 - **Fixed 6M-row row groups** — a row group becomes a segment as-is, so row-group sizing *is* segment sizing; anything from **1M to 16M rows is a fine segment**, a property of the in-memory engine, not of Parquet. Every write — overwrite, append, `SORTED BY AUTO`, and compaction alike — uses the same fixed **6M-row** ceiling: nothing is derived from the result, so no write pays a plan walk or a row count.
