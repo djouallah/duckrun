@@ -8,7 +8,10 @@ name: local_stress_tests
 # (separate VMs, separate RAM — no cross-job memory contention).
 #
 # Jobs:
-#   • merge-spill   — generate a large TPCH lineitem (gate SF=10 ≈ 60M rows) and merge several
+#   • merge-spill   — generate a large TPCH lineitem (gate SF=9 ≈ 54M rows; SF=10 is a coin flip
+#                     at the 128 MB file geometry — the whole-table update-only merge's disk spill
+#                     sits right AT the runner's ~66.6 GB cap: one dispatch passed, the v0.4.62
+#                     release run failed on Resources exhausted) and merge several
 #                     incremental batches back into it (mixed / insert-only / update-only /
 #                     idempotent), plus append / append_if_unchanged / overwrite for comparison, on the
 #                     runner's real RAM with duckrun's shipping defaults. Pinned deltalake 1.5.0
@@ -27,9 +30,9 @@ on:
   workflow_dispatch:
     inputs:
       sf:
-        description: "merge-spill: TPCH scale factor for lineitem (gate uses 10 ≈ 60M rows; SF=20 verified in 0.3.22)"
+        description: "merge-spill: TPCH scale factor for lineitem (gate uses 9 ≈ 54M rows — SF=10's spill rides the runner's ~66.6 GB disk cap at the 128 MB file geometry; SF=20 verified in 0.3.22 at the old geometry)"
         required: false
-        default: "10"
+        default: "9"
       tpch_sf:
         description: "tpch-stress: TPCH scale factor for a MANUAL ceiling-finding run (default 100 ≈ 600M-row lineitem; the release gate ignores this and uses SF=10)"
         required: false
@@ -48,7 +51,7 @@ jobs:
       group: merge-spill
       cancel-in-progress: false
     env:
-      SF: "${{ inputs.sf || '10' }}"   # release gate uses 10 (SF=20 verified once in 0.3.22); a manual dispatch can pick another
+      SF: "${{ inputs.sf || '9' }}"   # release gate uses 9 (see the header comment: SF=10 rides the disk cap at 128 MB files); a manual dispatch can pick another
       DIR: /mnt/mbench   # the big (~66 GB) runner disk; / has only ~14 GB free
     steps:
       - uses: actions/checkout@v4
