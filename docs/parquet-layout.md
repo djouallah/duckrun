@@ -138,6 +138,47 @@ SELECT * FROM delta_scan('…/sales') ORDER BY "region", "order_date"
 
 It is a **global** ordering — row 1 of file 1 through the last row of the last file form one continuous sorted sequence. It is not a per-file reordering and not z-order interleaving. Every existing file is read and rewritten, so the whole table is re-laid-out in a single new Delta version. The only decision the feature makes is **which columns go in that `ORDER BY`, and in what order.**
 
+The *global* part is the point. On a toy `region` column, contrast one `ORDER BY` over the whole table with V-Order's write-time sort, which is scoped to each row group as it is written:
+
+```mermaid
+flowchart TB
+    subgraph arrival["a toy region column — 8 rows, arrival order"]
+        direction LR
+        r1["B"] --- r2["A"] --- r3["C"] --- r4["A"] --- r5["B"] --- r6["A"] --- r7["C"] --- r8["B"]
+    end
+
+    subgraph global["duckrun — one global ORDER BY region"]
+        direction LR
+        subgraph rg1["row group 1 · min A · max B"]
+            direction LR
+            g1["A"] --- g2["A"] --- g3["A"] --- g4["B"]
+        end
+        subgraph rg2["row group 2 · min B · max C"]
+            direction LR
+            g5["B"] --- g6["B"] --- g7["C"] --- g8["C"]
+        end
+        g4 -.- g5
+    end
+
+    subgraph vorder["V-Order — sorted inside each row group"]
+        direction LR
+        subgraph vg1["row group 1 · min A · max C"]
+            direction LR
+            v1["A"] --- v2["A"] --- v3["B"] --- v4["C"]
+        end
+        subgraph vg2["row group 2 · min A · max C"]
+            direction LR
+            v5["A"] --- v6["B"] --- v7["B"] --- v8["C"]
+        end
+        v4 ~~~ v5
+    end
+
+    arrival --> global
+    arrival --> vorder
+```
+
+Same eight rows, three outcomes. Unsorted, the column is eight runs — RLE has nothing to collapse. The **global** sort orders across row groups: runs grow as long as the data allows (`A×3 B×3 C×2`), each group holds a narrow slice of the values so its dictionary shrinks, and the min/max ranges separate — a filter on `region = 'C'` skips row group 1 outright. **V-Order** sorts as it writes, inside each row group: RLE still wins locally, but runs restart at every group boundary, and every group spans `A–C`, so no filter can skip a group. That cross-group alignment is what only a global `ORDER BY` buys.
+
 ### Why a sort shrinks files
 
 A columnar file stores each column independently. For a low-cardinality column, two encodings compete: **bit-packed dictionary indices** (`ceil(log2 ndv)` bits per row) and **run-length encoding** (RLE — one entry per contiguous run of equal values). RLE only wins when values arrive in long runs.
