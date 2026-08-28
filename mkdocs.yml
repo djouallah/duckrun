@@ -71,7 +71,11 @@ markdown_extensions:
   - pymdownx.highlight:
       anchor_linenums: true
   - pymdownx.inlinehilite
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.details
   - pymdownx.tabbed:
       alternate_style: true
@@ -131,10 +135,10 @@ nav:
   - Benchmarks:
       - MERGE benchmark: merge-benchmark.md
       - TPC-H benchmark: tpch.md
+  - Parquet layout: parquet-layout.md
   - Internals:
       - Overview: overview.md
       - Design document: design_document.md
-      - Parquet layout: parquet-layout.md
       - Snapshot isolation: snapshot-isolation.md
       - Snapshot pin walkthrough: snapshot-pin.md
   - Limitations: limitations.md

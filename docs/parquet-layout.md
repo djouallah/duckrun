@@ -1,10 +1,42 @@
 # Parquet layout
 
-Two things determine how a duckrun table sits on disk: the **physical file format** every write emits, and the **row order** a sort lays down inside it. This page documents both.
+duckrun tries to write **VertiPaq-friendly Parquet**. Three properties define every table it lands:
 
-Before anything else, one caveat that applies to the entire page: **every value and every rule described here is a heuristic.** Compression is a function of your data's cardinality, skew, and correlation structure, and those differ from table to table and change over time within the same table. The settings below are defaults that worked well across the workloads duckrun was tuned against; they are starting points, not guarantees. Where a rule can fail, this page says so.
+- **6M-row row groups** — one Parquet row group becomes one VertiPaq column segment.
+- **Dictionary encoding** — kept wherever sensible, to help transcoding.
+- **Sorted** — duckrun doesn't have V-Order, so it simulates it (kind of) with one global `ORDER BY` over the table.
 
-- [Parquet layout](#parquet-layout-the-file-format) — what the layout optimizes for (transcoding), the file-format settings, and the reasoning behind each.
+The rest of this page is the detail behind those three.
+
+## Power BI transcodes — it doesn't scan
+
+Direct Lake does not scan Parquet the way DuckDB or Spark do, query after query. On the first query against cold data it **transcodes** the file — converts it once into **VertiPaq**, the in-memory format Power BI actually queries — and every query after that runs purely in memory, never touching the file again until the data changes.
+
+```mermaid
+flowchart LR
+    disk["Parquet on disk<br/>row groups · dictionaries · sorted runs"]
+    t(["transcoding<br/>cold load, once"])
+    mem["In-memory format (VertiPaq)<br/>column segments"]
+    disk --> t --> mem
+```
+
+The conversion is direct: each **row group** becomes one resident **column segment**, and a Parquet **dictionary** can be remapped straight into the engine's own dictionary instead of being rebuilt from raw values. The whole layout is shaped so that this conversion is a cheap mechanical copy rather than a full re-encode.
+
+## Cold and hot
+
+The layout is **mainly for cold**. The transcode is the big one-time cost — the seconds a report user feels on the first click — and the choices above (fast-decoding compression, dictionaries the engine can remap, row-group sizing) exist chiefly to make it fast.
+
+Hot runs are not indifferent to the layout, though. The file's geometry outlives the transcode: one row group becomes one resident segment and the sort order carries into it, so a good sort and a decent row-group size keep paying after the data is in memory. In the DAX comparisons, hot runs have tended to look better with smaller row groups — around **2M rows** — while very large row groups hurt them: treat **16M as the maximum**. duckrun's fixed **6M** sits inside that band, balancing the cold transcode (bigger groups are fine) against hot scans (smaller tends to look better). These are observed tendencies from the comparisons, not measured laws.
+
+---
+
+## The details
+
+Two things determine how a duckrun table sits on disk: the **physical file format** every write emits, and the **row order** a sort lays down inside it. The rest of this page documents both in depth.
+
+One caveat applies to all of it: **every value and every rule described here is a heuristic.** Compression is a function of your data's cardinality, skew, and correlation structure, and those differ from table to table and change over time within the same table. The settings below are defaults that worked well across the workloads duckrun was tuned against; they are starting points, not guarantees. Where a rule can fail, this page says so.
+
+- [Parquet layout](#parquet-layout-the-file-format) — what the layout optimizes for (transcoding, in depth), the file-format settings, and the reasoning behind each.
 - [Automatic sorting](#automatic-sorting) — `SORTED BY AUTO`: what it does and how it picks a key.
 - [The design goal, stated precisely](#the-design-goal-stated-precisely) — the best outcome for Power BI within two hard limits: merge must survive, and the sort key must be the sharpest heuristic a single pass allows.
 
@@ -14,7 +46,7 @@ The configuration is a compromise between two consumers with opposite needs — 
 
 ### What the layout optimizes for: transcoding
 
-Most Parquet advice targets **scan engines** — Spark, DuckDB, a warehouse — where the engine streams the file, decompresses it, and processes it row-group by row-group. That is not the primary consumer here. This layout is tuned for **Direct Lake**, and Direct Lake does not scan Parquet: it **transcodes** it.
+Most Parquet advice targets **scan engines** — Spark, DuckDB, a warehouse — where the engine streams the file, decompresses it, and processes it row-group by row-group. That is not the primary consumer here: as the introduction said, this layout is tuned for **Direct Lake**, and Direct Lake does not scan Parquet — it **transcodes** it.
 
 The distinction is between two formats that happen to describe the same data:
 
