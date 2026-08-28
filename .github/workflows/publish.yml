@@ -14,12 +14,14 @@ concurrency:
   group: pypi
   cancel-in-progress: false
 
-# A release must pass cores + local_stress_tests before publishing. Each is a reusable workflow run
-# as a gate job here. Both render scorecards into README and commit them to main (cores: conformance
-# + connection-API + snapshot-pin cards; local_stress_tests: the MERGE card), so both call jobs grant
-# contents:write (a reusable workflow can only use permissions the caller grants). cores' card jobs
-# and local_stress_tests both use static concurrency groups, so a tag-time call queues behind any
-# in-flight push-to-main run rather than racing it.
+# A release must pass cores + local_stress_tests (TPC-H) + merge_spill before publishing. Each is a
+# reusable workflow run as a gate job here. All render scorecards into README/docs and commit them to
+# main (cores: conformance + connection-API + snapshot-pin cards; merge_spill: the MERGE card), so
+# every call job grants contents:write (a reusable workflow can only use permissions the caller
+# grants). The card jobs all use static concurrency groups, so a tag-time call queues behind any
+# in-flight push-to-main run rather than racing it. merge_spill is its own workflow (not a
+# local_stress_tests sibling job) so its runner — whose single-volume disk is the scarce resource —
+# shares nothing with any other job.
 # integration_tests_onelake is deliberately NOT a release gate: it depends on live OneLake/AEMO data
 # and so is prone to transient infra failures that would needlessly block a publish. It still runs on
 # its own.
@@ -52,8 +54,14 @@ jobs:
       contents: write
     uses: ./.github/workflows/local_stress_tests.yml
 
+  merge-spill:
+    needs: version-check
+    permissions:
+      contents: write
+    uses: ./.github/workflows/merge_spill.yml
+
   publish:
-    needs: [cores, local-stress]
+    needs: [cores, local-stress, merge-spill]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing

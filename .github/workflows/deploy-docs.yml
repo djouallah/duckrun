@@ -21,11 +21,12 @@ on:
       - 'hooks/**'
       - '.github/workflows/deploy-docs.yml'
   workflow_run:
-    # After integration finishes (fresh example pages), or after cores / local_stress_tests finish
-    # (the scorecards they commit to docs with [skip ci] — conformance / connection / snapshot-pin
-    # from cores, the SF=100 TPC-H card from local_stress_tests — which would otherwise not reach the
-    # site, since [skip ci] suppresses the docs-push trigger).
-    workflows: ["integration_tests_onelake", "aemo", "cores", "local_stress_tests", "parity"]
+    # After integration finishes (fresh example pages), or after cores / local_stress_tests /
+    # merge_spill finish (the scorecards they commit to docs with [skip ci] — conformance /
+    # connection / snapshot-pin from cores, the SF=100 TPC-H card from local_stress_tests, the
+    # MERGE card from merge_spill — which would otherwise not reach the site, since [skip ci]
+    # suppresses the docs-push trigger).
+    workflows: ["integration_tests_onelake", "aemo", "cores", "local_stress_tests", "merge_spill", "parity"]
     types: [completed]
     branches: [main]
   workflow_dispatch:

@@ -1,0 +1,122 @@
+name: merge_spill
+
+# The heavy merge-spill stress gate, in its OWN workflow so it shares nothing with any other job:
+# its runner VM runs this and only this. Generate a large TPCH lineitem (gate SF=10 ≈ 60M rows) and
+# merge several incremental batches back into it (mixed / insert-only / update-only / idempotent),
+# plus append / append_if_unchanged / overwrite for comparison, on the runner's real RAM with
+# duckrun's shipping defaults. Pinned deltalake 1.5.0 (1.6.0's merge is broken at scale). Renders
+# the MERGE scorecard into docs and commits to main on the release path.
+#
+# Disk: the current ubuntu-latest image is a SINGLE ~145 GB root volume (~86 GB free; /mnt is just
+# a directory on it — the old separate data disk no longer exists), and ~59 GB of it is preinstalled
+# toolchains. The update-only whole-table merge's DataFusion disk spill at SF=10 with the 128 MB
+# file geometry is ~66-68 GB — exactly the free space left, which made the gate a coin flip (the
+# v0.4.62 and v0.4.63 release runs both died on "Resources exhausted"; SF=9 was tried and was a
+# coin flip too). The first step below deletes the unused toolchains, lifting free space to
+# ~110 GB, so the auto-derived spill cap (free minus the 8 GiB reserve) clears the demand with
+# real margin. NEVER runs on push/PR: it is a RELEASE GATE (workflow_call from publish.yml — a tag
+# publishes only if it passes) and can be run by hand (workflow_dispatch) to find the ceiling.
+
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      sf:
+        description: "TPCH scale factor for lineitem (gate uses 10 ≈ 60M rows; SF=20 verified in 0.3.22 at the old geometry)"
+        required: false
+        default: "10"
+
+# Needed so the release run can commit the rendered MERGE scorecard back to README on main.
+permissions:
+  contents: write
+
+jobs:
+  merge-spill:
+    runs-on: ubuntu-latest
+    # Serialize: never run two merge-spill jobs at once (each needs the whole runner's RAM and
+    # disk). Static group so concurrent release tags queue rather than race.
+    concurrency:
+      group: merge-spill
+      cancel-in-progress: false
+    env:
+      SF: "${{ inputs.sf || '10' }}"   # release gate uses 10; a manual dispatch can pick another
+      DIR: /mnt/mbench   # just a directory on the single root volume (see the header comment)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-duckrun
+        with:
+          extra-packages: tpchgen-cli
+
+      - name: Free the runner disk for spill (~59 GB of the single volume is preinstalled toolchains)
+        # The spill, the dataset, the warehouse, and the OS all share the one root volume, and the
+        # spill cap is auto-derived from free space at merge start — reclaiming the unused
+        # toolchains is what buys SF=10 its headroom. /opt/hostedtoolcache/Python stays: the
+        # setup-python action needs it.
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+                      /usr/local/.ghcup /usr/local/share/boost /opt/hostedtoolcache/CodeQL
+          sudo docker system prune -af > /dev/null 2>&1 || true
+          df -h /
+
+      - name: Show RAM / disk / deltalake version (must be 1.5.0)
+        run: |
+          free -h
+          df -h /mnt /
+          DLV=$(python -c "import deltalake; print(deltalake.__version__)")
+          echo "deltalake $DLV"
+          python -c "import deltalake,sys; sys.exit(0 if deltalake.__version__.startswith('1.5.') else 1)"
+          echo "DLV=$DLV" >> "$GITHUB_ENV"
+
+      - name: Prepare big disk dir
+        run: sudo mkdir -p "$DIR" && sudo chown "$(id -u):$(id -g)" "$DIR"
+
+      - name: Generate fact + run merge scenarios
+        # The bench writes the detailed, data-engineer-readable report straight to
+        # $GITHUB_STEP_SUMMARY on completion (pass or assertion-fail). We only add a fallback
+        # line here for the case where it dies before writing — i.e. OOM-killed (rc 137/139).
+        run: |
+          set -o pipefail
+          python tests/performance/merge_spill/merge_tpch_bench.py --dir "$DIR" --sf "$SF" ; rc=$?
+          if [ $rc -eq 137 ] || [ $rc -eq 139 ]; then
+            {
+              echo "## 🔀 Incremental MERGE test — duckrun on Delta Lake"
+              echo
+              echo "Mixed / insert-only / update-only merges into a SF=${SF} lineitem table on the runner's real RAM."
+              echo
+              echo "**Result: 💀 OOM-killed (rc=$rc)** — duckrun's defaults did not keep the merge under the runner's RAM."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+          exit $rc
+
+      # Render the scorecard the bench just wrote (docs/merge_card.md) into docs/merge-benchmark.md
+      # and commit it to main, so the MERGE card always reflects the latest release. The release runs on a tag
+      # ref, so check out main explicitly and push there. [skip ci] avoids re-triggering. Never fails
+      # the release on a commit hiccup. No-op if the bench died before writing the card.
+      - name: Render scorecard into docs and commit to main
+        # Only the release path (workflow_call -> caller's event is the tag push) commits the
+        # canonical card. A manual workflow_dispatch (possibly a smaller SF) shows the card in its
+        # own run summary but must NOT overwrite the release card in the docs.
+        if: always() && hashFiles('docs/merge_card.md') != '' && github.event_name != 'workflow_dispatch'
+        continue-on-error: true
+        uses: ./.github/actions/commit-docs
+        with:
+          checkout-main: 'true'   # the release runs on a tag ref; the gitignored card survives the checkout
+          prepare: |
+            python tests/tools/inject_readme.py docs/merge-benchmark.md docs/merge_card.md MERGE
+          paths: docs/merge-benchmark.md
+          message: "docs: update MERGE scorecard [skip ci]"
+
+      - name: Append this run's result to the benchmark history
+        # Unlike the canonical card above (release-only), EVERY run — release gate AND manual
+        # dispatch — leaves one permanent row in docs/merge-benchmark-history.md for the trend log.
+        # The bench wrote the row to docs/merge_history_row.md (gitignored); append it to the tracked
+        # history against a fresh origin/main. Never fail the run on a git hiccup; [skip ci].
+        if: always() && hashFiles('docs/merge_history_row.md') != ''
+        continue-on-error: true
+        uses: ./.github/actions/commit-docs
+        with:
+          checkout-main: 'true'   # the gitignored history-row file survives the checkout
+          prepare: |
+            cat docs/merge_history_row.md >> docs/merge-benchmark-history.md
+          paths: docs/merge-benchmark-history.md
+          message: "docs: record MERGE benchmark result [skip ci]"

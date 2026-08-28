@@ -11,7 +11,7 @@ subfolder is one kind of thing; nothing loose at the top level.
 | [`integration_tests/aemo/`](integration_tests/aemo/) | A real **dbt project** (the AEMO example) built against OneLake to exercise the adapter end to end. | `.github/workflows/aemo.yml` |
 | [`integration_tests/coffee/`](integration_tests/coffee/) | One coffee-shop scenario for **`duckrun.connect()`** (dims from a public CSV generator, locally-generated fact) exercising every method, parameterized by row count: `test_coffee_local` (local fs) and `test_coffee_onelake` (live OneLake, small — **skips** without `WAREHOUSE_PATH` + `ONELAKE_TOKEN`). Knobs: `COFFEE_LOCAL_ROWS`, `COFFEE_ONELAKE_ROWS`. | `pytest tests/integration_tests/coffee` (local) · `.github/workflows/integration_tests_onelake.yml` (`coffee` job, OneLake) |
 | [`correctness/`](correctness/) | Standalone **correctness scripts** for specific invariants (e.g. concurrency / OCC). | `.github/workflows/cores.yml` (`concurrency-correctness` job) |
-| [`tools/`](tools/) | **Tooling/scripts**: the MERGE TPCH benchmark, conformance baseline/gate/summary, README card injection. | `.github/workflows/local_stress_tests.yml`, `cores.yml` |
+| [`tools/`](tools/) | **Tooling/scripts**: the MERGE TPCH benchmark, conformance baseline/gate/summary, README card injection. | `.github/workflows/merge_spill.yml`, `cores.yml` |
 
 **What's gitignored:** only runtime outputs (`conformance/_run.log`, the integration dbt
 `target/`/`logs/`/`warehouse/`) and **`_local/`** — the one clearly-named folder for local

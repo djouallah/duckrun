@@ -107,7 +107,7 @@ number if there is one.
 
 [`.github/workflows/publish.yml`](.github/workflows/publish.yml) then runs `version-check`
 (the tag must equal `pyproject.toml`'s version, or it hard-fails), gates on `cores` +
-`local_stress_tests`, and publishes to PyPI via OIDC trusted publishing.
+`local_stress_tests` + `merge_spill`, and publishes to PyPI via OIDC trusted publishing.
 `integration_tests_onelake` and `parity` are deliberately excluded from release gating.
 
 Tags are the source of truth for what shipped — the GitHub *Releases* page is not

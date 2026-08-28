@@ -30,14 +30,14 @@ name: cores
 #   • snapshot-pin            — renders the "snapshot pin, version by version" card from a real
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • merge-spill-smoke       — fast SF=1 smoke of the incremental-MERGE chain (full delta_rs clause
-#                               set) as a per-change guard; the heavy SF=10 gate is local_stress_tests.yml.
+#                               set) as a per-change guard; the heavy SF=10 gate is merge_spill.yml.
 #
 # Path-filtered to the offline surface it actually exercises — the adapter, the duckrun package, and
 # the test suites (everything under tests/, which now also houses the aemo / parity / integration
 # projects). A change that touches only docs doesn't affect these tests, so it doesn't run cores. As
 # a release gate it still runs UNFILTERED via workflow_call from publish.yml. Out of scope here
 # (deliberately): the live-OneLake projects (integration_tests_onelake.yml) and the heavy local
-# stress runs (local_stress_tests.yml).
+# stress runs (local_stress_tests.yml + merge_spill.yml).
 
 on:
   push:
@@ -53,7 +53,7 @@ on:
       - '!tests/parquet_layout/aemo/**'            # parquet_layout.yml (manual)
       - '!tests/parquet_layout/contoso/**'          # parquet_layout.yml (manual, contoso job)
       - '!tests/parquet_layout/nyc/**'              # local-only layout probe (no workflow)
-      - '!tests/performance/merge_spill/**'         # local_stress_tests.yml + integration_tests_onelake.yml (tpch/ still fires cores)
+      - '!tests/performance/merge_spill/**'         # merge_spill.yml + integration_tests_onelake.yml (tpch/ still fires cores)
       - '!tests/performance/nyc/**'                 # nyc_bench.yml (manual, remote Fabric)
       - '!tests/integration_tests/taxi/**'          # integration_tests_onelake.yml
       - '!tests/integration_tests/multicatalog/**'  # integration_tests_onelake.yml
@@ -462,11 +462,11 @@ jobs:
     # clause set (CDC, by-source delete, expression update) / append / overwrite. Pure per-change
     # GUARD: the bench exits non-zero if any op's row count or value check is wrong. SF=1 (~6M-row
     # lineitem) fits the runner's local disk, no /mnt needed. The PUBLISHED, RAM-ceiling SF=10 gate
-    # (which also commits the MERGE scorecard) is in local_stress_tests.yml; this job never commits
+    # (which also commits the MERGE scorecard) is in merge_spill.yml; this job never commits
     # the card. Fully offline bar tpchgen-cli.
     runs-on: ubuntu-latest
     env:
-      MERGE_SF: "1"   # small + fast; local_stress_tests.yml is where the SF is cranked
+      MERGE_SF: "1"   # small + fast; merge_spill.yml is where the SF is cranked
     steps:
       - uses: actions/checkout@v4
 

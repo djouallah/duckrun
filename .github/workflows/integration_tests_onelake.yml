@@ -8,7 +8,7 @@ name: integration_tests_onelake
 #   (aemo moved to its own workflow, .github/workflows/aemo.yml.)
 #   • merge_spill — the SQL-only incremental-MERGE chain (merge_tpch_bench.py, conn.sql) over OneLake
 #                   at a SMALL scale factor. No docs catalog (not a dbt project). The HEAVY SF=10
-#                   (60M-row) memory-spill version stays a LOCAL release gate (local_stress_tests.yml).
+#                   (60M-row) memory-spill version stays a LOCAL release gate (merge_spill.yml).
 #   • coffee      — build the dbt models ON OneLake (like aemo) so the docs catalog reflects the
 #                   live tables, then the connection-API coffee scenario.
 #
@@ -98,7 +98,7 @@ jobs:
   merge_spill:
     # The incremental-MERGE project (SQL-only): the MERGE chain over OneLake at a SMALL scale factor
     # (the abfss:// merge write/read path via conn.sql). The heavy SF=10 memory-spill version is a
-    # local release gate (local_stress_tests.yml), not this.
+    # local release gate (merge_spill.yml), not this.
     needs: changes
     if: ${{ github.event_name != 'workflow_dispatch' && needs.changes.outputs.merge_spill == 'true' || (github.event_name == 'workflow_dispatch' && (inputs.project == 'merge_spill' || inputs.project == 'all')) }}
     runs-on: ubuntu-latest
@@ -121,7 +121,7 @@ jobs:
       - name: Run the MERGE chain against OneLake (tiny scale factor)
         # --warehouse abfss://… routes the whole chain to OneLake; this job only exercises the abfss://
         # MERGE write/read path, NOT memory — the heavy SF=10 spill gate runs locally
-        # (local_stress_tests.yml). So keep the fact tiny (--sf 0.1) to cut the OneLake round-trip time.
+        # (merge_spill.yml). So keep the fact tiny (--sf 0.1) to cut the OneLake round-trip time.
         # DBT_SCHEMA isolates it from aemo.
         env:
           WAREHOUSE_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
