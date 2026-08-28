@@ -4,13 +4,13 @@ duckrun tries to write **VertiPaq-friendly Parquet**. Three properties define ev
 
 - **6M-row row groups** — one Parquet row group becomes one VertiPaq column segment.
 - **Dictionary encoding** — kept wherever sensible, to help transcoding.
-- **Sorted** — duckrun doesn't have V-Order, so it simulates it (kind of) with one global `ORDER BY` over the table.
+- **Sorted** — duckrun has no V-Order; it approximates its effect with a single global `ORDER BY` over the table.
 
 The rest of this page is the detail behind those three.
 
-## Power BI transcodes — it doesn't scan
+## VertiPaq transcodes — it doesn't scan
 
-Direct Lake does not scan Parquet the way DuckDB or Spark do, query after query. It **transcodes** — and it transcodes **per column, on demand**, not per file. The first DAX query to touch a column that is not yet in memory converts *that column only* into **VertiPaq**, the in-memory format Power BI actually queries: the column's per-row-group Parquet **dictionaries** are merged into one global VertiPaq dictionary, then each **row group** of the column is loaded as one resident **column segment**, remapping Parquet data IDs onto VertiPaq IDs on the way in.
+**VertiPaq** is Power BI's in-memory engine; **Direct Lake** is the mode where that engine reads Parquet straight from OneLake. And it does not scan the file the way DuckDB or Spark do, query after query — it **transcodes** it, **per column, on demand**. The first DAX query to touch a column that is not yet in memory converts *that column only* into VertiPaq's own in-memory format: the column's per-row-group Parquet **dictionaries** are merged into one global VertiPaq dictionary, then each **row group** of the column is loaded as one resident **column segment**, remapping Parquet data IDs onto VertiPaq IDs on the way in.
 
 ```mermaid
 flowchart LR
@@ -18,7 +18,9 @@ flowchart LR
     chunks["that column on disk<br/>one chunk per row group<br/>dictionary + data IDs"] -->|"transcoding<br/>per column, on demand"| seg["that column in memory<br/>row group → one segment<br/>one global dictionary"]
 ```
 
-Columns no query touches are never transcoded at all, and a warm query on resident columns skips everything — it runs purely in memory, never touching the file until a reframe brings new data or memory pressure evicts segments. The whole layout is shaped so that this per-column conversion is a cheap dictionary **remap**, not a re-encode from raw values. The full mechanics and the measurements behind this page live in [direct-lake-parquet-layout](https://github.com/djouallah/direct-lake-parquet-layout).
+**Dictionary encoding is what makes that conversion cheap.** A dictionary-encoded column transcodes as an ID **remap**; a PLAIN — or undeclared — column forces the engine to re-encode every value from raw. The difference is not subtle: the same 142M-row string column, same pages, went from **10,857.5 ms to 689.3 ms** cold (~15×) once the footer actually declared the dictionary — a writer gap this project found and fixed upstream in [duckdb#24957](https://github.com/duckdb/duckdb/pull/24957).
+
+Columns no query touches are never transcoded at all, and a warm query on resident columns skips everything — it runs purely in memory, never touching the file until a reframe brings new data or memory pressure evicts segments. The full mechanics and the measurements behind this page live in [direct-lake-parquet-layout](https://github.com/djouallah/direct-lake-parquet-layout).
 
 ## Cold and hot
 
