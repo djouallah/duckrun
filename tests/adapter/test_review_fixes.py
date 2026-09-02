@@ -878,16 +878,19 @@ def test_split_statements_normalizes_like_handle():
 
 # --- D: merge update maps are quoted; update+exclude conflict; quoted unique_key
 
-def test_merge_update_maps_are_quoted():
-    q = engine.quote_ident
+def test_merge_update_maps_are_quoted_when_needed():
+    # A column with a space only binds quoted in datafusion ("No field named source.Total" — proven
+    # against deltalake 1.5.0); a bare identifier stays verbatim, the shape the clause tests pin.
     specs = Plugin._specs_from_set_expressions(
         {"merge_update_columns": ["Total Amount", "x"],
          "merge_update_set_expressions": {"x": "source.x + 1"}},
         ["id", "Total Amount", "x"], "id")
-    updates = specs[0]["updates"]
-    assert updates == {q("Total Amount"): 'source."Total Amount"', q("x"): "source.x + 1"}
+    assert specs[0]["updates"] == {'"Total Amount"': 'source."Total Amount"', "x": "source.x + 1"}
     assert Plugin._explicit_updates({"include": ["Total Amount"]}, ["id", "Total Amount"], {"id"}) == \
         {'"Total Amount"': 'source."Total Amount"'}
+    assert engine.quote_ident_if_needed("MyCol") == "MyCol"
+    assert engine.quote_ident_if_needed('"already"') == '"already"'
+    assert engine.quote_ident_if_needed("a-b") == '"a-b"'
 
 
 def test_update_and_exclude_columns_together_is_a_compile_error():

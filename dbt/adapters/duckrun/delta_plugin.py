@@ -1330,9 +1330,9 @@ class Plugin(BasePlugin):
         """The ``{col: expr}`` map for an explicit-mode matched UPDATE: the columns named by
         ``include``/``exclude`` copied from source, with ``set_expressions`` overriding — the same
         shape ``merge_update_set_expressions`` produces (dbt-duckdb ``merge.sql`` explicit mode)."""
-        # Keys and source refs quoted (engine.quote_ident, idempotent): datafusion parses an
-        # unquoted name, so a column with a space / reserved word fails to bind unquoted.
-        q = engine.quote_ident
+        # Keys and source refs quoted WHEN NEEDED (engine.quote_ident_if_needed): datafusion parses
+        # an unquoted name, so a column with a space fails to bind; a bare identifier stays verbatim.
+        q = engine.quote_ident_if_needed
         updates = {q(col): f"source.{q(col)}" for col in cls._explicit_cols(spec, allcols, keys)}
         for col, expr in ((spec if isinstance(spec, dict) else {}).get("set_expressions") or {}).items():
             updates[q(col)] = cls._rewrite_merge_aliases(expr)
@@ -1355,8 +1355,9 @@ class Plugin(BasePlugin):
                     f"merge_clauses insert lists {len(cols)} column(s) but {len(vals)} value(s); "
                     "they must pair up one-to-one."
                 )
-            return {engine.quote_ident(c): cls._rewrite_merge_aliases(v) for c, v in zip(cols, vals)}
-        q = engine.quote_ident
+            q = engine.quote_ident_if_needed
+            return {q(c): cls._rewrite_merge_aliases(v) for c, v in zip(cols, vals)}
+        q = engine.quote_ident_if_needed
         return {q(col): f"source.{q(col)}" for col in cls._explicit_cols(spec, allcols, keys)}
 
     @classmethod
@@ -1427,7 +1428,7 @@ class Plugin(BasePlugin):
             base = [c for c in allcols if c.lower() not in ex and c.lower() not in keys]
         else:
             base = [c for c in allcols if c.lower() not in keys]
-        q = engine.quote_ident  # quoted keys/refs: a space / reserved-word column binds only quoted
+        q = engine.quote_ident_if_needed  # a column with a space binds only quoted; bare names verbatim
         updates = {q(c): f"source.{q(c)}" for c in base}
         for col, expr in cfg["merge_update_set_expressions"].items():
             updates[q(col)] = cls._rewrite_merge_aliases(expr)

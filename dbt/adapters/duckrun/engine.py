@@ -754,6 +754,20 @@ def quote_ident(name) -> str:
     return '"' + str(name).strip().strip('"').replace('"', '""') + '"'
 
 
+_BARE_COLUMN = re.compile(r"[A-Za-z_]\w*")
+
+
+def quote_ident_if_needed(name) -> str:
+    """``name`` verbatim when it is a bare identifier (``[A-Za-z_]\\w*`` — delta_rs binds those as-is,
+    mixed case included), else :func:`quote_ident`. For the merge UPDATE/INSERT column maps: datafusion
+    parses an unquoted name, so a column with a space or other punctuation ("Total Amount") only
+    binds quoted, while the plain spelling is the shape every existing caller and test expects."""
+    n = str(name).strip()
+    if n.startswith('"') and n.endswith('"'):
+        return quote_ident(n)  # normalize an already-quoted name (escape inner quotes)
+    return n if _BARE_COLUMN.fullmatch(n) else quote_ident(n)
+
+
 # DuckDB's naive timestamp spellings. Top-level columns only: a naive timestamp nested in a
 # STRUCT/LIST types as "STRUCT(...)" and is left alone (documented gap in docs/limitations.md).
 _NAIVE_TS_TYPES = {"TIMESTAMP", "TIMESTAMP_S", "TIMESTAMP_MS", "TIMESTAMP_NS"}
@@ -1961,11 +1975,11 @@ def merge_delta(
                         "predicate": insert_condition})
     else:
         if update_columns:
-            # Quoted like merge_on_predicate's keys: datafusion parses an unquoted name, so a
-            # column with a space / reserved word ("Total Amount") fails with "No field named
-            # source.Total" — quoted, it binds. quote_ident is idempotent on already-quoted names.
+            # Quoted when needed: datafusion parses an unquoted name, so a column with a space
+            # ("Total Amount") fails with "No field named source.Total"; a bare identifier stays
+            # verbatim (the shape every caller and the clause tests expect).
             clauses.append({"clause": "matched", "action": "update",
-                            "updates": {quote_ident(c): f"source.{quote_ident(c)}"
+                            "updates": {quote_ident_if_needed(c): f"source.{quote_ident_if_needed(c)}"
                                         for c in update_columns},
                             "predicate": update_condition})
         elif exclude_columns:
