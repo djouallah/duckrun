@@ -5,7 +5,8 @@ Every backend (local / s3 / gcs / az / OneLake ``abfss://``) goes through **obst
 binding over the same Rust ``object_store`` crate that ``deltalake`` uses. That shared lineage is the
 whole point: the ``storage_options`` dict duckrun already forwards to delta-rs for Delta writes *is*
 an ``object_store`` config, so it builds an obstore store verbatim — no per-backend auth code, no
-DuckDB Azure secret, no OneLake DFS REST enumeration (obstore lists OneLake natively).
+DuckDB Azure secret, no OneLake DFS REST enumeration (obstore lists OneLake natively). The one
+exception is :func:`delete` on OneLake — see its docstring for why that is a raw DFS call.
 
 Uploads stream from an open file handle, so obstore does a multipart PUT for large files instead of
 materializing the whole file in memory — the fix for the old ``read_blob``/``COPY … (FORMAT BLOB)``
@@ -49,18 +50,34 @@ def exists(store, key: str) -> bool:
         return False
 
 
-def delete(store, key: str) -> None:
-    """Delete the single object ``key`` from ``store`` — deliberately ONE key per call, never a list.
+def delete(store, key: str, base_url: str = "", storage_options: Optional[Dict[str, str]] = None) -> None:
+    """Delete the single object ``key`` under ``base_url``.
 
-    obstore's ``delete(store, paths)`` takes a str or a sequence. A **sequence** goes through
-    ``object_store``'s ``delete_stream``, which on Azure is the bulk *batch* endpoint — broken for
-    OneLake upstream (arrow-rs object_store #701: the batch URL drops the workspace/artifact id and
-    OneLake answers 400 ``WorkspaceId or ArtifactId are missing``; the same bug that forced
-    ``copy(overwrite=True)`` onto a single Put Blob instead of delete-then-put). A single **str** is
-    the plain per-object ``delete`` — one HTTP DELETE — which OneLake honors. So ``copy(sync=True)``
-    calls this once per stale key even where bulk would be fewer round trips. A missing key raises
-    ``FileNotFoundError`` on local / Azure / GCS (S3 is silent); the caller only deletes keys it
-    listed a moment earlier, so a miss means another writer got there first — let it surface."""
+    OneLake (``abfss://``) does NOT go through obstore: object_store's Azure delete — a single key
+    or a list, it makes no difference — is the bulk *batch* request (``?restype=container&comp=batch``),
+    which OneLake rejects with 400 ``Either WorkspaceId or ArtifactId are missing`` (arrow-rs
+    object_store #701; the same bug that forced ``copy(overwrite=True)`` onto a single Put Blob
+    instead of delete-then-put). The live coffee gate proved a one-key ``obstore.delete`` still hits
+    it. So on OneLake this is one raw DFS ``DELETE`` per key (the ADLS Gen2 Path - Delete call the
+    listing code already speaks) with the bearer token the session holds — the surgical shape of the
+    Put Blob workaround, and it disappears the day upstream fixes #701. Every other backend (local /
+    s3 / gcs / plain Azure) is a plain ``obstore.delete``. A missing key raises ``FileNotFoundError``
+    on both paths; the caller only deletes keys it listed a moment earlier, so a miss means another
+    writer got there first — let it surface."""
+    from . import remote
+
+    if remote.is_abfss(base_url):
+        from urllib.parse import quote
+
+        filesystem, host, path = remote._parse_abfss(base_url.rstrip("/"))
+        url = f"https://{host}/{filesystem}/" + quote(f"{path}/{key}".lstrip("/"), safe="/")
+        headers = {"Authorization": f"Bearer {bearer_token(storage_options)}",
+                   "x-ms-version": remote._DFS_API_VERSION}
+        resp = remote.retry_request("DELETE", url, headers=headers)
+        if resp.status_code == 404:
+            raise FileNotFoundError(key)
+        resp.raise_for_status()
+        return
     import obstore
 
     obstore.delete(store, key)

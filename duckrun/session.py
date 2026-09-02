@@ -1158,8 +1158,9 @@ class DuckSession:
         (``sync=True`` with ``['.sql']`` never touches a ``.csv``); uploads happen first and deletes
         last (a crash mid-deploy leaves extra files, never missing ones); and an empty local set is
         refused outright, so a typo'd ``local_folder`` cannot become "delete everything remote".
-        Deletes are individual files, one request per key (obstore's bulk delete is broken on
-        OneLake upstream — arrow-rs object_store #701).
+        Deletes are individual files, one request per key — on OneLake a raw DFS ``DELETE`` with the
+        session's token, because obstore's Azure delete (single key or not) is the batch request
+        OneLake rejects (arrow-rs object_store #701).
 
         ``sync`` governs *presence*, ``overwrite`` governs *content*: a file present on both sides is
         still skipped unless ``overwrite=True``. A deploy that expects edited models to land wants
@@ -1197,7 +1198,8 @@ class DuckSession:
                   + (f" (filtered by {file_extensions})" if exts else ""))
             return True
         print(f"Uploading {len(pairs)} file(s) to '{base}'...")
-        store = objectstore.build_store(base, secret.refreshed(self.storage_options))
+        so = secret.refreshed(self.storage_options)
+        store = objectstore.build_store(base, so)
         # obstore overwrites by default (put mode="overwrite"), but on OneLake neither streaming path
         # can replace an *existing* blob: the default multipart commit stages blocks (Put Block) that
         # OneLake rejects over a committed blob (409 BlobOperationNotSupported), and delete-then-put is
@@ -1221,7 +1223,8 @@ class DuckSession:
             if stale:
                 print(f"Removing {len(stale)} stale file(s) from '{base}'...")
                 for k in stale:
-                    objectstore.delete(store, k)  # one key per call — never a bulk list (see objectstore)
+                    # per key; on OneLake a raw DFS DELETE with the session token (see objectstore.delete)
+                    objectstore.delete(store, k, base_url=base, storage_options=so)
                     print(f"  [del] {base}/{k}")
         print("upload complete")
         return True

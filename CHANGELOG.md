@@ -115,8 +115,9 @@ All notable changes to this project will be documented in this file.
   machine; outside a git checkout it falls back to the full walk with a warning). `sync=True`
   deletes remote files no longer present locally: a per-file diff scoped to `remote_folder` and to
   the same `file_extensions` filter, uploads first and deletes last, refused outright on an empty
-  local set or a bare `remote_folder`, and issued as single-key deletes because obstore's bulk
-  delete is broken on OneLake upstream (arrow-rs object_store #701). Defaults unchanged.
+  local set or a bare `remote_folder`, and issued one key at a time — on OneLake as a raw DFS
+  `DELETE` with the session's token, because obstore's Azure delete (single key or not) is the
+  batch request OneLake rejects (arrow-rs object_store #701). Defaults unchanged.
 - **`materialized='external'`** — the last materialization dbt-duckdb had and duckrun didn't. A
   model can now be exported as a plain parquet/csv/json file (DuckDB `COPY … TO`) and is surfaced as
   a view over that file, for hand-off to tools that don't read Delta. It is dbt-duckdb's macro
