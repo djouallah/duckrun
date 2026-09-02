@@ -59,14 +59,10 @@ _TOP_USING = re.compile(r"\busing\b", re.IGNORECASE)
 _TOP_RETURNING = re.compile(r"\breturning\b", re.IGNORECASE)
 _strip_leading = delta_dml._strip_leading  # shared comment/whitespace stripper
 
-_UPDATE_FROM_MSG = (
-    "conn.sql() can't run UPDATE … FROM via delta_rs. Rewrite the SET values as correlated "
-    "subqueries, or express the join as MERGE INTO … USING …."
-)
-_DELETE_USING_MSG = (
-    "conn.sql() can't run DELETE … USING via delta_rs. Rewrite the predicate as a correlated "
-    "subquery (DELETE … WHERE … IN (SELECT …)), or express the join as MERGE INTO … USING …."
-)
+# Shared with the router (delta_dml re-checks UPDATE … FROM on the dbt cursor path, which has no
+# _unsupported_dml gate) so both surfaces raise the same words.
+_UPDATE_FROM_MSG = delta_dml.UPDATE_FROM_MSG
+_DELETE_USING_MSG = delta_dml.DELETE_USING_MSG
 _RETURNING_MSG = (
     "conn.sql() can't run a RETURNING clause via delta_rs — a Delta write commits through the "
     "transaction log and does not hand back the affected rows. Drop RETURNING, then read the "
@@ -583,12 +579,13 @@ class DuckSession:
         if remote.is_abfss(root):
             # Immediate sub-directories under the root (…/Tables) are the schema folders.
             return remote.list_delta_tables(root, "", so)
-        # Local / s3 / gcs / az: glob two levels deep and collect the schema segment.
+        # Local / s3 / gcs / az: glob two levels deep and collect the schema segment. No error
+        # swallowing — same policy as remote.list_delta_tables_via_glob: DuckDB's glob yields zero
+        # rows for a missing/empty root (no error), while a missing secret, a transport failure or
+        # an absent bucket RAISE. Degrading those to [] made connect() report "discovered 0 tables"
+        # on a lakehouse full of tables, with nothing to tell the user why.
         pattern = _qlit(root.rstrip("/") + "/*/*/_delta_log/*.json")
-        try:
-            rows = self.con.execute(f"SELECT DISTINCT file FROM glob('{pattern}')").fetchall()
-        except Exception:
-            return []
+        rows = self.con.execute(f"SELECT DISTINCT file FROM glob('{pattern}')").fetchall()
         marker = "/_delta_log/"
         schemas: List[str] = []
         for (fp,) in rows:
@@ -944,7 +941,10 @@ class DuckSession:
             # surface at connect() or an explicit refresh() — the same visibility points as dbt's
             # run-start discovery. (Dropped: a full re-list + per-table probe per statement.)
             return self.con.sql("SELECT 'ok' AS status")
-        if _is_delta_write(query):
+        # An unrouted write is an error — unless its bare target is a DuckDB TEMP table (the router
+        # declines those on purpose: DuckDB resolves the name to the temp first, so a same-named
+        # Delta table must not be written instead). That one runs natively, like any scratch DDL.
+        if _is_delta_write(query) and not delta_dml.targets_temp_table(self.con, query):
             raise ValueError(_delta_write_message(query))
         return self.con.sql(query)
 

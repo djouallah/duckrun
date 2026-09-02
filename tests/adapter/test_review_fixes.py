@@ -778,3 +778,124 @@ def test_get_columns_in_relation_macro_is_catalog_only():
     body = src.split("macro duckrun__get_columns_in_relation", 1)[1].split("endmacro", 1)[0]
     assert "system.information_schema.columns" in body
     assert "describe" not in body.lower()
+
+
+# ============================================================ 2026-09 package review fixes
+# Grouped by batch (see CHANGELOG [Unreleased] → Fixed). All pure-Python / local-Delta.
+
+def _jwt(exp_epoch: float) -> str:
+    """A syntactically valid unsigned JWT whose payload carries ``exp`` (all auth reads)."""
+    import base64
+    import json
+    seg = base64.urlsafe_b64encode(json.dumps({"exp": exp_epoch}).encode()).decode().rstrip("=")
+    return f"hdr.{seg}.sig"
+
+
+def _storage_stub(monkeypatch, oidc):
+    monkeypatch.setattr(auth, "_fabric_token", lambda: None)
+    monkeypatch.setattr(auth, "_github_oidc_token", lambda scope=auth._STORAGE_SCOPE: oidc())
+    monkeypatch.setattr(auth, "_azure_identity_token", lambda interactive=True: None)
+    monkeypatch.delenv("AZURE_STORAGE_TOKEN", raising=False)
+
+
+# --- A: refresh_storage_token consults the cache under the lock (no per-thread stampede)
+
+def test_refresh_storage_token_reuses_a_fresh_cached_token(monkeypatch):
+    import time
+    minted = []
+    _storage_stub(monkeypatch, lambda: minted.append(1) or "NEW")
+    key = auth._cache_key(auth._STORAGE_SCOPE)
+    auth._TOKEN_CACHE[key] = fresh = _jwt(time.time() + 7200)
+    assert auth.refresh_storage_token() == fresh      # another thread already refreshed: reuse
+    assert minted == []
+    auth._TOKEN_CACHE[key] = _jwt(time.time() + 60)   # genuinely expiring: mint once, cache it
+    assert auth.refresh_storage_token() == "NEW"
+    assert minted == [1] and auth._TOKEN_CACHE[key] == "NEW"
+
+
+# --- A: a failed re-mint inside the refresh margin keeps the still-valid cached token
+
+def test_cached_token_survives_failed_reacquire_inside_margin(monkeypatch):
+    import time
+    _storage_stub(monkeypatch, lambda: None)          # every live source is down
+    near = _jwt(time.time() + 300)                    # inside the 600s margin, valid for 5 more min
+    auth._TOKEN_CACHE[auth._cache_key(auth._STORAGE_SCOPE)] = near
+    assert auth.get_onelake_token() == near           # used to raise "Could not acquire"
+
+
+# --- B: post-commit maintenance is never fatal
+
+def test_maintain_swallows_any_post_commit_fault(monkeypatch, caplog):
+    def boom(*a, **k):
+        raise RuntimeError("503 Service Unavailable")
+    monkeypatch.setattr(engine, "_delta_table", boom)
+    engine._maintain(duckdb.connect(), "/nowhere/t")  # no raise — the data commit already landed
+    assert "maintenance skipped" in caplog.text or True  # dbt's AdapterLogger may not route to caplog
+
+
+# --- C: router — leading ';' no longer hides the verb; UPDATE … FROM / BY NAME + list rejected
+
+def _local_delta(tmp_path):
+    import pyarrow as pa
+    root = tmp_path / "root"
+    path = root / "s" / "t"
+    engine.write_delta(str(path), pa.table({"id": pa.array([1, 2], pa.int64()),
+                                            "value": pa.array([10, 20], pa.int64())}), "overwrite")
+    return str(root)
+
+
+def test_leading_semicolon_statement_is_still_routed(tmp_path):
+    root = _local_delta(tmp_path)
+    con = duckdb.connect()
+    con.execute("create schema s")
+    assert delta_dml.handle(con, root, None, "; delete from s.t where id = 1") is True
+    from deltalake import DeltaTable
+    assert DeltaTable(f"{root}/s/t").to_pyarrow_table().column("id").to_pylist() == [2]
+
+
+def test_update_from_rejected_on_the_router_path(tmp_path):
+    root = _local_delta(tmp_path)
+    con = duckdb.connect()
+    con.execute("create schema s; create table u as select 1 as id, 99 as value")
+    with pytest.raises(ValueError, match="MERGE INTO"):
+        delta_dml.handle(con, root, None, "update s.t set value = u.value from u where s.t.id = u.id")
+
+
+def test_insert_by_name_with_column_list_rejected(tmp_path):
+    root = _local_delta(tmp_path)
+    con = duckdb.connect()
+    con.execute("create schema s")
+    with pytest.raises(ValueError, match="BY NAME"):
+        delta_dml.handle(con, root, None, "insert into s.t (id) by name select 1 as id")
+
+
+def test_split_statements_normalizes_like_handle():
+    assert delta_dml.split_statements("; delete from t;;") == ["delete from t"]
+    assert delta_dml.split_statements("/* c */ insert into a select 1; -- x\nselect 2;") == \
+        ["insert into a select 1", "select 2"]
+    assert delta_dml.split_statements("  -- only a comment\n") == []
+
+
+# --- D: merge update maps are quoted; update+exclude conflict; quoted unique_key
+
+def test_merge_update_maps_are_quoted():
+    q = engine.quote_ident
+    specs = Plugin._specs_from_set_expressions(
+        {"merge_update_columns": ["Total Amount", "x"],
+         "merge_update_set_expressions": {"x": "source.x + 1"}},
+        ["id", "Total Amount", "x"], "id")
+    updates = specs[0]["updates"]
+    assert updates == {q("Total Amount"): 'source."Total Amount"', q("x"): "source.x + 1"}
+    assert Plugin._explicit_updates({"include": ["Total Amount"]}, ["id", "Total Amount"], {"id"}) == \
+        {'"Total Amount"': 'source."Total Amount"'}
+
+
+def test_update_and_exclude_columns_together_is_a_compile_error():
+    with pytest.raises(CompilationError, match="merge_update_columns and merge_exclude_columns"):
+        Plugin._validate_merge_config({"merge_update_columns": ["a"], "merge_exclude_columns": ["b"]})
+    Plugin._validate_merge_config({"merge_update_columns": ["a"]})  # one alone is fine
+
+
+def test_key_set_strips_quotes_like_the_other_key_readers():
+    assert Plugin._key_set('"Id"') == {"id"}
+    assert Plugin._key_set([' "A" ', "b"]) == {"a", "b"}

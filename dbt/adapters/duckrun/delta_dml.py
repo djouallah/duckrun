@@ -244,6 +244,21 @@ _UPDATE = re.compile(
     re.I | re.S,
 )
 _TOP_WHERE = re.compile(r"\bwhere\b", re.I)
+_TOP_FROM = re.compile(r"\bfrom\b", re.I)
+
+# DML forms that genuinely can't be expressed through delta_rs. Rejected up front with a form-specific
+# pointer (the connection API checks the whole statement in session._unsupported_dml; the dbt cursor
+# path has no such gate, so _update re-checks its own body) rather than letting DuckDB raise a cryptic
+# error on the read-only delta_scan view — or, for UPDATE … FROM, silently mangling the SET clause
+# (`SET x = u.x FROM u` would split into the assignment `x = "u.x from u"`).
+UPDATE_FROM_MSG = (
+    "UPDATE … FROM can't run via delta_rs. Rewrite the SET values as correlated subqueries, or "
+    "express the join as MERGE INTO … USING …."
+)
+DELETE_USING_MSG = (
+    "DELETE … USING can't run via delta_rs. Rewrite the predicate as a correlated subquery "
+    "(DELETE … WHERE … IN (SELECT …)), or express the join as MERGE INTO … USING …."
+)
 _ALTER_ADD = re.compile(
     r"\s*alter\s+table\s+(?P<rel>.+?)\s+add\s+column\s+(?P<col>\S+)\s+(?P<def>.+?)\s*;?\s*",
     re.I | re.S,
@@ -653,6 +668,30 @@ def _split_relation(rel: str) -> Tuple[Optional[str], Optional[str]]:
     schema = parts[-2] if len(parts) >= 2 else None
     return schema, identifier
 
+
+
+def is_temp_table(cursor, rel: str) -> bool:
+    """True when the UNQUALIFIED ``rel`` names a DuckDB TEMP table (case-insensitive, like DuckDB's
+    own resolution). A qualified name never does — temp tables live in DuckDB's ``temp`` catalog,
+    not in a lakehouse schema. Shared by the router's shadow check and the connection API's
+    "no Delta table" guard so the two can't disagree on what counts as native scratch."""
+    schema, identifier = _split_relation(rel)
+    if schema or not identifier:
+        return False
+    row = cursor.execute(
+        "select 1 from duckdb_tables() where temporary and lower(table_name) = lower(?) limit 1",
+        [identifier],
+    ).fetchone()
+    return row is not None
+
+
+def targets_temp_table(cursor, sql: str) -> bool:
+    """True when the DML statement ``sql`` (INSERT / UPDATE / DELETE / MERGE / DROP / CREATE …)
+    targets a DuckDB TEMP table by bare name — the connection API then lets DuckDB run it instead
+    of refusing it as a write to a Delta table that doesn't exist."""
+    _, body = _split_leading_with(_strip_leading(sql))
+    m = _DML_REL.match(_strip_leading(body))
+    return bool(m) and is_temp_table(cursor, m.group("rel"))
 
 _BARE_IDENT = re.compile(r"[A-Za-z_][\w$]*", re.A)
 
@@ -1321,10 +1360,11 @@ class _DeltaDML:
         # CTAS: data committed, view never registered). A 1/2-part rel stays unqualified in the current
         # catalog, preserving the dbt single-catalog path.
         parts = _split_dotted(rel)  # quote-aware: a dot inside "a.b" isn't a separator
+        q_schema = engine.quote_ident(schema)  # doubles an embedded `"` (the parts are quote-stripped)
         if len(parts) >= 3:
-            self.cursor.execute(f'create schema if not exists "{parts[-3]}"."{schema}"')
+            self.cursor.execute(f"create schema if not exists {engine.quote_ident(parts[-3])}.{q_schema}")
         else:
-            self.cursor.execute(f'create schema if not exists "{schema}"')
+            self.cursor.execute(f"create schema if not exists {q_schema}")
         self.cursor.execute(
             f"create or replace view {rel} as select * from delta_scan('{loc_sql}')"
         )
@@ -1507,10 +1547,20 @@ class _DeltaDML:
         return True
 
     # -- forms that only apply when a Delta table already exists at the target ------------------
+    def _shadowed_by_temp(self, rel: str) -> bool:
+        """True when the UNQUALIFIED ``rel`` names a DuckDB TEMP table. DuckDB resolves a bare name
+        to the temp table first, so a session that did ``CREATE TEMP TABLE stg …`` and then
+        ``INSERT INTO stg …`` / ``DROP TABLE stg`` means the temp one — but the router used to decide
+        Delta-vs-native purely on whether ``<root>/<schema>/stg`` exists, and with a same-named Delta
+        table in the current schema it appended to (or tombstoned) the PRODUCTION table while every
+        later ``SELECT … FROM stg`` read the empty temp. A qualified name never shadows (temp tables
+        live in DuckDB's ``temp`` catalog, not in a lakehouse schema). Case-insensitive like DuckDB."""
+        return is_temp_table(self.cursor, rel)
+
     def _mutate(self, m, op) -> bool:
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
-        if not loc or not self._exists(loc):
+        if not loc or self._shadowed_by_temp(rel) or not self._exists(loc):
             return False  # native relation (e.g. the test's `fact`/`seed`) -> let DuckDB handle it
         if self._with_clause and op not in (self._insert_select, self._delete, self._update):
             return False  # a leading `WITH …` only composes with INSERT … SELECT / UPDATE / DELETE
@@ -1594,6 +1644,11 @@ class _DeltaDML:
         # Split SET / WHERE structurally (quote/paren/CASE-aware) so a literal containing `where`
         # can't cut the statement in the wrong place.
         body = m.group("body")
+        # The dbt cursor path (hooks, run-operation) has no session._unsupported_dml gate, so an
+        # `UPDATE t SET x = u.x FROM u …` reaches here and the SET split below would hand delta_rs
+        # the assignment `x = "u.x from u"`. Reject the form the same way the connection API does.
+        if _find_top_level(body, _TOP_FROM) != -1:
+            raise ValueError(UPDATE_FROM_MSG)
         widx = _find_top_level(body, _TOP_WHERE)
         if widx == -1:
             set_clause, where = body, None
@@ -1671,6 +1726,11 @@ class _DeltaDML:
         if self._with_clause:  # `WITH … INSERT INTO t SELECT …`: re-attach the CTE to the body
             body = f"{self._with_clause} {body}"
         if m.group("byname"):
+            if m.group("cols"):
+                # DuckDB rejects the pair; silently ignoring the list wrote the source's columns and
+                # NULLed the listed ones — a green statement that did something else.
+                raise ValueError(
+                    "INSERT … BY NAME cannot be combined with a column list; drop one of the two")
             # `INSERT INTO t BY NAME SELECT …`: align the source's OWN columns to the target by name
             # (any target column the source doesn't name becomes NULL). Read the source column names
             # and treat them as the written column list — _project_onto_schema already maps by name.
@@ -1991,7 +2051,8 @@ class _DeltaDML:
         # isn't a duckrun-managed Delta table, fall through and let DuckDB drop the native table.
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
-        if not loc or not self._exists(loc) or is_dropped_dt(self._pinned(loc)):
+        if (not loc or self._shadowed_by_temp(rel) or not self._exists(loc)
+                or is_dropped_dt(self._pinned(loc))):
             # Not a LIVE duckrun table (never existed, native, or already tombstoned) → pass through so
             # DuckDB applies plain DROP / DROP IF EXISTS semantics: a plain `DROP TABLE <gone>` raises
             # (the delta_scan view was already unregistered on the first drop), IF EXISTS is a no-op.
@@ -2146,17 +2207,33 @@ def handle(cursor, root_path, storage_options, sql: str, default_schema=None) ->
     """
     if not root_path:
         return False
-    sql = _strip_leading(sql)  # so leading comments/whitespace don't hide the verb
-    sql = _strip_comments(sql)  # drop interior --/* */ comments so they can't fake a clause boundary
-    sql = re.sub(r";\s*$", "", sql)  # drop a trailing ';' terminator. A matcher's body capture is
-    # DOTALL (`select\b.*`), so `insert … select … from t;` would carry the ';' into the rewritten
-    # `select … from (select … from t;) v(…)` — a syntax error mid-statement. dbt-duckdb runs the raw
-    # statement so never hits this; duckrun re-embeds the body, so it must drop the terminator first.
-    stmts = _split_top_level(sql)
-    if len(stmts) <= 1:
-        return _handle_one(cursor, root_path, storage_options, sql, default_schema)
+    stmts = split_statements(sql)
+    if not stmts:
+        return False  # nothing but whitespace/comments — let DuckDB have it
+    if len(stmts) == 1:
+        # The SPLIT statement, not the raw text: a leading `;` or a doubled `;;` survived the
+        # trailing-terminator strip and hid the verb from _handle_one's prefilter, so `; delete from
+        # mart.t` passed through to DuckDB and died on the read-only view.
+        return _handle_one(cursor, root_path, storage_options, stmts[0], default_schema)
     # Multi-statement script: route each statement; non-Delta ones run on the cursor as DuckDB would.
+    # (The dbt cursor wrapper now splits BEFORE reaching here so each statement resolves its own
+    # catalog and lazy binds; this branch remains for any direct caller of handle().)
     for stmt in stmts:
         if not _handle_one(cursor, root_path, storage_options, stmt, default_schema):
             cursor.execute(stmt)
     return True
+
+
+def split_statements(sql: str) -> List[str]:
+    """``sql`` as its top-level statements, normalized the way :func:`handle` needs them: leading
+    whitespace/comments peeled (so they can't hide the verb), interior ``--``/``/* */`` comments
+    dropped (so they can't fake a clause boundary or a ``;``), the trailing ``;`` terminator removed
+    (a matcher's DOTALL body capture would otherwise carry it into the rewritten ``select … from
+    (… ;) v(…)`` — a mid-statement syntax error), then split on top-level ``;`` (quote / paren /
+    dollar-quote aware). Empty statements are dropped. Exposed so the dbt cursor wrapper can route a
+    multi-statement script one statement at a time — each to its own catalog, each with its lazy
+    Delta binds — with exactly the normalization the router applies."""
+    sql = _strip_leading(sql)
+    sql = _strip_comments(sql)
+    sql = re.sub(r";\s*$", "", sql)
+    return _split_top_level(sql)

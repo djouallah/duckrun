@@ -35,6 +35,50 @@ All notable changes to this project will be documented in this file.
   every write and to post-write compaction; a per-model `max_row_group_size` still wins verbatim.
 
 ### Fixed
+- **Post-commit maintenance can no longer fail a model whose write already landed.** The
+  compaction / vacuum / metadata-cleanup pass runs after the data commit, but only a lost-race
+  `CommitFailedError` was tolerated — a transient store fault there (a 503, a token expiring
+  mid-run) reported the model failed, and for an `append` model the retry appended the same rows
+  again. Every post-commit fault is now a warning. Same for the overwrite path's vacuum + cleanup.
+- **Token refresh no longer stampedes the token endpoint at the ~1h mark.** `refresh_storage_token`
+  now consults the per-scope cache under the cache lock, so with `threads: N` one thread mints and
+  the rest reuse it (each used to mint its own — the rate-limit case where a mint returns nothing,
+  the stale token is kept and the next write 401s). A failed re-mint inside the 10-minute refresh
+  margin also keeps the still-valid cached token instead of raising, the lock-free JWT-expiry read
+  can no longer `KeyError` against a concurrent cache clear, `sys.stdin is None` (pythonw / service
+  hosts) no longer crashes the credential chain, and `DUCKRUN_AUTH_DEBUG` prints why each
+  credential in the chain failed.
+- **A multi-statement script on the dbt cursor routes each statement to its own catalog.** With a
+  `catalogs:` profile, `insert into catA.s.t …; insert into catB.s.t …` used to land both in catA
+  (the catalog was resolved from the first statement only); passthrough statements in a script also
+  bypassed the lazy Delta bind. Each statement now re-enters the cursor on its own. A leading `;`
+  or doubled `;;` no longer hides the verb from the router.
+- **A same-named TEMP table is no longer shadowed by a Delta table.** `CREATE TEMP TABLE stg …`
+  then `INSERT INTO stg …` / `DROP TABLE stg` in `conn.sql()` used to append to (or tombstone) the
+  Delta table `stg` in the current schema while later reads hit the empty temp; an unqualified name
+  that DuckDB resolves to a temp table now stays native.
+- **`UPDATE … FROM` on the dbt cursor path** (hooks / run-operation) is rejected with the same
+  message the connection API gives, instead of silently mangling the SET clause into delta_rs.
+  `INSERT INTO t (cols) BY NAME …` is rejected like DuckDB does instead of dropping the column list.
+- **Merge `UPDATE` column maps are quoted** (`merge_update_columns`, `merge_update_set_expressions`,
+  explicit-mode `merge_clauses`): a column with a space or a reserved-word name failed inside
+  datafusion ("No field named source.Total"). `merge_update_columns` together with
+  `merge_exclude_columns` is now a compile error, as in dbt-core, instead of silently dropping the
+  exclusions; a quoted `unique_key` (`'"id"'`) is recognized as the join key.
+- **`on_schema_change` goes through dbt-core's own validator** — an unknown value (a typo) logs
+  and falls back to `ignore`, as upstream, instead of enabling schema evolution.
+- **Microbatch `--full-refresh` can retype columns.** Its first-batch overwrite now uses the same
+  schema replacement as every other rebuild (it was the only strict one, so a retyped column — or
+  the #42 naive→UTC timestamp retype — failed with a schema mismatch).
+- **Staging temp tables are released on every exit of the plugin write** — a NOT NULL contract
+  violation (or a raise from the sort-key profile) used to leak a full copy of the model result for
+  the rest of the run.
+- **`connect()` schema discovery fails loud on a store error** on local / s3 / gcs / az roots
+  (a missing secret, a transport failure) instead of reporting "discovered 0 tables"; a missing or
+  empty root still yields nothing, without error — the same policy OneLake discovery already had.
+- Schema names are quote-escaped in the router's `create schema` and the debug session's view
+  binding; a Fabric create LRO with no `Location` header raises `RemoteRunError` rather than a bare
+  `requests` error.
 - **The merge disk-spill cap no longer strands most of a big disk.** The default
   `max_temp_directory_size` was 80% of free space on the spill disk — a purely proportional
   reserve that left ~15 GB unused on a 75 GB CI disk while the v0.4.58 release gate's update-only

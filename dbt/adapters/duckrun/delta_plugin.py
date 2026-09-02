@@ -256,177 +256,182 @@ class Plugin(BasePlugin):
         #                             logs and the profile label keep naming the model, not a
         #                             staging table (the benchmark history records the label, and
         #                             0.4.54 briefly recorded the temp name).
-        if _merge_path and (cfg.get("merge_materialize_source") or not_null_columns):
-            src_tmp = '"' + engine.tmp_name("msrc", path) + '"'
-            cur.execute(f"CREATE OR REPLACE TEMP TABLE {src_tmp} AS SELECT * FROM {name}")
-            name = src_tmp          # guards and write all read the one materialization
-
-        # sort_by='auto' profiling SUBSTRATE (sortkey v6). The staged relation is a VIEW over the
-        # model SQL, so every scan re-runs it — and the profiler scans its source several times.
-        # Copying ALL rows first (0.4.54's msrc) was the defect at scale: materializing 591.7M rows
-        # cost ~5 min and every profile pass re-read a 38 GB spill (~49 min of a 72-min build). Now:
-        #   - exact COUNT(*) off the view first (footer metadata for scan models — near-free);
-        #   - at/below sortkey.SUBSTRATE_CAP: a FULL local copy — it doubles as the staging table
-        #     (guards + write read it; one model evaluation), byte-identical to the old behavior;
-        #   - above the cap: a deterministic hash(row) % K subset (~cap rows) for the profile ONLY,
-        #     and the write reads the VIEW directly (re-evaluating a bare scan is far cheaper than
-        #     copying the world; a nondeterministic model at worst gets a marginally stale key).
-        profile_src, full_rows = name, None
-        if _profile_sort:
-            full_rows = int(cur.sql(f"SELECT count(*) FROM {name}").fetchone()[0] or 0)
-            k = sortkey.substrate_modulus(full_rows)
-            psub = '"' + engine.tmp_name("psub", path) + '"'
-            if k == 1:
-                cur.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS SELECT * FROM {name}")
-                name = psub         # the full copy IS the staging table
-                full_rows = None    # profile covers every row — exact semantics, v5-identical
-            else:
-                cur.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS "
-                            f"SELECT * FROM {name} _r WHERE hash(_r) % {k} = 0")
-            profile_src = psub
-
-        # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
-        # honored here — the staged relation is read through a wrapper SELECT *, and with
-        # preserve_insertion_order=false DuckDB may reorder any result lacking a top-level ORDER BY.
-        # A top-level ORDER BY on this read IS honored, so long RLE runs / dictionary locality (the
-        # point of the Parquet tuning) are deterministic regardless of the global flag.
-        # sort_by='auto' resolves here to concrete columns (or None); rewrite cfg so every
-        # downstream cfg.get('sort_by') reader (the merge branch) sees the resolved value too.
-        #
-        # Resolved HERE, after `exists` and the tombstone adjustment, rather than at the top of
-        # store(): `_sort_by_is_inert` needs the branch this write will actually take, because
-        # resolving 'auto' means PROFILING the staged relation and three branches then throw the
-        # answer away (see that method). A project-wide `+sort_by: auto` used to pay that profile on
-        # every incremental run of every merge model.
-        sort_by = self._resolve_sort_by(
-            cur, profile_src, cfg.get("sort_by"), partition_by, profile=_profile_sort,
-            display_name=model_name, full_rows=full_rows)
-        cfg["sort_by"] = sort_by
-        # Wide-DECIMAL narrowing, the dbt spelling of session._narrow_wide_decimals: a
-        # DECIMAL(p>18) maps to a 16-byte FLBA that arrow-rs never dictionary-encodes, so a
-        # SORTED BY AUTO write narrows it back to INT64 territory when the exact column max fits.
-        # Overwrite branch ONLY — an append/merge increment must keep the existing table's schema —
-        # and only on the profiled path.
-        select_body = f"SELECT * FROM {name}"
-        if _profile_sort and (not incremental or full_refresh or not exists):
-            select_body = self._narrow_wide_decimals_select(cur, name)
-        if sort_by:
-            cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
-            order = ", ".join(engine.quote_ident(c) for c in cols)
-            data = cur.sql(f"{select_body} ORDER BY {order}")
-        else:
-            data = cur.sql(select_body)
-
-        # Contract NOT NULL enforcement (config(contract={enforced:true}) with a not_null column
-        # constraint). duckrun writes via delta_rs, not SQL DDL, so dbt-core's column-constraint
-        # DDL never runs. Guard the staged rows BEFORE any write: a null in a not-null column
-        # raises, and because nothing has been written yet the prior Delta version is untouched
-        # (the rollback the constraint tests assert). Message carries "NOT NULL constraint failed"
-        # to match dbt's standard contract-error phrasing.
-        if not_null_columns:
-            self._assert_not_null(cur, name, not_null_columns)
-
-        # try/finally: src_tmp may now be created for the auto-sort profile on branches that
-        # return early (overwrite, append, microbatch, delete+insert), so the one release point
-        # has to cover every exit. The two eager drops inside stay — they free a full copy of the
-        # model result before post-write maintenance runs, and DROP ... IF EXISTS is idempotent.
+        # try/finally from HERE, above the staging temp tables (src_tmp / psub): the one finally at
+        # the bottom releases them on EVERY exit — including a raise from the sort-key profile, the
+        # decimal narrowing, the ORDER BY bind or the NOT NULL guard, which all sit between the
+        # CREATE TEMP TABLE and the write. They used to be created above the try, so a contract
+        # violation leaked a full copy of the model result for the rest of the run.
         try:
-                # Microbatch is delete+insert per event_time window, not a key-based upsert, so it
-                # bypasses the generic overwrite/merge dispatch below (which would clobber every batch
-                # under --full-refresh, since dbt marks each microbatch batch full_refresh in that case).
-                if incremental and strategy == "microbatch":
-                    self._store_microbatch(
-                        path, cur, name, cfg, storage_options, exists, full_refresh,
-                        read_version=cfg.get("read_version"),
-                        row_group_rows=row_group_rows, target_file_size=target_file_size,
-                        timestamp_ntz=timestamp_ntz, existing_dt=dt0,
-                    )
-                    return
+            if _merge_path and (cfg.get("merge_materialize_source") or not_null_columns):
+                src_tmp = '"' + engine.tmp_name("msrc", path) + '"'
+                cur.execute(f"CREATE OR REPLACE TEMP TABLE {src_tmp} AS SELECT * FROM {name}")
+                name = src_tmp          # guards and write all read the one materialization
 
-                # Table-like (non-incremental) models always overwrite. Incremental models
-                # overwrite on first run / full-refresh, then apply the incremental strategy.
-                if not incremental or full_refresh or not exists:
-                    self._store_overwrite(path, cur, data, partition_by, merge_schema, exists,
-                                          storage_options,
-                                          row_group_rows=row_group_rows,
-                                          target_file_size=target_file_size,
-                                          timestamp_ntz=timestamp_ntz, existing_dt=dt0)
-                    return
+            # sort_by='auto' profiling SUBSTRATE (sortkey v6). The staged relation is a VIEW over the
+            # model SQL, so every scan re-runs it — and the profiler scans its source several times.
+            # Copying ALL rows first (0.4.54's msrc) was the defect at scale: materializing 591.7M rows
+            # cost ~5 min and every profile pass re-read a 38 GB spill (~49 min of a 72-min build). Now:
+            #   - exact COUNT(*) off the view first (footer metadata for scan models — near-free);
+            #   - at/below sortkey.SUBSTRATE_CAP: a FULL local copy — it doubles as the staging table
+            #     (guards + write read it; one model evaluation), byte-identical to the old behavior;
+            #   - above the cap: a deterministic hash(row) % K subset (~cap rows) for the profile ONLY,
+            #     and the write reads the VIEW directly (re-evaluating a bare scan is far cheaper than
+            #     copying the world; a nondeterministic model at worst gets a marginally stale key).
+            profile_src, full_rows = name, None
+            if _profile_sort:
+                full_rows = int(cur.sql(f"SELECT count(*) FROM {name}").fetchone()[0] or 0)
+                k = sortkey.substrate_modulus(full_rows)
+                psub = '"' + engine.tmp_name("psub", path) + '"'
+                if k == 1:
+                    cur.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS SELECT * FROM {name}")
+                    name = psub         # the full copy IS the staging table
+                    full_rows = None    # profile covers every row — exact semantics, v5-identical
+                else:
+                    cur.execute(f"CREATE OR REPLACE TEMP TABLE {psub} AS "
+                                f"SELECT * FROM {name} _r WHERE hash(_r) % {k} = 0")
+                profile_src = psub
 
-                # Resolve the incremental strategy: default to merge when a unique_key is given, else append.
-                strategy = strategy or ("merge" if unique_key else "append")
+            # sort_by makes the write order EXPLICIT. A trailing ORDER BY inside the model SQL is not
+            # honored here — the staged relation is read through a wrapper SELECT *, and with
+            # preserve_insertion_order=false DuckDB may reorder any result lacking a top-level ORDER BY.
+            # A top-level ORDER BY on this read IS honored, so long RLE runs / dictionary locality (the
+            # point of the Parquet tuning) are deterministic regardless of the global flag.
+            # sort_by='auto' resolves here to concrete columns (or None); rewrite cfg so every
+            # downstream cfg.get('sort_by') reader (the merge branch) sees the resolved value too.
+            #
+            # Resolved HERE, after `exists` and the tombstone adjustment, rather than at the top of
+            # store(): `_sort_by_is_inert` needs the branch this write will actually take, because
+            # resolving 'auto' means PROFILING the staged relation and three branches then throw the
+            # answer away (see that method). A project-wide `+sort_by: auto` used to pay that profile on
+            # every incremental run of every merge model.
+            sort_by = self._resolve_sort_by(
+                cur, profile_src, cfg.get("sort_by"), partition_by, profile=_profile_sort,
+                display_name=model_name, full_rows=full_rows)
+            cfg["sort_by"] = sort_by
+            # Wide-DECIMAL narrowing, the dbt spelling of session._narrow_wide_decimals: a
+            # DECIMAL(p>18) maps to a 16-byte FLBA that arrow-rs never dictionary-encodes, so a
+            # SORTED BY AUTO write narrows it back to INT64 territory when the exact column max fits.
+            # Overwrite branch ONLY — an append/merge increment must keep the existing table's schema —
+            # and only on the profiled path.
+            select_body = f"SELECT * FROM {name}"
+            if _profile_sort and (not incremental or full_refresh or not exists):
+                select_body = self._narrow_wide_decimals_select(cur, name)
+            if sort_by:
+                cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
+                order = ", ".join(engine.quote_ident(c) for c in cols)
+                data = cur.sql(f"{select_body} ORDER BY {order}")
+            else:
+                data = cur.sql(select_body)
 
-                # delete+insert: delete the target rows whose unique_key appears in the incoming batch, then
-                # insert EVERY incoming row (duplicates preserved) — computed in DuckDB and written as a
-                # fenced full-table overwrite (overwrite_if_unchanged, CAS to vB). NOT an alias for merge:
-                # merge UPDATEs matched rows and REJECTS a duplicate-key source (duckrun fails loud, like
-                # Spark/Snowflake/BigQuery), whereas delete+insert replaces whole rows and tolerates duplicate
-                # keys — matching dbt-duckdb's delete+insert exactly.
-                if strategy in ("delete+insert", "delete_insert"):
-                    if not unique_key:
-                        raise ValueError("incremental_strategy='delete+insert' requires a unique_key.")
-                    self._store_delete_insert(
-                        path, cur, name, unique_key, storage_options,
-                        read_version=cfg.get("read_version"), partition_by=partition_by,
-                        incremental_predicates=cfg.get("incremental_predicates"),
-                        row_group_rows=row_group_rows, target_file_size=target_file_size,
-                        timestamp_ntz=timestamp_ntz, existing_dt=dt0,
-                    )
-                    return
+            # Contract NOT NULL enforcement (config(contract={enforced:true}) with a not_null column
+            # constraint). duckrun writes via delta_rs, not SQL DDL, so dbt-core's column-constraint
+            # DDL never runs. Guard the staged rows BEFORE any write: a null in a not-null column
+            # raises, and because nothing has been written yet the prior Delta version is untouched
+            # (the rollback the constraint tests assert). Message carries "NOT NULL constraint failed"
+            # to match dbt's standard contract-error phrasing.
+            if not_null_columns:
+                self._assert_not_null(cur, name, not_null_columns)
 
-                # insert (insert-only) is the one incremental shape that never removes a row, so it is a
-                # PURE APPEND — computed as a DuckDB anti-join and committed with `add` actions only, no
-                # target file rewritten. delta_rs's merge produces the same table at a cost that scales with
-                # the target's partition span instead of the batch. The advanced clause surface
-                # (merge_clauses / merge_update_set_expressions) takes the _store_merge branch below instead,
-                # but lands at the SAME engine seam — so a clause list that IS insert-only (dbt-duckdb's
-                # `merge_clauses: {when_matched: [{action: do_nothing}]}`) gets the anti-join too. The
-                # documented way back to delta_rs, for either spelling, is `merge_streamed_exec: true`.
-                if (strategy == "insert"
-                        and self._custom_merge_clauses(cfg, data.columns, unique_key) is None):
-                    self._validate_merge_config(cfg)
-                    if not unique_key:
-                        raise ValueError("incremental_strategy='insert' requires a unique_key.")
-                    evolve_schema, _ = self._resolve_schema_change(
-                        (cfg.get("on_schema_change") or "ignore").lower(), path, data, storage_options
-                    )
-                    # No per-model memory tuning: the session pin covers every path, and the anti-join
-                    # runs at DuckDB's full pinned limit. The merge overrides are forwarded so the
-                    # `merge_streamed_exec: true` escape hatch (and the spill caps, should the engine
-                    # fall through to a real delta_rs merge) work on this spelling too.
-                    with engine.mem_profile("insert", con=cur):
-                        self._store_insert(
-                            path, cur, name, data, unique_key, storage_options,
-                            read_version=cfg.get("read_version"),
-                            partition_by=partition_by,
-                            merge_schema=evolve_schema,
-                            incremental_predicates=cfg.get("incremental_predicates"),
-                            insert_condition=cfg.get("merge_insert_condition"),
-                            sort_by=sort_by,
-                            max_spill_size=cfg.get("merge_max_spill_size"),
-                            max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
-                            streamed_exec=bool(cfg.get("merge_streamed_exec")),
-                            row_group_rows=row_group_rows, target_file_size=target_file_size,
-                            timestamp_ntz=timestamp_ntz, existing_dt=dt0,
-                        )
-                    if src_tmp is not None:
-                        cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")
-                    return
+            # The finally at the bottom is the ONE release point for src_tmp / psub (branches below
+            # return early: overwrite, append, microbatch, delete+insert). The two eager drops inside
+            # stay — they free a full copy of the model result before post-write maintenance runs,
+            # and DROP ... IF EXISTS is idempotent.
+            # Microbatch is delete+insert per event_time window, not a key-based upsert, so it
+            # bypasses the generic overwrite/merge dispatch below (which would clobber every batch
+            # under --full-refresh, since dbt marks each microbatch batch full_refresh in that case).
+            if incremental and strategy == "microbatch":
+                self._store_microbatch(
+                    path, cur, name, cfg, storage_options, exists, full_refresh,
+                    read_version=cfg.get("read_version"),
+                    row_group_rows=row_group_rows, target_file_size=target_file_size,
+                    timestamp_ntz=timestamp_ntz, existing_dt=dt0,
+                )
+                return
 
-                if strategy in ("merge", "insert"):
-                    self._store_merge(path, cur, data, cfg, unique_key, strategy, storage_options,
-                                      src_tmp, row_group_rows=row_group_rows,
+            # Table-like (non-incremental) models always overwrite. Incremental models
+            # overwrite on first run / full-refresh, then apply the incremental strategy.
+            if not incremental or full_refresh or not exists:
+                self._store_overwrite(path, cur, data, partition_by, merge_schema, exists,
+                                      storage_options,
+                                      row_group_rows=row_group_rows,
                                       target_file_size=target_file_size,
                                       timestamp_ntz=timestamp_ntz, existing_dt=dt0)
-                elif strategy == "append":
-                    self._store_append(path, cur, data, cfg, partition_by, merge_schema, storage_options,
-                                       row_group_rows=row_group_rows, target_file_size=target_file_size,
-                                       timestamp_ntz=timestamp_ntz, existing_dt=dt0)
-                else:
-                    raise ValueError(
-                        f"Unknown incremental_strategy '{strategy}'. "
-                        "Use 'merge', 'insert', 'delete+insert', 'append', or 'microbatch'."
+                return
+
+            # Resolve the incremental strategy: default to merge when a unique_key is given, else append.
+            strategy = strategy or ("merge" if unique_key else "append")
+
+            # delete+insert: delete the target rows whose unique_key appears in the incoming batch, then
+            # insert EVERY incoming row (duplicates preserved) — computed in DuckDB and written as a
+            # fenced full-table overwrite (overwrite_if_unchanged, CAS to vB). NOT an alias for merge:
+            # merge UPDATEs matched rows and REJECTS a duplicate-key source (duckrun fails loud, like
+            # Spark/Snowflake/BigQuery), whereas delete+insert replaces whole rows and tolerates duplicate
+            # keys — matching dbt-duckdb's delete+insert exactly.
+            if strategy in ("delete+insert", "delete_insert"):
+                if not unique_key:
+                    raise ValueError("incremental_strategy='delete+insert' requires a unique_key.")
+                self._store_delete_insert(
+                    path, cur, name, unique_key, storage_options,
+                    read_version=cfg.get("read_version"), partition_by=partition_by,
+                    incremental_predicates=cfg.get("incremental_predicates"),
+                    row_group_rows=row_group_rows, target_file_size=target_file_size,
+                    timestamp_ntz=timestamp_ntz, existing_dt=dt0,
+                )
+                return
+
+            # insert (insert-only) is the one incremental shape that never removes a row, so it is a
+            # PURE APPEND — computed as a DuckDB anti-join and committed with `add` actions only, no
+            # target file rewritten. delta_rs's merge produces the same table at a cost that scales with
+            # the target's partition span instead of the batch. The advanced clause surface
+            # (merge_clauses / merge_update_set_expressions) takes the _store_merge branch below instead,
+            # but lands at the SAME engine seam — so a clause list that IS insert-only (dbt-duckdb's
+            # `merge_clauses: {when_matched: [{action: do_nothing}]}`) gets the anti-join too. The
+            # documented way back to delta_rs, for either spelling, is `merge_streamed_exec: true`.
+            if (strategy == "insert"
+                    and self._custom_merge_clauses(cfg, data.columns, unique_key) is None):
+                self._validate_merge_config(cfg)
+                if not unique_key:
+                    raise ValueError("incremental_strategy='insert' requires a unique_key.")
+                evolve_schema, _ = self._resolve_schema_change(
+                    (cfg.get("on_schema_change") or "ignore").lower(), path, data, storage_options
+                )
+                # No per-model memory tuning: the session pin covers every path, and the anti-join
+                # runs at DuckDB's full pinned limit. The merge overrides are forwarded so the
+                # `merge_streamed_exec: true` escape hatch (and the spill caps, should the engine
+                # fall through to a real delta_rs merge) work on this spelling too.
+                with engine.mem_profile("insert", con=cur):
+                    self._store_insert(
+                        path, cur, name, data, unique_key, storage_options,
+                        read_version=cfg.get("read_version"),
+                        partition_by=partition_by,
+                        merge_schema=evolve_schema,
+                        incremental_predicates=cfg.get("incremental_predicates"),
+                        insert_condition=cfg.get("merge_insert_condition"),
+                        sort_by=sort_by,
+                        max_spill_size=cfg.get("merge_max_spill_size"),
+                        max_temp_directory_size=cfg.get("merge_max_temp_directory_size"),
+                        streamed_exec=bool(cfg.get("merge_streamed_exec")),
+                        row_group_rows=row_group_rows, target_file_size=target_file_size,
+                        timestamp_ntz=timestamp_ntz, existing_dt=dt0,
                     )
+                if src_tmp is not None:
+                    cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")
+                return
+
+            if strategy in ("merge", "insert"):
+                self._store_merge(path, cur, data, cfg, unique_key, strategy, storage_options,
+                                  src_tmp, row_group_rows=row_group_rows,
+                                  target_file_size=target_file_size,
+                                  timestamp_ntz=timestamp_ntz, existing_dt=dt0)
+            elif strategy == "append":
+                self._store_append(path, cur, data, cfg, partition_by, merge_schema, storage_options,
+                                   row_group_rows=row_group_rows, target_file_size=target_file_size,
+                                   timestamp_ntz=timestamp_ntz, existing_dt=dt0)
+            else:
+                raise ValueError(
+                    f"Unknown incremental_strategy '{strategy}'. "
+                    "Use 'merge', 'insert', 'delete+insert', 'append', or 'microbatch'."
+                )
         finally:
             if src_tmp is not None:
                 cur.execute(f"DROP TABLE IF EXISTS {src_tmp}")
@@ -803,9 +808,16 @@ class Plugin(BasePlugin):
 
         partition_by = cfg.get("partition_by")
         if not exists or (full_refresh and first_batch):
+            # Same schema handling as _store_overwrite: a --full-refresh REPLACING an existing table
+            # lets delta_rs replace the schema wholesale (a retyped column, the #42 NTZ->UTC retype),
+            # exactly like CREATE OR REPLACE TABLE. Without it this first-batch overwrite was a
+            # strict one — the only rebuild path that couldn't change a column's type.
+            merge_schema = bool(cfg.get("merge_schema"))
             engine.write_delta(
                 path, window, "overwrite",
                 partition_by=partition_by,
+                merge_schema=merge_schema,
+                overwrite_schema=exists and not merge_schema,
                 storage_options=storage_options,
                 cur=cur,
                 row_group_rows=row_group_rows,
@@ -1125,6 +1137,14 @@ class Plugin(BasePlugin):
                 if not is_mapping(val):
                     errors.append(f"{name} must be a dictionary, found: {val}")
 
+        # dbt-core's get_merge_update_columns raises on this pair; duckrun used to take
+        # merge_update_columns and silently drop merge_exclude_columns. Same wording as upstream.
+        if cfg.get("merge_update_columns") and cfg.get("merge_exclude_columns"):
+            errors.append(
+                "Model cannot specify merge_update_columns and merge_exclude_columns. "
+                "Please update model to use only one config"
+            )
+
         merge_clauses = cfg.get("merge_clauses")
         if merge_clauses is not None:
             if not is_mapping(merge_clauses):
@@ -1265,7 +1285,9 @@ class Plugin(BasePlugin):
     @staticmethod
     def _key_set(unique_key):
         keys = unique_key if isinstance(unique_key, (list, tuple)) else [unique_key]
-        return {str(k).lower() for k in keys}
+        # Same normalization as _store_delete_insert / _store_insert: a YAML `unique_key: '"id"'`
+        # must still be recognized as the join key (and excluded from the update set).
+        return {str(k).strip().strip('"').lower() for k in keys}
 
     @classmethod
     def _explicit_cols(cls, spec, allcols, keys) -> list:
@@ -1308,9 +1330,12 @@ class Plugin(BasePlugin):
         """The ``{col: expr}`` map for an explicit-mode matched UPDATE: the columns named by
         ``include``/``exclude`` copied from source, with ``set_expressions`` overriding — the same
         shape ``merge_update_set_expressions`` produces (dbt-duckdb ``merge.sql`` explicit mode)."""
-        updates = {col: f"source.{col}" for col in cls._explicit_cols(spec, allcols, keys)}
+        # Keys and source refs quoted (engine.quote_ident, idempotent): datafusion parses an
+        # unquoted name, so a column with a space / reserved word fails to bind unquoted.
+        q = engine.quote_ident
+        updates = {q(col): f"source.{q(col)}" for col in cls._explicit_cols(spec, allcols, keys)}
         for col, expr in ((spec if isinstance(spec, dict) else {}).get("set_expressions") or {}).items():
-            updates[str(col)] = cls._rewrite_merge_aliases(expr)
+            updates[q(col)] = cls._rewrite_merge_aliases(expr)
         return updates
 
     @classmethod
@@ -1330,8 +1355,9 @@ class Plugin(BasePlugin):
                     f"merge_clauses insert lists {len(cols)} column(s) but {len(vals)} value(s); "
                     "they must pair up one-to-one."
                 )
-            return {str(c).strip(): cls._rewrite_merge_aliases(v) for c, v in zip(cols, vals)}
-        return {col: f"source.{col}" for col in cls._explicit_cols(spec, allcols, keys)}
+            return {engine.quote_ident(c): cls._rewrite_merge_aliases(v) for c, v in zip(cols, vals)}
+        q = engine.quote_ident
+        return {q(col): f"source.{q(col)}" for col in cls._explicit_cols(spec, allcols, keys)}
 
     @classmethod
     def _by_source_spec(cls, c: dict, cond, allcols, keys) -> dict:
@@ -1401,9 +1427,10 @@ class Plugin(BasePlugin):
             base = [c for c in allcols if c.lower() not in ex and c.lower() not in keys]
         else:
             base = [c for c in allcols if c.lower() not in keys]
-        updates = {c: f"source.{c}" for c in base}
+        q = engine.quote_ident  # quoted keys/refs: a space / reserved-word column binds only quoted
+        updates = {q(c): f"source.{q(c)}" for c in base}
         for col, expr in cfg["merge_update_set_expressions"].items():
-            updates[col] = cls._rewrite_merge_aliases(expr)
+            updates[q(col)] = cls._rewrite_merge_aliases(expr)
         return [
             {"clause": "matched", "action": "update", "updates": updates,
              "predicate": cls._rewrite_merge_aliases(cfg.get("merge_update_condition"))},

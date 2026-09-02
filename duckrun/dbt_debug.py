@@ -54,6 +54,8 @@ import os
 import time
 from pathlib import Path
 
+from dbt.adapters.duckrun.engine import quote_ident
+
 __all__ = ["dbt_project", "DbtProject", "CompileResult", "DbtProjectError"]
 
 # Suffixes whose edit invalidates a parsed manifest: models and macros (.sql), schema/config/profile
@@ -733,8 +735,9 @@ class DbtProject:
         if schema:
             # A custom-schema model has no schema in a fresh in-memory DuckDB (same reason the
             # adapter's Delta bind creates one).
-            prefix = f'"{database}".' if database else ""
-            self._cursor.execute(f'create schema if not exists {prefix}"{schema}"')
+            # quote_ident doubles an embedded `"` — node.schema/database are raw manifest strings.
+            prefix = f"{quote_ident(database)}." if database else ""
+            self._cursor.execute(f"create schema if not exists {prefix}{quote_ident(schema)}")
         # Through the debug cursor, not the raw one: `create or replace view` classifies as
         # passthrough, and going this way means a Delta-backed parent still gets its lazy bind.
         self._cursor.execute(f"create or replace view {relation} as {sql}")

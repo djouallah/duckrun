@@ -71,6 +71,15 @@ def _no_sleep(monkeypatch):
     monkeypatch.setattr(fr, "_sleep", lambda *a, **k: None)
 
 
+def test_create_lro_without_location_is_a_remote_run_error():
+    """A 202 with no Location header used to reach `_http_request("GET", None)` and surface as a
+    bare requests MissingSchema; the sibling pollers already raise RemoteRunError — so does this."""
+    class NoLocation:
+        headers = {}
+    with pytest.raises(fr.RemoteRunError, match="no Location"):
+        fr._await_lro_item_id("tok", NoLocation())
+
+
 def _stub_result(monkeypatch, results):
     monkeypatch.setattr(fr, "_dfs_get", lambda url, tok: json.dumps(
         {"runid": "r", "results": results, "log": "10:00 Done. PASS=1"}))

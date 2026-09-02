@@ -1339,6 +1339,18 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
     layout, silently undoing the config the write just honored. ``None`` = the defaults, unchanged."""
     if cur is None:
         return
+    # NEVER fatal means EVERY exception, not just the lost-race CommitFailedError the policy
+    # swallows: the table open, the debt scan, compact, vacuum and cleanup_metadata all run after
+    # the data commit, and a transient store fault there (a 503, a token that expired mid-run, a
+    # DeltaError) used to propagate and report the model FAILED although its rows had landed — and
+    # for an append model the retry then appends the same rows again. Warn and move on.
+    try:
+        _maintain_inner(cur, path, storage_options, target_file_size, row_group_cap)
+    except Exception as e:
+        logger.warning(f"post-write maintenance skipped (data commit already succeeded): {e}")
+
+
+def _maintain_inner(cur, path, storage_options, target_file_size, row_group_cap) -> None:
     dt = _delta_table(path, storage_options)
     debt = compaction_debt(cur, path, dt=dt, storage_options=storage_options)
     _target = target_file_size if target_file_size is not None else _TARGET_FILE_SIZE
@@ -1461,12 +1473,17 @@ def write_delta(
                       record_read_version=True)
 
     if mode == "overwrite":
-        dt = _delta_table(path, storage_options)
-        # A fresh table (this overwrite created v0) has no prior versions — nothing for vacuum or
-        # cleanup_metadata to reclaim, so skip both store-listing operations on a brand-new create.
-        if dt.version() > 0:
-            dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
-            dt.cleanup_metadata()
+        # Post-commit housekeeping, never fatal (same contract as _maintain): the overwrite has
+        # already landed, so a store fault while reclaiming old versions must not report it failed.
+        try:
+            dt = _delta_table(path, storage_options)
+            # A fresh table (this overwrite created v0) has no prior versions — nothing for vacuum or
+            # cleanup_metadata to reclaim, so skip both store-listing operations on a brand-new create.
+            if dt.version() > 0:
+                dt.vacuum(dry_run=False)  # safe default 168h retention (no concurrent reader broken)
+                dt.cleanup_metadata()
+        except Exception as e:
+            logger.warning(f"post-overwrite vacuum/cleanup skipped (data commit already succeeded): {e}")
     else:  # append
         _maintain(cur, path, storage_options=storage_options,
                   target_file_size=target_file_size, row_group_cap=row_group_rows)
@@ -1944,8 +1961,12 @@ def merge_delta(
                         "predicate": insert_condition})
     else:
         if update_columns:
+            # Quoted like merge_on_predicate's keys: datafusion parses an unquoted name, so a
+            # column with a space / reserved word ("Total Amount") fails with "No field named
+            # source.Total" — quoted, it binds. quote_ident is idempotent on already-quoted names.
             clauses.append({"clause": "matched", "action": "update",
-                            "updates": {c: f"source.{c}" for c in update_columns},
+                            "updates": {quote_ident(c): f"source.{quote_ident(c)}"
+                                        for c in update_columns},
                             "predicate": update_condition})
         elif exclude_columns:
             clauses.append({"clause": "matched", "action": "update_all",

@@ -213,6 +213,10 @@
   {%- if _sort_by is not none and _sort_by is not string and _sort_by | length == 0 -%}
     {% do exceptions.raise_compiler_error("sorted_by/sort_by must contain at least one column") %}
   {%- endif -%}
+  {#-- on_schema_change goes through dbt-core's own validator: an unknown value (a typo) logs
+       and falls back to 'ignore', exactly as upstream — the plugin used to treat any
+       unrecognized spelling as "evolve the schema". (A Jinja comment cannot sit inside the
+       set tag below, hence here.) --#}
   {%- set delta_config = {
       'incremental': is_incremental,
       'incremental_strategy': config.get('incremental_strategy'),
@@ -242,7 +246,7 @@
       'merge_streamed_exec': config.get('merge_streamed_exec'),
       'merge_materialize_source': config.get('merge_materialize_source'),
       'incremental_predicates': config.get('incremental_predicates') or config.get('predicates'),
-      'on_schema_change': config.get('on_schema_change', 'ignore'),
+      'on_schema_change': incremental_validate_on_schema_change(config.get('on_schema_change'), default='ignore'),
       'event_time': config.get('event_time'),
       'batch_start': _batch_start,
       'batch_end': _batch_end,

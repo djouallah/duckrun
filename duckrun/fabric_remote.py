@@ -907,6 +907,8 @@ def _await_lro_result(token: str, resp) -> dict:
 def _await_lro_item_id(token: str, resp) -> str:
     """Poll a create long-running-operation to completion and return the created item id."""
     location = resp.headers.get("Location")
+    if not location:  # same guard as _await_lro_result: a bare GET None is a MissingSchema, not a RemoteRunError
+        raise RemoteRunError("create operation returned no Location to poll")
     deadline_polls = _POLL_TIMEOUT // max(_POLL_INTERVAL, 1)
     for _ in range(int(deadline_polls) + 1):
         _sleep(_POLL_INTERVAL)

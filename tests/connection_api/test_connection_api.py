@@ -104,6 +104,20 @@ class TestSession:
     def test_show_tables(self, conn):
         assert "src" in {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
 
+    def test_temp_table_is_not_shadowed_by_same_named_delta_table(self, conn):
+        # DuckDB resolves a bare name to the TEMP table first; the router must too. It used to
+        # decide Delta-vs-native on "does <root>/dbo/stg exist" alone, so this INSERT appended to
+        # the production Delta table (and DROP tombstoned it) while every read hit the temp.
+        conn.sql("CREATE OR REPLACE TABLE stg AS select 1 as id")           # Delta dbo.stg
+        v0 = deltalake.DeltaTable(conn._table_path("dbo", "stg")).version()
+        conn.sql("CREATE TEMP TABLE stg AS select 99 as id")
+        conn.sql("INSERT INTO stg VALUES (100)")                            # -> the temp, not Delta
+        assert deltalake.DeltaTable(conn._table_path("dbo", "stg")).version() == v0
+        assert {r[0] for r in conn.sql("select id from stg").fetchall()} == {99, 100}
+        conn.sql("DROP TABLE stg")                                          # drops the temp only
+        assert conn.sql("select id from stg").fetchone()[0] == 1            # Delta still there
+        assert deltalake.DeltaTable(conn._table_path("dbo", "stg")).version() == v0
+
     def test_copy(self, conn, tmp_path):
         # upload preserves the tree and honours the extension filter (streamed via obstore).
         src = tmp_path / "src"

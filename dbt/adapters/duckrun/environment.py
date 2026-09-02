@@ -229,6 +229,18 @@ class DuckrunCursorWrapper(_DeltaBindCursor):
         # per token lifetime, not per statement.
         self._refresh_onelake_token(creds)
         if bindings is None:
+            # A multi-statement script (`delete …; insert …` — Elementary's upsert, a hook batch) is
+            # split HERE and each statement re-enters execute() on its own: the catalog route below
+            # is per-statement (a script naming catA then catB used to send both to catA — the
+            # catalog is resolved from the first statement only), and a passthrough statement gets
+            # the same lazy Delta bind a lone statement would (the router used to run those on the
+            # raw cursor, so a `create view … as select … from mart.t` mid-script failed with a
+            # bare CatalogException under run-operation).
+            stmts = delta_dml.split_statements(sql)
+            if len(stmts) > 1:
+                for stmt in stmts:
+                    self.execute(stmt)
+                return self._cursor
             # Route raw DML to the catalog its target names (a 3-part `catalog.schema.table`), else
             # the default catalog. `root_for` falls back to the default when there are no catalogs,
             # so single-catalog behavior is unchanged.

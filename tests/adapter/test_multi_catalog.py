@@ -70,6 +70,31 @@ def test_plugin_config_carries_catalogs():
 
 # --------------------------------------------------------------- DML catalog routing
 
+def test_multi_statement_script_routes_each_statement_to_its_own_catalog(tmp_path):
+    """The dbt cursor resolved the catalog ONCE per execute() from the first statement, so a script
+    naming catA then catB sent both writes to catA's root. Each statement now re-enters execute()
+    on its own and lands under its own lakehouse."""
+    import pyarrow as pa
+    from deltalake import DeltaTable, write_deltalake
+    from dbt.adapters.duckrun.environment import DuckrunCursorWrapper
+
+    silver, bronze = tmp_path / "silver", tmp_path / "bronze"
+    for root in (silver, bronze):
+        write_deltalake(str(root / "main" / "t"), pa.table({"id": pa.array([0], pa.int64())}))
+    creds = DuckrunCredentials(
+        database="silver", path=":memory:", root_path=str(silver), storage_options={},
+        catalogs={"lh_bronze": {"root_path": str(bronze), "storage_options": {}}})
+    con = duckdb.connect()
+    con.execute("attach ':memory:' as silver; attach ':memory:' as lh_bronze")
+    cur = DuckrunCursorWrapper(con.cursor(), creds)
+    cur.execute("insert into silver.main.t select 1 as id; insert into lh_bronze.main.t select 2 as id")
+
+    def ids(root):
+        return sorted(DeltaTable(str(root / "main" / "t")).to_pyarrow_table().column("id").to_pylist())
+    assert ids(silver) == [0, 1]
+    assert ids(bronze) == [0, 2]   # used to be [0] — the second INSERT landed in silver
+
+
 @pytest.mark.parametrize("sql,expected", [
     ("insert into lh_bronze.main.t select 1", "lh_bronze"),   # 3-part -> catalog
     ("delete from lh_bronze.main.t where id=1", "lh_bronze"),

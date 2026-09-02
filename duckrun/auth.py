@@ -84,7 +84,10 @@ def _cached_token(scope: str, acquire):
         token = acquire()
         if token:
             _TOKEN_CACHE[key] = token
-        return token
+        # A failed re-acquire (a blip on the CLI/OIDC endpoint) must not throw away a token that is
+        # merely INSIDE the refresh margin — it is still valid for up to margin_seconds, and the
+        # caller would otherwise raise "could not acquire" while holding a working token.
+        return token or cached
 
 
 def _fabric_token() -> Optional[str]:
@@ -119,16 +122,23 @@ def _azure_identity_token(scope: str = _STORAGE_SCOPE, interactive: bool = True)
     except ImportError:
         return None
     credentials = [AzureCliCredential]
-    if interactive and sys.stdin.isatty():
+    # sys.stdin is None under pythonw / some service hosts — no TTY there either.
+    if interactive and sys.stdin is not None and sys.stdin.isatty():
         try:
             from azure.identity import InteractiveBrowserCredential
             credentials.append(InteractiveBrowserCredential)
         except ImportError:
             pass
+    debug = bool(os.environ.get("DUCKRUN_AUTH_DEBUG"))
     for credential in credentials:
         try:
             return credential().get_token(scope).token
-        except Exception:
+        except Exception as e:
+            # Each credential's failure is swallowed so the chain can continue; the final "run az
+            # login" error then hides the real cause (expired CLI session, wrong tenant). Surface it
+            # under the same debug switch secret.refreshed() honors.
+            if debug:
+                print(f"[duckrun-auth] {credential.__name__} failed for {scope}: {e!r}", flush=True)
             continue
     return None
 
@@ -271,6 +281,7 @@ def get_powerbi_token() -> str:
 
 
 _EXPIRY_CACHE: Dict[str, Optional[float]] = {}
+_MISS = object()  # sentinel: a cached None (non-JWT) must read as a hit, not a miss
 
 
 def _token_expiry_epoch(token: str) -> Optional[float]:
@@ -278,8 +289,12 @@ def _token_expiry_epoch(token: str) -> Optional[float]:
     No signature check — we only read the expiry to know when to refresh. Memoized per token
     string: the freshness guard decodes on EVERY statement per catalog, and a token's ``exp``
     is immutable; the cache is cleared on insert so it never holds more than the live tokens."""
-    if token in _EXPIRY_CACHE:
-        return _EXPIRY_CACHE[token]
+    # One atomic .get, not `in` then `[]`: the read is deliberately lock-free (it runs on every
+    # statement from every dbt thread) while the clear() below runs under the lock — two separate
+    # ops here could see the key vanish between them and raise KeyError mid-run.
+    hit = _EXPIRY_CACHE.get(token, _MISS)
+    if hit is not _MISS:
+        return hit
     try:
         seg = token.split(".")[1]
         seg += "=" * (-len(seg) % 4)  # restore base64url padding
@@ -315,12 +330,22 @@ def refresh_storage_token() -> Optional[str]:
     source is available (then the caller keeps the token it has).
 
     Non-interactive only: ``_azure_identity_token(interactive=False)`` so a mid-run refresh (called
-    from the per-statement cursor guard) can never pop a browser and hang a headless build."""
-    token = _fabric_token() or _github_oidc_token() or _azure_identity_token(interactive=False)
-    if token:
-        # Keep the per-scope cache in sync: the next get_onelake_token() then reuses this fresh
-        # token instead of finding the near-expiry one and re-acquiring on its own — two callers,
-        # one notion of "current token".
-        with _CACHE_LOCK:
-            _TOKEN_CACHE[_cache_key(_STORAGE_SCOPE)] = token
-    return token
+    from the per-statement cursor guard) can never pop a browser and hang a headless build.
+
+    Serialized on the cache lock, and the cache is consulted FIRST: at the ~1h mark every dbt
+    thread's cursor guard sees the same token expiring at once, and without this each would mint
+    its own — the OIDC/token-endpoint stampede the cache exists to prevent (rate-limited mints
+    return None, the caller keeps the stale token, the next write 401s). Under the lock the first
+    thread mints and stores; the rest find the fresh token and return it without a network call."""
+    key = _cache_key(_STORAGE_SCOPE)
+    with _CACHE_LOCK:
+        cached = _TOKEN_CACHE.get(key)
+        if cached and not token_is_expiring(cached):
+            return cached  # another thread already refreshed while this one waited for the lock
+        token = _fabric_token() or _github_oidc_token() or _azure_identity_token(interactive=False)
+        if token:
+            # Keep the per-scope cache in sync: the next get_onelake_token() then reuses this fresh
+            # token instead of finding the near-expiry one and re-acquiring on its own — two
+            # callers, one notion of "current token".
+            _TOKEN_CACHE[key] = token
+        return token
