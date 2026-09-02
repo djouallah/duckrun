@@ -14,7 +14,7 @@
 | `DuckSession` | `attach` | `path, name=None, storage_options=None, schema=None, read_only=None, format='delta'` |
 | `DuckSession` | `close` | *(none)* |
 | `DuckSession` | `convert_to_delta` | `identifier, partition_schema=None` |
-| `DuckSession` | `copy` | `local_folder, remote_folder, file_extensions=None, overwrite=False` |
+| `DuckSession` | `copy` | `local_folder, remote_folder, file_extensions=None, overwrite=False, git_only=False, sync=False` |
 | `DuckSession` | `download` | `remote_folder='', local_folder='./downloaded_files', file_extensions=None, overwrite=False` |
 | `DuckSession` | `get_stats` | `source=None, detailed=False` |
 | `DuckSession` | `list_files` | `remote_folder='', file_extensions=None` |

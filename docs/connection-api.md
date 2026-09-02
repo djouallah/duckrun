@@ -104,6 +104,33 @@ conn.sql("SELECT * FROM df").df()                                # query it
 conn.sql("CREATE OR REPLACE TABLE seeded AS SELECT * FROM df")   # or persist it to Delta
 ```
 
+## Files — `conn.copy` / `conn.download` / `conn.list_files`
+
+Loose (non-Delta) files move through the same session: `conn.copy(local_folder, remote_folder)`
+uploads a directory tree, `conn.download(remote_folder, local_folder)` pulls one back, and
+`conn.list_files(remote_folder)` lists what is there as relative paths. `remote_folder` is relative to
+the lakehouse **Files** section on OneLake (the catalog root elsewhere), or a full `…://` URL. Every
+backend streams through obstore over the credentials `connect()` already holds; `file_extensions`
+filters by suffix and `overwrite=False` (the default) skips files already present on the other side.
+
+Two opt-in flags make `copy` a deployment tool for a dbt project that runs inside Fabric (the
+project lives in `Files/<folder>`, a notebook is only the runner):
+
+- `git_only=True` uploads only the files git tracks — `git ls-files` run inside `local_folder` — so
+  `dbt_packages/`, `target/`, caches and ignored local secrets never leave the machine. It is exactly
+  git's index: a new file must be `git add`ed to ship. Outside a git checkout it falls back to the
+  full directory walk with a warning.
+- `sync=True` removes remote files that no longer exist locally, as a per-file diff scoped to
+  `remote_folder` and to the same `file_extensions` filter — never a folder wipe. Uploads run first
+  and deletes last, and an empty local set is refused rather than treated as "delete everything".
+
+```python
+conn.copy("dbt", "dbt", git_only=True, sync=True, overwrite=True)
+```
+
+`sync` decides which files exist remotely; `overwrite` decides whether an existing file's content is
+replaced. A deploy that expects edited models to land needs both.
+
 ## Multiple catalogs with `conn.attach`
 
 `connect()` binds one lakehouse root as the **primary catalog**; `conn.attach(path, name=…)` binds

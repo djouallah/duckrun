@@ -168,6 +168,10 @@ rather than hardcoding, resolve the lakehouse **GUID** with
 the token with `notebookutils.credentials.getToken('storage')`. The dbt project itself
 lives in the lakehouse `Files/dbt` area and is copied to `/tmp` each run with
 `notebookutils.fs.cp(..., True)`: the notebook is a runner, not the project's home.
+Deploy it there from a laptop with
+`duckrun.connect(tables).copy("dbt", "dbt", git_only=True, sync=True, overwrite=True)` —
+git-tracked files only (no `dbt_packages/`, `target/`, local secrets), stale remote
+files removed, edited files replaced.
 
 **Cell 3 — env vars are the only interface between notebook and dbt.** Export
 `ONELAKE_TABLES_PATH`, `ONELAKE_TOKEN`, `FILES_PATH`, and any limits; keep
@@ -582,7 +586,8 @@ conn.sql("SELECT * FROM orders_copy").show()
   `catalog.schema.table` names.
 - `conn.register(name, df)` exposes a local pandas/polars/arrow object to SQL (explicit
   because DuckDB's replacement scan can't see the caller's frame). Utilities:
-  `conn.copy`, `conn.download`, `conn.list_files`, `conn.get_stats`, and
+  `conn.copy` (`git_only=` / `sync=` for project deploys), `conn.download`,
+  `conn.list_files`, `conn.get_stats`, and
   `conn.convert_to_delta` (one-off zero-copy parquet→Delta ingest — never in a
   repeatable pipeline).
 - Delta extras with SQL spellings: `SORTED BY AUTO` / `SORTED BY (cols)` /

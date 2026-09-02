@@ -12,6 +12,7 @@ every storage concern (token → secret, table discovery, the Delta write path) 
 """
 import os
 import re
+import subprocess
 from collections import namedtuple
 from typing import Dict, List, Optional
 
@@ -260,6 +261,25 @@ def _norm_exts(file_extensions: Optional[List[str]]) -> Optional[set]:
     if not file_extensions:
         return None
     return {("" if e.startswith(".") else ".") + e.lower() for e in file_extensions}
+
+
+def _git_tracked(local_folder: str) -> Optional[List[str]]:
+    """The files git tracks under ``local_folder``, as ``/``-separated paths relative to it — or
+    ``None`` when the folder is not inside a git work tree (``git ls-files`` exits 128) or git is
+    not installed (``FileNotFoundError``), so the caller can fall back to a plain directory walk.
+    ``git -C <dir> ls-files`` prints paths relative to ``<dir>``, so a sub-directory of a repo works;
+    ``-z`` NUL-separates so odd names are neither quoted nor escaped; git prints ``/`` even on
+    Windows, so the strings are already remote keys. Decoded with ``os.fsdecode`` rather than
+    ``text=True``: git emits raw UTF-8 bytes, which ``text=True`` would run through cp1252 on Windows.
+    Files deleted in the work tree but still in the index are listed too — the caller drops them
+    with ``os.path.isfile`` (which also drops submodule gitlinks)."""
+    try:
+        res = subprocess.run(["git", "-C", local_folder, "ls-files", "-z"], capture_output=True)
+    except FileNotFoundError:
+        return None
+    if res.returncode != 0:
+        return None
+    return [os.fsdecode(p) for p in res.stdout.split(b"\0") if p]
 
 
 def _strip_query_context(msg: str) -> str:
@@ -1108,7 +1128,8 @@ class DuckSession:
         return f"{base}/{rf}" if rf else base
 
     def copy(self, local_folder: str, remote_folder: str,
-             file_extensions: Optional[List[str]] = None, overwrite: bool = False) -> bool:
+             file_extensions: Optional[List[str]] = None, overwrite: bool = False,
+             git_only: bool = False, sync: bool = False) -> bool:
         """Upload every file under ``local_folder`` to ``remote_folder`` on the store, preserving the
         directory tree. Storage-neutral: files stream via obstore over the same ``storage_options``
         ``connect()`` already holds — no extra auth. ``remote_folder`` is relative to the lakehouse
@@ -1117,17 +1138,60 @@ class DuckSession:
         Returns ``True`` on success.
 
         Each file is streamed from an open handle (multipart PUT for large files), so this handles
-        multi-GB blobs, not just ordinary files."""
+        multi-GB blobs, not just ordinary files.
+
+        ``git_only=True`` uploads only the files git tracks (``git ls-files`` run inside
+        ``local_folder``), so ``.gitignore``d content — ``dbt_packages/``, ``target/``, caches, local
+        secrets — never leaves the machine. The contract is exactly "what is in git's index": a new
+        file must be ``git add``ed to ship, a force-added ignored file ships, ``.dbtignore`` is
+        deliberately not consulted (dbt's concern; a second filter would make the flag
+        unpredictable). Outside a git work tree, or with no git installed, it degrades to the plain
+        directory walk with a ``[warn]`` so a deploy script can leave it on and still work from an
+        unpacked archive.
+
+        ``sync=True`` makes ``remote_folder`` mirror the local set: after the upload, remote files
+        that are not local are deleted. A per-file diff, not a wipe-and-reupload, fenced four ways:
+        the diff is scoped to ``remote_folder`` by construction (the store is rooted there — on a
+        OneLake ``…/Tables`` root that is ``Files/<remote_folder>``, so ``Tables/`` is unreachable,
+        and a bare ``remote_folder`` is refused because on every other store that root is where the
+        Delta tables live); only keys passing the same ``file_extensions`` filter are eligible
+        (``sync=True`` with ``['.sql']`` never touches a ``.csv``); uploads happen first and deletes
+        last (a crash mid-deploy leaves extra files, never missing ones); and an empty local set is
+        refused outright, so a typo'd ``local_folder`` cannot become "delete everything remote".
+        Deletes are individual files, one request per key (obstore's bulk delete is broken on
+        OneLake upstream — arrow-rs object_store #701).
+
+        ``sync`` governs *presence*, ``overwrite`` governs *content*: a file present on both sides is
+        still skipped unless ``overwrite=True``. A deploy that expects edited models to land wants
+        ``overwrite=True, sync=True``."""
         exts = _norm_exts(file_extensions)
         base = self._files_base(remote_folder)
-        pairs = []
-        for dirpath, _dirs, names in os.walk(local_folder):
-            for n in names:
-                if exts and os.path.splitext(n)[1].lower() not in exts:
-                    continue
-                local_path = os.path.join(dirpath, n)
-                rel = os.path.relpath(local_path, local_folder).replace("\\", "/")
-                pairs.append((local_path, rel))
+        if sync and "://" not in remote_folder and not remote_folder.replace("\\", "/").strip("/"):
+            raise ValueError(
+                "copy(sync=True) needs an explicit remote_folder: with none, the target is the store "
+                "root -- the whole Files section on OneLake, or the catalog root (where the Delta "
+                "tables live) on every other store.")
+        tracked = _git_tracked(local_folder) if git_only else None
+        if git_only and tracked is None:
+            print(f"[warn] '{local_folder}' is not in a git repo (or git is not installed); "
+                  "git_only ignored, uploading every file")
+        if tracked is not None:
+            walk = [(os.path.join(local_folder, *rel.split("/")), rel) for rel in tracked]
+            walk = [(lp, rel) for lp, rel in walk if os.path.isfile(lp)]  # index-only / gitlinks out
+        else:
+            walk = []
+            for dirpath, _dirs, names in os.walk(local_folder):
+                for n in names:
+                    local_path = os.path.join(dirpath, n)
+                    walk.append((local_path, os.path.relpath(local_path, local_folder).replace("\\", "/")))
+        pairs = [(lp, rel) for lp, rel in walk
+                 if not exts or os.path.splitext(rel)[1].lower() in exts]
+        if sync and not pairs:
+            raise ValueError(
+                f"copy(sync=True) refuses to run with nothing to upload from '{local_folder}'"
+                + (f" (filtered by {file_extensions})" if exts else "")
+                + " -- an empty local set would delete every file under the remote folder; check the "
+                  "path / filter, or drop sync=True.")
         if not pairs:
             print(f"[warn] no files to upload from '{local_folder}'"
                   + (f" (filtered by {file_extensions})" if exts else ""))
@@ -1148,6 +1212,17 @@ class DuckSession:
                 continue
             objectstore.upload(store, rel, local_path, single_shot=single_shot)
             print(f"  [ok] {local_path} -> {base}/{rel}")
+        if sync:
+            # The FULL local set (not just what was uploaded): a file skipped as already present
+            # under overwrite=False is still local and must not read as stale.
+            local_keys = {rel for _lp, rel in pairs}
+            stale = [k for k in objectstore.list_keys(store)
+                     if k not in local_keys and (not exts or os.path.splitext(k)[1].lower() in exts)]
+            if stale:
+                print(f"Removing {len(stale)} stale file(s) from '{base}'...")
+                for k in stale:
+                    objectstore.delete(store, k)  # one key per call — never a bulk list (see objectstore)
+                    print(f"  [del] {base}/{k}")
         print("upload complete")
         return True
 

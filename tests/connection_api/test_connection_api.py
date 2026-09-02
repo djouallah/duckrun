@@ -123,6 +123,67 @@ class TestSession:
         assert (base / "d.csv.gz").read_bytes() == gz  # byte-verbatim, not double-compressed
         assert not (base / "skip.txt").exists()  # filtered out
 
+    def test_copy_git_only(self, conn, tmp_path):
+        # git_only=True ships exactly git's index: ignored and untracked files stay home, a tracked
+        # file deleted from the work tree (still in the index) is dropped, keys are '/'-separated
+        # even on Windows, and a sub-directory of the repo works (git -C prints paths relative to it).
+        import shutil
+        import subprocess
+        if shutil.which("git") is None:
+            pytest.skip("git not installed")
+        repo = tmp_path / "repo"
+        (repo / "models").mkdir(parents=True)
+        (repo / "dbt_packages").mkdir()
+        (repo / "models" / "a.sql").write_text("select 1")
+        (repo / "models" / "b.sql").write_text("select 2")          # untracked
+        (repo / "dbt_packages" / "pkg.sql").write_text("select 3")  # ignored
+        (repo / ".gitignore").write_text("dbt_packages/\n")
+        (repo / "gone.sql").write_text("select 4")
+        subprocess.run(["git", "init", "-q", str(repo)], check=True)
+        subprocess.run(["git", "-C", str(repo), "add", "models/a.sql", ".gitignore", "gone.sql"], check=True)
+        (repo / "gone.sql").unlink()                                 # index-only: not on disk
+        conn.copy(str(repo), "gitdep", git_only=True)
+        assert set(conn.list_files("gitdep")) == {"models/a.sql", ".gitignore"}
+        conn.copy(str(repo / "models"), "gitsub", git_only=True)
+        assert conn.list_files("gitsub") == ["a.sql"]
+
+    def test_copy_git_only_falls_back_outside_repo(self, conn, tmp_path, capsys):
+        # not a git checkout (exit 128) -> warn and upload everything, so a deploy script can leave
+        # the flag on and still work from an unpacked archive.
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        (plain / "x.sql").write_text("1")
+        (plain / "y.sql").write_text("2")
+        conn.copy(str(plain), "fallback", git_only=True)
+        assert set(conn.list_files("fallback")) == {"x.sql", "y.sql"}
+        out = capsys.readouterr().out
+        assert "[warn]" in out and "git_only ignored" in out
+
+    def test_copy_sync(self, conn, tmp_path):
+        # sync=True: stale remote files go (per-file diff, same extension filter, upload first /
+        # delete last); files outside the filter and files skipped as already present survive; an
+        # empty local set or a bare remote_folder is refused, deleting nothing.
+        src = tmp_path / "src"
+        (src / "sub").mkdir(parents=True)
+        (src / "a.sql").write_bytes(b"v1")
+        (src / "sub" / "b.sql").write_bytes(b"b")
+        (src / "keep.csv").write_bytes(b"k")
+        conn.copy(str(src), "synced")
+        remote = Path(conn.root_path) / "synced"
+        (src / "sub" / "b.sql").unlink()                 # deleted locally -> stale remotely
+        (src / "c.sql").write_bytes(b"c")                # new locally -> uploaded
+        (src / "a.sql").write_bytes(b"v2")               # edited: sync != overwrite, stays v1
+        (remote / "orphan.sql").write_bytes(b"o")        # only remote, in the filter -> deleted
+        (remote / "orphan.csv").write_bytes(b"o")        # only remote, outside the filter -> kept
+        conn.copy(str(src), "synced", file_extensions=["sql"], sync=True)   # no leading dot on purpose
+        assert set(conn.list_files("synced")) == {"a.sql", "c.sql", "keep.csv", "orphan.csv"}
+        assert (remote / "a.sql").read_bytes() == b"v1"
+        with pytest.raises(ValueError, match="nothing to upload"):
+            conn.copy(str(tmp_path / "nope"), "synced", sync=True)
+        with pytest.raises(ValueError, match="explicit remote_folder"):
+            conn.copy(str(src), "", sync=True)
+        assert set(conn.list_files("synced")) == {"a.sql", "c.sql", "keep.csv", "orphan.csv"}
+
     def test_download(self, conn, tmp_path):
         # download mirrors copy; overwrite=False (default) skips files already present locally.
         remote = Path(conn.root_path) / "remote"

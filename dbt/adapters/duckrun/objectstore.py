@@ -1,4 +1,5 @@
-"""Storage-neutral loose-file transfer for ``conn.copy`` / ``conn.download`` / ``conn.list_files``.
+"""Storage-neutral loose-file transfer for ``conn.copy`` (incl. its ``sync`` deletes) /
+``conn.download`` / ``conn.list_files``.
 
 Every backend (local / s3 / gcs / az / OneLake ``abfss://``) goes through **obstore** — the Python
 binding over the same Rust ``object_store`` crate that ``deltalake`` uses. That shared lineage is the
@@ -46,6 +47,23 @@ def exists(store, key: str) -> bool:
         return True
     except FileNotFoundError:
         return False
+
+
+def delete(store, key: str) -> None:
+    """Delete the single object ``key`` from ``store`` — deliberately ONE key per call, never a list.
+
+    obstore's ``delete(store, paths)`` takes a str or a sequence. A **sequence** goes through
+    ``object_store``'s ``delete_stream``, which on Azure is the bulk *batch* endpoint — broken for
+    OneLake upstream (arrow-rs object_store #701: the batch URL drops the workspace/artifact id and
+    OneLake answers 400 ``WorkspaceId or ArtifactId are missing``; the same bug that forced
+    ``copy(overwrite=True)`` onto a single Put Blob instead of delete-then-put). A single **str** is
+    the plain per-object ``delete`` — one HTTP DELETE — which OneLake honors. So ``copy(sync=True)``
+    calls this once per stale key even where bulk would be fewer round trips. A missing key raises
+    ``FileNotFoundError`` on local / Azure / GCS (S3 is silent); the caller only deletes keys it
+    listed a moment earlier, so a miss means another writer got there first — let it surface."""
+    import obstore
+
+    obstore.delete(store, key)
 
 
 def list_keys(store) -> List[str]:

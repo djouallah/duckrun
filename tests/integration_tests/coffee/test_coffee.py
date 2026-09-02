@@ -288,6 +288,14 @@ def test_onelake_files_copy_download_roundtrip(tmp_path):
     conn.download(scratch, str(dst2), file_extensions=[".csv"], overwrite=True)
     assert (dst2 / "a.csv").read_bytes() == big
 
+    # sync=True must remove a stale key via a SINGLE-key obstore.delete (one HTTP DELETE): the
+    # bulk/batch path is broken on OneLake upstream (arrow-rs object_store #701), so this is the live
+    # proof that the per-key delete sidesteps it. Remote holds {a.csv, sub/b.parquet}; after the
+    # local unlink the filtered local set is {a.csv} (skip.txt never qualifies) -> exactly one stale.
+    (src / "sub" / "b.parquet").unlink()
+    conn.copy(str(src), scratch, file_extensions=[".csv", "parquet"], sync=True)
+    assert set(conn.list_files(scratch)) == {"a.csv"}
+
 
 def _shorthand(abfss_path):
     """``abfss://<ws>@onelake…/<item>/Tables[/<tail>]`` → the ``<ws>/<item>[/<tail>]`` shorthand.
