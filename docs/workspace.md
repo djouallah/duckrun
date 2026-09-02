@@ -5,9 +5,7 @@ hide:
 
 # Fabric workspace handle
 
-`connect()` points *into* an existing lakehouse, and works the same on local, `s3://`, `gs://`, or
-OneLake. Creating a lakehouse is the opposite job — Fabric-only, control-plane, and there's no
-lakehouse to point at yet — so it lives on a separate **workspace handle**:
+`connect()` points into an existing lakehouse. Creating one, and deploying the items around it, is Fabric-only control-plane work, so it lives on a separate **workspace handle**:
 
 ```python
 import duckrun
@@ -21,92 +19,38 @@ vl_id = ws.deploy("variables.json", variables={"lakehouse_name": "bronze", "work
 ws.run("etl.ipynb")                             # run a deployed notebook/pipeline on Fabric, wait
 ws.schedule("pipeline", daily="06:00")          # or every="1h" / weekly=["Mon"], at="06:00"
 ws.list_items()                                 # [{"displayName":…, "id":…, "type":…}, ...]
-ws.list_lakehouses()                            # [{"displayName": ..., "id": ...}, ...]
 ```
 
-**`list_items(kind=None)`** lists what's actually in the workspace. With no argument you get every
-item of every type, each tagged with its `type`; pass a collection name — `"notebooks"`,
-`"semanticModels"`, `"lakehouses"`, `"dataPipelines"`, `"variableLibraries"` — to narrow to one.
-Paged to completion either way. `list_lakehouses()` is the wrapper for the lakehouse collection.
+## `list_items`
+
+`list_items(kind=None)` lists every item with its `type`; pass a collection name (`"notebooks"`, `"semanticModels"`, `"lakehouses"`, `"dataPipelines"`, `"variableLibraries"`) to narrow. `list_lakehouses()` wraps the lakehouse collection; `lakehouse_id(name)` / `warehouse_id(name)` resolve one item's id.
+
+## `create_lakehouse` / `create_warehouse`
+
+`create_lakehouse(name, schemas=True, folder=None)` provisions an empty lakehouse and is **idempotent**: an existing lakehouse of that name returns its id unchanged. `schemas=False` makes a non-schema-enabled lakehouse. `create_warehouse(name, folder=None)` is the warehouse sibling, idempotent too. `folder=` places an item it creates in a workspace folder. `sql_endpoint(warehouse=None)` returns the workspace's SQL endpoint hostname (shared by every warehouse and lakehouse SQL analytics endpoint in the workspace), what a connection string's `Server=` takes.
+
+## `deploy`
+
+`deploy(source, name=None, overwrite=False, …)` pushes a file, an `http(s)` URL, or a **folder** of items. The item type comes from the extension: `.ipynb` → notebook, `.bim` → semantic model, `.json` → data pipeline (`properties.activities`, deployed verbatim) or variable library (`variables`, with an optional `variables=` mapping to set values at deploy time; an unknown name raises). The name defaults to the filename stem. `deploy` is **not** idempotent: an existing item is replaced only with `overwrite=True`, otherwise the call raises. Each item logs `created` or `updated`. A `.ipynb`'s cell sources are normalized to Fabric's list-of-lines form. A `.bim` is refreshed (reframed) after deploy, so `deploy` returns once the model is live; a Direct Lake model reads OneLake with the caller's identity, so there is no gateway or stored credential to bind.
+
+**Pointing a Direct Lake model at a lakehouse.** A `.bim` bakes in the OneLake workspace and lakehouse GUIDs it reads; `lakehouse=` rewrites them. It is inferred when the model already targets a lakehouse in this workspace or the workspace has exactly one; with several you must name it, and a wrong name raises with the available names. Ignored for `.ipynb` / `.json`.
 
 ```python
-[it for it in ws.list_items() if it["type"] == "Notebook"]   # what deploy actually landed
-```
-
-**`create_lakehouse(name, schemas=True)`** provisions an empty container by name. It is
-**idempotent**: if a lakehouse of that name already exists it returns its id unchanged (nothing is
-re-created), so it's safe to call before every run. Pass `schemas=False` for a non-schema-enabled
-lakehouse. It raises on a real API failure rather than returning a sentinel.
-
-**`deploy(source, name=None, overwrite=False)`** pushes a file artifact to the workspace. `source` is
-a local file path, an `http(s)` URL (e.g. a GitHub raw URL), or a **folder** of items (see below). The item type comes from the
-extension — `.ipynb` → notebook, `.bim` → semantic model, `.json` → data pipeline — and the name
-defaults to the filename stem (override with `name=`). A `.bim` is also **refreshed** after deploy (a
-*reframe* onto the latest Delta data for Direct Lake), so `deploy` returns only once the model is
-live. A `.json` is a **data pipeline** or a **variable library**, told apart by content: a pipeline
-(`properties.activities`) is deployed verbatim (no id rewriting); a variable library (`variables`)
-takes an optional `variables=` mapping to set values at deploy time —
-`ws.deploy("variables.json", variables={"lakehouse_name": "bronze", "workspace_id": ws.id})` — the
-environment-specific injection, without editing the file (an unknown variable name raises). A `.json`
-that is neither raises. `deploy` is **not** idempotent: if an item of that name already exists it is
-replaced only when `overwrite=True`, otherwise the call raises rather than hide a stale deploy.
-
-Each item logs which of the two happened — `created notebook 'etl' (f05e7780…)` vs
-`updated notebook 'etl' (…)` — so an `overwrite=True` that updated in place is distinguishable from
-a second item of the same name, one line per item on a folder deploy. A `.ipynb`'s cell sources are
-**normalized** on the way out: nbformat allows a cell's `source` to be a single string and editors do
-write it that way, but Fabric wants a list of lines, so duckrun splits it rather than shipping a
-notebook that uploads fine and renders wrong.
-
-**Pointing a Direct Lake model at a lakehouse.** A Direct Lake `model.bim` bakes in the OneLake
-workspace + lakehouse GUIDs it reads from; deploying it elsewhere would leave it pointed at the wrong
-place. `lakehouse=` fixes that — you name a lakehouse in this workspace and duckrun rewrites those
-GUIDs for you (no connection strings or GUIDs to edit):
-
-```python
-ws.deploy("model.bim", lakehouse="silver")   # point the model at the silver lakehouse
+ws.deploy("model.bim", lakehouse="silver")
 ws.deploy("model.bim")                        # workspace has one lakehouse → inferred
 ```
 
-The lakehouse is **inferred** when the model already targets one that exists in this workspace, or
-the workspace has exactly one; with several you must name it (otherwise `deploy` raises, listing
-them). A wrong name raises with the available names. `lakehouse=` is ignored for `.ipynb` / `.json`.
-
-**Choosing a model's storage mode at deploy time.** `mode=` forces every data table in a `.bim` into
-one storage mode, so a single authored model ships either way — and on a folder deploy, every model in
-the folder:
+**Storage mode.** `mode=` forces every data table in a `.bim` (or every model in a folder) into one storage mode; omit it and the model deploys as authored. `lakehouse=` / `warehouse=` name the item holding the tables — either serves either mode — and are inferred the same way as above; with both named in a mixed folder, each model takes the one matching what it reads today. `direct_lake` gives each table an entity partition on the item's OneLake root with `directLakeOnly` behavior (no SQL endpoint, no DirectQuery fallback) and reframes after deploy; `direct_query` gives each table an M partition over `Sql.Database(<endpoint>, <item>)`. Calculated tables and calculation groups are left alone; a table that reads through a real M query raises, naming the table, rather than deploying with its transformation dropped.
 
 ```python
-ws.deploy("model.bim", lakehouse="silver",   mode="direct_lake")    # Delta straight off OneLake
-ws.deploy("model.bim", lakehouse="silver",   mode="direct_query")   # via the SQL analytics endpoint
-ws.deploy("model.bim", warehouse="gold_dwh", mode="direct_lake")    # a warehouse's tables are Delta too
+ws.deploy("model.bim", lakehouse="silver",   mode="direct_lake")
 ws.deploy("model.bim", warehouse="gold_dwh", mode="direct_query")
 ws.deploy("fabric_items", overwrite=True, mode="direct_lake")       # every model in the folder
 ```
 
-`lakehouse=` / `warehouse=` name the item holding the tables, `mode=` how it's read — either kind
-serves either mode, since a lakehouse has a SQL analytics endpoint and a warehouse's tables are Delta
-in OneLake. Omit `mode` (the default) and the model deploys exactly as authored, with only the
-repoints above.
+## Deploying a folder of items
 
-Both directions are **pure**, so a converted model keeps no trace of the mode it left.
-`direct_lake` gives each table an entity partition over one `AzureStorage.DataLake` expression on the
-item's OneLake root and sets `directLakeBehavior` to `directLakeOnly` — no SQL endpoint anywhere, and
-a query Direct Lake can't serve **fails** instead of silently falling back to DirectQuery.
-`direct_query` gives each table an M partition over `Sql.Database(<workspace SQL endpoint>, <item>)`
-and strips the Direct Lake side. Direct Lake models are refreshed (reframed) after deploy; DirectQuery
-ones aren't, having nothing to reframe.
-
-The source item is inferred the same way as the repoints — the item the model already reads if it
-lives here, else the workspace's only candidate, else you name it. With **both** named (a mixed
-folder) each model takes the one matching what it reads today: OneLake → `lakehouse=`,
-`Sql.Database` → `warehouse=`. Calculated tables and calculation groups are left alone; a table that
-reads through a real M query rather than a plain schema/table read **raises**, naming the table,
-rather than deploying a model with its transformation silently dropped.
-
-**Deploying a whole folder of items.** Point `deploy` at a **folder** in the Fabric
-git-integration layout — one `name.ItemType/` subfolder per item, each with its `.platform` file —
-and every item in it is deployed in one call:
+Point `deploy` at a folder in the Fabric git-integration layout — one `name.ItemType/` subfolder per item, each with its `.platform` file:
 
 ```
 fabric_items/
@@ -118,55 +62,28 @@ fabric_items/
 ws.deploy("fabric_items", overwrite=True)   # → {"deploy_config": id, "run": id, ...}
 ```
 
-Items deploy in **dependency order** — variable libraries, notebooks, semantic models, then
-pipelines — and each behaves exactly like its single-file deploy: names come from the `.platform`
-`displayName`, the `.bim` is repointed (`lakehouse=`) and refreshed, `variables=` fills the variable
-library, `overwrite` applies per item. The automagic bit: when the folder has exactly **one**
-notebook, a pipeline's notebook activities are automatically pointed at it — the just-deployed
-notebook, in this workspace, no GUID surgery (with several notebooks, pick one via `notebook=`).
-Folder mode returns a `{displayName: item id}` dict instead of a single id. Supported item types are
-VariableLibrary, Notebook (ipynb format), SemanticModel, and DataPipeline; anything else in the
-folder raises rather than half-deploying.
+Items deploy in dependency order (variable libraries, notebooks, semantic models, pipelines), each exactly like its single-file deploy, names taken from `.platform` `displayName`. With exactly one notebook in the folder, a pipeline's notebook activities are pointed at it automatically (several: pick one with `notebook=`). Supported types are VariableLibrary, Notebook (ipynb), SemanticModel and DataPipeline; anything else raises rather than half-deploying. Returns `{displayName: item id}`.
 
-**`download(folder=".", name=None, overwrite=False)`** is the mirror: it exports the workspace's
-items **to** disk in the same layout, so you can build a workspace by hand once, download it,
-commit the folder, and redeploy it anywhere:
+## `download`
+
+`download(folder=".", name=None, overwrite=False)` exports the workspace's items to disk in the same layout — notebooks as ipynb, semantic models as TMSL `model.bim`, each with its `.platform` — so a downloaded folder redeploys unchanged. An existing local item folder is skipped unless `overwrite=True`. Returns `{displayName: folder path}`.
 
 ```python
-ws.download("fabric_items")                  # export every item → fabric_items/name.ItemType/...
-ws.download("fabric_items", name="run")      # just one item
+ws.download("fabric_items")                  # every item
+ws.download("fabric_items", name="run")      # one item
 duckrun.workspace("Prod").deploy("fabric_items", overwrite=True)   # round-trip
 ```
 
-Notebooks are fetched in ipynb format and semantic models as TMSL (`model.bim`) — exactly the
-formats `deploy` consumes — and each item folder gets its `.platform` file as Fabric returns it,
-so a downloaded folder always redeploys unchanged. The item types are the same deployable four.
-An item folder that already exists locally is **skipped** unless `overwrite=True` (your local
-edits are never clobbered by default). Returns `{displayName: item folder path}`.
+## `run` / `run_python`
 
-`deploy` does create + refresh, and for Direct Lake that's the whole story: a Direct Lake model reads
-the Delta files straight from OneLake with the caller's own identity, so there's no gateway or stored
-data-source credential to bind — the reframe just works once the model is deployed.
+`run(name)` executes a deployed notebook or pipeline on Fabric and waits, returning the terminal job status (raising on failure). `name` is the display name with or without extension; a bare name is looked up as a notebook, then a pipeline. Parameters are a pipeline's job, so `run` takes none. `run_python(script, *, lakehouse=None, cores=None, pip=None, env=None, …)` runs a local `.py` file (or a folder with `entry=`) in a throwaway Fabric notebook, streams its output back, and returns a `ScriptResult` (`success`, `returncode`, `log`, `item_id`); it is what [`RemoteRunner`](remote.md) is built on.
 
-**`run(name)`** executes a deployed notebook or data pipeline on Fabric compute and waits for it,
-returning the terminal job status (raising on failure). `name` is the item's display name with or
-without the source extension — `run("etl.ipynb")` / `run("etl")` run the notebook,
-`run("pipeline.json")` the pipeline; a bare name is looked up as a notebook then a pipeline. It's
-inherently remote (the job runs on Fabric, not your machine). Parameterizing a run is a **pipeline's**
-job — a pipeline passes parameters to the notebooks it orchestrates — so `run` itself takes none.
+## `schedule`
 
-**`schedule(name, every=/daily=/weekly=, at=, tz="UTC")`** schedules a deployed notebook or pipeline
-to run on Fabric, returning the schedule id. Fabric's scheduler is interval / daily / weekly, not
-free-form cron, so pass one of: `every="30m"` / `"2h"` (interval), `daily="06:00"` or
-`daily=["06:00","18:00"]`, or `weekly=["Mon","Fri"], at="06:00"`. No cadence → **daily at midnight**.
-It's idempotent — re-scheduling the same item updates its schedule instead of stacking a duplicate.
+`schedule(name, every=/daily=/weekly=, at=, tz="UTC")` schedules a deployed notebook or pipeline and returns the schedule id. Fabric's scheduler is interval / daily / weekly: `every="30m"` / `"2h"`, `daily="06:00"` or `daily=["06:00","18:00"]`, or `weekly=["Mon","Fri"], at="06:00"`. No cadence → daily at midnight. Re-scheduling the same item updates its schedule.
 
-Authentication reuses the same Fabric control-plane token as [remote execution](remote.md): inside a
-Fabric notebook it's automatic (`notebookutils`), and locally it comes from `FABRIC_TOKEN`, GitHub
-OIDC, or `az login`. The semantic-model refresh additionally needs a Power BI token (`POWERBI_TOKEN`
-or `az login --scope https://analysis.windows.net/powerbi/api/.default`); inside Fabric it's
-automatic. Pass `token=` to inject the Fabric one.
+## Authentication
 
-Pipelines, TMDL-folder semantic models, and git-folder workspace CD are intentionally out of scope —
-use [`fabric-cicd`](https://microsoft.github.io/fabric-cicd/) or
-[`semantic-link-labs`](https://github.com/microsoft/semantic-link-labs) for those.
+The same Fabric control-plane token as [remote execution](remote.md): automatic inside a Fabric notebook (`notebookutils`); locally from `FABRIC_TOKEN`, GitHub OIDC, or `az login`. The semantic-model refresh additionally needs a Power BI token (`POWERBI_TOKEN` or `az login --scope https://analysis.windows.net/powerbi/api/.default`). Pass `token=` to inject the Fabric one.
+
+TMDL-folder semantic models and git-folder workspace CD are out of scope — use [`fabric-cicd`](https://microsoft.github.io/fabric-cicd/) or [`semantic-link-labs`](https://github.com/microsoft/semantic-link-labs).

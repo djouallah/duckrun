@@ -5,11 +5,7 @@ hide:
 
 # duckrun dbt adapter
 
-duckrun is a thin wrapper around [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb): you keep
-everything dbt-duckdb gives you — views, seeds, sources, tests, snapshots, the full plugin ecosystem
-— and gain a Delta-backed `table` / `incremental` materialization that writes real Delta tables via
-delta_rs. The design rationale (why delta_rs, why Delta not Iceberg, why a separate adapter) is in
-[design_document.md](design_document.md).
+duckrun is a thin wrapper around [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb): views, seeds, sources, tests, snapshots and the plugin ecosystem are inherited, and `table` / `incremental` write real Delta tables via delta-rs. The rationale is in the [design document](design_document.md).
 
 ## Configure your profile
 
@@ -20,82 +16,48 @@ my_project:
   outputs:
     dev:
       type: duckrun
-      # `threads:` works as usual (dbt defaults to 1). Concurrent models share one DuckDB
-      # memory budget, so raise it for many small/network-bound models, not for one big merge.
-      # DuckDB runs in-memory by default — the Delta tables are the only state.
+      # threads: works as usual (dbt defaults to 1); concurrent models share one DuckDB memory budget.
+      # DuckDB runs in-memory — the Delta tables are the only state.
       # Default Delta location for models that don't set config(location=...).
-      # OneLake — address by GUID, not friendly names (see "OneLake: use GUID paths" below):
+      # OneLake — address by GUID, not friendly names (see below):
       root_path: "abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables"
       # Or any other store: './warehouse' (local), 's3://...', 'gs://...'.
       # storage_options: {}      # passed through to deltalake for remote stores
 ```
 
-Persisted models are written to `<root_path>/<schema>/<model>` (e.g. `.../Tables/dbo/orders`), or to
-an explicit `config(location=...)`.
+Models are written to `<root_path>/<schema>/<model>` (e.g. `.../Tables/dbo/orders`), or to an explicit `config(location=...)`.
 
 ### OneLake shorthand for `root_path`
 
-On OneLake you can drop the `abfss://…@onelake.dfs.fabric.microsoft.com/…/Tables` boilerplate and
-write `workspace/item` — the same shorthand `duckrun.connect()` accepts, expanded when the profile
-loads:
+`root_path`, every entry under `catalogs:`, and a source's `location` / `delta_table_path` accept the same `workspace/item` shorthand as `duckrun.connect()`:
 
 ```yaml
       root_path: "<workspace_id>/<lakehouse_id>"        # → abfss://…/<lakehouse_id>/Tables
       # or by name: root_path: "my_workspace/sales.Lakehouse"
 ```
 
-It works for each entry under `catalogs:` and for a source's `location` / `delta_table_path` too
-(spell `…/Files/…` explicitly to reach the file side). Only two shapes are shorthand: an item with a
-`.Lakehouse`/`.Warehouse` suffix, or a workspace-GUID/item-GUID pair — a suffix-less `warehouse/tables`
-is still an ordinary local relative path.
+The rules are on the [Connection API](connection-api.md#onelake-shorthand) page.
 
 ### OneLake: use GUID paths for now
 
-Address OneLake tables by **workspace GUID + lakehouse GUID**, not friendly names —
-`abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>/Tables/...`. This sidesteps an
-upstream `duckdb-delta` read bug ("No files in log segment") that is **already fixed upstream but
-still rolling out to production OneLake**. Friendly-name paths will work again once the fix finishes
-deploying.
+Address OneLake by **workspace GUID + lakehouse GUID**. Friendly-name paths trip an upstream `duckdb-delta` read bug ("No files in log segment") that is fixed upstream but still rolling out to production OneLake.
 
 ### OneLake authentication — tokens are optional
 
-On OneLake, `storage_options` can be left out entirely: when no `bearer_token` is supplied, duckrun
-self-acquires one (`azure-identity` ships as a core dependency) and mints the matching DuckDB Azure
-secret, so writes **and** `delta_scan` reads — including `dbt test` / `dbt show` /
-`dbt docs generate` — work with no credential in the profile. Acquisition order: Fabric notebook
-(`notebookutils`) → an `AZURE_STORAGE_TOKEN` env var → GitHub Actions OIDC workload-identity
-federation (`AZURE_CLIENT_ID` + `AZURE_TENANT_ID` env vars and `id-token: write` job permission — no
-client secret) → Azure CLI → interactive browser. Tokens are cached per scope and re-acquired near
-expiry.
-
-An explicit `storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }` still works and
-takes precedence — use it when you want to pin exactly which identity writes.
+With no `bearer_token` in `storage_options`, duckrun acquires one itself (`azure-identity` is a core dependency) and mints the matching DuckDB Azure secret, so writes and `delta_scan` reads — including `dbt test` / `dbt show` / `dbt docs generate` — work with no credential in the profile. Order: Fabric notebook (`notebookutils`) → `AZURE_STORAGE_TOKEN` → GitHub Actions OIDC (`AZURE_CLIENT_ID` + `AZURE_TENANT_ID`, `id-token: write`) → Azure CLI → interactive browser. Tokens are cached per scope and re-acquired near expiry. An explicit `storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }` takes precedence.
 
 ### Fabric Lakehouse without a schema
 
-A schema-less Lakehouse (tables straight under `Tables/`, no `Tables/<schema>/` grouping) is a **bad
-pattern** — you lose the namespace that keeps a warehouse organized — but if you're stuck with one,
-no special config is needed. Drop the trailing `Tables` from `root_path` and let the schema fill that
-slot:
+A schema-less Lakehouse (tables straight under `Tables/`) is a poor pattern, but needs no special config: drop the trailing `Tables` from `root_path` and let the schema fill that slot.
 
 ```yaml
       schema: Tables
       root_path: "abfss://<workspace_id>@onelake.dfs.fabric.microsoft.com/<lakehouse_id>"
 ```
 
-Since models are written to `<root_path>/<schema>/<model>`, this lands them at
-`<lh>.Lakehouse/Tables/<model>` — exactly the flat layout the schema-less Lakehouse expects. Prefer a
-schema-enabled Lakehouse (`root_path: .../Tables`, real schemas) whenever you can.
-
 ### Remote stores (S3 / GCS / ADLS)
 
-Point `root_path` at the warehouse location and pass credentials through `storage_options` — these
-flow straight to deltalake for writes and merges.
-
-On Azure-backed stores, if `storage_options` carries a `bearer_token` (or `token` / `access_token`),
-the adapter also auto-creates a matching DuckDB Azure secret, so `delta_scan()` reads work with no
-extra config. In a notebook where the storage secret is already provided to DuckDB, you can leave
-`storage_options` empty.
+Point `root_path` at the store and pass credentials through `storage_options`; they flow straight to deltalake. On Azure-backed stores a `bearer_token` (or `token` / `access_token`) in `storage_options` also mints the DuckDB Azure secret for `delta_scan` reads.
 
 ```yaml
     remote:
@@ -107,29 +69,17 @@ extra config. In a notebook where the storage secret is already provided to Duck
         aws_secret_access_key: "{{ env_var('AWS_SECRET_ACCESS_KEY') }}"
 ```
 
-Verified end-to-end against real remote object storage: `table` overwrite, `incremental` merge, and
-`delta_scan` reads / tests.
-
 ### Multiple Lakehouses in one project
 
-One dbt project can write across several Lakehouses (e.g. a medallion `LH_Bronze` / `LH_Silver` /
-`LH_Gold`). Declare each extra write root as a named **catalog** under `catalogs:`, then send a model
-to it with the standard dbt `+database: <alias>` config. The default catalog is `database`
-(`root_path` / `storage_options` at the top level); a project with no `catalogs:` behaves exactly as
-before.
+Declare each extra write root as a named catalog under `catalogs:` and send a model to it with dbt's standard `+database: <alias>`. The default catalog is the top-level `root_path` / `storage_options`; don't set `database:` (dbt-duckdb requires it to match the `:memory:` path).
 
 ```yaml
     dev:
       type: duckrun
-      # The default catalog is the top-level root_path/storage_options (Silver here). Don't set a
-      # `database:` — dbt-duckdb requires it to match the `:memory:` path; the default catalog is
-      # DuckDB's own `memory`.
       root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
-      storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
       catalogs:
         lh_bronze:
           root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
-          storage_options: { bearer_token: "{{ env_var('ONELAKE_TOKEN') }}" }
         lh_gold:
           root_path: "abfss://ws@onelake.dfs.fabric.microsoft.com/LH_Gold.Lakehouse/Tables"
 ```
@@ -140,56 +90,29 @@ before.
 select ...
 ```
 
-Each catalog carries its own `storage_options`, so a per-Lakehouse OneLake token works (the adapter
-mints a path-scoped DuckDB secret per catalog). `ref()` resolves across catalogs, and
-`is_incremental()` / `dbt docs generate` work per Lakehouse.
+Each catalog carries its own `storage_options` (a path-scoped DuckDB secret per catalog); `ref()`, `is_incremental()` and `dbt docs generate` work across catalogs.
 
 ### Multiple environments (dev / test / prod)
 
-A team promoting the same project across Fabric workspaces (dev → test → prod) needs one **target**
-per environment, each pointing its `catalogs:` aliases at that environment's own Lakehouses. Reuse
-the same alias names in every target — only the `root_path`s change — so model config
-(`+database: lh_bronze`) doesn't need to differ per environment. `storage_options` can stay empty on
-OneLake — duckrun self-acquires the token per environment (see
-[OneLake authentication](#onelake-authentication--tokens-are-optional)).
+One target per environment, reusing the same alias names so model config never changes:
 
 ```yaml
-my_project:
-  target: dev
-  outputs:
     dev:
       type: duckrun
       root_path: "abfss://dev_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
       catalogs:
         lh_bronze:
           root_path: "abfss://dev_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
-    test:
-      type: duckrun
-      root_path: "abfss://test_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
-      catalogs:
-        lh_bronze:
-          root_path: "abfss://test_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
-    prod:
-      type: duckrun
-      root_path: "abfss://prod_ws@onelake.dfs.fabric.microsoft.com/LH_Silver.Lakehouse/Tables"
-      catalogs:
-        lh_bronze:
-          root_path: "abfss://prod_ws@onelake.dfs.fabric.microsoft.com/LH_Bronze.Lakehouse/Tables"
+    # test / prod: the same block with that environment's workspace
 ```
 
 ```bash
 dbt run --target test
 ```
 
-Model config (`+database: lh_bronze`) never mentions an environment, so the same project runs
-unmodified against any target.
-
 #### Following the target from a source
 
-A source can resolve its path the same way, via the alias → root map the profile resolver exposes
-on the Jinja `target` as `target.catalog_locations` (see [Config your profile](#configure-your-profile)) —
-`{alias: root_path}` for every entry under `catalogs:`, no tokens. This lets a source pick up
-whichever environment's Lakehouse the current target points at, instead of hard-coding one path:
+The profile exposes `target.catalog_locations` (`{alias: root_path}` for every entry under `catalogs:`, no tokens), so a source can follow the current target:
 
 ```yaml
 sources:
@@ -201,42 +124,24 @@ sources:
           delta_table_path: "{{ target.catalog_locations['lh_bronze'] }}/dbo/raw_events"
 ```
 
-**The empty-string trap.** `target.catalog_locations['lh_bronze']` is a plain Jinja dict lookup: if
-the current target has no `lh_bronze` entry under `catalogs:` — a typo, or a target that hasn't been
-updated yet — Jinja renders it as an empty string instead of failing, so the source silently becomes
-`/dbo/raw_events`, and the failure surfaces later as a confusing
-`InvalidTableLocationError: Path does not exist` (or an empty read) rather than a clear "unknown
-catalog" error. If that's a risk for your project, check membership (`'lh_bronze' in
-target.catalog_locations`) before indexing — e.g. in an `on-run-start` macro that fails the run early
-with a clear message instead of letting it surface downstream.
-
-```yaml
-# dbt_project.yml — both guards run on every invocation, in order
-on-run-start:
-  - "{{ require_catalogs(['lh_bronze', 'lh_gold']) }}"
-  - "{{ guard_prod() }}"
-```
+It is a plain Jinja dict lookup: a missing alias renders as an empty string, so the path silently becomes `/dbo/raw_events` and fails later with `InvalidTableLocationError`. Guard it in an `on-run-start` macro (`'lh_bronze' in target.catalog_locations`) if that is a risk.
 
 ## Materializations
 
 | materialized      | backed by                | notes                                                                 |
 |-------------------|--------------------------|-----------------------------------------------------------------------|
-| **`table`**       | Delta (overwrite)        | DuckDB runs the SQL; delta_rs writes the table fresh each run.         |
-| **`incremental`** | Delta (merge / append)   | First run overwrites; later runs apply `incremental_strategy`.         |
-| `view`            | in-memory DuckDB         | Ephemeral staging within a run (inherited from dbt-duckdb).            |
-| `seed`            | Delta (overwrite)        | CSV loaded via DuckDB, then persisted as a Delta table — survives across processes like a model. |
-| `delta`           | Delta                    | Alias for `table`; honors `incremental=true`. Kept for convenience.   |
-| `external`        | a parquet / csv / json **file** | Not Delta: DuckDB `COPY … TO` writes the file, and the model is a view over it ([below](#external)). |
+| **`table`**       | Delta (overwrite)        | DuckDB runs the SQL; delta-rs writes the table fresh each run.        |
+| **`incremental`** | Delta (merge / append)   | First run overwrites; later runs apply `incremental_strategy`.        |
+| `view`            | in-memory DuckDB         | Session-scoped, nothing on storage (inherited from dbt-duckdb).       |
+| `seed`            | Delta (overwrite)        | CSV loaded via DuckDB, persisted as a Delta table, rediscovered in a fresh process. |
+| `delta`           | Delta                    | Alias for `table`; honors `incremental=true`.                         |
+| `external`        | a parquet / csv / json **file** | Not Delta: DuckDB `COPY … TO` writes the file and the model is a view over it ([below](#external)). |
 
-The persisted materializations (`table`, `incremental`, `delta`, `seed`) register a `delta_scan` view
-over the new Delta table, so downstream `ref()` works — and because a seed is now a real Delta table,
-it's rediscovered from storage in a fresh process (e.g. `dbt docs generate`, or a partial
-`--select`), not just within the run that loaded it.
+The persisted materializations register a `delta_scan` view over the new table, so downstream `ref()` works.
 
 ### `table`
 
 ```sql
--- models/orders.sql
 {{ config(materialized='table') }}
 
 select status, count(*) as n, sum(amount) as total
@@ -255,51 +160,23 @@ select * from {{ ref('stg_orders') }}
 {% endif %}
 ```
 
-The first run (or `--full-refresh`, or a missing table) overwrites. Later runs apply the
-`incremental_strategy`:
+The first run (or `--full-refresh`, or a missing table) overwrites. Later runs apply:
 
 | `incremental_strategy`             | behavior                                  | requires     |
 |------------------------------------|-------------------------------------------|--------------|
 | `merge` (default with `unique_key`) | upsert — update matched, insert new       | `unique_key` |
-| `insert`                           | insert only new keys (idempotent append) — computed in DuckDB, committed as a **plain append** | `unique_key` |
+| `insert`                           | insert only new keys — a DuckDB anti-join committed as a **plain append** | `unique_key` |
 | `delete+insert`                    | delete the batch's keys, insert the whole batch (duplicates preserved) | `unique_key` |
-| `append` (default without `unique_key`) | append; **auto-fenced** when the model reads `{{ this }}`, else a blind append | — |
+| `append` (default without `unique_key`) | append; **auto-fenced** when the model reads `{{ this }}` | — |
 | `microbatch`                       | `replaceWhere` per dbt-driven `event_time` window | `event_time` |
 
 ### `insert` — insert-only, computed in DuckDB
 
-Insert-only is the one incremental shape that never *removes* a row, so it is genuinely a single
-Delta append: duckrun computes "batch rows whose `unique_key` is not already present" as a DuckDB
-anti-join and hands delta_rs a commit containing `add` actions only. **No existing data file is ever
-rewritten**, and the target read is projected down to the key columns.
+Insert-only never removes a row, so duckrun computes "batch rows whose `unique_key` is not already present" as a DuckDB anti-join and commits `add` actions only. No existing file is rewritten, the target read is projected to the key columns, and the anti-join spills like any DuckDB query, where a delta-rs `MERGE` plans a join against the whole pinned target and does not fully spill. NULL keys insert, as with `IN`.
 
-This matters on a large fact table. A delta_rs `MERGE` — even an insert-only one — plans a join
-against the whole pinned target, so its cost scales with the target's partition span rather than the
-size of the batch, and its join state is not fully spillable. The DuckDB anti-join spills, keeps the
-full write memory share (the 30/60 merge split is not applied), and writes nothing but the new rows.
-
-It is row-for-row the same table delta_rs's `when_not_matched_insert_all` produces, NULL keys
-included: `target.k = source.k` is NULL for a NULL key, never TRUE, so the row counts as unmatched
-and inserts — the same rule SQL `IN` follows.
-
-Two consequences worth knowing:
-
-- **A batch that adds nothing writes no commit at all.** The Delta version does not move, where a
-  delta_rs `MERGE` commits a no-op version. Re-running an already-loaded backlog is free and leaves
-  no log churn. History records the write as `WRITE`, not `MERGE`.
-- **The append is always fenced.** The anti-join reads the target, so this is a read-modify-append:
-  it commits only if the table version is unchanged since the model started, and fails with
-  `CommitFailedError` otherwise. A concurrent writer that landed in between would have made the
-  anti-join stale and let a duplicate through.
-
-The probe does not scan blindly. For every column it joins on, duckrun folds a **constant** filter
-into the read of the target: the batch's `min`/`max` for a high-cardinality key
-(`"id" >= 19900000 AND "id" <= 20099999`), so the reader skips files whose Delta stats put them
-outside the batch's range — the same early filter a delta-rs merge derives from source statistics.
-Both are result-neutral, because the join already requires equality.
-
-For a partition column you get something better — the exact value set — but only if you declare the
-equality, the same predicate you would give a merge:
+- **A batch that adds nothing writes no commit**; history records the write as `WRITE`, not `MERGE`.
+- **The append is always fenced**: it commits only if the table version is unchanged since the model started, else `CommitFailedError`.
+- **The target probe prunes.** For each key column the batch's `min` / `max` is folded into the target read, so files outside the range are skipped. For a partition column declare the equality and get the exact value set instead (`"month_key" IN (202601, 202602)`), which beats a range when a source unions an old backfill with the current feed:
 
 ```sql
 {{ config(
@@ -311,74 +188,26 @@ equality, the same predicate you would give a merge:
 ) }}
 ```
 
-That gets `"month_key" IN (202601, 202602)` — the batch's actual partitions, so whole partition
-directories are skipped. An `IN` set beats a range here: a source that unions an old backfill with the
-current feed is bimodal, and a `min`/`max` bound would smear across every partition in between.
-Without the declared equality duckrun will not prune on `month_key` at all, since doing so would no
-longer be result-neutral.
-
-One thing the append inherits from the plain `append` strategy: it leaves a small file per partition,
-and the shared post-write maintenance will compact them once the table's byte debt trips its gate,
-rewriting files the insert itself did not. On a table whose files are already at target size that gate
-does not fire.
-
-**The notebook API gets the same treatment.** `conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED
-THEN INSERT *")` is the same operation written differently, so it routes to the same anti-join —
-duckrun decides this at the shared engine seam, not per surface, so a dbt model and the equivalent SQL
-cannot execute two different ways. Any other clause shape (a matched update or delete, a by-source
-clause, a partial `INSERT (cols)`) still runs on delta_rs, because removing or changing a row means
-rewriting files.
-
-Need delta_rs's merge for an insert-only shape anyway? Set `merge_streamed_exec: true` (or pass
-`streamed_exec` on the connection API) — an explicit request for delta_rs's streaming source handling
-forces that path.
+`conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED THEN INSERT *")` routes to the same anti-join; any other clause shape runs on delta-rs. `merge_streamed_exec: true` forces delta-rs's merge for an insert-only shape.
 
 ### `append` that reads `{{ this }}` — the automatic fence
 
-A cheap append for the common "load only what's new" pattern — when your model SQL **already
-guarantees no duplicates** and you don't want to pay for a merge. Use `incremental_strategy='append'`
-and dedup against the table itself:
+When your SQL already guarantees no duplicates, skip the merge:
 
 ```sql
 {{ config(materialized='incremental', incremental_strategy='append') }}
 
 select * from read_csv(getvariable('new_files'))
 {% if is_incremental() %}
-  -- the dedup is your SQL's job: only load files not already in the table
   where file not in (select distinct file from {{ this }})
 {% endif %}
 ```
 
-**Why, reason 1 — performance.** `merge` / `insert` read the target and join on the key to find
-what's new. If the SQL above already excludes rows that are present, that work is redundant: a plain
-`append` does **no target data scan and no key join at all**, reading only one Delta log entry to get
-the version. (`insert` is far cheaper than it used to be — it is a DuckDB anti-join over the key
-columns now, not a delta_rs merge — but it still reads the target, and this reads nothing.)
-
-**Why, reason 2 — an automatic concurrency guard.** Because the dedup is done in SQL against
-`{{ this }}`, a naive append would be unsafe under concurrency: if another writer commits between your
-`not in (... from {{ this }})` read and your write, the file it added isn't excluded and you get a
-duplicate. duckrun closes that gap **automatically** — because the model **reads `{{ this }}`**, the
-append commits **only if the table version is unchanged since the model started** (captured *before* it
-reads `{{ this }}`); if anything committed in between, it fails with `CommitFailedError` so the run
-re-runs against the new state. No duplicate slips in. An `append` that does *not* read `{{ this }}`
-(appending genuinely new data) is left unfenced — there's nothing to lose.
-
-This is **optimistic concurrency control** — it never locks the table or blocks other writers; it
-appends, then validates at commit with a compare-and-swap on the version and aborts on a mismatch.
-It's the strictest guard (abort on *any* concurrent change), applied automatically only when the
-read-modify-append shape needs it. Re-running is safe and idempotent: the SQL dedup simply excludes
-whatever the previous attempt already loaded.
-
-> Earlier versions exposed this as a separate `append_if_unchanged` strategy. That's gone — the
-> behavior is now automatic on `append` whenever the model reads `{{ this }}`, so there's no strategy
-> to pick. First run (or `--full-refresh`, or a missing table) overwrites to create the table.
+A plain `append` does no target scan and no key join. Because the model reads `{{ this }}`, duckrun commits only if the table version is unchanged since the model started (captured before the read); otherwise it fails with `CommitFailedError` and a re-run dedups against the new state. An `append` that does not read `{{ this }}` is left unfenced. The model is in [Snapshot isolation](snapshot-isolation.md).
 
 ### `external`
 
-The one materialization that doesn't write Delta. It is dbt-duckdb's, shipped verbatim under
-duckrun's adapter name, for exporting a model as a plain file — a hand-off to a tool that reads
-parquet/CSV/JSON but not Delta.
+dbt-duckdb's file export, shipped verbatim: DuckDB runs the SQL, `COPY … TO` writes a parquet / CSV / JSON file, and the model becomes a view over it, so `ref()` works within the run in both directions.
 
 ```sql
 {{ config(materialized='external', location='exports/orders.parquet') }}
@@ -386,63 +215,50 @@ parquet/CSV/JSON but not Delta.
 select * from {{ ref('mart_orders') }}
 ```
 
-DuckDB runs the SQL, `COPY … TO` writes the file, and the model relation becomes a view over that
-file — so downstream `ref()` works within the run, and a Delta `table` model can read an external one
-(and vice versa). Everything is upstream's: same config spelling, same defaults, same output.
-
 | option | description |
 |---|---|
-| `location` | output **file** path. Defaults to `<external_root>/<identifier>.<format>` (`external_root` is a profile key, `.` if unset). Note this is a *file*, unlike the `location` of a Delta materialization. |
-| `format` | `parquet` (default) \| `csv` \| `json`. Inferred from `location`'s extension when omitted. |
-| `options` | dict spliced into `COPY … TO (…)` — e.g. `{'partition_by': 'year,month'}`, `{'per_thread_output': true}`, `{'compression': 'zstd'}`. |
+| `location` | output **file** path. Defaults to `<external_root>/<identifier>.<format>` (`external_root` is a profile key, `.` if unset). |
+| `format` | `parquet` (default) \| `csv` \| `json`; inferred from `location`'s extension when omitted. |
+| `options` | dict spliced into `COPY … TO (…)` — e.g. `{'partition_by': 'year,month'}`, `{'compression': 'zstd'}`. |
 | `delimiter` | legacy top-level alias, folded into `options`. |
 | `parquet_read_options` / `csv_read_options` / `json_read_options` | args for the `read_*` call the view is built from. |
-| `plugin`, `glue_register`, `glue_database`, `partition_columns` | register the written file with a dbt-duckdb plugin (e.g. the AWS Glue catalog) after the write. |
+| `plugin`, `glue_register`, `glue_database`, `partition_columns` | register the written file with a dbt-duckdb plugin after the write. |
 
-Two things to know, both inherited from how duckrun stores state:
+The view does not survive the process: a later run that reads an external model without rebuilding it needs upstream's hook, exactly as on dbt-duckdb. `--full-refresh` means nothing; every run rewrites the file.
 
-- **The view doesn't survive the process.** duckrun's DuckDB is in-memory and its disk discovery
-  rebuilds Delta tables only, so a later run that reads an external model *without* rebuilding it
-  (`dbt run --select some_downstream`) needs upstream's hook — exactly as on dbt-duckdb:
-
-  ```yaml
-  # dbt_project.yml
-  on-run-start: "{{ register_upstream_external_models() }}"
-  ```
-
-- **`--full-refresh` means nothing here** — every run rewrites the file wholesale. There is no
-  incremental external model, upstream or here.
+```yaml
+# dbt_project.yml
+on-run-start: "{{ register_upstream_external_models() }}"
+```
 
 ### Config options (`table` / `incremental` / `delta`)
 
 | option                  | description                                                                 |
 |-------------------------|-----------------------------------------------------------------------------|
 | `location`              | Delta path. Defaults to `<root_path>/<schema>/<id>`.                        |
-| `incremental_strategy`  | `merge` \| `insert` \| `append` \| `delete+insert` \| `microbatch` (incremental only). |
+| `incremental_strategy`  | `merge` \| `insert` \| `append` \| `delete+insert` \| `microbatch`.         |
 | `unique_key`            | column(s) to merge on.                                                       |
-| `merge_update_columns`  | merge: update only these columns on match (others untouched).               |
-| `merge_exclude_columns` | merge: update all columns **except** these on match.                        |
-| `merge_update_condition` / `merge_insert_condition` | merge: extra predicate AND-ed onto the matched-update / not-matched-insert clause (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). `merge_insert_condition` also applies to `insert`, where it must reference only the source — an unmatched row has no target to read. |
-| `merge_clauses` / `merge_update_set_expressions` | merge: dbt-duckdb-style custom clause list / per-column `SET` expressions — translated to delta_rs's full TableMerger clause list. The clause dict follows dbt-duckdb spelling for spelling, so one config works on both adapters: `action` `update` / `delete` / `insert` / `do_nothing`, `mode` `by_name` / `by_position` / `star` / `explicit`, a `condition` string **or** list, `insert: {columns, values}`, `update: {include, exclude, set_expressions}`, and `by: source` for a not-matched-**by-source** clause. An omitted `when_matched` / `when_not_matched` key gets dbt-duckdb's implicit default (update-by-name / insert-by-name) — so `merge_clauses={'when_matched': [{'action': 'do_nothing'}]}` is insert-only, and takes the same cheap append route as `incremental_strategy='insert'`. duckrun refuses only what delta_rs cannot express: `merge_on_using_columns` and `action: error`. |
-| `when_not_matched_by_source` | merge: duckrun's own top-level `merge_clauses` key (`update` with a `set` map / `delete` / `do_nothing`) for rows the source doesn't carry — full-sync semantics. Being duckrun-only, a dict that uses it opts **out** of the implicit clause defaults above; use dbt-duckdb's portable `{'by': 'source', …}` entry inside `when_not_matched` if you want both. |
-| `merge_max_spill_size`  | merge: memory ceiling in **bytes** for delta_rs's merge pool (not a disk budget). Defaults to ~60% of the **effective** limit — `min(physical RAM, container/cgroup limit, currently-free RAM)` — beyond which delta_rs spills the merge join to disk (like DuckDB's `memory_limit`). DuckDB itself is bounded once per session by a `memory_limit` pin at ~85% of the same effective limit (measurement shows the two never peak together — delta_rs holds ~99% of merge RSS); both log their chosen value at run start. Set `0` to disable. It bounds the merge pool, *not* the whole process (the Arrow source, read buffers, and spill-file page cache sit outside it), so on a tight container with a huge source the total can still exceed the cap — lower it if needed. A cap below the join's minimum (~hundreds of MB) makes the merge raise `Resources exhausted` instead of spilling. Requires deltalake 1.5.0 (pinned). |
-| `merge_max_temp_directory_size` | merge: disk cap in bytes for delta_rs's merge spill files (default ~80% of free disk). |
-| `merge_streamed_exec`   | merge: `true` streams a huge merge **source** instead of collecting it into memory — needed for very large sources (especially `WHEN NOT MATCHED BY SOURCE` custom clauses), at the cost of losing target-file pruning. Default `false` suits the normal small-batch-into-big-table case. |
-| `incremental_predicates`| merge / insert: extra predicates AND-ed into the merge (or anti-join) condition (use `target.`/`source.`, or dbt's `DBT_INTERNAL_DEST`/`DBT_INTERNAL_SOURCE`). On `insert`, a `target.<part> = source.<part>` entry also unlocks literal partition pruning of the target probe. |
-| `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. (`sync_all_columns` only *adds* — delta_rs can't drop columns.) |
+| `merge_update_columns`  | merge: update only these columns on match.                                   |
+| `merge_exclude_columns` | merge: update all columns **except** these on match.                         |
+| `merge_update_condition` / `merge_insert_condition` | merge: extra predicate AND-ed onto the matched-update / not-matched-insert clause (`target.` / `source.`, or `DBT_INTERNAL_DEST` / `DBT_INTERNAL_SOURCE`). `merge_insert_condition` also applies to `insert`, where it may reference only the source. |
+| `merge_clauses` / `merge_update_set_expressions` | merge: dbt-duckdb's custom clause list / per-column `SET` expressions, translated to delta-rs's TableMerger. Same spelling as upstream — `action` `update` / `delete` / `insert` / `do_nothing`, `mode` `by_name` / `by_position` / `star` / `explicit`, `condition`, `insert: {columns, values}`, `update: {include, exclude, set_expressions}`, `by: source` — with upstream's implicit defaults for an omitted `when_matched` / `when_not_matched`, so `{'when_matched': [{'action': 'do_nothing'}]}` is insert-only and takes the `insert` route. Rejected: `merge_on_using_columns` and `action: error`. |
+| `when_not_matched_by_source` | merge: duckrun's own top-level `merge_clauses` key (`update` with a `set` map / `delete` / `do_nothing`) for rows the source doesn't carry. A dict using it opts out of the implicit defaults above; use upstream's portable `{'by': 'source', …}` entry inside `when_not_matched` to keep both. |
+| `merge_max_spill_size`  | merge: memory ceiling in **bytes** for delta-rs's merge pool, beyond which the join spills to disk. Default ~60% of the effective limit (`min(physical RAM, cgroup limit, free RAM)`); DuckDB is pinned separately at ~85%. It bounds the merge pool, not the process, so on a tight container with a huge source lower it; below the join's minimum (~hundreds of MB) the merge raises `Resources exhausted`. `0` disables. |
+| `merge_max_temp_directory_size` | merge: disk cap in bytes for the merge's spill files. Default: the spill disk's free space minus `min(20% of free, 8 GiB)`. |
+| `merge_streamed_exec`   | merge: `true` streams a huge merge **source** instead of collecting it (needed for very large sources, especially by-source clauses) at the cost of target-file pruning. Default `false`. |
+| `incremental_predicates`| merge / insert: extra predicates AND-ed into the join condition. On `insert`, a `target.<part> = source.<part>` entry also unlocks partition pruning of the target probe. |
+| `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. `sync_all_columns` only *adds* — delta-rs can't drop columns. |
 | `partition_by`          | Delta partition column(s).                                                   |
-| `sort_by`               | column(s) to physically ORDER the write by (long RLE runs / dictionary locality — a trailing `ORDER BY` in the model SQL is **not** honored, this config is). The scalar `'auto'` (case-insensitive, **experimental**) profiles the staged model result and picks the key itself — the same heuristic as the connection API's `SORTED BY AUTO`. It writes unsorted when nothing pays off, and re-profiles every incremental batch (so the key can vary run to run). The profile decides only the key — the write lands in the same fixed layout as every other write (see [the write layout](parquet-layout.md#parquet-layout-the-file-format)). `sort_by` is inert on the delta_rs `merge` / `microbatch` / `delete+insert` paths, which keep the table's existing layout — on those, `'auto'` is skipped entirely rather than profiled and discarded, so a project-wide `+sort_by: auto` costs nothing on a merge model. See [Automatic sorting](parquet-layout.md#automatic-sorting). |
-| `max_row_group_size`    | **rows** (deltalake's `WriterProperties` spelling) — an explicit parquet row-group **ceiling** for this model's writes (default: the fixed **6M**; see [the write layout](parquet-layout.md#parquet-layout-the-file-format)). An explicit value is honored verbatim and preserved by post-write compaction. E.g. `max_row_group_size: 16000000` pins a large fact to 16M-row Direct Lake segments. Applies wherever duckrun writes files (overwrite, append, `insert`, `delete+insert`, `microbatch`); the delta_rs `merge` write itself keeps delta_rs defaults, but the post-merge compaction folds merged files into this geometry. |
-| `target_file_size_mb`   | **megabytes** — per-model target parquet file size (default 256 MB). A row group cannot span files, so this byte cap also bounds segment size; the same value drives this model's post-write compaction so maintenance doesn't undo it. Same write-path coverage (and merge caveat) as `max_row_group_size`. |
-| `merge_schema`          | allow schema evolution on write.                                            |
-| `timestamp_ntz`         | default `false`: a **naive** `TIMESTAMP` column is written UTC-adjusted (`timezone('UTC', col)` — the naive value read as a UTC wall clock, session-TZ independent) and lands as Delta `timestamp`, because Fabric's SQL analytics endpoint silently **omits** `timestamp_ntz` columns (issue #42). `TIMESTAMPTZ` columns are untouched. `true` keeps the verbatim `timestamp_ntz` write for this model; `DUCKRUN_TIMESTAMP_NTZ=1` is the env spelling (whole run / connection API). A pre-existing `timestamp_ntz` column is matched, not broken: appends/merges skip the coercion for it and warn once — `--full-refresh` retypes. See [limitations](limitations.md#microsoft-fabric--onelake). |
+| `sort_by`               | column(s) to physically `ORDER` the write by — a trailing `ORDER BY` in the model SQL is not honored, this is. The scalar `'auto'` profiles the staged result and picks the key itself, re-profiling every batch and writing unsorted when nothing pays off. Inert on the `merge` / `microbatch` / `delete+insert` paths. See [Automatic sorting](parquet-layout.md#automatic-sorting). |
+| `max_row_group_size`    | **rows** — the parquet row-group ceiling for this model's writes (default 6M). Honored verbatim and preserved by post-write compaction. The delta-rs `merge` write keeps delta-rs defaults; post-merge compaction folds its files into this geometry. See [Write settings](parquet-layout.md#write-settings). |
+| `target_file_size_mb`   | **megabytes** — target parquet file size (default 256). Same coverage and merge caveat as `max_row_group_size`. |
+| `merge_schema`          | allow schema evolution on write.                                             |
+| `timestamp_ntz`         | default `false`: a naive `TIMESTAMP` column is written UTC-adjusted and lands as Delta `timestamp`, because Fabric's SQL analytics endpoint omits `timestamp_ntz` columns. `true` (or `DUCKRUN_TIMESTAMP_NTZ=1`) keeps the verbatim `timestamp_ntz` write. Details in [Limitations](limitations.md#microsoft-fabric-onelake). |
 | `storage_options`       | per-model override forwarded to deltalake.                                   |
 
 ## Reading existing tables/files as sources
 
-A source routed to the `duckrun` plugin can be a Delta table, a CSV, or a Parquet file.
-`delta_table_path` always reads Delta; otherwise the path comes from `location` and the format is
-taken from `format` (`csv` | `parquet` | `delta`) or inferred from the extension.
+A source routed to the `duckrun` plugin can be a Delta table, a CSV, or a Parquet file. `delta_table_path` always reads Delta; otherwise the path comes from `location` and the format from `format` (`csv` | `parquet` | `delta`) or the extension.
 
 ```yaml
 sources:
@@ -466,46 +282,23 @@ sources:
 
 ## How it works
 
-1. dbt compiles your model SQL.
-2. The materialization stages it as a DuckDB view.
-3. A `dbt-duckdb` plugin (a `store()` hook) hands that relation to deltalake over the Arrow C-stream
-   interface (`__arrow_c_stream__`) — no pyarrow required — which `write_deltalake` /
-   `DeltaTable.merge` consume natively.
-4. The model relation becomes a `delta_scan` view over the new Delta table.
+1. dbt compiles the model SQL; the materialization stages it as a DuckDB view.
+2. A dbt-duckdb plugin (`store()`) hands the relation to deltalake over the Arrow C-stream interface, which `write_deltalake` / `DeltaTable.merge` consume natively.
+3. The model relation becomes a `delta_scan` view over the new Delta table.
 
-The adapter is a thin subclass of dbt-duckdb declaring `dependencies=['duckdb']`, so `view`, `seed`,
-tests, and the rest are inherited directly; only `table` and `incremental` are overridden to write
-Delta.
+The adapter subclasses dbt-duckdb with `dependencies=['duckdb']`; only `table` and `incremental` are overridden.
 
 ## Table maintenance (compaction & vacuum)
 
-**duckrun maintains your Delta tables automatically — no configuration, no scheduled job, no separate
-`OPTIMIZE`/`VACUUM` run to remember.** It happens inline on every write.
-
-This matters because delta_rs has **no** automatic, post-commit maintenance of its own — and it
-ignores Databricks-style auto-optimize table properties (`delta.autoOptimize.*`). Left alone, an
-incremental table fragments into many small Parquet files and keeps every superseded file version
-forever. duckrun runs the maintenance for you, right after each write:
+delta-rs has no post-commit maintenance of its own, so duckrun runs it inline after each write:
 
 | write | maintenance |
 |---|---|
 | `table` / overwrite | `vacuum` + metadata cleanup every run |
-| `append` | `optimize.compact` + `vacuum` + cleanup once the small-file **byte debt** is worth it (≥8 files under half the target size AND ≥2× the target in small bytes) |
-| `merge` / `insert` | same threshold-gated `compact` + `vacuum` + cleanup after the merge |
-| `microbatch` / delete+insert | same threshold-gated maintenance |
+| `append`, `merge`, `insert`, `microbatch`, `delete+insert` | `optimize.compact` + `vacuum` + cleanup once the small-file byte debt is worth it (≥8 files under half the target size AND ≥2× the target in small bytes) |
 
-Every table duckrun creates is stamped with `delta.checkpointInterval = 10`, so delta-rs writes a
-Delta log checkpoint every 10 commits (its default is 100) — an incrementally-written table never
-replays a long JSON commit tail on open. Creation-only: an existing table keeps whatever interval
-it has.
-
-Every `vacuum` uses delta_rs's **safe default retention (7 days / 168h)**, so files a concurrent
-reader might still be reading are never deleted out from under it. The trade-off is that a superseded
-file version lingers for the retention window before it can be reclaimed — duckrun favors read-safety
-over immediate disk savings.
+Every table duckrun creates is stamped `delta.checkpointInterval = 10` (delta-rs's default is 100), creation-only. Every `vacuum` uses delta-rs's safe retention (7 days), so a file a concurrent reader may still be reading is never deleted; a superseded file lingers for that window.
 
 ## Limitations
 
-The adapter's trade-offs — what `threads` above 1 costs you, the shared two-engine memory pool, the
-soft-tombstone `DROP TABLE`, rejected merge configs, add-only schema evolution — are consolidated
-with everything else in the top-level [Limitations](limitations.md) page.
+Consolidated on the [Limitations](limitations.md) page.

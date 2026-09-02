@@ -23,15 +23,13 @@ Microsoft Fabric OneLake lakehouse.*
 
     The coffee-shop scenario (`coffee_shop`): ingest two dimension CSVs over https, dedup
     the SCD2 product dim, generate an N-row fact partitioned by region, and a revenue mart.
-    Built for real on OneLake, so the catalog carries Delta stats.
 
     *source: [JosueBogran/coffeeshopdatageneratorv2](https://github.com/JosueBogran/coffeeshopdatageneratorv2)*
 
 -   __[multi-lakehouse — Bronze/Silver/Gold across three Lakehouses](multicatalog_dbt.html)__
 
     One dbt project, a medallion whose layers each materialize into a **separate** Fabric
-    Lakehouse via the `catalogs:` profile key + `+database: <alias>` on a model. Built for real
-    on OneLake; `ref()` and joins resolve across the Lakehouses.
+    Lakehouse via the `catalogs:` profile key + `+database: <alias>` on a model. `ref()` and joins resolve across the Lakehouses.
 
     *source: [demo_multicatalog_dbt.py](https://github.com/djouallah/duckrun/blob/main/tests/integration_tests/multicatalog/demo_multicatalog_dbt.py)*
 

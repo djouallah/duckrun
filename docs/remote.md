@@ -10,10 +10,9 @@ or CI runner. It's a drop-in for dbt's own `dbtRunner`: it ships only the dbt *l
 macros, a token-scrubbed `profiles.yml`) into a **temporary Fabric Python notebook**, runs your dbt
 command there, streams the log back, and deletes the notebook when it's done.
 
-Why bother? Running dbt against OneLake from a laptop means every read and write crosses the network,
-tokens have to be juggled, and big builds can exhaust local memory. The same project run **on Fabric
-compute, co-located with the lakehouse**, is far faster and scales past what your machine can hold —
-Fabric has no Livy-for-Python endpoint, so the temp-notebook trick is how you get there.
+Running dbt against OneLake from a laptop means every read and write crosses the network and a big
+build can exhaust local memory. Fabric has no Livy-for-Python endpoint, so a temporary notebook is
+how the same project runs next to the lakehouse.
 
 ## Usage
 
@@ -61,12 +60,9 @@ print(build.success, test.success)       # results are populated after the block
 lightweight stand-in for dbt's `dbtRunnerResult`, enough for the common `res.success` check — the
 full dbt log tail is printed to your console.
 
-`.item_id` is reported even though the notebook is deleted on the way out: Fabric bills a run's
-compute against the notebook **item**, so that id is what joins the run to the Capacity Metrics
-data — no display-name matching, and it stays valid long after the item is gone. Every command in
-one `with` block shares the notebook and so reports the same id, and a run that died is attributed
-too: the raised `RemoteRunError` carries `.item_id`. `Workspace.run_python` reports the same thing
-as `ScriptResult.item_id`.
+`.item_id` is reported even though the notebook is deleted: Fabric bills a run's compute against
+the notebook **item**, so that id joins the run to the Capacity Metrics data. Every command in one
+`with` block shares it, and a failed run's `RemoteRunError` carries it too.
 
 ## The `cores` knob
 

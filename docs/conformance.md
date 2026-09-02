@@ -2,28 +2,22 @@
 
 `tests/conformance/` runs the official dbt adapter test suite
 ([`dbt-tests-adapter`](https://github.com/dbt-labs/dbt-adapters/tree/main/dbt-tests-adapter))
-against duckrun ([`.github/workflows/cores.yml`](../.github/workflows/cores.yml), `conformance` job).
-The card below is published to the job summary and regenerated on every push to `main`, so it
-reflects the latest `main` — which may be ahead of the published PyPI release.
+against duckrun ([`cores.yml`](../.github/workflows/cores.yml), `conformance` job). The card is
+regenerated on every push to `main`, so it may be ahead of the published PyPI release.
 
-Every still-failing test in the card below falls into one of three categories:
+Every still-failing test falls into one of these categories:
 
-- **no persistent views** — the open Delta format (and `deltalake==1.5.0`) has no *view* primitive;
-  a view exists only in some engine's catalog, never on disk. duckrun's durable artifact is always a
-  Delta *table*, so a `materialized='view'` model is just a transient DuckDB catalog view, and the
-  tests that swap a model's materialization `table → view` (`TestSimpleMaterializationsDuckDB::test_base`,
-  `changing_relation_type`) have no durable home to land in. Satisfying them would mean rewriting
-  Delta data on a mere materialization change — deliberately not done.
-- **deliberate rejection of silently-divergent merge configs** — `merge_on_using_columns` (and a
-  clause `action: error`) are dbt-duckdb-specific with no delta-rs equivalent. duckrun raises a clear
-  error rather than accept them and quietly run something else (a silent-divergence data bug), so
+- **No persistent views.** Delta has no view primitive, so a `materialized='view'` model is a
+  transient DuckDB catalog view, and the tests that swap a model `table → view`
+  (`TestSimpleMaterializationsDuckDB::test_base`, `changing_relation_type`) have nowhere durable to
+  land. Rewriting Delta data on a materialization change is deliberately not done.
+- **Deliberate rejection of silently-divergent merge configs.** `merge_on_using_columns` and a clause
+  `action: error` have no delta-rs equivalent, so duckrun raises instead of running something else;
   `test_ducklake_valid_single_update` stays red on purpose. `merge_clauses` and
-  `merge_update_set_expressions` ARE translated onto delta-rs's TableMerger clause list —
-  `test_merge_custom_clauses` and `test_merge_with_set_expressions` pass.
-- **delta-rs capability limit** — `on_schema_change='sync_all_columns'` requires *dropping* columns,
-  which delta-rs can't do (it's add-only), so duckrun's schema evolution is add-only; and
-  `QuotingFalse` expects a hard compile error for unquoted identifiers with spaces, which DuckDB and
-  delta-rs simply permit.
+  `merge_update_set_expressions` are translated and pass.
+- **delta-rs and DuckDB limits.** `sync_all_columns` needs column drops, which delta-rs cannot do
+  (schema evolution is add-only); `QuotingFalse` expects a compile error for unquoted identifiers
+  with spaces, which DuckDB permits.
 
 <!-- CONFORMANCE:START -->
 

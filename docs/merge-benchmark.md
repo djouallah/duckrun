@@ -1,22 +1,18 @@
 # Incremental MERGE benchmark
 
-The `merge-spill` job in [`local_stress_tests.yml`](../.github/workflows/local_stress_tests.yml) builds a large TPCH `lineitem`
-fact table (the release gate runs scale factor **10**, ~60M rows) and runs several merge
-shapes against it — mixed upsert, insert-only, update-only, idempotent re-merge, and the full
-delta-rs clause set (CDC delete+update+insert, by-source delete, expression update) — plus a
-plain `append` and `overwrite` of the same batch for comparison, all through the
-**connection API** (`duckrun.connect()` + `conn.sql(...)` — no dbt), on a single machine with
-duckrun's shipping memory defaults (the session DuckDB `memory_limit` pin + delta_rs `max_spill_size`
-+ target pruning). It runs on a standard **GitHub-hosted runner (~16 GB RAM)** — no beefy
-hardware — proving the merges stay within that RAM and apply every UPDATE/INSERT/DELETE
-correctly, and lets you compare a MERGE's cost against a plain write of the same batch. It gates
-every release; the latest scorecard is rendered live below. Every run also appends one line to the
-[full run history](merge-benchmark-history.md).
+The `merge-spill` job in [`local_stress_tests.yml`](../.github/workflows/local_stress_tests.yml)
+builds a TPCH `lineitem` fact table (scale factor **10**, ~60M rows, the release gate) and runs
+several merge shapes against it — mixed upsert, insert-only, update-only, idempotent re-merge, and
+the full delta-rs clause set (CDC delete+update+insert, by-source delete, expression update) — plus
+a plain `append` and `overwrite` of the same batch for comparison. Everything goes through
+`duckrun.connect()` + `conn.sql(...)` on a GitHub-hosted runner (~16 GB RAM) with duckrun's shipping
+memory defaults, and every UPDATE / INSERT / DELETE is checked for correctness. The latest scorecard
+is below; every run appends a line to the [run history](merge-benchmark-history.md).
 
-One row here no longer measures delta-rs: **`Insert-only`**. An insert-only merge removes no row, so
-duckrun now routes it — from SQL and from dbt alike — to a DuckDB anti-join committed as a plain
-append (see [the dbt adapter guide](dbt-adapter.md#insert--insert-only-computed-in-duckdb)). Every
-other row still exercises delta-rs's merge, because changing or removing a row means rewriting files.
+**`Insert-only` no longer measures delta-rs**: an insert-only merge removes no row, so duckrun
+routes it — from SQL and dbt alike — to a DuckDB anti-join committed as a plain append (see
+[`insert`](dbt-adapter.md#insert-insert-only-computed-in-duckdb)). Every other row exercises
+delta-rs's merge.
 
 <!-- MERGE:START -->
 

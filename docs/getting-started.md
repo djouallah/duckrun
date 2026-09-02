@@ -6,8 +6,7 @@ hide:
 # Getting started
 
 duckrun gives you a DuckDB SQL engine that **reads and writes Delta Lake** — locally or on
-OneLake / S3 / GCS / ADLS. Everything below is plain `conn.sql(...)`: if you know SQL, you're
-already productive.
+OneLake / S3 / GCS / ADLS. Everything below is plain `conn.sql(...)`.
 
 ## 1. Connect
 
@@ -16,10 +15,7 @@ import duckrun
 
 # Read-only by default — safe to explore, no accidental writes.
 conn = duckrun.connect("./lakehouse/Tables")
-# OneLake: duckrun.connect("abfss://<ws>@onelake.dfs.fabric.microsoft.com/<lakehouse>/Tables/dbo")
-# OneLake shorthand for the same thing: duckrun.connect("<ws>/<lakehouse>.Lakehouse/dbo")
-#   — also takes GUIDs: duckrun.connect("<ws-guid>/<lakehouse-guid>")
-#   — a suffix-less "ws/lh" stays a local relative path
+# OneLake: duckrun.connect("<ws>/<lakehouse>.Lakehouse/dbo")   # shorthand — see the Connection API
 
 # Opt into writes:
 conn = duckrun.connect("./lakehouse/Tables", read_only=False)

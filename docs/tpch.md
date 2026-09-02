@@ -11,8 +11,7 @@ big-disk runner), committed to `main`.
 It is a **coverage + cost** check, not a speed contest: the ingestion time is the (near-free)
 convert cost, and the 22 query times are DuckDB reading Delta with no second engine to compare
 against — so read them as "the whole schema loads and all 22 queries run at this scale", not a
-"duckrun is fast" claim. (We measured rewriting sorted with fine row groups and a native DuckDB file
-too; zero-rewrite convert was cheapest to load and fastest to query, so it's the arm kept.)
+"duckrun is fast" claim.
 Every run also appends one line to the [full run history](tpch-benchmark-history.md).
 
 <!-- TPCH:START -->
