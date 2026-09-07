@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **The default parquet row-group ceiling is now 4M rows** (was 6M; `target_file_size` stays
+  256 MB). One row group is one Direct Lake column segment, and the layout sweeps put the useful
+  band at 2-6M rows with hot scans favouring the small end — 4M sits mid-band, trading a little
+  per-segment density for one more group per file to scan in parallel. Still a CEILING, not a size:
+  the 256 MB file roll usually closes the group first. Applies to every write and to post-write
+  compaction; a per-model `max_row_group_size` still wins verbatim.
 - **The default target file size is back to 256 MB** (128 MB shipped only in 0.4.64). A Parquet
   row group cannot span files, so every file's LAST row group is truncated wherever the byte roll
   lands — halving the file size doubles the file count and with it the truncated tail segments:

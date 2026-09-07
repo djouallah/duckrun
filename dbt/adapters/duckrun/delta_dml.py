@@ -1477,7 +1477,7 @@ class _DeltaDML:
         data = self.cursor.sql(body)
         # overwrite_schema so this replaces a prior table (or a drop-tombstone) wholesale — a live
         # table is recreated with the real schema, clearing any tombstone marker. Every CTAS —
-        # SORTED BY AUTO included — lands on the fixed geometry (6M-row ceiling, 256 MB files),
+        # SORTED BY AUTO included — lands on the fixed geometry (4M-row ceiling, 256 MB files),
         # so this SQL path and the dbt table path behave identically.
         engine.write_delta(loc, data, "overwrite", overwrite_schema=True,
                            partition_by=partition_cols or None, storage_options=self.so,

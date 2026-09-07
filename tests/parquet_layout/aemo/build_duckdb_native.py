@@ -43,7 +43,8 @@ Shape mechanics, each measured in a local probe before this was written:
 
 Env: ONELAKE_TABLES_PATH (resolve_env), OPT_SORT (explicit columns, default 'date, time' —
 'auto' is the delta-rs builder's spelling and is rejected here), OPT_RG (rows per row group,
-default 6000000 = duckrun's fixed write geometry; the nightly OOM'd the 12.4GiB runner at 4
+default 6000000, the geometry duckrun shipped through 0.4.67 — PINNED here so this A/B arm stays
+comparable across releases, not following the 4M default; the nightly OOM'd the 12.4GiB runner at 4
 threads), OPT_DICT_LIMIT (default 16000000), OPT_PAGE_BYTES (DATA_PAGE_SIZE_LIMIT, default 1048576;
 65536 is the value that lands page geometry near delta-rs's),
 OPT_TFS_MB (file rotation size, default 256 = duckrun's target_file_size_mb),

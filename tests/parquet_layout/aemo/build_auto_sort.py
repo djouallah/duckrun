@@ -21,7 +21,7 @@ force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 # The CTAS goes through the connection API (no dbt config to carry it), so pin it at the one
 # sizing seam every write reads at call time: engine._ROW_GROUP_SIZE (the module global behind
 # _writer_properties). Same writer path (row_group_rows -> WriterProperties) the dbt config
-# feeds; empty = the fixed 6M default.
+# feeds; empty = the fixed 4M default.
 _rg = os.environ.get("OPT_RG", "").strip()
 OPT_RG = int(_rg) if _rg.isdigit() and int(_rg) > 0 else None
 if OPT_RG is not None:
@@ -109,6 +109,6 @@ else:
 
 report.merge({"tables": {TABLE: {"build": {
     "engine": "delta_rs", "sort": clause, "sort_key": sort_key, "vorder": False,
-    "row_group_ceiling": OPT_RG,     # None = the fixed 6M default
+    "row_group_ceiling": OPT_RG,     # None = the fixed 4M default
     "target_file_size_mb": OPT_TFS_MB,  # None = the 256 MB default
     "seconds": round(time.perf_counter() - _t0, 1), "status": status}}}})

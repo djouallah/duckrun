@@ -958,7 +958,7 @@ class DuckSession:
         Returns ``(query, staged)``. ``staged`` is a temp table holding the body's rows, or
         ``None`` when nothing was staged (any non-AUTO statement). The CALLER must drop it after the
         statement runs — :meth:`sql` does, in a ``finally``. The write itself is NOT sized here:
-        an AUTO write lands on the same fixed geometry (6M-row ceiling, 256 MB files) as every
+        an AUTO write lands on the same fixed geometry (4M-row ceiling, 256 MB files) as every
         other write — AUTO's one job is picking the sort key.
 
         When the body is a bare ``SELECT * FROM <one delta table>`` (the re-cluster-this-table case)

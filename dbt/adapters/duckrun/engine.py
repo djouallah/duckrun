@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover - older layouts
         ColumnProperties = None
 
 
-# The FIXED row-group ceiling (6M rows) every write uses — see policy.ROW_GROUP_DEFAULT_ROWS.
+# The FIXED row-group ceiling (4M rows) every write uses — see policy.ROW_GROUP_DEFAULT_ROWS.
 # This alias is the default max_row_group_size _writer_properties uses when no explicit ceiling is
 # passed; only a per-model max_row_group_size config moves it.
 _ROW_GROUP_SIZE = ROW_GROUP_DEFAULT_ROWS
@@ -92,7 +92,7 @@ _PART_PRUNE_MAX = 400
 
 def _writer_properties(row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, the fixed 6M-row group ceiling, a 32 MB dictionary page limit
+    # compaction, and the optimize sort-rewrite: SNAPPY, the fixed 4M-row group ceiling, a 32 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
     # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap that shapes
     # dense columns into ~1 MB pages (the 1M-row cap only backstops ultra-compressible columns — see
@@ -1120,7 +1120,7 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     the recommended ORDER BY columns (``[]`` if nothing pays off) and the advisory lines for the
     CALLER to print/log. The one seam behind dbt's ``sort_by='auto'`` and the connection API's
     relation fallback for ``SORTED BY AUTO``. The write itself is NOT sized here — an AUTO write
-    lands on the same fixed geometry (6M-row ceiling, 256 MB files) as every other write.
+    lands on the same fixed geometry (4M-row ceiling, 256 MB files) as every other write.
 
     ``source`` MUST be cheap to scan repeatedly — the recommender reads it several times. The
     CALLER is responsible for that: both surfaces materialize a PROFILING SUBSTRATE (a full local
@@ -1338,7 +1338,7 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
 
     The compaction trigger matches the Tier-0 safe button exactly (compaction_debt: at least 8 files
     under half the target AND at least 2x the target in small bytes). compact() reuses the same
-    _writer_properties() read layout (the fixed 6M-row ceiling) and _TARGET_FILE_SIZE every file
+    _writer_properties() read layout (the fixed 4M-row ceiling) and _TARGET_FILE_SIZE every file
     write uses, so maintenance (including the consolidation of files a lean MERGE left behind) keeps
     the uniform Direct Lake layout.
 
@@ -1349,7 +1349,7 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
 
     ``target_file_size`` / ``row_group_cap`` carry a model's EXPLICIT write geometry (the
     ``target_file_size_mb`` / ``max_row_group_size`` dbt configs) into maintenance: without them, the
-    very next compaction would re-fold the model's files back into the global 256 MB / fixed-6M
+    very next compaction would re-fold the model's files back into the global 256 MB / fixed-4M
     layout, silently undoing the config the write just honored. ``None`` = the defaults, unchanged."""
     if cur is None:
         return
@@ -1433,7 +1433,7 @@ def write_delta(
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
     Every write lands in the one read-layout profile (tuned writer properties + 256 MB files) —
-    append included, with the same fixed 6M row-group ceiling everywhere. Nothing is derived from
+    append included, with the same fixed 4M row-group ceiling everywhere. Nothing is derived from
     the result: no planner estimate, no count, no prior-log probe (the only self-sizing write is
     SORTED BY AUTO, whose profile already paid for an exact count).
 
@@ -1825,7 +1825,7 @@ def optimize(
     cur=None,
 ) -> Dict:
     """Compact small files into larger ones (delta_rs ``optimize.compact``) and return the operation
-    metrics. Reuses the one ``_writer_properties()`` read layout (the fixed 6M-row ceiling — same as
+    metrics. Reuses the one ``_writer_properties()`` read layout (the fixed 4M-row ceiling — same as
     every write; ``cur`` is accepted for API compatibility and unused). A lexicographic ``ORDER BY``
     at write time
     (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a columnar reader wants;

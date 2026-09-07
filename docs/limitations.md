@@ -66,7 +66,7 @@ The full matrix is in the [Connection API](connection-api.md#raw-sql-dml-through
 
 - **`SORTED BY AUTO` (dbt: `sort_by: auto`) is a greedy heuristic** over approximate cardinalities and HyperLogLog dependency tests, validated against essentially one dataset. It is not guaranteed to shrink anything and can pick a worse key than arrival order. Prefer `SORTED BY (cols)` when you know the grain, and compare `conn.get_stats()` before and after. See [Automatic sorting](parquet-layout.md#automatic-sorting).
 - **Profiling stages the source locally.** Every row up to 30M, a deterministic hash-selected ~30M-row substrate above that (`DUCKRUN_PROFILE_ROWS`; `0` = always exact), staged into a temp table that spills to DuckDB's `temp_directory`, so disk is the ceiling. An explicit key skips profiling.
-- **The write geometry is fixed**: a 6M-row row-group ceiling and a 256 MB target file for every write, nothing derived from the result. `max_row_group_size` / `target_file_size_mb` override it per model. See [Write settings](parquet-layout.md#write-settings).
+- **The write geometry is fixed**: a 4M-row row-group ceiling and a 256 MB target file for every write, nothing derived from the result. `max_row_group_size` / `target_file_size_mb` override it per model. See [Write settings](parquet-layout.md#write-settings).
 
 ## Memory
 

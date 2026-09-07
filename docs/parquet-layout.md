@@ -2,7 +2,7 @@
 
 duckrun tries to write **VertiPaq-friendly Parquet**. Three properties define every table it lands:
 
-- **6M-row row groups** — one Parquet row group becomes one VertiPaq column segment.
+- **4M-row row groups** — one Parquet row group becomes one VertiPaq column segment.
 - **Dictionary encoding** — kept wherever sensible, and declared in the footer, so the transcode is a remap.
 - **Sorted** — duckrun has no V-Order; it approximates its effect with a single global `ORDER BY` over the table.
 
@@ -25,7 +25,7 @@ The layout is mainly for the **cold** load, the cost a report user feels on firs
 | Property | Value | Why |
 | --- | --- | --- |
 | Compression | `SNAPPY` | The transcode is decode-bound. SNAPPY output is ~1.3× ZSTD on representative data; the sort and the dictionary do most of the shrinking. |
-| Row group | ≤ 6M rows, fixed | One row group becomes one segment. 1–16M rows is a healthy segment; 2–6M measured best in the sweeps (hot leans to ~2M), 16M is the ceiling, and DuckDB's 122,880-row default made the same table 3.5× slower cold. This is a ceiling, not a size: the 256 MB file roll usually closes the group first. |
+| Row group | ≤ 4M rows, fixed | One row group becomes one segment. 1–16M rows is a healthy segment; 2–6M measured best in the sweeps (hot leans to ~2M), so 4M sits mid-band; 16M is the ceiling, and DuckDB's 122,880-row default made the same table 3.5× slower cold. This is a ceiling, not a size: the 256 MB file roll usually closes the group first. |
 | Dictionary page | 32 MB | Mid- and high-cardinality columns stay dictionary-encoded; truly unique columns overflow to PLAIN, which is correct. It is also the main lever on merge memory, since a merge reading the table materializes the dictionaries: on an 18M-row merge, 128 MB peaked at ~25 GB, 16 MB at ~8.7 GB. |
 | Data page | 1 MB, 1M-row cap | The row cap matters: without it a highly compressible column buffers the whole row group as one page ([arrow-rs #5797](https://github.com/apache/arrow-rs/issues/5797)). |
 | Statistics | chunk-level, 64-char truncation | Row-group min/max is what a reader skips on; page statistics only bloat the footer. |

@@ -1753,18 +1753,18 @@ def _live_files(conn, table):
 
 
 def test_ctas_gets_the_fixed_row_group_ceiling(conn):
-    # Every normal write uses the FIXED 6M-row ceiling — nothing is derived from the result (the
-    # planner-estimate machinery is gone). 20M rows → 6M + 6M + 6M + 2M = 4 groups.
+    # Every normal write uses the FIXED 4M-row ceiling — nothing is derived from the result (the
+    # planner-estimate machinery is gone). 20M rows → 5 full 4M groups.
     conn.sql("CREATE OR REPLACE TABLE small_ctas AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "small_ctas")
-    assert 4 <= n <= 5, f"expected 4 row groups (20M at the fixed 6M ceiling), got {n}"
+    assert 5 <= n <= 6, f"expected 5 row groups (20M at the fixed 4M ceiling), got {n}"
 
 
 def test_ctas_sorted_result_gets_the_same_fixed_ceiling(conn):
     # SORTED BY (an explicit column list) changes the row ORDER, never the geometry.
     conn.sql("CREATE OR REPLACE TABLE sorted_ctas SORTED BY (j) AS select i as j from range(20000000) t(i)")
     n = _row_groups(conn, "sorted_ctas")
-    assert 4 <= n <= 5, f"sorted CTAS changed the fixed geometry: {n} row groups"
+    assert 5 <= n <= 6, f"sorted CTAS changed the fixed geometry: {n} row groups"
 
 
 def test_ctas_geometry_is_independent_of_the_source_size(conn):
@@ -1774,12 +1774,12 @@ def test_ctas_geometry_is_independent_of_the_source_size(conn):
              "select * from (select i as j from range(200000000) t(i) limit 20000000)")
     assert conn.sql("select count(*) from limited_ctas").fetchone()[0] == 20000000
     n = _row_groups(conn, "limited_ctas")
-    assert 4 <= n <= 5, f"expected 4 row groups at the fixed 6M ceiling, got {n}"
+    assert 5 <= n <= 6, f"expected 5 row groups at the fixed 4M ceiling, got {n}"
 
 
 def test_estimator_machinery_is_gone():
     # The write path must take no planner estimate, no count(*), and no prior-log probe — the whole
-    # apparatus was deleted (fixed 6M/256MB geometry). Guards against it creeping back.
+    # apparatus was deleted (fixed 4M/256MB geometry). Guards against it creeping back.
     from dbt.adapters.duckrun import engine
     for name in ("estimated_rows", "prior_row_count", "table_num_records",
                  "_walk_cardinality", "_plan_has_limit", "_warn_if_estimate_was_far_off"):
@@ -2024,8 +2024,8 @@ def test_replace_window_into_tz_column(conn):
 
 
 def test_compaction_lands_the_fixed_read_layout(conn):
-    # Compaction rewrites fragmented appends into the same fixed read layout every write uses (6M
-    # ceiling, 256 MB target) — no row count is taken, no derived sizing. 20M rows → 4 groups.
+    # Compaction rewrites fragmented appends into the same fixed read layout every write uses (4M
+    # ceiling, 256 MB target) — no row count is taken, no derived sizing. 20M rows → 5 groups.
     from dbt.adapters.duckrun import engine
     conn.sql("CREATE OR REPLACE TABLE compact_me AS select i as j from range(4000000) t(i)")
     for k in range(1, 5):
@@ -2037,7 +2037,7 @@ def test_compaction_lands_the_fixed_read_layout(conn):
     live = engine._delta_table(loc, conn.storage_options).file_uris()
     n = conn.sql(f"select count(*) from (select distinct file_name, row_group_id "
                  f"from parquet_metadata({live!r}))").fetchone()[0]
-    assert 4 <= n <= 5, f"compaction left the fixed 6M layout: {n} row groups"
+    assert 5 <= n <= 6, f"compaction left the fixed 4M layout: {n} row groups"
 
 
 def test_deleted_row_count_gates_on_the_protocol(conn):
@@ -2217,14 +2217,14 @@ def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
 
 def test_sorted_by_auto_uses_the_fixed_geometry(conn):
     # AUTO's one job is picking the sort key — the write itself lands on the SAME fixed geometry
-    # as every other write (6M-row ceiling, 256 MB file roll). 20M rows → full 6M-row groups.
+    # as every other write (4M-row ceiling, 256 MB file roll). 20M rows → full 4M-row groups.
     conn.sql("CREATE OR REPLACE TABLE auto_geo SORTED BY AUTO AS "
              "select i as j, (i%1000)::int k from range(20000000) t(i)")
     live = _live_files(conn, "auto_geo")
     mx, total = conn.sql(
         f"select max(row_group_num_rows), sum(row_group_num_rows) from (select distinct "
         f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchone()
-    assert mx == 6_000_000, f"AUTO left the fixed 6M ceiling: max group {mx}"
+    assert mx == 4_000_000, f"AUTO left the fixed 4M ceiling: max group {mx}"
     assert total == 20_000_000
 
 
@@ -2239,16 +2239,16 @@ def test_auto_recluster_gets_the_fixed_geometry_too(conn):
     mx, total = conn.sql(
         f"select max(row_group_num_rows), sum(row_group_num_rows) from (select distinct "
         f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchone()
-    assert mx == 6_000_000, f"AUTO re-cluster left the fixed 6M ceiling: max group {mx}"
+    assert mx == 4_000_000, f"AUTO re-cluster left the fixed 4M ceiling: max group {mx}"
     assert total == 20_000_000
 
 
 def test_plain_ctas_keeps_the_fixed_ceiling(conn):
-    # A plain CTAS keeps the fixed 6M ceiling, so 20M rows land full 6M-row groups.
+    # A plain CTAS keeps the fixed 4M ceiling, so 20M rows land full 4M-row groups.
     conn.sql("CREATE OR REPLACE TABLE plain_geo AS select i as j from range(20000000) t(i)")
     live = _live_files(conn, "plain_geo")
     mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchone()[0]
-    assert mx == 6_000_000, f"plain CTAS left the fixed 6M ceiling: max group {mx}"
+    assert mx == 4_000_000, f"plain CTAS left the fixed 4M ceiling: max group {mx}"
 
 
 # NOTE: sort / partition on write are covered by test_sql_only.py (CREATE TABLE … SORTED BY /
@@ -2393,7 +2393,7 @@ def test_explicit_target_file_size_overrides_the_constant():
 
 
 def test_explicit_row_group_overrides_the_fixed_ceiling_and_lands(conn):
-    # An explicit max_row_group_size is a DECLARED geometry: it overrides the fixed 6M ceiling
+    # An explicit max_row_group_size is a DECLARED geometry: it overrides the fixed 4M ceiling
     # verbatim and must land in the written parquet.
     from dbt.adapters.duckrun import engine
     data = conn._connection.sql("select i from range(1000) t(i)")

@@ -45,16 +45,18 @@ DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
 CHECKPOINT_INTERVAL = 10
 
 # ------------------------------------------------------------------------- write-layout geometry
-# The FIXED row-group ceiling EVERY write uses — 6M rows. A Parquet row group maps 1:1 to a Direct
+# The FIXED row-group ceiling EVERY write uses — 4M rows. A Parquet row group maps 1:1 to a Direct
 # Lake column segment; anything in the 1M-16M band is a healthy segment (Power BI's own default
-# segment size is 8M), and 6M trades a little per-segment density for one more group to scan in
-# parallel per file. A CEILING, not a size: the 256 MB file roll usually closes the group first.
+# segment size is 8M), and 4M sits mid-band: 2-6M measured best across the layout sweeps, with hot
+# scans leaning to the small end (one more group to scan in parallel per file) and the cold U-curve
+# shallow from 6M up. Was 6M through 0.4.67; the trade is a little cold-load density for hot scan
+# parallelism. A CEILING, not a size: the 256 MB file roll usually closes the group first.
 # There is no derived sizing anywhere: the planner-estimate machinery (EXPLAIN cardinality,
 # prior-log floors) and, later, the SORTED BY AUTO byte-model geometry (rg_for / tfs_for / one row
 # group per file) each cost plan walks, counts and a calibrated bytes/row model for no measured
 # read-side advantage over the fixed constants. SORTED BY AUTO now only picks the sort key; the
 # write is shaped like any other.
-ROW_GROUP_DEFAULT_ROWS = 6_000_000
+ROW_GROUP_DEFAULT_ROWS = 4_000_000
 
 
 class MaintenancePolicy:
