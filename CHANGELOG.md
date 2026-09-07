@@ -35,6 +35,13 @@ All notable changes to this project will be documented in this file.
   every write and to post-write compaction; a per-model `max_row_group_size` still wins verbatim.
 
 ### Fixed
+- **`get_stats()` reads each parquet footer once** (#81). The per-table aggregate (`detailed=False`)
+  opened every live file twice — `parquet_file_metadata` for the counts, then a second
+  `parquet_metadata` scan for `compression` — so a 3,667-file OneLake table paid two rounds of footer
+  reads. It now derives `total_rows` / `num_row_groups` / `avg_row_group` / `compression` from one
+  `parquet_metadata` pass; columns, types and values are unchanged (a table mixing codecs now lists
+  them in sorted order). Slicing the file list into concurrent `UNION ALL` scans was measured and
+  rejected: DuckDB's `parquet_metadata` already reads footers in parallel across `threads`.
 - **Post-commit maintenance can no longer fail a model whose write already landed.** The
   compaction / vacuum / metadata-cleanup pass runs after the data commit, but only a lost-race
   `CommitFailedError` was tolerated — a transient store fault there (a 503, a token expiring

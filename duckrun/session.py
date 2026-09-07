@@ -1327,15 +1327,26 @@ class DuckSession:
                 parts.append(f"SELECT {pre}, m.*{_logical_names(colmap)} "
                              f"FROM parquet_metadata({lit}) m")
             else:
+                # ONE footer pass. parquet_metadata is one row per (row group, column chunk) and
+                # column_id restarts at 0 in every row group, so the column_id = 0 row stands for its
+                # row group: counting those is num_row_groups, summing their row_group_num_rows is the
+                # footer row total (== parquet_file_metadata.num_rows). A file with no row groups emits
+                # no rows at all, hence the COALESCEs; num_files is the Delta log's live-file count,
+                # which is exactly what COUNT(*) over parquet_file_metadata returned. STRING_AGG is
+                # order-dependent, so it sits above the GROUP BY (one row per codec), not in it.
                 parts.append(
                     f"SELECT {pre}, "
-                    f"SUM(fm.num_rows) - {deleted} AS total_rows, COUNT(*) AS num_files, "
-                    f"SUM(fm.num_row_groups) AS num_row_groups, "
-                    f"ROUND(SUM(fm.num_rows)::DOUBLE / NULLIF(SUM(fm.num_row_groups), 0), 1) AS avg_row_group, "
+                    f"COALESCE(SUM(rg_rows), 0) - {deleted} AS total_rows, "
+                    f"{len(files)}::BIGINT AS num_files, "
+                    f"COALESCE(SUM(rg_count), 0) AS num_row_groups, "
+                    f"ROUND(SUM(rg_rows)::DOUBLE / NULLIF(SUM(rg_count), 0), 1) AS avg_row_group, "
                     f"ROUND({size_bytes} / 1048576.0, 2) AS size_mb, {str(vorder).lower()} AS vorder, "
-                    f"(SELECT COALESCE(STRING_AGG(DISTINCT compression, ', '), 'UNCOMPRESSED') "
-                    f"FROM parquet_metadata({lit})) AS compression "
-                    f"FROM parquet_file_metadata({lit}) fm")
+                    f"COALESCE(STRING_AGG(compression, ', ' ORDER BY compression), 'UNCOMPRESSED') "
+                    f"AS compression "
+                    f"FROM (SELECT compression, "
+                    f"SUM(row_group_num_rows) FILTER (WHERE column_id = 0) AS rg_rows, "
+                    f"COUNT(*) FILTER (WHERE column_id = 0) AS rg_count "
+                    f"FROM parquet_metadata({lit}) GROUP BY compression) g")
         if not parts:
             raise ValueError(f"get_stats: no files to describe for source={source!r}.")
         return self.con.sql(" UNION ALL ".join(parts))

@@ -2111,6 +2111,29 @@ def test_get_stats_names_columns_logically_under_column_mapping(conn):
     assert (d["total_rows"], d["num_files"], d["num_row_groups"], d["vorder"]) == (5, 2, 2, False)
 
 
+def test_get_stats_aggregates_match_the_footers_in_one_pass(conn):
+    # detailed=False reads every footer ONCE (a single parquet_metadata scan: the separate
+    # parquet_file_metadata pass and the compression scalar-subquery are gone), so its numbers are
+    # checked against the two footer functions read independently, over several files/row groups.
+    conn.sql("CREATE OR REPLACE TABLE multi_t AS select i from range(10) t(i)")
+    for k in range(1, 4):
+        conn.sql(f"INSERT INTO multi_t select i + {k} * 10 from range(10) t(i)")  # one file per append
+    files = _live_files(conn, "multi_t")
+    assert len(files) == 4
+    lit = "[" + ", ".join(f"'{f}'" for f in files) + "]"
+    st = conn.get_stats("multi_t")
+    assert st.columns == ["catalog", "schema", "table", "total_rows", "num_files", "num_row_groups",
+                          "avg_row_group", "size_mb", "vorder", "compression"]
+    d = dict(zip(st.columns, st.fetchall()[0]))
+    rows, nfiles, groups = conn.sql(
+        f"select sum(num_rows), count(*), sum(num_row_groups) from parquet_file_metadata({lit})").fetchone()
+    codecs = conn.sql(f"select list(distinct compression order by compression) "
+                      f"from parquet_metadata({lit})").fetchone()[0]
+    assert (d["total_rows"], d["num_files"], d["num_row_groups"]) == (rows, nfiles, groups) == (40, 4, 4)
+    assert d["avg_row_group"] == round(rows / groups, 1)
+    assert d["compression"] == ", ".join(codecs) and d["vorder"] is False
+
+
 def test_delta_column_stats_reads_a_column_mapped_log(conn):
     # The sort-key profiler's null shares come from add.stats, which a mapped table keys by the
     # PHYSICAL name while `cols` (off a delta_scan) are logical -- so every column missed and the
