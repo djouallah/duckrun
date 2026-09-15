@@ -10,7 +10,11 @@ All notable changes to this project will be documented in this file.
   deployed into a warehouse-less workspace can only be reading a warehouse elsewhere
   (cross-workspace / cross-tenant DirectQuery), so the endpoint it was authored with is now left
   as-is and logged. Naming `warehouse=` still requires it to exist here, and a workspace with
-  warehouses still infers or asks exactly as before.
+  warehouses still infers or asks exactly as before — unless you pass **`warehouse=False`**, the
+  explicit opt-out that keeps the authored endpoint even when this workspace has warehouses of
+  its own (a model reading another workspace's or tenant's warehouse must not have its endpoint
+  inferred away to the one that happens to live here). `False` with `mode=` raises: a mode
+  conversion needs a source item here.
 - **The default parquet row-group ceiling is now 4M rows** (was 6M; `target_file_size` stays
   256 MB). One row group is one Direct Lake column segment, and the layout sweeps put the useful
   band at 2-6M rows with hot scans favouring the small end — 4M sits mid-band, trading a little

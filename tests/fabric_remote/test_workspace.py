@@ -488,6 +488,34 @@ def test_deploy_bim_named_warehouse_in_empty_workspace_raises(_patch, monkeypatc
         _ws().deploy(src, warehouse="tpch_dwh")
 
 
+def test_deploy_bim_warehouse_false_keeps_authored_endpoint(_patch, monkeypatch, tmp_path):
+    # The workspace HAS a sole warehouse, which would otherwise be inferred over the model's own
+    # endpoint. warehouse=False is the explicit opt-out for a model that reads elsewhere.
+    fake = _dq_fabric(_patch, monkeypatch, [{"displayName": "wh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="tpch_dwh"))
+    _ws().deploy(src, warehouse=False)
+    out = _deployed_bim(fake)
+    assert "old-endpoint.datawarehouse.fabric.microsoft.com" in out
+    assert "tpch_dwh" in out and '"wh"' not in out
+    assert not any(u.endswith("/warehouses/wh-1") for _, u, _ in fake.calls)   # no endpoint lookup
+
+
+def test_deploy_bim_warehouse_false_without_sql_ref_is_fine(_patch, monkeypatch, tmp_path):
+    # Unlike a named warehouse, False on a model with no Sql.Database reference has nothing to
+    # object to -- it is what a mixed folder deploy passes to every bim.
+    fake = _dq_fabric(_patch, monkeypatch, [{"displayName": "wh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", json.dumps({"model": {"tables": []}}))
+    _ws().deploy(src, warehouse=False)
+    assert any(m == "POST" for m, _, _ in fake.calls)      # created, nothing raised
+
+
+def test_deploy_bim_warehouse_false_with_mode_raises(_patch, monkeypatch, tmp_path):
+    _dq_fabric(_patch, monkeypatch, [{"displayName": "wh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim())
+    with pytest.raises(fr.RemoteRunError, match="warehouse=False"):
+        _ws().deploy(src, warehouse=False, mode="direct_query")
+
+
 def test_deploy_bim_unknown_warehouse_raises(_patch, monkeypatch, tmp_path):
     _dq_fabric(_patch, monkeypatch, [{"displayName": "tpch_dwh", "id": "wh-1"}])
     src = _write(tmp_path, "model.bim", _directquery_bim())
