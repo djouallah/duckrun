@@ -468,6 +468,26 @@ def test_deploy_bim_infers_sole_warehouse(_patch, monkeypatch, tmp_path):
     assert "stale_dwh" not in out and "only_dwh" in out
 
 
+def test_deploy_bim_no_warehouse_here_keeps_authored_endpoint(_patch, monkeypatch, tmp_path):
+    # A workspace with NO warehouse: the model can only be reading one elsewhere (cross-workspace
+    # DirectQuery), so the endpoint it was authored with is kept verbatim, not raised on.
+    fake = _dq_fabric(_patch, monkeypatch, [])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="tpch_dwh"))
+    _ws().deploy(src)
+    out = _deployed_bim(fake)
+    assert "old-endpoint.datawarehouse.fabric.microsoft.com" in out
+    assert "tpch_dwh" in out
+    assert not any(u.endswith("/warehouses/wh-1") for _, u, _ in fake.calls)   # no endpoint lookup
+
+
+def test_deploy_bim_named_warehouse_in_empty_workspace_raises(_patch, monkeypatch, tmp_path):
+    # Naming a warehouse is still a promise it exists here.
+    _dq_fabric(_patch, monkeypatch, [])
+    src = _write(tmp_path, "model.bim", _directquery_bim())
+    with pytest.raises(fr.RemoteRunError, match="'tpch_dwh' not found"):
+        _ws().deploy(src, warehouse="tpch_dwh")
+
+
 def test_deploy_bim_unknown_warehouse_raises(_patch, monkeypatch, tmp_path):
     _dq_fabric(_patch, monkeypatch, [{"displayName": "tpch_dwh", "id": "wh-1"}])
     src = _write(tmp_path, "model.bim", _directquery_bim())

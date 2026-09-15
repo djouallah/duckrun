@@ -561,8 +561,10 @@ class Workspace:
         reference to this workspace's SQL endpoint (:meth:`sql_endpoint`) and that warehouse — so the
         model connects to the right warehouse by NAME, wherever the bim was authored. Inferred when
         the referenced database name matches a warehouse here, or the workspace has exactly one. A
-        Direct Lake model is refreshed after deploy; a DirectQuery-only model is NOT (nothing to
-        reframe — it queries live).
+        workspace with NO warehouse leaves the reference as authored: the model can only be reading
+        a warehouse elsewhere (cross-workspace DirectQuery), so the endpoint it names is the one it
+        should keep. A Direct Lake model is refreshed after deploy; a DirectQuery-only model is NOT
+        (nothing to reframe — it queries live).
 
         ``mode`` (``"direct_lake"`` / ``"direct_query"``) forces the **storage mode** of every data
         table in a ``.bim`` at deploy time, so one authored model ships either way — and on a folder
@@ -1105,6 +1107,12 @@ class Workspace:
                     "(is it a DirectQuery-on-warehouse model?)")
             return content
         target = self._resolve_warehouse(warehouse, m.group("db"))
+        if target is None:
+            # No warehouse here to point at, none named: the model reads a warehouse in another
+            # workspace, and the endpoint it was authored with is the one it needs.
+            _log(f"{_basename(source)}: no warehouse in this workspace - "
+                 f"Sql.Database({m.group('server')!r}, {m.group('db')!r}) left as authored")
+            return content
         server = self.sql_endpoint(target)
 
         def _swap(match):
@@ -1117,7 +1125,8 @@ class Workspace:
     def _resolve_warehouse(self, warehouse: Optional[str], source_db: str) -> str:
         """The target warehouse NAME for a DirectQuery repoint. Named → verified to exist (raise
         listing the real names). Unnamed → the warehouse the model already references if it lives
-        here, else the sole warehouse, else raise asking which one."""
+        here, else the sole warehouse, else ``None`` when the workspace has no warehouse at all (a
+        cross-workspace model: nothing here to point at), else raise asking which one."""
         warehouses = self._items("warehouses")
         names = [w.get("displayName") for w in warehouses]
         if warehouse is not None:
@@ -1129,7 +1138,7 @@ class Workspace:
         if len(warehouses) == 1:
             return names[0]
         if not warehouses:
-            raise RemoteRunError("no warehouse in this workspace to point the model at")
+            return None
         raise RemoteRunError(f"which warehouse should the model use? pass warehouse=; have: {names}")
 
     def _repoint_bim(self, content: bytes, lakehouse: Optional[str], source: str) -> bytes:

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **`deploy` keeps a DirectQuery bim's `Sql.Database(...)` endpoint when the workspace has no
+  warehouse.** It used to raise `no warehouse in this workspace to point the model at`; a model
+  deployed into a warehouse-less workspace can only be reading a warehouse elsewhere
+  (cross-workspace / cross-tenant DirectQuery), so the endpoint it was authored with is now left
+  as-is and logged. Naming `warehouse=` still requires it to exist here, and a workspace with
+  warehouses still infers or asks exactly as before.
 - **The default parquet row-group ceiling is now 4M rows** (was 6M; `target_file_size` stays
   256 MB). One row group is one Direct Lake column segment, and the layout sweeps put the useful
   band at 2-6M rows with hot scans favouring the small end — 4M sits mid-band, trading a little
