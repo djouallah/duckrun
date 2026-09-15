@@ -468,52 +468,42 @@ def test_deploy_bim_infers_sole_warehouse(_patch, monkeypatch, tmp_path):
     assert "stale_dwh" not in out and "only_dwh" in out
 
 
-def test_deploy_bim_no_warehouse_here_keeps_authored_endpoint(_patch, monkeypatch, tmp_path):
-    # A workspace with NO warehouse: the model can only be reading one elsewhere (cross-workspace
-    # DirectQuery), so the endpoint it was authored with is kept verbatim, not raised on.
-    fake = _dq_fabric(_patch, monkeypatch, [])
-    src = _write(tmp_path, "model.bim", _directquery_bim(db="tpch_dwh"))
-    _ws().deploy(src)
-    out = _deployed_bim(fake)
-    assert "old-endpoint.datawarehouse.fabric.microsoft.com" in out
-    assert "tpch_dwh" in out
-    assert not any(u.endswith("/warehouses/wh-1") for _, u, _ in fake.calls)   # no endpoint lookup
-
-
-def test_deploy_bim_named_warehouse_in_empty_workspace_raises(_patch, monkeypatch, tmp_path):
-    # Naming a warehouse is still a promise it exists here.
-    _dq_fabric(_patch, monkeypatch, [])
-    src = _write(tmp_path, "model.bim", _directquery_bim())
-    with pytest.raises(fr.RemoteRunError, match="'tpch_dwh' not found"):
-        _ws().deploy(src, warehouse="tpch_dwh")
-
-
-def test_deploy_bim_warehouse_false_keeps_authored_endpoint(_patch, monkeypatch, tmp_path):
-    # The workspace HAS a sole warehouse, which would otherwise be inferred over the model's own
-    # endpoint. warehouse=False is the explicit opt-out for a model that reads elsewhere.
+def test_deploy_bim_warehouse_host_replaces_server_keeps_db(_patch, monkeypatch, tmp_path):
+    # warehouse= given as a SQL endpoint host: the model reads a warehouse elsewhere. The server is
+    # written verbatim and the database kept as authored -- even though this workspace has a sole
+    # warehouse of its own that unnamed inference would otherwise pick.
     fake = _dq_fabric(_patch, monkeypatch, [{"displayName": "wh", "id": "wh-1"}])
     src = _write(tmp_path, "model.bim", _directquery_bim(db="tpch_dwh"))
-    _ws().deploy(src, warehouse=False)
+    _ws().deploy(src, warehouse="far-away.datawarehouse.fabric.microsoft.com")
     out = _deployed_bim(fake)
-    assert "old-endpoint.datawarehouse.fabric.microsoft.com" in out
+    assert "far-away.datawarehouse.fabric.microsoft.com" in out
+    assert "old-endpoint.datawarehouse" not in out
     assert "tpch_dwh" in out and '"wh"' not in out
     assert not any(u.endswith("/warehouses/wh-1") for _, u, _ in fake.calls)   # no endpoint lookup
 
 
-def test_deploy_bim_warehouse_false_without_sql_ref_is_fine(_patch, monkeypatch, tmp_path):
-    # Unlike a named warehouse, False on a model with no Sql.Database reference has nothing to
-    # object to -- it is what a mixed folder deploy passes to every bim.
-    fake = _dq_fabric(_patch, monkeypatch, [{"displayName": "wh", "id": "wh-1"}])
-    src = _write(tmp_path, "model.bim", json.dumps({"model": {"tables": []}}))
-    _ws().deploy(src, warehouse=False)
-    assert any(m == "POST" for m, _, _ in fake.calls)      # created, nothing raised
+def test_deploy_bim_warehouse_host_needs_no_warehouse_here(_patch, monkeypatch, tmp_path):
+    fake = _dq_fabric(_patch, monkeypatch, [])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="tpch_dwh"))
+    _ws().deploy(src, warehouse="far-away.datawarehouse.fabric.microsoft.com")
+    out = _deployed_bim(fake)
+    assert "far-away.datawarehouse.fabric.microsoft.com" in out and "tpch_dwh" in out
 
 
-def test_deploy_bim_warehouse_false_with_mode_raises(_patch, monkeypatch, tmp_path):
-    _dq_fabric(_patch, monkeypatch, [{"displayName": "wh", "id": "wh-1"}])
+def test_deploy_bim_warehouse_name_wins_over_host_form(_patch, monkeypatch, tmp_path):
+    # A warehouse here whose display name contains a dot is still a name, not a host.
+    fake = _dq_fabric(_patch, monkeypatch, [{"displayName": "gold.dwh", "id": "wh-1"}])
+    src = _write(tmp_path, "model.bim", _directquery_bim(db="stale_dwh"))
+    _ws().deploy(src, warehouse="gold.dwh")
+    out = _deployed_bim(fake)
+    assert "new-endpoint.datawarehouse.fabric.microsoft.com" in out and "gold.dwh" in out
+
+
+def test_deploy_bim_no_warehouse_here_raises(_patch, monkeypatch, tmp_path):
+    _dq_fabric(_patch, monkeypatch, [])
     src = _write(tmp_path, "model.bim", _directquery_bim())
-    with pytest.raises(fr.RemoteRunError, match="warehouse=False"):
-        _ws().deploy(src, warehouse=False, mode="direct_query")
+    with pytest.raises(fr.RemoteRunError, match="no warehouse in this workspace"):
+        _ws().deploy(src)
 
 
 def test_deploy_bim_unknown_warehouse_raises(_patch, monkeypatch, tmp_path):

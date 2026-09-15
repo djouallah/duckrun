@@ -528,7 +528,7 @@ class Workspace:
     def deploy(self, source: str, lakehouse: Optional[str] = None, variables: Optional[Dict] = None,
                name: Optional[str] = None, overwrite: bool = False,
                notebook: Optional[str] = None,
-               warehouse: Union[str, bool, None] = None,
+               warehouse: Optional[str] = None,
                folder: Optional[str] = None,
                mode: Optional[str] = None) -> Union[str, Dict[str, str]]:
         """Deploy a file artifact — or a whole folder of items — to the workspace.
@@ -556,18 +556,21 @@ class Workspace:
         when the model already targets a lakehouse in this workspace, or the workspace has exactly one;
         with several you must name it.
 
-        ``warehouse`` (a warehouse name in this workspace) is the sibling for a **DirectQuery** ``.bim``:
-        duckrun rewrites every ``Sql.Database("<endpoint>.datawarehouse.fabric.microsoft.com", "<db>")``
-        reference to this workspace's SQL endpoint (:meth:`sql_endpoint`) and that warehouse — so the
-        model connects to the right warehouse by NAME, wherever the bim was authored. Inferred when
-        the referenced database name matches a warehouse here, or the workspace has exactly one. A
-        workspace with NO warehouse leaves the reference as authored: the model can only be reading
-        a warehouse elsewhere (cross-workspace DirectQuery), so the endpoint it names is the one it
-        should keep. ``warehouse=False`` forces that same pass-through when the workspace DOES have
-        warehouses — a model that reads a warehouse in another workspace or tenant must not have
-        its endpoint inferred away to the one that happens to live here. A Direct Lake model is
-        refreshed after deploy; a DirectQuery-only model is NOT (nothing to reframe — it queries
-        live).
+        ``warehouse`` is the sibling for a **DirectQuery** ``.bim``, and takes either form:
+
+        - a **warehouse name in this workspace**: duckrun rewrites every
+          ``Sql.Database("<endpoint>.datawarehouse.fabric.microsoft.com", "<db>")`` reference to
+          this workspace's SQL endpoint (:meth:`sql_endpoint`) and that warehouse — so the model
+          connects to the right warehouse by NAME, wherever the bim was authored. Inferred when the
+          referenced database name matches a warehouse here, or the workspace has exactly one.
+        - a **SQL endpoint host** (anything with a dot that is not a warehouse name here, e.g.
+          ``"xxxx-yyyy.datawarehouse.fabric.microsoft.com"``): written into every ``Sql.Database``
+          reference verbatim as the server, the database kept as authored. That is how a model
+          reads a warehouse in another workspace or tenant — wherever the endpoint is, it is the
+          one the model gets.
+
+        A Direct Lake model is refreshed after deploy; a DirectQuery-only model is NOT (nothing to
+        reframe — it queries live).
 
         ``mode`` (``"direct_lake"`` / ``"direct_query"``) forces the **storage mode** of every data
         table in a ``.bim`` at deploy time, so one authored model ships either way — and on a folder
@@ -621,10 +624,6 @@ class Workspace:
             endpoint = "notebooks"
         elif ext == ".bim":
             endpoint = "semanticModels"
-            if warehouse is False and mode is not None:
-                raise RemoteRunError("warehouse=False leaves the model's Sql.Database(...) as "
-                                     "authored, but mode= needs a source item in this workspace "
-                                     "to read — name the warehouse instead")
             if mode is not None:
                 # The conversion resolves the source item itself and writes the final ids / endpoint,
                 # so it stands in for both repoints — and it decides the mode, so DL-ness is read off
@@ -674,7 +673,7 @@ class Workspace:
 
     def _deploy_folder(self, folder: str, lakehouse: Optional[str], variables: Optional[Dict],
                        name: Optional[str], overwrite: bool, notebook: Optional[str],
-                       warehouse: Union[str, bool, None] = None,
+                       warehouse: Optional[str] = None,
                        ws_folder: Optional[str] = None,
                        mode: Optional[str] = None) -> Dict[str, str]:
         """Deploy every Fabric item under ``folder`` in dependency order; return
@@ -1098,37 +1097,31 @@ class Workspace:
                         return kind, it.get("displayName"), it["id"]
         return None
 
-    def _repoint_dq_bim(self, content: bytes, warehouse: Union[str, bool, None],
-                        source: str) -> bytes:
-        """Rewrite a DirectQuery ``model.bim``'s ``Sql.Database(server, db)`` references to this
-        workspace's SQL endpoint and the chosen warehouse — the warehouse sibling of
-        ``_repoint_bim``. If the model carries no warehouse reference it isn't
+    def _repoint_dq_bim(self, content: bytes, warehouse: Optional[str], source: str) -> bytes:
+        """Rewrite a DirectQuery ``model.bim``'s ``Sql.Database(server, db)`` references — the
+        warehouse sibling of ``_repoint_bim``. ``warehouse`` is a warehouse name here (server →
+        this workspace's SQL endpoint, db → that name) or a SQL endpoint host (server → it,
+        verbatim; db kept as authored). If the model carries no warehouse reference it isn't
         DirectQuery-on-warehouse, so it's returned unchanged (and an explicit ``warehouse=`` then
-        raises — nothing to point). ``warehouse=False`` returns it unchanged on purpose: the
-        model's own endpoint is the one it should keep."""
+        raises — nothing to point)."""
         text = content.decode("utf-8")
         m = _SQL_DATABASE_REF.search(text)
         if not m:
-            if warehouse is not None and warehouse is not False:
+            if warehouse is not None:
                 raise RemoteRunError(
                     f"{source!r} has no Sql.Database(...datawarehouse.fabric.microsoft.com) "
                     f"reference to point at warehouse {warehouse!r} "
                     "(is it a DirectQuery-on-warehouse model?)")
             return content
-        if warehouse is False:
-            # Explicit opt-out: the model reads a warehouse elsewhere and this workspace's own
-            # warehouses must not be inferred over it.
-            _log(f"{_basename(source)}: warehouse=False - "
-                 f"Sql.Database({m.group('server')!r}, {m.group('db')!r}) left as authored")
-            return content
-        target = self._resolve_warehouse(warehouse, m.group("db"))
-        if target is None:
-            # No warehouse here to point at, none named: the model reads a warehouse in another
-            # workspace, and the endpoint it was authored with is the one it needs.
-            _log(f"{_basename(source)}: no warehouse in this workspace - "
-                 f"Sql.Database({m.group('server')!r}, {m.group('db')!r}) left as authored")
-            return content
-        server = self.sql_endpoint(target)
+        names = [w.get("displayName") for w in self._items("warehouses")]
+        if warehouse is not None and warehouse not in names and "." in warehouse:
+            # An endpoint host, not a name: the model reads a warehouse somewhere else (another
+            # workspace, another tenant) and gets exactly the server it was given.
+            server, target = warehouse, m.group("db")
+            _log(f"{_basename(source)}: Sql.Database server -> {server!r} (database {target!r})")
+        else:
+            target = self._resolve_warehouse(warehouse, m.group("db"))
+            server = self.sql_endpoint(target)
 
         def _swap(match):
             call = match.group(0)
@@ -1140,8 +1133,7 @@ class Workspace:
     def _resolve_warehouse(self, warehouse: Optional[str], source_db: str) -> str:
         """The target warehouse NAME for a DirectQuery repoint. Named → verified to exist (raise
         listing the real names). Unnamed → the warehouse the model already references if it lives
-        here, else the sole warehouse, else ``None`` when the workspace has no warehouse at all (a
-        cross-workspace model: nothing here to point at), else raise asking which one."""
+        here, else the sole warehouse, else raise asking which one."""
         warehouses = self._items("warehouses")
         names = [w.get("displayName") for w in warehouses]
         if warehouse is not None:
@@ -1153,7 +1145,8 @@ class Workspace:
         if len(warehouses) == 1:
             return names[0]
         if not warehouses:
-            return None
+            raise RemoteRunError("no warehouse in this workspace to point the model at; pass "
+                                 "warehouse=<sql endpoint host> for a warehouse that lives elsewhere")
         raise RemoteRunError(f"which warehouse should the model use? pass warehouse=; have: {names}")
 
     def _repoint_bim(self, content: bytes, lakehouse: Optional[str], source: str) -> bytes:
