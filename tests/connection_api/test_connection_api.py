@@ -2198,6 +2198,12 @@ def test_logical_names_escapes_and_passes_unknown_segments_through(conn):
                    f"(select m.*{clause} from parquet_metadata({lit}) m)").fetchall()
     assert {r[0] for r in got} == {"DU'ID", "name"}
     assert session_mod._logical_names({}) == ""            # no mapping -> no clause at all
+    # The lambda must be spelled `lambda y:`, never the deprecated `y ->`: DuckDB's 1.6/2.0
+    # pre-release line REFUSES the arrow ("Binder Error: Deprecated lambda arrow (->) detected"),
+    # which turned every get_stats(detailed=True) on a column-mapped table (a Fabric Warehouse,
+    # always) into a failure. The query above binds fine on the supported floor either way, so
+    # only the spelling catches a regression before a pre-release wheel reaches a user.
+    assert "lambda y:" in clause and "->" not in clause
 
 
 def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
