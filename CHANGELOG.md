@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`get_stats(detailed=True)` on a column-mapped table (a Fabric Warehouse, always) died on
+  DuckDB's pre-release line** with `Binder Error: Deprecated lambda arrow (->) detected`: the
+  `path_in_schema` rewrite that maps `col-<guid>` back to logical names used the arrow lambda,
+  which the 1.6/2.0 pre-release wheels reject. Now the `lambda y:` form, accepted since 1.3.
+
 ### Changed
 - **`deploy(warehouse=...)` takes a SQL endpoint host as well as a warehouse name.** A value
   with a dot that is not a warehouse name in this workspace (e.g.

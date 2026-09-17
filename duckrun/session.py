@@ -219,8 +219,14 @@ def _logical_names(colmap: Dict[str, str]) -> str:
         return ""
     cases = " ".join(f"WHEN '{_qlit(physical)}' THEN '{_qlit(logical)}'"
                      for physical, logical in colmap.items())
+    # `lambda y:`, not `y ->`: DuckDB deprecated the arrow lambda and the 1.6/2.0 pre-release
+    # line REJECTS it -- "Binder Error: Deprecated lambda arrow (->) detected" -- which turned
+    # every `get_stats(detailed=True)` on a column-mapped table (a Fabric Warehouse, always)
+    # into a failure on the first pre-release wheel that reached CI (dbt_fabric's layout job,
+    # 2026-09-17). The Python-style form is accepted from 1.3 on, so it serves the 1.5.x floor
+    # and the pre-release line alike.
     return (" REPLACE (array_to_string(list_transform(str_split(m.path_in_schema, ', '), "
-            f"y -> CASE y {cases} ELSE y END), ', ') AS path_in_schema)")
+            f"lambda y: CASE y {cases} ELSE y END), ', ') AS path_in_schema)")
 
 
 def _case_collision(names):
