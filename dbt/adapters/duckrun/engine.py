@@ -2370,6 +2370,9 @@ def insert_delta(
     committing in between would make the anti-join stale and let a duplicate through. A batch that
     adds nothing writes NO commit at all; the Delta version does not move.
 
+    The unmatched rows are never materialized: they stream from DuckDB straight into the append, the
+    way the overwrite path streams its staged view (issue #82).
+
     Raises :class:`AntiJoinUnsupported` if the generated SQL will not bind (nothing has been committed
     at that point), so the caller can fall through to delta_rs.
     """
@@ -2405,37 +2408,48 @@ def insert_delta(
         # filter semantics.
         outer = f" AND ({_to_probe(insert_condition)}) IS TRUE"
 
-    tmp = tmp_name("ins", path)
-    sql = (f'CREATE OR REPLACE TEMP TABLE "{tmp}" AS '
-           f"SELECT {proj} FROM {source_name} s WHERE NOT EXISTS ("
-           f"SELECT 1 FROM (SELECT * FROM delta_scan('{loc_sql}', version => {read_version})"
-           f"{where_t}) t WHERE {_to_probe(predicate)})" + outer)
+    body = (f"SELECT {proj} FROM {source_name} s WHERE NOT EXISTS ("
+            f"SELECT 1 FROM (SELECT * FROM delta_scan('{loc_sql}', version => {read_version})"
+            f"{where_t}) t WHERE {_to_probe(predicate)})" + outer)
     try:
-        cur.execute(sql)
+        # cur.sql() BINDS without executing (DuckDB raises Binder/ParserException here; a runtime error
+        # surfaces only on fetch), so this try is bind/parse only — exactly the fallback's contract.
+        rel = cur.sql(body)
     except Exception as e:
         # A bind/parse failure means the ON predicate (or the insert condition) is DataFusion SQL that
         # DuckDB will not take. Nothing has been committed — let the caller run delta_rs instead.
         raise AntiJoinUnsupported(str(e)) from e
-    try:
-        if cur.sql(f'SELECT 1 FROM "{tmp}" LIMIT 1').fetchone() is None:
-            return  # nothing new — no commit, the version stays put
-        order = ""
-        if sort_by:
-            cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
-            order = " ORDER BY " + ", ".join(quote_ident(c) for c in cols)
-        append_if_unchanged(
-            path, cur.sql(f'SELECT * FROM "{tmp}"{order}'),
-            read_version=read_version,
-            partition_by=partition_by,
-            merge_schema=merge_schema,
-            storage_options=storage_options,
-            cur=cur,
-            row_group_rows=row_group_rows,
-            target_file_size=target_file_size,
-            timestamp_ntz=timestamp_ntz,
-        )
-    finally:
-        cur.execute(f'DROP TABLE IF EXISTS "{tmp}"')
+    # Emptiness probe BEFORE the write: delta_rs commits an empty append (the version moves, with zero
+    # add actions), and "a batch that adds nothing writes no commit" is the documented contract. LIMIT 1
+    # builds the probe-filtered target side once and stops at the first unmatched source row. Outside
+    # the try on purpose: a RUNTIME error here fails loud rather than falling back — it would fail on
+    # delta_rs too, and once the stream below starts nothing can fall back anyway.
+    if rel.limit(1).fetchone() is None:
+        return  # nothing new — no commit, the version stays put
+    order = ""
+    if sort_by:
+        cols = sort_by if isinstance(sort_by, (list, tuple)) else [sort_by]
+        order = " ORDER BY " + ", ".join(quote_ident(c) for c in cols)
+    # The anti-join reaches the write as a LAZY relation, consumed over the Arrow C stream — never a
+    # temp-table copy of the increment. That copy was the memory peak that OOM-killed a large catch-up
+    # batch (issue #82): every writer thread held its whole increment while the first build of the same
+    # rows, going through the overwrite path, streamed them. The fence needs no materialization — it
+    # pins the TARGET handle to read_version, the same snapshot the anti-join reads. ORDER BY is
+    # DuckDB's out-of-core sort, which streams its output, as the overwrite path already relies on.
+    # Probe and write are two evaluations of the source; a nondeterministic model can differ between
+    # them (at worst an empty commit, or rows deferred to the next run — both idempotent), and
+    # merge_materialize_source stages the source once where that matters.
+    append_if_unchanged(
+        path, cur.sql(body + order),
+        read_version=read_version,
+        partition_by=partition_by,
+        merge_schema=merge_schema,
+        storage_options=storage_options,
+        cur=cur,
+        row_group_rows=row_group_rows,
+        target_file_size=target_file_size,
+        timestamp_ntz=timestamp_ntz,
+    )
 
 
 def _merge_evolve_schema(path, data, storage_options, read_version: int, merge_schema: bool,
@@ -2633,7 +2647,13 @@ def merge_delta_clauses(
     # and pinned to the same effective_version the merger would have used.
     if (_insert_only_shape(clauses) and not streamed_exec
             and cur is not None and hasattr(data, "query")):
-        src_view = tmp_name("msrc", path)
+        # "isrc", NOT "msrc": the dbt plugin stages its own source under __duckrun_msrc_<hash> as a
+        # TEMP TABLE (merge_materialize_source / a contract NOT NULL list). Registering a VIEW under
+        # that same name put a table and a view in one namespace, and DROP resolves by name before
+        # type — so a release of either one could hit the other and raise, failing the model, or be
+        # swallowed and strand a view whose body reads the staging table it was named after (every
+        # later bind of the name then raising infinite recursion).
+        src_view = tmp_name("isrc", path)
         data.create_view(src_view, replace=True)
         try:
             insert_delta(
@@ -2657,7 +2677,7 @@ def merge_delta_clauses(
         finally:
             try:
                 cur.execute(f'DROP VIEW IF EXISTS "{src_view}"')
-            except Exception:  # pragma: no cover - the view is temp; a failed drop is harmless
+            except Exception:  # pragma: no cover - scoped to this write; a failed drop is harmless
                 pass
 
     # One delta_rs merge at a time (see _MERGE_GATE): the spill caps are sized to the WHOLE

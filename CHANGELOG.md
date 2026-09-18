@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **The insert-only path staged the whole increment in a temp table; it now streams** (#82). An
+  `incremental_strategy='insert'` model — and the portable `merge_clauses: {when_matched: do_nothing}`
+  spelling, and a raw `MERGE ... WHEN NOT MATCHED THEN INSERT *` — computed its anti-join into
+  `CREATE TEMP TABLE`, then read that table twice: once to check for rows, once to write. Every
+  concurrent writer therefore held its entire increment, while the FIRST build of the very same rows
+  streamed them through the overwrite path. A ~1000-file catch-up batch folded into a 222M-row fact
+  table was OOM-killed on the incremental run and succeeded on the initial one. The anti-join now
+  reaches the fenced append as a lazy relation, consumed over the Arrow C stream like every other
+  write. The snapshot fence is unaffected: it pins the target handle to the version the anti-join
+  reads, never the rows. A batch that adds nothing still writes no commit, now probed with a
+  `LIMIT 1` over the anti-join itself.
+- **`incremental_strategy='insert'` with `merge_materialize_source` (or a contract `NOT NULL` list)
+  failed the model** with `Catalog Error: Existing object __duckrun_msrc_<hash> is of type View,
+  trying to drop type Table`. The staged source table and the engine's source relation were minted
+  under the same path-hashed name, so releasing the staging table hit the wrong object type. The
+  engine's relation now carries its own prefix.
+- **A DuckDB runtime error in the anti-join now fails the model** instead of silently re-running the
+  operation on delta-rs. Only a bind/parse failure falls back, which is what that fallback has always
+  documented; the old behaviour re-ran a failure on the engine that uses more memory, not less.
 - **`get_stats(detailed=True)` on a column-mapped table (a Fabric Warehouse, always) died on
   DuckDB's pre-release line** with `Binder Error: Deprecated lambda arrow (->) detected`: the
   `path_in_schema` rewrite that maps `col-<guid>` back to logical names used the arrow lambda,

@@ -297,6 +297,41 @@ def test_insert_composite_key_and_incremental_predicate(cur, tmp_path):
     assert got == {("a", 1): "old1", ("a", 2): "old2", ("a", 3): "new3"}
 
 
+def test_insert_streams_the_anti_join_into_the_append(cur, tmp_path, monkeypatch):
+    """Issue #82: the anti-join reaches the fenced append as a LAZY relation, consumed over the Arrow
+    C stream — never a temp-table copy of the increment. That copy was the memory peak that OOM-killed
+    a large catch-up batch: every writer thread held its whole increment, while the FIRST build of the
+    same rows (the overwrite path) streamed them. Spied, not stubbed: the real append still runs off
+    the captured relation, so the streamed write — ORDER BY included — is exercised end to end."""
+    path = (tmp_path / "t").as_posix()
+    _seed_partitioned(cur, path)
+    real, seen = engine.append_if_unchanged, {}
+
+    def _staging_tables():
+        return cur.sql("select table_name from duckdb_tables() "
+                       "where starts_with(table_name, '__duckrun_ins_')").fetchall()
+
+    def spy(p, data, **kw):
+        seen["sql"] = data.sql_query()
+        seen["staged"] = _staging_tables()   # nothing materialized at the moment of the write
+        return real(p, data, **kw)
+
+    monkeypatch.setattr(engine, "append_if_unchanged", spy)
+    _plugin()._store_insert(path, cur, "batch", cur.sql("select * from batch"), ["id"], None,
+                            read_version=0, partition_by=["month_key"],
+                            incremental_predicates=["target.month_key = source.month_key"],
+                            sort_by=["a"])
+
+    q = seen["sql"].upper()
+    assert "DELTA_SCAN" in q and "NOT EXISTS" in q      # the anti-join itself, not a staged copy …
+    assert "ORDER BY" in q                              # … carrying the sort into the stream
+    assert "__DUCKRUN_INS_" not in q
+    assert seen["staged"] == []
+    assert _staging_tables() == []
+    got = {(r["id"], r["a"]) for r in _rows(path)}
+    assert ("4", "A4") in got and (None, "A5") in got and ("2", "a2") in got
+
+
 # --- the constant probe filters (what makes the target probe skip files) --------------------------
 #
 # Every filter here is derived ONLY from a declared equality, and is result-neutral for that reason:
@@ -477,6 +512,40 @@ def test_clause_merge_forwards_partition_by_and_sort_by(tmp_path, monkeypatch):
         "read_version": DeltaTable(path).version(),
     }))
     assert seen.get("partition_by") == ["id"] and seen.get("sort_by") == ["a"]
+
+
+@pytest.mark.parametrize("cfg_extra", [
+    {"incremental_strategy": "insert", "merge_materialize_source": True},
+    {"incremental_strategy": "insert", "not_null_columns": ["id"]},
+    # the portable clause spelling reaches the same seam through _store_merge
+    {"incremental_strategy": "merge", "merge_materialize_source": True,
+     "merge_clauses": {"when_matched": [{"action": "do_nothing"}]}},
+])
+def test_insert_with_a_staged_source_leaves_no_orphan_relation(tmp_path, cfg_extra):
+    """store() stages the model into a TEMP TABLE for merge_materialize_source / a NOT NULL contract,
+    and the engine seam registers the source relation as a VIEW. They used to be minted under the SAME
+    path-hashed name, putting a table and a view in one namespace. DROP resolves by name before type,
+    so releasing them hit the wrong object: the model failed outright with `Catalog Error: Existing
+    object __duckrun_msrc_<hash> is of type View, trying to drop type Table`, and where the failing
+    drop was the swallowed one instead, a view whose body reads the staging table it was named after
+    outlived that table — every later bind of the name then raising infinite recursion."""
+    path = (tmp_path / "t").as_posix()
+    write_deltalake(path, pa.table({"id": ["1"], "a": ["x"]}))
+    con = duckdb.connect()
+    con.execute("create view increment as select * from (values ('1','x'),('2','y')) v(id, a)")
+    cfg = {"incremental": True, "full_refresh": False, "dbt_believes_exists": True,
+           "unique_key": "id", "read_version": DeltaTable(path).version()}
+    cfg.update(cfg_extra)
+    _store_plugin(con).store(_store_target_config(path, "increment", cfg))
+
+    assert {r["id"] for r in _read(path).to_pylist()} == {"1", "2"}
+    # starts_with, not LIKE: `_` is a LIKE wildcard.
+    leftovers = con.sql(
+        "select view_name from duckdb_views() where starts_with(view_name, '__duckrun_') "
+        "union all "
+        "select table_name from duckdb_tables() where starts_with(table_name, '__duckrun_')"
+    ).fetchall()
+    assert leftovers == []
 
 
 # `sort_by='auto'` PROFILES the staged relation to pick a key — the expensive part of the whole

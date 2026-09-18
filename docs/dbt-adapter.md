@@ -172,7 +172,7 @@ The first run (or `--full-refresh`, or a missing table) overwrites. Later runs a
 
 ### `insert` — insert-only, computed in DuckDB
 
-Insert-only never removes a row, so duckrun computes "batch rows whose `unique_key` is not already present" as a DuckDB anti-join and commits `add` actions only. No existing file is rewritten, the target read is projected to the key columns, and the anti-join spills like any DuckDB query, where a delta-rs `MERGE` plans a join against the whole pinned target and does not fully spill. NULL keys insert, as with `IN`.
+Insert-only never removes a row, so duckrun computes "batch rows whose `unique_key` is not already present" as a DuckDB anti-join and commits `add` actions only. No existing file is rewritten, the target read is projected to the key columns, and the anti-join streams its result straight into the append — the increment is never copied into a staging table — where a delta-rs `MERGE` plans a join against the whole pinned target and does not fully spill. NULL keys insert, as with `IN`.
 
 - **A batch that adds nothing writes no commit**; history records the write as `WRITE`, not `MERGE`.
 - **The append is always fenced**: it commits only if the table version is unchanged since the model started, else `CommitFailedError`.
