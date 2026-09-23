@@ -73,7 +73,7 @@ jobs:
           python-version: '3.11'
       - name: Install duckrun (pulls dbt-duckdb + duckdb + deltalake + azure-identity)
         working-directory: ${{ github.workspace }}
-        run: pip install -e .
+        run: pip install -e ".[dbt]"
       - name: Generate external sources (calendar Delta table — external, NOT embedded)
         # dim_calendar is an external Delta table read via source('aemo','dim_calendar'), not a model.
         run: python scripts/generate_calendar.py

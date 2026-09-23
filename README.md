@@ -30,6 +30,8 @@ which is newer than the bundled stable build; it fails loud at `connect()` other
 notebookutils.session.restartPython()
 ```
 
+For the dbt adapter, install the extra instead: `pip install "duckrun[dbt]"`.
+
 ## Quickstart — OneLake in a notebook
 
 ```python

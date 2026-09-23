@@ -53,7 +53,7 @@ def _pip_spec() -> str:
     if spec:
         return spec
     sha = os.environ.get("GITHUB_SHA")
-    return f"duckrun @ git+https://github.com/djouallah/duckrun@{sha}" if sha else "duckrun"
+    return f"duckrun[dbt] @ git+https://github.com/djouallah/duckrun@{sha}" if sha else "duckrun[dbt]"
 
 
 def _parse_log(log: str) -> dict:

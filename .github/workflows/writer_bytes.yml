@@ -78,7 +78,7 @@ jobs:
       - name: 📦 Install deps
         run: |
           pip install pyyaml pyarrow fastparquet cramjam
-          pip install -e .
+          pip install -e ".[dbt]"
 
       - name: 🦆 Pin duckdb to the nightly the benchmark writes with
         # The whole point: compare the bytes THIS build emits, not the ones a different build

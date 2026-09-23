@@ -33,6 +33,7 @@ import io
 import json
 import os
 import re
+import shlex
 import uuid
 import zipfile
 from typing import Dict, List, Optional, Tuple
@@ -368,7 +369,7 @@ def build_notebook(runid: str, project_b64: str, commands: List[List[str]],
     # in a Python notebook; the earlier -9 crash was from this landing in a *PySpark* notebook — the
     # metadata below (microsoft.language_group = jupyter_python) is what makes this a Python notebook.
     setup = (
-        f"!pip install -q {install_target} --upgrade\n"
+        f"!pip install -q {shlex.quote(install_target)} --upgrade\n"
         "import notebookutils\n"
         "notebookutils.session.restartPython()\n"
     )
@@ -1174,10 +1175,13 @@ class RemoteRunner:
     def _install_target(self) -> str:
         """The exact pip requirement the notebook installs: an explicit ``pip_spec`` (e.g. a
         ``git+…@sha`` branch install) wins; otherwise the local version as ``duckrun==<v>`` (bare
-        ``duckrun`` when the version is unknown)."""
+        ``duckrun`` when the version is unknown). The notebook runs dbt, so it always installs the
+        ``[dbt]`` extra — a bare ``git+…`` URL spec is named ``duckrun[dbt] @ <url>`` for that."""
         if self.pip_spec:
+            if "://" in self.pip_spec and " @ " not in self.pip_spec:
+                return f"duckrun[dbt] @ {self.pip_spec}"
             return self.pip_spec
-        return f"duckrun=={self.duckrun_version}" if self.duckrun_version else "duckrun"
+        return f"duckrun[dbt]=={self.duckrun_version}" if self.duckrun_version else "duckrun[dbt]"
 
     def _resolve_env(self, project_dir: str) -> Dict[str, str]:
         """The config env to export in the notebook: the project's own ``env_var`` names pulled from

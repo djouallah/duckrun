@@ -7,6 +7,15 @@ hide:
 
 duckrun is a thin wrapper around [`dbt-duckdb`](https://github.com/duckdb/dbt-duckdb): views, seeds, sources, tests, snapshots and the plugin ecosystem are inherited, and `table` / `incremental` write real Delta tables via delta-rs. The rationale is in the [design document](design_document.md).
 
+## Install
+
+```bash
+pip install "duckrun[dbt]"
+```
+
+The `[dbt]` extra brings dbt-core and dbt-duckdb. Plain `pip install duckrun` is the
+[connection API](connection-api.md) alone, without dbt.
+
 ## Configure your profile
 
 ```yaml

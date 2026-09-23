@@ -14,15 +14,13 @@ import threading
 import time
 from typing import Any, Dict, List, Optional
 
-from dbt.adapters.events.logging import AdapterLogger
+from dbt.adapters.duckrun._log import logger
 from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_deltalake
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, CHECKPOINT_INTERVAL,
                                          DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS)
 from dbt.adapters.duckrun import sortkey
-
-logger = AdapterLogger("Duckrun")
 
 try:  # deltalake 1.x exposes WriterProperties at the top level
     from deltalake import WriterProperties

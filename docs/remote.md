@@ -121,7 +121,7 @@ RemoteRunner(cores=16,
 For each run (or once per `with` block):
 
 1. Zip the project and write a token-scrubbed `profiles.yml` into it; base64 it into a generated
-   Python notebook (`%%configure` sets the vCores; `pip install duckrun` runs the project).
+   Python notebook (`%%configure` sets the vCores; `pip install duckrun[dbt]` runs the project).
 2. Create the notebook item in the workspace via the Fabric REST API.
 3. Start it as an on-demand job and poll to completion.
 4. The notebook writes its dbt log + per-node status to a small JSON file in OneLake Files; the runner

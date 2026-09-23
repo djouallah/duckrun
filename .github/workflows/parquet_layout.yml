@@ -146,7 +146,7 @@ jobs:
       - name: 📦 Install deps (duckrun from THIS tree — tests the current WriterProperties)
         run: |
           pip install pythonnet pyyaml
-          pip install -e .
+          pip install -e ".[dbt]"
 
       - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
         # Stable duckdb (<= 1.5.5) still hard-splits data pages at 100MB uncompressed — the exact
@@ -498,7 +498,7 @@ jobs:
       - name: 📦 Install deps (duckrun from THIS tree)
         run: |
           pip install pyyaml
-          pip install -e .
+          pip install -e ".[dbt]"
 
       - name: 🔑 Resolve lakehouse + workspace (duckrun, no az)
         run: python tests/parquet_layout/aemo/resolve_env.py --env ${{ inputs.env }}

@@ -31,6 +31,8 @@ name: cores
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • merge-spill-smoke       — fast SF=1 smoke of the incremental-MERGE chain (full delta_rs clause
 #                               set) as a per-change guard; the heavy SF=10 gate is merge_spill.yml.
+#   • lean-install            — `pip install duckrun` WITHOUT the [dbt] extra: connect() imports
+#                               and writes Delta with no dbt installed.
 #
 # Path-filtered to the offline surface it actually exercises — the adapter, the duckrun package, and
 # the test suites (everything under tests/, which now also houses the aemo / parity / integration
@@ -478,3 +480,36 @@ jobs:
         # Local warehouse under the runner's temp dir; the bench writes docs/merge_card.md (gitignored)
         # + the job summary but is NOT committed here. Exit != 0 = a merge op regressed.
         run: python tests/performance/merge_spill/merge_tpch_bench.py --dir "${RUNNER_TEMP}/merge_smoke" --sf "$MERGE_SF"
+
+  lean-install:
+    # `pip install duckrun` without the [dbt] extra: the connect()/deploy API must import and
+    # write Delta with no dbt-core / dbt-duckdb installed, and dbt_project() must say which
+    # extra it needs. Guards the dbt-free import path (a stray top-level `import dbt…` in the
+    # connect() modules would only show up here — every other job installs the [dbt] extra).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install duckrun without the dbt extra
+        run: pip install -e .
+      - name: connect() works, dbt is absent
+        run: |
+          cd "$RUNNER_TEMP"
+          python - <<'PY'
+          import importlib.util, tempfile
+          assert importlib.util.find_spec("dbt.cli") is None, "lean install pulled in dbt-core"
+          import duckrun
+          conn = duckrun.connect(tempfile.mkdtemp(), read_only=False)
+          conn.sql("CREATE TABLE t AS SELECT 1 AS a")
+          conn.sql("INSERT INTO t VALUES (2)")
+          assert sorted(conn.sql("SELECT a FROM t").fetchall()) == [(1,), (2,)]
+          try:
+              duckrun.dbt_project(".")
+          except ImportError as e:
+              assert "duckrun[dbt]" in str(e), e
+          else:
+              raise SystemExit("dbt_project() should require the [dbt] extra")
+          print("lean install OK")
+          PY

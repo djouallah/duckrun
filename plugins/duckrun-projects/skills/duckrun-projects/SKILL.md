@@ -21,7 +21,7 @@ are the ONLY state; there is no database file to manage.
 ## Install and profile
 
 ```bash
-pip install duckrun        # brings dbt-duckdb, duckdb, deltalake at the right pins
+pip install "duckrun[dbt]"   # brings dbt-duckdb, duckdb, deltalake at the right pins
 ```
 
 Do NOT separately pin `duckdb` or `deltalake` in your requirements — duckrun pins exact
@@ -141,7 +141,7 @@ run (small default, scale up for backfills).
 **Cell 1 — install, then restart, nothing else:**
 
 ```python
-!pip install -q duckrun --upgrade
+!pip install -q "duckrun[dbt]" --upgrade
 notebookutils.session.restartPython()
 ```
 
@@ -450,7 +450,7 @@ OPTIMIZE for these tables", the answer is: you don't, it's built in.
 - **Weird import errors, version mismatches, or delta-log read failures right after
   installing in a Fabric notebook**: the kernel is still running the preinstalled
   `duckdb`/`deltalake` binaries. The fix is the install cell pattern above —
-  `pip install duckrun --upgrade` followed immediately by
+  `pip install "duckrun[dbt]" --upgrade` followed immediately by
   `notebookutils.session.restartPython()`, before any import.
 - **"schema does not exist" on OneLake** for `dbt test`/`show`/`docs`: the bearer token
   is missing or expired — discovery needs it before anything runs. Check

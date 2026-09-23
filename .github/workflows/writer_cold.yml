@@ -186,7 +186,7 @@ jobs:
         run: |
           pip install pythonnet pyyaml pyarrow
           pip install fastparquet cramjam  # footer thrift + page decompression for the diffs
-          pip install -e .
+          pip install -e ".[dbt]"
 
       - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
         run: pip install duckdb==1.6.0.dev365

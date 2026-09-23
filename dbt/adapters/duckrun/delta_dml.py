@@ -71,11 +71,9 @@ from typing import List, Optional, Tuple
 
 import duckdb
 
-from dbt.adapters.events.logging import AdapterLogger
+from dbt.adapters.duckrun._log import logger
 
 from . import engine
-
-logger = AdapterLogger("Duckrun")
 
 # `drop table` tombstone: a dropped relation is overwritten (via delta_rs) to a table whose ONLY
 # column is this marker, so (a) discovery recognizes it as dropped and hides it, and (b) anyone who

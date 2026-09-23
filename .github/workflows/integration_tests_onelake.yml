@@ -253,7 +253,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun (pulls duckdb + deltalake)
-        run: pip install -e .
+        run: pip install -e ".[dbt]"
       - name: NYC taxi live demo (SQL-first connection-API showcase, OneLake)
         env:
           WAREHOUSE_PATH: 1c52481c-0523-4a5a-bbde-fdc932bd77c2/7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
@@ -319,7 +319,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Install duckrun + pytest (pulls duckdb + deltalake)
-        run: pip install -e . pytest
+        run: pip install -e ".[dbt]" pytest
       - name: Multi-lakehouse dbt demo — local de-risk (network-free, always runs)
         # The dbt medallion across three catalogs, run against three local folders. Proves the
         # `catalogs:` + `+database` write/read/incremental paths before the OneLake steps below.

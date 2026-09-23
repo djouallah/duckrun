@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **dbt is now an optional extra: install the adapter with `pip install "duckrun[dbt]"`.** Plain
+  `pip install duckrun` is the connection API alone (`duckrun.connect()`, `RemoteRunner`,
+  `workspace`): DuckDB, delta-rs and OneLake auth, with no dbt-core or dbt-duckdb. dbt was never run
+  on those paths; it came along only because the connection API imports helpers from the adapter
+  package. **Breaking for dbt users:** an existing `pip install duckrun` followed by `dbt run` stops
+  finding the adapter until the install adds `[dbt]`. Python APIs and `profiles.yml` are unchanged.
+  `RemoteRunner` installs `duckrun[dbt]` in the remote notebook itself, including when `pip_spec` is a
+  bare `git+…` URL, and `duckrun.dbt_project()` says which extra it needs when dbt is missing.
+
 ### Fixed
 - **The insert-only path staged the whole increment in a temp table; it now streams** (#82). An
   `incremental_strategy='insert'` model — and the portable `merge_clauses: {when_matched: do_nothing}`

@@ -24,9 +24,7 @@ from typing import Callable, Iterable, Set, Tuple
 
 from deltalake.exceptions import CommitFailedError
 
-from dbt.adapters.events.logging import AdapterLogger
-
-logger = AdapterLogger("Duckrun")
+from dbt.adapters.duckrun._log import logger
 
 # The one read-layout target every file write, compaction, and sort-rewrite uses (see engine).
 # 256, not 128: a row group cannot span files, so every file's LAST group is truncated wherever

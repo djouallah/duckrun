@@ -96,7 +96,7 @@ jobs:
         run: |
           pip install pyyaml
           pip install fastparquet cramjam  # page-header thrift reader + page decompression
-          pip install -e .
+          pip install -e ".[dbt]"
 
       - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
         # Pinned for the WHOLE job, not just the duckdb arm: delta-rs writes its parquet through

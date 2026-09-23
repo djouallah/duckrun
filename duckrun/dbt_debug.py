@@ -49,6 +49,7 @@ edit, silently. That is the worst possible failure for a debugging tool, so the 
 mtime-checked on every call (single-digit milliseconds) and re-parsed only when something changed.
 """
 import contextlib
+import importlib.util
 import io
 import os
 import time
@@ -122,6 +123,8 @@ class DbtProject:
     """A read-only debug session over a dbt project. Build one with :func:`dbt_project`."""
 
     def __init__(self, project_dir=".", target=None, profiles_dir=None):
+        if importlib.util.find_spec("dbt.cli") is None:
+            raise ImportError("duckrun.dbt_project() needs dbt: pip install 'duckrun[dbt]'")
         self.project_dir = Path(project_dir).expanduser().resolve()
         self.target = target
         self.profiles_dir = self._resolve_profiles_dir(profiles_dir)
