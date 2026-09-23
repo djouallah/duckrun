@@ -70,3 +70,4 @@ dispatch), newest at the bottom. Written by the `tpch-stress` job; the live scor
 | 2026-09-17 | [#122](https://github.com/djouallah/duckrun/actions/runs/35206042721) | fc320c6 | 1.5.5 | 1.5.0 | 10 | 4 | 49.5s | 18.0s | ✅ |
 | 2026-09-18 | [#123](https://github.com/djouallah/duckrun/actions/runs/35325906448) | 619d26b | 1.5.5 | 1.5.0 | 10 | 4 | 48.4s | 17.7s | ✅ |
 | 2026-09-23 | [#124](https://github.com/djouallah/duckrun/actions/runs/35825761503) | b657e91 | 1.5.5 | 1.5.0 | 10 | 4 | 67.4s | 26.4s | ✅ |
+| 2026-09-23 | [#32](https://github.com/djouallah/duckrun/actions/runs/35827718355) | 1c8ae06 | 1.5.5 | 1.6.5 | 10 | 4 | 66.0s | 26.9s | ✅ |
