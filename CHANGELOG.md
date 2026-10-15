@@ -5,6 +5,10 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **0.5.1: `deltalake` is no longer pinned to exactly 1.5.0** — the requirement is the floor
+  `deltalake>=1.5.0`, and the runtime guard rejects only an older deltalake. Earlier releases called
+  every deltalake above 1.5.0 broken for MERGE at scale and batch DELETE; with the pin lifted, the
+  version pip resolves is the one that runs. The test extras keep `pyarrow<25`.
 - **dbt is now an optional extra: install the adapter with `pip install "duckrun[dbt]"`.** Plain
   `pip install duckrun` is the connection API alone (`duckrun.connect()`, `RemoteRunner`,
   `workspace`): DuckDB, delta-rs and OneLake auth, with no dbt-core or dbt-duckdb. dbt was never run

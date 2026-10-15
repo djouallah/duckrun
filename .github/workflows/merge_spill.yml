@@ -4,7 +4,7 @@ name: merge_spill
 # its runner VM runs this and only this. Generate a large TPCH lineitem (gate SF=10 ≈ 60M rows) and
 # merge several incremental batches back into it (mixed / insert-only / update-only / idempotent),
 # plus append / append_if_unchanged / overwrite for comparison, on the runner's real RAM with
-# duckrun's shipping defaults. Pinned deltalake 1.5.0 (1.6.0's merge is broken at scale). Renders
+# duckrun's shipping defaults, on whatever deltalake >= 1.5.0 pip resolves. Renders
 # the MERGE scorecard into docs and commits to main on the release path.
 #
 # Disk: the current ubuntu-latest image is a SINGLE ~145 GB root volume (~86 GB free; /mnt is just
@@ -58,13 +58,13 @@ jobs:
           sudo docker system prune -af > /dev/null 2>&1 || true
           df -h /
 
-      - name: Show RAM / disk / deltalake version (must be 1.5.0)
+      - name: Show RAM / disk / deltalake version (>= 1.5.0)
         run: |
           free -h
           df -h /mnt /
           DLV=$(python -c "import deltalake; print(deltalake.__version__)")
           echo "deltalake $DLV"
-          python -c "import deltalake,sys; sys.exit(0 if deltalake.__version__.startswith('1.5.') else 1)"
+          python -c "import deltalake,sys; from packaging.version import Version; sys.exit(0 if Version(deltalake.__version__) >= Version('1.5.0') else 1)"
           echo "DLV=$DLV" >> "$GITHUB_ENV"
 
       - name: Prepare big disk dir

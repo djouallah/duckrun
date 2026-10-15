@@ -1,10 +1,8 @@
 """The runtime version guardrail (``duckrun._runtime.check_runtime_versions``).
 
-duckrun requires *exactly* ``deltalake==1.5.0`` — every newer release breaks MERGE at scale and
-batch DELETE — and ``duckdb>=1.5.4``. The guard exists for the Fabric "pip-installed but forgot
-``restartPython()``" case, where the *loaded* module version differs from the on-disk pin. It must
-fire on a too-new deltalake, not just a too-old one (the original bug: a floor-only check let a
-loaded 1.6.x sail through and silently run broken merges).
+duckrun requires ``deltalake>=1.5.0`` and ``duckdb>=1.5.4`` — floors, not pins (0.5.1 lifted the
+exact ``deltalake==1.5.0`` pin). The guard exists for the Fabric "pip-installed but forgot
+``restartPython()``" case, where the *loaded* module version trails the installed one.
 """
 import duckdb
 import deltalake
@@ -13,18 +11,11 @@ import pytest
 from duckrun import _runtime
 
 
-def test_exact_deltalake_accepted(monkeypatch):
-    monkeypatch.setattr(deltalake, "__version__", "1.5.0")
+@pytest.mark.parametrize("ok", ["1.5.0", "1.5.1", "1.6.0", "2.0.0"])
+def test_deltalake_at_or_above_the_floor_accepted(monkeypatch, ok):
+    monkeypatch.setattr(deltalake, "__version__", ok)
     monkeypatch.setattr(duckdb, "__version__", "1.5.4")
     _runtime.check_runtime_versions()  # no raise
-
-
-@pytest.mark.parametrize("bad", ["1.6.0", "1.5.1", "2.0.0"])
-def test_too_new_deltalake_rejected(monkeypatch, bad):
-    monkeypatch.setattr(deltalake, "__version__", bad)
-    monkeypatch.setattr(duckdb, "__version__", "1.5.4")
-    with pytest.raises(RuntimeError, match="deltalake"):
-        _runtime.check_runtime_versions()
 
 
 def test_too_old_deltalake_rejected(monkeypatch):
