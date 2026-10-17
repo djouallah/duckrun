@@ -65,9 +65,10 @@ ALTER TABLE ghost_table ADD COLUMN x INTEGER
 statement error
 ALTER TABLE err_t ADD COLUMN i VARCHAR
 
-# DuckDB semantics: integer // 0 is NULL, float / 0 is Infinity -- pin them
+# DuckDB semantics: integer // 0 is NULL under TRY, float / 0 is Infinity -- pin them
+# (TRY because duckdb 2.0 raises on a bare integer // 0, where 1.x returned NULL)
 query I
-SELECT CASE WHEN 1 // 0 IS NULL THEN 1 ELSE 0 END
+SELECT CASE WHEN TRY(1 // 0) IS NULL THEN 1 ELSE 0 END
 ----
 1
 
