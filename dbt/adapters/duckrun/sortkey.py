@@ -319,7 +319,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         [f"approx_count_distinct({_qid(c)}) AS n{i}" for i, c in enumerate(cols)]
         + [f"avg(octet_length(encode({_qid(c)}::VARCHAR))) AS w{j}"
            for j, c in enumerate(hash_cols)])
-    row = _q(f"SELECT {agg_sel}, COUNT(*) AS total FROM {src}").fetchone()
+    row = _q(f"SELECT {agg_sel}, COUNT(*) AS total FROM {src}").fetchall()[0]
     n = row[-1] or 0
     # `src` is a bounded substrate of a bigger table iff the caller says so — see the docstring.
     sampled = bool(total_rows and total_rows > n)
@@ -462,7 +462,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         exact count over every high-card column simultaneously, not a single bounded one."""
         pfx = ", ".join(_qid(x) for x in prefix_cols)
         row = _q(f"SELECT count(DISTINCT hash({pfx})), "
-                 f"count(DISTINCT hash({pfx}, {_qid(c)})) FROM {src}").fetchone()
+                 f"count(DISTINCT hash({pfx}, {_qid(c)})) FROM {src}").fetchall()[0]
         return int(row[0] or 1), int(row[1] or 1)
 
     def _exact_confirms(prefix_cols, cs):
@@ -478,7 +478,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         and the counts are deterministic, so WHEN they are computed cannot move any decision."""
         pfx = ", ".join(_qid(x) for x in prefix_cols)
         sel = ", ".join(f"count(DISTINCT hash({pfx}, {_qid(c)}))" for c in cs)
-        row = _q(f"SELECT {sel} FROM {src}").fetchone()
+        row = _q(f"SELECT {sel} FROM {src}").fetchall()[0]
         return {c: int(row[j] or 1) for j, c in enumerate(cs)}
 
     sort_key, sorted_runs = [], {}
@@ -489,7 +489,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
         sel = ", ".join(
             f"approx_count_distinct(hash({pfx + ', ' if pfx else ''}{_qid(c)})) AS m{j}"
             for j, c in enumerate(remaining))
-        mrow = _q(f"SELECT {sel} FROM {src}").fetchone()
+        mrow = _q(f"SELECT {sel} FROM {src}").fetchall()[0]
         marg = {c: max(int(mrow[j] or 0), kept_ndv) for j, c in enumerate(remaining)}
         visit = list(remaining)   # the level's visit order, fixed — prefetch pairing indexes into it
         exact_p = None            # exact distinct(prefix) once any confirm ran at this level
@@ -625,7 +625,7 @@ def recommend_sort_key(con, sch, tbl, src, cols, types, partition_cols,
             sel = ", ".join(
                 f"approx_count_distinct(hash({pfx}, {_qid(c)})) AS t{j}"
                 for j, c in enumerate(scan))
-            trow = _q(f"SELECT {sel} FROM {src}").fetchone()
+            trow = _q(f"SELECT {sel} FROM {src}").fetchall()[0]
             exact_tp = None       # exact distinct(prefix) once any confirm ran at this level
             prefetched = {}       # candidate -> exact distinct(prefix, candidate)
             best, best_runs, best_save = None, None, 0.0

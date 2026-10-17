@@ -343,7 +343,7 @@ def _duckdb_mem_bytes(con):
             row = cur.execute(
                 "SELECT coalesce(sum(memory_usage_bytes), 0), "
                 "coalesce(sum(temporary_storage_bytes), 0) FROM duckdb_memory()"
-            ).fetchone()
+            ).fetchall()[0]
         finally:
             cur.close()  # sampled every 0.1s while a profile runs — don't pile up cursors
         return (int(row[0]), int(row[1]))
@@ -591,7 +591,7 @@ def configure_duckdb_session(con) -> None:
     # the session's pinned memory_limit degrades to disk instead of erroring. Respect an explicit
     # temp_directory (a file-backed DB, or a user override).
     try:
-        tmp = con.execute("SELECT current_setting('temp_directory')").fetchone()[0]
+        tmp = con.execute("SELECT current_setting('temp_directory')").fetchall()[0][0]
     except Exception:  # best-effort: if we can't read it, skip overriding rather than guess
         tmp = "skip"  # couldn't read it; don't risk overriding
     if not tmp:
@@ -605,7 +605,7 @@ def read_memory_limit(con) -> Optional[str]:
     """DuckDB's current ``memory_limit`` as it reports it (e.g. '25.0 GiB'), or None if
     unreadable."""
     try:
-        return con.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        return con.execute("SELECT current_setting('memory_limit')").fetchall()[0][0]
     except Exception:  # best-effort: unreadable limit -> None (the pin then applies unconditionally)
         return None
 
@@ -936,7 +936,7 @@ def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None
             "select coalesce(sum(num_records), 0)::bigint, "
             "coalesce(sum(size_bytes), 0)::bigint, "
             "max(modification_time)::bigint from add_actions"
-        ).fetchone()
+        ).fetchall()[0]
     except Exception as exc:  # best-effort: docs stats must never fail catalog generation
         logger.debug(f"duckrun: no Delta stats for {path!r}: {exc}")
         return None
@@ -966,7 +966,7 @@ def deleted_row_count(cur, dt) -> int:
     return int(cur.sql(
         "select coalesce(sum(len(selection_vector) "
         "  - coalesce(list_aggregate(selection_vector, 'sum'), 0)), 0)::bigint "
-        "from deletion_vectors").fetchone()[0])
+        "from deletion_vectors").fetchall()[0][0])
 
 
 _DELTA_PHYSICAL_NAME_KEY = "delta.columnMapping.physicalName"
@@ -1030,7 +1030,7 @@ def delta_file_summary(cur, path: str, storage_options: Optional[Dict[str, str]]
     dt = _delta_table(path, storage_options)
     files = list(dt.file_uris())
     add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
-    size = int(cur.sql("select coalesce(sum(size_bytes), 0)::bigint from add_actions").fetchone()[0])
+    size = int(cur.sql("select coalesce(sum(size_bytes), 0)::bigint from add_actions").fetchall()[0][0])
     # The Fabric writer records VORDER both as a per-file `add.tags` entry AND as the table property
     # `delta.parquet.vorder.enabled`. delta-rs `get_add_actions` does NOT surface per-file tags, so
     # read the property off the reconstructed metadata (survives checkpointing).
@@ -1053,7 +1053,7 @@ def _log_ndv_cap(cur, type_str: str, qmn: str, qmx: str):
     try:
         v = cur.sql(
             f'select (max("{qmx}")::HUGEINT - min("{qmn}")::HUGEINT + 1) from add_actions '
-            f'where "{qmn}" is not null and "{qmx}" is not null').fetchone()[0]
+            f'where "{qmn}" is not null and "{qmx}" is not null').fetchall()[0][0]
         return int(v) if v is not None and v > 0 else None
     except Exception:
         return None
@@ -1085,7 +1085,7 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
         add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
         have = {d[0] for d in cur.sql("select * from add_actions limit 0").description}
         nfiles, total = cur.sql(
-            "select count(*), coalesce(sum(num_records), 0)::bigint from add_actions").fetchone()
+            "select count(*), coalesce(sum(num_records), 0)::bigint from add_actions").fetchall()[0]
         nfiles, total = int(nfiles or 0), int(total or 0)
         phys = {logical: physical for physical, logical in physical_to_logical(dt).items()}
         out = {}
@@ -1099,7 +1099,7 @@ def delta_column_stats(cur, path: str, cols, types, storage_options: Optional[Di
                 f'select coalesce(sum("{qnc}"), 0)::bigint, '
                 f'  coalesce(sum(case when "{qmn}" = "{qmx}" then 1 else 0 end), 0)::bigint, '
                 f'  coalesce(sum(case when "{qmn}" is not null then 1 else 0 end), 0)::bigint '
-                f'from add_actions').fetchone()
+                f'from add_actions').fetchall()[0]
             withstats = int(withstats or 0)
             if not withstats:
                 continue
@@ -2135,16 +2135,17 @@ def assert_source_unique(data, keys: List[str]) -> None:
         return
     keycols = ", ".join('"' + k.replace('"', '""') + '"' for k in keys)
     try:
-        dup = data.query(
+        dups = data.query(
             "__merge_src",
             f"SELECT {keycols}, count(*) AS __n FROM __merge_src "
             f"GROUP BY {keycols} HAVING count(*) > 1 LIMIT 1",
-        ).fetchone()
+        ).fetchall()
     except Exception as e:  # never let the guard ITSELF break a valid merge; surface and proceed
         logger.warning(f"merge duplicate-key guard could not run ({e!r}); proceeding")
         return
-    if dup is None:
+    if not dups:
         return
+    dup = dups[0]
     keyval = ", ".join(f"{k}={v!r}" for k, v in zip(keys, dup[:-1]))
     raise ValueError(
         f"MERGE source is not unique on the join key ({', '.join(keys)}): "
@@ -2225,7 +2226,7 @@ def _range_literals(cur, source_name, q, col):
     """``(min, max)`` of ``q`` over the source as SQL literals, or None when the column is empty,
     all-NULL, or has no literal rendering we trust."""
     try:
-        row = cur.sql(f"SELECT min({q}), max({q}) FROM {source_name}").fetchone()
+        row = cur.sql(f"SELECT min({q}), max({q}) FROM {source_name}").fetchall()[0]
     except Exception as e:  # pragma: no cover - defensive
         logger.warning(f"insert probe pruning: could not bound {col!r} ({e!r}); skipping")
         return None
@@ -2422,7 +2423,7 @@ def insert_delta(
     # builds the probe-filtered target side once and stops at the first unmatched source row. Outside
     # the try on purpose: a RUNTIME error here fails loud rather than falling back — it would fail on
     # delta_rs too, and once the stream below starts nothing can fall back anyway.
-    if rel.limit(1).fetchone() is None:
+    if not rel.limit(1).fetchall():
         return  # nothing new — no commit, the version stays put
     order = ""
     if sort_by:
@@ -2636,7 +2637,7 @@ def merge_delta_clauses(
     # clause exists — for those an empty source matches EVERY target row: work, not a no-op.
     if (source_materialized and hasattr(data, "limit")
             and not any(c.get("clause") == "not_matched_by_source" for c in clauses)
-            and data.limit(1).fetchone() is None):
+            and not data.limit(1).fetchall()):
         logger.info("merge: source has no rows and no by-source clause; nothing to do (no commit)")
         return
 

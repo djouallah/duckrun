@@ -459,12 +459,12 @@ class DuckSession:
     def _current_catalog(self) -> str:
         """The current catalog — DuckDB's own ``current_database()``. Single source of truth: a bare
         ``conn.sql("USE …")`` moves it, so reads and write-routing never disagree."""
-        return self.con.execute("SELECT current_database()").fetchone()[0]
+        return self.con.execute("SELECT current_database()").fetchall()[0][0]
 
     @property
     def _current_database(self) -> str:
         """The current schema — DuckDB's own ``current_schema()``."""
-        return self.con.execute("SELECT current_schema()").fetchone()[0]
+        return self.con.execute("SELECT current_schema()").fetchall()[0][0]
 
     def _attach_catalog(self, name: str, root: str, storage_options, schema_filter,
                         primary: bool = False, quiet: bool = True, read_only=None,
@@ -988,7 +988,7 @@ class DuckSession:
             return query, None
         body = m.group("body")
         staged = "_duckrun_auto_src"
-        n_full = int(self.con.sql(f"SELECT count(*) FROM ({body}) _c").fetchone()[0] or 0)
+        n_full = int(self.con.sql(f"SELECT count(*) FROM ({body}) _c").fetchall()[0][0] or 0)
         k = sortkey.substrate_modulus(n_full)
         if k == 1:
             self.con.execute(f"CREATE OR REPLACE TEMP TABLE {staged} AS {body}")
@@ -1049,7 +1049,7 @@ class DuckSession:
         if not wide:
             return body
         aggs = ", ".join(f"max(abs({_qid(c)}))" for c, _ in wide)
-        maxes = self.con.sql(f"SELECT {aggs} FROM ({body}) _m").fetchone()
+        maxes = self.con.sql(f"SELECT {aggs} FROM ({body}) _m").fetchall()[0]
         max_abs = dict(zip((c for c, _ in wide), maxes))
         repl = []
         for col, typ in wide:
@@ -1538,7 +1538,7 @@ class DuckSession:
         # re-reading the spill per pass was the measured defect). The exact total comes from the
         # Delta log for free; count(*) over the scan (footer metadata) is the statless fallback.
         n_full = int(_total or 0) or int(self.con.sql(
-            f"SELECT count(*) FROM delta_scan('{plit}')").fetchone()[0] or 0)
+            f"SELECT count(*) FROM delta_scan('{plit}')").fetchall()[0][0] or 0)
         k = sortkey.substrate_modulus(n_full)
         src = "_rle_src"
         if k == 1:
