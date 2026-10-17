@@ -104,16 +104,18 @@ jobs:
     # tested on a local-filesystem Delta warehouse. Run on every supported Python the package
     # advertises (pyproject requires-python >= 3.11, i.e. 3.11 + 3.12). (Conformance stays
     # single-version: its gate is a 3.11-derived baseline that a second Python would
-    # spuriously trip.)
+    # spuriously trip.) And under BOTH installs: `stable` (plain pip install) and `pre`
+    # (pip install --pre — the newest duckdb 2.0 dev build); duckrun must pass on each.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ['3.11', '3.12']
+        install: ['stable', 'pre']
     concurrency:
-      # Include the Python version: matrix cells share a job's concurrency group, so without it
-      # the second cell would cancel the first (cancel-in-progress: true).
-      group: cores-adapter-${{ github.ref }}-${{ matrix.python-version }}
+      # Include every matrix axis: matrix cells share a job's concurrency group, so without them
+      # one cell would cancel another (cancel-in-progress: true).
+      group: cores-adapter-${{ github.ref }}-${{ matrix.python-version }}-${{ matrix.install }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
@@ -121,6 +123,7 @@ jobs:
       - uses: ./.github/actions/setup-duckrun
         with:
           python-version: ${{ matrix.python-version }}
+          install: ${{ matrix.install }}
 
       - name: Adapter unit tests + connection-API offline tests
         # Run the WHOLE tests/connection_api directory — the per-method matrix + local-fs contract +
