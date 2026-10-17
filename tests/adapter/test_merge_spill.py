@@ -165,8 +165,8 @@ class _FakeResult:
     def __init__(self, val):
         self._val = val
 
-    def fetchone(self):
-        return (self._val,)
+    def fetchall(self):
+        return [(self._val,)]
 
 
 def test_configure_duckdb_session_disables_preserve_insertion_order():
