@@ -22,7 +22,7 @@ Everything else carries over: `DuckrunCredentials` subclasses dbt-duckdb's, so t
 ## Setup & versions
 
 - **Needs `duckdb >= 1.5.4`.** Older builds, including Microsoft Fabric's bundled runtime, fail loud at `connect()`. In a Fabric notebook: `!pip install duckrun --upgrade`, then restart.
-- **Pins `deltalake == 1.5.0`.** delta-rs 1.6.0's MERGE is broken at scale, and delta-rs `> 1.5.0` breaks bulk delete on OneLake (*"Either WorkspaceId or ArtifactId are missing in the request"*, [delta-rs #4401](https://github.com/delta-io/delta-rs/issues/4401)), which `vacuum` needs.
+- **Needs `deltalake >= 1.6.4`.** It is the first release that rolls files on row-group boundaries ([delta-rs #4677](https://github.com/delta-io/delta-rs/pull/4677)), which duckrun switches on so no file ends in a truncated row group. Open upstream: on OneLake, delta-rs `> 1.5.0` can fail the bulk delete `vacuum` uses (*"Either WorkspaceId or ArtifactId are missing in the request"*, [delta-rs #4401](https://github.com/delta-io/delta-rs/issues/4401)).
 
 ## Microsoft Fabric / OneLake
 
