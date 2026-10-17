@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **0.5.2: works with duckdb 2.0 (`pip install --pre duckrun`).** duckdb 2.0 keeps an `execute()`
+  result open until it is read to the end, and an open result makes every other call on that
+  connection raise `ResourceInUseException` — so 0.5.1 failed on the first write. duckrun now reads
+  every result in full. Your own code: duckdb 2.0 relations (what `conn.sql()` returns) have no
+  `fetchone()`; use `fetchall()` or `.limit(1).fetchall()`, which work on 1.x and 2.0 alike.
+
 ### Changed
 - **0.5.1: `deltalake` is no longer pinned to exactly 1.5.0** — the requirement is the floor
   `deltalake>=1.5.0`, and the runtime guard rejects only an older deltalake. Earlier releases called
