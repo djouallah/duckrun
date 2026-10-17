@@ -15,6 +15,17 @@ import time
 from typing import Any, Dict, List, Optional
 
 from dbt.adapters.duckrun._log import logger
+
+# Roll files on ROW-GROUP boundaries, so no file ends in a truncated row group (delta-rs#4677,
+# deltalake >= 1.6.4). A row group cannot span files, so the plain byte roll cuts each file's last
+# group wherever target_file_size lands — a runt segment for VertiPaq, which maps one row group to
+# one segment. With this on, every group is a full max_row_group_size (the end-of-data remainder
+# excepted) and a file overshoots the target by at most one group. delta-rs reads it ONCE per
+# process (a OnceLock on the first write), so it has to be in the environment before any write —
+# hence here, at import. setdefault: an explicit DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY=0 still wins.
+# An older deltalake ignores the variable and keeps the legacy roll.
+os.environ.setdefault("DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY", "1")
+
 from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_deltalake
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
@@ -73,8 +84,9 @@ _DATA_PAGE_ROW_LIMIT = 1_000_000
 # segment cap — and every file's LAST row group is truncated wherever the roll lands. That is why
 # 128 MB (tried in 0.4.64, reverted in 0.4.65) lost: it doubled the file count, so the aemo mart
 # went from ~2 roll-truncated tail groups to 4 of 25 (one a 1.25M-row runt at the bottom of the
-# healthy 1-16M segment band). Revisit only when delta-rs can align the file roll to a row-group
-# boundary. Not a merge-MEMORY lever (that was the dictionary page limit, see
+# healthy 1-16M segment band). delta-rs can now align the roll to a row-group boundary
+# (DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY, set at the top of this module), which removes the truncated
+# tails at any target size. Not a merge-MEMORY lever (that was the dictionary page limit, see
 # _DICT_PAGE_SIZE_LIMIT; 128/256/512 MB all merged in ~16s at ~4.5-5.2 GB RSS in the small-scale
 # measurement) — but it IS a merge-DISK lever at scale (128 MB's doubled file count pushed the
 # update-only merge's DataFusion spill from <59 to 60-100 GB). Deliberately far below 1 GB, which

@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **0.5.3: no more truncated row groups at file boundaries.** A row group cannot span files, so
+  delta-rs closed each file's last group wherever `target_file_size` landed, leaving a short runt
+  segment per file (the AEMO mart: 37 groups where 36 full 4M-row groups fit). duckrun now sets
+  `DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY=1` (delta-rs#4677) so files roll on row-group boundaries: every
+  group is a full `max_row_group_size` except the final remainder, and a file may overshoot the target
+  by one group. Needs deltalake >= 1.6.4 (older versions ignore it); set the variable to `0` to opt out.
 - **0.5.2: works with duckdb 2.0 (`pip install --pre duckrun`).** duckdb 2.0 keeps an `execute()`
   result open until it is read to the end, and an open result makes every other call on that
   connection raise `ResourceInUseException` — so 0.5.1 failed on the first write. duckrun now reads
