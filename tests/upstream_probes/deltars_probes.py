@@ -111,8 +111,10 @@ def p6_dml_writer_properties():
         codecs = {md.row_group(g).column(c).compression
                   for g in range(md.num_row_groups) for c in range(md.num_columns)}
         max_rg = max(md.row_group(g).num_rows for g in range(md.num_row_groups))
+        # The Arrow label (string vs string_view) is informational: plain writes carry the same
+        # label, and the parquet column is BYTE_ARRAY/UTF8 either way.
         s_type = str(pq.read_schema(new[0].replace("file://", "")).field("s").type)
-        good = codecs == {"ZSTD"} and max_rg <= 50_000 and s_type in ("string", "large_string")
+        good = codecs == {"ZSTD"} and max_rg <= 50_000
         ok &= good
         out.append(f"{op}: codecs={sorted(codecs)} max_rg={max_rg} s={s_type}")
     return ("FIXED" if ok else "BROKEN"), "; ".join(out)
@@ -207,7 +209,8 @@ def p13_alter_drop_rename():
     write_deltalake(p, pa.table({"a": [1], "b": [2]}))
     alter = DeltaTable(p).alter
     methods = sorted(m for m in dir(alter) if not m.startswith("_"))
-    hit = [m for m in methods if "drop_column" in m or "rename" in m]
+    hit = [m for m in methods if m in ("drop_column", "drop_columns", "rename_column",
+                                       "rename_columns")]
     return ("FIXED" if hit else "BROKEN", f"alter API: {methods}")
 
 
