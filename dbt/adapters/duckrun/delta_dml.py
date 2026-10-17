@@ -1679,16 +1679,14 @@ class _DeltaDML:
         # A leading `WITH …` (CTE referenced by the SET exprs or predicate via a subquery) can only be
         # evaluated by DuckDB, so force the overwrite fallback and re-attach the CTE to its read.
         with_prefix = f"{self._with_clause} " if self._with_clause else ""
-        if where is None or self._with_clause or (where and _PREDICATE_SUBQUERY.search(where)) or \
+        if self._with_clause or (where and _PREDICATE_SUBQUERY.search(where)) or \
                 any(_PREDICATE_SUBQUERY.search(e) for e in updates.values()):
-            # Route to a DuckDB-evaluated fenced overwrite (instead of delta_rs's dt.update) in two cases:
-            #  * a subquery in the predicate (`… where id in (select …)`) OR a SET expression (`set g =
-            #    (select max(id) from ref)`) — delta_rs's update() hits a datafusion "not implemented"
-            #    panic (pyo3 PanicException) on either; DuckDB can evaluate both.
-            #  * a predicate-less full-table UPDATE (`update t set i = i + 1`) — delta_rs 1.5.0 silently
-            #    updates only SOME rows of a multi-file table when the predicate references no column
-            #    (None / a constant both mis-prune to a broken fast path); a column-referencing predicate
-            #    is fine. A no-WHERE update rewrites every row anyway, so the full overwrite is equal work.
+            # Route to a DuckDB-evaluated fenced overwrite (instead of delta_rs's dt.update) when there
+            # is a subquery in the predicate (`… where id in (select …)`) OR a SET expression (`set g =
+            # (select max(id) from ref)`) — delta_rs's update() hits a datafusion "not implemented"
+            # error on either; DuckDB can evaluate both. (A predicate-less UPDATE used to come here
+            # too: delta_rs 1.5.0 updated only SOME rows of a multi-file table. Fixed by the >= 1.6.4
+            # floor — tests/upstream_probes P1 — so it now takes the delta_rs path below.)
             # Compute the updated rows there — `CASE WHEN (pred) THEN <expr> ELSE col END` per SET column
             # via SELECT * REPLACE (no predicate → apply <expr> to every row) — and commit a fenced full
             # overwrite, mirroring _delete's fallback. Fenced to vB so a

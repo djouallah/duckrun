@@ -519,9 +519,9 @@ def test_update_and_delete_accept_target_self_qualified_columns(w):
 
 def test_predicate_less_update_touches_every_row_over_many_files(w):
     """UPDATE t SET c = <expr> with NO WHERE updates EVERY row even when the table is many small files.
-    delta_rs 1.5.0's predicate-less update() silently updates only some rows of a multi-file table (a
-    predicate referencing no column mis-prunes to a broken fast path), so duckrun routes a full-table
-    update through a DuckDB-evaluated fenced overwrite."""
+    delta_rs 1.5.0's predicate-less update() silently updated only some rows of a multi-file table (a
+    predicate referencing no column mis-pruned to a broken fast path); fixed by the >= 1.6.4 floor, so
+    this now pins delta_rs's own predicate-less update."""
     w.sql("CREATE OR REPLACE TABLE batch (i INTEGER)")
     for k in range(60):
         w.sql(f"INSERT INTO batch VALUES ({k})")                 # 60 single-row commits → many files
