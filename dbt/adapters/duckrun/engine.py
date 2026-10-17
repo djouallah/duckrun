@@ -101,7 +101,7 @@ _PART_PRUNE_MAX = 400
 
 def _writer_properties(row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, the fixed 4M-row group ceiling, a 32 MB dictionary page limit
+    # the files a DELETE/UPDATE rewrites, compaction, and the optimize sort-rewrite: SNAPPY, the fixed 4M-row group ceiling, a 32 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
     # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap that shapes
     # dense columns into ~1 MB pages (the 1M-row cap only backstops ultra-compressible columns — see
@@ -1652,8 +1652,8 @@ def replace_where(
     pair — so there is no torn-read window (a reader never sees the range emptied-but-not-refilled)
     and no half-applied failure state.
 
-    ``predicate`` is a delta_rs/datafusion SQL expression. Keep it CAST-free: delta_rs can't
-    serialize a CAST expression back to a string ("Unable to convert expression to string").
+    ``predicate`` is a delta_rs/datafusion SQL expression. (Older delta_rs couldn't serialize a
+    CAST in it — "Unable to convert expression to string"; fine since the >= 1.6.4 floor.)
 
     A replaceWhere is a read-modify-write, so ``read_version`` is REQUIRED (no blind-HEAD path):
     the overwrite is pinned to that snapshot and committed with ``max_commit_retries=0``
@@ -1711,8 +1711,8 @@ def replace_window(
     window, insert the batch", as ONE atomic commit (``replaceWhere``). ``start``/``end`` are
     naive ``YYYY-MM-DD HH:MM:SS`` strings (UTC batch bounds from dbt). Delegates to
     :func:`replace_where` with the window predicate; ``read_version`` pins/fences the commit."""
-    # CAST-free window predicate — see replace_where. delta_rs coerces the string literals to the
-    # column's type, so this works whether event_time is a DATE or a TIMESTAMP.
+    # delta_rs coerces the string literals to the column's type, so this works whether event_time
+    # is a DATE or a TIMESTAMP.
     _col = quote_ident(column)
     predicate = f"{_col} >= '{start}' AND {_col} < '{end}'"
     replace_where(
@@ -1752,7 +1752,7 @@ def delete_rows(
     dt = dt if dt is not None else _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     try:
-        dt.delete(predicate)
+        dt.delete(predicate, writer_properties=_writer_properties())
     except CommitFailedError as e:
         raise CommitFailedError(
             f"delete: table '{path}' changed since version {read_version} "
@@ -1797,7 +1797,7 @@ def update_rows(
             f"UPDATE on {path!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
         )
     try:
-        dt.update(updates=updates, predicate=predicate)
+        dt.update(updates=updates, predicate=predicate, writer_properties=_writer_properties())
     except CommitFailedError as e:
         raise CommitFailedError(
             f"update: table '{path}' changed since version {read_version} "

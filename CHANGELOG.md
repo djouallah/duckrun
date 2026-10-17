@@ -25,6 +25,16 @@ All notable changes to this project will be documented in this file.
   that cost is gone. Applies to every write and to post-write compaction; the byte-debt compaction
   thresholds follow (small file < 64 MB, byte floor 256 MB). A per-model `target_file_size_mb` still
   wins verbatim.
+- **`DELETE` / `UPDATE` rewrites now get the read-layout writer profile.** The files delta-rs rewrites
+  for a delete or update used delta-rs defaults (1,048,576-row groups, default dictionary limits), so a
+  DML'd table drifted off the layout until a compaction happened to fire. They now use the same
+  SNAPPY / 4M-row-group / 32 MB-dictionary profile as every other write (`writer_properties`, honored
+  by delta-rs's delete and update since the 1.6.4 floor).
+- **A predicate-less `UPDATE` now runs on delta-rs** instead of a DuckDB-evaluated full overwrite.
+  The detour existed because delta-rs 1.5.0 updated only some rows of a multi-file table with no
+  predicate; fixed in the 1.6.4 floor. Subquery predicates / SET expressions still take the DuckDB path.
+- **`tests/upstream_probes/deltars_probes.py`** (CI: `delta-rs probes`) reports, on the deltalake
+  floor and on the newest release, which upstream bugs duckrun works around are still present.
 - **0.5.1: `deltalake` is no longer pinned to exactly 1.5.0** — the requirement is the floor
   `deltalake>=1.5.0`, and the runtime guard rejects only an older deltalake. Earlier releases called
   every deltalake above 1.5.0 broken for MERGE at scale and batch DELETE; with the pin lifted, the

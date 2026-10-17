@@ -1752,6 +1752,19 @@ def _live_files(conn, table):
     return engine._delta_table(conn.root_path + "/dbo/" + table, conn.storage_options).file_uris()
 
 
+def test_dml_rewrites_keep_the_read_layout(conn):
+    # DELETE / UPDATE rewrite the files they touch through delta-rs; the rewrite gets the same writer
+    # profile as every other write. delta-rs's own default would cut 3M rows into three
+    # 1,048,576-row groups; the profile's 4M ceiling keeps one.
+    conn.sql("CREATE OR REPLACE TABLE dml_geo AS select i as j from range(3000000) t(i)")
+    for stmt in ("DELETE FROM dml_geo WHERE j = 7", "UPDATE dml_geo SET j = -1 WHERE j = 8"):
+        conn.sql(stmt)
+        live = _live_files(conn, "dml_geo")
+        n = conn.sql(f"select count(*) from (select distinct file_name, row_group_id "
+                     f"from parquet_metadata({live!r}))").fetchall()[0][0]
+        assert n == 1, f"{stmt!r} rewrote the table outside the read layout: {n} row groups"
+
+
 def test_ctas_gets_the_fixed_row_group_ceiling(conn):
     # Every normal write uses the FIXED 4M-row ceiling — nothing is derived from the result (the
     # planner-estimate machinery is gone). 20M rows → 5 full 4M groups.
