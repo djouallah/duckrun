@@ -558,11 +558,11 @@ def test_skew_sigma_p2_matches_per_column_group_by():
     only if the numbers agree."""
     con = duckdb.connect()
     recs, _ = _profile(con, _COMPOSITE_FIXTURE)
-    n = con.sql("SELECT count(*) FROM t").fetchone()[0]
+    n = con.sql("SELECT count(*) FROM t").fetchall()[0][0]
     for c, r in recs.items():
         s = con.sql(
             f'SELECT COALESCE(SUM(cnt * cnt), 0)::DOUBLE FROM '
-            f'(SELECT COUNT(*) AS cnt FROM t GROUP BY "{c}")').fetchone()[0]
+            f'(SELECT COUNT(*) AS cnt FROM t GROUP BY "{c}")').fetchall()[0][0]
         assert r["skew_pct"] == pytest.approx(round(100.0 * s / (n * n), 2)), c
 
 

@@ -78,7 +78,7 @@ def count_pending() -> dict:
 
     log_path = files_path + "/csv_archive_log.parquet"
     # Nothing downloaded yet -> nothing to process (routes local; the very first run is trivially small).
-    if conn.sql(f"SELECT count(*) FROM glob('{log_path}')").fetchone()[0] == 0:
+    if conn.sql(f"SELECT count(*) FROM glob('{log_path}')").fetchall()[0][0] == 0:
         return {}
 
     conn.sql(f"""
@@ -113,7 +113,7 @@ def count_pending() -> dict:
             if fresh:
                 (n,) = conn.sql(
                     f"SELECT count(*) FROM _log WHERE source_type = '{source_type}'"
-                ).fetchone()
+                ).fetchall()[0]
             else:
                 # Null-safe anti-join = the assert_all_*_processed_* predicate exactly.
                 (n,) = conn.sql(f"""
@@ -122,7 +122,7 @@ def count_pending() -> dict:
                       AND NOT EXISTS (
                           SELECT 1 FROM _done d WHERE d.col = '{fact_col}' AND d.f = l.csv_filename
                       )
-                """).fetchone()
+                """).fetchall()[0]
             pending[(fact, source_type)] = n
     return pending
 

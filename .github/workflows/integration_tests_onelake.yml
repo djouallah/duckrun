@@ -192,7 +192,7 @@ jobs:
 
           def detail(t):
               rel = conn.sql(f"DESCRIBE DETAIL {t}")
-              return dict(zip(rel.columns, rel.fetchone()))
+              return dict(zip(rel.columns, rel.fetchall()[0]))
 
           before = detail("fact_sales")
           # Auto-key sort rewrite, SQL-only: profile the key from the Delta log, re-cluster in one commit.
@@ -276,7 +276,7 @@ jobs:
 
           def detail(t):
               rel = conn.sql(f"DESCRIBE DETAIL {t}")
-              return dict(zip(rel.columns, rel.fetchone()))
+              return dict(zip(rel.columns, rel.fetchall()[0]))
 
           before = detail("trips")
           # Auto-key sort rewrite, SQL-only: profile the key from the Delta log, re-cluster in one commit.

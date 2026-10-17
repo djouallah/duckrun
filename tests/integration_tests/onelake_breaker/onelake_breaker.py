@@ -91,7 +91,7 @@ def _detail(con, table):
     """`DESCRIBE DETAIL <table>` as a dict — numFiles / sizeInBytes / version, SQL-only (no deltalake
     import needed for the layout metrics)."""
     rel = con.sql(f"DESCRIBE DETAIL {table}")
-    return dict(zip(rel.columns, rel.fetchone()))
+    return dict(zip(rel.columns, rel.fetchall()[0]))
 
 
 # --------------------------------------------------------------------------- worker

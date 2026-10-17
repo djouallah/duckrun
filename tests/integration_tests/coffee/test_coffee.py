@@ -78,7 +78,7 @@ ONELAKE_SCHEMA = os.environ.get("DUCKRUN_IT_SCHEMA", "duckrun_conn_it")
 
 def run_coffee_scenario(conn, schema, n_rows):
     """Exercise the SQL-only connection API against ``conn`` with an ``n_rows`` fact table."""
-    q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731 — scalar helper
+    q = lambda sql: conn.sql(sql).fetchall()[0][0]  # noqa: E731 — scalar helper
 
     print(f"\n=== coffee-shop scenario | schema='{schema}' | {n_rows:,} fact rows "
           f"| warehouse={getattr(conn, 'root_path', '?')} ===", flush=True)
