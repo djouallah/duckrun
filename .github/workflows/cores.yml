@@ -63,6 +63,7 @@ on:
       - '!tests/integration_tests/coffee/**'        # integration_tests_onelake.yml (its own coffee job)
       - '!tests/fuzz/**'                            # fuzz.yml (manual)
       - '!tests/deploy_testing/**'                          # deploy_to_fabric.yml (manual)
+      - '!tests/pre_install/**'                             # pre_install.yml (manual)
       - 'pyproject.toml'      # dependency / version changes
       - '.github/workflows/cores.yml'
       - '.github/actions/**'  # shared composite actions the jobs below use
@@ -84,6 +85,7 @@ on:
       - '!tests/integration_tests/coffee/**'
       - '!tests/fuzz/**'
       - '!tests/deploy_testing/**'
+      - '!tests/pre_install/**'
       - 'pyproject.toml'
       - '.github/workflows/cores.yml'
       - '.github/actions/**'
