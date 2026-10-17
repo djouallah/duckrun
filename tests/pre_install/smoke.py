@@ -1,11 +1,11 @@
-"""Smoke test for the PUBLISHED duckrun as `pip install --pre "duckrun[dbt]"` resolves it today.
+"""Smoke test for duckrun as `pip install --pre "duckrun[dbt]"` resolves it today.
 
 A pre-release install pulls the newest duckdb 2.0 dev build, and DuckDB 2.0 is reshaping its Python
-result API (fetchone & co). This proves the released duckrun still works against whatever duckdb
+result API (fetchone & co). This proves duckrun still works against whatever duckdb
 that resolves to: the connect() DML surface, every fetch* reader, and an incremental dbt run.
 
-Run by .github/workflows/pre_install.yml from OUTSIDE the checkout, so `import duckrun` can only be
-the installed package. Plain script: exits non-zero on the first failed check.
+Run by the `pre-install` job in .github/workflows/cores.yml (a release gate) from OUTSIDE the
+checkout, so `import duckrun` can only be the installed wheel. Plain script: exits non-zero on the first failed check.
 """
 import tempfile
 from importlib.metadata import version
