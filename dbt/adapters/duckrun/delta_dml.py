@@ -96,7 +96,9 @@ def is_dropped(con, location: str, storage_options=None) -> bool:
     loc_sql = str(location).replace("'", "''")
     try:
         rel = con.execute(f"select * from delta_scan('{loc_sql}') limit 0")
-        return _columns_are_tombstone([d[0] for d in rel.description])
+        cols = [d[0] for d in rel.description]
+        rel.fetchall()  # end the result: an open one blocks the connection on duckdb 2.0 (#26747)
+        return _columns_are_tombstone(cols)
     except Exception as exc:  # best-effort: treat unreadable as 'not a tombstone', but leave a trace
         logger.debug(f"duckrun: is_dropped could not scan {location!r}, treating as live: {exc}")
         return False
@@ -676,11 +678,11 @@ def is_temp_table(cursor, rel: str) -> bool:
     schema, identifier = _split_relation(rel)
     if schema or not identifier:
         return False
-    row = cursor.execute(
+    rows = cursor.execute(
         "select 1 from duckdb_tables() where temporary and lower(table_name) = lower(?) limit 1",
         [identifier],
-    ).fetchone()
-    return row is not None
+    ).fetchall()
+    return bool(rows)
 
 
 def targets_temp_table(cursor, sql: str) -> bool:
@@ -1091,7 +1093,7 @@ def _try_literal(expr: str, cur) -> Optional[str]:
     then skipped and the original text left for delta_rs (no worse than before)."""
     try:
         rel = cur.sql(f"SELECT ({expr}) AS v")
-        val = rel.fetchone()[0]
+        val = rel.fetchall()[0][0]
         typ = str(rel.types[0])
     except Exception:
         return None
@@ -1910,7 +1912,7 @@ class _DeltaDML:
             f'count(*) filter (where {pred}) as "n{i}", '
             f'any_value(v."{col}") filter (where {pred}) as "ex{i}"'
             for i, (col, pred) in enumerate(checks))
-        row = self.cursor.sql(f"select {sel} from {inner}").fetchone()
+        row = self.cursor.sql(f"select {sel} from {inner}").fetchall()[0]
         for i, (col, _) in enumerate(checks):
             n, ex = row[2 * i], row[2 * i + 1]
             if n:
