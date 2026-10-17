@@ -34,7 +34,7 @@ name: cores
 #   • lean-install            — `pip install duckrun` WITHOUT the [dbt] extra: connect() imports
 #                               and writes Delta with no dbt installed.
 #   • pre-install             — `pip install --pre "duckrun[dbt]"` (newest duckdb dev build) from a
-#                               built wheel: connect() DML + fetch*, and an incremental dbt run.
+#                               built wheel: connect() DML + read-back, and an incremental dbt run.
 #
 # Path-filtered to the offline surface it actually exercises — the adapter, the duckrun package, and
 # the test suites (everything under tests/, which now also houses the aemo / parity / integration
@@ -533,7 +533,7 @@ jobs:
         run: pip install --pre ".[dbt]"
       - name: Resolved versions
         run: pip show duckrun duckdb dbt-core dbt-duckdb deltalake | grep -E '^(Name|Version):'
-      - name: Smoke — connect() DML + fetch*, incremental dbt run
+      - name: Smoke — connect() DML, incremental dbt run
         run: |
           cd "$RUNNER_TEMP"
           python "$GITHUB_WORKSPACE/tests/pre_install/smoke.py"
