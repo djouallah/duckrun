@@ -2,7 +2,7 @@
 
 A pre-release install pulls the newest duckdb 2.0 dev build, and DuckDB 2.0 is reshaping its Python
 result API (fetchone & co). This proves duckrun still works against whatever duckdb
-that resolves to: the connect() DML surface, every fetch* reader, and an incremental dbt run.
+that resolves to: the connect() DML surface and an incremental dbt run.
 
 Run by the `pre-install` job in .github/workflows/cores.yml (a release gate) from OUTSIDE the
 checkout, so `import duckrun` can only be the installed wheel. Plain script: exits non-zero on the first failed check.
@@ -18,7 +18,9 @@ assert "site-packages" in Path(duckrun.__file__).parts, f"not the installed duck
 print(f"duckrun {version('duckrun')} / duckdb {duckdb.__version__}")
 
 
-# --- connect(): every DML statement, read back through each fetch* method ----------------------
+# --- connect(): every DML statement, read back ---------------------------------------------------
+# conn.sql() returns a DuckDB relation, and duckdb 2.0 relations have no fetchone()/fetchmany() (a
+# relation keeps no result between calls) — fetchall() / limit(n).fetchall() is the portable read.
 conn = duckrun.connect(tempfile.mkdtemp(), read_only=False)
 conn.sql("CREATE TABLE t AS SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) v(id, name)")
 conn.sql("INSERT INTO t VALUES (4, 'd')")
@@ -29,9 +31,9 @@ conn.sql("MERGE INTO t USING (VALUES (1, 'A'), (9, 'z')) s(id, name) ON target.i
 
 expected = [(1, "A"), (2, "B"), (4, "d"), (9, "z")]
 assert conn.sql("SELECT id, name FROM t ORDER BY id").fetchall() == expected
-assert conn.sql("SELECT count(*) FROM t").fetchone() == (4,)
-assert conn.sql("SELECT id, name FROM t ORDER BY id").fetchmany(2) == expected[:2]
-assert conn.sql("SELECT id FROM t WHERE id = 42").fetchone() is None
+assert conn.sql("SELECT count(*) FROM t").fetchall() == [(4,)]
+assert conn.sql("SELECT id, name FROM t ORDER BY id").limit(2).fetchall() == expected[:2]
+assert conn.sql("SELECT id FROM t WHERE id = 42").fetchall() == []
 print("connect() OK")
 
 
@@ -60,9 +62,9 @@ for run in (1, 2):  # run 2 takes the is_incremental() merge path
     assert res.success, f"dbt run {run} failed: {res.exception}"
 
 wh = duckrun.connect(root, schema="main")
-assert wh.sql("SELECT count(*), count(DISTINCT id) FROM src").fetchone() == (100, 100)
-assert wh.sql("SELECT count(*), count(DISTINCT id) FROM inc").fetchone() == (100, 100)
-assert wh.sql("SELECT val FROM inc WHERE id = 99").fetchone() == ("v99",)
+assert wh.sql("SELECT count(*), count(DISTINCT id) FROM src").fetchall() == [(100, 100)]
+assert wh.sql("SELECT count(*), count(DISTINCT id) FROM inc").fetchall() == [(100, 100)]
+assert wh.sql("SELECT val FROM inc WHERE id = 99").fetchall() == [("v99",)]
 print("dbt OK")
 
 print("pre-install smoke OK")
