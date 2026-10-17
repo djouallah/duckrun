@@ -33,7 +33,7 @@ on:
         type: string
         default: ""
       opt_tfs_mb:
-        description: "target parquet file size (MB) for BOTH writers. Empty = duckrun's 256 MB."
+        description: "target parquet file size (MB) for BOTH writers. Empty = duckrun's 128 MB."
         type: string
         default: ""
       opt_page_bytes:

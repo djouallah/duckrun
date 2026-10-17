@@ -19,6 +19,12 @@ All notable changes to this project will be documented in this file.
   `fetchone()`; use `fetchall()` or `.limit(1).fetchall()`, which work on 1.x and 2.0 alike.
 
 ### Changed
+- **The default target file size is 128 MB** (was 256 MB), the bin size Fabric Spark's
+  optimize-write targets. 128 MB was reverted in 0.4.65 only because every file ended in a truncated
+  row group and smaller files meant more of them; since 0.5.4 files roll on row-group boundaries, so
+  that cost is gone. Applies to every write and to post-write compaction; the byte-debt compaction
+  thresholds follow (small file < 64 MB, byte floor 256 MB). A per-model `target_file_size_mb` still
+  wins verbatim.
 - **0.5.1: `deltalake` is no longer pinned to exactly 1.5.0** — the requirement is the floor
   `deltalake>=1.5.0`, and the runtime guard rejects only an older deltalake. Earlier releases called
   every deltalake above 1.5.0 broken for MERGE at scale and batch DELETE; with the pin lifted, the

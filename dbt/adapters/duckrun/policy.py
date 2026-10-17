@@ -27,14 +27,14 @@ from deltalake.exceptions import CommitFailedError
 from dbt.adapters.duckrun._log import logger
 
 # The one read-layout target every file write, compaction, and sort-rewrite uses (see engine).
-# 256, not 128: a row group cannot span files, so every file's LAST group is truncated wherever
-# the byte roll lands — at 128 MB the aemo mart measured 4 roll-truncated tails out of 25 groups
-# (one a 1.25M-row runt, the bottom of the healthy 1-16M Direct Lake segment band) vs ~2 at
-# 256 MB. Shipped as 128 in 0.4.64, reverted in 0.4.65: fewer, larger files mean fewer truncated
-# tail segments. Revisit only when delta-rs can align the file roll to a row-group boundary
-# (force full row groups). 256 also keeps the merge-spill gate's disk demand lower (128 doubled
-# the file count and the update-only merge's DataFusion spill).
-DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
+# 128 MB, the bin size Fabric Spark's optimize-write targets. Shipped as 128 in 0.4.64 and reverted
+# to 256 in 0.4.65 because a row group cannot span files: the byte roll truncated every file's LAST
+# group, and at 128 MB the aemo mart measured 4 roll-truncated tails out of 25 groups vs ~2 at 256.
+# Since 0.5.4 the roll is aligned to row-group boundaries (DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY, see
+# engine), so there are no truncated tails at any target and that reason is gone. The cost still on
+# record: 128 doubled the file count and, at the old 8M-row-group geometry, the update-only merge's
+# DataFusion spill — the merge-spill gate is what keeps this value honest.
+DEFAULT_TARGET_FILE_SIZE = 128 * 1024 * 1024
 
 # Delta checkpoint cadence, stamped as `delta.checkpointInterval` on every table duckrun creates.
 # delta-rs's post-commit hook honors the property and writes the checkpoint itself; without it the
@@ -48,7 +48,7 @@ CHECKPOINT_INTERVAL = 10
 # segment size is 8M), and 4M sits mid-band: 2-6M measured best across the layout sweeps, with hot
 # scans leaning to the small end (one more group to scan in parallel per file) and the cold U-curve
 # shallow from 6M up. Was 6M through 0.4.67; the trade is a little cold-load density for hot scan
-# parallelism. A CEILING, not a size: the 256 MB file roll usually closes the group first.
+# parallelism. A CEILING, not a size: the 128 MB file roll usually closes the group first.
 # There is no derived sizing anywhere: the planner-estimate machinery (EXPLAIN cardinality,
 # prior-log floors) and, later, the SORTED BY AUTO byte-model geometry (rg_for / tfs_for / one row
 # group per file) each cost plan walks, counts and a calibrated bytes/row model for no measured

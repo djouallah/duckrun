@@ -80,13 +80,12 @@ _DATA_PAGE_SIZE_LIMIT = 1_048_576
 # layout benchmark (tests/parquet_layout/aemo): ~40x fewer pages per chunk, cold column loads
 # consistently faster, write memory unchanged (dense pages are bounded by bytes, not rows).
 _DATA_PAGE_ROW_LIMIT = 1_000_000
-# Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a
-# segment cap — and every file's LAST row group is truncated wherever the roll lands. That is why
-# 128 MB (tried in 0.4.64, reverted in 0.4.65) lost: it doubled the file count, so the aemo mart
-# went from ~2 roll-truncated tail groups to 4 of 25 (one a 1.25M-row runt at the bottom of the
-# healthy 1-16M segment band). delta-rs can now align the roll to a row-group boundary
-# (DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY, set at the top of this module), which removes the truncated
-# tails at any target size. Not a merge-MEMORY lever (that was the dictionary page limit, see
+# Target file size: 128 MB. A Parquet row group can't span files, so before the aligned roll every
+# file's LAST row group was truncated wherever the byte roll landed — which is why 128 MB (tried in
+# 0.4.64) was reverted to 256 in 0.4.65: it doubled the file count and with it the truncated tails
+# (aemo mart: 4 of 25 groups vs ~2). The roll is now aligned to a row-group boundary
+# (DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY, set at the top of this module), so there are no truncated
+# tails at any target size and 128 MB is back. Not a merge-MEMORY lever (that was the dictionary page limit, see
 # _DICT_PAGE_SIZE_LIMIT; 128/256/512 MB all merged in ~16s at ~4.5-5.2 GB RSS in the small-scale
 # measurement) — but it IS a merge-DISK lever at scale (128 MB's doubled file count pushed the
 # update-only merge's DataFusion spill from <59 to 60-100 GB). Deliberately far below 1 GB, which
@@ -665,7 +664,7 @@ def build_write_deltalake_args(
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
     EVERY write through here — overwrite, replace-where and append alike — gets the one read-layout
-    profile: the tuned writer properties plus the 256 MB ``target_file_size``. MERGE does not go
+    profile: the tuned writer properties plus the 128 MB ``target_file_size``. MERGE does not go
     through here at all and keeps delta_rs defaults.
 
     Append used to be excluded on the theory that appends are transient increments which
@@ -682,7 +681,7 @@ def build_write_deltalake_args(
     ``None`` — every normal write — keeps the fixed ``_ROW_GROUP_SIZE`` ceiling and lets the
     file roll pick the group; nothing is derived.
 
-    ``target_file_size`` (bytes) overrides the 256 MB default for THIS write — the per-model
+    ``target_file_size`` (bytes) overrides the 128 MB default for THIS write — the per-model
     ``target_file_size_mb`` dbt config lands here. ``None`` keeps ``_TARGET_FILE_SIZE``.
     """
     args: Dict[str, Any] = {
@@ -1130,7 +1129,7 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     the recommended ORDER BY columns (``[]`` if nothing pays off) and the advisory lines for the
     CALLER to print/log. The one seam behind dbt's ``sort_by='auto'`` and the connection API's
     relation fallback for ``SORTED BY AUTO``. The write itself is NOT sized here — an AUTO write
-    lands on the same fixed geometry (4M-row ceiling, 256 MB files) as every other write.
+    lands on the same fixed geometry (4M-row ceiling, 128 MB files) as every other write.
 
     ``source`` MUST be cheap to scan repeatedly — the recommender reads it several times. The
     CALLER is responsible for that: both surfaces materialize a PROFILING SUBSTRATE (a full local
@@ -1359,7 +1358,7 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
 
     ``target_file_size`` / ``row_group_cap`` carry a model's EXPLICIT write geometry (the
     ``target_file_size_mb`` / ``max_row_group_size`` dbt configs) into maintenance: without them, the
-    very next compaction would re-fold the model's files back into the global 256 MB / fixed-4M
+    very next compaction would re-fold the model's files back into the global 128 MB / fixed-4M
     layout, silently undoing the config the write just honored. ``None`` = the defaults, unchanged."""
     if cur is None:
         return
@@ -1442,7 +1441,7 @@ def write_delta(
     ONE Delta write seam), so a fenced write is pinned to the caller's snapshot and fails loudly on a
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
-    Every write lands in the one read-layout profile (tuned writer properties + 256 MB files) —
+    Every write lands in the one read-layout profile (tuned writer properties + 128 MB files) —
     append included, with the same fixed 4M row-group ceiling everywhere. Nothing is derived from
     the result: no planner estimate, no count, no prior-log probe (the only self-sizing write is
     SORTED BY AUTO, whose profile already paid for an exact count).
