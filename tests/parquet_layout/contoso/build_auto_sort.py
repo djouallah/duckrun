@@ -35,7 +35,7 @@ con.sql("create schema if not exists tests")
 
 def _exists():
     try:
-        con.sql("select 1 from tests.sales_auto_sort limit 1").fetchone()
+        con.sql("select 1 from tests.sales_auto_sort limit 1").fetchall()
         return True
     except Exception:
         return False
@@ -66,7 +66,7 @@ def resolved_sort_key(body):
 _t0 = time.perf_counter()
 sort_key = None
 if not force and _exists():
-    rows = con.sql("select count(*) from tests.sales_auto_sort").fetchone()[0]
+    rows = con.sql("select count(*) from tests.sales_auto_sort").fetchall()[0][0]
     print(f"tests.sales_auto_sort already exists ({rows:,} rows) — skipping "
           "(rebuild=true to rebuild)", flush=True)
     status = "skipped"   # nothing was written, so no key was chosen — report null, not a guess
@@ -76,7 +76,7 @@ else:
     print(f"sort key: {clause} -> {sort_key or '(no sort — nothing pays off)'}", flush=True)
     print(f"Building tests.sales_auto_sort with '{clause}' ...", flush=True)
     con.sql(f"create or replace table tests.sales_auto_sort {clause} as {body}")
-    rows = con.sql("select count(*) from tests.sales_auto_sort").fetchone()[0]
+    rows = con.sql("select count(*) from tests.sales_auto_sort").fetchall()[0][0]
     print(f"done — tests.sales_auto_sort built ({rows:,} rows)", flush=True)
     status = "rebuilt"
 

@@ -37,8 +37,9 @@ def test_sql_returns_native_duckdb_relation(w):
     """conn.sql() hands back DuckDB's own relation, unwrapped — exact type, not isinstance-of-ours."""
     rel = w.sql("select 1 as x")
     assert type(rel) is duckdb.DuckDBPyRelation
-    # the native surface users rely on is all present (maintained upstream by DuckDB)
-    for m in ("show", "df", "arrow", "pl", "fetchall", "fetchone", "filter", "aggregate"):
+    # the native surface users rely on is all present (maintained upstream by DuckDB; 2.0 relations
+    # have no fetchone — rel.limit(1).fetchall() is the read on both 1.x and 2.0)
+    for m in ("show", "df", "arrow", "pl", "fetchall", "limit", "filter", "aggregate"):
         assert hasattr(rel, m), m
     assert rel.fetchall() == [(1,)]
 
@@ -52,10 +53,10 @@ def test_register_makes_local_object_queryable(w):
     pd = pytest.importorskip("pandas")
     local_df = pd.DataFrame({"id": [1, 2, 3], "name": ["a", "b", "c"]})
     w.register("local_df", local_df)
-    assert w.sql("select sum(id) from local_df").fetchone()[0] == 6
+    assert w.sql("select sum(id) from local_df").fetchall()[0][0] == 6
     # and it can seed a real Delta table through the normal write path
     w.sql("CREATE OR REPLACE TABLE seeded AS SELECT * FROM local_df")
-    assert w.sql("select count(*) from seeded").fetchone()[0] == 3
+    assert w.sql("select count(*) from seeded").fetchall()[0][0] == 3
 
 
 # ─────────────────────────────────────────────────────── router classification matrix (RED → P1)
@@ -141,10 +142,10 @@ def test_sql_rejects_multi_statement_reads(w):
     with pytest.raises(ValueError, match="one statement"):
         w.sql("select 1; create table foo as select 2")  # the smuggling case the guard closes
     # single statements are unaffected — trailing `;` and `;` inside a literal both run fine
-    assert w.sql("select 1 as x;").fetchone()[0] == 1
-    assert w.sql("select ';' as x").fetchone()[0] == ";"
+    assert w.sql("select 1 as x;").fetchall()[0][0] == 1
+    assert w.sql("select ';' as x").fetchall()[0][0] == ";"
     # and the ephemeral-table smuggle never happened
-    assert w.sql("select count(*) from duckdb_tables() where table_name = 'foo'").fetchone()[0] == 0
+    assert w.sql("select count(*) from duckdb_tables() where table_name = 'foo'").fetchall()[0][0] == 0
 
 
 # ─────────────────────────────────────────────── CREATE TABLE layout: SORTED BY / PARTITIONED BY
@@ -167,7 +168,7 @@ def test_create_partitioned_by(w):
     dirs = {os.path.basename(os.path.dirname(f))
             for f in glob.glob(os.path.join(w._table_path("dbo", "p"), "**", "*.parquet"), recursive=True)}
     assert dirs == {"region=eu", "region=us"}
-    assert w.sql("select count(*) from p").fetchone()[0] == 3
+    assert w.sql("select count(*) from p").fetchall()[0][0] == 3
 
 
 def test_create_sorted_and_partitioned(w):
@@ -178,7 +179,7 @@ def test_create_sorted_and_partitioned(w):
     dirs = {os.path.basename(os.path.dirname(f))
             for f in glob.glob(os.path.join(w._table_path("dbo", "sp"), "**", "*.parquet"), recursive=True)}
     assert dirs == {"region=0", "region=1"}
-    assert w.sql("select count(*) from sp").fetchone()[0] == 40
+    assert w.sql("select count(*) from sp").fetchall()[0][0] == 40
 
 
 def test_create_sorted_by_auto(w):
@@ -187,7 +188,7 @@ def test_create_sorted_by_auto(w):
     w.sql("CREATE OR REPLACE TABLE a SORTED BY AUTO AS SELECT (i%5) as region, i as id FROM range(20000) t(i)")
     regs = [r[0] for r in w.sql(f"select region from parquet_scan('{_first_file(w, 'a')}')").fetchall()]
     assert regs == sorted(regs)                                   # clustered by the auto-picked key
-    assert w.sql("select count(*) from a").fetchone()[0] == 20000
+    assert w.sql("select count(*) from a").fetchall()[0][0] == 20000
 
 
 def test_sorted_by_auto_single_table_profiles_from_the_log(w, monkeypatch):
@@ -263,7 +264,7 @@ def test_sorted_by_auto_reads_the_source_once(w, monkeypatch):
     staged = [s for s in seen if "_duckrun_auto_src" in s]
     assert len(staged) > 5, staged
     assert any("ORDER BY" in s for s in staged), "the write did not read the staged copy"
-    assert w.sql("select count(*) from out1").fetchone()[0] == 2994
+    assert w.sql("select count(*) from out1").fetchall()[0][0] == 2994
 
     # ── above the cap: count + substrate CTAS; the WRITE is the only other read of the body.
     monkeypatch.setattr(sk, "SUBSTRATE_CAP", 1000)     # n=2994 → K=3
@@ -281,7 +282,7 @@ def test_sorted_by_auto_reads_the_source_once(w, monkeypatch):
     # The write reads the ORIGINAL body (the staged table is a partial substrate) — it reaches
     # the connection as the SELECT feeding the Delta write, sorted by the resolved key.
     assert touch[2].upper().startswith("SELECT"), touch[2]
-    assert w.sql("select count(*) from out2").fetchone()[0] == 2994
+    assert w.sql("select count(*) from out2").fetchall()[0][0] == 2994
 
 
 # ─────────────────────────────────────────────────────── shared engine seam + fencing (GREEN)
@@ -299,7 +300,7 @@ def test_ctas_goes_through_engine_write_delta(w, monkeypatch):
     monkeypatch.setattr(engine, "write_delta", spy)
     w.sql("CREATE OR REPLACE TABLE t2 AS SELECT 1 AS id")
     assert calls and calls[-1][1] == "overwrite"
-    assert w.sql("select id from t2").fetchone()[0] == 1
+    assert w.sql("select id from t2").fetchall()[0][0] == 1
 
 
 def test_routed_merge_is_fenced(w, monkeypatch):
@@ -337,9 +338,9 @@ def test_vacuum_compacts_small_files(w):
     before = nfiles()
     assert before >= 6                                     # one file per append, uncompacted
     status = w.sql("VACUUM m")
-    assert status.fetchone()[0] == "ok"                    # native status relation, like other DML
+    assert status.fetchall()[0][0] == "ok"                    # native status relation, like other DML
     assert nfiles() < before                               # compacted into fewer files
-    assert w.sql("select count(*) from m").fetchone()[0] == 7   # every row preserved
+    assert w.sql("select count(*) from m").fetchall()[0][0] == 7   # every row preserved
 
 
 # ───────────────────────────────────────────── INSERT … REPLACE WHERE: atomic slice overwrite
@@ -354,7 +355,7 @@ def test_insert_replace_where_overwrites_only_the_slice(w):
     counts = dict(w.sql("select region, count(*) from s group by region").fetchall())
     assert counts == {"eu": 2, "us": 1}                    # eu slice replaced (2 new), us untouched
     assert sorted(r[0] for r in w.sql("select id from s where region='eu'").fetchall()) == [8, 9]
-    assert w.sql("select id from s where region='us'").fetchone()[0] == 3
+    assert w.sql("select id from s where region='us'").fetchall()[0][0] == 3
 
 
 def test_routed_replace_where_is_fenced(w, monkeypatch):
@@ -424,7 +425,7 @@ def test_use_switches_write_routing(tmp_path):
     c.attach(sec, name="sec")
     c.sql("CREATE OR REPLACE TABLE sec.dbo.s0 AS SELECT 1 x")   # give sec a dbo schema to USE into
     c.sql("USE sec.dbo")
-    assert c.sql("SELECT current_database()").fetchone()[0] == "sec"
+    assert c.sql("SELECT current_database()").fetchall()[0][0] == "sec"
     assert c._current_catalog == "sec"                          # routing followed the USE, not just reads
     c.sql("CREATE OR REPLACE TABLE t AS SELECT 42 x")           # unqualified write
     assert glob.glob(os.path.join(sec, "**", "t"), recursive=True)      # landed in sec
@@ -453,7 +454,7 @@ def test_insert_values_casts_mixed_literal_types_to_target(w):
     w.sql("CREATE OR REPLACE TABLE fl (f DOUBLE)")
     w.sql("INSERT INTO fl VALUES ('inf'), ('-inf'), ('nan'), (0.0), (-0.0), (1.5)")
     assert w.sql("select count(*) filter (where isinf(f)), count(*) filter (where isnan(f)), "
-                 "count(*) filter (where f = 0.0) from fl").fetchone() == (2, 1, 2)
+                 "count(*) filter (where f = 0.0) from fl").fetchall()[0] == (2, 1, 2)
 
 
 def test_insert_values_default_fills_the_column_default(w):
@@ -485,7 +486,7 @@ def test_insert_into_with_cte_after_target_shadowing_its_name(w):
     target's name) is routed, not swallowed into the relation: the CTE's row is appended."""
     w.sql("CREATE OR REPLACE TABLE sales AS SELECT 1 AS id, 'a' AS note")
     w.sql("INSERT INTO sales WITH sales AS (SELECT 999 AS id, 'cte' AS note) SELECT * FROM sales")
-    assert w.sql("select count(*), count(*) filter (where id = 999) from sales").fetchone() == (2, 1)
+    assert w.sql("select count(*), count(*) filter (where id = 999) from sales").fetchall()[0] == (2, 1)
 
 
 def test_insert_by_name_aligns_source_columns_to_target(w):
@@ -505,9 +506,9 @@ def test_update_and_delete_accept_target_self_qualified_columns(w):
     subquery fallback aliases the scan to the same name so even a correlated reference resolves."""
     w.sql("CREATE OR REPLACE TABLE q AS SELECT * FROM (VALUES (1,10),(2,20),(3,30)) v(k, val)")
     w.sql("UPDATE q SET val = q.val + 1 WHERE q.k = 2")                 # fast path, self-qualified
-    assert w.sql("select val from q where k = 2").fetchone() == (21,)
+    assert w.sql("select val from q where k = 2").fetchall()[0] == (21,)
     w.sql("UPDATE q SET val = q.val, k = q.k")                          # every SET self-qualified (no-op)
-    assert w.sql("select sum(val) from q").fetchone() == (61,)
+    assert w.sql("select sum(val) from q").fetchall()[0] == (61,)
     # subquery in the predicate -> DuckDB fallback; the self-qualified `q.k` must resolve against the
     # aliased scan alongside the subquery over another table.
     w.sql("DELETE FROM q WHERE q.k IN (SELECT k FROM q WHERE val < 15)")
@@ -525,7 +526,7 @@ def test_predicate_less_update_touches_every_row_over_many_files(w):
     for k in range(60):
         w.sql(f"INSERT INTO batch VALUES ({k})")                 # 60 single-row commits → many files
     w.sql("UPDATE batch SET i = i + 1")
-    assert w.sql("select count(*), sum(i), min(i), max(i) from batch").fetchone() == (60, 1830, 1, 60)
+    assert w.sql("select count(*), sum(i), min(i), max(i) from batch").fetchall()[0] == (60, 1830, 1, 60)
 
 
 def test_plain_drop_of_already_dropped_table_errors(w):
@@ -565,7 +566,7 @@ def test_describe_detail(w):
     d = w.sql("DESCRIBE DETAIL t")
     assert d.columns == ["format", "id", "name", "location", "partitionColumns",
                          "numFiles", "sizeInBytes", "version"]
-    row = dict(zip(d.columns, d.fetchone()))
+    row = dict(zip(d.columns, d.fetchall()[0]))
     assert row["format"] == "delta"
     assert row["location"].replace("\\", "/").endswith("dbo/t")
     assert row["partitionColumns"] == ["r"] and row["numFiles"] >= 1 and row["version"] == 0
@@ -582,8 +583,8 @@ def test_describe_history_and_time_travel(w):
     assert hist.columns == ["version", "timestamp", "operation", "operationMetrics"]
     assert [r[0] for r in hist.fetchall()] == [1, 0]        # newest first
     d = w.sql("DESCRIBE DETAIL h")
-    loc = dict(zip(d.columns, d.fetchone()))["location"]
-    assert w.sql(f"SELECT count(*) FROM delta_scan('{loc}', version => 0)").fetchone()[0] == 1
+    loc = dict(zip(d.columns, d.fetchall()[0]))["location"]
+    assert w.sql(f"SELECT count(*) FROM delta_scan('{loc}', version => 0)").fetchall()[0][0] == 1
 
 
 def test_restore_to_version(w):
@@ -631,7 +632,7 @@ def test_update_unknown_set_column_fails_loud_no_commit(w):
     with pytest.raises(Exception):
         w.sql("UPDATE t SET nope = 1")
     assert [r[0] for r in w.sql("DESCRIBE HISTORY t").fetchall()] == before   # no new commit
-    assert w.sql("select s from t").fetchone()[0] == "x"                      # data untouched
+    assert w.sql("select s from t").fetchall()[0][0] == "x"                      # data untouched
 
 
 def test_update_scalar_subquery_in_set_does_not_panic(w):
@@ -650,7 +651,7 @@ def test_quoted_identifier_with_dot_is_one_table(w):
     w.sql('CREATE OR REPLACE TABLE "a.b" AS SELECT 1 AS id')
     assert os.path.isdir(w._table_path("dbo", "a.b"))         # landed at <root>/dbo/a.b …
     assert not os.path.isdir(w._table_path("a", "b"))         # … NOT dot-split into schema a / table b
-    assert w.sql('SELECT id FROM "a.b"').fetchone()[0] == 1
+    assert w.sql('SELECT id FROM "a.b"').fetchall()[0][0] == 1
 
 
 @pytest.mark.parametrize("evil", ['"../escape"', '"x/../../pwned"', '".."'])
@@ -672,7 +673,7 @@ def test_insert_select_extra_columns_fails_loud(w):
     with pytest.raises(Exception):
         w.sql("INSERT INTO t SELECT 1, 'y', 99")              # 3 cols into a 2-col table
     assert [r[0] for r in w.sql("DESCRIBE HISTORY t").fetchall()] == before
-    assert w.sql("select count(*) from t").fetchone()[0] == 1
+    assert w.sql("select count(*) from t").fetchall()[0][0] == 1
 
 
 def test_delta_write_inside_explicit_transaction_is_rejected(w):

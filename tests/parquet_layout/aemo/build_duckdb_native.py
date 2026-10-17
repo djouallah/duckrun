@@ -230,7 +230,7 @@ except Exception:
 
 def _exists():
     try:
-        con.sql(f"select 1 from tests.{TABLE} limit 1").fetchone()
+        con.sql(f"select 1 from tests.{TABLE} limit 1").fetchall()
         return True
     except Exception:
         return False
@@ -300,7 +300,7 @@ def _write_cli(dd, collist, src, order, table_uri, run_tag, con):
     t_s = time.perf_counter()
     # Hand the box to the child. This process has just staged 142M rows and its buffer pool is
     # still holding them; it needs nothing until the CLI returns.
-    _parent_mem = dd.execute("select current_setting('memory_limit')").fetchone()[0]
+    _parent_mem = dd.execute("select current_setting('memory_limit')").fetchall()[0][0]
     dd.execute("SET memory_limit='1GB'")
     try:
         subprocess.run([cli, "-c", sql], check=True)
@@ -397,7 +397,7 @@ def _delta_json(v):
 
 _t0 = time.perf_counter()
 if not force and _exists():
-    rows = con.sql(f"select count(*) from tests.{TABLE}").fetchone()[0]
+    rows = con.sql(f"select count(*) from tests.{TABLE}").fetchall()[0][0]
     print(f"tests.{TABLE} already exists ({rows:,} rows) — skipping (rebuild=true to rebuild)",
           flush=True)
     status, k, n = "skipped", None, rows
@@ -496,11 +496,11 @@ else:
     else:
         _lead = f'"{sort_cols[0]}"'
         _cut = dd.execute(f"select max(k) from (select {_lead} as k from {_src_tbl} "
-                          f"order by k limit {N_CAP})").fetchone()[0]
+                          f"order by k limit {N_CAP})").fetchall()[0][0]
         src = f"(select {sellist} from {_src_tbl} where {_lead} <= '{_cut}')"
-    n_src = dd.execute(f"select count(*) from {src}").fetchone()[0]
+    n_src = dd.execute(f"select count(*) from {src}").fetchall()[0][0]
     if N_CAP is not None:
-        _total = dd.execute(f"select count(*) from {_src_tbl}").fetchone()[0]
+        _total = dd.execute(f"select count(*) from {_src_tbl}").fetchall()[0][0]
         print(f"source has {_total:,} rows; capped to {n_src:,} at {sort_cols[0]} <= {_cut}"
               + ("  (cap is a no-op)" if _total <= N_CAP else ""), flush=True)
     order = ", ".join(f'"{c}"' for c in sort_cols)
@@ -724,7 +724,7 @@ else:
     """).fetchall()
     if non_dict:  # warn only: a data property (e.g. >DICT_LIMIT distinct doubles), not a bug
         print(f"WARN: columns not fully dictionary-encoded: {non_dict}", flush=True)
-    n_back = dd.execute(f"select count(*) from delta_scan('{table_uri}')").fetchone()[0]
+    n_back = dd.execute(f"select count(*) from delta_scan('{table_uri}')").fetchall()[0][0]
     if n_back != n_src:
         raise SystemExit(f"row count mismatch after commit: delta_scan {n_back:,} vs source {n_src:,}")
     print(f"verified: {len(meta)} file(s) / {rgs} row group(s), {n_back:,} rows readable",

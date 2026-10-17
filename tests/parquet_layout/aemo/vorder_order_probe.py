@@ -189,7 +189,7 @@ def _table_files(con, table):
 
 def _exists(con, table):
     try:
-        con.sql(f"select 1 from tests.{table} limit 1").fetchone()
+        con.sql(f"select 1 from tests.{table} limit 1").fetchall()
         return True
     except Exception:
         return False
@@ -250,7 +250,7 @@ def main():
     seed_ok = False
     if not FORCE:
         try:
-            con.sql(f"SELECT COUNT(*) FROM parquet_metadata('{SEED_REMOTE}')").fetchone()
+            con.sql(f"SELECT COUNT(*) FROM parquet_metadata('{SEED_REMOTE}')").fetchall()
             seed_ok = True
             print(f"seed {SEED_REMOTE} already exists — skipping build", flush=True)
         except Exception:

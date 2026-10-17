@@ -82,7 +82,7 @@ except Exception:
 
 def _exists():
     try:
-        con.sql(f"select 1 from {QUALIFIED} limit 1").fetchone()
+        con.sql(f"select 1 from {QUALIFIED} limit 1").fetchall()
         return True
     except Exception:
         return False
@@ -91,7 +91,7 @@ def _exists():
 _t0 = time.perf_counter()
 sort_key = None
 if not force and _exists():
-    rows = con.sql(f"select count(*) from {QUALIFIED}").fetchone()[0]
+    rows = con.sql(f"select count(*) from {QUALIFIED}").fetchall()[0][0]
     print(f"{QUALIFIED} already exists ({rows:,} rows) — skipping "
           "(rebuild=true to rebuild)", flush=True)
     status = "skipped"   # nothing was written, so no key was chosen — report null, not a guess
@@ -103,7 +103,7 @@ else:
     # Read mart.fct_summary directly (independent of the Spark V-Order build's read); SORTED BY AUTO
     # re-sorts regardless of the source's order.
     con.sql(f"create or replace table {QUALIFIED} {clause} as {body}")
-    rows = con.sql(f"select count(*) from {QUALIFIED}").fetchone()[0]
+    rows = con.sql(f"select count(*) from {QUALIFIED}").fetchall()[0][0]
     print(f"done — {QUALIFIED} built ({rows:,} rows)", flush=True)
     status = "rebuilt"
 

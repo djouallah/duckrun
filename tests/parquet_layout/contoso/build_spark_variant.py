@@ -64,7 +64,7 @@ def _table_exists(qualified):
     import duckrun
     con = duckrun.connect(os.environ["ONELAKE_TABLES_PATH"])
     try:
-        con.sql(f"select 1 from {qualified} limit 1").fetchone()
+        con.sql(f"select 1 from {qualified} limit 1").fetchall()
         return True
     except Exception:
         return False

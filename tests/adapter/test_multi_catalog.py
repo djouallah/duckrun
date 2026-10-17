@@ -122,7 +122,7 @@ def test_mint_scoped_secret_coexists_with_default():
     # The scoped secret carries the catalog's root as its scope so longest-prefix routing works.
     scopes = con.execute(
         "select scope from duckdb_secrets() where name = 'duckrun_cat_lh_bronze'"
-    ).fetchone()[0]
+    ).fetchall()[0][0]
     assert any("onelake" in str(s) for s in scopes)
 
 
