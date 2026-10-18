@@ -14,12 +14,12 @@ from duckrun import _runtime
 
 
 def test_exact_deltalake_accepted(monkeypatch):
-    monkeypatch.setattr(deltalake, "__version__", "1.5.0")
+    monkeypatch.setattr(deltalake, "__version__", "1.6.1")
     monkeypatch.setattr(duckdb, "__version__", "1.5.4")
     _runtime.check_runtime_versions()  # no raise
 
 
-@pytest.mark.parametrize("bad", ["1.6.0", "1.5.1", "2.0.0"])
+@pytest.mark.parametrize("bad", ["1.5.0", "1.6.2", "2.0.0"])
 def test_too_new_deltalake_rejected(monkeypatch, bad):
     monkeypatch.setattr(deltalake, "__version__", bad)
     monkeypatch.setattr(duckdb, "__version__", "1.5.4")
@@ -35,7 +35,7 @@ def test_too_old_deltalake_rejected(monkeypatch):
 
 
 def test_too_old_duckdb_rejected(monkeypatch):
-    monkeypatch.setattr(deltalake, "__version__", "1.5.0")
+    monkeypatch.setattr(deltalake, "__version__", "1.6.1")
     monkeypatch.setattr(duckdb, "__version__", "1.5.3")
     with pytest.raises(RuntimeError, match="duckdb"):
         _runtime.check_runtime_versions()

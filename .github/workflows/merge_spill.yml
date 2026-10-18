@@ -58,13 +58,13 @@ jobs:
           sudo docker system prune -af > /dev/null 2>&1 || true
           df -h /
 
-      - name: Show RAM / disk / deltalake version (must be 1.5.0)
+      - name: Show RAM / disk / deltalake version (must be 1.6.1 on this experiment branch)
         run: |
           free -h
           df -h /mnt /
           DLV=$(python -c "import deltalake; print(deltalake.__version__)")
           echo "deltalake $DLV"
-          python -c "import deltalake,sys; sys.exit(0 if deltalake.__version__.startswith('1.5.') else 1)"
+          python -c "import deltalake,sys; sys.exit(0 if deltalake.__version__.== '1.6.1' else 1)"
           echo "DLV=$DLV" >> "$GITHUB_ENV"
 
       - name: Prepare big disk dir

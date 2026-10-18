@@ -34,7 +34,7 @@ dependencies = [
     # cap merge RAM and avoid OOM on large upserts, and every newer release so far breaks us — DELETE
     # is broken and OneLake support regresses. So pin exactly; do NOT float until upstream fixes land.
     "duckdb>=1.5.4",
-    "deltalake==1.5.0",
+    "deltalake==1.6.1",
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
     # API directly; requests is otherwise only a transitive dbt dependency.
     "requests",

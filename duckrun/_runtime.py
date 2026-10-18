@@ -21,7 +21,7 @@ from packaging.version import Version
 #   deltalake == 1.5.0 -> max_spill_size on MERGE; the ONLY release where MERGE-at-scale and batch
 #                         DELETE also work (every newer deltalake is broken for duckrun).
 _MIN_DUCKDB = "1.5.4"
-_REQUIRED_DELTALAKE = "1.5.0"
+_REQUIRED_DELTALAKE = "1.6.1"
 
 _REMEDY = (
     "In a Fabric Python notebook, upgrade then restart the kernel so the right versions load:\n"
