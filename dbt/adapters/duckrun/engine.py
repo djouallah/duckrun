@@ -17,7 +17,9 @@ from typing import Any, Dict, List, Optional
 from dbt.adapters.duckrun._log import logger
 
 # Roll files on ROW-GROUP boundaries, so no file ends in a truncated row group (delta-rs#4677,
-# deltalake >= 1.6.4). A row group cannot span files, so the plain byte roll cuts each file's last
+# deltalake >= 1.6.4). duckrun pins deltalake 1.6.2 (#84: 1.6.3+ lists the dictionary page last in
+# encoding_stats and Direct Lake stops using the dictionary), which ignores the variable; it is kept
+# so the aligned roll comes back when the cap lifts. A row group cannot span files, so the plain byte roll cuts each file's last
 # group wherever target_file_size lands — a runt segment for VertiPaq, which maps one row group to
 # one segment. With this on, every group is a full max_row_group_size (the end-of-data remainder
 # excepted) and a file overshoots the target by at most one group. delta-rs reads it ONCE per
@@ -80,12 +82,14 @@ _DATA_PAGE_SIZE_LIMIT = 1_048_576
 # layout benchmark (tests/parquet_layout/aemo): ~40x fewer pages per chunk, cold column loads
 # consistently faster, write memory unchanged (dense pages are bounded by bytes, not rows).
 _DATA_PAGE_ROW_LIMIT = 1_000_000
-# Target file size: 128 MB. A Parquet row group can't span files, so before the aligned roll every
-# file's LAST row group was truncated wherever the byte roll landed — which is why 128 MB (tried in
-# 0.4.64) was reverted to 256 in 0.4.65: it doubled the file count and with it the truncated tails
-# (aemo mart: 4 of 25 groups vs ~2). The roll is now aligned to a row-group boundary
-# (DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY, set at the top of this module), so there are no truncated
-# tails at any target size and 128 MB is back. Not a merge-MEMORY lever (that was the dictionary page limit, see
+# Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a
+# segment cap — and every file's LAST row group is truncated wherever the roll lands. That is why
+# 128 MB (tried in 0.4.64, reverted in 0.4.65) lost: it doubled the file count, so the aemo mart
+# went from ~2 roll-truncated tail groups to 4 of 25 (one a 1.25M-row runt at the bottom of the
+# healthy 1-16M segment band). deltalake >= 1.6.4 can align the roll to a row-group boundary
+# (DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY, set at the top of this module), which removes the truncated
+# tails at any target size — 0.5.5 moved to 128 MB on that basis, and 0.5.6 is back at 256 because
+# the 1.6.2 pin (#84) has no aligned roll. Not a merge-MEMORY lever (that was the dictionary page limit, see
 # _DICT_PAGE_SIZE_LIMIT; 128/256/512 MB all merged in ~16s at ~4.5-5.2 GB RSS in the small-scale
 # measurement) — but it IS a merge-DISK lever at scale (128 MB's doubled file count pushed the
 # update-only merge's DataFusion spill from <59 to 60-100 GB). Deliberately far below 1 GB, which
@@ -101,7 +105,7 @@ _PART_PRUNE_MAX = 400
 
 def _writer_properties(row_group_rows=None):
     # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # the files a DELETE/UPDATE rewrites, compaction, and the optimize sort-rewrite: SNAPPY, the fixed 4M-row group ceiling, a 32 MB dictionary page limit
+    # compaction, and the optimize sort-rewrite: SNAPPY, the fixed 4M-row group ceiling, a 32 MB dictionary page limit
     # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
     # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap that shapes
     # dense columns into ~1 MB pages (the 1M-row cap only backstops ultra-compressible columns — see
@@ -664,7 +668,7 @@ def build_write_deltalake_args(
     """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
 
     EVERY write through here — overwrite, replace-where and append alike — gets the one read-layout
-    profile: the tuned writer properties plus the 128 MB ``target_file_size``. MERGE does not go
+    profile: the tuned writer properties plus the 256 MB ``target_file_size``. MERGE does not go
     through here at all and keeps delta_rs defaults.
 
     Append used to be excluded on the theory that appends are transient increments which
@@ -681,7 +685,7 @@ def build_write_deltalake_args(
     ``None`` — every normal write — keeps the fixed ``_ROW_GROUP_SIZE`` ceiling and lets the
     file roll pick the group; nothing is derived.
 
-    ``target_file_size`` (bytes) overrides the 128 MB default for THIS write — the per-model
+    ``target_file_size`` (bytes) overrides the 256 MB default for THIS write — the per-model
     ``target_file_size_mb`` dbt config lands here. ``None`` keeps ``_TARGET_FILE_SIZE``.
     """
     args: Dict[str, Any] = {
@@ -1129,7 +1133,7 @@ def auto_sort_cols(cur, source, *, partition_cols=None, label=("model", "sort_by
     the recommended ORDER BY columns (``[]`` if nothing pays off) and the advisory lines for the
     CALLER to print/log. The one seam behind dbt's ``sort_by='auto'`` and the connection API's
     relation fallback for ``SORTED BY AUTO``. The write itself is NOT sized here — an AUTO write
-    lands on the same fixed geometry (4M-row ceiling, 128 MB files) as every other write.
+    lands on the same fixed geometry (4M-row ceiling, 256 MB files) as every other write.
 
     ``source`` MUST be cheap to scan repeatedly — the recommender reads it several times. The
     CALLER is responsible for that: both surfaces materialize a PROFILING SUBSTRATE (a full local
@@ -1358,7 +1362,7 @@ def _maintain(cur, path: str, storage_options: Optional[Dict[str, str]] = None, 
 
     ``target_file_size`` / ``row_group_cap`` carry a model's EXPLICIT write geometry (the
     ``target_file_size_mb`` / ``max_row_group_size`` dbt configs) into maintenance: without them, the
-    very next compaction would re-fold the model's files back into the global 128 MB / fixed-4M
+    very next compaction would re-fold the model's files back into the global 256 MB / fixed-4M
     layout, silently undoing the config the write just honored. ``None`` = the defaults, unchanged."""
     if cur is None:
         return
@@ -1441,7 +1445,7 @@ def write_delta(
     ONE Delta write seam), so a fenced write is pinned to the caller's snapshot and fails loudly on a
     concurrent commit instead of clobbering it. ``None`` = the unfenced last-writer-wins write.
 
-    Every write lands in the one read-layout profile (tuned writer properties + 128 MB files) —
+    Every write lands in the one read-layout profile (tuned writer properties + 256 MB files) —
     append included, with the same fixed 4M row-group ceiling everywhere. Nothing is derived from
     the result: no planner estimate, no count, no prior-log probe (the only self-sizing write is
     SORTED BY AUTO, whose profile already paid for an exact count).
@@ -1653,7 +1657,7 @@ def replace_where(
     and no half-applied failure state.
 
     ``predicate`` is a delta_rs/datafusion SQL expression. (Older delta_rs couldn't serialize a
-    CAST in it — "Unable to convert expression to string"; fine since the >= 1.6.4 floor.)
+    CAST in it — "Unable to convert expression to string"; fine on the 1.6.2 pin.)
 
     A replaceWhere is a read-modify-write, so ``read_version`` is REQUIRED (no blind-HEAD path):
     the overwrite is pinned to that snapshot and committed with ``max_commit_retries=0``
@@ -1752,7 +1756,7 @@ def delete_rows(
     dt = dt if dt is not None else _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     try:
-        dt.delete(predicate, writer_properties=_writer_properties())
+        dt.delete(predicate)
     except CommitFailedError as e:
         raise CommitFailedError(
             f"delete: table '{path}' changed since version {read_version} "
@@ -1797,7 +1801,7 @@ def update_rows(
             f"UPDATE on {path!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
         )
     try:
-        dt.update(updates=updates, predicate=predicate, writer_properties=_writer_properties())
+        dt.update(updates=updates, predicate=predicate)
     except CommitFailedError as e:
         raise CommitFailedError(
             f"update: table '{path}' changed since version {read_version} "

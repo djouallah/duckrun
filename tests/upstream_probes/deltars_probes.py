@@ -88,8 +88,8 @@ def p5_update_unknown_column():
 
 def p6_dml_writer_properties():
     """engine.delete_rows / update_rows pass no writer_properties, so DML-rewritten files miss the read
-    layout. Upstream fixed delete() writing string_view and dropping writer_properties.compression;
-    if delete AND update now honor writer_properties, duckrun can pass its own."""
+    layout. FIXED on 1.6.4 (0.5.5 passed them), BROKEN on 1.6.2, which duckrun pins for #84 — so
+    duckrun passes none again until the cap lifts."""
     out = []
     ok = True
     for op in ("delete", "update"):

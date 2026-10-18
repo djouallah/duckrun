@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Fixed
+- **0.5.6: `deltalake` is pinned to 1.6.2 (`>=1.6.2,<1.6.3`); Direct Lake reads are fast again** (#84).
+  Every deltalake from 1.6.3 on bundles parquet-rs 59, which lists each column chunk's dictionary page
+  last in the footer's `encoding_stats` instead of first. Data, pages and encodings are unchanged, but
+  readers that check "fully dictionary encoded" on the first entry (Arrow C++, Power BI Direct Lake) stop
+  using the dictionary and decode every value: on the AEMO mart, first load went from 22-27 s to 69-76 s
+  and read CU from ~1.7k to ~8.5k (a VARCHAR column 0.6 s to 10.5 s). No writer property avoids it, so
+  0.5.4/0.5.5 (which required `>=1.6.4`) wrote it on every table. The runtime guard now also rejects a
+  loaded deltalake >= 1.6.3 (a Fabric kernel not restarted after the downgrade). Upstream:
+  apache/arrow-rs#11659; the cap lifts once a deltalake ships that fix. What 1.6.2 lacks:
+  - the row-group-aligned roll (delta-rs#4677). `DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY` stays set but has
+    no effect, so each file's last row group is truncated again, and the default target file size goes
+    back to **256 MB** (fewer files, fewer truncated tails), as before 0.5.5;
+  - `writer_properties` on delete/update. `DELETE` / `UPDATE` rewrites use delta-rs defaults again, as
+    before 0.5.5, until the next compaction.
 - **0.5.4: no more truncated row groups at file boundaries.** A row group cannot span files, so
   delta-rs closed each file's last group wherever `target_file_size` landed, leaving a short runt
   segment per file (the AEMO mart: 37 groups where 36 full 4M-row groups fit). duckrun now sets

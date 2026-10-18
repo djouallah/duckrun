@@ -520,13 +520,29 @@ def test_update_and_delete_accept_target_self_qualified_columns(w):
 def test_predicate_less_update_touches_every_row_over_many_files(w):
     """UPDATE t SET c = <expr> with NO WHERE updates EVERY row even when the table is many small files.
     delta_rs 1.5.0's predicate-less update() silently updated only some rows of a multi-file table (a
-    predicate referencing no column mis-pruned to a broken fast path); fixed by the >= 1.6.4 floor, so
+    predicate referencing no column mis-pruned to a broken fast path); fixed in the pinned 1.6.2, so
     this now pins delta_rs's own predicate-less update."""
     w.sql("CREATE OR REPLACE TABLE batch (i INTEGER)")
     for k in range(60):
         w.sql(f"INSERT INTO batch VALUES ({k})")                 # 60 single-row commits → many files
     w.sql("UPDATE batch SET i = i + 1")
     assert w.sql("select count(*), sum(i), min(i), max(i) from batch").fetchall()[0] == (60, 1830, 1, 60)
+
+
+def test_dml_on_int32_column_with_int_literal_over_many_files(w):
+    """DELETE / UPDATE with a bare integer literal on an INTEGER (Int32) column of a multi-file table.
+    The literal binds as Int64, and some delta_rs releases reject Int32-vs-Int64 in their file-skipping
+    pass (delta-rs probe P4, seen on 1.6.2) — a plain `DELETE FROM t WHERE k = 3` must still work."""
+    w.sql("CREATE OR REPLACE TABLE i32 (k INTEGER, v INTEGER)")
+    for k in range(4):
+        w.sql(f"INSERT INTO i32 VALUES ({k * 2}, 0), ({k * 2 + 1}, 0)")    # 4 commits → 4 files
+    w.sql("DELETE FROM i32 WHERE k = 3")
+    w.sql("DELETE FROM i32 WHERE k IN (5, 6)")
+    assert w.sql("select k from i32 order by k").fetchall() == [(0,), (1,), (2,), (4,), (7,)]
+    w.sql("UPDATE i32 SET v = 1 WHERE k = 4")
+    w.sql("UPDATE i32 SET v = v + 2 WHERE k IN (0, 7)")
+    assert w.sql("select k, v from i32 order by k").fetchall() == [
+        (0, 2), (1, 0), (2, 0), (4, 1), (7, 2)]
 
 
 def test_plain_drop_of_already_dropped_table_errors(w):

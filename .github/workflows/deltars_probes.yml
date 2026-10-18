@@ -22,7 +22,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        deltalake: ["1.6.4", "latest"]
+        deltalake: ["1.6.2", "latest"]
     name: probe (deltalake ${{ matrix.deltalake }})
     steps:
       - uses: actions/checkout@v4

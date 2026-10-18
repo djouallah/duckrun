@@ -29,12 +29,13 @@ dependencies = [
     # read and the write commit resolve at ONE Delta snapshot (single-snapshot MERGE parity; see the
     # staging-read pin in _delta_core.sql and merge_delta's read_version). duckdb is only ever used to
     # READ here, so any newer version is fine — the floor exists solely to get the version-pin support.
-    # deltalake floor is 1.6.4, the first release that can roll files on row-group boundaries
-    # (delta-rs#4677, DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY, set in engine.py) — below it every file ends
-    # in a truncated row group. 1.5.0 was the earlier floor (MERGE max_spill_size). A floor, not an
-    # exact pin (0.5.1): the exact pin blocked installing duckrun next to any newer deltalake.
+    # deltalake is capped below 1.6.3 (#84): from 1.6.3 on it bundles parquet-rs 59, which lists each
+    # column chunk's dictionary page LAST in encoding_stats, and readers that check the first entry
+    # (Arrow C++, Power BI Direct Lake) stop using the dictionary — ~3x slower first loads, ~5x the CU.
+    # No writer property avoids it. Lift the cap once a deltalake ships apache/arrow-rs#11659; 1.6.4+
+    # also brings back the row-group-aligned roll (delta-rs#4677) and DML writer_properties.
     "duckdb>=1.5.4",
-    "deltalake>=1.6.4",
+    "deltalake>=1.6.2,<1.6.3",
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
     # API directly; requests is otherwise only a transitive dbt dependency.
     "requests",

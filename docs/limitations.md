@@ -22,7 +22,7 @@ Everything else carries over: `DuckrunCredentials` subclasses dbt-duckdb's, so t
 ## Setup & versions
 
 - **Needs `duckdb >= 1.5.4`.** Older builds, including Microsoft Fabric's bundled runtime, fail loud at `connect()`. In a Fabric notebook: `!pip install duckrun --upgrade`, then restart.
-- **Needs `deltalake >= 1.6.4`.** It is the first release that rolls files on row-group boundaries ([delta-rs #4677](https://github.com/delta-io/delta-rs/pull/4677)), which duckrun switches on so no file ends in a truncated row group.
+- **Pinned to `deltalake 1.6.2`.** Every release from 1.6.3 on lists each column chunk's dictionary page last in the parquet footer, and Power BI Direct Lake then stops using the dictionary: first loads ~3x slower and ~5x the CU ([#84](https://github.com/djouallah/duckrun/issues/84), [arrow-rs #11659](https://github.com/apache/arrow-rs/issues/11659)). 1.6.2 has no row-group-aligned roll ([delta-rs #4677](https://github.com/delta-io/delta-rs/pull/4677)), so each file's last row group is truncated, and its `delete`/`update` ignore writer properties, so DML-rewritten files use delta-rs defaults until the next compaction. The pin lifts once a deltalake ships the arrow-rs fix.
 
 ## Microsoft Fabric / OneLake
 
@@ -66,7 +66,7 @@ The full matrix is in the [Connection API](connection-api.md#raw-sql-dml-through
 
 - **`SORTED BY AUTO` (dbt: `sort_by: auto`) is a greedy heuristic** over approximate cardinalities and HyperLogLog dependency tests, validated against essentially one dataset. It is not guaranteed to shrink anything and can pick a worse key than arrival order. Prefer `SORTED BY (cols)` when you know the grain, and compare `conn.get_stats()` before and after. See [Automatic sorting](parquet-layout.md#automatic-sorting).
 - **Profiling stages the source locally.** Every row up to 30M, a deterministic hash-selected ~30M-row substrate above that (`DUCKRUN_PROFILE_ROWS`; `0` = always exact), staged into a temp table that spills to DuckDB's `temp_directory`, so disk is the ceiling. An explicit key skips profiling.
-- **The write geometry is fixed**: a 4M-row row-group ceiling and a 128 MB target file for every write, nothing derived from the result. `max_row_group_size` / `target_file_size_mb` override it per model. See [Write settings](parquet-layout.md#write-settings).
+- **The write geometry is fixed**: a 4M-row row-group ceiling and a 256 MB target file for every write, nothing derived from the result. `max_row_group_size` / `target_file_size_mb` override it per model. See [Write settings](parquet-layout.md#write-settings).
 
 ## Memory
 

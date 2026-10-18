@@ -1752,19 +1752,6 @@ def _live_files(conn, table):
     return engine._delta_table(conn.root_path + "/dbo/" + table, conn.storage_options).file_uris()
 
 
-def test_dml_rewrites_keep_the_read_layout(conn):
-    # DELETE / UPDATE rewrite the files they touch through delta-rs; the rewrite gets the same writer
-    # profile as every other write. delta-rs's own default would cut 3M rows into three
-    # 1,048,576-row groups; the profile's 4M ceiling keeps one.
-    conn.sql("CREATE OR REPLACE TABLE dml_geo AS select i as j from range(3000000) t(i)")
-    for stmt in ("DELETE FROM dml_geo WHERE j = 7", "UPDATE dml_geo SET j = -1 WHERE j = 8"):
-        conn.sql(stmt)
-        live = _live_files(conn, "dml_geo")
-        n = conn.sql(f"select count(*) from (select distinct file_name, row_group_id "
-                     f"from parquet_metadata({live!r}))").fetchall()[0][0]
-        assert n == 1, f"{stmt!r} rewrote the table outside the read layout: {n} row groups"
-
-
 def test_ctas_gets_the_fixed_row_group_ceiling(conn):
     # Every normal write uses the FIXED 4M-row ceiling — nothing is derived from the result (the
     # planner-estimate machinery is gone). 20M rows → 5 full 4M groups.
@@ -1792,7 +1779,7 @@ def test_ctas_geometry_is_independent_of_the_source_size(conn):
 
 def test_estimator_machinery_is_gone():
     # The write path must take no planner estimate, no count(*), and no prior-log probe — the whole
-    # apparatus was deleted (fixed 4M/128MB geometry). Guards against it creeping back.
+    # apparatus was deleted (fixed 4M/256MB geometry). Guards against it creeping back.
     from dbt.adapters.duckrun import engine
     for name in ("estimated_rows", "prior_row_count", "table_num_records",
                  "_walk_cardinality", "_plan_has_limit", "_warn_if_estimate_was_far_off"):
@@ -2038,7 +2025,7 @@ def test_replace_window_into_tz_column(conn):
 
 def test_compaction_lands_the_fixed_read_layout(conn):
     # Compaction rewrites fragmented appends into the same fixed read layout every write uses (4M
-    # ceiling, 128 MB target) — no row count is taken, no derived sizing. 20M rows → 5 groups.
+    # ceiling, 256 MB target) — no row count is taken, no derived sizing. 20M rows → 5 groups.
     from dbt.adapters.duckrun import engine
     conn.sql("CREATE OR REPLACE TABLE compact_me AS select i as j from range(4000000) t(i)")
     for k in range(1, 5):
@@ -2236,7 +2223,7 @@ def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
 
 def test_sorted_by_auto_uses_the_fixed_geometry(conn):
     # AUTO's one job is picking the sort key — the write itself lands on the SAME fixed geometry
-    # as every other write (4M-row ceiling, 128 MB file roll). 20M rows → full 4M-row groups.
+    # as every other write (4M-row ceiling, 256 MB file roll). 20M rows → full 4M-row groups.
     conn.sql("CREATE OR REPLACE TABLE auto_geo SORTED BY AUTO AS "
              "select i as j, (i%1000)::int k from range(20000000) t(i)")
     live = _live_files(conn, "auto_geo")
@@ -2401,11 +2388,11 @@ def test_connect_rejects_unknown_format(tmp_path):
 
 
 def test_explicit_target_file_size_overrides_the_constant():
-    # The per-model target_file_size_mb config lands here as bytes and overrides the 128 MB
+    # The per-model target_file_size_mb config lands here as bytes and overrides the 256 MB
     # constant for THIS write only; None keeps the default. Same for overwrite and append.
     from dbt.adapters.duckrun import engine
     default = engine.build_write_deltalake_args("p", None, "overwrite")
-    assert default["target_file_size"] == engine._TARGET_FILE_SIZE == 128 * 1024 * 1024
+    assert default["target_file_size"] == engine._TARGET_FILE_SIZE == 256 * 1024 * 1024
     custom = engine.build_write_deltalake_args(
         "p", None, "append", target_file_size=64 * 1024 * 1024)
     assert custom["target_file_size"] == 64 * 1024 * 1024
