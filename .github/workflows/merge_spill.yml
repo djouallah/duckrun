@@ -64,7 +64,7 @@ jobs:
           df -h /mnt /
           DLV=$(python -c "import deltalake; print(deltalake.__version__)")
           echo "deltalake $DLV"
-          python -c "import deltalake,sys; sys.exit(0 if deltalake.__version__.== '1.6.1' else 1)"
+          python -c "import deltalake,sys; sys.exit(0 if deltalake.__version__ == '1.6.1' else 1)"
           echo "DLV=$DLV" >> "$GITHUB_ENV"
 
       - name: Prepare big disk dir
