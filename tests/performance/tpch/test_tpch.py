@@ -762,7 +762,7 @@ def _generate_tables(conn, sf, schema):
     Returns the per-table ingestion timings ``[{'table', 'rows', 'dur'}, …]`` (the write cost; the row
     count is a cheap parquet-metadata read), or ``[]`` when the tables already exist and nothing was
     written."""
-    if conn.sql("SELECT count(*) FROM information_schema.tables WHERE table_name = 'supplier'").fetchall()[0][0]:
+    if conn.sql("SELECT count(*) FROM information_schema.tables WHERE table_name = 'supplier'").fetchone()[0]:
         print("Data already exists")
         return []
     gen_root = os.path.join(tempfile.gettempdir(), f"tpch_gen_sf{sf}")
@@ -782,7 +782,7 @@ def _generate_tables(conn, sf, schema):
     for tbl in TPCH_TABLES:
         src = f"{gen_root}/{tbl}/*.parquet"
         srclit = src.replace("'", "''")
-        rows = conn.sql(f"SELECT count(*) FROM read_parquet('{srclit}')").fetchall()[0][0]  # parquet footer
+        rows = conn.sql(f"SELECT count(*) FROM read_parquet('{srclit}')").fetchone()[0]  # parquet footer
         ts = time.time()
         conn.sql(f"CREATE OR REPLACE TABLE {schema}.{tbl} AS SELECT * FROM read_parquet('{srclit}')")
         dur = time.time() - ts
@@ -818,7 +818,7 @@ def run_tpch_benchmark(sf=1, base_path=None, timings_out=None):
     ingestion = _generate_tables(conn, sf, schema)
     # connect(schema=schema) already made `schema` the current database, so the queries' unqualified
     # table names resolve; a plain `USE` keeps it current after the ingestion refresh.
-    cat = conn.sql("SELECT current_database()").fetchall()[0][0]
+    cat = conn.sql("SELECT current_database()").fetchone()[0]
     conn.sql(f'USE "{cat}"."{schema}"')
 
     results = _execute_queries(conn, _tpch_sql(sf))

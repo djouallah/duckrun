@@ -33,8 +33,6 @@ name: cores
 #                               set) as a per-change guard; the heavy SF=10 gate is merge_spill.yml.
 #   • lean-install            — `pip install duckrun` WITHOUT the [dbt] extra: connect() imports
 #                               and writes Delta with no dbt installed.
-#   • pre-install             — `pip install --pre "duckrun[dbt]"` (newest duckdb dev build) from a
-#                               built wheel: connect() DML + read-back, and an incremental dbt run.
 #
 # Path-filtered to the offline surface it actually exercises — the adapter, the duckrun package, and
 # the test suites (everything under tests/, which now also houses the aemo / parity / integration
@@ -104,18 +102,16 @@ jobs:
     # tested on a local-filesystem Delta warehouse. Run on every supported Python the package
     # advertises (pyproject requires-python >= 3.11, i.e. 3.11 + 3.12). (Conformance stays
     # single-version: its gate is a 3.11-derived baseline that a second Python would
-    # spuriously trip.) And under BOTH installs: `stable` (plain pip install) and `pre`
-    # (pip install --pre — the newest duckdb 2.0 dev build); duckrun must pass on each.
+    # spuriously trip.)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ['3.11', '3.12']
-        install: ['stable', 'pre']
     concurrency:
-      # Include every matrix axis: matrix cells share a job's concurrency group, so without them
-      # one cell would cancel another (cancel-in-progress: true).
-      group: cores-adapter-${{ github.ref }}-${{ matrix.python-version }}-${{ matrix.install }}
+      # Include the Python version: matrix cells share a job's concurrency group, so without it
+      # the second cell would cancel the first (cancel-in-progress: true).
+      group: cores-adapter-${{ github.ref }}-${{ matrix.python-version }}
       cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
@@ -123,7 +119,6 @@ jobs:
       - uses: ./.github/actions/setup-duckrun
         with:
           python-version: ${{ matrix.python-version }}
-          install: ${{ matrix.install }}
 
       - name: Adapter unit tests + connection-API offline tests
         # Run the WHOLE tests/connection_api directory — the per-method matrix + local-fs contract +
@@ -518,25 +513,3 @@ jobs:
               raise SystemExit("dbt_project() should require the [dbt] extra")
           print("lean install OK")
           PY
-
-  pre-install:
-    # `pip install --pre duckrun` resolves the newest duckdb 2.0 dev build (no cap on duckdb), and
-    # DuckDB 2.0 is changing its Python result API — e.g. a statement on a connection with an
-    # unfinished result now raises ResourceInUseException (duckdb#26747) instead of silently
-    # aborting it. Installs the checkout as a regular (non-editable) wheel with --pre, then runs
-    # tests/pre_install/smoke.py from outside the checkout so it can only import the installed copy.
-    # Part of cores, so it is also a release gate (publish.yml calls this workflow).
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: pip install --pre duckrun[dbt]
-        run: pip install --pre ".[dbt]"
-      - name: Resolved versions
-        run: pip show duckrun duckdb dbt-core dbt-duckdb deltalake | grep -E '^(Name|Version):'
-      - name: Smoke — connect() DML, incremental dbt run
-        run: |
-          cd "$RUNNER_TEMP"
-          python "$GITHUB_WORKSPACE/tests/pre_install/smoke.py"

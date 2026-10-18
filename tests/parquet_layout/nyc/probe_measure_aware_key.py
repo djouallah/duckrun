@@ -137,7 +137,7 @@ def column_bytes(table_dir):
         f"SELECT path_in_schema, SUM(total_compressed_size) FROM parquet_metadata('{pat}') "
         "GROUP BY 1").fetchall())
     n = con.sql(f"SELECT SUM(num_values) FROM parquet_metadata('{pat}') "
-                "WHERE path_in_schema = 'pickup_date'").fetchall()[0][0] or 0
+                "WHERE path_in_schema = 'pickup_date'").fetchone()[0] or 0
     return cols, int(n)
 
 

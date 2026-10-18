@@ -117,7 +117,7 @@ def _connect():
 
 def _exists(con, tbl):
     try:
-        con.sql(f'select 1 from contoso."{tbl}" limit 1').fetchall()
+        con.sql(f'select 1 from contoso."{tbl}" limit 1').fetchone()
         return True
     except Exception:
         return False
@@ -169,7 +169,7 @@ def main():
     # refuse loud and point at it. The generator emits a hair fewer orders than OrdersCount (a few %
     # drop for unassignable rows), so match the `orders` table on a tolerance, not equality.
     if not force and all(_exists(con, tbl) for _, tbl in dim_tables) and _sales_present():
-        have = con.sql('select count(*) from contoso."orders"').fetchall()[0][0]
+        have = con.sql('select count(*) from contoso."orders"').fetchone()[0]
         if orders.isdigit() and int(orders) > 0 and abs(have - int(orders)) > 0.05 * int(orders):
             raise SystemExit(
                 f"contoso base exists at orders={have:,} but OrdersCount={orders} was requested — "
@@ -218,7 +218,7 @@ def main():
             url = store_root + files_object(pq)
             con.sql(f'create or replace table contoso."{tbl}" as '
                     f"select * from read_parquet('{url}')")
-            n = con.sql(f'select count(*) from contoso."{tbl}"').fetchall()[0][0]
+            n = con.sql(f'select count(*) from contoso."{tbl}"').fetchone()[0]
             print(f"  contoso.{tbl}: {n:,} rows (from Files)", flush=True)
     else:
         # Offline dry-run (local path, no Files section): materialise everything as local Delta so the

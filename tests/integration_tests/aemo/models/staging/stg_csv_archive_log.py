@@ -51,7 +51,7 @@ def model(dbt, session):
     # =========================================================================
     log_exists = session.sql(
         f"SELECT count(*) FROM glob('{csv_log_path}')"
-    ).fetchall()[0][0]
+    ).fetchone()[0]
 
     if log_exists > 0:
         # Check if csv_filename column exists in existing parquet
@@ -197,7 +197,7 @@ def model(dbt, session):
         WHERE 'daily::' || filename NOT IN (
             SELECT source_type || '::' || source_filename FROM _csv_archive_log
         )
-    """).fetchall()[0][0]
+    """).fetchone()[0]
 
     if aemo_new < download_limit:
         # Backfill from GitHub
@@ -343,7 +343,7 @@ def model(dbt, session):
     last_duid_download = session.sql("""
         SELECT max(archived_at) FROM _csv_archive_log
         WHERE source_type LIKE 'duid_%'
-    """).fetchall()[0][0]
+    """).fetchone()[0]
 
     skip_duid = (
         last_duid_download is not None

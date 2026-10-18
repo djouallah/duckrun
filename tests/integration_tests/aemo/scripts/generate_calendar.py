@@ -47,7 +47,7 @@ def main() -> None:
         storage_options = {"bearer_token": auth.get_onelake_token()}
 
     con = duckdb.connect()
-    n = con.sql(f"SELECT count(*) FROM ({CALENDAR_SQL})").fetchall()[0][0]
+    n = con.sql(f"SELECT count(*) FROM ({CALENDAR_SQL})").fetchone()[0]
     rel = con.sql(CALENDAR_SQL)
     write_deltalake(path, rel, mode="overwrite", storage_options=storage_options)
     print(f"Wrote dim_calendar ({n} rows) to {path}")

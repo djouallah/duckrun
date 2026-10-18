@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "duckrun"
-version = "0.5.5"
+version = "0.5.0"
 description = "A dbt adapter that runs SQL in DuckDB and materializes to Delta Lake (delta_rs)."
 readme = "README.md"
 license = {text = "MIT"}
@@ -29,13 +29,12 @@ dependencies = [
     # read and the write commit resolve at ONE Delta snapshot (single-snapshot MERGE parity; see the
     # staging-read pin in _delta_core.sql and merge_delta's read_version). duckdb is only ever used to
     # READ here, so any newer version is fine — the floor exists solely to get the version-pin support.
-    # deltalake is capped below 1.6.3 (#84): from 1.6.3 on it bundles parquet-rs 59, which lists each
-    # column chunk's dictionary page LAST in encoding_stats, and readers that check the first entry
-    # (Arrow C++, Power BI Direct Lake) stop using the dictionary — ~3x slower first loads, ~5x the CU.
-    # No writer property avoids it. Lift the cap once a deltalake ships apache/arrow-rs#11659; 1.6.4+
-    # also brings back the row-group-aligned roll (delta-rs#4677) and DML writer_properties.
+    # deltalake is pinned EXACTLY to 1.5.0 — a HARD requirement, not a preference: 1.5.0 is the first
+    # release with the MERGE disk-spill config (max_spill_size) that engine.merge_delta relies on to
+    # cap merge RAM and avoid OOM on large upserts, and every newer release so far breaks us — DELETE
+    # is broken and OneLake support regresses. So pin exactly; do NOT float until upstream fixes land.
     "duckdb>=1.5.4",
-    "deltalake>=1.6.2,<1.6.3",
+    "deltalake==1.5.0",
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
     # API directly; requests is otherwise only a transitive dbt dependency.
     "requests",
@@ -83,8 +82,8 @@ dbt = [
 # Test-only. pyarrow builds reusable Arrow fixtures; pandas is required by the DataFrame.toPandas()
 # test (DuckDB .df() materializes a pandas DataFrame, so it needs pandas+numpy). Production duckrun
 # stays pyarrow-/pandas-free — it streams DuckDB relations straight to deltalake.
-# pyarrow<25: 25.0.0 segfaulted deltalake 1.5.0 in its native to_pyarrow_table (ABI mismatch —
-# 24.0.0 is the last good one). Kept while 1.5.0 is still an allowed deltalake.
+# pyarrow<25: 25.0.0 segfaults the exactly-pinned deltalake==1.5.0 in its native to_pyarrow_table
+# (ABI mismatch — 24.0.0 is the last good one). Lift together with the deltalake pin, not before.
 # Both test extras pull the [dbt] extra: the suites drive the adapter through real `dbt run`.
 test = ["duckrun[dbt]", "pytest>=7", "pyarrow<25", "pandas"]
 # Official dbt adapter conformance suite (dbt-labs/dbt-adapters). Subclassed in

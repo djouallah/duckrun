@@ -22,7 +22,7 @@ Everything else carries over: `DuckrunCredentials` subclasses dbt-duckdb's, so t
 ## Setup & versions
 
 - **Needs `duckdb >= 1.5.4`.** Older builds, including Microsoft Fabric's bundled runtime, fail loud at `connect()`. In a Fabric notebook: `!pip install duckrun --upgrade`, then restart.
-- **Pinned to `deltalake 1.6.2`.** Every release from 1.6.3 on lists each column chunk's dictionary page last in the parquet footer, and Power BI Direct Lake then stops using the dictionary: first loads ~3x slower and ~5x the CU ([#84](https://github.com/djouallah/duckrun/issues/84), [arrow-rs #11659](https://github.com/apache/arrow-rs/issues/11659)). 1.6.2 has no row-group-aligned roll ([delta-rs #4677](https://github.com/delta-io/delta-rs/pull/4677)), so each file's last row group is truncated, and its `delete`/`update` ignore writer properties, so DML-rewritten files use delta-rs defaults until the next compaction. The pin lifts once a deltalake ships the arrow-rs fix.
+- **Pins `deltalake == 1.5.0`.** delta-rs 1.6.0's MERGE is broken at scale, and delta-rs `> 1.5.0` breaks bulk delete on OneLake (*"Either WorkspaceId or ArtifactId are missing in the request"*, [delta-rs #4401](https://github.com/delta-io/delta-rs/issues/4401)), which `vacuum` needs.
 
 ## Microsoft Fabric / OneLake
 

@@ -281,7 +281,7 @@ def run_taxi_demo(conn, schema):
     """The whole SQL-first showcase against ``conn``. Importable so it runs the same against a local
     warehouse (de-risking) or live OneLake (the demo)."""
     _DOC.clear()
-    q = lambda sql: conn.sql(sql).fetchall()[0][0]  # noqa: E731 — scalar helper
+    q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731 — scalar helper
     start, end = _month_bounds(TAXI_MONTH)
     trips_parquet = f"{CF}/trip-data/yellow_tripdata_{TAXI_MONTH}.parquet"
     results = []
@@ -344,7 +344,7 @@ def run_taxi_demo(conn, schema):
             FROM trips_raw USING SAMPLE {SAMPLE_ROWS} ROWS
         """)
         _det = conn.sql("DESCRIBE DETAIL trips")                 # the snapshot we'll time-travel back to
-        v_landed = dict(zip(_det.columns, _det.fetchall()[0]))["version"]
+        v_landed = dict(zip(_det.columns, _det.fetchone()))["version"]
         n_trips = q("SELECT count(*) FROM trips")
         bad = q("SELECT count(*) FROM trips WHERE fare <= 0")
         results.append(_row("Land trips sample", 0, n_trips, SAMPLE_ROWS, n_trips == SAMPLE_ROWS, bad == 0,
@@ -374,7 +374,7 @@ def run_taxi_demo(conn, schema):
         locs = []
         for t in tbls:                                          # DESCRIBE DETAIL → each table's location
             d = conn.sql(f'DESCRIBE DETAIL {schema}."{t}"')
-            locs.append((t, _trim_loc(dict(zip(d.columns, d.fetchall()[0]))["location"])))
+            locs.append((t, _trim_loc(dict(zip(d.columns, d.fetchone()))["location"])))
         _table(locs, ["table", "location (real Delta dir)"], f"  tables in '{schema}'")
         say(f"{len(tbls)} Delta tables — each a real directory with a _delta_log at the location shown")
 
@@ -473,12 +473,12 @@ def run_taxi_demo(conn, schema):
         results.append(_row("DELETE Cash trips", before, after, before - cash, after == before - cash, still == 0,
                             time.perf_counter() - t0))
         _dd = conn.sql("DESCRIBE DETAIL trips")                  # the table's location, straight from SQL
-        path = dict(zip(_dd.columns, _dd.fetchall()[0]))["location"].replace("\\", "/")
+        path = dict(zip(_dd.columns, _dd.fetchone()))["location"].replace("\\", "/")
         _emit('  <pre class="py"># SQL time travel — location from DESCRIBE DETAIL, then delta_scan by version:\n'
-              'loc = conn.sql("DESCRIBE DETAIL trips").fetchall()[0][3]   # the location column\n'
-              f"conn.sql(\"SELECT count(*) FROM delta_scan('&lt;loc&gt;', version =&gt; {v_landed})\").fetchall()[0][0]</pre>")
+              'loc = conn.sql("DESCRIBE DETAIL trips").fetchone()[3]   # the location column\n'
+              f"conn.sql(\"SELECT count(*) FROM delta_scan('&lt;loc&gt;', version =&gt; {v_landed})\").fetchone()[0]</pre>")
         at_landed = conn.sql(
-            f"SELECT count(*) FROM delta_scan('{path}', version => {v_landed})").fetchall()[0][0]
+            f"SELECT count(*) FROM delta_scan('{path}', version => {v_landed})").fetchone()[0]
         how = f"delta_scan(version => {v_landed})"
         _table([(f"{before:,}", f"{cash:,}", f"{after:,}", f"{at_landed:,}")],
                ["before", "Cash deleted", "after (now)", "at landed ver"], "  time travel: current vs landed snapshot")
@@ -587,7 +587,7 @@ def run_taxi_demo(conn, schema):
     # 16 ── attach a second lakehouse as a named catalog ────────────────────────────────────────────
     with _step(16, "conn.attach(path, name='scratch'): bring a second lakehouse in as a catalog") as say:
         scratch_path = tempfile.mkdtemp(prefix="duckrun_scratch_")
-        primary = conn.sql("SELECT current_database()").fetchall()[0][0]
+        primary = conn.sql("SELECT current_database()").fetchone()[0]
         _emit('  <pre class="py"># a second lakehouse root becomes a named catalog (could be another\n'
               '# OneLake lakehouse, an S3 bucket, … — here a local scratch dir):\n'
               'conn.attach(scratch_path, name="scratch")\n'
@@ -617,7 +617,7 @@ def run_taxi_demo(conn, schema):
         """)
         n_tgt = q("SELECT count(*) FROM scratch.dbo.borough_targets")
         _ld = conn.sql("DESCRIBE DETAIL scratch.dbo.borough_targets")
-        landed = dict(zip(_ld.columns, _ld.fetchall()[0]))["location"].replace("\\", "/")
+        landed = dict(zip(_ld.columns, _ld.fetchone()))["location"].replace("\\", "/")
         in_scratch = scratch_path.replace("\\", "/") in landed
         results.append(_row("Cross-catalog write (scratch)", 0, n_tgt, n_tgt, n_tgt > 0, in_scratch,
                             time.perf_counter() - t0))
@@ -648,10 +648,10 @@ def run_taxi_demo(conn, schema):
               '# fail-loud rails (both raise — no state change):\n'
               'conn.attach(scratch_path, name="dup")              # one URL ↔ one name\n'
               'conn.sql("INSERT INTO scratch.dbo.borough_targets VALUES (\'Z\', 0)")  # cross-catalog raw DML</pre>')
-        primary_db = conn.sql("SELECT current_schema()").fetchall()[0][0]   # restore the primary's schema after
+        primary_db = conn.sql("SELECT current_schema()").fetchone()[0]   # restore the primary's schema after
         conn.sql("USE scratch.dbo")                              # USE is the single switch (reads + writes)
         unq = q("SELECT count(*) FROM borough_targets")           # resolves in scratch.dbo now
-        switched = conn.sql("SELECT current_database()").fetchall()[0][0]
+        switched = conn.sql("SELECT current_database()").fetchone()[0]
         conn.sql(f'USE "{primary}"."{primary_db}"')
         guards = []
         try:
@@ -824,10 +824,10 @@ def run_taxi_demo(conn, schema):
         t0 = time.perf_counter()
         back = tempfile.mkdtemp(prefix="duckrun_files_dl_")
         _emit('  <pre class="py">conn.download("demo_files/…", local_dir, overwrite=True)  # OneLake → local\n'
-              'conn.sql("SELECT count(*) FROM read_csv_auto(\'<local_dir>/zone_scorecard.csv\')").fetchall()[0][0]</pre>')
+              'conn.sql("SELECT count(*) FROM read_csv_auto(\'<local_dir>/zone_scorecard.csv\')").fetchone()[0]</pre>')
         conn.download(remote_dir, back, overwrite=True)
         csv_back = os.path.join(back, "zone_scorecard.csv").replace("\\", "/")
-        rows_back = conn.sql(f"SELECT count(*) FROM read_csv_auto('{csv_back}')").fetchall()[0][0]
+        rows_back = conn.sql(f"SELECT count(*) FROM read_csv_auto('{csv_back}')").fetchone()[0]
         rows_local = q("SELECT count(*) FROM zone_scorecard")
         results.append(_row("conn.download (Files round-trip)", rows_local, rows_back, rows_local,
                             rows_back == rows_local, rows_back == rows_local, time.perf_counter() - t0))

@@ -279,7 +279,7 @@ class Plugin(BasePlugin):
             #     copying the world; a nondeterministic model at worst gets a marginally stale key).
             profile_src, full_rows = name, None
             if _profile_sort:
-                full_rows = int(cur.sql(f"SELECT count(*) FROM {name}").fetchall()[0][0] or 0)
+                full_rows = int(cur.sql(f"SELECT count(*) FROM {name}").fetchone()[0] or 0)
                 k = sortkey.substrate_modulus(full_rows)
                 psub = '"' + engine.tmp_name("psub", path) + '"'
                 if k == 1:
@@ -531,7 +531,7 @@ class Plugin(BasePlugin):
             if not wide:
                 return default
             aggs = ", ".join(f"max(abs({engine.quote_ident(c)}))" for c, _ in wide)
-            maxes = cur.sql(f"SELECT {aggs} FROM {name}").fetchall()[0]
+            maxes = cur.sql(f"SELECT {aggs} FROM {name}").fetchone()
             repl = []
             for (col, typ), mv in zip(wide, maxes):
                 target = sortkey.decimal_narrow_target(typ, mv)
@@ -872,7 +872,7 @@ class Plugin(BasePlugin):
         keys = [str(k).strip().strip('"') for k in keys]
         # Empty batch → nothing to delete or insert (an incremental no-op). Probe with LIMIT 1 rather
         # than pulling DISTINCT keys into Python.
-        if not cur.sql(f"SELECT 1 FROM {name} LIMIT 1").fetchall():
+        if cur.sql(f"SELECT 1 FROM {name} LIMIT 1").fetchone() is None:
             return
         loc_sql = path.replace("'", "''")
         # Always fenced: reached only when the table exists. read_version is None only if a writer
@@ -975,7 +975,7 @@ class Plugin(BasePlugin):
         keys = [str(k).strip().strip('"') for k in keys]
         # Empty batch → nothing to insert (an incremental no-op). Probe with LIMIT 1 rather than
         # counting, exactly as the delete+insert path does.
-        if not cur.sql(f"SELECT 1 FROM {name} LIMIT 1").fetchall():
+        if cur.sql(f"SELECT 1 FROM {name} LIMIT 1").fetchone() is None:
             return
 
         loc_sql = path.replace("'", "''")
@@ -1079,7 +1079,7 @@ class Plugin(BasePlugin):
             return
         quoted = ['"' + str(col).replace('"', '""') + '"' for col in cols]
         selects = ", ".join(f"count(*) FILTER (WHERE {q} IS NULL)" for q in quoted)
-        counts = cur.sql(f"SELECT {selects} FROM {name}").fetchall()[0]
+        counts = cur.sql(f"SELECT {selects} FROM {name}").fetchone()
         for col, cnt in zip(cols, counts):
             if cnt:
                 raise CompilationError(

@@ -32,8 +32,7 @@ from dbt.adapters.duckrun._log import logger
 # (one a 1.25M-row runt, the bottom of the healthy 1-16M Direct Lake segment band) vs ~2 at
 # 256 MB. Shipped as 128 in 0.4.64, reverted in 0.4.65: fewer, larger files mean fewer truncated
 # tail segments. Revisit only when delta-rs can align the file roll to a row-group boundary
-# (force full row groups) — deltalake >= 1.6.4 can, and 0.5.5 moved to 128 MB on it, but the 1.6.2
-# pin (#84) has no aligned roll, so 0.5.6 is back at 256. 256 also keeps the merge-spill gate's disk demand lower (128 doubled
+# (force full row groups). 256 also keeps the merge-spill gate's disk demand lower (128 doubled
 # the file count and the update-only merge's DataFusion spill).
 DEFAULT_TARGET_FILE_SIZE = 256 * 1024 * 1024
 

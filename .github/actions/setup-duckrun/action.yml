@@ -15,12 +15,6 @@ inputs:
     description: Optional extra pip packages to install after duckrun (e.g. tpchgen-cli)
     required: false
     default: ''
-  install:
-    description: >
-      'stable' = plain pip install; 'pre' = pip install --pre, i.e. what `pip install --pre duckrun`
-      resolves (newest duckdb 2.0 dev build, pre-release dbt/deltalake). duckrun must pass on both.
-    required: false
-    default: 'stable'
 runs:
   using: composite
   steps:
@@ -30,10 +24,7 @@ runs:
     - name: Install duckrun + deps
       shell: bash
       run: |
-        PRE=""
-        if [ "${{ inputs.install }}" = "pre" ]; then PRE="--pre"; fi
-        pip install $PRE -e ".[${{ inputs.extras }}]"
+        pip install -e ".[${{ inputs.extras }}]"
         if [ -n "${{ inputs.extra-packages }}" ]; then
-          pip install $PRE ${{ inputs.extra-packages }}
+          pip install ${{ inputs.extra-packages }}
         fi
-        pip show duckdb dbt-core dbt-duckdb deltalake | grep -E '^(Name|Version):'

@@ -76,13 +76,13 @@ class TestSession:
         assert isinstance(conn, duckrun.DuckSession)
 
     def test_sql(self, conn):
-        assert conn.sql("select count(*) from src").fetchall()[0][0] == 3
+        assert conn.sql("select count(*) from src").fetchone()[0] == 3
 
     def test_refresh(self, conn):
         assert conn.refresh() is conn
 
     def test_connection(self, conn):
-        assert conn._connection.execute("select 1").fetchall()[0][0] == 1
+        assert conn._connection.execute("select 1").fetchone()[0] == 1
 
     def test_close(self, conn):
         conn.close()  # closes the DuckDB connection
@@ -99,7 +99,7 @@ class TestSession:
         other.close()
         assert conn.attach(str(tmp_path / "wh2"), name="sales") is conn  # chains
         assert "sales" in conn._catalogs
-        assert conn.sql("select n from sales.dbo.only_there").fetchall()[0][0] == 99
+        assert conn.sql("select n from sales.dbo.only_there").fetchone()[0] == 99
 
     def test_show_tables(self, conn):
         assert "src" in {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
@@ -115,7 +115,7 @@ class TestSession:
         assert deltalake.DeltaTable(conn._table_path("dbo", "stg")).version() == v0
         assert {r[0] for r in conn.sql("select id from stg").fetchall()} == {99, 100}
         conn.sql("DROP TABLE stg")                                          # drops the temp only
-        assert conn.sql("select id from stg").fetchall()[0][0] == 1            # Delta still there
+        assert conn.sql("select id from stg").fetchone()[0] == 1            # Delta still there
         assert deltalake.DeltaTable(conn._table_path("dbo", "stg")).version() == v0
 
     def test_copy(self, conn, tmp_path):
@@ -351,41 +351,41 @@ class TestSqlDml:
         conn.sql("CREATE OR REPLACE TABLE tt AS select 1 a")  # v0
         conn.sql("CREATE OR REPLACE TABLE tt AS select 2 a")  # v1
         path = conn._table_path("dbo", "tt")
-        assert conn.sql(f"select a from delta_scan('{path}', version => 0)").fetchall()[0][0] == 1
+        assert conn.sql(f"select a from delta_scan('{path}', version => 0)").fetchone()[0] == 1
 
     def test_sql_create_table_as(self, conn):
         conn.sql("create table cta as select * from (values (1),(2)) t(x)")
-        assert conn.sql("select count(*) from cta").fetchall()[0][0] == 2
+        assert conn.sql("select count(*) from cta").fetchone()[0] == 2
 
     def test_sql_insert_select(self, conn):
         conn.sql("insert into src select * from (values (9,'z')) t(id, name)")
-        assert conn.sql("select count(*) from src").fetchall()[0][0] == 4
+        assert conn.sql("select count(*) from src").fetchone()[0] == 4
 
     def test_sql_insert_values(self, conn):
         conn.sql("insert into src values (9, 'z')")
-        assert conn.sql("select count(*) from src").fetchall()[0][0] == 4
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "z"
+        assert conn.sql("select count(*) from src").fetchone()[0] == 4
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
     def test_sql_insert_values_named_subset(self, conn):
         # explicit column list → unsupplied target columns are filled with NULL (schema-fill, not
         # positional luck).
         conn.sql("insert into src (id) values (9)")
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] is None
+        assert conn.sql("select name from src where id = 9").fetchone()[0] is None
 
     def test_sql_update(self, conn):
         conn.sql("update src set name = 'Z' where id = 1")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "Z"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "Z"
 
     def test_sql_delete(self, conn):
         conn.sql("delete from src where id = 1")
-        assert conn.sql("select count(*) from src").fetchall()[0][0] == 2
+        assert conn.sql("select count(*) from src").fetchone()[0] == 2
 
     def test_sql_update_where_inside_set_literal(self, conn):
         # A literal containing the word `where` in the SET list must not mis-split the statement
         # (review #5): only the trailing WHERE is the predicate.
         conn.sql("update src set name = 'a where b' where id = 1")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "a where b"
-        assert conn.sql("select name from src where id = 2").fetchall()[0][0] == "b"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "a where b"
+        assert conn.sql("select name from src where id = 2").fetchone()[0] == "b"
 
     def test_sql_update_subquery_predicate(self, conn):
         # UPDATE with a subquery predicate: delta_rs's update() would panic, so duckrun evaluates it
@@ -412,7 +412,7 @@ class TestSqlDml:
         df = conn.sql("select * from src")
         qty_type = dict(zip(df.columns, df.types))["qty"]
         assert str(qty_type).upper().startswith("INT")
-        assert conn.sql("select count(*) from src where qty is not null").fetchall()[0][0] == 0
+        assert conn.sql("select count(*) from src where qty is not null").fetchone()[0] == 0
 
     def test_sql_drop_tombstone(self, conn):
         # drop is a tombstone (no data deleted); the table leaves the catalog.
@@ -423,20 +423,20 @@ class TestSqlDml:
         conn.sql("MERGE INTO src USING (values (2,'B'),(9,'z')) t(id, name) "
                  "ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select count(*) from src").fetchall()[0][0] == 4
-        assert conn.sql("select name from src where id = 2").fetchall()[0][0] == "B"
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "z"
+        assert conn.sql("select count(*) from src").fetchone()[0] == 4
+        assert conn.sql("select name from src where id = 2").fetchone()[0] == "B"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
     def test_sql_merge_update_columns(self, conn):
         conn.sql("MERGE INTO src USING (values (1,'X')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET name = source.name WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
 
     def test_sql_merge_insert_only(self, conn):
         conn.sql("MERGE INTO src USING (values (2,'B'),(5,'e')) t(id, name) "
                  "ON target.id = source.id WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select count(*) from src").fetchall()[0][0] == 4          # only id=5 added
-        assert conn.sql("select name from src where id = 2").fetchall()[0][0] == "b"  # untouched
+        assert conn.sql("select count(*) from src").fetchone()[0] == 4          # only id=5 added
+        assert conn.sql("select name from src where id = 2").fetchone()[0] == "b"  # untouched
 
     def test_sql_merge_by_source_delete(self, conn):
         # full sync: source carries ids {2,3}; matched updates, unmatched-by-source (1) deleted.
@@ -449,34 +449,34 @@ class TestSqlDml:
     def test_sql_merge_subquery_source(self, conn):
         conn.sql("MERGE INTO src USING (select 9 as id, 'z' as name) AS source "
                  "ON target.id = source.id WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "z"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
     def test_sql_merge_user_aliases(self, conn):
         # user-chosen aliases (s/t) on both sides resolve to the engine's target/source.
         conn.sql("MERGE INTO src s USING (values (1,'X'),(9,'z')) t(id, name) ON s.id = t.id "
                  "WHEN MATCHED THEN UPDATE SET name = t.name WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "z"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
     def test_sql_merge_qualify_target_by_table_name(self, conn):
         # no target alias: qualify the target by its table name, the source by its alias.
         conn.sql("MERGE INTO src USING (values (1,'X')) u(id, name) ON src.id = u.id "
                  "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
 
     def test_sql_merge_qualify_source_by_relation_name(self, conn):
         # a bare-relation source can be qualified by its own name (no alias needed).
         conn.sql("create table donor as select * from (values (1,'X'),(9,'z')) t(id, name)")
         conn.sql("MERGE INTO src USING donor ON src.id = donor.id "
                  "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "z"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
     def test_sql_merge_literal_aliases_still_work(self, conn):
         # backward compatible: the literal target/source aliases keep working.
         conn.sql("MERGE INTO src USING (values (1,'X')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
 
     def test_sql_merge_literal_with_then_in_predicate(self, conn):
         # a string literal containing the word "then" (with spaces) must NOT be mistaken for the
@@ -484,8 +484,8 @@ class TestSqlDml:
         conn.sql("MERGE INTO src USING (values (1,'X'),(9,'z')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED AND source.name <> 'do then redo' THEN UPDATE SET * "
                  "WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"  # pred true → updated
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "z"  # inserted
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"  # pred true → updated
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"  # inserted
 
     def test_sql_merge_inline_line_comment(self, conn):
         # an interior `--` comment (here carrying the word "when") must not inject a false clause
@@ -494,7 +494,7 @@ class TestSqlDml:
                  "WHEN MATCHED THEN UPDATE SET *\n"
                  "-- recompute when stale\n"
                  "WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
 
     def test_sql_merge_inline_block_comment(self, conn):
         # a `/* */` comment (with using/on/when inside) between the target and USING is ignored, not
@@ -502,8 +502,8 @@ class TestSqlDml:
         conn.sql("MERGE INTO src /* using on when */ USING (values (1,'X'),(9,'z')) t(id, name) "
                  "ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "z"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"
 
     def test_sql_merge_bad_alias_rejected(self, conn):
         # an alias matching neither side (not the table/source names or their aliases) is rejected.
@@ -523,7 +523,7 @@ class TestSqlDml:
         conn.sql("MERGE INTO src USING (select t.id, t.name from (values (1,'X')) t(id, name) "
                  "join (values (1)) u(k) on t.id = u.k) AS s ON target.id = s.id "
                  "WHEN MATCHED THEN UPDATE SET name = s.name")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
 
     def test_sql_merge_matched_delete(self, conn):
         # WHEN MATCHED THEN DELETE — matched rows removed (full delta-rs surface).
@@ -546,14 +546,14 @@ class TestSqlDml:
         # WHEN NOT MATCHED THEN INSERT (cols) VALUES (<exprs>) — arbitrary value expressions.
         conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
                  "WHEN NOT MATCHED THEN INSERT (id, name) VALUES (source.id, upper(source.name))")
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "Z"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "Z"
 
     def test_sql_merge_update_expression(self, conn):
         # UPDATE SET col = <arbitrary expr> (not just plain source.col copies).
         conn.sql("MERGE INTO src USING (values (1,'x')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET name = upper(source.name) || '!' "
                  "WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X!"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X!"
 
     def test_sql_merge_case_expression(self, conn):
         # a CASE WHEN … THEN … END inside a clause action carries its OWN when/then keywords; the
@@ -562,8 +562,8 @@ class TestSqlDml:
                  "WHEN MATCHED THEN UPDATE SET "
                  "  name = case when source.id = 1 then 'one' else source.name end "
                  "WHEN NOT MATCHED THEN INSERT *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "one"   # CASE true branch
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "z"     # inserted
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "one"   # CASE true branch
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "z"     # inserted
 
     def test_sql_merge_by_source_update(self, conn):
         # WHEN NOT MATCHED BY SOURCE THEN UPDATE — touch rows the source doesn't carry.
@@ -579,15 +579,15 @@ class TestSqlDml:
         # update-only merge (matched update, no insert clause) is now supported.
         conn.sql("MERGE INTO src USING (values (1,'A'),(9,'z')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED THEN UPDATE SET *")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "A"  # updated
-        assert conn.sql("select count(*) from src").fetchall()[0][0] == 3             # id=9 NOT inserted
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "A"  # updated
+        assert conn.sql("select count(*) from src").fetchone()[0] == 3             # id=9 NOT inserted
 
     def test_sql_merge_insert_values_columnless(self, conn):
         # WHEN NOT MATCHED THEN INSERT VALUES (…) with NO column list — bound positionally to the
         # target columns in declared order (id, name), like a native positional INSERT.
         conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
                  "WHEN NOT MATCHED THEN INSERT VALUES (source.id, upper(source.name))")
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "Z"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "Z"
 
     def test_sql_merge_insert_values_columnless_arity_mismatch(self, conn):
         # a columnless INSERT VALUES whose value count != target column count is a clean error.
@@ -621,20 +621,20 @@ class TestSqlDml:
         # (which lacks it) ever sees the expression.
         conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
                  "WHEN NOT MATCHED THEN INSERT VALUES (source.id, upper('hi') || current_schema())")
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0].startswith("HI")
+        assert conn.sql("select name from src where id = 9").fetchone()[0].startswith("HI")
 
     def test_sql_merge_constfold_noncorrelated_subquery_in_value(self, conn):
         # a subquery that references neither target nor source is constant w.r.t. the merge — folded to
         # its literal in DuckDB (delta_rs can't plan a subquery), so the merge succeeds.
         conn.sql("MERGE INTO src USING (values (9,'z')) t(id, name) ON target.id = source.id "
                  "WHEN NOT MATCHED THEN INSERT VALUES (source.id, (select name from src where id = 1))")
-        assert conn.sql("select name from src where id = 9").fetchall()[0][0] == "a"
+        assert conn.sql("select name from src where id = 9").fetchone()[0] == "a"
 
     def test_sql_merge_constfold_noncorrelated_subquery_in_predicate(self, conn):
         # same fold in a WHEN predicate: (select count(*) …) > 0 is constant → folded, merge runs.
         conn.sql("MERGE INTO src USING (values (1,'X')) t(id, name) ON target.id = source.id "
                  "WHEN MATCHED AND (select count(*) from src) > 0 THEN UPDATE SET name = source.name")
-        assert conn.sql("select name from src where id = 1").fetchall()[0][0] == "X"
+        assert conn.sql("select name from src where id = 1").fetchone()[0] == "X"
 
     def test_sql_merge_correlated_subquery_value_rejected(self, conn):
         # a CORRELATED subquery (references target/source) can't be folded and is a hard datafusion
@@ -758,7 +758,7 @@ def test_local_relative_two_segment_path_still_local(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     conn = duckrun.connect("ws/lh")
     assert conn._current_catalog == "lh"
-    assert conn.sql("select count(*) from dbo.t").fetchall()[0][0] == 1
+    assert conn.sql("select count(*) from dbo.t").fetchone()[0] == 1
     conn.close()
 
 
@@ -769,7 +769,7 @@ def test_discovery_and_catalog(wh):
     # SHOW TABLES works for free (native DuckDB over the registered views).
     shown = {r[0] for r in conn.sql("SHOW TABLES").fetchall()}
     assert {"t1", "t2"} <= shown
-    assert conn.sql("select count(*) from t1").fetchall()[0][0] == 2
+    assert conn.sql("select count(*) from t1").fetchone()[0] == 2
 
 
 def test_discover_all_schemas(wh):
@@ -777,7 +777,7 @@ def test_discover_all_schemas(wh):
     _write_table(wh + "/sales/orders", "select 7 as n")
     conn = duckrun.connect(wh)
     assert set(conn._cat_databases()) == {"dbo", "sales"}
-    assert conn.sql("select n from sales.orders").fetchall()[0][0] == 7
+    assert conn.sql("select n from sales.orders").fetchone()[0] == 7
 
 
 def test_write_modes_round_trip(wh):
@@ -786,13 +786,13 @@ def test_write_modes_round_trip(wh):
     conn = duckrun.connect(wh, schema="dbo", read_only=False)
 
     conn.sql("CREATE OR REPLACE TABLE t3 AS select 1 as id, 'x' as v")
-    assert conn.sql("select count(*) from t3").fetchall()[0][0] == 1
+    assert conn.sql("select count(*) from t3").fetchone()[0] == 1
 
     conn.sql("insert into t3 select 2 as id, 'y' as v")
-    assert conn.sql("select count(*) from t3").fetchall()[0][0] == 2
+    assert conn.sql("select count(*) from t3").fetchone()[0] == 2
 
     conn.sql("create table if not exists t3 as select 99 as id, 'q' as v")  # no-op, table exists
-    assert conn.sql("select count(*) from t3").fetchall()[0][0] == 2
+    assert conn.sql("select count(*) from t3").fetchone()[0] == 2
 
 
 def test_writes_persist_to_delta(wh):
@@ -815,7 +815,7 @@ def test_read_only_is_default_and_blocks_writes(wh):
     # connect() is read-only by default: every Delta-write raises PermissionError, reads and native
     # scratch still work. read_only=False opts back in.
     ro = duckrun.connect(wh, schema="dbo")
-    assert ro.sql("select count(*) from t1").fetchall()[0][0] == 2          # reads fine
+    assert ro.sql("select count(*) from t1").fetchone()[0] == 2          # reads fine
     ro.sql("create temp table scratch as select 1 x")                    # native scratch fine
     with pytest.raises(PermissionError):
         ro.sql("create or replace table nope as select 1 id")             # CTAS blocked
@@ -826,15 +826,15 @@ def test_read_only_is_default_and_blocks_writes(wh):
 
     rw = duckrun.connect(wh, schema="dbo", read_only=False)
     rw.sql("create or replace table ok as select 9 id, 'z' v")            # opt-in writes
-    assert rw.sql("select count(*) from ok").fetchall()[0][0] == 1
+    assert rw.sql("select count(*) from ok").fetchone()[0] == 1
 
 
 def test_raw_connection_escape_hatch(wh):
     # conn._connection exposes the underlying DuckDB connection for anything the DataFrame surface
     # doesn't cover — scalar queries, and reading the registered views directly.
     conn = duckrun.connect(wh, schema="dbo")
-    assert conn._connection.execute("select 40 + 2").fetchall()[0][0] == 42
-    assert conn._connection.execute("select count(*) from t1").fetchall()[0][0] == 2
+    assert conn._connection.execute("select 40 + 2").fetchone()[0] == 42
+    assert conn._connection.execute("select count(*) from t1").fetchone()[0] == 2
 
 
 def test_refresh_picks_up_external_writes(wh):
@@ -844,7 +844,7 @@ def test_refresh_picks_up_external_writes(wh):
     _write_table(wh + "/dbo/t3", "select 1 as id")
     conn.refresh(quiet=True)
     assert "t3" in conn._cat_tables()
-    assert conn.sql("select count(*) from t3").fetchall()[0][0] == 1
+    assert conn.sql("select count(*) from t3").fetchone()[0] == 1
 
 
 def test_read_files_via_sql(wh, tmp_path):
@@ -855,8 +855,8 @@ def test_read_files_via_sql(wh, tmp_path):
     conn._connection.execute(f"COPY (select * from t1) TO '{pq}' (FORMAT parquet)")
     conn._connection.execute(f"COPY (select * from t1) TO '{csv}' (FORMAT csv, HEADER)")
 
-    assert conn.sql(f"select count(*) from read_parquet('{pq}')").fetchall()[0][0] == 2
-    assert conn.sql(f"select count(*) from read_csv_auto('{csv}')").fetchall()[0][0] == 2
+    assert conn.sql(f"select count(*) from read_parquet('{pq}')").fetchone()[0] == 2
+    assert conn.sql(f"select count(*) from read_csv_auto('{csv}')").fetchone()[0] == 2
 
 
 # ── convert_to_delta: zero-copy parquet→Delta in place (session-level convert) ───────────────────────
@@ -888,7 +888,7 @@ def test_convertToDelta_bare_path_round_trip(conn):
     path = _stage_parquet(conn, "dbo/bare")
     conn.convert_to_delta(path)                      # a bare path works, not just parquet.`…`
     conn.refresh()
-    assert conn.sql("select count(*) from bare").fetchall()[0][0] == 1
+    assert conn.sql("select count(*) from bare").fetchone()[0] == 1
 
 
 def test_convertToDelta_is_zero_copy(conn):
@@ -1200,7 +1200,7 @@ def test_native_passthrough_not_delta(tmp_path, stmt, name):
     wh = str(tmp_path / "wh")
     c = _seed(wh)
     c.sql(stmt)
-    assert c.sql(f"select count(*) from {name}").fetchall()[0][0] is not None   # queryable now
+    assert c.sql(f"select count(*) from {name}").fetchone()[0] is not None   # queryable now
     assert not deltalake.DeltaTable.is_deltatable(c._table_path("dbo", name))  # but not Delta
     assert name not in duckrun.connect(wh, schema="dbo")._cat_tables()  # and not persisted
 
@@ -1228,16 +1228,16 @@ def test_with_prefixed_update(tmp_path):
     # the DuckDB overwrite fallback with the CTE re-attached to the read.
     c = _seed(str(tmp_path / "wh"))
     c.sql("with bump as (select 1 id) update items set name = 'Z' where id in (select id from bump)")
-    assert c.sql("select name from items where id = 1").fetchall()[0][0] == "Z"
+    assert c.sql("select name from items where id = 1").fetchone()[0] == "Z"
 
 
 def test_with_prefixed_delete(tmp_path):
     # Same for a leading-CTE DELETE — the CTE feeds the predicate's subquery via the fallback read.
     c = _seed(str(tmp_path / "wh"))
-    before = c.sql("select count(*) from items").fetchall()[0][0]
+    before = c.sql("select count(*) from items").fetchone()[0]
     c.sql("with victims as (select 1 id) delete from items where id in (select id from victims)")
-    assert c.sql("select count(*) from items where id = 1").fetchall()[0][0] == 0
-    assert c.sql("select count(*) from items").fetchall()[0][0] == before - 1
+    assert c.sql("select count(*) from items where id = 1").fetchone()[0] == 0
+    assert c.sql("select count(*) from items").fetchone()[0] == before - 1
 
 
 # ════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1262,11 +1262,11 @@ def test_multi_catalog_cross_query(tmp_path):
     assert list(conn._catalogs) == ["lhA", "other"]   # primary derives its folder name "lhA"
     assert conn._current_catalog == "lhA"
     # cross-catalog read resolves catalog.schema.table across the two lakehouse roots.
-    assert conn.sql("select n from other.dbo.t2").fetchall()[0][0] == 7
-    assert conn.sql("select label from other.sales.s").fetchall()[0][0] == "x"
+    assert conn.sql("select n from other.dbo.t2").fetchone()[0] == 7
+    assert conn.sql("select label from other.sales.s").fetchone()[0] == "x"
     # 2-part / unqualified still resolve in the CURRENT catalog (lhA), not the attached one.
-    assert conn.sql("select count(*) from dbo.t1").fetchall()[0][0] == 2
-    assert conn.sql("select count(*) from t1").fetchall()[0][0] == 2  # via USE lhA.dbo
+    assert conn.sql("select count(*) from dbo.t1").fetchone()[0] == 2
+    assert conn.sql("select count(*) from t1").fetchone()[0] == 2  # via USE lhA.dbo
 
 
 def test_multi_catalog_get_stats_spans_all(tmp_path):
@@ -1299,7 +1299,7 @@ def test_multi_catalog_set_current(tmp_path):
     _set_current_catalog(conn, "other")
     assert conn._current_catalog == "other"
     assert conn._current_database == "dbo"                  # picks dbo when present
-    assert conn.sql("select n from t2").fetchall()[0][0] == 7   # unqualified now resolves in 'other'
+    assert conn.sql("select n from t2").fetchone()[0] == 7   # unqualified now resolves in 'other'
     assert set(conn._cat_databases()) == {"dbo", "sales"}   # other's schemas, not lhA's
     assert conn._cat_tables() == ["t2"]                     # current catalog (other) + db (dbo)
 
@@ -1310,7 +1310,7 @@ def test_multi_catalog_write_lands_in_right_root(tmp_path):
     conn.sql("CREATE OR REPLACE TABLE other.dbo.created AS select 1 as id, 'z' as v")
     assert deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhB" / "dbo" / "created"))
     assert not deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhA" / "dbo" / "created"))
-    assert conn.sql("select v from other.dbo.created").fetchall()[0][0] == "z"
+    assert conn.sql("select v from other.dbo.created").fetchone()[0] == "z"
     # and the resolved path lands under the attached catalog's root.
     path = conn._table_path("dbo", "created", catalog="other")
     assert path.replace("\\", "/").endswith("lhB/dbo/created")
@@ -1342,7 +1342,7 @@ def test_primary_name_derive_explicit_and_fallback(tmp_path):
     _write_table(g + "/dbo/t", "select 1 as id")
     conn = duckrun.connect(g)
     assert conn._current_catalog == "data"
-    assert conn.sql("select count(*) from data.dbo.t").fetchall()[0][0] == 1   # bare, no quoting needed
+    assert conn.sql("select count(*) from data.dbo.t").fetchone()[0] == 1   # bare, no quoting needed
 
 
 def test_name_url_bijection_with_derived_names(tmp_path, tmp_path_factory):
@@ -1357,7 +1357,7 @@ def test_name_url_bijection_with_derived_names(tmp_path, tmp_path_factory):
         conn.attach(b)                                 # derived name "wh" clashes with the primary
     conn.attach(b, name="wh2")                         # an explicit name resolves it
     assert set(conn._catalogs) == {"wh", "wh2"}
-    assert conn.sql("select id from wh2.dbo.t").fetchall()[0][0] == 2
+    assert conn.sql("select id from wh2.dbo.t").fetchone()[0] == 2
 
 
 def test_attach_schema_filter_skips_discovery(tmp_path):
@@ -1381,22 +1381,22 @@ def test_cross_catalog_raw_dml_routes_to_target_root(tmp_path):
 
     # INSERT ... VALUES into the attached catalog lands under lhB, leaving lhA's dbo.t2 absent.
     conn.sql("insert into other.dbo.t2 values (8)")
-    assert conn.sql("select count(*) from other.dbo.t2").fetchall()[0][0] == 2
+    assert conn.sql("select count(*) from other.dbo.t2").fetchone()[0] == 2
     assert deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhB" / "dbo" / "t2"))
     assert not deltalake.DeltaTable.is_deltatable(str(tmp_path / "lhA" / "dbo" / "t2"))
 
     # INSERT ... SELECT reading from the CURRENT catalog (lhA.dbo.t1) into the attached one (the
     # user's literal shape, cross-root): both rows of t1 append to other.dbo.t2.
     conn.sql("insert into other.dbo.t2 select id from lhA.dbo.t1")
-    assert conn.sql("select count(*) from other.dbo.t2").fetchall()[0][0] == 4
+    assert conn.sql("select count(*) from other.dbo.t2").fetchone()[0] == 4
 
     # a non-INSERT verb routes the same way: UPDATE/DELETE hit the target catalog's root.
     conn.sql("delete from other.dbo.t2 where n = 8")
-    assert conn.sql("select count(*) from other.dbo.t2").fetchall()[0][0] == 3
+    assert conn.sql("select count(*) from other.dbo.t2").fetchone()[0] == 3
 
     # a 3-part target naming the CURRENT catalog ("lhA") still works (routes to the current root).
     conn.sql("insert into lhA.dbo.t1 values (3, 'c')")
-    assert conn.sql("select count(*) from t1").fetchall()[0][0] == 3
+    assert conn.sql("select count(*) from t1").fetchone()[0] == 3
 
     # an unknown catalog name is rejected with the attach pointer (not silently written anywhere).
     with pytest.raises(ValueError, match="unknown catalog 'nope'"):
@@ -1413,7 +1413,7 @@ def test_attach_read_only_catalog_fences_writes(tmp_path):
     conn.attach(b, name="ref", read_only=True)              # attached read-only
 
     # the read-only catalog still reads (cross-catalog) ...
-    assert conn.sql("select label from ref.dbo.lookup").fetchall()[0][0] == "one"
+    assert conn.sql("select label from ref.dbo.lookup").fetchone()[0] == "one"
     # ... but a write into it fails loud, even though the session is writable — the fence is on the
     # TARGET catalog's read-only flag, not the current one.
     with pytest.raises(PermissionError):
@@ -1422,7 +1422,7 @@ def test_attach_read_only_catalog_fences_writes(tmp_path):
         conn.sql("insert into ref.dbo.lookup values (2, 'two')")
     # writes to the writable primary still work.
     conn.sql("insert into t1 select 2 as id")
-    assert conn.sql("select count(*) from t1").fetchall()[0][0] == 2
+    assert conn.sql("select count(*) from t1").fetchone()[0] == 2
 
 
 def test_close_closes_connection(tmp_path):
@@ -1486,10 +1486,10 @@ def test_weird_attached_catalog_names(tmp_path, tmp_path_factory, weird):
     assert weird in conn._catalogs
     qn = '"' + weird.replace('"', '""') + '"'   # the caller quotes the weird name in their own SQL
     # cross-catalog read through the quoted 3-part name
-    assert conn.sql(f"select n from {qn}.dbo.t2").fetchall()[0][0] == 9
+    assert conn.sql(f"select n from {qn}.dbo.t2").fetchone()[0] == 9
     # cross-catalog write (catalog resolved from the quoted 3-part name)
     conn.sql(f"CREATE OR REPLACE TABLE {qn}.dbo.created AS select 7 as v")
-    assert conn.sql(f"select v from {qn}.dbo.created").fetchall()[0][0] == 7
+    assert conn.sql(f"select v from {qn}.dbo.created").fetchone()[0] == 7
     # switch to it and introspect under the weird name
     _set_current_catalog(conn, weird)
     assert conn._current_catalog == weird
@@ -1504,9 +1504,9 @@ def test_weird_primary_catalog_name(tmp_path, weird):
     _write_table(a + "/dbo/t", "select 5 as id")
     conn = duckrun.connect(a, name=weird, read_only=False)
     assert conn._current_catalog == weird
-    assert conn.sql("select id from t").fetchall()[0][0] == 5            # bare, current catalog
+    assert conn.sql("select id from t").fetchone()[0] == 5            # bare, current catalog
     qn = '"' + weird.replace('"', '""') + '"'
-    assert conn.sql(f"select id from {qn}.dbo.t").fetchall()[0][0] == 5  # explicit 3-part, quoted
+    assert conn.sql(f"select id from {qn}.dbo.t").fetchone()[0] == 5  # explicit 3-part, quoted
 
 
 # ── _get_rle: PRIVATE / experimental (parked) — deliberately OUT of the TestSession scorecard ──
@@ -1741,7 +1741,7 @@ def _row_groups(conn, table):
     assert files, "no parquet files written"
     return conn.sql(
         f"select count(*) from (select distinct file_name, row_group_id "
-        f"from parquet_metadata({files!r}))").fetchall()[0][0]
+        f"from parquet_metadata({files!r}))").fetchone()[0]
 
 
 def _live_files(conn, table):
@@ -1772,7 +1772,7 @@ def test_ctas_geometry_is_independent_of_the_source_size(conn):
     # so no plan walk and no exact count happen at write time.
     conn.sql("CREATE OR REPLACE TABLE limited_ctas AS "
              "select * from (select i as j from range(200000000) t(i) limit 20000000)")
-    assert conn.sql("select count(*) from limited_ctas").fetchall()[0][0] == 20000000
+    assert conn.sql("select count(*) from limited_ctas").fetchone()[0] == 20000000
     n = _row_groups(conn, "limited_ctas")
     assert 5 <= n <= 6, f"expected 5 row groups at the fixed 4M ceiling, got {n}"
 
@@ -1891,7 +1891,7 @@ def test_naive_timestamp_lands_as_utc_timestamp(conn):
     feats = (proto.reader_features or []) + (proto.writer_features or [])
     assert "timestampNtz" not in feats, feats
     conn.sql("SET TimeZone='UTC'")
-    assert conn.sql("select lpep_pickup_datetime::varchar from ts42").fetchall()[0][0] \
+    assert conn.sql("select lpep_pickup_datetime::varchar from ts42").fetchone()[0] \
         == "2014-01-01 10:00:00+00"
 
 
@@ -1915,7 +1915,7 @@ def test_existing_ntz_table_append_skips_and_warns(conn, monkeypatch):
     conn.sql("INSERT INTO ts42_old values (TIMESTAMP '2014-01-02 11:00:00', 2)")
     loc = conn.root_path + "/dbo/ts42_old"
     assert _delta_field_types(loc)["ts"] == "timestamp_ntz"
-    assert conn.sql("select count(*) from ts42_old").fetchall()[0][0] == 2
+    assert conn.sql("select count(*) from ts42_old").fetchone()[0] == 2
     hits = [w for w in warned if "timestamp_ntz" in w]
     assert len(hits) == 1 and "ts" in hits[0] and "--full-refresh" in hits[0], warned
     # ...and a full replace retypes it.
@@ -1951,9 +1951,9 @@ def test_coerce_helper_unit_matrix(monkeypatch):
                    "ts_ms": "TIMESTAMP WITH TIME ZONE", "ts_ns": "TIMESTAMP WITH TIME ZONE",
                    "tstz": "TIMESTAMP WITH TIME ZONE", "x": "INTEGER"}, got
     # The values are the naive wall clock READ AS UTC — session TZ (Brisbane) must not leak in.
-    epoch = out.query("__v", 'select epoch_us("ts ""odd""") from __v').fetchall()[0][0]
+    epoch = out.query("__v", 'select epoch_us("ts ""odd""") from __v').fetchone()[0]
     naive_utc = duckdb.connect().sql(
-        "select epoch_us(timezone('UTC', TIMESTAMP '2014-01-01 10:00:00'))").fetchall()[0][0]
+        "select epoch_us(timezone('UTC', TIMESTAMP '2014-01-01 10:00:00'))").fetchone()[0]
     assert epoch == naive_utc
 
 
@@ -1991,14 +1991,14 @@ def test_merge_naive_source_into_tz_target(conn, monkeypatch):
              "'upd' as val) s ON m42.id = s.id AND m42.ts >= '2020-01-01 00:00:00' "
              "WHEN MATCHED THEN UPDATE SET ts = s.ts, val = s.val")
     conn.sql("SET TimeZone='UTC'")
-    assert conn.sql("select ts::varchar, val from m42 where id = 1").fetchall()[0] \
+    assert conn.sql("select ts::varchar, val from m42 where id = 1").fetchone() \
         == ("2026-06-01 12:00:00+00", "upd")
     # Insert-only MERGE takes the anti-join divert (append seam): same UTC semantics, no clash.
     warned = []
     monkeypatch.setattr(engine.logger, "warning", lambda msg, *a, **k: warned.append(str(msg)))
     conn.sql("MERGE INTO m42 USING (select 9 as id, TIMESTAMP '2026-09-09 09:00:00' as ts, "
              "'new' as val) s ON m42.id = s.id WHEN NOT MATCHED THEN INSERT *")
-    assert conn.sql("select ts::varchar from m42 where id = 9").fetchall()[0][0] \
+    assert conn.sql("select ts::varchar from m42 where id = 9").fetchone()[0] \
         == "2026-09-09 09:00:00+00"
     assert not [w for w in warned if "timestamp_ntz" in w], warned
 
@@ -2036,7 +2036,7 @@ def test_compaction_lands_the_fixed_read_layout(conn):
     # over the LIVE files only (file_uris), not a raw glob.
     live = engine._delta_table(loc, conn.storage_options).file_uris()
     n = conn.sql(f"select count(*) from (select distinct file_name, row_group_id "
-                 f"from parquet_metadata({live!r}))").fetchall()[0][0]
+                 f"from parquet_metadata({live!r}))").fetchone()[0]
     assert 5 <= n <= 6, f"compaction left the fixed 4M layout: {n} row groups"
 
 
@@ -2126,9 +2126,9 @@ def test_get_stats_aggregates_match_the_footers_in_one_pass(conn):
                           "avg_row_group", "size_mb", "vorder", "compression"]
     d = dict(zip(st.columns, st.fetchall()[0]))
     rows, nfiles, groups = conn.sql(
-        f"select sum(num_rows), count(*), sum(num_row_groups) from parquet_file_metadata({lit})").fetchall()[0]
+        f"select sum(num_rows), count(*), sum(num_row_groups) from parquet_file_metadata({lit})").fetchone()
     codecs = conn.sql(f"select list(distinct compression order by compression) "
-                      f"from parquet_metadata({lit})").fetchall()[0][0]
+                      f"from parquet_metadata({lit})").fetchone()[0]
     assert (d["total_rows"], d["num_files"], d["num_row_groups"]) == (rows, nfiles, groups) == (40, 4, 4)
     assert d["avg_row_group"] == round(rows / groups, 1)
     assert d["compression"] == ", ".join(codecs) and d["vorder"] is False
@@ -2214,8 +2214,8 @@ def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
     conn.sql("CREATE OR REPLACE TABLE big_auto SORTED BY AUTO AS "
              "select (i % 40) as region, (i % 997) as store, ((i * 31) % 100000)::double as amt "
              "from range(200000) t(i)")
-    assert conn.sql("select count(*) from big_auto").fetchall()[0][0] == 200_000
-    assert conn.sql("select count(distinct region) from big_auto").fetchall()[0][0] == 40
+    assert conn.sql("select count(*) from big_auto").fetchone()[0] == 200_000
+    assert conn.sql("select count(distinct region) from big_auto").fetchone()[0] == 40
     leftovers = [r[0] for r in conn.sql("show tables").fetchall()
                  if "_duckrun_auto_src" in r[0] or "_rle" in r[0]]
     assert not leftovers, leftovers
@@ -2229,7 +2229,7 @@ def test_sorted_by_auto_uses_the_fixed_geometry(conn):
     live = _live_files(conn, "auto_geo")
     mx, total = conn.sql(
         f"select max(row_group_num_rows), sum(row_group_num_rows) from (select distinct "
-        f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchall()[0]
+        f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchone()
     assert mx == 4_000_000, f"AUTO left the fixed 4M ceiling: max group {mx}"
     assert total == 20_000_000
 
@@ -2244,7 +2244,7 @@ def test_auto_recluster_gets_the_fixed_geometry_too(conn):
     live = _live_files(conn, "recluster_src")
     mx, total = conn.sql(
         f"select max(row_group_num_rows), sum(row_group_num_rows) from (select distinct "
-        f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchall()[0]
+        f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchone()
     assert mx == 4_000_000, f"AUTO re-cluster left the fixed 4M ceiling: max group {mx}"
     assert total == 20_000_000
 
@@ -2253,7 +2253,7 @@ def test_plain_ctas_keeps_the_fixed_ceiling(conn):
     # A plain CTAS keeps the fixed 4M ceiling, so 20M rows land full 4M-row groups.
     conn.sql("CREATE OR REPLACE TABLE plain_geo AS select i as j from range(20000000) t(i)")
     live = _live_files(conn, "plain_geo")
-    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchall()[0][0]
+    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchone()[0]
     assert mx == 4_000_000, f"plain CTAS left the fixed 4M ceiling: max group {mx}"
 
 
@@ -2293,7 +2293,7 @@ def test_failed_attach_rolls_back_cleanly(tmp_path, monkeypatch):
 
     # The same name/root attaches fine now that the half-built catalog is gone.
     conn.attach(str(tmp_path / "wh2"), name="sales")
-    assert conn.sql("select n from sales.dbo.only_there").fetchall()[0][0] == 99
+    assert conn.sql("select n from sales.dbo.only_there").fetchone()[0] == 99
     conn.close()
 
 
@@ -2407,7 +2407,7 @@ def test_explicit_row_group_overrides_the_fixed_ceiling_and_lands(conn):
     engine.write_delta(loc, data, "overwrite", cur=conn._connection,
                        storage_options=conn.storage_options, row_group_rows=250)
     live = engine._delta_table(loc, conn.storage_options).file_uris()
-    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchall()[0][0]
+    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchone()[0]
     assert mx <= 250, f"explicit row-group ceiling not honored: max group {mx}"
 
 
@@ -2436,7 +2436,7 @@ def test_maintain_honors_model_geometry(conn, monkeypatch):
                      target_file_size=64 * 1024 * 1024, row_group_cap=7)
     assert captured["target"] == 64 * 1024 * 1024
     live = engine._delta_table(loc, conn.storage_options).file_uris()
-    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchall()[0][0]
+    mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchone()[0]
     assert mx <= 7, f"compaction ignored the explicit row-group cap: max group {mx}"
     # Unset -> the defaults, unchanged.
     engine._maintain(conn._connection, loc, storage_options=conn.storage_options)

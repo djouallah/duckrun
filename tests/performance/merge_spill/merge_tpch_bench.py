@@ -183,7 +183,7 @@ class Bench:
         return f"{self.schema}.{model}"
 
     def q(self, sql):
-        return self.conn.sql(sql).fetchall()[0][0]
+        return self.conn.sql(sql).fetchone()[0]
 
     def count(self, model):
         return self.q(f"SELECT count(*) FROM {self.t(model)}")

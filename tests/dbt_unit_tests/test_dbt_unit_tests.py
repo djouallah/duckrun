@@ -275,7 +275,7 @@ def _fingerprint(wh: str) -> dict:
         cols = [c[0] for c in con.sql(f"describe select * from {table}").fetchall()]
         row_hash = "hash(" + ", ".join('"' + c.replace('"', '""') + '"' for c in cols) + ")"
         rows, digest = con.sql(
-            f"select count(*), sum({row_hash}::HUGEINT) from {table}").fetchall()[0]
+            f"select count(*), sum({row_hash}::HUGEINT) from {table}").fetchone()
         out[table] = (rows, str(digest))
     return out
 

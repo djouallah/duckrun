@@ -508,9 +508,9 @@ def test_catalog_view_detection_is_structural(tmp_path):
     con.execute(f"create view real_delta as select * from delta_scan('{t}')")
     con.execute(f"create view versioned as select * from delta_scan('{t}', version => 0)")
     con.execute("create view mentions as select 'delta_scan(x)' as s, 1 as n")
-    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["real_delta"]).fetchall()[0][0] == "BASE TABLE"
-    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["versioned"]).fetchall()[0][0] == "BASE TABLE"
-    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["mentions"]).fetchall()[0][0] == "VIEW"
+    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["real_delta"]).fetchone()[0] == "BASE TABLE"
+    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["versioned"]).fetchone()[0] == "BASE TABLE"
+    assert con.execute(CATALOG_VIEW_TYPE_SQL, ["mentions"]).fetchone()[0] == "VIEW"
 
 
 def test_delta_core_macro_forwards_every_config_key_the_plugin_reads():

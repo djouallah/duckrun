@@ -342,7 +342,7 @@ SELECT sum(u) FROM (SELECT unnest([1, 2, 3, 4]) AS u)
 10
 
 query T
-SELECT list_transform([1, 2, 3], lambda x: x * x)::VARCHAR
+SELECT list_transform([1, 2, 3], x -> x * x)::VARCHAR
 ----
 [1, 4, 9]
 

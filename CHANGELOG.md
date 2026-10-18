@@ -4,58 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Fixed
-- **0.5.6: `deltalake` is pinned to 1.6.2 (`>=1.6.2,<1.6.3`); Direct Lake reads are fast again** (#84).
-  Every deltalake from 1.6.3 on bundles parquet-rs 59, which lists each column chunk's dictionary page
-  last in the footer's `encoding_stats` instead of first. Data, pages and encodings are unchanged, but
-  readers that check "fully dictionary encoded" on the first entry (Arrow C++, Power BI Direct Lake) stop
-  using the dictionary and decode every value: on the AEMO mart, first load went from 22-27 s to 69-76 s
-  and read CU from ~1.7k to ~8.5k (a VARCHAR column 0.6 s to 10.5 s). No writer property avoids it, so
-  0.5.4/0.5.5 (which required `>=1.6.4`) wrote it on every table. The runtime guard now also rejects a
-  loaded deltalake >= 1.6.3 (a Fabric kernel not restarted after the downgrade). Upstream:
-  apache/arrow-rs#11659; the cap lifts once a deltalake ships that fix. What 1.6.2 lacks:
-  - the row-group-aligned roll (delta-rs#4677). `DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY` stays set but has
-    no effect, so each file's last row group is truncated again, and the default target file size goes
-    back to **256 MB** (fewer files, fewer truncated tails), as before 0.5.5;
-  - `writer_properties` on delete/update. `DELETE` / `UPDATE` rewrites use delta-rs defaults again, as
-    before 0.5.5, until the next compaction;
-  - Int32-vs-Int64 comparisons in its file-skipping pass, so `DELETE FROM t WHERE k = 3` on an
-    `INTEGER` column fails there; that DELETE / UPDATE falls back to the DuckDB-evaluated fenced
-    overwrite (correct, slower on a large table).
-- **0.5.4: no more truncated row groups at file boundaries.** A row group cannot span files, so
-  delta-rs closed each file's last group wherever `target_file_size` landed, leaving a short runt
-  segment per file (the AEMO mart: 37 groups where 36 full 4M-row groups fit). duckrun now sets
-  `DELTARS_ROLL_ON_ROW_GROUP_BOUNDARY=1` (delta-rs#4677) so files roll on row-group boundaries: every
-  group is a full `max_row_group_size` except the final remainder, and a file may overshoot the target
-  by one group. The deltalake floor rises to `>=1.6.4`, the first release with the aligned roll, so pip
-  upgrades an older one; set the variable to `0` to opt out. (0.5.3 was tagged but never published.)
-- **0.5.2: works with duckdb 2.0 (`pip install --pre duckrun`).** duckdb 2.0 keeps an `execute()`
-  result open until it is read to the end, and an open result makes every other call on that
-  connection raise `ResourceInUseException` — so 0.5.1 failed on the first write. duckrun now reads
-  every result in full. Your own code: duckdb 2.0 relations (what `conn.sql()` returns) have no
-  `fetchone()`; use `fetchall()` or `.limit(1).fetchall()`, which work on 1.x and 2.0 alike.
-
 ### Changed
-- **0.5.5: the default target file size is 128 MB** (was 256 MB), the bin size Fabric Spark's
-  optimize-write targets. 128 MB was reverted in 0.4.65 only because every file ended in a truncated
-  row group and smaller files meant more of them; since 0.5.4 files roll on row-group boundaries, so
-  that cost is gone. Applies to every write and to post-write compaction; the byte-debt compaction
-  thresholds follow (small file < 64 MB, byte floor 256 MB). A per-model `target_file_size_mb` still
-  wins verbatim.
-- **0.5.5: `DELETE` / `UPDATE` rewrites now get the read-layout writer profile.** The files delta-rs rewrites
-  for a delete or update used delta-rs defaults (1,048,576-row groups, default dictionary limits), so a
-  DML'd table drifted off the layout until a compaction happened to fire. They now use the same
-  SNAPPY / 4M-row-group / 32 MB-dictionary profile as every other write (`writer_properties`, honored
-  by delta-rs's delete and update since the 1.6.4 floor).
-- **0.5.5: a predicate-less `UPDATE` now runs on delta-rs** instead of a DuckDB-evaluated full overwrite.
-  The detour existed because delta-rs 1.5.0 updated only some rows of a multi-file table with no
-  predicate; fixed in the 1.6.4 floor. Subquery predicates / SET expressions still take the DuckDB path.
-- **0.5.5: `tests/upstream_probes/deltars_probes.py`** (CI: `delta-rs probes`) reports, on the deltalake
-  floor and on the newest release, which upstream bugs duckrun works around are still present.
-- **0.5.1: `deltalake` is no longer pinned to exactly 1.5.0** — the requirement is the floor
-  `deltalake>=1.5.0`, and the runtime guard rejects only an older deltalake. Earlier releases called
-  every deltalake above 1.5.0 broken for MERGE at scale and batch DELETE; with the pin lifted, the
-  version pip resolves is the one that runs. The test extras keep `pyarrow<25`.
 - **dbt is now an optional extra: install the adapter with `pip install "duckrun[dbt]"`.** Plain
   `pip install duckrun` is the connection API alone (`duckrun.connect()`, `RemoteRunner`,
   `workspace`): DuckDB, delta-rs and OneLake auth, with no dbt-core or dbt-duckdb. dbt was never run

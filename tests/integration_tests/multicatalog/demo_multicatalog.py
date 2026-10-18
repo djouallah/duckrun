@@ -204,7 +204,7 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
     read-only; ``local_path`` is attached writable. Storage-neutral, so it runs the same against local
     dirs (de-risk) or live OneLake (the demo)."""
     _DOC.clear()
-    q = lambda sql: conn.sql(sql).fetchall()[0][0]  # noqa: E731
+    q = lambda sql: conn.sql(sql).fetchone()[0]  # noqa: E731
     lakehouse = q("SELECT current_database()")   # the current catalog, straight from DuckDB
 
     print(f"\n=== duckrun multi-catalog | lakehouse={_trim_loc(conn.root_path)} | "
@@ -329,7 +329,7 @@ def run_multicatalog_demo(conn, warehouse_path, local_path, schema):
             GROUP BY d.State
         """)
         det = conn.sql(f"DESCRIBE DETAIL {schema}.mart_generation_by_state")   # location straight from SQL
-        landed = dict(zip(det.columns, det.fetchall()[0]))["location"].replace("\\", "/")
+        landed = dict(zip(det.columns, det.fetchone()))["location"].replace("\\", "/")
         _table([(s, f"{mw:,.0f}", f"{p:,.2f}", f"{co2:,.0f}") for s, mw, p, co2 in conn.sql(
                     f"SELECT State, total_mw, avg_price, est_tonnes_co2 FROM {schema}.mart_generation_by_state "
                     "ORDER BY total_mw DESC").fetchall()],

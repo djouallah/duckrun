@@ -30,7 +30,7 @@ else:
 
 for t in TABLES:
     try:
-        con.sql(f"select 1 from {t} limit 1").fetchall()
+        con.sql(f"select 1 from {t} limit 1").fetchone()
         print(f"  exists : {t}", flush=True)
     except Exception:
         missing.append(t)
