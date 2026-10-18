@@ -18,7 +18,10 @@ All notable changes to this project will be documented in this file.
     no effect, so each file's last row group is truncated again, and the default target file size goes
     back to **256 MB** (fewer files, fewer truncated tails), as before 0.5.5;
   - `writer_properties` on delete/update. `DELETE` / `UPDATE` rewrites use delta-rs defaults again, as
-    before 0.5.5, until the next compaction.
+    before 0.5.5, until the next compaction;
+  - Int32-vs-Int64 comparisons in its file-skipping pass, so `DELETE FROM t WHERE k = 3` on an
+    `INTEGER` column fails there; that DELETE / UPDATE falls back to the DuckDB-evaluated fenced
+    overwrite (correct, slower on a large table).
 - **0.5.4: no more truncated row groups at file boundaries.** A row group cannot span files, so
   delta-rs closed each file's last group wherever `target_file_size` landed, leaving a short runt
   segment per file (the AEMO mart: 37 groups where 36 full 4M-row groups fit). duckrun now sets

@@ -70,10 +70,17 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 
 import duckdb
+from deltalake.exceptions import DeltaError
 
 from dbt.adapters.duckrun._log import logger
 
 from . import engine
+
+# deltalake 1.6.2's file-skipping pass (the Delta kernel) rejects an Int32 column compared to the
+# Int64 a bare integer literal binds as (`DELETE FROM t WHERE k = 3` on an INTEGER column) — raised
+# while planning, before anything is written (delta-rs probe P4; fine on 1.6.4+). DELETE / UPDATE
+# fall back to their DuckDB-evaluated fenced overwrite on exactly this error.
+_KERNEL_TYPE_MISMATCH = "Invalid comparison operation"
 
 # `drop table` tombstone: a dropped relation is overwritten (via delta_rs) to a table whose ONLY
 # column is this marker, so (a) discovery recognizes it as dropped and hides it, and (b) anyone who
@@ -1632,13 +1639,21 @@ class _DeltaDML:
         # snapshot-fenced path (read_version → load_as_version, OCC over (vB, HEAD], post-op
         # maintenance) every duckrun mutation uses; a raw delta-rs delete() at HEAD would skip the
         # pin and the maintenance.
-        engine.delete_rows(
-            loc, where,
-            read_version=self._vB(loc),
-            storage_options=self.so,
-            cur=self.cursor,
-            dt=self._pinned(loc),
-        )
+        try:
+            engine.delete_rows(
+                loc, where,
+                read_version=self._vB(loc),
+                storage_options=self.so,
+                cur=self.cursor,
+                dt=self._pinned(loc),
+            )
+        except DeltaError as e:
+            if not where or _KERNEL_TYPE_MISMATCH not in str(e):
+                raise
+            logger.debug(f"duckrun: delta_rs rejected the DELETE predicate on {loc!r} ({e}); "
+                         "falling back to a DuckDB-filtered full overwrite (slower).")
+            self._rewrite_overwrite(loc, "*", alias=tname,
+                                    tail=f" where ({where}) is not true", materialize_tag="del")
 
     def _update(self, m, rel, schema, loc) -> None:
         # Split SET / WHERE structurally (quote/paren/CASE-aware) so a literal containing `where`
@@ -1685,8 +1700,8 @@ class _DeltaDML:
             # is a subquery in the predicate (`… where id in (select …)`) OR a SET expression (`set g =
             # (select max(id) from ref)`) — delta_rs's update() hits a datafusion "not implemented"
             # error on either; DuckDB can evaluate both. (A predicate-less UPDATE used to come here
-            # too: delta_rs 1.5.0 updated only SOME rows of a multi-file table. Fixed by the 1.6.2
-            # floor — tests/upstream_probes P1 — so it now takes the delta_rs path below.)
+            # too: delta_rs 1.5.0 updated only SOME rows of a multi-file table. Fixed in the pinned
+            # 1.6.2 — tests/upstream_probes P1 — so it now takes the delta_rs path below.)
             # Compute the updated rows there — `CASE WHEN (pred) THEN <expr> ELSE col END` per SET column
             # via SELECT * REPLACE (no predicate → apply <expr> to every row) — and commit a fenced full
             # overwrite, mirroring _delete's fallback. Fenced to vB so a
@@ -1695,15 +1710,7 @@ class _DeltaDML:
                 f"duckrun: UPDATE on {loc!r} references a subquery (predicate or SET expr); delta_rs "
                 "can't evaluate it, falling back to a DuckDB-evaluated fenced full overwrite (slower)."
             )
-            replaces = ", ".join(
-                (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
-                 else f'({expr}) AS "{col}"')
-                for col, expr in updates.items()
-            )
-            # The scan is aliased to the target's name so a self-qualified reference (`sales.cat`,
-            # incl. one inside a correlated subquery) binds to it; unqualified columns still resolve.
-            self._rewrite_overwrite(loc, f"* replace ({replaces})", alias=tname,
-                                    with_prefix=with_prefix, materialize_tag="upd")
+            self._update_by_rewrite(loc, updates, where, alias=tname, with_prefix=with_prefix)
             return
         # Fast path (no subquery): delta_rs binds bare columns, so drop any self-qualifier the user
         # wrote (`sales.cat` → `cat`) from the SET expressions and the predicate.
@@ -1711,13 +1718,33 @@ class _DeltaDML:
             updates = {c: _strip_qualifiers(e, {tname}) for c, e in updates.items()}
             where = _strip_qualifiers(where, {tname}) if where else where
         # Same snapshot-fenced path (read_version → OCC) every duckrun mutation uses.
-        engine.update_rows(
-            loc, updates, where,
-            read_version=self._vB(loc),
-            storage_options=self.so,
-            cur=self.cursor,
-            dt=self._pinned(loc),
+        try:
+            engine.update_rows(
+                loc, updates, where,
+                read_version=self._vB(loc),
+                storage_options=self.so,
+                cur=self.cursor,
+                dt=self._pinned(loc),
+            )
+        except DeltaError as e:
+            if not where or _KERNEL_TYPE_MISMATCH not in str(e):
+                raise
+            logger.debug(f"duckrun: delta_rs rejected the UPDATE predicate on {loc!r} ({e}); "
+                         "falling back to a DuckDB-evaluated fenced full overwrite (slower).")
+            self._update_by_rewrite(loc, updates, where, alias=tname)
+
+    def _update_by_rewrite(self, loc, updates, where, *, alias, with_prefix="") -> None:
+        """UPDATE as a DuckDB-evaluated fenced full overwrite: `CASE WHEN (pred) THEN <expr> ELSE col
+        END` per SET column via SELECT * REPLACE (no predicate → apply <expr> to every row). The scan is
+        aliased to the target's name so a self-qualified reference (`sales.cat`, incl. one inside a
+        correlated subquery) binds to it; unqualified columns still resolve."""
+        replaces = ", ".join(
+            (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
+             else f'({expr}) AS "{col}"')
+            for col, expr in updates.items()
         )
+        self._rewrite_overwrite(loc, f"* replace ({replaces})", alias=alias,
+                                with_prefix=with_prefix, materialize_tag="upd")
 
     def _insert_select(self, m, rel, schema, loc) -> None:
         body = m.group("body")
