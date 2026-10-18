@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **0.5.6: back to the 0.5.0 code with `deltalake==1.5.0`; 0.5.1-0.5.5 are yanked** (#84). Every
+  deltalake from 1.6.3 on lists each column chunk's dictionary page last in the parquet footer's
+  `encoding_stats`, so Power BI Direct Lake stops using the dictionary: first loads ~3x slower at ~5x
+  the CU. 0.5.4/0.5.5 required `deltalake>=1.6.4` and 0.5.1/0.5.2 let pip pick it, so the tables they
+  wrote have that footer until their files are rewritten (an overwrite or a compaction). 1.6.2 has
+  a good footer but its MERGE hangs, so 1.5.0 stays the pin until a deltalake ships both. The 0.5.1-0.5.5
+  changes are withdrawn, except 0.5.2's duckdb 2.0 fix below.
+- **0.5.6 (from 0.5.2): works with duckdb 2.0 (`pip install --pre duckrun`).** duckdb 2.0 keeps an
+  `execute()` result open until it is read to the end, and an open result makes every other call on
+  that connection raise `ResourceInUseException` — so 0.5.0 failed on the first write. duckrun now
+  reads every result in full. Your own code: duckdb 2.0 relations (what `conn.sql()` returns) have no
+  `fetchone()`; use `fetchall()` or `.limit(1).fetchall()`, which work on 1.x and 2.0 alike.
+
 ### Changed
 - **dbt is now an optional extra: install the adapter with `pip install "duckrun[dbt]"`.** Plain
   `pip install duckrun` is the connection API alone (`duckrun.connect()`, `RemoteRunner`,
