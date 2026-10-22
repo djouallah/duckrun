@@ -14,7 +14,7 @@
 -- The WHERE clause self-references {{ this }} on purpose. duckrun pins this read to the snapshot
 -- captured at the START of the run, by registering {{ this }} as
 --     delta_scan('<location>', version => vB)
--- (the duckdb-delta `version => N` param, which is why duckdb is pinned to the 1.5.4 floor). So
+-- (the duckdb-delta `version => N` param, first shipped in duckdb 1.5.4). So
 -- this SELECT sees the target exactly as it was at vB, NOT whatever a concurrent writer may have
 -- committed since the run began. The merge that follows is likewise pinned to vB, so its commit is
 -- validated against the window (vB, HEAD] — read and write agree on one snapshot (single-snapshot MERGE

@@ -23,17 +23,19 @@ classifiers = [
     "Topic :: Database",
 ]
 dependencies = [
-    # duckdb floor is 1.5.4 (a floor only, NOT a pin, and deliberately no upper cap): 1.5.4 is the
-    # first stable build whose bundled duckdb-delta extension supports `delta_scan('...', version => N)`
-    # (duckdb-delta #312) — the version-pinned read this project relies on to make the incremental
-    # read and the write commit resolve at ONE Delta snapshot (single-snapshot MERGE parity; see the
-    # staging-read pin in _delta_core.sql and merge_delta's read_version). duckdb is only ever used to
-    # READ here, so any newer version is fine — the floor exists solely to get the version-pin support.
+    # duckdb floor is 2.0.0 (a floor only, NOT a pin, and deliberately no upper cap). duckdb is only
+    # ever used to READ here (delta-rs does every write), and 2.0 is a read-side upgrade: async
+    # Parquet read-ahead on object storage (duckdb#23662), aggregates that spill instead of OOMing
+    # under our pinned memory_limit (#24499), wider row-group pruning, HTTP cache-control plus azure
+    # ETag passthrough, and struct-field projection in delta_scan (duckdb-delta #401). It also keeps
+    # `delta_scan('...', version => N)` (duckdb-delta #312, first in 1.5.4) — the version-pinned read
+    # that makes the incremental read and the write commit resolve at ONE Delta snapshot (see the
+    # staging-read pin in _delta_core.sql and merge_delta's read_version).
     # deltalake is pinned EXACTLY to 1.5.0 — a HARD requirement, not a preference: 1.5.0 is the first
     # release with the MERGE disk-spill config (max_spill_size) that engine.merge_delta relies on to
     # cap merge RAM and avoid OOM on large upserts, and every newer release so far breaks us — DELETE
     # is broken and OneLake support regresses. So pin exactly; do NOT float until upstream fixes land.
-    "duckdb>=1.5.4",
+    "duckdb>=2.0.0",
     "deltalake==1.5.0",
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
     # API directly; requests is otherwise only a transitive dbt dependency.

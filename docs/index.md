@@ -41,4 +41,4 @@ and [Apache Arrow](https://arrow.apache.org/).
 
 </div>
 
-<p class="duck-pins">needs <code>duckdb&nbsp;&gt;=&nbsp;1.5.4</code> &middot; <code>deltalake&nbsp;==&nbsp;1.5.0</code></p>
+<p class="duck-pins">needs <code>duckdb&nbsp;&gt;=&nbsp;2.0.0</code> &middot; <code>deltalake&nbsp;==&nbsp;1.5.0</code></p>

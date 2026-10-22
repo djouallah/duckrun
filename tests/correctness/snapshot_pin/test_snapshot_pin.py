@@ -12,7 +12,7 @@ WHAT DUCKRUN DOES ON EVERY INCREMENTAL RUN (see _delta_core.sql + engine.merge_d
                        create or replace view {{ this }} as
                          select * from delta_scan('<location>', version => vB)
                    so the model's SQL sees the table as of vB, not a drifted HEAD. (Needs the
-                   duckdb-delta `version => N` param → the duckdb 1.5.4 pin.)
+                   duckdb-delta `version => N` param, first in duckdb 1.5.4.)
     * WRITE pin  — it opens the merge target at the same vB and lets delta-rs validate the commit
                    over the window (vB, HEAD]. If another writer committed into that window while
                    the model was running, the merge REFUSES to commit (a Delta commit conflict).

@@ -98,11 +98,11 @@ jobs:
           pip install fastparquet cramjam  # page-header thrift reader + page decompression
           pip install -e ".[dbt]"
 
-      - name: 🦆 Pin duckdb to the nightly that has DATA_PAGE_SIZE_LIMIT (duckdb#24645)
+      - name: 🦆 Pin duckdb 2.0.0 (first stable with DATA_PAGE_SIZE_LIMIT, duckdb#24645)
         # Pinned for the WHOLE job, not just the duckdb arm: delta-rs writes its parquet through
         # arrow-rs either way, so this cannot touch its output — and it means both arms read the
         # source with the identical engine, which is the point of an A/B.
-        run: pip install duckdb==1.6.0.dev365
+        run: pip install duckdb==2.0.0
 
       - name: 🔑 Resolve lakehouse + workspace (duckrun, no az)
         run: python tests/parquet_layout/aemo/resolve_env.py --env ${{ inputs.env }}

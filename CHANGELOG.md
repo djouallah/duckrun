@@ -19,6 +19,13 @@ All notable changes to this project will be documented in this file.
   `fetchone()`; use `fetchall()` or `.limit(1).fetchall()`, which work on 1.x and 2.0 alike.
 
 ### Changed
+- **0.5.7: requires `duckdb>=2.0.0`** (was `>=1.5.4`). duckdb only reads here, and 2.0 is a read-side
+  upgrade: async Parquet read-ahead on object storage (duckdb#23662), aggregates that spill to
+  `.duckrun_spill` instead of failing at `memory_limit` (#24499), wider row-group pruning (bloom, `IN`,
+  string, date, struct filters), HTTP cache-control with azure ETag passthrough, and `delta_scan` that
+  reads only the struct fields a query names (duckdb-delta #401). Fabric's bundled duckdb is older: the
+  `!pip install duckrun --upgrade` + `notebookutils.session.restartPython()` cell is still required,
+  and `connect()` fails loud without the restart. Writes are unchanged (delta-rs, `deltalake==1.5.0`).
 - **dbt is now an optional extra: install the adapter with `pip install "duckrun[dbt]"`.** Plain
   `pip install duckrun` is the connection API alone (`duckrun.connect()`, `RemoteRunner`,
   `workspace`): DuckDB, delta-rs and OneLake auth, with no dbt-core or dbt-duckdb. dbt was never run

@@ -25,7 +25,7 @@ Shape mechanics, each measured in a local probe before this was written:
     DuckDB's default is ROW_GROUP_SIZE/5, and 1.5.5 dictionary-encodes every type at any NDV
     under the limit. (Exception: DECIMAL(p>18) writes FLBA, never dictionary — the mart already
     stores decimal(18,4), and the post-commit WARN names any column that slips out.)
-  * DATA_PAGE_SIZE_LIMIT caps data pages (duckdb#24645, nightly-only until the next stable). This
+  * DATA_PAGE_SIZE_LIMIT caps data pages (duckdb#24645, first stable in duckdb 2.0.0). This
     arm's first run died on the old hardcoded 100MB split: ONE giant page per 16M-row column
     chunk, which the consumer transcodes 5-26x slower (duckdb#24507). A startup probe fails the
     build loudly on any duckdb without the option — a stable build would silently write the
@@ -35,11 +35,10 @@ Shape mechanics, each measured in a local probe before this was written:
     count, so the effective limit steps 2^19 -> 2^17 -> 2^15 as the byte cap falls). Measured on a
     6M-row group: DuckDB writes 12 pages/chunk at 1MB and 184 at 64KB, against delta-rs's 294.
     64KB therefore buys near-parity page geometry for no extra bytes — see OPT_PAGE_BYTES.
-  * encoding_stats (PageEncodingStats) is the one footer field we CANNOT match: DuckDB writes
-    none (duckdb#12892, closed as not planned), delta-rs writes
+  * encoding_stats (PageEncodingStats): DuckDB wrote none through 1.5.x (duckdb#12892); from
+    2.0.0 it writes them (duckdb#24957), dictionary page first, matching delta-rs's
     DICTIONARY_PAGE/PLAINx1 + DATA_PAGE/RLE_DICTIONARYxN. A consumer that wants to prove a chunk
-    is 100% dictionary-encoded before choosing a transcode path can read that for free from
-    delta-rs and must crack pages open for DuckDB.
+    is 100% dictionary-encoded before choosing a transcode path reads that from the footer.
 
 Env: ONELAKE_TABLES_PATH (resolve_env), OPT_SORT (explicit columns, default 'date, time' —
 'auto' is the delta-rs builder's spelling and is rejected here), OPT_RG (rows per row group,

@@ -22,7 +22,7 @@ silently interleaving.
 
 ## Install
 
-In a **Microsoft Fabric** notebook, upgrade and restart the kernel (duckrun needs `duckdb` ≥ 1.5.4,
+In a **Microsoft Fabric** notebook, upgrade and restart the kernel (duckrun needs `duckdb` ≥ 2.0.0,
 which is newer than the bundled stable build; it fails loud at `connect()` otherwise):
 
 ```python

@@ -24,9 +24,9 @@ are the ONLY state; there is no database file to manage.
 pip install "duckrun[dbt]"   # brings dbt-duckdb, duckdb, deltalake at the right pins
 ```
 
-Do NOT separately pin `duckdb` or `deltalake` in your requirements — duckrun pins exact
-versions for documented upstream-bug reasons, and overriding them is the most common
-way to break a project.
+Do NOT separately pin `duckdb` or `deltalake` in your requirements — duckrun sets a
+`duckdb>=2.0.0` floor and pins `deltalake` exactly, for documented upstream-bug reasons, and
+overriding them is the most common way to break a project.
 
 ```yaml
 # ~/.dbt/profiles.yml

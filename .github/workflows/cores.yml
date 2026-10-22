@@ -105,7 +105,7 @@ jobs:
     # advertises (pyproject requires-python >= 3.11, i.e. 3.11 + 3.12). (Conformance stays
     # single-version: its gate is a 3.11-derived baseline that a second Python would
     # spuriously trip.) And under BOTH installs: `stable` (plain pip install) and `pre`
-    # (pip install --pre — the newest duckdb 2.0 dev build); duckrun must pass on each.
+    # (pip install --pre — the newest duckdb dev build, i.e. the 2.1 line); duckrun must pass on each.
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -520,8 +520,8 @@ jobs:
           PY
 
   pre-install:
-    # `pip install --pre duckrun` resolves the newest duckdb 2.0 dev build (no cap on duckdb), and
-    # DuckDB 2.0 is changing its Python result API — e.g. a statement on a connection with an
+    # `pip install --pre duckrun` resolves the newest duckdb dev build (no cap on duckdb), and
+    # DuckDB 2.0 changed its Python result API — e.g. a statement on a connection with an
     # unfinished result now raises ResourceInUseException (duckdb#26747) instead of silently
     # aborting it. Installs the checkout as a regular (non-editable) wheel with --pre, then runs
     # tests/pre_install/smoke.py from outside the checkout so it can only import the installed copy.

@@ -80,10 +80,10 @@ jobs:
           pip install pyyaml pyarrow fastparquet cramjam
           pip install -e ".[dbt]"
 
-      - name: 🦆 Pin duckdb to the nightly the benchmark writes with
+      - name: 🦆 Pin duckdb to the exact build the benchmark writes with
         # The whole point: compare the bytes THIS build emits, not the ones a different build
         # happens to emit on a laptop.
-        run: pip install duckdb==1.6.0.dev365
+        run: pip install duckdb==2.0.0
 
       - name: 🧪 Page-statistics synthesizer guards (offline)
         # The synthesizer writes a DataPageHeader by hand, which is where this goes wrong quietly.

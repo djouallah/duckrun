@@ -1,7 +1,8 @@
 """Runtime version guardrail.
 
-duckrun needs ``duckdb`` >= 1.5.4 — the release where ``delta_scan`` gained its ``version => N``
-parameter (used for snapshot-pinned reads) — and ``deltalake`` **exactly 1.5.0**: it is the only
+duckrun needs ``duckdb`` >= 2.0.0 — the read-side upgrade (async Parquet read-ahead, spilling
+aggregates, wider pruning) that also carries ``delta_scan``'s ``version => N`` parameter (used for
+snapshot-pinned reads) — and ``deltalake`` **exactly 1.5.0**: it is the only
 release with the merge ``max_spill_size`` cap that *also* has a working MERGE-at-scale and batch
 DELETE. Every deltalake above 1.5.0 is broken for duckrun (MERGE breaks at scale, batch DELETE is
 unsupported), which is why pyproject pins it exactly. A Microsoft Fabric Python notebook ships a
@@ -17,10 +18,10 @@ pin), so it fires exactly on the forgot-to-restart case.
 from packaging.version import Version
 
 # Versions duckrun needs at *runtime* — keep in sync with the pins in pyproject.toml:
-#   duckdb >= 1.5.4  -> delta_scan('...', version => N) for snapshot-pinned incremental reads
+#   duckdb >= 2.0.0  -> async read-ahead / spilling aggregates; delta_scan('...', version => N)
 #   deltalake == 1.5.0 -> max_spill_size on MERGE; the ONLY release where MERGE-at-scale and batch
 #                         DELETE also work (every newer deltalake is broken for duckrun).
-_MIN_DUCKDB = "1.5.4"
+_MIN_DUCKDB = "2.0.0"
 _REQUIRED_DELTALAKE = "1.5.0"
 
 _REMEDY = (
@@ -35,7 +36,7 @@ _REMEDY = (
 def check_runtime_versions():
     """Raise ``RuntimeError`` if the *loaded* duckdb/deltalake are not what duckrun requires.
 
-    duckdb must be >= 1.5.4; deltalake must be *exactly* 1.5.0 (newer releases break MERGE and batch
+    duckdb must be >= 2.0.0; deltalake must be *exactly* 1.5.0 (newer releases break MERGE and batch
     DELETE). Catches the notebook "installed but forgot ``restartPython()``" case: the kernel keeps
     the previously-loaded duckdb/deltalake bound until restart. Idempotent and cheap; called at each
     entry point (``duckrun.connect()`` and the dbt connection open).

@@ -4,8 +4,8 @@ On every incremental run, duckrun captures the target table's Delta version `vB`
 model runs, then anchors both sides of the run to it:
 
 - **Read pin** — the model's `{{ this }}` self-reference is registered as
-  `delta_scan('<location>', version => vB)` (the duckdb-delta `version => N` param, which is why
-  duckdb is pinned to the 1.5.4 floor), so the model SQL sees the table as of `vB`, not a drifted
+  `delta_scan('<location>', version => vB)` (the duckdb-delta `version => N` param, first
+  shipped in duckdb 1.5.4; duckrun's floor is now 2.0.0), so the model SQL sees the table as of `vB`, not a drifted
   HEAD.
 - **Write pin** — the merge target is opened at the same `vB`, and delta-rs validates the commit
   over the window `(vB, HEAD]`. A foreign commit inside that window makes the merge refuse.

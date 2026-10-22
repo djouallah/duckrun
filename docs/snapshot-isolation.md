@@ -59,7 +59,7 @@ Every write is one SQL statement, fenced automatically — no handle to manage, 
 ## The dbt path
 
 The incremental materialization captures the target version `vB` before the model runs, pins
-`{{ this }}` to it (`delta_scan('…', version => vB)` — the reason for the duckdb 1.5.4 floor) and
+`{{ this }}` to it (`delta_scan('…', version => vB)`, duckdb-delta's `version => N`, first shipped in duckdb 1.5.4) and
 pins the merge / overwrite commit to `vB`. Version-by-version proof through a real `dbt run`:
 [snapshot-pin.md](snapshot-pin.md).
 
