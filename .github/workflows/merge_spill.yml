@@ -74,6 +74,10 @@ jobs:
         # The bench writes the detailed, data-engineer-readable report straight to
         # $GITHUB_STEP_SUMMARY on completion (pass or assertion-fail). We only add a fallback
         # line here for the case where it dies before writing — i.e. OOM-killed (rc 137/139).
+        env:
+          # ubuntu-latest is ubuntu-26.04, where /tmp is a ~8 GiB tmpfs: the merge's disk spill (and
+          # its auto-derived cap) must land on the root volume, not RAM. Same as local_stress_tests.
+          TMPDIR: /mnt/mbench
         run: |
           set -o pipefail
           python tests/performance/merge_spill/merge_tpch_bench.py --dir "$DIR" --sf "$SF" ; rc=$?
