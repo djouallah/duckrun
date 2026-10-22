@@ -456,7 +456,7 @@ jobs:
 
       - uses: ./.github/actions/setup-duckrun
         with:
-          extra-packages: tpchgen-cli==3.0.0   # the scenario shells out to it to generate the data
+          extra-packages: tpchgen-cli   # the scenario shells out to it to generate the data
 
       - name: Run the TPCH benchmark (SF=1) as the guard
         # Runs the full benchmark; exit non-zero = the read/write surface or the 22-query run
@@ -479,7 +479,7 @@ jobs:
 
       - uses: ./.github/actions/setup-duckrun
         with:
-          extra-packages: tpchgen-cli==3.0.0   # the bench shells out to it to generate lineitem
+          extra-packages: tpchgen-cli   # the bench shells out to it to generate lineitem
 
       - name: Run the incremental-MERGE chain (SF=1) as the guard
         # Local warehouse under the runner's temp dir; the bench writes docs/merge_card.md (gitignored)

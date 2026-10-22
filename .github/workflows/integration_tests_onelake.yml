@@ -117,7 +117,7 @@ jobs:
       - name: Install duckrun + tpchgen-cli (the runner shells out to tpchgen)
         run: |
           pip install -e ".[test]"
-          pip install tpchgen-cli==3.0.0  # 4.0 dropped --format and changed part splitting
+          pip install tpchgen-cli
       - name: Run the MERGE chain against OneLake (tiny scale factor)
         # --warehouse abfss://… routes the whole chain to OneLake; this job only exercises the abfss://
         # MERGE write/read path, NOT memory — the heavy SF=10 spill gate runs locally
