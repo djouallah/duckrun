@@ -47,7 +47,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-duckrun
         with:
-          extra-packages: tpchgen-cli
+          extra-packages: tpchgen-cli==3.0.0  # 4.0 dropped --format (use the parquet subcommand) and changed part splitting
 
       - name: Prepare big disk dir + show specs
         run: |

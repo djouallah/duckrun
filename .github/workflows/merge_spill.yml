@@ -45,7 +45,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-duckrun
         with:
-          extra-packages: tpchgen-cli
+          extra-packages: tpchgen-cli==3.0.0  # 4.0 dropped --format (use the parquet subcommand) and changed part splitting
 
       - name: Free the runner disk for spill (~59 GB of the single volume is preinstalled toolchains)
         # The spill, the dataset, the warehouse, and the OS all share the one root volume, and the
