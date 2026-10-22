@@ -196,8 +196,8 @@ class Bench:
         os.makedirs(self.gen, exist_ok=True)
         parts = max(1, round(float(self.args.sf) / 2))
         subprocess.run(
-            ["tpchgen-cli", "-s", str(self.args.sf), "--tables", "lineitem",
-             "--parts", str(parts), "--format", "parquet", "--output-dir", self.gen],
+            ["tpchgen-cli", "parquet", "-s", str(self.args.sf), "--tables", "lineitem",
+             "--parts", str(parts), "--output-dir", self.gen],
             check=True,
         )
 

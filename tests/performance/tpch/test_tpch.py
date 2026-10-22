@@ -771,7 +771,7 @@ def _generate_tables(conn, sf, schema):
     print(f"Generating TPC-H SF={sf}")
     t0 = time.time()
     subprocess.run(
-        ["tpchgen-cli", "-s", str(sf), "--output-dir", gen_root, "--format", "parquet",
+        ["tpchgen-cli", "parquet", "-s", str(sf), "--output-dir", gen_root,
          "--parts", str(max(2, os.cpu_count() or 2))],
         check=True,
     )
