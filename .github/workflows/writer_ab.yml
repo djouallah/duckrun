@@ -21,9 +21,9 @@ on:
         type: string
         default: main
       opt_sort:
-        description: "the FIXED sort key both writers use, e.g. 'date, time'. Explicit columns only — 'auto' would let the picker choose per writer, which is no longer an A/B."
+        description: "the FIXED sort key both writers use. Explicit columns only — 'auto' would let the picker choose per writer, which is no longer an A/B. Keep a full tie-break (date, time, DUID): with ties, DuckDB's COPY ORDER BY leaves DUID shuffled within a slot while the delta-rs arm keeps it ordered, so DuckDB's DUID stops compressing (149 vs 34 MB)."
         type: string
-        default: "date, time"
+        default: "date, time, DUID"
       row_limit:
         description: "row cap on the shared source mart.fct_summary (142M ≈ full)"
         type: string

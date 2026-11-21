@@ -29,7 +29,7 @@ except Exception:
     pass
 
 import payload_diff as PD  # noqa: E402
-from page_diff import read_footer  # noqa: E402
+from page_diff import live_parquet, read_footer  # noqa: E402
 
 COLUMN = os.environ.get("FULL_DIFF_COLUMN") or "DUID"
 N_RG = int(os.environ.get("FULL_DIFF_ROW_GROUPS") or 2)
@@ -124,14 +124,7 @@ def read_table(name, uri, storage_options):
     from dbt.adapters.duckrun.objectstore import build_store
 
     store = build_store(uri, storage_options)
-    entries = []
-    for batch in obstore.list(store):
-        for obj in batch:
-            nm = obj["path"].rsplit("/", 1)[-1]
-            if nm.endswith(".parquet"):
-                entries.append((nm, obj["size"]))
-    entries.sort()
-    key, size = entries[0]
+    key, size = live_parquet(store, uri, storage_options)[0]
     fmd = read_footer(store, key, size)
 
     se_by_name = {}

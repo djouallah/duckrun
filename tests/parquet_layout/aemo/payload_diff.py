@@ -269,7 +269,7 @@ def main():
     import obstore
     import duckrun
     from dbt.adapters.duckrun.objectstore import build_store
-    from page_diff import read_footer
+    from page_diff import live_parquet, read_footer
 
     root = os.environ["ONELAKE_TABLES_PATH"].rstrip("/")
     con = duckrun.connect(root, schema="tests")
@@ -284,14 +284,8 @@ def main():
     summary = {}
     for tbl, uri in targets:
         store = build_store(uri, con.storage_options)
-        entries = []
-        for batch in obstore.list(store):
-            for obj in batch:
-                nm = obj["path"].rsplit("/", 1)[-1]
-                if nm.endswith(".parquet"):
-                    entries.append((nm, obj["size"]))
-        entries.sort()
-        if len(entries) > 1:                             # pick the file holding the FIRST rows
+        entries = live_parquet(store, uri, con.storage_options)
+        if len(entries) > 1:                            # pick the file holding the FIRST rows
             keyed = []
             for nm, sz in entries:
                 try:

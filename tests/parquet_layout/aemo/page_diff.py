@@ -95,6 +95,26 @@ def walk_pages(blob):
     return pages
 
 
+def live_parquet(store, uri, storage_options):
+    """(name, size) of the parquet files the table's CURRENT Delta snapshot references, sorted.
+
+    A rebuild leaves the previous build's files in the folder until a vacuum, so listing the folder
+    would decode stale bytes (an August file once stood in for a fresh one)."""
+    import obstore
+    from deltalake import DeltaTable
+
+    live = {u.rsplit("/", 1)[-1] for u in DeltaTable(uri, storage_options=storage_options).file_uris()}
+    entries = []
+    for batch in obstore.list(store):
+        for obj in batch:
+            name = obj["path"].rsplit("/", 1)[-1]
+            if name in live:
+                entries.append((name, obj["size"]))
+    if not entries:
+        raise SystemExit(f"no parquet file of the current snapshot found under {uri}")
+    return sorted(entries)
+
+
 def main():
     import obstore
     from dbt.adapters.duckrun.objectstore import build_store
@@ -112,13 +132,7 @@ def main():
     out = []
     for tbl, uri in targets:
         store = build_store(uri, con.storage_options)
-        entries = []
-        for batch in obstore.list(store):
-            for obj in batch:
-                name = obj["path"].rsplit("/", 1)[-1]
-                if name.endswith(".parquet"):
-                    entries.append((name, obj["size"]))
-        entries.sort()
+        entries = live_parquet(store, uri, con.storage_options)
         key, size = entries[0]
         fmd = read_footer(store, key, size)
 
