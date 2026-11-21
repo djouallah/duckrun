@@ -148,12 +148,12 @@ jobs:
           pip install pythonnet pyyaml
           pip install -e ".[dbt]"
 
-      - name: 🦆 Pin duckdb 2.0.1 (DATA_PAGE_SIZE_LIMIT since 2.0.0, duckdb#24645; duckrun floor 2.0.1)
+      - name: 🦆 Pin duckdb 2.0.0 (first stable with DATA_PAGE_SIZE_LIMIT, duckdb#24645)
         # duckdb <= 1.5.x hard-splits data pages at 100MB uncompressed — the exact failure that
         # killed this arm's first run (duckdb#24507). Pinned exactly so the arm stays reproducible;
         # build_duckdb_native.py probes the option at startup and dies loudly if it is missing.
         if: ${{ inputs.writer == 'duckdb_native' }}
-        run: pip install duckdb==2.0.1
+        run: pip install duckdb==2.0.0
 
       - name: 🧾 Init run report
         env:
