@@ -1,9 +1,9 @@
 """Enumerate Delta tables on a remote OneLake/ADLS store for relation discovery.
 
 DuckDB's azure extension can't reliably glob/list OneLake (``abfss://``) directories
-(duckdb/duckdb-azure#174 — trailing-slash 403s — still unreleased; in practice ``glob``
-returns zero rows or errors there). Glob-based discovery therefore comes back empty on
-OneLake and read-only commands fail with "schema does not exist". So for ``abfss://`` we
+(duckdb/duckdb-azure#226 — a glob over a directory holding ``_delta_log`` fails with a JSON
+type_error, because OneLake lists that entry without owner/group/permissions). Glob-based
+discovery therefore fails on OneLake and read-only commands fail with "schema does not exist". So for ``abfss://`` we
 list the schema's table directories with the ADLS Gen2 / OneLake DFS "List Paths" REST API
 instead, using the same bearer token that authenticates the Delta reads/writes. Local and
 ``az://`` stores keep using DuckDB ``glob`` (which works there).
@@ -267,7 +267,7 @@ def list_delta_tables(root_path: str, schema: str, storage_options) -> List[str]
 
 def list_files(dir_url: str, storage_options) -> List[str]:
     """Recursively list FILE paths (not directories) under a OneLake/ADLS directory, as full
-    ``abfss://`` URLs. DuckDB's azure extension can't glob OneLake (duckdb-azure#174), so file
+    ``abfss://`` URLs. DuckDB's azure extension can't glob OneLake (duckdb-azure#226), so file
     transfer (``conn.download``) enumerates via the DFS REST API instead — same mechanism as
     :func:`list_delta_tables`. Returns ``[]`` if the directory doesn't exist yet (HTTP 404) or
     there's no token; raises if the store is unreachable (wrong tenant / item not found). Follows

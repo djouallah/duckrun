@@ -241,7 +241,7 @@ class DuckrunAdapter(DuckDBAdapter):
         schema = schema_relation.schema
         database = schema_relation.database
 
-        # OneLake (abfss://) can't be listed with DuckDB glob (duckdb/duckdb-azure#174), so
+        # OneLake (abfss://) can't be listed with DuckDB glob (duckdb/duckdb-azure#226), so
         # enumerate table directories with the OneLake DFS REST API; local / az:// stores use
         # DuckDB glob, which works there.
         if remote.is_abfss(root_path):
