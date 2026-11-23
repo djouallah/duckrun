@@ -1734,7 +1734,8 @@ class _DeltaDML:
             for col, expr in updates.items())
         if engine.cow_rewrite(self.cursor, loc, where=where, projection=f"* replace ({cow_replaces})",
                               alias=tname, with_prefix=with_prefix, read_version=self._vB(loc),
-                              storage_options=self.so, dt=self._pinned(loc), operation="UPDATE"):
+                              storage_options=self.so, dt=self._pinned(loc), operation="UPDATE",
+                              changes=updates):
             engine._maintain(self.cursor, loc, storage_options=self.so)
             return
         if where is None or self._with_clause or (where and _PREDICATE_SUBQUERY.search(where)) or \

@@ -143,3 +143,44 @@ def test_check_constraint_is_enforced(tmp_path, paths):
     conn.sql("update t set id = 100 where id = 3")
     assert any("update: copy-on-write" in m for m in paths)
     assert conn.sql("select count(*) from t where id = 100").fetchall() == [(1,)]
+
+
+def _live(conn, table):
+    return set(engine._delta_table(f"{conn.root_path}/dbo/{table}", None).file_uris())
+
+
+def test_unchanged_rows_touch_no_file(tmp_path, paths):
+    # Rows a MERGE / UPDATE matches but leaves identical need no rewrite: an idempotent re-merge
+    # or a no-op UPDATE commits nothing, and a partial change rewrites only the file it lands in.
+    conn = _conn(tmp_path)
+    conn.sql("create table t as select i as id, 'v' as v from range(100) r(i)")
+    conn.sql("insert into t select i as id, 'v' as v from range(100, 200) r(i)")
+    path = f"{conn.root_path}/dbo/t"
+    before, v = _live(conn, "t"), engine.table_version(path)
+    assert len(before) == 2
+    merge = ("merge into t using (select i as id, 'v' as v from range(200) r(i)) s on t.id = s.id "
+             "when matched then update set v = s.v when not matched then insert (id, v) values (s.id, s.v)")
+    conn.sql(merge)
+    conn.sql("update t set v = 'v' where id < 150")
+    assert engine.table_version(path) == v and _live(conn, "t") == before
+    conn.sql("merge into t using (select 5 as id, 'five' as v union all select 150, 'v') s "
+             "on t.id = s.id when matched then update set v = s.v")
+    after = _live(conn, "t")
+    assert engine.table_version(path) == v + 1
+    assert len(after & before) == 1                   # the file holding id 150 was not rewritten
+    assert conn.sql("select count(*), count(*) filter (v = 'five') from t").fetchall() == [(200, 1)]
+
+
+def test_unchanged_match_in_untouched_file_is_not_inserted(tmp_path, paths):
+    # A source row matching a row in a file that is NOT rewritten must still count as matched.
+    conn = _conn(tmp_path)
+    conn.sql("create table t as select i as id, 'v' as v from range(100) r(i)")
+    conn.sql("insert into t select i as id, 'v' as v from range(100, 200) r(i)")
+    conn.sql("merge into t using (select 5 as id, 'five' as v union all select 150, 'v' "
+             "union all select 999, 'new') s on t.id = s.id "
+             "when matched then update set v = s.v when not matched then insert (id, v) values (s.id, s.v)")
+    assert conn.sql("select count(*), count(distinct id) from t").fetchall() == [(201, 201)]
+    conn.sql("merge into t using (select 7 as id, 'x' as v) s on t.id = s.id "
+             "when matched then update set v = s.v when not matched by source and t.id >= 100 then delete")
+    assert conn.sql("select count(*) from t").fetchall() == [(100,)]
+    assert conn.sql("select v from t where id = 7").fetchall() == [("x",)]

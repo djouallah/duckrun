@@ -2581,6 +2581,42 @@ def _cow_merge_clauses(clauses: List[dict], target_cols: List[str], source_cols:
     return " ".join(out)
 
 
+def _cow_changes(pairs, types: Dict[str, str], qualifier: str = "") -> str:
+    """SQL that is TRUE when assigning ``pairs`` (``[(column, expr)]``) changes the row: some
+    column ``IS DISTINCT FROM`` its new value cast to the column's type (the value the write would
+    store). A row it leaves identical needs no rewrite, so its file is not touched."""
+    by_lower = {k.lower(): (k, v) for k, v in types.items()}
+    terms = []
+    for col, expr in pairs:
+        name, typ = by_lower[str(col).strip().strip('"').lower()]
+        terms.append(f"{qualifier}{quote_ident(name)} IS DISTINCT FROM CAST(({expr}) AS {typ})")
+    return "(" + " OR ".join(terms) + ")" if terms else "false"
+
+
+def _cow_touch_case(clauses: List[dict], kind: str, target_cols: List[str], source_cols: List[str],
+                    types: Dict[str, str]) -> str:
+    """``CASE`` that is TRUE when the first ``kind`` clause a row takes changes it (a DELETE always
+    does; an UPDATE when :func:`_cow_changes` says so), FALSE when it takes none."""
+    src = {c.lower() for c in source_cols}
+    whens = []
+    for c in clauses:
+        if c["clause"] != kind:
+            continue
+        cond = f"({c['predicate']})" if c.get("predicate") else "true"
+        if c["action"] == "delete":
+            chg = "true"
+        elif c["action"] == "update":
+            chg = _cow_changes(list(c["updates"].items()), types, "target.")
+        elif c["action"] == "update_all":
+            skip = {str(x).strip('"').lower() for x in (c.get("except_cols") or [])}
+            chg = _cow_changes([(k, f"source.{quote_ident(k)}") for k in target_cols
+                                if k.lower() in src and k.lower() not in skip], types, "target.")
+        else:
+            continue
+        whens.append(f"WHEN {cond} THEN {chg}")
+    return f"(CASE {' '.join(whens)} ELSE false END)" if whens else "false"
+
+
 def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read_version: int,
               storage_options: Optional[Dict[str, str]] = None, sort_by=None,
               row_group_rows: Optional[int] = None,
@@ -2611,21 +2647,47 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
         v for c in clauses for v in (c.get("updates") or {}).values()]
     try:
         # Bind only (cur.sql does not execute): a predicate or expression DuckDB rejects raises here.
-        target_cols = list(cur.sql(f"SELECT * EXCLUDE (filename) FROM {scan}").columns)
-        cur.sql(f"SELECT {', '.join(f'({x})' for x in exprs)} FROM {scan} AS target, "
-                f"{source} AS source")
-        whens = _cow_merge_clauses(clauses, target_cols, list(data.columns))
+        trel = cur.sql(f"SELECT * EXCLUDE (filename) FROM {scan}")
+        target_cols = list(trel.columns)
+        types = {c: str(ty) for c, ty in zip(trel.columns, trel.types)}
+        source_cols = list(data.columns)
+        if any(c.lower() == "rowid" for c in source_cols):
+            raise _CowUnsupported("a source column named rowid")
+        whens = _cow_merge_clauses(clauses, target_cols, source_cols)
+        matched_chg = _cow_touch_case(clauses, "matched", target_cols, source_cols, types)
+        orphan_chg = _cow_touch_case(clauses, "not_matched_by_source", target_cols, source_cols,
+                                     types)
+        cur.sql(f"SELECT {', '.join(f'({x})' for x in exprs)}, {matched_chg} "
+                f"FROM {scan} AS target, {source} AS source")
+        if orphan_chg != "false":
+            cur.sql(f"SELECT {orphan_chg} FROM {scan} AS target")
     except Exception as e:
         logger.info(f"merge: delta_rs path (DuckDB cannot run this merge: {e})")
         return False
+    src, hits = tmp_name("cowsrc", path), tmp_name("cowhits", path)
     touched, rows = tmp_name("cowfiles", path), tmp_name("cowrows", path)
     try:
-        by_source = any(c["clause"] == "not_matched_by_source" for c in clauses)
-        hit = "" if by_source else f" AS target SEMI JOIN {source} AS source ON ({predicate})"
+        # The source once, as a table: its rowid names each source row. `hits` pairs every target
+        # row the source matches with its source row and whether the first matched clause it takes
+        # CHANGES it; only those rows' files (plus, for BY SOURCE, the files of unmatched rows a
+        # clause changes) are rewritten. A match that leaves its row identical touches nothing.
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{src}" AS SELECT * FROM {source}')
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{hits}" AS SELECT target.filename AS f, '
+                    f'source.rowid AS rn, {matched_chg} AS chg FROM {scan} AS target '
+                    f'JOIN "{src}" AS source ON ({predicate})')
+        orphans = ""
+        if orphan_chg != "false":
+            orphans = (f" UNION SELECT target.filename FROM {scan} AS target "
+                       f'ANTI JOIN "{src}" AS source ON ({predicate}) WHERE {orphan_chg}')
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
-                    f"SELECT DISTINCT filename FROM {scan}{hit}")
+                    f'SELECT f AS filename FROM "{hits}" WHERE chg{orphans}')
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT * EXCLUDE (filename) '
                     f'FROM {scan} WHERE filename IN (SELECT filename FROM "{touched}")')
+        # The MERGE source: the rows that match a rewritten row, and the rows that match nothing
+        # (the insert candidates). A source row matching only an untouched file is left out — in
+        # the rewrite it would otherwise look unmatched and be inserted.
+        source = (f'(SELECT * FROM "{src}" WHERE rowid NOT IN (SELECT rn FROM "{hits}") OR rowid IN '
+                  f'(SELECT rn FROM "{hits}" WHERE f IN (SELECT filename FROM "{touched}")))')
         try:
             cow.check_table_rules(cur, f'"{rows}"', dt)
         except cow.Unsupported as e:
@@ -2648,9 +2710,11 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
         removes = cow.removes_for(cur, dt, gone)
         if adds or removes:
             cow.commit(dt, path, adds + removes, read_version=read_version, operation="MERGE")
+        else:
+            logger.info("merge: no row changes; nothing to commit")
         return True
     finally:
-        for name in (touched, rows):
+        for name in (src, hits, touched, rows):
             try:
                 cur.execute(f'DROP TABLE IF EXISTS "{name}"')
             except Exception:  # pragma: no cover - scoped to this merge; a leftover is harmless
@@ -2660,12 +2724,14 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
 def cow_rewrite(cur, path: str, *, where: Optional[str], projection: str = "*",
                 delete: bool = False, alias: str = "", with_prefix: str = "", read_version: int,
                 storage_options: Optional[Dict[str, str]] = None, dt: Optional[DeltaTable] = None,
-                operation: str = "DML") -> bool:
+                operation: str = "DML", changes: Optional[Dict[str, str]] = None) -> bool:
     """DELETE / UPDATE as copy-on-write: DuckDB rewrites only the files the predicate touches and
     delta-rs commits the add + remove actions in one fenced transaction (see :mod:`cow`).
     ``delete=True`` keeps the rows where ``where`` is not true; otherwise ``projection`` (a select
     list over the scan, e.g. ``* replace (...)``) rewrites the touched files' rows. ``where=None``
-    touches every file. Returns False, having written nothing, when the table needs delta-rs."""
+    touches every file. ``changes`` (an UPDATE's ``{column: expr}``) narrows the touched files to
+    those holding a row the assignment actually changes. Returns False, having written nothing,
+    when the table needs delta-rs."""
     dt = dt if dt is not None else _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     why = cow.unsupported_reason(dt)
@@ -2675,6 +2741,10 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], projection: str = "*",
     scan = (f"delta_scan('{path.replace(chr(39), chr(39) * 2)}', version => {int(read_version)}, "
             f"filename = true)" + (f' AS "{alias}"' if alias else ""))
     pred = f"({where}) IS TRUE" if where else "true"
+    if changes:
+        trel = cur.sql(f"SELECT * EXCLUDE (filename) FROM {scan}")
+        types = {c: str(ty) for c, ty in zip(trel.columns, trel.types)}
+        pred += " AND " + _cow_changes(list(changes.items()), types)
     touched, rows = tmp_name("cowfiles", path), tmp_name("cowrows", path)
     try:
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
