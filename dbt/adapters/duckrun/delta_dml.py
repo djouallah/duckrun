@@ -546,7 +546,8 @@ _DML_REL_ANY = re.compile(
     r"^(?:insert\s+(?:with\s+schema\s+evolution\s+)?into|delete\s+from|update|merge\s+into|"
     r"alter\s+table|drop\s+table(?:\s+if\s+exists)?|"
     r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?|"
-    r"vacuum(?:\s+analyze)?|restore\s+table)\s+(?P<rel>[\w.\"]+)",
+    r"vacuum(?:\s+analyze)?|restore\s+table)\s+"
+    r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)",   # a quoted part may hold `-` (GUIDs)
     re.IGNORECASE,
 )
 

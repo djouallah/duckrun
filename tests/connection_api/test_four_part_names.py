@@ -124,3 +124,14 @@ def test_plain_local_lakehouse_has_no_four_part_name(tmp_path):
     conn.sql("create table t as select 1 as k")
     assert conn._aliases == {}
     assert conn.sql("select k from plain.dbo.t").fetchall() == [(1,)]
+
+
+def test_quoted_four_part_name_with_dashes(tmp_path):
+    # A GUID (or any name with `-`) is a quoted identifier; the write router must keep it whole.
+    root = tmp_path / "my-ws" / "sales-eu.Lakehouse" / "Tables"
+    root.mkdir(parents=True)
+    conn = duckrun.connect(str(root), read_only=False)
+    conn.sql('create table "my-ws"."sales-eu".dbo.t as select 1 as k')
+    conn.sql('insert into "my-ws"."sales-eu".dbo.t values (2)')
+    assert conn.sql('select sum(k) from "my-ws"."sales-eu".dbo.t').fetchall() == [(3,)]
+    assert deltalake.DeltaTable.is_deltatable(str(root / "dbo" / "t"))
