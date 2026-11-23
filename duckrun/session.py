@@ -1392,9 +1392,7 @@ class DuckSession:
         (``sync=True`` with ``['.sql']`` never touches a ``.csv``); uploads happen first and deletes
         last (a crash mid-deploy leaves extra files, never missing ones); and an empty local set is
         refused outright, so a typo'd ``local_folder`` cannot become "delete everything remote".
-        Deletes are individual files, one request per key — on OneLake a raw DFS ``DELETE`` with the
-        session's token, because obstore's Azure delete (single key or not) is the batch request
-        OneLake rejects (arrow-rs object_store #701).
+        Deletes are individual files, one obstore delete per key.
 
         ``sync`` governs *presence*, ``overwrite`` governs *content*: a file present on both sides is
         still skipped unless ``overwrite=True``. A deploy that expects edited models to land wants
@@ -1434,13 +1432,11 @@ class DuckSession:
         print(f"Uploading {len(pairs)} file(s) to '{base}'...")
         so = secret.refreshed(self.storage_options)
         store = objectstore.build_store(base, so)
-        # obstore overwrites by default (put mode="overwrite"), but on OneLake neither streaming path
-        # can replace an *existing* blob: the default multipart commit stages blocks (Put Block) that
-        # OneLake rejects over a committed blob (409 BlobOperationNotSupported), and delete-then-put is
-        # out because obstore's delete is upstream-broken on OneLake (arrow-rs object_store #701: the
-        # bulk-delete batch URL drops the artifact id → 400). So on OneLake an overwrite goes as a
-        # single Put Blob (single_shot) — the one path OneLake honors as an atomic replace. It buffers
-        # the file in memory, the price of replacing on OneLake; fresh keys still stream as multipart.
+        # obstore overwrites by default (put mode="overwrite"), but on OneLake the default multipart
+        # commit stages blocks (Put Block) that OneLake rejects over a committed blob (409
+        # BlobOperationNotSupported). So on OneLake an overwrite goes as a single Put Blob
+        # (single_shot), which OneLake honors as an atomic replace. It buffers the file in memory, the
+        # price of replacing on OneLake; fresh keys still stream as multipart.
         single_shot = overwrite and remote.is_abfss(base)
         for local_path, rel in pairs:
             if not overwrite and objectstore.exists(store, rel):

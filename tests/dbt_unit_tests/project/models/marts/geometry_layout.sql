@@ -3,7 +3,8 @@
 -- the values (_geometry_config -> WriterProperties) but _delta_core.sql's delta_config dict never
 -- carried them, so every dbt model got the adaptive layout while the unit test on the parser and
 -- the parquet_layout CI (which pins the engine seam directly) both stayed green.
--- 10 rows under a 3-row ceiling = 4 row groups; the adaptive default would write 1.
-{{ config(materialized='table', max_row_group_size=3, target_file_size_mb=1) }}
+-- 10,000 rows under a 2048-row ceiling = ~5 row groups (DuckDB scale: its row groups close on
+-- 2048-row vectors); the default would write 1.
+{{ config(materialized='table', max_row_group_size=2048, target_file_size_mb=1) }}
 
-select range as id, 'row_' || range as label from range(10)
+select range as id, 'row_' || range as label from range(10000)

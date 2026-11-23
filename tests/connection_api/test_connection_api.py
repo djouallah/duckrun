@@ -197,35 +197,17 @@ class TestSession:
             conn.copy(str(src), "", sync=True)
         assert set(conn.list_files("synced")) == {"a.sql", "c.sql", "keep.csv", "orphan.csv"}
 
-    def test_copy_sync_delete_on_onelake_is_a_raw_dfs_delete(self, monkeypatch):
-        # obstore's Azure delete (single key or a list) is the batch request OneLake rejects
-        # (arrow-rs object_store #701), so on abfss:// the stale-file delete is one DFS DELETE per key
-        # carrying the session token; obstore is never called there.
-        from dbt.adapters.duckrun import objectstore, remote
+    def test_copy_sync_delete_on_onelake_goes_through_obstore(self, monkeypatch):
+        # OneLake now accepts object_store's Azure delete (arrow-rs object_store #701 no longer
+        # bites), so the stale-file delete is a plain obstore delete on abfss:// like everywhere else.
+        import obstore
+        from dbt.adapters.duckrun import objectstore
         calls = []
-
-        class Resp:
-            status_code = 200
-
-            def raise_for_status(self):
-                pass
-
-        def fake(method, url, *, headers, **kw):
-            calls.append((method, url, headers))
-            return Resp()
-        monkeypatch.setattr(remote, "retry_request", fake)
+        monkeypatch.setattr(obstore, "delete", lambda store, key: calls.append((store, key)))
         base = "abfss://ws-guid@onelake.dfs.fabric.microsoft.com/lh-guid/Files/dbt"
-        objectstore.delete(None, "models/old model.sql", base_url=base,
+        objectstore.delete("STORE", "models/old model.sql", base_url=base,
                            storage_options={"bearer_token": "TOK"})
-        assert calls == [("DELETE",
-                          "https://onelake.dfs.fabric.microsoft.com/ws-guid/lh-guid/Files/dbt/models/old%20model.sql",
-                          {"Authorization": "Bearer TOK", "x-ms-version": remote._DFS_API_VERSION})]
-
-        class Gone(Resp):
-            status_code = 404
-        monkeypatch.setattr(remote, "retry_request", lambda *a, **kw: Gone())
-        with pytest.raises(FileNotFoundError):
-            objectstore.delete(None, "x", base_url=base, storage_options={"bearer_token": "TOK"})
+        assert calls == [("STORE", "models/old model.sql")]
 
     def test_download(self, conn, tmp_path):
         # download mirrors copy; overwrite=False (default) skips files already present locally.

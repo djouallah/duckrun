@@ -169,8 +169,8 @@ def test_geometry_configs_reach_the_writer(tmp_path):
     hand-off. This is the hop that broke in 0.4.43: _delta_core.sql's delta_config carried sort_by
     but neither geometry key, so the plugin saw None and fell back to the adaptive layout — while
     test_geometry_config_validation (parser only) and the parquet_layout CI (pins the engine seam
-    directly, no dbt config) both stayed green. 10 rows under a 3-row ceiling = 4 row groups; the
-    adaptive default writes 1, so a dropped key fails this loudly."""
+    directly, no dbt config) both stayed green. 10,000 rows under a 2048-row ceiling = ~5 row groups;
+    the default writes 1, so a dropped key fails this loudly."""
     import pyarrow.parquet as pq
     from deltalake import DeltaTable
 
@@ -179,7 +179,7 @@ def test_geometry_configs_reach_the_writer(tmp_path):
     files = DeltaTable(f"{wh}/{SCHEMA}/geometry_layout").file_uris()
     assert len(files) == 1, files
     rg = pq.ParquetFile(files[0]).metadata.num_row_groups
-    assert rg == 4, f"expected 4 row groups from max_row_group_size=3 over 10 rows, got {rg}"
+    assert rg >= 4, f"expected ~5 row groups from max_row_group_size=2048 over 10,000 rows, got {rg}"
 
 
 def test_sort_by_auto_writes_clustered(tmp_path):

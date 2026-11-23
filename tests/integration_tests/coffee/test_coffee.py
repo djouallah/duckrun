@@ -277,9 +277,8 @@ def test_onelake_files_copy_download_roundtrip(tmp_path):
     assert not (dst / "skip.txt").exists()  # extension filter carried through
 
     # overwrite=True over an *already-present* key: on OneLake obstore's default multipart PUT 409s
-    # (BlobOperationNotSupported) committing blocks over a committed blob, and delete-then-put is out
-    # (obstore's bulk delete is broken on OneLake upstream, arrow-rs object_store #701), so copy must
-    # replace via a single Put Blob (use_multipart=False). Sized past the ~5 MiB multipart threshold so
+    # (BlobOperationNotSupported) committing blocks over a committed blob, so copy must replace via a
+    # single Put Blob (use_multipart=False). Sized past the ~5 MiB multipart threshold so
     # the default path would go multipart — proving the single-shot override actually replaces.
     big = os.urandom(6 * 1024 * 1024)
     (src / "a.csv").write_bytes(big)
@@ -288,10 +287,10 @@ def test_onelake_files_copy_download_roundtrip(tmp_path):
     conn.download(scratch, str(dst2), file_extensions=[".csv"], overwrite=True)
     assert (dst2 / "a.csv").read_bytes() == big
 
-    # sync=True must remove a stale key. obstore's Azure delete — even for ONE key — is the bulk batch
-    # request OneLake rejects (arrow-rs object_store #701; this gate proved it), so on OneLake the
-    # delete is a raw DFS DELETE with the session token. Remote holds {a.csv, sub/b.parquet}; after
-    # the local unlink the filtered local set is {a.csv} (skip.txt never qualifies) -> one stale.
+    # sync=True must remove a stale key, with a plain obstore delete: OneLake now accepts
+    # object_store's Azure delete (it rejected it before — arrow-rs object_store #701; this gate is
+    # what proves it). Remote holds {a.csv, sub/b.parquet}; after the local unlink the filtered local
+    # set is {a.csv} (skip.txt never qualifies) -> one stale.
     (src / "sub" / "b.parquet").unlink()
     conn.copy(str(src), scratch, file_extensions=[".csv", "parquet"], sync=True)
     assert set(conn.list_files(scratch)) == {"a.csv"}
