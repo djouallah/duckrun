@@ -139,7 +139,7 @@ It is a plain Jinja dict lookup: a missing alias renders as an empty string, so 
 
 | materialized      | backed by                | notes                                                                 |
 |-------------------|--------------------------|-----------------------------------------------------------------------|
-| **`table`**       | Delta (overwrite)        | DuckDB runs the SQL; delta-rs writes the table fresh each run.        |
+| **`table`**       | Delta (overwrite)        | DuckDB runs the SQL and writes the files; delta-rs commits the table fresh each run. |
 | **`incremental`** | Delta (merge / append)   | First run overwrites; later runs apply `incremental_strategy`.        |
 | `view`            | in-memory DuckDB         | Session-scoped, nothing on storage (inherited from dbt-duckdb).       |
 | `seed`            | Delta (overwrite)        | CSV loaded via DuckDB, persisted as a Delta table, rediscovered in a fresh process. |
@@ -197,7 +197,7 @@ Insert-only never removes a row, so duckrun computes "batch rows whose `unique_k
 ) }}
 ```
 
-`conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED THEN INSERT *")` routes to the same anti-join. Any other clause shape runs copy-on-write: DuckDB rewrites only the files a changed row lands in and delta-rs commits the file swap, fenced to the version read. Tables that need more than that (change data feed, deletion vectors, identity columns, append-only) run on delta-rs's merge. `merge_streamed_exec: true` forces delta-rs's merge.
+`conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED THEN INSERT *")` routes to the same anti-join. Any other clause shape runs copy-on-write: DuckDB rewrites only the files a changed row lands in and delta-rs commits the file swap, fenced to the version read. Tables with change data feed, deletion vectors, identity columns, append-only tables, column mapping on a partitioned or nested table are refused with a clear error before anything is written: delta-rs's commit API has no action for what they need.
 
 ### `append` that reads `{{ this }}` — the automatic fence
 
@@ -252,14 +252,14 @@ on-run-start: "{{ register_upstream_external_models() }}"
 | `merge_update_condition` / `merge_insert_condition` | merge: extra predicate AND-ed onto the matched-update / not-matched-insert clause (`target.` / `source.`, or `DBT_INTERNAL_DEST` / `DBT_INTERNAL_SOURCE`). `merge_insert_condition` also applies to `insert`, where it may reference only the source. |
 | `merge_clauses` / `merge_update_set_expressions` | merge: dbt-duckdb's custom clause list / per-column `SET` expressions, translated to delta-rs's TableMerger. Same spelling as upstream — `action` `update` / `delete` / `insert` / `do_nothing`, `mode` `by_name` / `by_position` / `star` / `explicit`, `condition`, `insert: {columns, values}`, `update: {include, exclude, set_expressions}`, `by: source` — with upstream's implicit defaults for an omitted `when_matched` / `when_not_matched`, so `{'when_matched': [{'action': 'do_nothing'}]}` is insert-only and takes the `insert` route. Rejected: `merge_on_using_columns` and `action: error`. |
 | `when_not_matched_by_source` | merge: duckrun's own top-level `merge_clauses` key (`update` with a `set` map / `delete` / `do_nothing`) for rows the source doesn't carry. A dict using it opts out of the implicit defaults above; use upstream's portable `{'by': 'source', …}` entry inside `when_not_matched` to keep both. |
-| `merge_max_spill_size`  | merge (delta-rs fallback only): memory ceiling in **bytes** for delta-rs's merge pool, beyond which the join spills to disk. Default ~60% of the effective limit (`min(physical RAM, cgroup limit, free RAM)`); DuckDB is pinned separately at ~85%. It bounds the merge pool, not the process, so on a tight container with a huge source lower it; below the join's minimum (~hundreds of MB) the merge raises `Resources exhausted`. `0` disables. |
-| `merge_max_temp_directory_size` | merge (delta-rs fallback only): disk cap in bytes for the merge's spill files. Default: the spill disk's free space minus `min(20% of free, 8 GiB)`. |
-| `merge_streamed_exec`   | merge: `true` runs delta-rs's merge instead of copy-on-write and streams a huge merge **source** instead of collecting it (needed for very large sources, especially by-source clauses) at the cost of target-file pruning. Default `false`. |
+| `merge_max_spill_size`  | no effect since 0.5.8: DuckDB runs every MERGE under its pinned `memory_limit` and spills to its temp directory. Accepted with a warning. |
+| `merge_max_temp_directory_size` | no effect since 0.5.8. Accepted with a warning. |
+| `merge_streamed_exec`   | no effect since 0.5.8. Accepted. |
 | `incremental_predicates`| merge / insert: extra predicates AND-ed into the join condition. On `insert`, a `target.<part> = source.<part>` entry also unlocks partition pruning of the target probe. |
 | `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. `sync_all_columns` only *adds* — delta-rs can't drop columns. |
 | `partition_by`          | Delta partition column(s).                                                   |
 | `sort_by`               | column(s) to physically `ORDER` the write by — a trailing `ORDER BY` in the model SQL is not honored, this is. The scalar `'auto'` profiles the staged result and picks the key itself, re-profiling every batch and writing unsorted when nothing pays off. `'auto'` is inert on the `merge` / `microbatch` / `delete+insert` paths; an explicit key also orders the files a merge rewrites, which otherwise keep their rows' existing order. See [Automatic sorting](parquet-layout.md#automatic-sorting). |
-| `max_row_group_size`    | **rows** — the parquet row-group ceiling for this model's writes (default 4M). Honored verbatim and preserved by post-write compaction. A merge that falls back to delta-rs writes with delta-rs defaults; post-merge compaction folds its files into this geometry. See [Write settings](parquet-layout.md#write-settings). |
+| `max_row_group_size`    | **rows** — the parquet row-group ceiling for this model's writes (default 4M). Honored verbatim by every write, MERGE included, and by post-write compaction. See [Write settings](parquet-layout.md#write-settings). |
 | `target_file_size_mb`   | **megabytes** — target parquet file size (default 256). Same coverage and merge caveat as `max_row_group_size`. |
 | `merge_schema`          | allow schema evolution on write.                                             |
 | `timestamp_ntz`         | default `false`: a naive `TIMESTAMP` column is written UTC-adjusted and lands as Delta `timestamp`, because Fabric's SQL analytics endpoint omits `timestamp_ntz` columns. `true` (or `DUCKRUN_TIMESTAMP_NTZ=1`) keeps the verbatim `timestamp_ntz` write. Details in [Limitations](limitations.md#microsoft-fabric-onelake). |

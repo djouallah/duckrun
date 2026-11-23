@@ -98,14 +98,19 @@ def column_mapping(dt: DeltaTable):
     return out
 
 
-def unsupported_reason(dt: DeltaTable) -> Optional[str]:
-    """Why a copy-on-write rewrite must not touch ``dt`` (None = it may): each case needs Delta
-    metadata or checks this writer does not produce."""
+def unsupported_reason(dt: DeltaTable, op: str = "rewrite") -> Optional[str]:
+    """Why DuckDB-written files committed through delta-rs's commit API cannot ``op`` ``dt`` (None =
+    they can): each case needs Delta metadata or checks the commit API does not produce. ``op`` is
+    ``rewrite`` (MERGE / UPDATE / DELETE / REPLACE WHERE), ``append``, ``overwrite`` or ``compact``.
+    An append only adds files, so change data feed, append-only and deletion vectors do not stop it;
+    a compaction changes no data (dataChange=false), so neither do change data feed and append-only."""
     md = dt.metadata()
     conf = md.configuration or {}
-    if str(conf.get("delta.enableChangeDataFeed", "false")).lower() == "true":
-        return "change data feed"
-    if str(conf.get("delta.appendOnly", "false")).lower() == "true":
+    if (op in ("rewrite", "overwrite")
+            and str(conf.get("delta.enableChangeDataFeed", "false")).lower() == "true"):
+        return "change data feed (the commit API cannot write the change files)"
+    if (op in ("rewrite", "overwrite")
+            and str(conf.get("delta.appendOnly", "false")).lower() == "true"):
         return "append-only table"
     mode = mapping_mode(conf)
     if mode is not None:
@@ -120,16 +125,18 @@ def unsupported_reason(dt: DeltaTable) -> Optional[str]:
     unknown = sorted(set(dt.protocol().writer_features or []) - _WRITABLE_FEATURES)
     if unknown:
         return f"table feature(s) {', '.join(unknown)}"
-    if "deletionVectors" in (dt.protocol().reader_features or []):
-        return "deletion vectors"
-    if '"delta.identity.' in dt.schema().to_json():
+    if (op in ("rewrite", "compact")
+            and "deletionVectors" in (dt.protocol().reader_features or [])):
+        return "deletion vectors (the commit API cannot remove a file that has one)"
+    if op != "compact" and '"delta.identity.' in dt.schema().to_json():
         return "identity columns"
     return None
 
 
-class Unsupported(Exception):
-    """DuckDB cannot evaluate a table rule (a CHECK / invariant / generation expression in Spark
-    SQL); nothing has been written, so the statement can still run on delta-rs."""
+class Unsupported(ValueError):
+    """duckrun cannot write this statement or table shape (DuckDB writes the files and delta-rs's
+    commit API commits them; some Delta features need actions that API does not have). Raised
+    before anything is written."""
 
 
 def _table_rules(dt: DeltaTable):
@@ -383,7 +390,9 @@ def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
                 partition_by: Optional[Sequence[str]] = None,
                 row_group_rows: Optional[int] = None, target_file_size: Optional[int] = None,
                 configuration: Optional[Dict[str, Optional[str]]] = None,
-                mapping: Optional[Dict[str, tuple]] = None) -> List[AddAction]:
+                mapping: Optional[Dict[str, tuple]] = None,
+                not_null: Sequence[str] = (), operation: str = "WRITE",
+                data_change: bool = True) -> List[AddAction]:
     """Write DuckDB table ``table`` under ``loc`` with ONE ``COPY`` in the fixed read layout and
     return one ``AddAction`` per non-empty file. ``partition_by`` columns go into the hive
     directories (DuckDB's ``PARTITION_BY``), not the files, as Delta expects. Nothing is committed
@@ -425,6 +434,17 @@ def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
         f"COPY (SELECT {select} FROM {table}{order}) TO {_lit(loc.rstrip('/'))} "
         f"(FORMAT parquet, {opt_sql}, APPEND, FILENAME_PATTERN 'part-{tag}-{{uuid}}', RETURN_STATS)"
     ).fetchall()
+    if not_null:
+        # NOT NULL from the COPY's own statistics, so the data is never read twice: a file with a
+        # NULL in such a column fails the write before anything is committed (the files it wrote
+        # are unreferenced; vacuum collects them).
+        keys = {('"' + (mapping[c][0] if mapping else c).replace('"', '""') + '"'): c
+                for c in not_null}
+        for filename, count, _size, _footer, colstats, *_ in rows:
+            for key, st in (colstats or {}).items():
+                if key in keys and int((st or {}).get("null_count") or 0):
+                    raise ValueError(f"{operation} would write {st['null_count']} NULL(s) into "
+                                     f"NOT NULL column {keys[key]!r}")
     now_ms = int(time.time() * 1000)
     adds: List[AddAction] = []
     for filename, count, size, _footer, colstats, *rest in rows:
@@ -434,14 +454,16 @@ def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
         pkeys = (rest[0] if rest else None) or {}
         pvals = {p: _partition_value(col_types.get(p, ""), pkeys.get(p)) for p in partition_by}
         adds.append(AddAction(path=_rel_path(filename, loc), size=int(size), partition_values=pvals,
-                              modification_time=now_ms, data_change=True,
+                              modification_time=now_ms, data_change=data_change,
                               stats=stats_json(count, colstats, col_types, indexed)))
     return adds
 
 
-def removes_for(cur, dt: DeltaTable, filenames: Sequence[str]) -> List[RemoveAction]:
+def removes_for(cur, dt: DeltaTable, filenames: Sequence[str],
+                data_change: bool = True) -> List[RemoveAction]:
     """``RemoveAction`` for each live data file named in ``filenames`` (full paths, as
-    ``delta_scan(..., filename = true)`` reports them), matched on the file name."""
+    ``delta_scan(..., filename = true)`` reports them), matched on the file name. A compaction
+    passes ``data_change=False``."""
     from urllib.parse import unquote
 
     wanted = {f.replace("\\", "/").rsplit("/", 1)[-1] for f in filenames}
@@ -450,7 +472,7 @@ def removes_for(cur, dt: DeltaTable, filenames: Sequence[str]) -> List[RemoveAct
     add_actions = dt.get_add_actions(flatten=False)  # noqa: F841 - read below by DuckDB's replacement scan
     for rel, size in cur.sql("SELECT path, size_bytes FROM add_actions").fetchall():
         if unquote(rel).rsplit("/", 1)[-1] in wanted:
-            out.append(RemoveAction(path=rel, data_change=True, deletion_timestamp=now_ms,
+            out.append(RemoveAction(path=rel, data_change=data_change, deletion_timestamp=now_ms,
                                     size=int(size), partition_values=None))
     if len(out) != len(wanted):
         raise RuntimeError(f"duckrun: {len(wanted) - len(out)} rewritten file(s) are not live in "

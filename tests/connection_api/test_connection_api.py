@@ -1820,10 +1820,10 @@ def test_created_table_gets_the_checkpoint_interval(conn):
 def test_replace_where_keeps_the_flat_ceiling(conn, monkeypatch):
     # A replaceWhere writes a SLICE, not a table: like every write it passes no derived
     # row_group_rows and keeps the fixed ceiling.
-    from dbt.adapters.duckrun import engine
+    from dbt.adapters.duckrun import cow, engine
     seen = []
-    orig = engine.build_write_deltalake_args
-    monkeypatch.setattr(engine, "build_write_deltalake_args",
+    orig = cow.write_files
+    monkeypatch.setattr(cow, "write_files",
                         lambda *a, **k: (seen.append(k.get("row_group_rows")), orig(*a, **k))[1])
     conn.sql("CREATE OR REPLACE TABLE rw_flat AS select i as j from range(100) t(i)")
     loc = conn.root_path + "/dbo/rw_flat"
@@ -1832,38 +1832,41 @@ def test_replace_where_keeps_the_flat_ceiling(conn, monkeypatch):
     engine.replace_where(loc, conn._connection.sql("select i as j from range(50) t(i)"),
                          "j < 50", read_version=vB, storage_options=conn.storage_options,
                          cur=conn._connection)
-    assert seen == [None], f"replaceWhere leaked a derived row-group ceiling: {seen}"
+    assert seen and all(rg is None for rg in seen), f"replaceWhere leaked a derived ceiling: {seen}"
 
 
 def test_no_derived_row_group_reaches_the_seam(conn, monkeypatch):
     # Neither overwrite nor append derives a geometry: both pass row_group_rows=None and the writer
     # falls back to the fixed _ROW_GROUP_SIZE ceiling. Only an explicit per-model config or the
     # AUTO geometry ever passes a value here.
-    from dbt.adapters.duckrun import engine
+    from dbt.adapters.duckrun import cow
     seen = []
-    orig = engine.build_write_deltalake_args
+    orig = cow.write_files
 
     def spy(*a, **k):
-        seen.append((k.get("mode") or (a[2] if len(a) > 2 else None), k.get("row_group_rows")))
+        seen.append((k.get("operation"), k.get("row_group_rows")))
         return orig(*a, **k)
 
-    monkeypatch.setattr(engine, "build_write_deltalake_args", spy)
+    monkeypatch.setattr(cow, "write_files", spy)
     conn.sql("CREATE OR REPLACE TABLE seam AS select i as j from range(100) t(i)")  # overwrite
     conn.sql("INSERT INTO seam select i from range(100, 110) t(i)")                 # append
     assert seen, "no write seam calls recorded"
     assert all(rg is None for _mode, rg in seen), f"a write leaked a derived row_group_rows: {seen}"
 
 
-def test_append_uses_the_read_layout_profile():
-    # Append gets the SAME read-layout profile as a full-table overwrite. It used to be excluded on the
-    # theory that compaction would fold it in later, but compaction fires on small-file byte debt, so
-    # healthy-sized append files never trip it and stayed at delta_rs's 1,048,576-row groups forever
-    # (issue #22). Only MERGE still writes with delta_rs defaults.
-    from dbt.adapters.duckrun import engine
-    ow = engine.build_write_deltalake_args("p", None, "overwrite")
-    ap = engine.build_write_deltalake_args("p", None, "append")
-    assert "target_file_size" in ow and "writer_properties" in ow
-    assert "target_file_size" in ap and "writer_properties" in ap
+def test_append_uses_the_read_layout_profile(conn, monkeypatch):
+    # Append gets the SAME read-layout profile as a full-table overwrite (issue #22): both are
+    # written by the one DuckDB COPY seam, cow.write_files, with cow.parquet_options.
+    from dbt.adapters.duckrun import cow
+    seen = []
+    orig = cow.write_files
+    monkeypatch.setattr(cow, "write_files",
+                        lambda *a, **k: (seen.append(k.get("operation")), orig(*a, **k))[1])
+    conn.sql("CREATE OR REPLACE TABLE prof AS select i as j from range(10) t(i)")
+    conn.sql("INSERT INTO prof select i from range(10, 20) t(i)")
+    assert "APPEND" in seen and any(op in ("CREATE", "OVERWRITE") for op in seen), seen
+    opts = cow.parquet_options()
+    assert opts["ROW_GROUP_SIZE"] == 4_000_000 and opts["FILE_SIZE_BYTES"] == 256 * 1024 * 1024
 
 
 # ── issue #42: a naive DuckDB TIMESTAMP lands as UTC-adjusted Delta `timestamp`, not timestamp_ntz
@@ -2388,12 +2391,9 @@ def test_connect_rejects_unknown_format(tmp_path):
 def test_explicit_target_file_size_overrides_the_constant():
     # The per-model target_file_size_mb config lands here as bytes and overrides the 256 MB
     # constant for THIS write only; None keeps the default. Same for overwrite and append.
-    from dbt.adapters.duckrun import engine
-    default = engine.build_write_deltalake_args("p", None, "overwrite")
-    assert default["target_file_size"] == engine._TARGET_FILE_SIZE == 256 * 1024 * 1024
-    custom = engine.build_write_deltalake_args(
-        "p", None, "append", target_file_size=64 * 1024 * 1024)
-    assert custom["target_file_size"] == 64 * 1024 * 1024
+    from dbt.adapters.duckrun import cow, engine
+    assert cow.parquet_options()["FILE_SIZE_BYTES"] == engine._TARGET_FILE_SIZE == 256 * 1024 * 1024
+    assert cow.parquet_options(target_file_size=64 * 1024 * 1024)["FILE_SIZE_BYTES"] == 64 * 1024 * 1024
 
 
 def test_explicit_row_group_overrides_the_fixed_ceiling_and_lands(conn):

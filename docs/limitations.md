@@ -22,13 +22,13 @@ Everything else carries over: `DuckrunCredentials` subclasses dbt-duckdb's, so t
 ## Setup & versions
 
 - **Needs `duckdb >= 2.0.1`.** Older builds, including Microsoft Fabric's bundled runtime, fail loud at `connect()`. In a Fabric notebook: `!pip install duckrun --upgrade`, then restart.
-- **Needs `deltalake >= 1.7.0`.** 1.6.3–1.6.6 list the parquet dictionary page last in `encoding_stats`, which makes Direct Lake read their files ~3x slower ([#84](https://github.com/djouallah/duckrun/issues/84)); 1.7.0 ships the fix.
+- **Needs `deltalake >= 1.6.4`.** duckrun uses it only to read the Delta log and commit; DuckDB writes every parquet file. 1.6.4 is the first release whose commit API takes remove actions as well as adds.
 
 ## Microsoft Fabric / OneLake
 
 - **Naive `TIMESTAMP` columns are UTC-coerced on write** (issue #42). Fabric's SQL analytics endpoint does not support Delta `timestamp_ntz`: the column is silently missing and T-SQL naming it fails with *Invalid column name*. So duckrun rewrites a naive timestamp as `timezone('UTC', col)` — the naive value read as a UTC wall clock, independent of the session `TimeZone` — and lands it as Delta `timestamp`.
   - `timestamp_ntz: true` (per model) or `DUCKRUN_TIMESTAMP_NTZ=1` (whole run / connection API) keeps the verbatim `timestamp_ntz` write.
-  - A **pre-existing** `timestamp_ntz` column is matched: appends / merges skip the coercion for it and warn once; a full rebuild (`--full-refresh` / `CREATE OR REPLACE`, and the raw-SQL `DELETE` / `UPDATE` fallbacks and `ALTER` rewrites) retypes it.
+  - A **pre-existing** `timestamp_ntz` column is matched: appends / merges skip the coercion for it and warn once; a full rebuild (`--full-refresh` / `CREATE OR REPLACE`, and the `ALTER … DROP / RENAME COLUMN` rewrites) retypes it.
   - Timestamps nested in a `STRUCT` / `LIST` still land as `timestamp_ntz`.
   - A raw-SQL `INSERT` of a naive value into an existing tz-aware column keeps DuckDB's own cast semantics (session `TimeZone`).
 - **`get_stats` is slow on tables with deletion vectors.** `total_rows` subtracts the DV total to stay equal to `SELECT COUNT(*)`, and the only delta-rs API for that total expands every bitmap (~10 s on a 150M-row table). Only tables written by Fabric Warehouse / Spark carry DVs; delta-rs rewrites files instead.
@@ -43,7 +43,7 @@ The full matrix is in the [Connection API](connection-api.md#raw-sql-dml-through
 ## dbt & incremental
 
 - **`threads` is honored**, with two differences from a pure-SQL adapter, both because a model writes a real table:
-    - **Concurrent writers share one memory budget.** `memory_limit` is pinned once for the run (85% of the container-aware effective limit). A merge runs inside DuckDB under that limit. Only a merge that falls back to delta-rs (change data feed, deletion vectors, identity columns, append-only tables) is serialized: one at a time, holding the full merge pool and spill cap, while other threads keep running. Many independent network-bound models benefit most from more threads.
+    - **Concurrent writers share one memory budget.** `memory_limit` is pinned once for the run (85% of the container-aware effective limit). Every write, MERGE included, runs inside DuckDB under that limit. Many independent network-bound models benefit most from more threads.
     - **A microbatch model's batches run in order**, since every batch writes the same table. Different models still run in parallel.
 - None of this limits concurrent **writers**: separate runs writing the same tables at once is supported, every write being snapshot-pinned and failing loud on a conflict.
 
@@ -61,6 +61,7 @@ The full matrix is in the [Connection API](connection-api.md#raw-sql-dml-through
 - **No persistent views.** The Delta spec defines no view, so a `materialized='view'` model is a DuckDB catalog view that lives only in the session that built it.
 - **`materialized='external'`** needs `on-run-start: "{{ register_upstream_external_models() }}"` for a later run that reads it without rebuilding it — see the [dbt adapter](dbt-adapter.md#external).
 - **`DROP TABLE` deletes the files.** `conn.sql("drop table x")` deletes the table's folder. OneLake keeps them 7 days as soft-deleted files (restore with Azure Storage Explorer or the Blob `Undelete` API); a local disk, or S3/GCS without bucket versioning, has no undo. To roll a table back instead, use `RESTORE TABLE … TO VERSION AS OF n`.
+- **A compaction shows as `WRITE` in the table history (workaround).** delta-rs's commit API records every commit as `WRITE` and has no `OPTIMIZE` operation. What marks a compaction as moving no data is the protocol's `dataChange=false` on every add and remove, which Spark, Fabric and streaming / change-data-feed readers honour; the commit info also carries `duckrun.operation = OPTIMIZE`.
 
 ## Parquet layout
 
@@ -70,7 +71,7 @@ The full matrix is in the [Connection API](connection-api.md#raw-sql-dml-through
 
 ## Memory
 
-- **Two engines share one machine's memory.** DuckDB is bounded by one pinned `memory_limit`, a delta-rs merge by its own spill caps behind a gate; neither is a shared allocator. The merge pool exists only for a `merge` / `MERGE INTO` that falls back to delta-rs. Background in the [Design document](design_document.md#tradeoffs).
+- **Some Delta tables can't be written.** DuckDB writes the files and delta-rs's commit API commits them; that API has no action for change files, for removing a file that has a deletion vector, or for an identity column's high-water mark. So MERGE / UPDATE / DELETE / TRUNCATE / REPLACE WHERE on tables with change data feed, deletion vectors, identity columns, append-only tables, column mapping on a partitioned or nested table are refused with a clear error, before anything is written. Appends into change-data-feed, deletion-vector and append-only tables work. `OPTIMIZE … ZORDER BY` is refused: sort the table with `SORTED BY` instead.
 - **`merge` is the write path most likely to run out of memory.** A `MERGE` joins the batch against the whole pinned target and rewrites every file a changed row lands in, so its cost scales with the target's partition span, not the batch. For a key-level idempotent append use `incremental_strategy='insert'` (a DuckDB anti-join, no merge, no file rewritten). For a genuine upsert, keep each batch inside as few partitions as possible.
 - **delta-rs hard-codes a 100 GB merge disk-spill ceiling** (a merge that falls back to delta-rs). DataFusion's `DiskManager` caps on-disk spill at a flat 100 GB regardless of disk size, so a wide merge aborts with *"Resources exhausted … exceeded the allowable limit of 100.0 GB"* on a machine with terabytes free. duckrun sizes `max_temp_directory_size` to the spill disk's free space minus `min(20% of free, 8 GiB)` on every merge (override with `merge_max_temp_directory_size`). The real fix is layout: one partition per batch. See [MERGE at scale](merge-benchmark.md).
 

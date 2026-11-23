@@ -1797,51 +1797,18 @@ class _DeltaDML:
     def _delete(self, m, rel, schema, loc) -> None:
         where = m.group("where")
         where = where.strip() if where else None
-        # The predicate may self-qualify columns with the target's name (`DELETE FROM t WHERE t.k>0`);
-        # the fast path strips it (delta_rs binds bare columns), the subquery fallback aliases the
-        # delta_scan to the same name so the qualified reference resolves there.
+        # The predicate may self-qualify columns with the target's name (`DELETE FROM t WHERE t.k>0`):
+        # the scan is aliased to that name, so the reference resolves.
         tname = _split_relation(rel)[1]
-        # A leading `WITH …` (CTE the predicate references via a subquery) can only be evaluated by
-        # DuckDB, so force the overwrite fallback and re-attach the CTE to its read.
+        # A leading `WITH …` (a CTE the predicate references) is re-attached to the reads.
         with_prefix = f"{self._with_clause} " if self._with_clause else ""
         # Copy-on-write: DuckDB evaluates the predicate (subqueries and CTEs included), rewrites only
-        # the touched files, and delta-rs commits the add/remove actions. False = a table shape it
-        # does not cover; the delta-rs paths below run instead.
-        if engine.cow_rewrite(self.cursor, loc, where=where, delete=True, alias=tname,
-                              with_prefix=with_prefix, read_version=self._vB(loc),
-                              storage_options=self.so, dt=self._pinned(loc), operation="DELETE"):
-            engine._maintain(self.cursor, loc, storage_options=self.so)
-            return
-        # The paths below run only for a table shape copy-on-write refuses (CDF, deletion vectors…).
-        if where and (self._with_clause or _PREDICATE_SUBQUERY.search(where)):
-            # delta_rs's delete(predicate) can't evaluate a predicate that references ANOTHER table
-            # via subquery (`… in (select … from other)`): its datafusion expr engine raises a Rust
-            # `not implemented` panic. DuckDB CAN evaluate it (the subquery's table is a live relation
-            # on this cursor), so keep the complement and overwrite. `(P) IS NOT TRUE` is the exact
-            # set DELETE keeps — rows where the predicate is false OR null (3-valued logic), not just
-            # `NOT (P)`. Materialize survivors into a native temp first so the read is fully detached
-            # from the Delta table being replaced. Simple predicates still take the fenced path below.
-            logger.debug(
-                f"duckrun: DELETE predicate on {loc!r} references a subquery; delta_rs can't "
-                "evaluate it, falling back to a DuckDB-filtered full overwrite (slower)."
-            )
-            self._rewrite_overwrite(loc, "*", alias=tname, with_prefix=with_prefix,
-                                    tail=f" where ({where}) is not true", materialize_tag="del")
-            return
-        # Fast path (no subquery): delta_rs binds bare columns, so drop any self-qualifier.
-        if tname and where:
-            where = _strip_qualifiers(where, {tname})
-        # Route through engine.delete_rows pinned to the version read at statement start — the SAME
-        # snapshot-fenced path (read_version → load_as_version, OCC over (vB, HEAD], post-op
-        # maintenance) every duckrun mutation uses; a raw delta-rs delete() at HEAD would skip the
-        # pin and the maintenance.
-        engine.delete_rows(
-            loc, where,
-            read_version=self._vB(loc),
-            storage_options=self.so,
-            cur=self.cursor,
-            dt=self._pinned(loc),
-        )
+        # the touched files, and delta-rs commits the add/remove actions. A table shape it cannot
+        # rewrite raises cow.Unsupported before anything is written.
+        engine.cow_rewrite(self.cursor, loc, where=where, delete=True, alias=tname,
+                           with_prefix=with_prefix, read_version=self._vB(loc),
+                           storage_options=self.so, dt=self._pinned(loc), operation="DELETE")
+        engine._maintain(self.cursor, loc, storage_options=self.so)
 
     def _update(self, m, rel, schema, loc) -> None:
         # Split SET / WHERE structurally (quote/paren/CASE-aware) so a literal containing `where`
@@ -1874,62 +1841,23 @@ class _DeltaDML:
                 f"UPDATE on {loc!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
             )
         # The target may be referenced by its own name in the SET expressions or the WHERE predicate
-        # (`UPDATE sales SET cat = sales.cat WHERE sales.id > 0`). The fast path strips that self-
-        # qualifier (delta_rs binds bare columns); the DuckDB fallback below aliases the delta_scan to
-        # the same name instead, so a qualified reference — even one inside a correlated subquery —
-        # resolves correctly there.
+        # (`UPDATE sales SET cat = sales.cat WHERE sales.id > 0`), even inside a correlated subquery:
+        # the scan is aliased to that name, so the reference resolves.
         tname = _split_relation(rel)[1]
-        # A leading `WITH …` (CTE referenced by the SET exprs or predicate via a subquery) can only be
-        # evaluated by DuckDB, so force the overwrite fallback and re-attach the CTE to its read.
+        # A leading `WITH …` (a CTE the SET exprs or the predicate reference) is re-attached.
         with_prefix = f"{self._with_clause} " if self._with_clause else ""
         # The updated rows as DuckDB computes them: `CASE WHEN (pred) THEN <expr> ELSE col END` per
-        # SET column via SELECT * REPLACE (no predicate → <expr> on every row). Copy-on-write applies
-        # it to the touched files only; the delta-rs-shape fallback below to the whole table.
+        # SET column via SELECT * REPLACE (no predicate → <expr> on every row), applied by
+        # copy-on-write to the touched files only (see _delete).
         replaces = ", ".join(
             (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
              else f'({expr}) AS "{col}"')
             for col, expr in updates.items())
-        # Copy-on-write first (see _delete).
-        if engine.cow_rewrite(self.cursor, loc, where=where, replaces=replaces,
-                              alias=tname, with_prefix=with_prefix, read_version=self._vB(loc),
-                              storage_options=self.so, dt=self._pinned(loc), operation="UPDATE",
-                              changes=updates):
-            engine._maintain(self.cursor, loc, storage_options=self.so)
-            return
-        if where is None or self._with_clause or (where and _PREDICATE_SUBQUERY.search(where)) or \
-                any(_PREDICATE_SUBQUERY.search(e) for e in updates.values()):
-            # Route to a DuckDB-evaluated fenced overwrite (instead of delta_rs's dt.update) in two cases:
-            #  * a subquery in the predicate (`… where id in (select …)`) OR a SET expression (`set g =
-            #    (select max(id) from ref)`) — delta_rs's update() hits a datafusion "not implemented"
-            #    panic (pyo3 PanicException) on either; DuckDB can evaluate both.
-            #  * a predicate-less full-table UPDATE (`update t set i = i + 1`) — delta_rs 1.5.0 silently
-            #    updates only SOME rows of a multi-file table when the predicate references no column
-            #    (None / a constant both mis-prune to a broken fast path); a column-referencing predicate
-            #    is fine. A no-WHERE update rewrites every row anyway, so the full overwrite is equal work.
-            # Compute the updated rows there (`replaces`, above) and commit a fenced full overwrite,
-            # mirroring _delete's fallback. Fenced to vB so a concurrent commit fails loud, not clobbered.
-            logger.debug(
-                f"duckrun: UPDATE on {loc!r} references a subquery (predicate or SET expr); delta_rs "
-                "can't evaluate it, falling back to a DuckDB-evaluated fenced full overwrite (slower)."
-            )
-            # The scan is aliased to the target's name so a self-qualified reference (`sales.cat`,
-            # incl. one inside a correlated subquery) binds to it; unqualified columns still resolve.
-            self._rewrite_overwrite(loc, f"* replace ({replaces})", alias=tname,
-                                    with_prefix=with_prefix, materialize_tag="upd")
-            return
-        # Fast path (no subquery): delta_rs binds bare columns, so drop any self-qualifier the user
-        # wrote (`sales.cat` → `cat`) from the SET expressions and the predicate.
-        if tname:
-            updates = {c: _strip_qualifiers(e, {tname}) for c, e in updates.items()}
-            where = _strip_qualifiers(where, {tname}) if where else where
-        # Same snapshot-fenced path (read_version → OCC) every duckrun mutation uses.
-        engine.update_rows(
-            loc, updates, where,
-            read_version=self._vB(loc),
-            storage_options=self.so,
-            cur=self.cursor,
-            dt=self._pinned(loc),
-        )
+        engine.cow_rewrite(self.cursor, loc, where=where, replaces=replaces,
+                           alias=tname, with_prefix=with_prefix, read_version=self._vB(loc),
+                           storage_options=self.so, dt=self._pinned(loc), operation="UPDATE",
+                           changes=updates)
+        engine._maintain(self.cursor, loc, storage_options=self.so)
 
     def _insert_select(self, m, rel, schema, loc) -> None:
         body = m.group("body")
@@ -2143,15 +2071,20 @@ class _DeltaDML:
     def _alter_add(self, m, rel, schema, loc) -> None:
         col = m.group("col").strip().strip('"')
         # Keep only the column type (drop any trailing DEFAULT / NOT NULL / NULL clause); add it as
-        # an all-null column by rewriting the table with overwrite_schema so delta_rs accepts the
-        # widened schema. Locate the DEFAULT/NOT NULL/NULL boundary structurally (quote/paren-aware
+        # an all-null column. Locate the DEFAULT/NOT NULL/NULL boundary structurally (quote/paren-aware
         # via _find_top_level), NOT by a quote-blind re.split — a string DEFAULT containing ` not null`
         # (`default 'not null'`) would otherwise truncate the type. Scanning left-to-right, the first
         # top-level tail keyword is hit before its own `null`, so `not null` is handled correctly.
         deftext = m.group("def")
         tidx = _find_top_level(deftext, _ALTER_TAIL)
         coltype = (deftext if tidx == -1 else deftext[:tidx]).strip() or "VARCHAR"
-        self._rewrite_overwrite(loc, f'*, cast(null as {coltype}) as "{col}"')
+        # A metadata-only commit (delta-rs alter.add_columns): no file is rewritten, existing rows
+        # read NULL. The column is always nullable — its existing rows have no value.
+        if col.lower() in {c.lower() for c in self.cursor.sql(
+                f"select * from delta_scan('{loc.replace(chr(39), chr(39) * 2)}') limit 0").columns}:
+            raise ValueError(f"ALTER TABLE … ADD COLUMN: column {col!r} already exists")
+        engine.add_columns(loc, self.cursor.sql(f'select cast(null as {coltype}) as "{col}"'), [col],
+                           dt=self._pinned(loc), read_version=self._vB(loc))
 
     def _alter_drop(self, m, rel, schema, loc) -> None:
         """`alter table <t> drop column <c>`: delta_rs has no in-place column drop, so rewrite the
@@ -2305,12 +2238,9 @@ class _DeltaDML:
         return True
 
     def _optimize(self, m) -> bool:
-        """`optimize <table> [zorder by (cols)]` (the Delta verb): compact the table's small files
-        (delta_rs ``optimize.compact``), or rewrite it z-ordered on ``cols``
-        (``optimize.z_order``). Both commit dataChange=false. Plain compaction is what duckrun's
-        own post-write maintenance does; z-order interleaves the columns' bits, which breaks the
-        run-length runs a sort key gives Direct Lake, so prefer ``CREATE OR REPLACE TABLE t SORTED
-        BY (…) AS SELECT * FROM t`` for a table Power BI reads. Returns False (pass through) if
+        """`optimize <table>` (the Delta verb): compact the table's small files in DuckDB
+        (:func:`engine.compact`, a dataChange=false commit) — what duckrun's post-write maintenance
+        does. ``ZORDER BY`` is refused: sort the table instead. Returns False (pass through) if
         <table> isn't a duckrun-managed Delta table."""
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
@@ -2320,24 +2250,17 @@ class _DeltaDML:
         if cols is None:
             engine.optimize(loc, storage_options=self.so, cur=self.cursor)
             return True
-        wanted = [c.strip().strip('"') for c in cols.split(",") if c.strip()]
-        by_lower = {f.name.lower(): f.name for f in self._pinned(loc).schema().fields}
-        unknown = [c for c in wanted if c.lower() not in by_lower]
-        if unknown:
-            raise ValueError(f"OPTIMIZE … ZORDER BY: unknown column(s) {unknown}; "
-                             f"table columns are {list(by_lower.values())}")
-        engine.z_order(loc, [by_lower[c.lower()] for c in wanted], storage_options=self.so)
-        return True
+        raise ValueError(
+            "OPTIMIZE … ZORDER BY is not supported: DuckDB writes duckrun's files and has no z-order "
+            "(and interleaved bits break the runs a sort key gives Direct Lake). Sort the table "
+            f"instead: CREATE OR REPLACE TABLE {rel} SORTED BY ({cols.strip()}) AS SELECT * FROM {rel}")
 
     def _truncate(self, m, rel, schema, loc) -> None:
         """`truncate [table] <t>`: every row deleted in one commit that removes every data file and
-        writes none (copy-on-write; delta_rs delete for the table shapes it refuses). The table,
+        writes none (copy-on-write). The table,
         its schema, properties and history stay — unlike DROP TABLE."""
-        if engine.cow_rewrite(self.cursor, loc, where=None, delete=True, read_version=self._vB(loc),
-                              storage_options=self.so, dt=self._pinned(loc), operation="TRUNCATE"):
-            return
-        engine.delete_rows(loc, None, read_version=self._vB(loc), storage_options=self.so,
-                           cur=self.cursor, dt=self._pinned(loc))
+        engine.cow_rewrite(self.cursor, loc, where=None, delete=True, read_version=self._vB(loc),
+                           storage_options=self.so, dt=self._pinned(loc), operation="TRUNCATE")
 
     def _set_properties(self, m, rel, schema, loc) -> None:
         """`alter table <t> set tblproperties ('k' = 'v', …)`: delta_rs

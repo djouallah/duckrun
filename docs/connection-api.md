@@ -138,7 +138,7 @@ in [`tests/connection_api/test_connection_api.py`](../tests/connection_api/test_
 # sort the write by a lexicographic key (no z-order: bit-interleaving destroys run-length runs)
 conn.sql("CREATE OR REPLACE TABLE sales SORTED BY (region, order_date) AS SELECT * FROM stg_sales")
 
-# Hive-partitioned Delta (delta-rs writes col=value/ folders, strips the column from the data files)
+# Hive-partitioned Delta (col=value/ folders; the column is not stored in the data files)
 conn.sql("CREATE OR REPLACE TABLE sales PARTITIONED BY (region) AS SELECT * FROM stg_sales")
 
 # both compose — partition columns should lead the sort so delta-rs keeps ~one writer open

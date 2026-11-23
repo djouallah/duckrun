@@ -24,7 +24,7 @@ classifiers = [
 ]
 dependencies = [
     # duckdb floor is 2.0.1 (a floor only, NOT a pin, and deliberately no upper cap). duckdb only
-    # READS here (delta-rs does every write). 2.0.1 is the first release whose nested schemas work
+    # writes every parquet file too (delta-rs only commits). 2.0.1 is the first release whose nested schemas work
     # (broken in 2.0.0) — a workspace catalog surfaces `ws.lh.schema.table` through them. 2.0 also
     # brings async Parquet read-ahead on object storage (duckdb#23662), aggregates that spill instead
     # of OOMing under our pinned memory_limit (#24499), wider row-group pruning, azure ETag
@@ -33,13 +33,13 @@ dependencies = [
     # `delta_scan('...', version => N)` (duckdb-delta #312) — the version-pinned read that makes the
     # incremental read and the write commit resolve at ONE Delta snapshot (see the staging-read pin
     # in _delta_core.sql and merge_delta's read_version).
-    # deltalake floor is 1.7.0: the first release past 1.5.0 that is not broken for duckrun. 1.6.3-1.6.6
-    # bundle parquet-rs 59.0-59.3.1, which lists the dictionary page LAST in encoding_stats
-    # (apache/arrow-rs#11659, #84: Direct Lake reads ~3x slower); 1.7.0's wheels build parquet 59.3.3
-    # with the fix. It also fixes DELETE on an INT32 column with an int literal and DML ignoring
-    # writer_properties (tests/upstream_probes). MERGE keeps its disk-spill config (max_spill_size).
+    # deltalake floor is 1.6.4: duckrun uses it only to read the log and commit (DuckDB writes every
+    # parquet file), and 1.6.4 is the first release whose commit API (create_write_transaction)
+    # takes RemoveAction as well as AddAction (delta-rs PR #4713). The bugs that held the floor at
+    # 1.7.0 were all in delta-rs's own writer and DML (#84's dictionary order, the 1.6.2 MERGE hang,
+    # the INT32 DELETE literal), which duckrun no longer calls.
     "duckdb>=2.0.1",
-    "deltalake>=1.7.0",
+    "deltalake>=1.6.4",
     # The top-level connection API (duckrun.connect) discovers OneLake tables via the DFS REST
     # API directly; requests is otherwise only a transitive dbt dependency.
     "requests",

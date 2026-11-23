@@ -16,25 +16,27 @@ flowchart LR
     chunks["that column on disk<br/>one chunk per row group<br/>dictionary + data IDs"] -->|"transcoding<br/>per column, on demand"| seg["that column in memory<br/>row group → one segment<br/>one global dictionary"]
 ```
 
-Dictionary encoding is what makes the transcode cheap: a dictionary-encoded chunk is an ID remap, a PLAIN chunk is re-encoded from raw values. The fast path is gated on the footer, not the pages — `ColumnMetaData.encoding_stats` has to declare the chunk 100% dictionary-encoded, or the engine decodes and re-hashes every value. Same 142M-row string column, same pages: 10.9 s cold without the field, 0.7 s with it. duckrun's writer (delta-rs) emits it; DuckDB's `COPY TO parquet` did not until [duckdb#24957](https://github.com/duckdb/duckdb/pull/24957).
+Dictionary encoding is what makes the transcode cheap: a dictionary-encoded chunk is an ID remap, a PLAIN chunk is re-encoded from raw values. The fast path is gated on the footer, not the pages — `ColumnMetaData.encoding_stats` has to declare the chunk 100% dictionary-encoded, or the engine decodes and re-hashes every value. Same 142M-row string column, same pages: 10.9 s cold without the field, 0.7 s with it. duckrun's writer, DuckDB's `COPY TO parquet`, emits it since [duckdb#24957](https://github.com/duckdb/duckdb/pull/24957) (DuckDB 2.0).
 
 The layout is mainly for the **cold** load, the cost a report user feels on first click, which scales with the row-group count twice (dictionary merge, then segment setup). Hot scans inherit the row order and the segment count, so the sort and the row-group size keep paying. Measurements are in [direct-lake-parquet-layout](https://github.com/djouallah/direct-lake-parquet-layout).
 
 ## Write settings
 
+DuckDB writes every file (`COPY … TO parquet`, `cow.parquet_options`) and delta-rs commits it.
+
 | Property | Value | Why |
 | --- | --- | --- |
 | Compression | `SNAPPY` | The transcode is decode-bound. SNAPPY output is ~1.3× ZSTD on representative data; the sort and the dictionary do most of the shrinking. |
 | Row group | ≤ 4M rows, fixed | One row group becomes one segment. 1–16M rows is a healthy segment; 2–6M measured best in the sweeps (hot leans to ~2M), so 4M sits mid-band; 16M is the ceiling, and DuckDB's 122,880-row default made the same table 3.5× slower cold. This is a ceiling, not a size: the 256 MB file roll usually closes the group first. |
-| Dictionary page | 32 MB | Mid- and high-cardinality columns stay dictionary-encoded; truly unique columns overflow to PLAIN, which is correct. It is also the main lever on merge memory, since a merge reading the table materializes the dictionaries: on an 18M-row merge, 128 MB peaked at ~25 GB, 16 MB at ~8.7 GB. |
-| Data page | 1 MB, 1M-row cap | The row cap matters: without it a highly compressible column buffers the whole row group as one page ([arrow-rs #5797](https://github.com/apache/arrow-rs/issues/5797)). |
-| Statistics | chunk-level, 64-char truncation | Row-group min/max is what a reader skips on; page statistics only bloat the footer. |
+| Dictionary | up to the row-group size (`DICTIONARY_SIZE_LIMIT`), parquet V1 | Every column stays dictionary-encoded; one that overflows falls back to PLAIN. |
+| Data page | 1 MB (`DATA_PAGE_SIZE_LIMIT`) | DuckDB's own default page is far larger ([duckdb#24507](https://github.com/duckdb/duckdb/issues/24507)). |
+| Bloom filters | none | They cost ~30 MB on the aemo mart and Direct Lake doesn't read them. |
+| Statistics | from the COPY (`RETURN_STATS`), 64-char strings | The Delta log's min/max is what readers prune on; a stat that might be wrong is dropped, never guessed. |
 | Target file | 256 MB | A row group cannot span files, so every file's last group is cut wherever the roll lands. 128 MB doubled the file count and the truncated tails (4 of 25 groups vs ~2 on the 142M-row reference mart), so 256 stays. |
 
-- **Every write uses this profile** — overwrite, append, `replaceWhere` (microbatch), `SORTED BY AUTO`, and post-write compaction. **`MERGE` is the one exception**: it writes with delta-rs defaults so it never rewrites large files or materializes large dictionaries to touch a few rows, and the threshold-gated compaction folds its files back into the layout later. An insert-only merge is routed to a DuckDB anti-join and a plain append, so it does get the profile.
-- **Reader first, merge survives.** Each value is the largest that still passes the merge spill tests: Direct Lake wants big groups, big files and retained dictionaries; delta-rs buffers a whole uncompressed row group per open writer and pays for every dictionary it reads.
+- **Every write uses this profile**: overwrite, append, `replaceWhere` (microbatch), MERGE / UPDATE / DELETE (copy-on-write: only the files a change lands in are rewritten, rows in their order), `SORTED BY AUTO`, and post-write compaction.
 - **Per-model overrides.** `max_row_group_size` (rows) and `target_file_size_mb` pin a model's geometry; the explicit value is honored verbatim and preserved by post-write compaction. See the [config reference](dbt-adapter.md#config-options-table-incremental-delta).
-- **How the numbers are grounded.** The engine is treated as a black box. The same ~140M-row fact is built twice, with Spark's V-Order writer and with duckrun, both deployed as Direct Lake semantic models, and heavy DAX queries are timed over XMLA cold and hot. A writer property is kept only if the DAX time moves toward the V-Order reference and the merge spill tests still pass. That is one dataset, so treat the values as defaults, not guarantees; the comparison is reproducible from `tests/parquet_layout/aemo/` and the manual `parquet_layout.yml` workflow.
+- **How the numbers are grounded.** The engine is treated as a black box. The same ~140M-row fact is built twice, with Spark's V-Order writer and with duckrun, both deployed as Direct Lake semantic models, and heavy DAX queries are timed over XMLA cold and hot. A writer property is kept only if the DAX time moves toward the V-Order reference. That is one dataset, so treat the values as defaults, not guarantees; the comparison is reproducible from `tests/parquet_layout/aemo/` and the manual `parquet_layout.yml` workflow.
 
 ## Automatic sorting
 

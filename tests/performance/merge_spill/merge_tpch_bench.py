@@ -401,7 +401,7 @@ def run(args):
     b.generate()
     target_rows = b.q(f"SELECT count(*) FROM read_parquet('{b.gen_glob()}')")
     eff = b.engine._effective_mem_limit_bytes()
-    cap = int(eff * b.engine._MERGE_SPILL_FRACTION) if eff else None
+    cap = None  # no delta-rs merge pool since 0.5.8: DuckDB runs every MERGE under memory_limit
     print(f"== base lineitem: {target_rows:,} rows | effective_mem="
           f"{None if eff is None else round(eff/1048576)}MB merge_cap="
           f"{None if cap is None else round(cap/1048576)}MB ==", flush=True)

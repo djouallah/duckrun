@@ -19,14 +19,13 @@ force = os.environ.get("FORCE_REBUILD", "false").strip().lower() == "true"
 # OPT_RG: pin the row-group CEILING for this build (rows), e.g. 16000000 vs 6000000 — the harness
 # spelling of the per-model `max_row_group_size` dbt config, for A/B-ing geometries in THIS CI.
 # The CTAS goes through the connection API (no dbt config to carry it), so pin it at the one
-# sizing seam every write reads at call time: engine._ROW_GROUP_SIZE (the module global behind
-# _writer_properties). Same writer path (row_group_rows -> WriterProperties) the dbt config
-# feeds; empty = the fixed 4M default.
+# sizing seam every write reads at call time: cow.ROW_GROUP_DEFAULT_ROWS (the default behind
+# cow.parquet_options, i.e. DuckDB's COPY ROW_GROUP_SIZE). Empty = the fixed 4M default.
 _rg = os.environ.get("OPT_RG", "").strip()
 OPT_RG = int(_rg) if _rg.isdigit() and int(_rg) > 0 else None
 if OPT_RG is not None:
-    from dbt.adapters.duckrun import engine as _engine
-    _engine._ROW_GROUP_SIZE = OPT_RG
+    from dbt.adapters.duckrun import cow as _cow
+    _cow.ROW_GROUP_DEFAULT_ROWS = OPT_RG
     print(f"OPT_RG: row-group ceiling pinned to {OPT_RG:,} rows for this build", flush=True)
 # OPT_TFS_MB: pin the target parquet FILE size (MB) — the harness spelling of the
 # `target_file_size_mb` model config, same seam (the module global every write reads at call
@@ -36,7 +35,8 @@ if OPT_RG is not None:
 _tfs = os.environ.get("OPT_TFS_MB", "").strip()
 OPT_TFS_MB = int(_tfs) if _tfs.isdigit() and int(_tfs) > 0 else None
 if OPT_TFS_MB is not None:
-    from dbt.adapters.duckrun import engine as _engine
+    from dbt.adapters.duckrun import cow as _cow, engine as _engine
+    _cow.DEFAULT_TARGET_FILE_SIZE = OPT_TFS_MB * 1024 * 1024
     _engine._TARGET_FILE_SIZE = OPT_TFS_MB * 1024 * 1024
     print(f"OPT_TFS_MB: target file size pinned to {OPT_TFS_MB} MB for this build", flush=True)
 # OPT_PAGE_ROWS: pin the data-page ROW cap (default 1M since d0d23b4, see
@@ -47,9 +47,9 @@ if OPT_TFS_MB is not None:
 _pr = os.environ.get("OPT_PAGE_ROWS", "").strip()
 OPT_PAGE_ROWS = int(_pr) if _pr.isdigit() and int(_pr) > 0 else None
 if OPT_PAGE_ROWS is not None:
-    from dbt.adapters.duckrun import engine as _engine
-    _engine._DATA_PAGE_ROW_LIMIT = OPT_PAGE_ROWS
-    print(f"OPT_PAGE_ROWS: data-page row cap pinned to {OPT_PAGE_ROWS:,} rows for this build",
+    # DuckDB writes duckrun's files now, and its COPY has no page ROW cap (pages are sized by
+    # DATA_PAGE_SIZE_LIMIT bytes), so this knob no longer applies.
+    print(f"OPT_PAGE_ROWS={OPT_PAGE_ROWS:,} ignored: DuckDB's writer has no page row cap",
           flush=True)
 # Read the source mart.fct_summary DIRECTLY (its own independent read, separate from the Spark
 # V-Order build's) with the same row cap. SORTED BY AUTO re-sorts regardless of input order.

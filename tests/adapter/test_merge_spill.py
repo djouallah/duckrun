@@ -108,20 +108,10 @@ def test_effective_limit_adds_own_rss_back(monkeypatch):
     assert engine._effective_mem_limit_bytes() == 16 * 2 ** 30
 
 
-def test_default_merge_spill_cap_is_fraction_of_effective_limit(monkeypatch):
-    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
-    spill_kwargs, _ = engine._merge_spill_caps(None, None, False)
-    assert spill_kwargs["max_spill_size"] == int(16 * 2 ** 30 * engine._MERGE_SPILL_FRACTION)
-    assert 0 < engine._MERGE_SPILL_FRACTION < 1
-
 
 def test_mem_fractions_are_sane():
-    """The pin and the merge spill cap are each a proper fraction of the effective limit. They are
-    NOT shares of a divided budget — 0.85 + 0.6 deliberately sum past 1.0: they bound different
-    consumers (DuckDB vs the delta_rs merge pool) that measurement shows never peak together
-    (delta_rs holds ~99% of merge RSS while DuckDB sits near-idle)."""
+    """The DuckDB memory pin is a proper fraction of the effective limit."""
     assert 0 < engine._MEM_LIMIT_FRACTION < 1
-    assert 0 < engine._MERGE_SPILL_FRACTION < 1
 
 
 # ----------------------------------------------------------- byte-size parsing
@@ -222,127 +212,6 @@ def test_pin_noop_when_effective_limit_unknown(monkeypatch):
     assert not any(k == "memory_limit" for k, _ in con.sets)
 
 
-# ---------------------------------------------------------- kwarg forwarding
-
-class _FakeMerger:
-    def when_matched_update_all(self, **k):
-        return self
-
-    def when_matched_update(self, **k):
-        return self
-
-    def when_not_matched_insert_all(self, **k):
-        return self
-
-    def execute(self):
-        self.executed = True
-
-
-class _FakeDeltaTable:
-    def __init__(self, captured):
-        self._captured = captured
-
-    def load_as_version(self, version):
-        # merge_delta now always pins (read_version is required); the fake just accepts it.
-        self._captured["read_version"] = version
-
-    def merge(self, **kwargs):
-        self._captured.clear()
-        self._captured.update(kwargs)
-        return _FakeMerger()
-
-
-def _spy(monkeypatch):
-    captured = {}
-    monkeypatch.setattr(engine, "_delta_table", lambda path, so: _FakeDeltaTable(captured))
-    # These tests only care about the kwargs forwarded into .merge(); the post-merge maintenance
-    # (a real byte-debt read + optimize) is a no-op here so it can't touch the fake table.
-    monkeypatch.setattr(engine, "_maintain", lambda *a, **k: None)
-    return captured
-
-
-def test_delta_rs_merges_serialize_on_the_gate(monkeypatch):
-    """The spill caps are sized to the WHOLE budget (no 1/N division by the thread count), which is
-    only safe because _MERGE_GATE lets one delta_rs merge run at a time — two concurrent merges must
-    never be inside execute() together."""
-    state = {"active": 0, "peak": 0}
-    track = threading.Lock()
-
-    class _OverlapMerger(_FakeMerger):
-        def execute(self):
-            with track:
-                state["active"] += 1
-                state["peak"] = max(state["peak"], state["active"])
-            time.sleep(0.05)  # long enough for the second thread to reach the gate
-            with track:
-                state["active"] -= 1
-
-    class _OverlapTable(_FakeDeltaTable):
-        def merge(self, **kwargs):
-            return _OverlapMerger()
-
-    monkeypatch.setattr(engine, "_delta_table", lambda path, so: _OverlapTable({}))
-    monkeypatch.setattr(engine, "_maintain", lambda *a, **k: None)
-
-    threads = [
-        threading.Thread(
-            target=lambda: engine.merge_delta("target", _table([1]), "id", read_version=0))
-        for _ in range(2)
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-    # peak == 0 means neither merge reached execute() (an error upstream); 2 means they overlapped.
-    assert state["peak"] == 1
-
-
-def test_max_spill_size_defaults_to_effective_fraction(monkeypatch):
-    # Pin the limit so the forwarded cap can be compared exactly (free RAM is now sampled live
-    # on every call, so two unpinned reads would differ by a few KB and flake).
-    monkeypatch.setattr(engine, "_effective_mem_limit_bytes", lambda: 16 * 2 ** 30)
-    captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", read_version=0)
-    assert captured["max_spill_size"] == int(16 * 2 ** 30 * engine._MERGE_SPILL_FRACTION)
-
-
-def test_max_spill_size_explicit_is_forwarded(monkeypatch):
-    captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", max_spill_size=123_456, read_version=0)
-    assert captured["max_spill_size"] == 123_456
-
-
-def test_streamed_exec_defaults_to_false(monkeypatch):
-    """Default to collecting the source so delta_rs can derive an early prune predicate from its
-    stats (streamed_exec=True would stream it and scan the whole target)."""
-    captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", read_version=0)
-    assert captured["streamed_exec"] is False
-
-
-def test_streamed_exec_can_be_enabled(monkeypatch):
-    """A huge-source merge can opt back into streaming (no prune) so the source isn't collected."""
-    captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", streamed_exec=True, read_version=0)
-    assert captured["streamed_exec"] is True
-
-
-def test_max_spill_size_zero_disables_the_cap(monkeypatch):
-    """0 (or any falsy non-None) opts out: the kwarg is omitted so delta_rs runs unbounded."""
-    captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", max_spill_size=0, read_version=0)
-    assert "max_spill_size" not in captured
-
-
-def test_undetectable_ram_omits_the_cap(monkeypatch):
-    # No memory signal at all (physical, cgroup, available all undetectable) -> run unbounded.
-    monkeypatch.setattr(engine, "_total_ram_bytes", lambda: None)
-    monkeypatch.setattr(engine, "_cgroup_mem_limit_bytes", lambda: None)
-    monkeypatch.setattr(engine, "_available_ram_bytes", lambda: None)
-    captured = _spy(monkeypatch)
-    engine.merge_delta("target", _table([1]), "id", read_version=0)
-    assert "max_spill_size" not in captured
-
 
 # ---------------------------------------------------------------- end to end
 
@@ -373,8 +242,10 @@ def test_merge_with_explicit_spill_size_upserts_correctly(tmp_path):
 # ----------------------------------------------- post-merge maintenance
 
 def _commit_ops(path):
-    """The operation name of each commit in the table's history, newest first."""
-    return [c.get("operation") for c in DeltaTable(path).history()]
+    """The operation of each commit in the table's history, newest first: duckrun's own marker
+    (``duckrun.operation`` in commitInfo — delta-rs's commit API records every commit as WRITE),
+    else delta-rs's operation name."""
+    return [c.get("duckrun.operation") or c.get("operation") for c in DeltaTable(path).history()]
 
 
 def _debt(small_files, small_bytes):
@@ -506,32 +377,3 @@ def _fake_disk(monkeypatch, free_bytes):
     monkeypatch.setattr(_shutil, "disk_usage", lambda path: _Usage)
 
 
-def test_temp_dir_cap_small_disk_keeps_the_proportional_reserve(monkeypatch):
-    """Below 40 GiB free the old 80% rule holds unchanged — small disks keep the same slack."""
-    _fake_disk(monkeypatch, 10 * 2 ** 30)
-    assert engine._default_merge_temp_dir_size() == 8 * 2 ** 30
-
-
-def test_temp_dir_cap_big_disk_reserve_flattens_at_8gib(monkeypatch):
-    """Above 40 GiB free the reserve is a flat 8 GiB, not 20%: a proportional reserve stranded
-    ~15 GB on the 75 GB CI disk while the v0.4.58 gate's update-only merge died at the cap with
-    room left (and would strand ~380 GB on the Fabric work disk)."""
-    _fake_disk(monkeypatch, 75 * 2 ** 30)
-    assert engine._default_merge_temp_dir_size() == 67 * 2 ** 30
-    _fake_disk(monkeypatch, 2 * 2 ** 40)
-    assert engine._default_merge_temp_dir_size() == 2 * 2 ** 40 - 8 * 2 ** 30
-
-
-def test_temp_dir_cap_boundary_is_continuous(monkeypatch):
-    """At exactly 40 GiB free both formulas agree (reserve = 8 GiB = 20%)."""
-    _fake_disk(monkeypatch, 40 * 2 ** 30)
-    assert engine._default_merge_temp_dir_size() == 32 * 2 ** 30
-
-
-def test_temp_dir_cap_unreadable_disk_returns_none(monkeypatch):
-    import shutil as _shutil
-
-    def _boom(path):
-        raise OSError("no disk_usage here")
-    monkeypatch.setattr(_shutil, "disk_usage", _boom)
-    assert engine._default_merge_temp_dir_size() is None

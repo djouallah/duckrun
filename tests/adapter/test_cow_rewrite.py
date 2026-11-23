@@ -68,14 +68,22 @@ def test_partitioned_table(tmp_path, paths):
     assert all("p=" in f.replace("\\", "/") for f in dt.file_uris())
 
 
-def test_change_data_feed_table_stays_on_delta_rs(tmp_path, paths):
+def test_change_data_feed_table_refuses_rewrites_and_takes_appends(tmp_path, paths):
+    # delta-rs's commit API has no action for change files, so a rewrite of a CDF table is refused
+    # before anything is written; an append (adds only) still works.
     conn = _conn(tmp_path)
     conn.sql("create table t as select i as id, 'v' as v from range(10) r(i)")
-    deltalake.DeltaTable(f"{conn.root_path}/dbo/t").alter.set_table_properties(
-        {"delta.enableChangeDataFeed": "true"})
-    conn.sql("update t set v = 'w' where id = 1")
-    assert any("delta_rs path (change data feed)" in m for m in paths)
-    assert conn.sql("select v from t where id = 1").fetchall() == [("w",)]
+    path = f"{conn.root_path}/dbo/t"
+    deltalake.DeltaTable(path).alter.set_table_properties({"delta.enableChangeDataFeed": "true"})
+    v = engine.table_version(path)
+    for stmt in ("update t set v = 'w' where id = 1", "delete from t where id = 1",
+                 "merge into t using (select 1 as id, 'm' as v) s on t.id = s.id "
+                 "when matched then update set v = s.v"):
+        with pytest.raises(ValueError, match="change data feed"):
+            conn.sql(stmt)
+    assert engine.table_version(path) == v
+    conn.sql("insert into t values (100, 'n')")
+    assert conn.sql("select count(*) from t").fetchall() == [(11,)]
 
 
 def test_concurrent_commit_fails_loudly(tmp_path, monkeypatch):
@@ -120,15 +128,15 @@ def test_column_mapped_table(tmp_path, paths):
     assert any(n.startswith("col-") for n in names) and "Super Name" not in names
 
 
-def test_partitioned_column_mapped_table_stays_on_delta_rs(tmp_path, paths):
+def test_partitioned_column_mapped_table_is_refused(tmp_path, paths):
     import shutil
     from pathlib import Path
     conn = _conn(tmp_path)
     fixture = Path(__file__).parents[1] / "connection_api" / "data" / "table_with_column_mapping"
     shutil.copytree(fixture, Path(conn.root_path) / "dbo" / "cmp")
     conn.refresh(quiet=True)
-    conn.sql("""update cmp set "Super Name" = 'x' where "Super Name" is not null""")
-    assert any("delta_rs path (column mapping on a partitioned table)" in m for m in paths)
+    with pytest.raises(ValueError, match="column mapping on a partitioned table"):
+        conn.sql("""update cmp set "Super Name" = 'x' where "Super Name" is not null""")
 
 
 def test_check_constraint_is_enforced(tmp_path, paths):
@@ -230,7 +238,7 @@ def test_rewrite_keeps_the_row_order(tmp_path, paths):
 
 def test_delete_ignores_a_rule_duckdb_cannot_bind(tmp_path, paths):
     # A DELETE writes only rows already in the table, so a CHECK in DataFusion-only SQL does not
-    # send it to delta-rs (an UPDATE still goes there: its new values must be checked).
+    # stop it; an UPDATE is refused (its new values must be checked, and DuckDB cannot).
     conn = _conn(tmp_path)
     conn.sql("create table t as select i as id from range(10) r(i)")
     path = f"{conn.root_path}/dbo/t"
@@ -238,6 +246,5 @@ def test_delete_ignores_a_rule_duckdb_cannot_bind(tmp_path, paths):
     conn.sql("delete from t where id = 3")
     assert any("delete: copy-on-write" in m for m in paths)
     assert conn.sql("select count(*) from t").fetchall() == [(9,)]
-    conn.sql("update t set id = 30 where id = 4")
-    assert any(m.startswith("update: delta_rs path (DuckDB cannot evaluate a table rule")
-               for m in paths)
+    with pytest.raises(ValueError, match="DuckDB cannot evaluate a table rule"):
+        conn.sql("update t set id = 30 where id = 4")

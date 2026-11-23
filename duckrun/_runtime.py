@@ -2,13 +2,12 @@
 
 duckrun needs ``duckdb`` >= 2.0.1 — the first release with working nested schemas (workspace
 catalogs), on top of 2.0's read-side upgrade and ``delta_scan``'s ``version => N`` parameter (used
-for snapshot-pinned reads) — and ``deltalake`` >= 1.7.0: the first release past 1.5.0 whose parquet
-writer lists the dictionary page first in ``encoding_stats`` (#84) and whose DELETE/UPDATE work for
-duckrun. A Microsoft Fabric Python notebook ships a *stable* set of these packages, which may trail
+for snapshot-pinned reads) — and ``deltalake`` >= 1.6.4: duckrun only commits through it (DuckDB writes
+every file), and 1.6.4 is the first release whose commit API takes remove actions as well as adds. A Microsoft Fabric Python notebook ships a *stable* set of these packages, which may trail
 the versions duckrun needs. ``pip install duckrun --upgrade`` writes the new wheels to disk, but the
 already-loaded modules stay bound until the kernel restarts — so a user who skips the restart keeps
 running on the old modules, quietly losing snapshot-pinned reads / nested schemas (too-old duckdb)
-or writing files Direct Lake reads slowly (too-old deltalake).
+or failing every MERGE / UPDATE / DELETE commit (too-old deltalake).
 
 This check turns that into a loud, actionable error. It inspects the *loaded* versions (not the
 pin), so it fires exactly on the forgot-to-restart case.
@@ -17,9 +16,9 @@ from packaging.version import Version
 
 # Versions duckrun needs at *runtime* — keep in sync with the pins in pyproject.toml:
 #   duckdb >= 2.0.1    -> nested schemas (workspace catalogs); delta_scan('...', version => N)
-#   deltalake >= 1.7.0 -> dictionary page first in encoding_stats (#84); working DELETE/UPDATE
+#   deltalake >= 1.6.4 -> create_write_transaction with RemoveAction (delta-rs PR #4713)
 _MIN_DUCKDB = "2.0.1"
-_MIN_DELTALAKE = "1.7.0"
+_MIN_DELTALAKE = "1.6.4"
 
 _REMEDY = (
     "In a Fabric Python notebook, upgrade then restart the kernel so the right versions load:\n"
@@ -33,7 +32,7 @@ _REMEDY = (
 def check_runtime_versions():
     """Raise ``RuntimeError`` if the *loaded* duckdb/deltalake are not what duckrun requires.
 
-    duckdb must be >= 2.0.1; deltalake must be >= 1.7.0. Catches the notebook "installed but forgot ``restartPython()``" case: the kernel keeps
+    duckdb must be >= 2.0.1; deltalake must be >= 1.6.4. Catches the notebook "installed but forgot ``restartPython()``" case: the kernel keeps
     the previously-loaded duckdb/deltalake bound until restart. Idempotent and cheap; called at each
     entry point (``duckrun.connect()`` and the dbt connection open).
     """

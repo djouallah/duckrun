@@ -15,119 +15,20 @@ import time
 from typing import Any, Dict, List, Optional
 
 from dbt.adapters.duckrun._log import logger
-from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_deltalake
+from deltalake import CommitProperties, DeltaTable, convert_to_deltalake
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, CHECKPOINT_INTERVAL,
-                                         DATA_PAGE_SIZE_LIMIT, DEFAULT_TARGET_FILE_SIZE,
-                                         ROW_GROUP_DEFAULT_ROWS)
+                                         DEFAULT_TARGET_FILE_SIZE)
 from dbt.adapters.duckrun import cow, sortkey
 
-try:  # deltalake 1.x exposes WriterProperties at the top level
-    from deltalake import WriterProperties
-except ImportError:  # pragma: no cover - older layouts
-    try:
-        from deltalake.writer import WriterProperties
-    except ImportError:
-        WriterProperties = None
-
-try:  # per-column knobs (dictionary_enabled, statistics_enabled) — deltalake 1.x
-    from deltalake import ColumnProperties
-except ImportError:  # pragma: no cover - older layouts
-    try:
-        from deltalake.writer import ColumnProperties
-    except ImportError:
-        ColumnProperties = None
-
-
-# The FIXED row-group ceiling (4M rows) every write uses — see policy.ROW_GROUP_DEFAULT_ROWS.
-# This alias is the default max_row_group_size _writer_properties uses when no explicit ceiling is
-# passed; only a per-model max_row_group_size config moves it.
-_ROW_GROUP_SIZE = ROW_GROUP_DEFAULT_ROWS
-# Dictionary page limit: 32 MB. Caps how large one column's dictionary grows before its values
-# overflow to PLAIN. A bigger limit keeps more MID/HIGH-cardinality columns dictionary-encoded, which
-# shrinks the written files and gives the columnar reader denser, more uniform segments — the read
-# layout this write path is tuned for. The cost is merge memory: a delta_rs MERGE reads the table and
-# materializes those per-column dictionaries, so a larger limit means a larger merge working set.
-# Measured on an 18M-row merge: the old 128 MB limit hit ~25 GB RSS, 8 MB ~4 GB, 16 MB ~8.7 GB — so
-# 32 MB is a deliberate step further up the merge-memory curve, bought for read-layout density. Truly
-# near-unique join keys (e.g. l_orderkey / l_comment) still overflow to PLAIN — their dictionary would
-# be as big as the data, so no loss. This is the knob most likely to regress the merge-spill stress
-# gate; tests/parquet_layout/aemo/ is the harness to confirm the read-side win against a real Direct Lake
-# reference before trusting it.
-_DICT_PAGE_SIZE_LIMIT = 32 * 1024 * 1024
-# Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
-# column, so it can't cap the page on its own.
-_DATA_PAGE_SIZE_LIMIT = DATA_PAGE_SIZE_LIMIT
-# Data page ROW-COUNT limit — the backstop for columns the byte cap can't see: the byte cap is checked
-# on ENCODED page bytes, so a highly compressible column would otherwise buffer its whole row group
-# as a single page (~10x write memory, and giant pages blow the merge's read-side spill cap → out of
-# disk; arrow-rs #5797 / #4973). At 20k (arrow-rs's intended default) this cap fired FIRST on every
-# column, overriding the 1 MB byte cap into ~20k-row micro-pages — and page count is pure read-side
-# overhead: each page costs the reader a header parse, a decompressor setup, and an encoding-run
-# restart. 1M lets the byte cap shape dense columns into ~1 MB pages (the page size every mainstream
-# parquet writer targets) while still bounding the degenerate compressible case. Measured on the
-# layout benchmark (tests/parquet_layout/aemo): ~40x fewer pages per chunk, cold column loads
-# consistently faster, write memory unchanged (dense pages are bounded by bytes, not rows).
-_DATA_PAGE_ROW_LIMIT = 1_000_000
-# Target file size: 256 MB. A Parquet row group can't span files, so this byte cap is really a
-# segment cap — and every file's LAST row group is truncated wherever the roll lands. That is why
-# 128 MB (tried in 0.4.64, reverted in 0.4.65) lost: it doubled the file count, so the aemo mart
-# went from ~2 roll-truncated tail groups to 4 of 25 (one a 1.25M-row runt at the bottom of the
-# healthy 1-16M segment band). Revisit only when delta-rs can align the file roll to a row-group
-# boundary. Not a merge-MEMORY lever (that was the dictionary page limit, see
-# _DICT_PAGE_SIZE_LIMIT; 128/256/512 MB all merged in ~16s at ~4.5-5.2 GB RSS in the small-scale
-# measurement) — but it IS a merge-DISK lever at scale (128 MB's doubled file count pushed the
-# update-only merge's DataFusion spill from <59 to 60-100 GB). Deliberately far below 1 GB, which
-# forced the whole-file copy-on-write that blew up merges on disk. Applied by every file write
-# (build_write_deltalake_args) and the routine post-write compaction. MERGE is the exception — it
-# sets no target_file_size. Defined in policy.py (the one read-layout target); aliased here so the
-# many in-module references stay put.
+# Target file size: 256 MB (policy.DEFAULT_TARGET_FILE_SIZE): DuckDB's COPY rolls files at it
+# and compaction aims at it. A row group cannot span files, so it caps segments too.
 _TARGET_FILE_SIZE = DEFAULT_TARGET_FILE_SIZE
 
 # Max distinct partition values folded into a merge's `target.p IN (…)` prune predicate. Past this the
 # IN list stops buying pruning (the source spans most of the table) and we let delta_rs plan on its own.
 _PART_PRUNE_MAX = 400
-
-def _writer_properties(row_group_rows=None):
-    # The single read-layout writer config, used by every FILE write (append/overwrite/if_unchanged),
-    # compaction, and the optimize sort-rewrite: SNAPPY, the fixed 4M-row group ceiling, a 32 MB dictionary page limit
-    # (mid-card columns keep a remappable dictionary; high-card ones overflow to PLAIN — see
-    # _DICT_PAGE_SIZE_LIMIT, the load-bearing merge-memory knob), a 1 MB data-page byte cap that shapes
-    # dense columns into ~1 MB pages (the 1M-row cap only backstops ultra-compressible columns — see
-    # _DATA_PAGE_ROW_LIMIT), and chunk-level stats.
-    # MERGE deliberately does NOT use this — it passes no writer_properties (delta_rs defaults) so a
-    # merge stays quick and never rewrites fat files, and so the known OOM-prone path does not also
-    # take on a large write buffer; post-merge compaction folds merged files up into this layout
-    # later. That exemption covers only a merge that actually reaches delta_rs: an insert-only merge
-    # is routed to a DuckDB anti-join + plain append (see insert_delta) and IS written with this
-    # profile. Degrade gracefully if the pinned wheel rejects a newer parameter (last rung:
-    # SNAPPY-only).
-    if WriterProperties is None:
-        return None
-    rg = row_group_rows if row_group_rows is not None else _ROW_GROUP_SIZE
-    col_props = None
-    if ColumnProperties is not None:
-        try:
-            col_props = ColumnProperties(dictionary_enabled=True, statistics_enabled="CHUNK")
-        except Exception:  # best-effort: fall through to writer-level props without per-column knobs
-            col_props = None
-    for kwargs in (
-        dict(compression="SNAPPY",
-             max_row_group_size=rg,
-             dictionary_page_size_limit=_DICT_PAGE_SIZE_LIMIT,
-             data_page_size_limit=_DATA_PAGE_SIZE_LIMIT,
-             data_page_row_count_limit=_DATA_PAGE_ROW_LIMIT,
-             statistics_truncate_length=64,
-             default_column_properties=col_props),
-        dict(compression="SNAPPY", max_row_group_size=rg),
-        dict(compression="SNAPPY"),
-    ):
-        try:
-            return WriterProperties(**{k: v for k, v in kwargs.items() if v is not None})
-        except Exception:  # best-effort: any build rejection tries the next, simpler rung
-            continue
-    return None
 
 
 def _win_mem_status():
@@ -419,16 +320,6 @@ def mem_profile(label: str, con=None, interval: float = 0.1):
     return _MemSampler(label, con=con, interval=interval)
 
 
-# The two delta_rs merge spill caps. ``max_spill_size`` bounds the merge's in-memory pool — the
-# consumer that actually OOMs: profiling (DUCKRUN_MEM_PROFILE) measured that during a merge
-# delta_rs holds ~99% of process RSS while DuckDB sits near ~15 MB. Sized to the WHOLE effective
-# limit, not a per-thread slice — ``_MERGE_GATE`` (below) keeps that honest by letting only one
-# delta_rs merge run at a time. Past the cap the merge spills to disk instead of OOM-killing the
-# container; too small a cap makes delta_rs raise "Resources exhausted" instead (the merge can't
-# fit its working set), so the cap gets the bulk of the budget.
-_MERGE_SPILL_FRACTION = 0.6  # delta_rs merge max_spill_size (in-memory pool)
-_MERGE_TEMP_DIR_FRACTION = 0.8  # delta_rs merge max_temp_directory_size, as a share of free spill disk
-_MERGE_TEMP_DIR_RESERVE = 8 * 2 ** 30  # ceiling on the disk-spill reserve (see _default_merge_temp_dir_size)
 
 # The one DuckDB memory_limit pin, applied once per connection (see _pin_memory_limit). It exists
 # because DuckDB's own default memory_limit is 80% of *physical* RAM, and on a container
@@ -468,54 +359,7 @@ def pool_workers(n_items: int) -> int:
     return max(1, min(per_thread, n_items))
 
 
-# At most ONE delta_rs merge runs at a time, and it holds the FULL merge budget (the RAM pool
-# and the disk spill cap below). The merge is the only write whose working set is a large share
-# of the whole process budget — delta_rs holds ~99% of merge RSS while DuckDB sits near-idle —
-# so the alternative, dividing the caps by the thread count, charges every merge for concurrency
-# that usually isn't happening (one big merge at threads=4 would get a quarter of the budget with
-# the other three threads running views and appends). Concurrent merges queue here instead; the
-# other dbt threads keep running everything cheap (anti-join inserts, appends, overwrites) while
-# a merge holds the gate. Two big merges overlapping would also thrash the one spill disk.
-_MERGE_GATE = threading.Lock()
 
-
-def _merge_spill_dir() -> str:
-    """Where delta_rs (DataFusion) writes merge spill files: TMPDIR when set — the adapter points it
-    at the roomy Fabric work disk in configure_duckdb_session — else the platform temp dir. This is
-    the disk whose free space bounds the merge's on-disk spill."""
-    import tempfile
-    return os.environ.get("TMPDIR") or tempfile.gettempdir()
-
-
-def _default_merge_temp_dir_size() -> Optional[int]:
-    """delta_rs merge ``max_temp_directory_size`` default: the FREE space on the spill disk minus a
-    reserve of ``min(20% of free, 8 GiB)``.
-
-    DataFusion's DiskManager otherwise hard-caps on-disk merge spill at a flat 100 GB regardless of
-    how big the disk is — so a wide-partition merge aborts with "Resources exhausted ... exceeded the
-    allowable limit of 100.0 GB" on a box with terabytes free (exactly the Fabric work disk, ~1.9 TiB).
-    This is a SEPARATE limit from ``max_spill_size`` (which bounds the in-*memory* pool): this one
-    bounds bytes on disk. Sizing it to the actual disk lets a big merge spill as far as the disk allows.
-
-    A reserve, not all of it, because DuckDB spills to the same disk during the merge (source
-    collection) and the dbt target dir + delta_rs write staging also live there. The reserve's job
-    needs gigabytes, not gigabytes-per-gigabyte: a purely proportional 20% stranded ~15 GB on a
-    75 GB CI disk while a merge died at the cap with room left (v0.4.58 release gate), and ~380 GB
-    on the Fabric work disk. So the proportional reserve holds below 40 GiB free (small disks keep
-    exactly the old slack) and flattens to 8 GiB above it. Not divided by the thread count:
-    ``_MERGE_GATE`` serializes delta_rs merges, so at most one is spilling at a time and it gets
-    the whole disk. None if free space can't be read (then delta_rs keeps its 100 GB default).
-    Override with ``merge_max_temp_directory_size``."""
-    import shutil
-    try:
-        free = shutil.disk_usage(_merge_spill_dir()).free
-    except Exception:
-        return None
-    # Derived from the same int(free * 0.8) the proportional rule always used, so below the
-    # 40 GiB crossover the cap is byte-identical to the old behavior (no float-slop drift).
-    proportional_reserve = free - int(free * _MERGE_TEMP_DIR_FRACTION)
-    reserve = min(proportional_reserve, _MERGE_TEMP_DIR_RESERVE)
-    return (free - reserve) or None
 
 
 # Units DuckDB emits from current_setting('memory_limit') (e.g. "25.0 GiB"). Binary (GiB) and
@@ -634,68 +478,10 @@ def _pin_memory_limit(con) -> None:
         logger.info(
             f"DuckDB memory_limit pinned to {target / 2 ** 30:.2f} GiB "
             f"({int(_MEM_LIMIT_FRACTION * 100)}% of {limit / 2 ** 30:.2f} GiB "
-            f"{_effective_mem_limit_source()}); delta_rs merges serialize on a gate with a "
-            f"{int(_MERGE_SPILL_FRACTION * 100)}% spill cap"
+            f"{_effective_mem_limit_source()})"
         )
     except Exception:  # best-effort tuning: a failed SET leaves the prior limit, no abort
         pass
-
-
-def build_write_deltalake_args(
-    path: str,
-    data,
-    mode: str,
-    schema_mode: Optional[str] = None,
-    partition_by: Optional[List[str]] = None,
-    storage_options: Optional[Dict[str, str]] = None,
-    row_group_rows: Optional[int] = None,
-    target_file_size: Optional[int] = None,
-) -> Dict[str, Any]:
-    """Build kwargs for ``write_deltalake`` (deltalake >= 1.2).
-
-    EVERY write through here — overwrite, replace-where and append alike — gets the one read-layout
-    profile: the tuned writer properties plus the 256 MB ``target_file_size``. MERGE does not go
-    through here at all and keeps delta_rs defaults.
-
-    Append used to be excluded on the theory that appends are transient increments which
-    threshold-gated compaction folds into the read layout on a later pass. That fold does not
-    happen: compaction fires on small-file BYTE debt (>= 8 files under half-target, see
-    ``policy.MaintenancePolicy``), so append files that are already a healthy size are invisible to
-    the trigger and keep delta_rs's 1,048,576-row groups and 100 MB files forever — the bottom of
-    the segment band, permanently, on exactly the append-only fact tables that can least afford it
-    (issue #22). Writing the append with the profile is what closes that, and it costs
-    nothing on a small append: ``max_row_group_size`` is a CEILING, and an increment that never
-    reaches it is written exactly as before.
-
-    ``row_group_rows`` is an EXPLICIT ceiling only (a per-model ``max_row_group_size``).
-    ``None`` — every normal write — keeps the fixed ``_ROW_GROUP_SIZE`` ceiling and lets the
-    file roll pick the group; nothing is derived.
-
-    ``target_file_size`` (bytes) overrides the 256 MB default for THIS write — the per-model
-    ``target_file_size_mb`` dbt config lands here. ``None`` keeps ``_TARGET_FILE_SIZE``.
-    """
-    args: Dict[str, Any] = {
-        "table_or_uri": path,
-        "data": data,
-        "mode": mode,
-    }
-    if partition_by:
-        args["partition_by"] = partition_by
-    if storage_options:
-        args["storage_options"] = storage_options
-    # "merge" evolves the schema (adds columns); "overwrite" replaces it wholesale (overwrite
-    # mode only) — delta-rs's own schema_mode values, passed straight through.
-    if schema_mode in ("merge", "overwrite"):
-        args["schema_mode"] = schema_mode
-    args["target_file_size"] = target_file_size if target_file_size is not None else _TARGET_FILE_SIZE
-    # Applied only when this write CREATES the table; delta-rs ignores it on an existing one
-    # (verified on the pinned wheel — an existing table's configuration is never touched, so a
-    # user-set property can't be clobbered from here).
-    args["configuration"] = {"delta.checkpointInterval": str(CHECKPOINT_INTERVAL)}
-    wp = _writer_properties(row_group_rows=row_group_rows)
-    if wp is not None:
-        args["writer_properties"] = wp
-    return args
 
 
 def _delta_table(path: str, storage_options: Optional[Dict[str, str]]) -> DeltaTable:
@@ -862,34 +648,315 @@ def merge_on_predicate(unique_key, predicates: Optional[List[str]] = None) -> st
     return " AND ".join(conditions)
 
 
-def _fenced_write(args: Dict[str, Any], path: str, storage_options: Optional[Dict[str, str]],
-                  read_version: int, *, refusal_prefix: str, refusal_suffix: str,
-                  record_read_version: bool = False) -> None:
-    """The single fenced (compare-and-swap) write primitive behind every pinned write: load the
-    snapshot the caller read, hand ``write_deltalake`` the pinned ``DeltaTable`` (dropping the
-    ``storage_options`` kwarg — they live on the table), and disable rebasing
-    (``max_commit_retries=0``) so any commit that landed since ``read_version`` already took our
-    target version and this write fails LOUDLY instead of silently landing on top of it.
 
-    ``record_read_version`` stamps ``duckrun.readVersion`` into commitInfo so the fence is
-    observable in the log. The refusal message is
-    ``"<prefix>: table '<path>' changed since version <vB> (a concurrent write committed)<suffix>"``.
-    """
-    dt = _delta_table(path, storage_options)
-    dt.load_as_version(read_version)
-    args["table_or_uri"] = dt
-    args.pop("storage_options", None)
-    kwargs: Dict[str, Any] = {"max_commit_retries": 0}
-    if record_read_version:
-        kwargs["custom_metadata"] = {"duckrun.readVersion": str(read_version)}
-    args["commit_properties"] = CommitProperties(**kwargs)
+# DuckDB types with no Delta equivalent (or none DuckDB's parquet writer spells the way Delta
+# readers expect): a write carrying one keeps delta-rs's writer, which casts or refuses them.
+_NOT_DUCK_WRITABLE = re.compile(
+    r"\b(?:U?HUGEINT|UBIGINT|UINTEGER|USMALLINT|UTINYINT|UUID|INTERVAL|TIME|TIMETZ|BIT|BITSTRING|"
+    r"ENUM|UNION|VARIANT|JSON|TIMESTAMP_S|TIMESTAMP_MS|TIMESTAMP_NS|GEOMETRY|VARINT|BIGNUM)\b",
+    re.I)
+
+
+def _duck_unwritable(types: Dict[str, str]) -> Optional[str]:
+    for col, typ in types.items():
+        if _NOT_DUCK_WRITABLE.search(str(typ).upper().replace("TIMESTAMP WITH TIME ZONE", "TIMESTAMPTZ")):
+            return f"column {col!r} is {typ}"
+    return None
+
+
+def _utc_arrow_schema(arrow_schema):
+    """DuckDB stamps the SESSION TimeZone on tz-aware Arrow fields; Delta records UTC (a label,
+    not a value shift)."""
+    import pyarrow as pa
+    if not any(pa.types.is_timestamp(f.type) and f.type.tz not in (None, "UTC") for f in arrow_schema):
+        return arrow_schema
+    return pa.schema([f.with_type(pa.timestamp(f.type.unit, tz="UTC"))
+                      if pa.types.is_timestamp(f.type) and f.type.tz is not None else f
+                      for f in arrow_schema], metadata=arrow_schema.metadata)
+
+
+def _write_source(cur, data, storage_options: Optional[Dict[str, str]]):
+    """``(cursor, relation, owned_connection)`` for a write: ``data`` as a DuckDB relation on the
+    cursor that will COPY it. A pyarrow / pandas object is wrapped on ``cur``; with no cursor (a
+    library call) a private in-memory connection is opened, given the OneLake secret when the
+    storage options carry a token, and closed by the caller (``owned_connection``)."""
+    owned = None
+    if cur is None:
+        import duckdb
+        from dbt.adapters.duckrun import secret as _secret
+        owned = cur = duckdb.connect()
+        configure_duckdb_session(cur)
+        _secret.ensure_azure_secret(cur, storage_options)
+        if hasattr(data, "create_view"):        # a relation of another connection: stream it over
+            data = data.arrow()
+    if data is not None and not hasattr(data, "create_view"):
+        data = cur.from_arrow(data) if hasattr(data, "__arrow_c_stream__") else cur.from_df(data)
+    return cur, data, owned
+
+
+def _commit_props(read_version: Optional[int], operation: str):
+    if read_version is None:
+        return CommitProperties(custom_metadata={"duckrun.operation": operation})
+    return CommitProperties(max_commit_retries=0, custom_metadata={
+        "duckrun.readVersion": str(read_version), "duckrun.operation": operation})
+
+
+def _refused(e: CommitFailedError, op: str, path: str, read_version: Optional[int]):
+    if read_version is None:
+        return e
+    return CommitFailedError(f"{op} refused: table '{path}' changed since version {read_version} "
+                             f"(a concurrent write committed). Re-read and retry.")
+
+
+def add_columns(path: str, data, names: List[str], *, dt: DeltaTable,
+                read_version: Optional[int]) -> None:
+    """Add ``names`` (columns of the DuckDB relation ``data``) to the table as ONE metadata-only
+    commit (delta-rs ``alter.add_columns``): existing rows read NULL. Fenced to ``read_version``
+    when given; ``dt`` (loaded at that version) moves to the new version."""
+    from deltalake import Schema as DeltaSchema
+    cols = ", ".join(quote_ident(c) for c in names)
+    arrow = _utc_arrow_schema(
+        data.query("__duckrun_add", f"SELECT {cols} FROM __duckrun_add LIMIT 0").arrow().schema)
+    fields = list(DeltaSchema.from_arrow(arrow).fields)
     try:
-        write_deltalake(**args)
+        dt.alter.add_columns(fields, commit_properties=_commit_props(read_version, "ADD COLUMNS"))
     except CommitFailedError as e:
-        raise CommitFailedError(
-            f"{refusal_prefix}: table '{path}' changed since version {read_version} "
-            f"(a concurrent write committed){refusal_suffix}"
-        ) from e
+        raise _refused(e, "add columns", path, read_version) from e
+
+
+def _table_columns(cur, dt: DeltaTable, path: str):
+    trel = cur.sql(f"SELECT * EXCLUDE ({quote_ident(cow.FILE_COL)}) "
+                   f"FROM {cow.scan(path, dt.version())}")
+    return list(trel.columns), [str(t) for t in trel.types]
+
+
+def _project_to_table(cur, data, dt: DeltaTable, path: str, *, op: str, schema_mode=None,
+                      read_version: Optional[int] = None) -> str:
+    """The select list that casts ``data`` onto the table's columns and types (what delta-rs's
+    writer did with its safe cast). With ``schema_mode='merge'`` a column the table lacks is added
+    first (a metadata commit) and a column the data lacks is NULL; otherwise either is an error."""
+    cols, types = _table_columns(cur, dt, path)
+    data_by_lower = {c.lower(): c for c in data.columns}
+    table_lower = {c.lower() for c in cols}
+    added = [c for c in data.columns if c.lower() not in table_lower]
+    if added:
+        if schema_mode != "merge":
+            raise ValueError(f"{op}: column(s) {added} are not in the table {cols}; write them "
+                             f"with schema evolution or add them first")
+        add_columns(path, data, added, dt=dt, read_version=read_version)
+        cols, types = _table_columns(cur, dt, path)
+    missing = [c for c in cols if c.lower() not in data_by_lower]
+    if missing and schema_mode != "merge":
+        raise ValueError(f"{op}: the data has no column(s) {missing}; the table has {cols}")
+    return ", ".join(
+        (f"CAST({quote_ident(data_by_lower[c.lower()])} AS {t}) AS {quote_ident(c)}"
+         if c.lower() in data_by_lower else f"CAST(NULL AS {t}) AS {quote_ident(c)}")
+        for c, t in zip(cols, types))
+
+
+def _same_shape(cur, data, dt: DeltaTable, path: str, partition_by) -> bool:
+    """True when ``data`` has the table's columns, types and partitioning."""
+    cols, types = _table_columns(cur, dt, path)
+    same_cols = dict(zip(cols, types)) == {c: str(t) for c, t in zip(data.columns, data.types)}
+    parts = list(dt.metadata().partition_columns or [])
+    return same_cols and (not partition_by or list(partition_by) == parts)
+
+
+def duckdb_write(cur, path: str, data, mode: str, *, partition_by=None, schema_mode=None,
+                 storage_options: Optional[Dict[str, str]] = None,
+                 read_version: Optional[int] = None, row_group_rows: Optional[int] = None,
+                 target_file_size: Optional[int] = None) -> None:
+    """THE write: DuckDB writes the parquet (``cow.write_files``: one COPY in the fixed read layout,
+    stats from RETURN_STATS) and delta-rs only commits the file actions.
+
+    * a new table: ``create_table_with_add_actions``;
+    * an append / an overwrite of the same shape: ``create_write_transaction`` (an overwrite removes
+      every live file itself); the data is cast onto the table's types, and with
+      ``schema_mode='merge'`` new columns are added first;
+    * an overwrite with ``schema_mode='overwrite'`` that changes the columns or the partitioning:
+      ``create_table_with_add_actions(mode='overwrite')`` — the table is redefined, its history kept.
+
+    Fenced to ``read_version`` when given (``max_commit_retries=0``): a commit since then fails it.
+    CHECK constraints, invariants and generated columns are applied in DuckDB (the rows go through a
+    temp table); NOT NULL is checked from the COPY's statistics. A table shape the commit API cannot
+    write raises :class:`cow.Unsupported` before anything is written."""
+    cur, data, owned = _write_source(cur, data, storage_options)
+    view, staged = tmp_name("dwsrc", path), tmp_name("dwrows", path)
+    try:
+        why = _duck_unwritable({c: str(t) for c, t in zip(data.columns, data.types)})
+        if why:
+            raise cow.Unsupported(f"{mode}: {why}, which Delta has no type for; cast it (VARCHAR, "
+                                  f"BIGINT, DECIMAL, TIMESTAMPTZ, ...)")
+        data.create_view(view, replace=True)
+        dt = open_if_exists(path, storage_options)
+        if dt is not None and read_version is not None:
+            dt.load_as_version(read_version)
+        if (dt is not None and mode == "overwrite" and schema_mode == "overwrite"
+                and not _same_shape(cur, data, dt, path, partition_by)):
+            if cow.mapping_mode(dt.metadata().configuration) is not None:
+                raise cow.Unsupported(f"overwrite: replacing the schema of a column-mapped table; "
+                                      f"DROP TABLE {path!r} and create it again")
+            _replace_table(cur, view, data, dt, path, partition_by, storage_options, read_version,
+                           row_group_rows, target_file_size)
+            return
+        if dt is None:
+            _create_table(cur, view, path, partition_by, storage_options, row_group_rows,
+                          target_file_size)
+            return
+        why = cow.unsupported_reason(dt, mode)
+        if why:
+            raise cow.Unsupported(f"{mode}: {why}")
+        table_parts = list(dt.metadata().partition_columns or [])
+        if partition_by and list(partition_by) != table_parts:
+            raise ValueError(f"{mode}: partition_by {list(partition_by)} differs from the table's "
+                             f"{table_parts}")
+        projection = _project_to_table(cur, data, dt, path, op=mode, schema_mode=schema_mode,
+                                       read_version=read_version)
+        if read_version is not None:
+            read_version = dt.version()        # past our own add-columns commit, if one ran
+        source = f'(SELECT {projection} FROM "{view}")'
+        checks, generated = cow._table_rules(dt)
+        if checks or generated:
+            cow.check_table_rules(cur, source, dt)
+            cur.execute(f'CREATE OR REPLACE TEMP TABLE "{staged}" AS SELECT * FROM {source}')
+            cow.apply_table_rules(cur, f'"{staged}"', dt, mode.upper())
+            source = f'"{staged}"'
+        adds = cow.write_files(cur, source, path, partition_by=table_parts,
+                               row_group_rows=row_group_rows, target_file_size=target_file_size,
+                               configuration=dt.metadata().configuration,
+                               mapping=cow.column_mapping(dt),
+                               not_null=[f.name for f in dt.schema().fields if not f.nullable],
+                               operation=mode.upper())
+        if mode == "append" and not adds:
+            logger.info("append: no rows; nothing to commit")
+            return
+        try:
+            dt.create_write_transaction(adds, mode=mode, schema=dt.schema(),
+                                        partition_by=table_parts or None,
+                                        commit_properties=_commit_props(read_version, mode.upper()))
+        except CommitFailedError as e:
+            raise _refused(e, mode, path, read_version) from e
+        logger.info(f"{mode}: DuckDB write, delta_rs commit ({len(adds)} file(s))")
+    finally:
+        for stmt in (f'DROP VIEW IF EXISTS "{view}"', f'DROP TABLE IF EXISTS "{staged}"'):
+            try:
+                cur.execute(stmt)
+            except Exception:  # pragma: no cover - scoped to this write; a leftover is harmless
+                pass
+        if owned is not None:
+            owned.close()
+
+
+def _new_table_schema(cur, view: str):
+    from deltalake import Schema as DeltaSchema
+    return DeltaSchema.from_arrow(
+        _utc_arrow_schema(cur.sql(f'SELECT * FROM "{view}" LIMIT 0').arrow().schema))
+
+
+def _create_table(cur, view, path, partition_by, storage_options, row_group_rows,
+                  target_file_size) -> None:
+    from deltalake.transaction import create_table_with_add_actions
+    parts = list(partition_by or [])
+    adds = cow.write_files(cur, f'"{view}"', path, partition_by=parts,
+                           row_group_rows=row_group_rows, target_file_size=target_file_size,
+                           operation="CREATE")
+    create_table_with_add_actions(
+        path, _new_table_schema(cur, view), adds, mode="error", partition_by=parts or None,
+        storage_options=storage_options,
+        configuration={"delta.checkpointInterval": str(CHECKPOINT_INTERVAL)},
+        commit_properties=_commit_props(None, "CREATE TABLE"))
+    logger.info(f"create: DuckDB write, delta_rs commit (new table, {len(adds)} file(s))")
+
+
+def _replace_table(cur, view, data, dt, path, partition_by, storage_options, read_version,
+                   row_group_rows, target_file_size) -> None:
+    """CREATE OR REPLACE with another schema or partitioning: a new table definition committed on
+    top of the old one's history (``create_table_with_add_actions(mode='overwrite')``)."""
+    from deltalake.transaction import create_table_with_add_actions
+    parts = list(partition_by if partition_by is not None
+                 else (dt.metadata().partition_columns or []))
+    parts = [p for p in parts if p in data.columns]
+    adds = cow.write_files(cur, f'"{view}"', path, partition_by=parts,
+                           row_group_rows=row_group_rows, target_file_size=target_file_size,
+                           operation="OVERWRITE")
+    if read_version is not None and _delta_table(path, storage_options).version() != read_version:
+        raise CommitFailedError(f"overwrite refused: table '{path}' changed since version "
+                                f"{read_version} (a concurrent write committed). Re-read and retry.")
+    conf = {k: v for k, v in (dt.metadata().configuration or {}).items()
+            if not k.startswith("delta.columnMapping")}
+    conf.setdefault("delta.checkpointInterval", str(CHECKPOINT_INTERVAL))
+    try:
+        create_table_with_add_actions(
+            path, _new_table_schema(cur, view), adds, mode="overwrite", partition_by=parts or None,
+            storage_options=storage_options, configuration=conf,
+            commit_properties=_commit_props(read_version, "CREATE OR REPLACE TABLE"))
+    except CommitFailedError as e:
+        raise _refused(e, "overwrite", path, read_version) from e
+    logger.info(f"overwrite: DuckDB write, delta_rs commit (table redefined, {len(adds)} file(s))")
+
+
+def replace_rows(cur, path: str, data, predicate: str, *, read_version: int,
+                 storage_options: Optional[Dict[str, str]] = None,
+                 row_group_rows: Optional[int] = None,
+                 target_file_size: Optional[int] = None, operation: str = "REPLACE WHERE") -> None:
+    """``replaceWhere`` in DuckDB, as ONE fenced commit: the rows where ``predicate`` (DuckDB SQL
+    over the table's columns) is true are replaced by ``data``. Every row of ``data`` must satisfy
+    the predicate. The touched files' other rows are rewritten (order kept); the new rows are
+    written; the commit adds both and removes the touched files."""
+    cur, data, owned = _write_source(cur, data, storage_options)
+    view = tmp_name("rwsrc", path)
+    new, touched, kept = tmp_name("rwnew", path), tmp_name("rwfiles", path), tmp_name("rwkept", path)
+    try:
+        dt = _delta_table(path, storage_options)
+        dt.load_as_version(read_version)
+        why = cow.unsupported_reason(dt, "rewrite")
+        if why:
+            raise cow.Unsupported(f"{operation.lower()}: {why}")
+        data.create_view(view, replace=True)
+        projection = _project_to_table(cur, data, dt, path, op=operation.lower())
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{new}" AS SELECT {projection} FROM "{view}"')
+        outside = cur.execute(f'SELECT count(*) FROM "{new}" WHERE ({predicate}) IS NOT TRUE'
+                              ).fetchall()[0][0]
+        if outside:
+            raise ValueError(f"{operation}: {outside} row(s) of the new data do not match the "
+                             f"predicate ({predicate}); nothing written")
+        checks, generated = cow._table_rules(dt)
+        if checks or generated:
+            cow.check_table_rules(cur, f'"{new}"', dt)
+            cow.apply_table_rules(cur, f'"{new}"', dt, operation)
+        parts = list(dt.metadata().partition_columns or [])
+        common = dict(partition_by=parts, row_group_rows=row_group_rows,
+                      target_file_size=target_file_size, configuration=dt.metadata().configuration,
+                      mapping=cow.column_mapping(dt), operation=operation)
+        adds = cow.write_files(cur, f'"{new}"', path,
+                               not_null=[f.name for f in dt.schema().fields if not f.nullable],
+                               **common)
+        scan = cow.scan(path, read_version)
+        fcol = quote_ident(cow.FILE_COL)
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
+                    f"SELECT DISTINCT {fcol} AS f FROM {scan} WHERE ({predicate}) IS TRUE")
+        gone = [r[0] for r in cur.execute(f'SELECT f FROM "{touched}"').fetchall()]
+        if gone:
+            cur.execute(f'CREATE OR REPLACE TEMP TABLE "{kept}" AS SELECT *, {cow.with_position()} '
+                        f'FROM {scan} WHERE {fcol} IN (SELECT f FROM "{touched}") '
+                        f"AND ({predicate}) IS NOT TRUE")
+            adds += cow.write_files(cur, f'"{kept}"', path, **common)
+        if not adds and not gone:
+            logger.info(f"{operation.lower()}: nothing to replace; nothing to commit")
+            return
+        cow.commit(dt, path, adds + cow.removes_for(cur, dt, gone), read_version=read_version,
+                   operation=operation)
+        logger.info(f"{operation.lower()}: DuckDB write, delta_rs commit "
+                    f"({len(adds)} added, {len(gone)} removed)")
+    finally:
+        for stmt in (f'DROP VIEW IF EXISTS "{view}"', f'DROP TABLE IF EXISTS "{new}"',
+                     f'DROP TABLE IF EXISTS "{touched}"', f'DROP TABLE IF EXISTS "{kept}"'):
+            try:
+                cur.execute(stmt)
+            except Exception:  # pragma: no cover - scoped to this write; a leftover is harmless
+                pass
+        if owned is not None:
+            owned.close()
 
 
 def table_exists(path: str, storage_options: Optional[Dict[str, str]] = None) -> bool:
@@ -1372,8 +1439,8 @@ def _maintain_inner(cur, path, storage_options, target_file_size, row_group_cap)
     _compact_rg = row_group_cap
 
     def _compact():
-        dt.optimize.compact(target_size=_target,
-                            writer_properties=_writer_properties(row_group_rows=_compact_rg))
+        compact(cur, path, dt=dt, target_size=_target, row_group_rows=_compact_rg,
+                storage_options=storage_options)
 
     def _vacuum():  # past the retention-length gate only; a compaction just ran → compacted=True
         if policy.should_vacuum(compacted=True, last_vacuum_age_s=_last_vacuum_age_s(dt)):
@@ -1462,26 +1529,10 @@ def write_delta(
         timestamp_ntz=timestamp_ntz, existing_dt=existing_dt,
     )
 
-    args = build_write_deltalake_args(
-        path, data, mode,
-        schema_mode=schema_mode,
-        partition_by=partition_by,
-        storage_options=storage_options,
-        row_group_rows=row_group_rows,
-        target_file_size=target_file_size,
-    )
-    if read_version is None:
-        write_deltalake(**args)
-    else:
-        # Fenced (compare-and-swap) via the one _fenced_write primitive. Kept here — not in the
-        # fenced wrappers — so this stays the single seam a streamed mid-write race is observable at.
-        # duckrun.readVersion is recorded in commitInfo so the fence is OBSERVABLE: a fenced append
-        # (the self-reading `insert into t select … from t`, or safeappend) carries it, a blind
-        # last-writer-wins append does not — a concurrent writer / external reader can tell them
-        # apart in the log.
-        _fenced_write(args, path, storage_options, read_version,
-                      refusal_prefix=f"{mode} refused", refusal_suffix=". Re-read and retry.",
-                      record_read_version=True)
+    # DuckDB writes the parquet; delta-rs commits the file actions (see duckdb_write).
+    duckdb_write(cur, path, data, mode, partition_by=partition_by, schema_mode=schema_mode,
+                 storage_options=storage_options, read_version=read_version,
+                 row_group_rows=row_group_rows, target_file_size=target_file_size)
 
     if mode == "overwrite":
         # Post-commit housekeeping, never fatal (same contract as _maintain): the overwrite has
@@ -1537,15 +1588,6 @@ def set_table_properties(path: str, properties: Dict[str, str], *,
                          storage_options: Optional[Dict[str, str]] = None) -> None:
     """Set table properties (delta_rs ``alter.set_table_properties``): one metadata commit."""
     _delta_table(path, storage_options).alter.set_table_properties(properties)
-
-
-def z_order(path: str, columns: List[str], *, target_size: Optional[int] = None,
-            storage_options: Optional[Dict[str, str]] = None) -> Dict:
-    """Rewrite the table z-ordered on ``columns`` (delta_rs ``optimize.z_order``, dataChange=false),
-    in the same writer layout as compaction."""
-    dt = _delta_table(path, storage_options)
-    return dt.optimize.z_order(columns, target_size=target_size,
-                               writer_properties=_writer_properties())
 
 
 def append_if_unchanged(
@@ -1670,8 +1712,8 @@ def replace_where(
     pair — so there is no torn-read window (a reader never sees the range emptied-but-not-refilled)
     and no half-applied failure state.
 
-    ``predicate`` is a delta_rs/datafusion SQL expression. Keep it CAST-free: delta_rs can't
-    serialize a CAST expression back to a string ("Unable to convert expression to string").
+    ``predicate`` is DuckDB SQL over the table's columns; DuckDB rewrites the touched files and
+    delta-rs commits (:func:`replace_rows`). Every row of ``data`` must satisfy it.
 
     A replaceWhere is a read-modify-write, so ``read_version`` is REQUIRED (no blind-HEAD path):
     the overwrite is pinned to that snapshot and committed with ``max_commit_retries=0``
@@ -1692,15 +1734,9 @@ def replace_where(
         data, path=path, storage_options=storage_options,
         timestamp_ntz=timestamp_ntz, existing_dt=existing_dt,
     )
-    args = build_write_deltalake_args(
-        path, data, "overwrite", partition_by=partition_by, storage_options=storage_options,
-        row_group_rows=row_group_rows, target_file_size=target_file_size,
-    )
-    args["predicate"] = predicate  # replaceWhere: overwrite ONLY the rows matching the predicate
-    # Pin to the read snapshot and disable rebasing (CAS), so a concurrent commit since vB fails
-    # this overwrite instead of landing on top of it.
-    _fenced_write(args, path, storage_options, read_version,
-                  refusal_prefix="replaceWhere", refusal_suffix="; replace refused. Re-run.")
+    replace_rows(cur, path, data, predicate, read_version=read_version,
+                 storage_options=storage_options, row_group_rows=row_group_rows,
+                 target_file_size=target_file_size)
 
     # Maintenance ALWAYS at a fresh HEAD — never the pinned snapshot (a stale file list would
     # compact/vacuum files live versions still reference and corrupt the table).
@@ -1729,8 +1765,8 @@ def replace_window(
     window, insert the batch", as ONE atomic commit (``replaceWhere``). ``start``/``end`` are
     naive ``YYYY-MM-DD HH:MM:SS`` strings (UTC batch bounds from dbt). Delegates to
     :func:`replace_where` with the window predicate; ``read_version`` pins/fences the commit."""
-    # CAST-free window predicate — see replace_where. delta_rs coerces the string literals to the
-    # column's type, so this works whether event_time is a DATE or a TIMESTAMP.
+    # The bounds as string literals: DuckDB casts them to the column's type, so this works whether
+    # event_time is a DATE or a TIMESTAMP.
     _col = quote_ident(column)
     predicate = f"{_col} >= '{start}' AND {_col} < '{end}'"
     replace_where(
@@ -1751,32 +1787,24 @@ def delete_rows(
     cur=None,
     dt: Optional[DeltaTable] = None,
 ) -> None:
-    """Delete rows matching ``predicate`` (a delta_rs/datafusion SQL expression), or every row
-    when ``predicate`` is None. The Delta-native ``DELETE FROM`` for the connection API.
-    ``dt`` reuses an already-opened handle (e.g. the statement's existence check) instead of a
-    fresh log open.
-
-    A delete is a read-modify-write, so it is pinned to ``read_version`` (the version the caller
-    read) with ``load_as_version`` and committed under delta-rs native OCC — exactly like merge:
-    delta-rs validates the operation over ``(read_version, HEAD]`` and fails loudly if a
-    *conflicting* commit landed since that version (a non-conflicting one rebases). ``read_version``
-    is REQUIRED (no blind-HEAD path). Then maintenance at a fresh HEAD."""
+    """Delete rows matching ``predicate`` (DuckDB SQL over the table's columns), or every row when
+    ``predicate`` is None: copy-on-write (:func:`cow_rewrite`), pinned to ``read_version`` (REQUIRED —
+    a delete is a read-modify-write) so a commit since then fails it. Then maintenance at a fresh
+    HEAD. ``dt`` reuses an already-opened handle instead of a fresh log open."""
     if read_version is None:
         raise ValueError(
             "delete_rows requires read_version (the version the caller read). A delete is a "
             "read-modify-write and must be pinned to its snapshot — pass the version you read "
             "(engine.table_version(path, storage_options) captures the current HEAD)."
         )
-    dt = dt if dt is not None else _delta_table(path, storage_options)
-    dt.load_as_version(read_version)
+    cur, _, owned = _write_source(cur, None, storage_options)
     try:
-        dt.delete(predicate)
-    except CommitFailedError as e:
-        raise CommitFailedError(
-            f"delete: table '{path}' changed since version {read_version} "
-            f"(a conflicting concurrent write committed); delete refused. Re-read and retry."
-        ) from e
-    _maintain(cur, path, storage_options=storage_options)
+        cow_rewrite(cur, path, where=predicate, delete=True, read_version=read_version,
+                    storage_options=storage_options, dt=dt, operation="DELETE")
+        _maintain(cur, path, storage_options=storage_options)
+    finally:
+        if owned is not None:
+            owned.close()
 
 
 def update_rows(
@@ -1789,13 +1817,9 @@ def update_rows(
     cur=None,
     dt: Optional[DeltaTable] = None,
 ) -> None:
-    """Update ``{column: expression}`` for rows matching ``predicate`` (delta_rs/datafusion SQL),
-    or every row when ``predicate`` is None. The Delta-native ``UPDATE`` for the connection API.
-
-    Like :func:`delete_rows`, an update is a read-modify-write: pinned to ``read_version`` with
-    ``load_as_version`` and committed under delta-rs native OCC over ``(read_version, HEAD]``
-    (conflict → fail, like merge). ``read_version`` is REQUIRED. Then maintenance at a fresh HEAD.
-    ``dt`` reuses an already-opened handle instead of a fresh log open."""
+    """Update ``{column: expression}`` (DuckDB SQL) for rows matching ``predicate``, or every row
+    when ``predicate`` is None: copy-on-write (:func:`cow_rewrite`), pinned to ``read_version``
+    (REQUIRED). An unknown SET column fails before anything is written. Then maintenance."""
     if read_version is None:
         raise ValueError(
             "update_rows requires read_version (the version the caller read). An update is a "
@@ -1803,10 +1827,6 @@ def update_rows(
             "(engine.table_version(path, storage_options) captures the current HEAD)."
         )
     dt = dt if dt is not None else _delta_table(path, storage_options)
-    dt.load_as_version(read_version)
-    # Validate SET targets against the real schema BEFORE dt.update(): delta_rs silently accepts an
-    # unknown column, writing a no-op commit that advances the log while changing nothing. Fail loud
-    # with no commit — the same guard the raw-SQL UPDATE path applies (SQL == DataFrame parity).
     target_cols = [f.name for f in dt.schema().fields]
     by_lower = {c.lower(): c for c in target_cols}
     unknown = [c for c in updates if str(c).strip('"').lower() not in by_lower]
@@ -1814,18 +1834,19 @@ def update_rows(
         raise ValueError(
             f"UPDATE on {path!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
         )
-    # SET columns match case-insensitively (as in DuckDB SQL), but delta_rs >= 1.7 matches them
-    # exactly — so hand it the table's own spelling, keeping a caller's quotes.
-    updates = {(f'"{by_lower[str(c).strip(chr(34)).lower()]}"' if str(c).startswith('"')
-                else by_lower[str(c).lower()]): expr for c, expr in updates.items()}
+    updates = {by_lower[str(c).strip('"').lower()]: expr for c, expr in updates.items()}
+    replaces = ", ".join(
+        (f"CASE WHEN ({predicate}) THEN ({expr}) ELSE {quote_ident(col)} END AS {quote_ident(col)}"
+         if predicate else f"({expr}) AS {quote_ident(col)}")
+        for col, expr in updates.items())
+    cur, _, owned = _write_source(cur, None, storage_options)
     try:
-        dt.update(updates=updates, predicate=predicate)
-    except CommitFailedError as e:
-        raise CommitFailedError(
-            f"update: table '{path}' changed since version {read_version} "
-            f"(a conflicting concurrent write committed); update refused. Re-read and retry."
-        ) from e
-    _maintain(cur, path, storage_options=storage_options)
+        cow_rewrite(cur, path, where=predicate, replaces=replaces, read_version=read_version,
+                    storage_options=storage_options, dt=dt, operation="UPDATE", changes=updates)
+        _maintain(cur, path, storage_options=storage_options)
+    finally:
+        if owned is not None:
+            owned.close()
 
 
 def vacuum(
@@ -1855,16 +1876,89 @@ def optimize(
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
 ) -> Dict:
-    """Compact small files into larger ones (delta_rs ``optimize.compact``) and return the operation
-    metrics. Reuses the one ``_writer_properties()`` read layout (the fixed 4M-row ceiling — same as
-    every write; ``cur`` is accepted for API compatibility and unused). A lexicographic ``ORDER BY``
-    at write time
-    (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a columnar reader wants;
-    there is no z-order path — bit-interleaving destroys the run-length runs the in-memory reader
-    relies on."""
-    dt = _delta_table(path, storage_options)
-    return dt.optimize.compact(target_size=target_size,
-                               writer_properties=_writer_properties())
+    """``OPTIMIZE``: compact the table's small files (:func:`compact`). A table shape compaction
+    cannot rewrite (deletion vectors) raises :class:`cow.Unsupported`. A lexicographic ``ORDER BY``
+    at write time (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a
+    columnar reader wants; there is no z-order — bit-interleaving destroys the run-length runs the
+    in-memory reader relies on."""
+    cur, _, owned = _write_source(cur, None, storage_options)
+    try:
+        return compact(cur, path, target_size=target_size, storage_options=storage_options,
+                       explicit=True)
+    finally:
+        if owned is not None:
+            owned.close()
+
+
+def compact(cur, path: str, *, dt: Optional[DeltaTable] = None, target_size: Optional[int] = None,
+            row_group_rows: Optional[int] = None,
+            storage_options: Optional[Dict[str, str]] = None, explicit: bool = False) -> Dict:
+    """Compaction in DuckDB: in each partition holding two or more files under half the target
+    size, read those files (rows in their order), write them again in the read layout
+    (``cow.write_files``) and commit the new files and the removal of the old ones as ONE
+    ``dataChange=false`` transaction, pinned to the version read (a concurrent commit fails it).
+    Returns ``{"numFilesAdded", "numFilesRemoved"}``. A deletion-vector table raises when
+    ``explicit`` (OPTIMIZE) and is skipped otherwise (post-write maintenance).
+
+    WORKAROUND — a compaction is not a write, but delta-rs's commit API
+    (``create_write_transaction``) records every commit as operation ``WRITE``; it has no OPTIMIZE
+    operation. What makes it a compaction for readers is the protocol's own flag: every add and
+    remove here carries ``dataChange=false``, so streaming / change-data-feed readers and Spark /
+    Fabric treat the commit as moving no data. ``custom_metadata`` adds ``duckrun.operation =
+    OPTIMIZE`` to the commitInfo so the history says what it was. Drop this note once the commit
+    API can record the operation."""
+    from urllib.parse import unquote
+
+    dt = dt or _delta_table(path, storage_options)
+    why = cow.unsupported_reason(dt, "compact")
+    if why:
+        if explicit:
+            raise cow.Unsupported(f"optimize: {why}")
+        logger.info(f"compaction skipped ({why})")
+        return {"numFilesAdded": 0, "numFilesRemoved": 0}
+    target = target_size if target_size is not None else _TARGET_FILE_SIZE
+    add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - DuckDB replacement scan by name
+    pcols = [d[0] for d in cur.sql("SELECT * FROM add_actions LIMIT 0").description
+             if d[0].startswith("partition.")]
+    key = ", ".join(quote_ident(c) for c in pcols) or "1"
+    small = cur.sql(
+        f"SELECT path FROM (SELECT path, count(*) OVER (PARTITION BY {key}) AS n FROM add_actions "
+        f"WHERE size_bytes < {int(target * 0.5)}) WHERE n >= 2").fetchall()
+    if not small:
+        return {"numFilesAdded": 0, "numFilesRemoved": 0}
+    root = path.replace("\\", "/").rstrip("/") + "/"
+    full = [root + unquote(r[0]) for r in small]
+    version = dt.version()
+    scan, fcol = cow.scan(path, version), quote_ident(cow.FILE_COL)
+    rows = tmp_name("cmprows", path)
+    try:
+        listed = ", ".join(cow._lit(f) for f in full)
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT *, {cow.with_position()} '
+                    f"FROM {scan} WHERE {fcol} IN ({listed})")
+        got = cur.execute(f'SELECT count(DISTINCT {fcol}) FROM "{rows}"').fetchall()[0][0]
+        if got != len(full):
+            # The scan spells file paths differently (an encoded character, a drive alias): match
+            # on the file name instead — a full scan of the table, but the same files.
+            names = ", ".join(cow._lit(f.rsplit("/", 1)[-1]) for f in full)
+            cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT *, {cow.with_position()} '
+                        f"FROM {scan} WHERE parse_filename({fcol}) IN ({names})")
+        gone = [r[0] for r in cur.execute(f'SELECT DISTINCT {fcol} FROM "{rows}"').fetchall()]
+        adds = cow.write_files(cur, f'"{rows}"', path,
+                               partition_by=list(dt.metadata().partition_columns or []),
+                               row_group_rows=row_group_rows, target_file_size=target,
+                               configuration=dt.metadata().configuration,
+                               mapping=cow.column_mapping(dt), operation="OPTIMIZE",
+                               data_change=False)
+        removes = cow.removes_for(cur, dt, gone, data_change=False)
+        cow.commit(dt, path, adds + removes, read_version=version, operation="OPTIMIZE")
+        logger.info(f"compaction: {len(removes)} file(s) into {len(adds)} (DuckDB write, "
+                    f"delta_rs commit)")
+        return {"numFilesAdded": len(adds), "numFilesRemoved": len(removes)}
+    finally:
+        try:
+            cur.execute(f'DROP TABLE IF EXISTS "{rows}"')
+        except Exception:  # pragma: no cover - scoped to this compaction; a leftover is harmless
+            pass
 
 
 def compaction_debt(cur, path: str, *, dt: Optional[DeltaTable] = None,
@@ -2053,30 +2147,6 @@ def merge_delta(
     )
 
 
-# delta-rs TableMerger method per (clause, action) — the full surface duckrun's connection-API MERGE
-# exposes. `*_all` take except_cols; `update`/`insert` take an `updates` map; `delete` takes neither.
-def _apply_merge_clause(merger, c: dict):
-    clause, action = c["clause"], c["action"]
-    pred = c.get("predicate")
-    if clause == "matched":
-        if action == "update_all":
-            return merger.when_matched_update_all(predicate=pred, except_cols=c.get("except_cols"))
-        if action == "update":
-            return merger.when_matched_update(updates=c["updates"], predicate=pred)
-        if action == "delete":
-            return merger.when_matched_delete(predicate=pred)
-    elif clause == "not_matched":
-        if action == "insert_all":
-            return merger.when_not_matched_insert_all(predicate=pred, except_cols=c.get("except_cols"))
-        if action == "insert":
-            return merger.when_not_matched_insert(updates=c["updates"], predicate=pred)
-    elif clause == "not_matched_by_source":
-        if action == "update":
-            return merger.when_not_matched_by_source_update(updates=c["updates"], predicate=pred)
-        if action == "delete":
-            return merger.when_not_matched_by_source_delete(predicate=pred)
-    raise ValueError(f"unsupported merge clause/action: {clause}/{action}")
-
 
 # Equality pair in a MERGE ON predicate, either order: `source.x = target.y` / `target.y = source.x`.
 _MERGE_EQ_RE = re.compile(r'(?i)(source|target)\.("?)(\w+)\2\s*=\s*(source|target)\.("?)(\w+)\5')
@@ -2106,52 +2176,6 @@ def _merge_source_keys(predicate: str) -> List[str]:
             out.append(k)
     return out
 
-
-def _merge_spill_caps(max_spill_size, max_temp_directory_size, streamed_exec):
-    """Resolve + log the merge's two spill caps: the in-memory ``max_spill_size`` (a share of the
-    effective RAM limit) and the on-disk ``max_temp_directory_size`` (a share of the spill disk's
-    free space, overriding delta_rs/DataFusion's flat 100 GB default). Returns the kwarg dicts to
-    forward — empty when a cap is undetectable or opted out (0), preserving delta_rs defaults."""
-    # Sample the effective limit ONCE so the cap we apply and the cap we log can't disagree:
-    # free RAM is read live on every call, so two separate reads would drift on a busy box.
-    eff_limit = _effective_mem_limit_bytes()
-    if max_spill_size is None:
-        max_spill_size = int(eff_limit * _MERGE_SPILL_FRACTION) if eff_limit else None
-    # Only forward the kwarg when we have a positive cap: delta_rs builds a spilling session
-    # only when max_spill_size is set, so omitting it preserves the prior unbounded behavior
-    # (e.g. RAM undetectable, or caller explicitly passed 0 to opt out).
-    spill_kwargs = {"max_spill_size": max_spill_size} if max_spill_size else {}
-
-    if max_temp_directory_size is None:
-        max_temp_directory_size = _default_merge_temp_dir_size()
-    temp_dir_kwargs = (
-        {"max_temp_directory_size": max_temp_directory_size} if max_temp_directory_size else {}
-    )
-
-    # Make the spill decision observable: this is the only way to confirm, from a normal dbt
-    # run, that the cgroup-aware cap is actually being applied (and what value it picked).
-    if spill_kwargs:
-        logger.info(
-            f"merge spill cap: {max_spill_size / 2**30:.2f} GiB "
-            f"({int(_MERGE_SPILL_FRACTION * 100)}% of {(eff_limit or 0) / 2**30:.2f} GiB "
-            f"{_effective_mem_limit_source()})"
-        )
-    else:
-        logger.info("merge spill cap: disabled (memory limit undetectable or opted out) — merge runs unbounded")
-    if temp_dir_kwargs:
-        logger.info(
-            f"merge disk spill cap: {max_temp_directory_size / 2**30:.2f} GiB "
-            f"(free on {_merge_spill_dir()} minus a min(20%, 8 GiB) reserve) "
-            f"— overrides delta_rs's 100 GB default"
-        )
-    else:
-        logger.info("merge disk spill cap: delta_rs default (100 GB) — free disk space undetectable")
-    logger.info(
-        "merge target pruning: "
-        + ("on (source stats derive an early filter)" if not streamed_exec
-           else "off (streamed_exec=True — source streamed, whole target scanned)")
-    )
-    return spill_kwargs, temp_dir_kwargs
 
 
 def assert_source_unique(data, keys: List[str]) -> None:
@@ -2506,68 +2530,13 @@ def _merge_evolve_schema(path, data, storage_options, read_version: int, merge_s
     added = [c for c in data.columns if c.lower() not in existing]
     if not added:
         return read_version
-    # Compare-and-swap add-columns pinned to read_version (same primitive as append_if_unchanged):
-    # a zero-row append with schema_mode="merge" adds only the new columns (delta_rs derives their
-    # types from the source's Arrow stream) and commits nothing else.
-    evo_args = build_write_deltalake_args(
-        path, data.limit(0), "append",
-        schema_mode="merge",
-        storage_options=storage_options,
-    )
-    _fenced_write(evo_args, path, storage_options, read_version,
-                  refusal_prefix="schema evolution",
-                  refusal_suffix="; the on_schema_change add-columns commit was "
-                                 "refused before the merge. Re-read and retry.")
+    # Compare-and-swap add-columns pinned to read_version: ONE metadata-only commit
+    # (alter.add_columns) with the columns' types taken from the source relation.
+    dt = _delta_table(path, storage_options)
+    dt.load_as_version(read_version)
+    add_columns(path, data, added, dt=dt, read_version=read_version)
     return read_version + 1
 
-
-def _merge_partition_prune(dt: DeltaTable, data, predicate: str, streamed_exec: bool) -> str:
-    """Explicit partition-set pruning. delta_rs's auto early_filter (try_construct_early_filter) is
-    fragile: it silently returns None — degrading to a FULL target scan — on multi-key predicates
-    (delta-rs #3636) and whenever source min/max stats are unavailable. For each PARTITION column
-    joined as `target.p = source.p`, collect the source's DISTINCT values and fold a CONSTANT
-    `target.p IN (<vals>)` into the ON predicate. This is RESULT-NEUTRAL — any target row that can
-    match `source.p` already carries one of those values — but hands delta_rs a plan-time literal it
-    can push down to skip partition files deterministically, which is exactly what its own docs
-    recommend doing by hand. IN (not BETWEEN min/max): a source that unions two feeds (e.g. an old
-    backfill + a current stream) is BIMODAL, so min/max would smear the bound across the whole table
-    while the true set is a handful of partitions. Numeric partition cols only, capped at
-    _PART_PRUNE_MAX distinct values (beyond that the IN list stops helping and we let delta_rs be);
-    skipped for by-source merges (streamed_exec, which can't prune anyway). Best-effort: never break
-    a merge."""
-    if streamed_exec or not hasattr(data, "query"):
-        return predicate
-    try:
-        part_cols = list(dt.metadata().partition_columns or [])
-    except Exception:
-        part_cols = []
-    conds = []
-    for pcol in part_cols:
-        if not re.search(rf'target\."?{re.escape(pcol)}"?\s*=\s*source\."?{re.escape(pcol)}"?',
-                         predicate, re.I):
-            continue
-        q = '"' + pcol.replace('"', '""') + '"'
-        try:
-            rows = data.query(
-                "__mp",
-                f"SELECT DISTINCT {q} FROM __mp WHERE {q} IS NOT NULL LIMIT {_PART_PRUNE_MAX + 1}",
-            ).fetchall()
-        except Exception as e:
-            logger.warning(f"merge partition-set pruning: could not collect {pcol!r} values "
-                           f"({e!r}); skipping")
-            continue
-        vals = [r[0] for r in rows]
-        if not vals or len(vals) > _PART_PRUNE_MAX:
-            continue
-        if any(v is None or isinstance(v, bool) or not isinstance(v, (int, float)) for v in vals):
-            continue
-        tq = "target." + q
-        lst = ", ".join(str(v) for v in sorted(vals))
-        conds.append(f"{tq} IN ({lst})")
-        logger.info(f"merge partition-set pruning: injected {tq} IN ({lst})")
-    if conds:
-        return f"({predicate}) AND " + " AND ".join(conds)
-    return predicate
 
 
 def _cow_merge_clauses(clauses: List[dict], target_cols: List[str], source_cols: List[str]) -> str:
@@ -2646,27 +2615,26 @@ def _cow_touch_case(clauses: List[dict], kind: str, target_cols: List[str], sour
 def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read_version: int,
               storage_options: Optional[Dict[str, str]] = None, sort_by=None,
               row_group_rows: Optional[int] = None,
-              target_file_size: Optional[int] = None) -> bool:
+              target_file_size: Optional[int] = None) -> None:
     """MERGE as copy-on-write: DuckDB finds the files the source touches, rewrites their rows with
     its own ``MERGE`` (inserts included) and writes the parquet; delta-rs commits only the add +
-    remove actions, pinned to ``read_version``. Returns False, having written nothing, when the
-    table or the statement needs the delta-rs merge (the caller then runs it).
+    remove actions, pinned to ``read_version``.
 
     Everything that can refuse the statement is decided BEFORE anything executes: the table shape,
-    and a bind-only check (``cur.sql``) of every expression. A failed statement inside dbt's open
-    transaction aborts it, so the fallback must never be a caught execution error — once the
-    statement runs, an error fails it loudly."""
+    and a bind-only check (``cur.sql``) of every expression; a refusal raises
+    :class:`cow.Unsupported` with nothing written. ``cur`` must be the connection ``data`` lives
+    on (see :func:`_write_source`)."""
     dt = _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     why = cow.unsupported_reason(dt)
     if why:
-        logger.info(f"merge: delta_rs path ({why})")
-        return False
+        raise cow.Unsupported(f"merge: {why}")
     try:
         source = f"({data.sql_query()})"      # the source as SQL: no view to register or drop
-    except Exception as e:
-        logger.info(f"merge: delta_rs path (the source is not a SQL relation: {e})")
-        return False
+    except Exception:
+        view = tmp_name("cowsrcv", path)
+        data.create_view(view, replace=True)
+        source = f'"{view}"'
     scan = cow.scan(path, read_version)
     fcol = quote_ident(cow.FILE_COL)
     exprs = [predicate] + [c["predicate"] for c in clauses if c.get("predicate")] + [
@@ -2688,9 +2656,10 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
         if orphan_chg != "false":
             cur.sql(f"SELECT {orphan_chg} FROM {scan} AS target")
         cow.check_table_rules(cur, scan, dt)
+    except cow.Unsupported:
+        raise
     except Exception as e:
-        logger.info(f"merge: delta_rs path (DuckDB cannot run this merge: {e})")
-        return False
+        raise cow.Unsupported(f"merge: DuckDB cannot run this merge: {e}") from e
     src, hits = tmp_name("cowsrc", path), tmp_name("cowhits", path)
     touched, rows = tmp_name("cowfiles", path), tmp_name("cowrows", path)
     try:
@@ -2735,7 +2704,7 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
             cow.commit(dt, path, adds + removes, read_version=read_version, operation="MERGE")
         else:
             logger.info("merge: no row changes; nothing to commit")
-        return True
+        return
     finally:
         for name in (src, hits, touched, rows):
             try:
@@ -2753,22 +2722,18 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], replaces: Optional[str]
     ``delete=True`` keeps the rows where ``where`` is not true; otherwise ``replaces`` (the body of
     a ``* REPLACE (...)`` over the scan) rewrites the touched files' rows. ``where=None`` touches
     every file. ``changes`` (an UPDATE's ``{column: expr}``) narrows the touched files to those
-    holding a row the assignment actually changes. Returns False, having written nothing, when the
-    table needs delta-rs — decided before anything executes."""
+    holding a row the assignment actually changes. A table shape the commit API cannot rewrite, or a
+    table rule DuckDB cannot evaluate, raises :class:`cow.Unsupported` before anything executes.
+    Returns True."""
     dt = dt if dt is not None else _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     why = cow.unsupported_reason(dt)
     if why:
-        logger.info(f"{operation.lower()}: delta_rs path ({why})")
-        return False
+        raise cow.Unsupported(f"{operation.lower()}: {why}")
     scan = cow.scan(path, read_version, alias)
     fcol = quote_ident(cow.FILE_COL)
     if not delete:  # a DELETE writes only rows already in the table: no rule can newly fail
-        try:
-            cow.check_table_rules(cur, scan, dt)
-        except cow.Unsupported as e:
-            logger.info(f"{operation.lower()}: delta_rs path ({e})")
-            return False
+        cow.check_table_rules(cur, scan, dt)
     pred = f"({where}) IS TRUE" if where else "true"
     if changes:
         trel = cur.sql(f"SELECT * EXCLUDE ({fcol}) FROM {scan}")
@@ -2818,7 +2783,7 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], replaces: Optional[str]
                 pass
 
 
-def merge_delta_clauses(
+def _merge_clauses(
     path: str,
     data,
     predicate: str,
@@ -2930,9 +2895,8 @@ def merge_delta_clauses(
 
     # Insert-only: divert to the DuckDB anti-join + plain append (see the docstring). Done AFTER the
     # cardinality guard and the decoupled schema evolution so both branches inherit them unchanged,
-    # and pinned to the same effective_version the merger would have used.
-    if (_insert_only_shape(clauses) and not streamed_exec
-            and cur is not None and hasattr(data, "query")):
+    # and pinned to the same effective_version the merge would have used.
+    if _insert_only_shape(clauses):
         # "isrc", NOT "msrc": the dbt plugin stages its own source under __duckrun_msrc_<hash> as a
         # TEMP TABLE (merge_materialize_source / a contract NOT NULL list). Registering a VIEW under
         # that same name put a table and a view in one namespace, and DROP resolves by name before
@@ -2959,7 +2923,7 @@ def merge_delta_clauses(
             return
         except AntiJoinUnsupported as e:
             logger.info(f"insert-only merge: DuckDB could not bind the anti-join ({e}); "
-                        f"running it through delta_rs instead")
+                        f"running it as a copy-on-write MERGE instead")
         finally:
             try:
                 cur.execute(f'DROP VIEW IF EXISTS "{src_view}"')
@@ -2967,59 +2931,26 @@ def merge_delta_clauses(
                 pass
 
     # Copy-on-write: DuckDB computes the merge and writes the parquet, delta_rs commits the file
-    # actions. Falls through (False) for a table shape or a statement it cannot express, and for an
-    # explicit streamed_exec=True request for delta_rs's own merge — but not for the streamed_exec
-    # the by-source form sets for delta_rs's sake: the copy-on-write merge handles it (every file).
-    by_source = any(c.get("clause") == "not_matched_by_source" for c in clauses)
-    if ((not streamed_exec or by_source) and cur is not None and hasattr(data, "query")
-            and cow_merge(cur, path, data, predicate, clauses, read_version=effective_version,
-                          storage_options=storage_options, sort_by=sort_by,
-                          row_group_rows=row_group_rows, target_file_size=target_file_size)):
-        _maintain(cur, path, storage_options=storage_options,
-                  target_file_size=target_file_size, row_group_cap=row_group_rows)
-        return
-
-    # One delta_rs merge at a time (see _MERGE_GATE): the spill caps are sized to the WHOLE
-    # budget, not a 1/N share, so two merges running together would sum past it. The caps are
-    # resolved AFTER the gate so free RAM/disk are sampled when this merge actually starts, not
-    # while the previous one still holds its working set — and so a merge diverted to the
-    # anti-join above never logs caps it doesn't use.
-    if not _MERGE_GATE.acquire(blocking=False):
-        logger.info("merge gate: waiting for an in-flight delta_rs merge to finish")
-        _MERGE_GATE.acquire()
-    try:
-        spill_kwargs, temp_dir_kwargs = _merge_spill_caps(
-            max_spill_size, max_temp_directory_size, streamed_exec
-        )
-
-        dt = _delta_table(path, storage_options)
-        # Pin the target to the snapshot the model read (vB, or vB+1 after a decoupled add-columns
-        # commit) so OCC validates (effective_version, HEAD] — one snapshot for both the read and
-        # the commit.
-        dt.load_as_version(effective_version)
-
-        predicate = _merge_partition_prune(dt, data, predicate, streamed_exec)
-
-        merger = dt.merge(
-            source=data,
-            predicate=predicate,
-            source_alias="source",
-            target_alias="target",
-            merge_schema=False,
-            streamed_exec=streamed_exec,
-            **spill_kwargs,
-            **temp_dir_kwargs,
-        )
-        for c in clauses:
-            merger = _apply_merge_clause(merger, c)
-        merger.execute()
-    finally:
-        _MERGE_GATE.release()
-
-    # Same best-effort maintenance as the append / delete+insert paths: a merged-on-every-run
-    # incremental table fragments into small files and leaves tombstoned old versions otherwise.
-    # This delta_rs merge writes with delta_rs defaults (deliberately — no writer_properties on the
-    # OOM-prone path), so THIS is where a model's declared geometry reaches it: the post-merge
-    # compaction folds the lean merge files into it. (The copy-on-write merge writes it directly.)
+    # actions. A table shape or statement it cannot express raises cow.Unsupported, unwritten.
+    cow_merge(cur, path, data, predicate, clauses, read_version=effective_version,
+              storage_options=storage_options, sort_by=sort_by,
+              row_group_rows=row_group_rows, target_file_size=target_file_size)
     _maintain(cur, path, storage_options=storage_options,
               target_file_size=target_file_size, row_group_cap=row_group_rows)
+
+
+def merge_delta_clauses(path: str, data, predicate: str, clauses: List[dict], *, cur=None,
+                        storage_options: Optional[Dict[str, str]] = None, **kwargs) -> None:
+    """Run a MERGE described by an ORDERED list of clause dicts (see :func:`_merge_clauses`), with
+    ``data`` made a DuckDB relation on the cursor that runs it (a private connection when the
+    caller has none — see :func:`_write_source`)."""
+    for knob in ("max_spill_size", "max_temp_directory_size"):
+        if kwargs.get(knob):
+            logger.warning(f"merge: {knob} has no effect since 0.5.8 (DuckDB runs every MERGE)")
+    cur, data, owned = _write_source(cur, data, storage_options)
+    try:
+        _merge_clauses(path, data, predicate, clauses, cur=cur, storage_options=storage_options,
+                       **kwargs)
+    finally:
+        if owned is not None:
+            owned.close()

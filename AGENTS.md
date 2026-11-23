@@ -2,8 +2,8 @@
 
 Guidance for AI agents working in this repo or helping someone use duckrun.
 
-duckrun is a dbt adapter: DuckDB executes the model SQL, delta-rs writes the result as a
-Delta Lake table, and dbt orchestrates the DAG. It runs the same on a laptop, in CI, or
+duckrun is a dbt adapter: DuckDB executes the model SQL and writes the parquet files, delta-rs
+commits them as a Delta Lake table, and dbt orchestrates the DAG. It runs the same on a laptop, in CI, or
 in a Fabric notebook.
 
 **Before helping with a duckrun project, read the skill — it is the authoritative guide:**
@@ -44,4 +44,5 @@ short version:
   to invent surface nobody asked for. A question is not a work order.
 - It's fine to run tests locally for this project.
 - Keep duckrun **boring**: prefer the dull, idiomatic solution. The only intentional bet
-  is the Arrow + delta-rs core, because there's no alternative way to write Delta.
+  is the core split: DuckDB writes every data file, and delta-rs (the `deltalake` package) only
+  reads the log and commits, because nothing else commits Delta from Python.

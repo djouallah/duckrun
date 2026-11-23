@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Changed
+- **DuckDB writes every parquet file; deltalake only commits.** CTAS, INSERT, the dbt `table` /
+  `append` / `insert` / `delete+insert` / `microbatch` strategies, REPLACE WHERE, MERGE / UPDATE /
+  DELETE / TRUNCATE, the ALTER rewrites and compaction all write through one DuckDB `COPY` and commit
+  with delta-rs's `create_write_transaction` / `create_table_with_add_actions`. `ALTER TABLE … ADD
+  COLUMN` is a metadata-only commit. deltalake's floor drops to 1.6.4, the first release whose commit
+  API takes remove actions.
+- **No delta-rs writer fallback.** Writes the commit API can't express are refused with a clear
+  error: MERGE / UPDATE / DELETE on tables with change data feed, deletion vectors, identity columns, append-only tables, column mapping on a partitioned or nested table; `OPTIMIZE … ZORDER BY`. The dbt configs
+  `merge_max_spill_size`, `merge_max_temp_directory_size` and `merge_streamed_exec` have no effect.
+- A compaction is recorded as `WRITE` in the history (the commit API has no OPTIMIZE operation); its
+  adds and removes carry `dataChange=false` and the commit info `duckrun.operation = OPTIMIZE`.
 - **`DROP TABLE` deletes the table's folder.** It used to write a one-column tombstone and keep
   the files. On OneLake the files stay soft-deleted for 7 days (restorable); elsewhere the drop
   has no undo. Tables an older duckrun tombstoned are still hidden.

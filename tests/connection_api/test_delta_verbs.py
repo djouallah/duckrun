@@ -145,6 +145,10 @@ def test_create_table_tblproperties_spelling(tmp_path):
 
 
 # -- OPTIMIZE / VACUUM ---------------------------------------------------------------------------
+def _op(commit):
+    return commit.get("duckrun.operation") or commit["operation"]
+
+
 def test_optimize_compacts(wh):
     c = _rw(wh)
     for i in range(3):
@@ -152,19 +156,36 @@ def test_optimize_compacts(wh):
     before = len(deltalake.DeltaTable(_path(c, "t")).file_uris())
     c.sql("optimize t")
     assert len(deltalake.DeltaTable(_path(c, "t")).file_uris()) < before
-    assert _last_commit(_path(c, "t"))["operation"] == "OPTIMIZE"
+    commit = _last_commit(_path(c, "t"))
+    assert _op(commit) == "OPTIMIZE"
     assert c.sql("select count(*) from t").fetchall() == [(8,)]
 
 
-def test_optimize_zorder(wh):
+def test_compaction_commit_changes_no_data(wh):
+    # delta-rs's commit API records the compaction as operation WRITE (it has no OPTIMIZE); the
+    # protocol's flag is what marks it as moving no data: every add and remove has dataChange=false,
+    # and commitInfo carries duckrun.operation = OPTIMIZE.
+    import json
     c = _rw(wh)
-    c.sql("insert into t values (100, 0)")
-    c.sql("optimize t zorder by (id, v)")
-    commit = _last_commit(_path(c, "t"))
-    assert commit["operation"] == "OPTIMIZE"
-    assert "id" in str(commit["operationParameters"].get("zOrderBy"))
-    with pytest.raises(ValueError, match="unknown column"):
-        c.sql("optimize t zorder by (nope)")
+    for i in range(3):
+        c.sql(f"insert into t values ({100 + i}, 0)")
+    path = _path(c, "t")
+    c.sql("optimize t")
+    version = deltalake.DeltaTable(path).version()
+    log = os.path.join(path, "_delta_log", f"{version:020d}.json")
+    actions = [json.loads(line) for line in open(log, encoding="utf-8") if line.strip()]
+    files = [a[k] for a in actions for k in ("add", "remove") if k in a]
+    assert files and all(f["dataChange"] is False for f in files)
+    info = next(a["commitInfo"] for a in actions if "commitInfo" in a)
+    assert info.get("duckrun.operation") == "OPTIMIZE"
+
+
+def test_optimize_zorder_is_refused(wh):
+    c = _rw(wh)
+    v0 = deltalake.DeltaTable(_path(c, "t")).version()
+    with pytest.raises(ValueError, match="SORTED BY"):
+        c.sql("optimize t zorder by (id, v)")
+    assert deltalake.DeltaTable(_path(c, "t")).version() == v0
 
 
 def test_vacuum_retain_0_hours_deletes_the_removed_files(wh):

@@ -42,14 +42,13 @@ Relations are returned with `type=Table` — the physical object is a view, but 
 
 The staged view, and any `SET VARIABLE` a pre-hook set, live in the session of the cursor dbt ran the model on — dbt-duckdb gives each model its own child cursor via `configure_cursor`. The plugin overrides `configure_cursor(cursor)` to keep that cursor and reads on it in `store()` / `load()`; a fresh child cursor would see `getvariable(...)` as `NULL`.
 
-### 3. Memory: one pin + the delta-rs spill caps (`engine.py`) { #3-memory-one-cap-split-across-two-engines }
+### 3. Memory: one pin (`engine.py`) { #3-memory-one-cap-split-across-two-engines }
 
-DuckDB and delta-rs each manage their own memory. Profiling (`DUCKRUN_MEM_PROFILE`) shows that during a merge delta-rs holds ~99% of process RSS, so duckrun does not divide a budget; it applies two independent guardrails:
+DuckDB does all the heavy work, writes included; delta-rs only reads the log and commits. So there is one guardrail:
 
 - **One DuckDB `memory_limit` pin** per connection: `_MEM_LIMIT_FRACTION` (0.85) of the effective limit, tighten-only. DuckDB's own default is 80% of *host* RAM, blind to cgroups, which gets the process OOM-killed on Fabric / k8s.
-- **The delta-rs merge spill caps** (a merge that falls back to delta-rs): `max_spill_size` at `_MERGE_SPILL_FRACTION` (0.6) of the effective limit for the in-memory pool, `max_temp_directory_size` for on-disk spill.
 
-0.85 + 0.6 deliberately exceed 1.0: the two never peak together, and merges are serialized (`engine._MERGE_GATE`) so one merge holds the whole pool while other threads run the cheap paths. The effective limit (`_effective_mem_limit_bytes`) is the tightest of physical RAM, the cgroup cap and the RAM actually free.
+The effective limit (`_effective_mem_limit_bytes`) is the tightest of physical RAM, the cgroup cap and the RAM actually free.
 
 ## Cross-process state
 

@@ -13,8 +13,7 @@ it on the newest releases and on the pyproject floors):
   each column;
 * a rewrite (UPDATE / DELETE / MERGE) keeps the rows it carries over in the table's sort order.
 
-The delta-rs fallback paths (a change-data-feed table) write with delta-rs defaults on purpose, so
-they are held to the #84 / SNAPPY / stats part only."""
+Every file is written by DuckDB and committed by delta-rs, so one contract holds for all of them."""
 import os
 
 import deltalake
@@ -172,9 +171,20 @@ def test_compaction(table):
     f"merge into t using ({SELECT.format(lo=0, hi=100)}) src on t.id = src.id "
     "when matched then update set s = 'cdf'",
 ])
-def test_delta_rs_fallback(table, statement):
+def test_change_data_feed_rewrites_are_refused(table, statement):
+    # There is no delta-rs writer fallback: a rewrite the commit API cannot express is refused,
+    # and nothing is written.
     conn, path = table
     deltalake.DeltaTable(path).alter.set_table_properties({"delta.enableChangeDataFeed": "true"})
     before = _files(path)
-    conn.sql(statement)
-    _assert_contract(path, _files(path) - before, full=False)
+    with pytest.raises(ValueError, match="change data feed"):
+        conn.sql(statement)
+    assert _files(path) == before
+
+
+def test_append_into_a_change_data_feed_table(table):
+    conn, path = table
+    deltalake.DeltaTable(path).alter.set_table_properties({"delta.enableChangeDataFeed": "true"})
+    before = _files(path)
+    conn.sql(f"insert into t {SELECT.format(lo=N, hi=N + 1000)}")
+    _assert_contract(path, _files(path) - before)

@@ -5,8 +5,8 @@ description: How to build, configure, and run dbt projects on the duckrun adapte
 
 # Building dbt projects with duckrun
 
-duckrun is a dbt adapter where **DuckDB executes your model SQL, delta-rs writes the
-result as a Delta table, and dbt orchestrates the DAG**. It wraps dbt-duckdb, so
+duckrun is a dbt adapter where **DuckDB executes your model SQL and writes the parquet,
+delta-rs commits it as a Delta table, and dbt orchestrates the DAG**. It wraps dbt-duckdb, so
 everything dbt-duckdb gives you still works — `view`, `seed`, sources, tests,
 snapshots, Python models — and `table` / `incremental` write real Delta tables. The
 whole pipeline is pure Python: it runs identically on a laptop, in GitHub Actions, or
@@ -25,7 +25,7 @@ pip install "duckrun[dbt]"   # brings dbt-duckdb, duckdb, deltalake at the right
 ```
 
 Do NOT separately pin `duckdb` or `deltalake` in your requirements — duckrun sets a
-`duckdb>=2.0.1` floor and a `deltalake>=1.7.0` floor, for documented upstream-bug reasons, and
+`duckdb>=2.0.1` floor and a `deltalake>=1.6.4` floor, for documented upstream-bug reasons, and
 overriding them is the most common way to break a project.
 
 ```yaml
@@ -44,7 +44,7 @@ Things that differ from other adapters:
 
 - **`threads:` works, with a caveat.** It's honored like any dbt adapter (default 1), but
   concurrent models share ONE DuckDB `memory_limit` — above 1 thread duckrun pins it once
-  for the run at the tighter share and divides the delta-rs merge pool. So raise it for
+  for the run at the tighter share. So raise it for
   many small, network-bound models; leave it at 1 for a single big merge. A microbatch
   model's batches always run in order regardless (they all write one table).
 - **No database file.** DuckDB is in-memory by default; don't add a `path:` expecting
@@ -259,7 +259,7 @@ rows.** A MERGE joins the batch against the whole pinned target and rewrites eve
 changed row lands in, so its cost scales with the target's *partition span*, not the batch
 size. `insert` does not: insert-only never removes a row, so
 duckrun computes it as a DuckDB anti-join over the target's KEY columns and commits a
-plain append — `add` actions only, no existing file rewritten, no delta-rs merge pool,
+plain append — `add` actions only, no existing file rewritten,
 DuckDB keeps the full write budget. A batch that adds nothing writes no commit at all
 (the version does not move). The append is always fenced to the version the anti-join
 read, so a concurrent writer fails the run instead of letting a duplicate through.
@@ -296,8 +296,8 @@ INSERT *")` is the same operation and takes the same anti-join — duckrun route
 shared engine seam, so dbt and SQL cannot execute it two different ways. Any other clause
 shape (matched update/delete, by-source, partial insert column list) runs copy-on-write:
 DuckDB rewrites only the files a changed row lands in and delta-rs commits the file swap.
-Change data feed, deletion vectors, identity columns, append-only tables run on delta-rs's merge. To force delta-rs's
-merge anyway, set `merge_streamed_exec: true`.
+Tables with change data feed, deletion vectors, identity columns, append-only tables, column mapping on a partitioned or nested table are refused with a clear error: delta-rs's commit API has no
+action for what they need. Appends into change-data-feed and deletion-vector tables work.
 
 **Plain `append` with SQL dedup is still the cheapest of all** — it reads nothing from the
 target at all. If the model SQL already excludes rows present in
@@ -344,12 +344,12 @@ don't run other writers against a microbatch table during its window.
 | `on_schema_change` | `ignore` (default) / `append_new_columns` / `fail`. `sync_all_columns` only ADDS — delta-rs cannot drop columns |
 | `partition_by` | Delta partition column(s) |
 | `sort_by` | column(s) to physically ORDER the write by; the scalar `'auto'` (experimental) picks the key by profiling the model result — same heuristic as the connection API's `SORTED BY AUTO`, unsorted when nothing pays off. `'auto'` is inert on merge/microbatch/delete+insert; an explicit key also orders the files a merge rewrites |
-| `max_row_group_size` | explicit parquet row-group ceiling in **rows** for this model's writes (deltalake's spelling; default: the fixed 4M). Overrides the default verbatim — use it when a model must land 16M-row Direct Lake segments (e.g. `16000000`). Preserved by post-write compaction; a merge that falls back to delta-rs keeps its defaults, post-merge compaction folds files into this geometry |
+| `max_row_group_size` | explicit parquet row-group ceiling in **rows** for this model's writes (deltalake's spelling; default: the fixed 4M). Overrides the default verbatim — use it when a model must land 16M-row Direct Lake segments (e.g. `16000000`). Honored by every write, MERGE included, and by post-write compaction |
 | `target_file_size_mb` | per-model target parquet file size in **MB** (default 256). Same coverage and merge caveat as `max_row_group_size` |
 | `merge_schema` | allow schema evolution on write |
-| `merge_max_spill_size` | (delta-rs fallback only) bytes cap on delta-rs's merge pool before it spills to disk; sensible cgroup-aware default; `0` disables |
-| `merge_streamed_exec` | `true` runs delta-rs's merge and streams a HUGE source instead of collecting it — at the cost of losing target-file pruning. Default `false` is right for the normal small-delta-into-big-table case |
-| `merge_max_temp_directory_size` | (delta-rs fallback only) disk cap for delta-rs's merge spill files (default ~80% of free disk) |
+| `merge_max_spill_size` | no effect since 0.5.8 (DuckDB runs every MERGE under `memory_limit`); accepted with a warning |
+| `merge_streamed_exec` | no effect since 0.5.8; accepted |
+| `merge_max_temp_directory_size` | no effect since 0.5.8; accepted with a warning |
 | `merge_clauses` / `merge_update_set_expressions` | dbt-duckdb-style custom clause list / per-column SET expressions — translated to the full MERGE clause list |
 | `storage_options` | per-model override |
 
@@ -466,10 +466,9 @@ OPTIMIZE for these tables", the answer is: you don't, it's built in.
   deliberately deleted.
 - **Merge OOM / slow on a big target**: first ask whether the model actually needs to
   UPDATE anything. If matched rows should be left alone, switch `merge` → `insert`: that
-  becomes a DuckDB anti-join plus a plain append, with no delta-rs merge pool and no file
-  rewritten — the single biggest win available here. Otherwise add `incremental_predicates`
-  on the partition column to prune; check the logged "merge spill cap" line; lower
-  `merge_max_spill_size` in a tight container; consider whether the model qualifies for a
+  becomes a DuckDB anti-join plus a plain append, with no file rewritten — the single
+  biggest win available here. Otherwise add `incremental_predicates` on the partition
+  column to prune; lower DuckDB's `memory_limit` in a tight container; consider whether the model qualifies for a
   dedup-in-SQL `append` instead. A `merge` whose batch straddles many partitions is the
   worst case — its cost is the partition span, not the row count.
 - **Huge merge SOURCE (not target)**: set `merge_streamed_exec: true` so the source
