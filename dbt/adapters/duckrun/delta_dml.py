@@ -175,11 +175,11 @@ def _split_create_layout(rel: str):
     sort = partition = None
     ms = _SORTED_BY_RE.search(rel)
     if ms:
-        sort = "AUTO" if ms.group(1) else [c.strip().strip('"') for c in ms.group(2).split(",") if c.strip()]
+        sort = "AUTO" if ms.group(1) else [engine.unquote_ident(c) for c in ms.group(2).split(",") if c.strip()]
         rel = rel[:ms.start()] + rel[ms.end():]
     mp = _PARTITIONED_BY_RE.search(rel)
     if mp:
-        partition = [c.strip().strip('"') for c in mp.group(1).split(",") if c.strip()]
+        partition = [engine.unquote_ident(c) for c in mp.group(1).split(",") if c.strip()]
         rel = rel[:mp.start()] + rel[mp.end():]
     return rel.strip(), sort, partition
 
@@ -271,7 +271,7 @@ def _coldefs_parts(sql: str):
         if not mt:
             return None
         if mt.group("part") is not None:
-            partition = [c.strip().strip('"') for c in mt.group("part").split(",") if c.strip()]
+            partition = [engine.unquote_ident(c) for c in mt.group("part").split(",") if c.strip()]
         else:
             props.update(_parse_properties(mt.group("props")))
         pos = mt.end()
@@ -797,7 +797,7 @@ def _split_dotted(name: str) -> List[str]:
             parts.append(name[start:i])
             start = i + 1
     parts.append(name[start:])
-    return [p.strip().strip('"') for p in parts]
+    return [engine.unquote_ident(p) for p in parts]
 
 
 def _reject_unsafe_name(part: str, kind: str) -> None:
@@ -1029,9 +1029,9 @@ def _split_top_level_commas(s: str) -> List[str]:
                 quote = None
         elif ch in ("'", '"'):
             quote = ch
-        elif ch in "([":
+        elif ch in "([{":
             depth += 1
-        elif ch in ")]":
+        elif ch in ")]}":
             depth -= 1
         elif ch == "," and depth == 0:
             out.append(s[start:i])
@@ -1336,7 +1336,7 @@ def _parse_set_exprs(assign: str, cur=None) -> dict:
         col, sep, expr = a.partition("=")
         if not sep or not col.strip() or not expr.strip():
             raise ValueError(f"malformed UPDATE SET assignment: {a.strip()!r}")
-        updates[col.strip().strip('"')] = _fold_value(expr, cur, "MERGE UPDATE SET")
+        updates[engine.unquote_ident(col)] = _fold_value(expr, cur, "MERGE UPDATE SET")
     if not updates:
         raise ValueError("UPDATE SET has no assignments")
     return updates
@@ -1346,7 +1346,7 @@ def _parse_insert_cols(cols_text: str, vals_text: str, cur=None) -> dict:
     """``{col: value_expr}`` for ``INSERT (col, …) VALUES (<expr>, …)`` — columns and values zipped
     positionally (values split at top level so a function call's commas don't break the pairing); each
     value is constant-folded in DuckDB before delta_rs."""
-    cols = [c.strip().strip('"') for c in cols_text.split(",") if c.strip()]
+    cols = [engine.unquote_ident(c) for c in cols_text.split(",") if c.strip()]
     vals = _split_top_level_commas(vals_text)
     if len(cols) != len(vals):
         raise ValueError(
@@ -1656,7 +1656,7 @@ class _DeltaDML:
                 "pick the sort key); give an explicit SORTED BY (cols) on this path, or set "
                 "sort_by='auto' in the dbt model config.")
         if sort_cols:  # cluster the write: DuckDB ORDER BY the query, then materialize
-            order = ", ".join('"' + c + '"' for c in sort_cols)
+            order = ", ".join(engine.quote_ident(c) for c in sort_cols)
             body = f"SELECT * FROM ({body}) ORDER BY {order}"
         data = self.cursor.sql(body)
         # overwrite_schema so this replaces a prior table (or a drop-tombstone) wholesale — a live
@@ -1695,48 +1695,39 @@ class _DeltaDML:
                 f"use CREATE OR REPLACE TABLE to replace it"
             )
         # Let DuckDB parse the column defs (types, constraints, nested parens) by building the table
-        # as a TEMP, then take its Arrow schema and create an EMPTY Delta table from it. DeltaTable.create
-        # logs a CREATE TABLE operation (not a WRITE/Overwrite). A live table or a drop-tombstone already
-        # has files at ``loc``, so it must be replaced (overwrite); otherwise create-if-absent (error).
+        # as a TEMP, then create an EMPTY Delta table from its DuckDB types and NOT NULL flags (no
+        # Arrow, so no pyarrow). DeltaTable.create logs a CREATE TABLE operation (not a WRITE). A
+        # live table already has files at ``loc``, so it is replaced (overwrite); otherwise
+        # create-if-absent (error).
         tmp = engine.tmp_name("empty", (schema, identifier))
         self.cursor.execute(f'create or replace temp table "{tmp}" ({parts["defs"]})')
         try:
             rel0 = self.cursor.sql(f'select * from "{tmp}" limit 0')
-            # Naive-timestamp coercion (issue #42) on the SQL side, BEFORE .arrow() — a bare
-            # CREATE TABLE replaces the schema wholesale, so retype_ok (a user-typed TIMESTAMPTZ
-            # is untouched; a user-typed TIMESTAMP becomes UTC-adjusted unless the escape hatch
-            # keeps NTZ).
+            # Naive-timestamp coercion (issue #42): a bare CREATE TABLE replaces the schema
+            # wholesale, so retype_ok (a user-typed TIMESTAMP becomes UTC-adjusted TIMESTAMPTZ
+            # unless the escape hatch keeps NTZ).
             rel0 = engine.coerce_naive_timestamps(rel0, path=loc, storage_options=self.so,
                                                   retype_ok=True)
-            arrow_schema = rel0.arrow().schema
-            # DuckDB stamps the SESSION TimeZone on tz-aware Arrow fields, and DeltaTable.create
-            # accepts only UTC (isAdjustedToUTC) — a zone LABEL, not a value shift (the instants
-            # are identical). Normalize it, or any TIMESTAMPTZ coldef in a non-UTC session fails.
-            import pyarrow as pa  # local: this path already materializes .arrow() (needs pyarrow)
-            if any(pa.types.is_timestamp(f.type) and f.type.tz not in (None, "UTC")
-                   for f in arrow_schema):
-                arrow_schema = pa.schema(
-                    [f.with_type(pa.timestamp(f.type.unit, tz="UTC"))
-                     if pa.types.is_timestamp(f.type) and f.type.tz is not None else f
-                     for f in arrow_schema],
-                    metadata=arrow_schema.metadata,
-                )
+            not_null = [r[0] for r in self.cursor.execute(
+                "select column_name from duckdb_columns() where database_name = 'temp' "
+                "and table_name = ? and not is_nullable", [tmp]).fetchall()]
+            # Mode from the SAME existence check as the guards above (no second open, no window
+            # in which a table appearing/disappearing could make guard and mode disagree).
+            mode = "overwrite" if existed else "error"
+            partition = parts["partition"] or None
+            if partition:
+                by_lower = {c.lower(): c for c in rel0.columns}
+                unknown = [c for c in partition if c.lower() not in by_lower]
+                if unknown:
+                    raise ValueError(f"PARTITIONED BY names unknown column(s) {unknown}; "
+                                     f"columns are {list(by_lower.values())}")
+                partition = [by_lower[c.lower()] for c in partition]
+            engine.create_empty_delta(loc, rel0, mode=mode, storage_options=self.so,
+                                      partition_by=partition, configuration=parts["props"] or None,
+                                      generated=_generated_columns(parts["defs"]) or None,
+                                      not_null=not_null)
         finally:
             self.cursor.execute(f'drop table if exists "{tmp}"')
-        # Mode from the SAME existence check as the guards above (no second open, no window in
-        # which a table appearing/disappearing could make guard and mode disagree).
-        mode = "overwrite" if existed else "error"
-        partition = parts["partition"] or None
-        if partition:
-            by_lower = {f.name.lower(): f.name for f in arrow_schema}
-            unknown = [c for c in partition if c.lower() not in by_lower]
-            if unknown:
-                raise ValueError(f"PARTITIONED BY names unknown column(s) {unknown}; "
-                                 f"columns are {list(by_lower.values())}")
-            partition = [by_lower[c.lower()] for c in partition]
-        engine.create_empty_delta(loc, arrow_schema, mode=mode, storage_options=self.so,
-                                  partition_by=partition, configuration=parts["props"] or None,
-                                  generated=_generated_columns(parts["defs"]) or None)
         self._refresh_view(rel, schema, loc)
         return True
 
@@ -1828,7 +1819,7 @@ class _DeltaDML:
         updates = {}
         for assign in _split_top_level_commas(set_clause):
             col, _, expr = assign.partition("=")
-            updates[col.strip().strip('"')] = expr.strip()
+            updates[engine.unquote_ident(col)] = expr.strip()
         # Validate SET targets against the real schema BEFORE routing to delta_rs: dt.update() silently
         # accepts an unknown column, writing a no-op commit that changes nothing (a typo'd column name
         # would advance the log while doing nothing). Fail loud with no commit, like a bad SELECT column.
@@ -1850,8 +1841,8 @@ class _DeltaDML:
         # SET column via SELECT * REPLACE (no predicate → <expr> on every row), applied by
         # copy-on-write to the touched files only (see _delete).
         replaces = ", ".join(
-            (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
-             else f'({expr}) AS "{col}"')
+            (f'CASE WHEN ({where}) THEN ({expr}) ELSE {engine.quote_ident(col)} END AS {engine.quote_ident(col)}' if where
+             else f'({expr}) AS {engine.quote_ident(col)}')
             for col, expr in updates.items())
         engine.cow_rewrite(self.cursor, loc, where=where, replaces=replaces,
                            alias=tname, with_prefix=with_prefix, read_version=self._vB(loc),
@@ -1932,8 +1923,8 @@ class _DeltaDML:
                         f"INSERT into {loc!r} names unknown column {c!r}; columns are "
                         f"{list(template.columns)}")
                 cols_types.append(hit)
-        coldefs = ", ".join(f'"{c}" {t}' for c, t in cols_types)
-        collist = ", ".join(f'"{c}"' for c, _ in cols_types)
+        coldefs = ", ".join(f'{engine.quote_ident(c)} {t}' for c, t in cols_types)
+        collist = ", ".join(engine.quote_ident(c) for c, _ in cols_types)
         tmp = engine.tmp_name("vals", loc)
         self.cursor.execute(f'create or replace temp table "{tmp}" ({coldefs})')
         try:
@@ -1944,7 +1935,7 @@ class _DeltaDML:
 
     @staticmethod
     def _provided(cols: str) -> List[str]:
-        return [c.strip().strip('"') for c in cols.split(",")]
+        return [engine.unquote_ident(c) for c in cols.split(",")]
 
     def _project_onto_schema(self, loc, provided, derived: str):
         """Project a ``derived`` table (a ``(values …)`` tuple list or a ``(select …)`` subquery)
@@ -1981,12 +1972,12 @@ class _DeltaDML:
                 f"({', '.join(provided)}); the column counts must match — surplus or missing source "
                 f"columns are never silently dropped or NULL-filled on this path")
 
-        quoted = ", ".join('"' + c + '"' for c in provided)
+        quoted = ", ".join(engine.quote_ident(c) for c in provided)
         inner = f"{derived} v({quoted})"
         self._reject_lossy_numeric_narrowing(inner, provided, dict(zip(target_cols, target_types)))
         exprs = [
-            f'cast(v."{col}" as {typ}) as "{col}"' if col in provided_set
-            else f'cast(null as {typ}) as "{col}"'
+            f'cast(v.{engine.quote_ident(col)} as {typ}) as {engine.quote_ident(col)}' if col in provided_set
+            else f'cast(null as {typ}) as {engine.quote_ident(col)}'
             for col, typ in zip(target_cols, target_types)
         ]
         projected = f"select {', '.join(exprs)} from {inner}"
@@ -1997,7 +1988,7 @@ class _DeltaDML:
                     if c.lower() in by_lower and by_lower[c.lower()] not in provided_set]
         if computed:
             projected = ("select * replace (" + ", ".join(
-                f'cast(({e}) as {types[c]}) as "{c}"' for c, e in computed) + f") from ({projected})")
+                f'cast(({e}) as {types[c]}) as {engine.quote_ident(c)}' for c, e in computed) + f") from ({projected})")
         return self.cursor.sql(projected)
 
     def _append_projected(self, loc, provided, derived: str) -> None:
@@ -2040,7 +2031,7 @@ class _DeltaDML:
         Costs one extra evaluation of ``inner`` (trivial for VALUES; a second scan for ``insert …
         select`` — acceptable to turn silent corruption into a loud error)."""
         src = self.cursor.sql(
-            "select " + ", ".join(f'v."{c}"' for c in provided) + f" from {inner} limit 0")
+            "select " + ", ".join(f"v.{engine.quote_ident(c)}" for c in provided) + f" from {inner} limit 0")
         stype = {c: str(t) for c, t in zip(provided, src.types)}
         checks = []  # (col, lossy-predicate) for numeric→numeric casts that could narrow
         for col in provided:
@@ -2052,12 +2043,12 @@ class _DeltaDML:
             # round-trip through the target type; try_cast so the probe itself never throws — an
             # out-of-range value becomes NULL → distinct → flagged, same as a fractional loss.
             checks.append(
-                (col, f'try_cast(try_cast(v."{col}" as {t}) as {s}) is distinct from v."{col}"'))
+                (col, f'try_cast(try_cast(v.{engine.quote_ident(col)} as {t}) as {s}) is distinct from v.{engine.quote_ident(col)}'))
         if not checks:
             return
         sel = ", ".join(
             f'count(*) filter (where {pred}) as "n{i}", '
-            f'any_value(v."{col}") filter (where {pred}) as "ex{i}"'
+            f'any_value(v.{engine.quote_ident(col)}) filter (where {pred}) as "ex{i}"'
             for i, (col, pred) in enumerate(checks))
         row = self.cursor.sql(f"select {sel} from {inner}").fetchall()[0]
         for i, (col, _) in enumerate(checks):
@@ -2069,7 +2060,7 @@ class _DeltaDML:
                 )
 
     def _alter_add(self, m, rel, schema, loc) -> None:
-        col = m.group("col").strip().strip('"')
+        col = engine.unquote_ident(m.group("col"))
         # Keep only the column type (drop any trailing DEFAULT / NOT NULL / NULL clause); add it as
         # an all-null column. Locate the DEFAULT/NOT NULL/NULL boundary structurally (quote/paren-aware
         # via _find_top_level), NOT by a quote-blind re.split — a string DEFAULT containing ` not null`
@@ -2083,22 +2074,23 @@ class _DeltaDML:
         if col.lower() in {c.lower() for c in self.cursor.sql(
                 f"select * from delta_scan('{loc.replace(chr(39), chr(39) * 2)}') limit 0").columns}:
             raise ValueError(f"ALTER TABLE … ADD COLUMN: column {col!r} already exists")
-        engine.add_columns(loc, self.cursor.sql(f'select cast(null as {coltype}) as "{col}"'), [col],
+        engine.add_columns(loc, self.cursor.sql(f'select cast(null as {coltype}) as {engine.quote_ident(col)}'), [col],
                            dt=self._pinned(loc), read_version=self._vB(loc))
 
     def _alter_drop(self, m, rel, schema, loc) -> None:
         """`alter table <t> drop column <c>`: delta_rs has no in-place column drop, so rewrite the
         table WITHOUT the column (DuckDB ``SELECT * EXCLUDE``) under overwrite_schema, fenced to the
         version read — the same mechanism as ADD COLUMN."""
-        col = m.group("col").strip().strip('"')
-        self._rewrite_overwrite(loc, f'* exclude ("{col}")')
+        col = engine.unquote_ident(m.group("col"))
+        self._rewrite_overwrite(loc, f'* exclude ({engine.quote_ident(col)})')
 
     def _alter_rename(self, m, rel, schema, loc) -> None:
         """`alter table <t> rename column <old> to <new>`: rewrite with the column renamed (DuckDB
         ``SELECT * RENAME``) under overwrite_schema, fenced to the version read."""
-        old = m.group("old").strip().strip('"')
-        new = m.group("new").strip().strip('"')
-        self._rewrite_overwrite(loc, f'* rename ("{old}" as "{new}")')
+        old = engine.unquote_ident(m.group("old"))
+        new = engine.unquote_ident(m.group("new"))
+        self._rewrite_overwrite(
+            loc, f'* rename ({engine.quote_ident(old)} as {engine.quote_ident(new)})')
 
     def _insert_schema_evolution(self, m, rel, schema, loc) -> None:
         """`insert with schema evolution into <t> <select|values>` (Spark/Delta spelling): append with
@@ -2198,7 +2190,7 @@ class _DeltaDML:
         # `drop table` on a duckrun relation: unregister the delta_scan view and DELETE the table's
         # folder (objectstore.delete_tree: one recursive DFS delete on OneLake, which keeps the files 7
         # days as soft-deleted and restorable; rmtree locally; list + delete on s3 / gcs). A table a
-        # duckrun before 0.5.8 dropped is a one-column tombstone (TOMBSTONE_COLUMN) and is still
+        # duckrun before 0.6.0 dropped is a one-column tombstone (TOMBSTONE_COLUMN) and is still
         # hidden by discovery; dropping it again passes through like any absent table. If the
         # relation isn't a duckrun-managed Delta table, fall through and let DuckDB drop the native
         # table.

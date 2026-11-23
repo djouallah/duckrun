@@ -6,13 +6,14 @@ needs — and delta-rs commits nothing but the file actions: the new files (``Ad
 files they replace (``RemoveAction``), in ONE transaction pinned to the version the statement read
 (``create_write_transaction``, ``max_commit_retries=0``), so a concurrent commit fails it loudly.
 
-Internal module, not public API. :func:`unsupported_reason` sends the table shapes this writer
-cannot commit correctly to the delta-rs path: deletion vectors and change data feed (the commit API
-has no action for their metadata), identity columns (their high-water mark lives in the schema),
-append-only tables, and column-mapped tables that are also partitioned or nested (DuckDB's own
-Delta writer refuses those too). CHECK constraints and invariants are evaluated, and generated
-columns recomputed, in DuckDB (:func:`apply_table_rules`); an expression DuckDB cannot evaluate
-sends the statement to delta-rs before anything is written.
+Internal module, not public API. :func:`unsupported_reason` names the table shapes this writer
+cannot commit correctly — deletion vectors and change data feed on a rewrite (the commit API has no
+action for their metadata), identity columns (their high-water mark lives in the schema), append-only
+tables, and column-mapped tables that are also partitioned or nested (DuckDB's own Delta writer
+refuses those too) — and the statement is refused with :class:`Unsupported` before anything is
+written; there is no fallback writer. CHECK constraints and invariants are evaluated, and generated
+columns recomputed, in DuckDB (:func:`apply_table_rules`); an expression DuckDB cannot evaluate is
+refused the same way.
 """
 import datetime as _dt
 import json
@@ -101,15 +102,22 @@ def column_mapping(dt: DeltaTable):
 def unsupported_reason(dt: DeltaTable, op: str = "rewrite") -> Optional[str]:
     """Why DuckDB-written files committed through delta-rs's commit API cannot ``op`` ``dt`` (None =
     they can): each case needs Delta metadata or checks the commit API does not produce. ``op`` is
-    ``rewrite`` (MERGE / UPDATE / DELETE / REPLACE WHERE), ``append``, ``overwrite`` or ``compact``.
-    An append only adds files, so change data feed, append-only and deletion vectors do not stop it;
-    a compaction changes no data (dataChange=false), so neither do change data feed and append-only."""
+    ``rewrite`` (MERGE / UPDATE / DELETE / REPLACE WHERE), ``append``, ``overwrite``, ``truncate``
+    (every file removed, none added) or ``compact``.
+
+    * change data feed stops only a rewrite: a commit that only adds or removes WHOLE files (append,
+      overwrite, truncate) needs no change files — readers derive the changes from the actions —
+      but a rewrite carries rows over, which would read as deleted and re-inserted;
+    * append-only stops anything that removes data; a compaction changes none (dataChange=false);
+    * deletion vectors stop a rewrite and a compaction (their removes would need the vector); an
+      overwrite / truncate lets delta-rs derive the removes itself;
+    * identity columns stop every write of rows (their high-water mark lives in the schema)."""
     md = dt.metadata()
     conf = md.configuration or {}
-    if (op in ("rewrite", "overwrite")
+    if (op == "rewrite"
             and str(conf.get("delta.enableChangeDataFeed", "false")).lower() == "true"):
         return "change data feed (the commit API cannot write the change files)"
-    if (op in ("rewrite", "overwrite")
+    if (op in ("rewrite", "overwrite", "truncate")
             and str(conf.get("delta.appendOnly", "false")).lower() == "true"):
         return "append-only table"
     mode = mapping_mode(conf)
@@ -128,7 +136,7 @@ def unsupported_reason(dt: DeltaTable, op: str = "rewrite") -> Optional[str]:
     if (op in ("rewrite", "compact")
             and "deletionVectors" in (dt.protocol().reader_features or [])):
         return "deletion vectors (the commit API cannot remove a file that has one)"
-    if op != "compact" and '"delta.identity.' in dt.schema().to_json():
+    if op not in ("compact", "truncate") and '"delta.identity.' in dt.schema().to_json():
         return "identity columns"
     return None
 
@@ -260,6 +268,21 @@ def _stat_value(duck_type: str, s: str):
     return None  # BOOLEAN, BLOB, nested, time, interval, … — no min/max stat
 
 
+def _truncated_max(s: str) -> Optional[str]:
+    """An upper bound for every string ``s`` is a prefix of, :data:`STATS_TRUNCATE_LENGTH` chars
+    long: the prefix with its last char bumped by one code point (what delta-rs writes). A missing
+    max is legal Delta, but deltalake's Arrow filter path prunes such a file (it finds nothing), so
+    the bound is kept. None when no char can be bumped."""
+    head = s[:STATS_TRUNCATE_LENGTH]
+    for i in range(len(head) - 1, -1, -1):
+        cp = ord(head[i]) + 1
+        if 0xD800 <= cp <= 0xDFFF:
+            cp = 0xE000
+        if cp <= 0x10FFFF:
+            return head[:i] + chr(cp)
+    return None
+
+
 def _json(v) -> str:
     if isinstance(v, _Raw):
         return str(v)
@@ -319,7 +342,7 @@ def stats_json(num_records: int, column_statistics: Optional[Dict[str, Dict[str,
         if "max" in st and str(st.get("max_is_exact", "true")).lower() == "true":
             v = _stat_value(t, st["max"])
             if isinstance(v, str) and t.upper() == "VARCHAR" and len(v) > STATS_TRUNCATE_LENGTH:
-                v = None
+                v = _truncated_max(v)
             if v is not None:
                 maxs[col] = v
     return ("{" + f'"numRecords":{int(num_records)},"minValues":{_obj(mins)},'
@@ -462,21 +485,35 @@ def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
 def removes_for(cur, dt: DeltaTable, filenames: Sequence[str],
                 data_change: bool = True) -> List[RemoveAction]:
     """``RemoveAction`` for each live data file named in ``filenames`` (full paths, as
-    ``delta_scan(..., filename = true)`` reports them), matched on the file name. A compaction
-    passes ``data_change=False``."""
+    ``delta_scan(..., filename = true)`` reports them), matched on the whole path under the table
+    root — not the file name alone: Spark writes the same file name into every partition folder. A
+    compaction passes ``data_change=False``.
+
+    The log stores a path URI-encoded, and ``get_add_actions`` returns it that way; the commit API
+    encodes the path it is given. So the remove gets the DECODED path — the file's real relative
+    path — or a partition value with a character the encoding touches (a space, ``%``, ``:``, so
+    every timestamp partition) is encoded twice, matches no file, and the file stays live."""
     from urllib.parse import unquote
 
-    wanted = {f.replace("\\", "/").rsplit("/", 1)[-1] for f in filenames}
-    now_ms = int(time.time() * 1000)
-    out = []
+    by_name: Dict[str, list] = {}
     add_actions = dt.get_add_actions(flatten=False)  # noqa: F841 - read below by DuckDB's replacement scan
     for rel, size in cur.sql("SELECT path, size_bytes FROM add_actions").fetchall():
-        if unquote(rel).rsplit("/", 1)[-1] in wanted:
-            out.append(RemoveAction(path=rel, data_change=data_change, deletion_timestamp=now_ms,
-                                    size=int(size), partition_values=None))
-    if len(out) != len(wanted):
-        raise RuntimeError(f"duckrun: {len(wanted) - len(out)} rewritten file(s) are not live in "
-                           f"version {dt.version()}; refusing to commit")
+        real = unquote(rel)
+        by_name.setdefault(real.rsplit("/", 1)[-1], []).append((real, int(size)))
+    now_ms = int(time.time() * 1000)
+    out, missing = [], 0
+    for f in sorted({f.replace("\\", "/") for f in filenames}):
+        hits = [(real, size) for real, size in by_name.get(f.rsplit("/", 1)[-1], [])
+                if f == real or f.endswith("/" + real)]
+        if len(hits) != 1:
+            missing += 1
+            continue
+        real, size = hits[0]
+        out.append(RemoveAction(path=real, data_change=data_change, deletion_timestamp=now_ms,
+                                size=size, partition_values=None))
+    if missing:
+        raise RuntimeError(f"duckrun: {missing} rewritten file(s) are not live in version "
+                           f"{dt.version()}; refusing to commit")
     return out
 
 

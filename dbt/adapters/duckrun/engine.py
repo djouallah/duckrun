@@ -532,11 +532,21 @@ def tmp_name(tag: str, key) -> str:
     return f"__duckrun_{tag}_{digest}"
 
 
+def unquote_ident(name) -> str:
+    """A column name as written in SQL → the name itself: whitespace stripped, and a double-quoted
+    identifier unquoted with its doubled quotes undone (``"it""s"`` → ``it"s``). A bare name is
+    returned as is."""
+    n = str(name).strip()
+    if len(n) >= 2 and n[0] == '"' and n[-1] == '"':
+        return n[1:-1].replace('""', '"')
+    return n
+
+
 def quote_ident(name) -> str:
-    """A double-quoted SQL identifier from a possibly already-quoted, possibly padded name: strip
-    whitespace and any quotes the caller put on, then quote and escape embedded quotes. Accepted by
-    both DuckDB and datafusion — the one quoting shape for join keys / sort columns."""
-    return '"' + str(name).strip().strip('"').replace('"', '""') + '"'
+    """A double-quoted SQL identifier from a possibly already-quoted, possibly padded name (see
+    :func:`unquote_ident`), with embedded quotes escaped. Accepted by both DuckDB and datafusion —
+    the one quoting shape for join keys / sort columns."""
+    return '"' + unquote_ident(name).replace('"', '""') + '"'
 
 
 _BARE_COLUMN = re.compile(r"[A-Za-z_]\w*")
@@ -720,17 +730,22 @@ def _delta_type(t):
     raise cow.Unsupported(f"type {t} has no Delta equivalent")
 
 
-def _delta_field(name: str, t) -> Dict[str, Any]:
-    return {"name": name, "type": _delta_type(t), "nullable": True, "metadata": {}}
+def _delta_field(name: str, t, nullable: bool = True,
+                 metadata: Optional[Dict[str, str]] = None) -> Dict[str, Any]:
+    return {"name": name, "type": _delta_type(t), "nullable": nullable, "metadata": metadata or {}}
 
 
-def delta_schema(rel, names: Optional[List[str]] = None):
+def delta_schema(rel, names: Optional[List[str]] = None, *, not_null=(),
+                 metadata: Optional[Dict[str, Dict[str, str]]] = None):
     """The Delta schema of a DuckDB relation's columns (``names`` = a subset), from DuckDB's own
-    types — no Arrow (and so no pyarrow) involved."""
+    types — no Arrow (and so no pyarrow) involved. ``not_null`` columns are non-nullable;
+    ``metadata`` is per-column field metadata (a generated column's expression)."""
     import json
     from deltalake import Schema as DeltaSchema
-    fields = [_delta_field(c, t) for c, t in zip(rel.columns, rel.types)
-              if names is None or c in names]
+    nn = {c.lower() for c in not_null}
+    md = {k.lower(): v for k, v in (metadata or {}).items()}
+    fields = [_delta_field(c, t, c.lower() not in nn, md.get(c.lower()))
+              for c, t in zip(rel.columns, rel.types) if names is None or c in names]
     return DeltaSchema.from_json(json.dumps({"type": "struct", "fields": fields}))
 
 
@@ -940,6 +955,9 @@ def _replace_table(cur, view, data, dt, path, partition_by, storage_options, rea
     """CREATE OR REPLACE with another schema or partitioning: a new table definition committed on
     top of the old one's history (``create_table_with_add_actions(mode='overwrite')``)."""
     from deltalake.transaction import create_table_with_add_actions
+    why = cow.unsupported_reason(dt, "overwrite")
+    if why:
+        raise cow.Unsupported(f"overwrite: {why}")
     parts = list(partition_by if partition_by is not None
                  else (dt.metadata().partition_columns or []))
     parts = [p for p in parts if p in data.columns]
@@ -1627,25 +1645,24 @@ def create_empty_delta(
     partition_by: Optional[List[str]] = None,
     configuration: Optional[Dict[str, str]] = None,
     generated: Optional[Dict[str, str]] = None,
+    not_null=(),
 ) -> None:
-    """Create an EMPTY Delta table at ``path`` from an Arrow ``schema`` (no data files).
+    """Create an EMPTY Delta table at ``path`` (no data files). ``schema`` is a DuckDB relation
+    (its column types; no pyarrow needed) or anything ``DeltaTable.create`` takes.
 
     Used by the connection API's bare ``CREATE TABLE (col defs)``: it logs a ``CREATE TABLE``
     operation rather than a ``WRITE``/``Overwrite``, which is what a create — not an overwrite —
     should record. ``mode`` follows delta-rs: ``error`` (fail if the table exists), ``overwrite``
-    (replace an existing table or drop-tombstone), or ``ignore`` (no-op if it exists).
+    (replace an existing table), or ``ignore`` (no-op if it exists).
     ``configuration`` adds table properties (``delta.checkpointInterval`` is duckrun's unless given);
     ``generated`` (``{column: expression}``) records generated columns as Delta does, in the field's
-    ``delta.generationExpression`` metadata.
+    ``delta.generationExpression`` metadata; ``not_null`` columns are non-nullable.
     """
-    if generated:
-        import pyarrow as pa
-        by_lower = {k.lower(): v for k, v in generated.items()}
-        schema = pa.schema(
-            [f.with_metadata({**(f.metadata or {}),
-                              b"delta.generationExpression": by_lower[f.name.lower()].encode()})
-             if f.name.lower() in by_lower else f for f in schema],
-            metadata=schema.metadata)
+    if hasattr(schema, "types"):
+        schema = delta_schema(_normalized(schema, "create table"), not_null=not_null, metadata={
+            c: {"delta.generationExpression": x} for c, x in (generated or {}).items()})
+    elif generated or not_null:
+        raise TypeError("create_empty_delta: generated / not_null need a DuckDB relation schema")
     conf = {"delta.checkpointInterval": str(CHECKPOINT_INTERVAL), **(configuration or {})}
     DeltaTable.create(path, schema, mode=mode, storage_options=storage_options,
                       partition_by=partition_by or None, configuration=conf)
@@ -1833,9 +1850,20 @@ def replace_window(
     naive ``YYYY-MM-DD HH:MM:SS`` strings (UTC batch bounds from dbt). Delegates to
     :func:`replace_where` with the window predicate; ``read_version`` pins/fences the commit."""
     # The bounds as string literals: DuckDB casts them to the column's type, so this works whether
-    # event_time is a DATE or a TIMESTAMP.
+    # event_time is a DATE or a TIMESTAMP. On a tz-aware column a bare string is read in the
+    # SESSION time zone, not UTC — so a laptop off UTC moved the window and refused the batch.
+    # There the bounds are spelled TIMESTAMPTZ in UTC.
     _col = quote_ident(column)
-    predicate = f"{_col} >= '{start}' AND {_col} < '{end}'"
+    dt = existing_dt if existing_dt is not None else open_if_exists(path, storage_options)
+    tz = dt is not None and any(
+        f.name.lower() == unquote_ident(column).lower()
+        and getattr(f.type, "type", None) == "timestamp" for f in dt.schema().fields)
+    def _utc(b):
+        b = str(b).strip()
+        return b if re.search(r"(Z|[+-]\d\d(:?\d\d)?)$", b[10:]) else b + "+00"
+    lo, hi = ((f"TIMESTAMPTZ '{_utc(start)}'", f"TIMESTAMPTZ '{_utc(end)}'") if tz
+              else (f"'{start}'", f"'{end}'"))
+    predicate = f"{_col} >= {lo} AND {_col} < {hi}"
     replace_where(
         path, data, predicate,
         read_version=read_version, partition_by=partition_by,
@@ -1896,12 +1924,12 @@ def update_rows(
     dt = dt if dt is not None else _delta_table(path, storage_options)
     target_cols = [f.name for f in dt.schema().fields]
     by_lower = {c.lower(): c for c in target_cols}
-    unknown = [c for c in updates if str(c).strip('"').lower() not in by_lower]
+    unknown = [c for c in updates if unquote_ident(c).lower() not in by_lower]
     if unknown:
         raise ValueError(
             f"UPDATE on {path!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
         )
-    updates = {by_lower[str(c).strip('"').lower()]: expr for c, expr in updates.items()}
+    updates = {by_lower[unquote_ident(c).lower()]: expr for c, expr in updates.items()}
     replaces = ", ".join(
         (f"CASE WHEN ({predicate}) THEN ({expr}) ELSE {quote_ident(col)} END AS {quote_ident(col)}"
          if predicate else f"({expr}) AS {quote_ident(col)}")
@@ -2386,12 +2414,12 @@ def probe_filters(cur, source_name, partition_by, join_keys) -> List[str]:
     than breaking a valid insert."""
     if not join_keys:
         return []
-    parts = {str(c).strip().strip('"').lower()
+    parts = {unquote_ident(c).lower()
              for c in (partition_by if isinstance(partition_by, (list, tuple))
                        else [partition_by] if partition_by else [])}
     out = []
     for key in join_keys:
-        c = str(key).strip().strip('"')
+        c = unquote_ident(key)
         q = '"' + c.replace('"', '""') + '"'
         # Partition column: prefer the exact value set (an IN list beats a range, and a source that
         # unions an old backfill with a current feed is BIMODAL, so min/max would smear the bound
@@ -2613,7 +2641,7 @@ def _cow_merge_clauses(clauses: List[dict], target_cols: List[str], source_cols:
     src = {c.lower() for c in source_cols}
 
     def cols(except_cols):
-        skip = {str(c).strip('"').lower() for c in (except_cols or [])}
+        skip = {unquote_ident(c).lower() for c in (except_cols or [])}
         return [c for c in target_cols if c.lower() in src and c.lower() not in skip]
 
     out = []
@@ -2625,13 +2653,13 @@ def _cow_merge_clauses(clauses: List[dict], target_cols: List[str], source_cols:
         if action == "delete":
             then = "DELETE"
         elif action in ("update", "update_all"):
-            pairs = (list(c["updates"].items()) if action == "update" else
+            pairs = ([(quote_ident(k), v) for k, v in c["updates"].items()] if action == "update" else
                      [(quote_ident(k), f"source.{quote_ident(k)}") for k in cols(c.get("except_cols"))])
             if not pairs:
                 raise cow.Unsupported("an UPDATE with no column to set")
             then = "UPDATE SET " + ", ".join(f"{k} = {v}" for k, v in pairs)
         elif action in ("insert", "insert_all"):
-            pairs = (list(c["updates"].items()) if action == "insert" else
+            pairs = ([(quote_ident(k), v) for k, v in c["updates"].items()] if action == "insert" else
                      [(quote_ident(k), f"source.{quote_ident(k)}") for k in cols(c.get("except_cols"))])
             if not pairs:
                 raise cow.Unsupported("an INSERT with no column")
@@ -2650,7 +2678,7 @@ def _cow_changes(pairs, types: Dict[str, str], qualifier: str = "") -> str:
     by_lower = {k.lower(): (k, v) for k, v in types.items()}
     terms = []
     for col, expr in pairs:
-        name, typ = by_lower[str(col).strip().strip('"').lower()]
+        name, typ = by_lower[unquote_ident(col).lower()]
         terms.append(f"{qualifier}{quote_ident(name)} IS DISTINCT FROM CAST(({expr}) AS {typ})")
     return "(" + " OR ".join(terms) + ")" if terms else "false"
 
@@ -2670,7 +2698,7 @@ def _cow_touch_case(clauses: List[dict], kind: str, target_cols: List[str], sour
         elif c["action"] == "update":
             chg = _cow_changes(list(c["updates"].items()), types, "target.")
         elif c["action"] == "update_all":
-            skip = {str(x).strip('"').lower() for x in (c.get("except_cols") or [])}
+            skip = {unquote_ident(x).lower() for x in (c.get("except_cols") or [])}
             chg = _cow_changes([(k, f"source.{quote_ident(k)}") for k in target_cols
                                 if k.lower() in src and k.lower() not in skip], types, "target.")
         else:
@@ -2794,7 +2822,8 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], replaces: Optional[str]
     Returns True."""
     dt = dt if dt is not None else _delta_table(path, storage_options)
     dt.load_as_version(read_version)
-    why = cow.unsupported_reason(dt)
+    remove_all = delete and not where       # TRUNCATE / an unfiltered DELETE
+    why = cow.unsupported_reason(dt, "truncate" if remove_all else "rewrite")
     if why:
         raise cow.Unsupported(f"{operation.lower()}: {why}")
     scan = cow.scan(path, read_version, alias)
@@ -2814,11 +2843,18 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], replaces: Optional[str]
         if not gone:
             return True        # nothing matched: no rewrite, no commit (as delta-rs skips empty DML)
         # The touched files' rows, with their position (see cow.write_files: the rewrite keeps it).
-        if delete and not where:
-            # Every row goes (TRUNCATE, an unfiltered DELETE): remove every file, write none.
-            logger.info(f"{operation.lower()}: copy-on-write (every file removed, none written)")
-            cow.commit(dt, path, cow.removes_for(cur, dt, gone),
-                       read_version=read_version, operation=operation)
+        if remove_all:
+            # Every row goes: an overwrite that adds nothing — delta-rs removes every live file
+            # itself (a file with a deletion vector included), and whole-file removes are a valid
+            # change-data-feed commit (readers derive the deletes from them).
+            logger.info(f"{operation.lower()}: every file removed, none written")
+            try:
+                dt.create_write_transaction(
+                    [], mode="overwrite", schema=dt.schema(),
+                    partition_by=list(dt.metadata().partition_columns or []) or None,
+                    commit_properties=_commit_props(read_version, operation))
+            except CommitFailedError as e:
+                raise _refused(e, operation.lower(), path, read_version) from e
             return True
         files = f'{fcol} IN (SELECT f FROM "{touched}")'
         pos = cow.with_position(f"{quote_ident(alias)}." if alias else "")
@@ -3013,7 +3049,7 @@ def merge_delta_clauses(path: str, data, predicate: str, clauses: List[dict], *,
     caller has none — see :func:`_write_source`)."""
     for knob in ("max_spill_size", "max_temp_directory_size"):
         if kwargs.get(knob):
-            logger.warning(f"merge: {knob} has no effect since 0.5.8 (DuckDB runs every MERGE)")
+            logger.warning(f"merge: {knob} has no effect since 0.6.0 (DuckDB runs every MERGE)")
     cur, data, owned = _write_source(cur, data, storage_options)
     try:
         _merge_clauses(path, data, predicate, clauses, cur=cur, storage_options=storage_options,

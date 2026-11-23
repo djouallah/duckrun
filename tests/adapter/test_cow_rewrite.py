@@ -1,5 +1,5 @@
 """Copy-on-write MERGE / UPDATE / DELETE: DuckDB rewrites the touched files and writes the parquet,
-delta-rs commits only the add + remove actions. Shapes the commit cannot express stay on delta-rs."""
+delta-rs commits only the add + remove actions. Shapes the commit cannot express are refused."""
 import deltalake
 import pytest
 

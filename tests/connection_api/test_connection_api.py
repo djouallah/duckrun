@@ -2011,6 +2011,29 @@ def test_replace_window_into_tz_column(conn):
                     (3, "2026-01-01 03:00:00+00"), (100, "2026-01-01 01:30:00+00")], rows
 
 
+@pytest.mark.parametrize("zone", ["Australia/Brisbane", "America/Los_Angeles"])
+def test_replace_window_into_tz_column_off_utc(conn, zone):
+    # The same window from a session whose TimeZone is not UTC (a laptop): dbt's bounds are UTC
+    # wall clocks, so they must not be read in the session's zone. CI runs in UTC, which hid this.
+    conn.sql("CREATE OR REPLACE TABLE w43 AS select i as id, "
+             "TIMESTAMPTZ '2026-01-01 00:00:00+00' + to_hours(i) as ts from range(4) t(i)")
+    loc = conn.root_path + "/dbo/w43"
+    conn._connection.execute(f"SET TimeZone='{zone}'")
+    try:
+        batch = conn._connection.sql(
+            "select 100 as id, TIMESTAMPTZ '2026-01-01 01:30:00+00' as ts")
+        engine.replace_window(loc, batch, column="ts",
+                              start="2026-01-01 01:00:00", end="2026-01-01 02:00:00",
+                              read_version=engine.table_version(loc, conn.storage_options),
+                              storage_options=conn.storage_options, cur=conn._connection)
+    finally:
+        conn._connection.execute("SET TimeZone='UTC'")
+    conn.refresh()
+    rows = sorted(conn.sql("select id, ts::varchar from w43").fetchall())
+    assert rows == [(0, "2026-01-01 00:00:00+00"), (2, "2026-01-01 02:00:00+00"),
+                    (3, "2026-01-01 03:00:00+00"), (100, "2026-01-01 01:30:00+00")], rows
+
+
 def test_compaction_lands_the_fixed_read_layout(conn):
     # Compaction rewrites fragmented appends into the same fixed read layout every write uses (4M
     # ceiling, 256 MB target) — no row count is taken, no derived sizing. 20M rows → 5 groups.

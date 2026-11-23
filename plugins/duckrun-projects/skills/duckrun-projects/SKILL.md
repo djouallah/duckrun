@@ -297,7 +297,7 @@ shared engine seam, so dbt and SQL cannot execute it two different ways. Any oth
 shape (matched update/delete, by-source, partial insert column list) runs copy-on-write:
 DuckDB rewrites only the files a changed row lands in and delta-rs commits the file swap.
 Tables with change data feed, deletion vectors, identity columns, append-only tables, column mapping on a partitioned or nested table are refused with a clear error: delta-rs's commit API has no
-action for what they need. Appends into change-data-feed and deletion-vector tables work.
+action for what they need. Appends, overwrites and TRUNCATE on a change-data-feed table work, and so do appends into a deletion-vector table.
 
 **Plain `append` with SQL dedup is still the cheapest of all** — it reads nothing from the
 target at all. If the model SQL already excludes rows present in
@@ -347,9 +347,9 @@ don't run other writers against a microbatch table during its window.
 | `max_row_group_size` | explicit parquet row-group ceiling in **rows** for this model's writes (deltalake's spelling; default: the fixed 4M). Overrides the default verbatim — use it when a model must land 16M-row Direct Lake segments (e.g. `16000000`). Honored by every write, MERGE included, and by post-write compaction |
 | `target_file_size_mb` | per-model target parquet file size in **MB** (default 256). Same coverage and merge caveat as `max_row_group_size` |
 | `merge_schema` | allow schema evolution on write |
-| `merge_max_spill_size` | no effect since 0.5.8 (DuckDB runs every MERGE under `memory_limit`); accepted with a warning |
-| `merge_streamed_exec` | no effect since 0.5.8; accepted |
-| `merge_max_temp_directory_size` | no effect since 0.5.8; accepted with a warning |
+| `merge_max_spill_size` | no effect since 0.6.0 (DuckDB runs every MERGE under `memory_limit`); accepted with a warning |
+| `merge_streamed_exec` | no effect since 0.6.0; accepted |
+| `merge_max_temp_directory_size` | no effect since 0.6.0; accepted with a warning |
 | `merge_clauses` / `merge_update_set_expressions` | dbt-duckdb-style custom clause list / per-column SET expressions — translated to the full MERGE clause list |
 | `storage_options` | per-model override |
 
