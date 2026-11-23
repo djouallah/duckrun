@@ -285,7 +285,7 @@ def check_not_null(cur, table: str, dt: DeltaTable, operation: str) -> None:
     the check delta-rs's writer applied."""
     for f in dt.schema().fields:
         if not f.nullable:
-            n = cur.execute(f"SELECT count(*) FROM {table} WHERE {_q(f.name)} IS NULL").fetchone()[0]
+            n = cur.execute(f"SELECT count(*) FROM {table} WHERE {_q(f.name)} IS NULL").fetchall()[0][0]
             if n:
                 raise ValueError(f"{operation} would write {n} NULL(s) into NOT NULL column {f.name!r}")
 
