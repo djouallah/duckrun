@@ -338,12 +338,6 @@ def _split_root_schema(path: str, schema: Optional[str]):
     both :func:`connect` and :meth:`DuckSession.attach` accept it through this one seam.
     """
     p = _expand_onelake_shorthand(path).rstrip("/")
-    if _is_workspace_root(p):
-        if schema is not None:
-            raise ValueError(
-                f"'{path}' is a workspace; schema= does not apply. Address a table as "
-                f"<workspace>.<lakehouse>.<schema>.<table>, or connect one lakehouse to filter its schemas.")
-        return p, None
     if schema is not None:
         return p, schema
     if remote.is_abfss(p):
@@ -359,33 +353,13 @@ def _split_root_schema(path: str, schema: Optional[str]):
     return p, None
 
 
-_LAKEHOUSE_SUFFIX = ".lakehouse"
-
-
-def _is_workspace_root(p: str) -> bool:
-    """True when ``p`` names a whole workspace rather than one lakehouse: a OneLake URL with no item
-    segment (``abfss://ws@onelake.dfs.fabric.microsoft.com``), or a local directory holding
-    ``<name>.Lakehouse/Tables`` folders (the same layout, for tests and local mirrors). A lakehouse
-    root holds ``<schema>/<table>`` folders, never ``*.Lakehouse/Tables``, so no existing path
-    changes meaning."""
-    p = p.replace("\\", "/").rstrip("/")
-    if remote.is_abfss(p):
-        return remote._parse_abfss(p)[2] == ""
-    if "://" in p or not os.path.isdir(p):
-        return False
-    return any(n.lower().endswith(_LAKEHOUSE_SUFFIX) and os.path.isdir(os.path.join(p, n, "Tables"))
-               for n in os.listdir(p))
-
-
 # One attached lakehouse root = one DuckDB catalog. The primary (from connect) is the first entry;
 # attach() adds more. `schema_filter` mirrors connect's `schema=` (restrict discovery to one schema);
 # `read_only` is per-catalog so a read-only reference store (e.g. a Fabric Warehouse) can sit next to
 # a writable lakehouse in one session.
 _CatEntry = namedtuple("_CatEntry", ["name", "root_path", "storage_options", "schema_filter",
                                     "read_only", "kind"])
-# kind: "delta" (delta_scan views) | "iceberg" (native) | "workspace" (a whole Fabric workspace:
-# each lakehouse a schema, its table schemas nested under it — ws.lh.schema.table).
-_CatEntry.__new__.__defaults__ = ("delta",)
+_CatEntry.__new__.__defaults__ = ("delta",)   # kind: "delta" (delta_scan views) | "iceberg" (native)
 
 
 def _normalize_format(fmt: Optional[str]) -> str:
@@ -454,9 +428,6 @@ class DuckSession:
         # The primary catalog keeps the unscoped OneLake secret (attached ones are path-scoped); the
         # token-refresh guard needs to know which is which to re-mint the right secret.
         self._primary_catalog: Optional[str] = None
-        # Workspace catalogs only: catalog -> {lakehouse name -> that lakehouse's `…/Tables` root}.
-        # Tokens stay on the catalog's _CatEntry (one per workspace), so token refresh is unchanged.
-        self._ws_lakehouses: Dict[str, Dict[str, str]] = {}
 
         root, schema_filter = _split_root_schema(path, schema)
         # Catalog is first-class, so single- and multi-catalog sessions share one code path
@@ -476,10 +447,8 @@ class DuckSession:
 
     @property
     def root_path(self) -> str:
-        """The current catalog's lakehouse root (back-compat for single-catalog callers); in a
-        workspace catalog, the current lakehouse's (after ``USE ws.lakehouse.schema``)."""
-        cat, lh, _ = self._current_location()
-        return self._lakehouse_root(cat, lh)
+        """The current catalog's lakehouse root (back-compat for single-catalog callers)."""
+        return self._catalogs[self._current_catalog].root_path
 
     @property
     def storage_options(self) -> Optional[Dict[str, str]]:
@@ -509,10 +478,6 @@ class DuckSession:
         (listing, schemas, reads AND writes), so there is nothing to discover or register here."""
         root = root.replace("\\", "/").rstrip("/")
         ro = self.read_only if read_only is None else bool(read_only)
-        if _is_workspace_root(root):
-            if kind == "iceberg":
-                raise ValueError("format='iceberg' attaches one lakehouse's catalog, not a workspace.")
-            kind = "workspace"
         if kind == "iceberg":
             so, schema = _iceberg.attach_iceberg_catalog(self.con, name, root, schema_filter,
                                                          storage_options, ro)
@@ -546,7 +511,7 @@ class DuckSession:
             print(f"[warn] could not mint OneLake secret for catalog '{name}': {exc}")
 
         self.con.execute(f"ATTACH ':memory:' AS {_qid(name)}")
-        self._catalogs[name] = _CatEntry(name, root, so, schema_filter, ro, kind)
+        self._catalogs[name] = _CatEntry(name, root, so, schema_filter, ro)
         if primary:
             self._primary_catalog = name
         try:
@@ -557,20 +522,12 @@ class DuckSession:
             # refresh() would iterate a broken catalog, and re-attaching the corrected name/root
             # would die on "already attached".
             self._catalogs.pop(name, None)
-            self._ws_lakehouses.pop(name, None)
             try:
                 self.con.execute(f"DETACH {_qid(name)}")
             except Exception:
                 pass
             raise
-        if primary and kind == "workspace":
-            # No lakehouse is "the" default, so don't guess one: the catalog is current, and an
-            # unqualified name needs `USE <ws>.<lakehouse>.<schema>` first.
-            self._use(name, None)
-            if not quiet and schemas:
-                print(f"  tables are {name}.<lakehouse>.<schema>.<table>; for unqualified names: "
-                      f"USE {name}.{schemas[0]}.dbo")
-        elif primary:
+        if primary:
             # Make the primary the current catalog (+ a sensible default schema) via DuckDB's own USE —
             # the ONE place "current" is set; every reader derives it back from current_database().
             # Ensure the default schema exists first (an empty catalog has none yet) so USE can't fail
@@ -666,108 +623,25 @@ class DuckSession:
         if entry.kind == "iceberg":
             # DuckDB's own catalog — always live, nothing to re-discover or re-register.
             return [entry.schema_filter] if entry.schema_filter else []
-        if entry.kind == "workspace":
-            return self._refresh_workspace(name, quiet)
         root, so = entry.root_path, entry.storage_options
         if entry.schema_filter is not None:
             mapping = {entry.schema_filter: self._list_tables(root, entry.schema_filter, so)}
         else:
             mapping = {s: self._list_tables(root, s, so) for s in self._list_schemas(root, so)}
-        registered = self._register_mapping(name, None, root, so, mapping)
-        if not quiet:
-            lh = root.rstrip("/").rsplit("/", 1)[-1]
-            print(f"Connected to {lh} (catalog '{name}') - discovered {len(registered)} table(s)"
-                  + (": " + ", ".join(registered) if registered else ""))
-        return list(mapping.keys())
 
-    def _refresh_workspace(self, name: str, quiet: bool = True) -> List[str]:
-        """Discover every lakehouse of a workspace catalog: each becomes schema ``"ws"."lh"`` and its
-        table schemas nest under it (``"ws"."lh"."dbo"``). A lakehouse without schemas
-        (``Tables/<table>``) is skipped with a pointer to connect it directly — its tables have no
-        schema level to nest. Returns the lakehouse names."""
-        entry = self._catalogs[name]
-        so = entry.storage_options
-        lakehouses = self._list_workspace_lakehouses(entry.root_path, so)
-        clash = _case_collision(list(lakehouses))
-        if clash:
-            raise RuntimeError(_case_clash_msg(name, None, clash))
-        known: Dict[str, str] = {}
-        registered, skipped = [], []
-        for lh, root in lakehouses.items():
-            mapping = {}
-            for s in self._list_schemas(root, so):
-                mapping[s] = self._list_tables(root, s, so)
-                if "_delta_log" in mapping[s]:
-                    break                              # a table folder, not a schema: schema-less
-            if self._is_schemaless(root, mapping):
-                skipped.append(lh)
-                continue
-            known[lh] = root
-            self._ws_lakehouses[name] = known
-            self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(name)}.{_qid(lh)}")
-            registered += [f"{lh}.{t}" for t in self._register_mapping(name, lh, root, so, mapping)]
-        self._ws_lakehouses[name] = known
-        if not quiet:
-            print(f"Connected to workspace catalog '{name}' - {len(known)} lakehouse(s), "
-                  f"discovered {len(registered)} table(s)"
-                  + (": " + ", ".join(registered) if registered else ""))
-            for lh in skipped:
-                print(f"  skipped lakehouse '{lh}': it has no schemas; connect it on its own, "
-                      f"e.g. duckrun.connect('<workspace>/{lh}.Lakehouse', schema='Tables')")
-        return list(known)
-
-    def _list_workspace_lakehouses(self, ws_root: str, so) -> Dict[str, str]:
-        """``{lakehouse name: its …/Tables root}`` for a workspace. OneLake lists a workspace by
-        friendly name as ``<name>.Lakehouse`` folders (notebooks, pipelines … are skipped); a GUID
-        workspace lists bare item GUIDs, so the names come from the Fabric REST API instead."""
-        base = ws_root.rstrip("/")
-        if remote.is_abfss(base):
-            fs, host, _ = remote._parse_abfss(base)
-            if _GUID.match(fs):
-                from .workspace import workspace as _workspace
-                try:
-                    items = _workspace(fs).list_lakehouses()
-                except Exception as exc:
-                    raise RuntimeError(
-                        f"could not list the lakehouses of workspace {fs}: {exc}\nConnect the "
-                        f"workspace by its friendly name, or attach its lakehouses one by one.") from exc
-                return {i["displayName"]: f"abfss://{fs}@{host}/{i['id']}/Tables"
-                        for i in sorted(items, key=lambda i: i["displayName"])}
-            names = remote.list_delta_tables(base, "", so)
-        else:
-            names = [n for n in os.listdir(base) if os.path.isdir(os.path.join(base, n))]
-        return {n[: -len(_LAKEHOUSE_SUFFIX)]: f"{base}/{n}/Tables"
-                for n in sorted(names) if n.lower().endswith(_LAKEHOUSE_SUFFIX)}
-
-    def _is_schemaless(self, root: str, mapping) -> bool:
-        """True when a lakehouse keeps its tables straight under ``Tables/`` (no schema folders). On
-        OneLake a listed "schema" then holds ``_delta_log``; on other stores the schema glob finds
-        nothing, so look for a table log one level up."""
-        if any("_delta_log" in tables for tables in mapping.values()):
-            return True
-        if remote.is_abfss(root):
-            return False
-        pattern = _qlit(root.rstrip("/") + "/*/_delta_log/*.json")
-        return bool(self.con.execute(f"SELECT 1 FROM glob('{pattern}') LIMIT 1").fetchall())
-
-    def _register_mapping(self, name: str, lakehouse: Optional[str], root: str, so, mapping) -> List[str]:
-        """Register ``{schema: [tables]}`` under catalog ``name`` — or, for a workspace catalog, under
-        its lakehouse schema ``"name"."lakehouse"``. Returns the ``schema.table`` names registered."""
-        prefix = _qid(name) if lakehouse is None else f"{_qid(name)}.{_qid(lakehouse)}"
-        where = name if lakehouse is None else f"{name}.{lakehouse}"
         # Fail loud when the store holds two schemas/tables that differ ONLY by case: DuckDB's catalog
         # folds them to one name, so exposing both is impossible and one would silently shadow the
         # other. This happens on a case-sensitive store (Linux / OneLake) when an external engine
         # (Spark/Fabric) wrote both — duckrun can't fix it, but it must not hide it.
         clash = _case_collision(list(mapping))
         if clash:
-            raise RuntimeError(_case_clash_msg(where, None, clash))
+            raise RuntimeError(_case_clash_msg(name, None, clash))
 
         registered = []
         for schema, tables in mapping.items():
             if not tables:
                 continue
-            self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {prefix}.{_qid(schema)}")
+            self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(name)}.{_qid(schema)}")
             # Open every table's Delta log concurrently for the tombstone checks — serialized
             # per-table opens were the dominant connect()/refresh() cost on OneLake (the twin of
             # the adapter's issue-#16 discovery fix). View registration stays serial on the
@@ -784,27 +658,28 @@ class DuckSession:
                 # fall back to the original DuckDB-side probe so a tombstone there is still hidden.
                 elif delta_dml.is_dropped(self.con, f"{root}/{schema}/{table}", so):
                     continue
-                if self._register_view(name, schema, table, lakehouse):
+                if self._register_view(name, schema, table):
                     live.append(table)
                     registered.append(f"{schema}.{table}")
             clash = _case_collision(live)
             if clash:
-                raise RuntimeError(_case_clash_msg(where, schema, clash))
-        return registered
+                raise RuntimeError(_case_clash_msg(name, schema, clash))
 
-    def _register_view(self, catalog: str, schema: str, table: str,
-                       lakehouse: Optional[str] = None) -> bool:
+        if not quiet:
+            lh = root.rstrip("/").rsplit("/", 1)[-1]
+            print(f"Connected to {lh} (catalog '{name}') - discovered {len(registered)} table(s)"
+                  + (": " + ", ".join(registered) if registered else ""))
+        return list(mapping.keys())
+
+    def _register_view(self, catalog: str, schema: str, table: str) -> bool:
         """Register a discovered table as a ``delta_scan`` view. Returns True if registered, False if
         the directory turned out not to be a Delta table (no ``_delta_log``) and was skipped — so
-        ``connect()`` tolerates ANY root (a Files section, a mixed dir), not only a clean Tables root.
-        ``lakehouse`` (workspace catalogs) nests the view as ``catalog.lakehouse.schema.table``."""
+        ``connect()`` tolerates ANY root (a Files section, a mixed dir), not only a clean Tables root."""
         entry = self._catalogs[catalog]
-        root = self._lakehouse_root(catalog, lakehouse)
-        path = f"{root}/{schema}/{table}"
-        prefix = _qid(catalog) if lakehouse is None else f"{_qid(catalog)}.{_qid(lakehouse)}"
+        path = f"{entry.root_path}/{schema}/{table}"
         try:
             self.con.execute(
-                f"CREATE OR REPLACE VIEW {prefix}.{_qid(schema)}.{_qid(table)} AS "
+                f"CREATE OR REPLACE VIEW {_qid(catalog)}.{_qid(schema)}.{_qid(table)} AS "
                 f"SELECT * FROM delta_scan('{_qlit(path)}')"
             )
             return True
@@ -815,20 +690,12 @@ class DuckSession:
             # and still won't read is a real failure (e.g. the delta-kernel #307 friendly-name bug) →
             # fail loud, keeping the engine error but dropping DuckDB's echo of the CREATE VIEW we
             # generated (`from None` so the noisy SQL echo doesn't reappear in tracebacks).
-            if remote.is_abfss(root) and not remote.has_delta_log(path, entry.storage_options):
+            if remote.is_abfss(entry.root_path) and not remote.has_delta_log(path, entry.storage_options):
                 return False
-            where = catalog if lakehouse is None else f"{catalog}.{lakehouse}"
-            reason = _strip_query_context(str(exc))
-            if lakehouse is not None:
-                # A workspace spans lakehouses other people own: one unreadable table must not take
-                # the whole catalog down. Say so and skip it; a single-lakehouse connect fails loud.
-                print(f"[warn] skipped {where}.{schema}.{table} (could not read it): "
-                      f"{reason.splitlines()[0] if reason else exc}")
-                return False
-            hint = _onelake_guid_hint(root)
+            hint = _onelake_guid_hint(entry.root_path)
             raise RuntimeError(
-                f"duckrun: could not read Delta table {where}.{schema}.{table} at '{path}':\n"
-                f"{reason}"
+                f"duckrun: could not read Delta table {catalog}.{schema}.{table} at '{path}':\n"
+                f"{_strip_query_context(str(exc))}"
                 + (f"\n\n{hint}" if hint else "")
             ) from None
 
@@ -843,110 +710,30 @@ class DuckSession:
         except Exception:  # an empty/absent schema shouldn't abort connect
             pass
 
-    def _table_path(self, schema: str, table: str, catalog: Optional[str] = None,
-                    lakehouse: Optional[str] = None) -> str:
+    def _table_path(self, schema: str, table: str, catalog: Optional[str] = None) -> str:
         cat = catalog if catalog is not None else self._current_catalog
-        return f"{self._lakehouse_root(cat, lakehouse)}/{schema}/{table}"
+        return f"{self._catalogs[cat].root_path}/{schema}/{table}"
 
     def _catalog_storage_options(self, catalog: str):
         return self._catalogs[catalog].storage_options
 
-    def _is_workspace(self, catalog: Optional[str]) -> bool:
-        entry = self._catalogs.get(catalog) if catalog is not None else None
-        return entry is not None and entry.kind == "workspace"
-
-    def _lakehouse_name(self, catalog: str, lakehouse: str) -> Optional[str]:
-        """The workspace catalog's spelling of ``lakehouse`` (DuckDB folds identifier case), or None."""
-        low = lakehouse.lower()
-        return next((n for n in self._ws_lakehouses.get(catalog, {}) if n.lower() == low), None)
-
-    def _lakehouse_root(self, catalog: str, lakehouse: Optional[str] = None) -> str:
-        """The ``…/Tables`` root a table of ``catalog`` lives under: the catalog's own root, or for a
-        workspace catalog the root of its ``lakehouse``."""
-        if not self._is_workspace(catalog):
-            return self._catalogs[catalog].root_path
-        if lakehouse is None:
-            raise ValueError(
-                f"catalog '{catalog}' is a workspace: name the lakehouse "
-                f"({catalog}.<lakehouse>.<schema>.<table>), or USE {catalog}.<lakehouse>.<schema> first.")
-        name = self._lakehouse_name(catalog, lakehouse)
-        if name is None:
-            raise ValueError(f"workspace catalog '{catalog}' has no lakehouse '{lakehouse}'; "
-                             f"lakehouses: {sorted(self._ws_lakehouses.get(catalog, {}))}.")
-        return self._ws_lakehouses[catalog][name]
-
-    def _current_location(self):
-        """``(catalog, lakehouse, schema)`` that DuckDB's ``USE`` points at. In a workspace catalog
-        ``current_schema()`` reads ``lakehouse.schema`` (lakehouse names have no dots); right after
-        ``USE ws`` there is no lakehouse yet, so both come back None."""
-        cat = self._current_catalog
-        sch = self._current_database
-        if not self._is_workspace(cat):
-            return cat, None, sch
-        lh, _, leaf = sch.partition(".")
-        name = self._lakehouse_name(cat, lh) if leaf else None
-        return (cat, name, leaf) if name else (cat, None, None)
-
-    def _unknown_catalog(self, catalog: str) -> ValueError:
-        return ValueError(
-            f"unknown catalog '{catalog}'; attached catalogs: {list(self._catalogs)}. "
-            f"Attach it with conn.attach(path, name='{catalog}').")
-
-    def _locate_parts(self, parts):
-        """``(catalog, lakehouse, schema, table)`` for a dotted name; ``lakehouse`` is None outside
-        workspace catalogs.
-
-        4 parts → ``workspace.lakehouse.schema.table``. 3 parts → ``catalog.schema.table``, or, when
-        the first part is not a catalog but a lakehouse of the current workspace,
-        ``lakehouse.schema.table`` (catalog names win, as in DuckDB). 2 parts → ``schema.table`` in
-        the current catalog. 1 part → the current catalog + schema. In a workspace catalog a 2-part
-        name is ambiguous and 1 part needs ``USE ws.lakehouse.schema``."""
-        cur_cat, cur_lh, cur_sch = self._current_location()
-        if len(parts) >= 4:
-            cat, lh, sch, tbl = parts[-4:]
-            if cat not in self._catalogs:
-                raise self._unknown_catalog(cat)
-            if not self._is_workspace(cat):
-                raise ValueError(f"'{'.'.join(parts)}': a 4-part name needs a workspace catalog; "
-                                 f"'{cat}' is one lakehouse (use {cat}.<schema>.<table>).")
-            self._lakehouse_root(cat, lh)                       # raises on an unknown lakehouse
-            return cat, self._lakehouse_name(cat, lh), sch, tbl
-        if len(parts) == 3:
-            a, sch, tbl = parts
-            if a in self._catalogs:
-                if self._is_workspace(a):
-                    raise ValueError(f"'{a}' is a workspace catalog: name the lakehouse too, "
-                                     f"{a}.<lakehouse>.{sch}.{tbl}.")
-                return a, None, sch, tbl
-            if self._is_workspace(cur_cat) and self._lakehouse_name(cur_cat, a):
-                return cur_cat, self._lakehouse_name(cur_cat, a), sch, tbl
-            raise self._unknown_catalog(a)
-        if self._is_workspace(cur_cat):
-            if len(parts) == 2:
-                raise ValueError(f"'{'.'.join(parts)}' is ambiguous in workspace catalog '{cur_cat}': "
-                                 f"use <table>, <lakehouse>.<schema>.<table> or "
-                                 f"{cur_cat}.<lakehouse>.<schema>.<table>.")
-            if cur_lh is None:
-                raise ValueError(f"'{parts[0]}': no current lakehouse in workspace catalog "
-                                 f"'{cur_cat}'; USE {cur_cat}.<lakehouse>.<schema> or qualify the name.")
-            return cur_cat, cur_lh, cur_sch, parts[0]
-        if len(parts) == 2:
-            return cur_cat, None, parts[0], parts[1]
-        return cur_cat, None, cur_sch, parts[0]
-
-    def _locate(self, name: str):
-        return self._locate_parts(delta_dml._split_dotted(name))  # quote-aware: "a.b" is one part
-
     def _resolve(self, name: str):
-        """Split a possibly-qualified name into ``(catalog, schema, table)`` — :meth:`_locate` without
-        the lakehouse, for callers that only handle lakehouse catalogs."""
-        catalog, _lh, schema, table = self._locate(name)
-        return catalog, schema, table
+        """Split a possibly-qualified name into ``(catalog, schema, table)``.
 
-    def _locate_path(self, name: str):
-        """``(catalog, lakehouse, schema, table, path, storage_options)`` for a table name."""
-        cat, lh, sch, tbl = self._locate(name)
-        return cat, lh, sch, tbl, self._table_path(sch, tbl, cat, lh), self._catalog_storage_options(cat)
+        3 parts → ``catalog.schema.table`` (the catalog must be attached); 2 parts → ``schema.table``
+        in the current catalog; 1 part → table in the current catalog + database."""
+        parts = delta_dml._split_dotted(name)  # quote-aware: a dot inside "a.b" stays one part
+        if len(parts) >= 3:
+            catalog, schema, table = parts[-3], parts[-2], parts[-1]
+            if catalog not in self._catalogs:
+                raise ValueError(
+                    f"unknown catalog '{catalog}'; attached catalogs: {list(self._catalogs)}. "
+                    f"Attach it with conn.attach(path, name='{catalog}')."
+                )
+            return catalog, schema, table
+        if len(parts) == 2:
+            return self._current_catalog, parts[0], parts[1]
+        return self._current_catalog, self._current_database, parts[0]
 
     def _require_writable(self, op: str, catalog: Optional[str] = None):
         """Raise unless the target catalog (default: the current one) is writable. Guards every
@@ -964,13 +751,6 @@ class DuckSession:
         """Schemas in ``catalog`` (default: the current catalog) — the discovered Delta schema
         folders, minus DuckDB internals."""
         cat = catalog or self._current_catalog
-        if self._is_workspace(cat):
-            # information_schema names a nested schema by its leaf only (two lakehouses can both have
-            # `dbo`), so read the parent from duckdb_schemas: `lakehouse.schema`, as current_schema().
-            rows = self.con.execute(
-                "SELECT parent_schema || '.' || schema_name FROM duckdb_schemas() "
-                "WHERE database_name = ? AND parent_schema IS NOT NULL ORDER BY 1", [cat]).fetchall()
-            return [r[0] for r in rows]
         rows = self.con.execute(
             "SELECT schema_name FROM information_schema.schemata "
             "WHERE catalog_name = ? ORDER BY schema_name", [cat]).fetchall()
@@ -981,13 +761,6 @@ class DuckSession:
         ``catalog`` (default: the current catalog)."""
         cat = catalog or self._current_catalog
         schema = dbName or self._current_database
-        if self._is_workspace(cat):
-            lh, _, leaf = schema.partition(".")             # `lakehouse.schema`, see _cat_databases
-            rows = self.con.execute(
-                "SELECT v.view_name FROM duckdb_views() v JOIN duckdb_schemas() s "
-                "ON v.schema_oid = s.oid WHERE v.database_name = ? AND s.parent_schema = ? "
-                "AND s.schema_name = ? ORDER BY 1", [cat, lh, leaf]).fetchall()
-            return [r[0] for r in rows]
         rows = self.con.execute(
             "SELECT table_name FROM information_schema.tables "
             "WHERE table_catalog = ? AND table_schema = ? ORDER BY table_name",
@@ -996,8 +769,9 @@ class DuckSession:
 
     def _cat_table_exists(self, tableName: str) -> bool:
         """True iff ``tableName`` is a LIVE Delta table (read from the store; a drop-tombstone is False)."""
-        _cat, _lh, _sch, _tbl, path, so = self._locate_path(tableName)
-        return self._live_table_exists(path, so)
+        catalog, schema, table = self._resolve(tableName)
+        return self._live_table_exists(self._table_path(schema, table, catalog),
+                                       self._catalog_storage_options(catalog))
 
     def _cat_database_exists(self, dbName: str) -> bool:
         self.refresh(quiet=True)  # re-discover schema folders first
@@ -1037,13 +811,12 @@ class DuckSession:
             return
         self._catalogs[name] = entry._replace(storage_options=so)
 
-    def _handle_delta_write(self, root: str, so, query: str, default_schema, view_prefix=None) -> bool:
-        """Route a Delta write through ``delta_dml.handle`` against lakehouse ``root``. Memory is
-        already handled: the session's ``memory_limit`` was pinned once at connect
-        (``configure_duckdb_session``), and a ``MERGE``'s delta_rs pool is bounded by its own spill
-        caps behind the merge gate in the engine."""
-        return delta_dml.handle(self.con, root, so, query, default_schema=default_schema,
-                                view_prefix=view_prefix)
+    def _handle_delta_write(self, entry, query: str) -> bool:
+        """Route a Delta write through ``delta_dml.handle``. Memory is already handled: the session's
+        ``memory_limit`` was pinned once at connect (``configure_duckdb_session``), and a ``MERGE``'s
+        delta_rs pool is bounded by its own spill caps behind the merge gate in the engine."""
+        return delta_dml.handle(self.con, entry.root_path, entry.storage_options,
+                                query, default_schema=self._current_database)
 
     def sql(self, query: str) -> duckdb.DuckDBPyRelation:
         """Run a query and return DuckDB's native ``DuckDBPyRelation`` — unwrapped, with all of its
@@ -1112,16 +885,18 @@ class DuckSession:
             result = self.con.sql(query)
             self._in_explicit_txn = mtxn.group(1).lower() in ("begin", "start")
             return result
-        # Raw DML routes through delta_rs against ONE lakehouse root. A 3/4-part target names the
-        # catalog (and, in a workspace catalog, the lakehouse); an unqualified/2-part target is the
-        # current one. Reads (SELECT) are unaffected — DuckDB resolves every attached catalog natively.
+        # Raw DML routes through delta_rs against ONE root. A 3-part target names which catalog that
+        # is (``_dml_target_catalog`` → its name); an unqualified/2-part target is the current catalog.
+        # Reads (SELECT) are unaffected — DuckDB resolves every attached catalog natively.
+        target_cat = _dml_target_catalog(query)
+        if target_cat is not None and target_cat not in self._catalogs:
+            raise ValueError(
+                f"unknown catalog '{target_cat}'; attached catalogs: {list(self._catalogs)}. "
+                f"Attach it with conn.attach(path, name='{target_cat}')."
+            )
         # The current catalog is DuckDB's own current_database() (the _current_catalog property), so a
         # bare `USE cat.schema` steers write routing exactly as it steers reads — no parallel state.
-        tparts = delta_dml.dml_target_parts(query)
-        if tparts is not None and len(tparts) >= 3:
-            write_cat, write_lh, write_sch, _ = self._locate_parts(tparts)  # raises: unknown catalog
-        else:
-            write_cat, write_lh, write_sch = self._current_location()
+        write_cat = target_cat if target_cat is not None else self._current_catalog
         # An Iceberg catalog is DuckDB's end to end: it owns the tables, the writes and the
         # read-only flag (ATTACH … READ_ONLY). Nothing below applies — hand the statement over
         # untouched rather than parsing it against Delta's rules.
@@ -1145,21 +920,6 @@ class DuckSession:
         if entry is not None and entry.read_only and is_write:
             op = "vacuum (compact) a table" if _is_vacuum(query) else "run write DML"
             raise PermissionError(_READ_ONLY_MSG.format(op=op, catalog=write_cat))
-        # The lakehouse root the statement lands in. A workspace catalog needs a lakehouse: from a
-        # 3/4-part target, or `USE ws.lakehouse.schema`; its delta_scan views nest under "ws"."lh".
-        root = prefix = None
-        default_schema = self._current_database
-        if entry is not None and entry.kind == "workspace":
-            if is_write and tparts is not None and len(tparts) == 2:
-                self._locate_parts(tparts)             # raises: 2 parts are ambiguous in a workspace
-            if write_lh is not None:
-                root = self._lakehouse_root(write_cat, write_lh)
-                prefix = f"{_qid(write_cat)}.{_qid(write_lh)}"
-                default_schema = write_sch
-            elif is_write:
-                self._lakehouse_root(write_cat, None)  # raises with the USE hint
-        elif entry is not None:
-            root = entry.root_path
         unsupported = _unsupported_dml(query)
         if unsupported:
             raise ValueError(unsupported)
@@ -1170,12 +930,11 @@ class DuckSession:
         try:
             # A Delta write is routed with the DuckDB memory_limit clamped (and restored after); a read runs
             # handle() unwrapped — it returns False for non-DML and falls through to DuckDB below. is_write
-            # implies root is not None here (the cases without one raised above).
-            if root is not None:
-                handled = (self._handle_delta_write(root, entry.storage_options, query,
-                                                    default_schema, prefix) if is_write else
-                           delta_dml.handle(self.con, root, entry.storage_options, query,
-                                            default_schema=default_schema, view_prefix=prefix))
+            # implies entry is not None here (the None case raised above).
+            if entry is not None:
+                handled = (self._handle_delta_write(entry, query) if is_write else
+                           delta_dml.handle(self.con, entry.root_path, entry.storage_options,
+                                            query, default_schema=self._current_database))
             else:
                 handled = False
         finally:
@@ -1557,11 +1316,11 @@ class DuckSession:
                 f"get_stats: nothing to describe for source={source!r} "
                 f"(catalog '{self._current_catalog}', schema '{self._current_database}').")
         parts = []
-        for cat, lh, sch, tbl in targets:
+        for cat, sch, tbl in targets:
+            entry = self._catalogs[cat]
             files, size_bytes, vorder, deleted, colmap = engine.delta_file_summary(
-                self.con, self._table_path(sch, tbl, cat, lh), self._catalog_storage_options(cat))
-            shown = sch if lh is None else f"{lh}.{sch}"      # a workspace row shows lakehouse.schema
-            pre = (f"'{_qlit(cat)}' AS catalog, '{_qlit(shown)}' AS schema, "
+                self.con, f"{entry.root_path}/{sch}/{tbl}", entry.storage_options)
+            pre = (f"'{_qlit(cat)}' AS catalog, '{_qlit(sch)}' AS schema, "
                    f"'{_qlit(tbl)}' AS \"table\"")
             if not files:
                 if not detailed:
@@ -1602,13 +1361,15 @@ class DuckSession:
         """``describe detail <table>`` — the Delta table's ``format`` / ``id`` / ``name`` /
         ``location`` (its storage path) / ``partitionColumns`` / ``numFiles`` / ``sizeInBytes`` /
         ``version``, read from the Delta log. One row, as a native relation."""
-        _cat, _lh, sch, tbl, path, so = self._locate_path(name)
-        dt = engine._delta_table(path, so)
+        cat, sch, tbl = self._resolve(name)
+        entry = self._catalogs[cat]
+        path = f"{entry.root_path}/{sch}/{tbl}"
+        dt = engine._delta_table(path, entry.storage_options)
         md = dt.metadata()
         # count_deleted=False: `describe detail` reports files/bytes, no row count, so the
         # deletion-vector read (the only expensive part) would buy nothing.
         files, size_bytes, _, _, _ = engine.delta_file_summary(
-            self.con, path, so, count_deleted=False)
+            self.con, path, entry.storage_options, count_deleted=False)
         parts = list(md.partition_columns or [])
         part_lit = "[" + ", ".join(f"'{_qlit(p)}'" for p in parts) + "]"
         return self.con.sql(
@@ -1620,8 +1381,10 @@ class DuckSession:
     def _describe_history(self, name: str) -> "duckdb.DuckDBPyRelation":
         """``describe history <table>`` — one row per Delta commit (``version``, ``timestamp``,
         ``operation``, ``operationMetrics``), newest first, read from the Delta log."""
-        _cat, _lh, _sch, _tbl, path, so = self._locate_path(name)
-        dt = engine._delta_table(path, so)
+        cat, sch, tbl = self._resolve(name)
+        entry = self._catalogs[cat]
+        path = f"{entry.root_path}/{sch}/{tbl}"
+        dt = engine._delta_table(path, entry.storage_options)
         rows = []
         for h in dt.history():
             ver = h.get("version")
@@ -1641,32 +1404,22 @@ class DuckSession:
             f"ORDER BY version DESC")
 
 
-    def _stats_target(self, cat: str, db: str, tbl: str) -> tuple:
-        """``(catalog, lakehouse, schema, table)`` for a table listed under ``db`` — a workspace
-        catalog lists its schemas as ``lakehouse.schema`` (see :meth:`_cat_databases`)."""
-        if self._is_workspace(cat):
-            lh, _, sch = db.partition(".")
-            return cat, lh, sch, tbl
-        return cat, None, db, tbl
-
     def _resolve_stats_targets(self, source: Optional[str]) -> List[tuple]:
-        """Resolve a ``get_stats`` source to ``(catalog, lakehouse, schema, table)`` targets
-        (``lakehouse`` None outside workspace catalogs): ``None`` → every table across all attached
-        catalogs; a known table (1–4 parts) → itself; a schema name → its tables in every catalog that
-        has it; a wildcard pattern (``*``/``?``/``[...]``, e.g. ``fct_*`` or ``mart.fct_*``) → every
-        matching table across all attached catalogs."""
+        """Resolve a ``get_stats`` source to ``(catalog, schema, table)`` targets: ``None`` → every
+        table across all attached catalogs; a known table (1/2/3-part) → itself; a schema name →
+        its tables in every catalog that has it; a wildcard pattern (``*``/``?``/``[...]``, e.g.
+        ``fct_*`` or ``mart.fct_*``) → every matching table across all attached catalogs."""
         if source is None:
-            return [self._stats_target(c, s, t) for c in self._catalogs
+            return [(c, s, t) for c in self._catalogs
                     for s in self._cat_databases(c) for t in self._cat_tables(s, c)]
         if any(ch in source for ch in "*?["):
             return self._glob_stats_targets(source)
         if self._cat_table_exists(source):
-            return [self._locate(source)]
+            return [self._resolve(source)]
         if "." not in source:                          # a bare schema name, in any attached catalog
             self.refresh(quiet=True)                   # re-discover schema folders first
-            hits = [self._stats_target(c, db, t) for c in self._catalogs
-                    for db in self._cat_databases(c) if db.rpartition(".")[2] == source
-                    for t in self._cat_tables(db, c)]
+            hits = [(c, source, t) for c in self._catalogs
+                    if source in self._cat_databases(c) for t in self._cat_tables(source, c)]
             if hits:
                 return hits
         raise ValueError(
@@ -1675,41 +1428,33 @@ class DuckSession:
 
     def _glob_stats_targets(self, source: str) -> List[tuple]:
         """Wildcard-match ``source`` (fnmatch ``*``/``?``/``[...]``, case-insensitive) against tables
-        across all attached catalogs. Accepts ``table``, ``schema.table``, ``catalog.schema.table`` or
-        ``workspace.lakehouse.schema.table`` patterns; a missing leading segment defaults to ``*``
-        (any lakehouse / schema / catalog), and a schema pattern matches a workspace table's schema,
-        not its lakehouse. Returns the matched ``(catalog, lakehouse, schema, table)`` targets
-        (possibly empty — the caller reports the miss)."""
+        across all attached catalogs. Accepts ``table``, ``schema.table``, or
+        ``catalog.schema.table`` patterns; a missing leading segment defaults to ``*`` (matches any
+        schema / any catalog). Returns the matched ``(catalog, schema, table)`` targets (possibly
+        empty — the caller reports the miss)."""
         import fnmatch
         parts = delta_dml._split_dotted(source)  # quote-aware split (matches _resolve / the router)
         if len(parts) == 1:
-            cat_pat, lh_pat, schema_pat, table_pat = "*", "*", "*", parts[0]
+            cat_pat, schema_pat, table_pat = "*", "*", parts[0]
         elif len(parts) == 2:
-            cat_pat, lh_pat, schema_pat, table_pat = "*", "*", parts[0], parts[1]
+            cat_pat, schema_pat, table_pat = "*", parts[0], parts[1]
         elif len(parts) == 3:
-            cat_pat, lh_pat, schema_pat, table_pat = parts[0], "*", parts[1], parts[2]
-        elif len(parts) == 4:
-            cat_pat, lh_pat, schema_pat, table_pat = parts
+            cat_pat, schema_pat, table_pat = parts
         else:
             raise ValueError(
-                f"get_stats: too many segments in pattern {source!r} (use table, schema.table, "
-                f"catalog.schema.table or workspace.lakehouse.schema.table).")
-        cp, lp, sp, tp = cat_pat.lower(), lh_pat.lower(), schema_pat.lower(), table_pat.lower()
+                f"get_stats: too many segments in pattern {source!r} "
+                f"(use table, schema.table, or catalog.schema.table).")
+        cp, sp, tp = cat_pat.lower(), schema_pat.lower(), table_pat.lower()
         out = []
         for cat in self._catalogs:
             if not fnmatch.fnmatchcase(cat.lower(), cp):
                 continue
-            if len(parts) == 4 and not self._is_workspace(cat):
-                continue                               # a 4-part pattern only means workspaces
-            for db in self._cat_databases(cat):
-                _c, lh, sch, _t = self._stats_target(cat, db, "")
-                if lh is not None and not fnmatch.fnmatchcase(lh.lower(), lp):
-                    continue
+            for sch in self._cat_databases(cat):
                 if not fnmatch.fnmatchcase(sch.lower(), sp):
                     continue
-                for tbl in self._cat_tables(db, cat):
+                for tbl in self._cat_tables(sch, cat):
                     if fnmatch.fnmatchcase(tbl.lower(), tp):
-                        out.append((cat, lh, sch, tbl))
+                        out.append((cat, sch, tbl))
         return out
 
     def _get_rle(self, table: str, sort_key_cap: int = 4, min_gain_pct: float = 1.0,
@@ -1761,7 +1506,8 @@ class DuckSession:
             if "." not in table and self._cat_database_exists(table):
                 raise ValueError(f"_get_rle is single-table; '{table}' is a schema — pass one table.")
             raise ValueError(f"_get_rle: table '{table}' not found.")
-        cat, _lh, sch, tbl, path, _so = self._locate_path(table)
+        cat, sch, tbl = self._resolve(table)
+        path = f"{self._catalogs[cat].root_path}/{sch}/{tbl}"
         plit = _qlit(path)
         # Partition columns lead the physical ORDER BY but are NOT compression-key candidates: Delta
         # strips them from the data files (zero RLE value), yet ordering by them first keeps ~one
