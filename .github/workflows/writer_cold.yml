@@ -135,6 +135,88 @@ on:
         type: boolean
         default: false
 
+  # The release gate (publish.yml) calls this workflow. Same inputs and defaults as the dispatch
+  # above, as plain strings (workflow_call has no `choice` type). It takes no `keep` input, so
+  # teardown always runs, and adds `gate`.
+  workflow_call:
+    inputs:
+      env:
+        type: string
+        default: "main"
+      opt_sort:
+        type: string
+        default: "date, time, DUID"
+      row_limit:
+        type: string
+        default: "142000000"
+      opt_page_bytes:
+        type: string
+        default: "1048576"
+      opt_footer_inject:
+        type: string
+        default: ""
+      opt_reframe:
+        type: string
+        default: ""
+      duckdb_cli:
+        type: string
+        default: ""
+      opt_derived:
+        type: string
+        default: ""
+      opt_bitwidth:
+        type: string
+        default: ""
+      opt_compression:
+        type: string
+        default: "snappy"
+      opt_max_rows_per_page:
+        type: string
+        default: ""
+      opt_dict_encoding:
+        type: string
+        default: ""
+      opt_dict_sorted:
+        type: string
+        default: ""
+      opt_page_stats:
+        type: string
+        default: ""
+      opt_dict_limit:
+        type: string
+        default: ""
+      opt_transplant_duckdb:
+        type: string
+        default: ""
+      opt_transplant:
+        type: string
+        default: ""
+      opt_rg:
+        type: string
+        default: "6000000"
+      opt_threads:
+        type: string
+        default: "2"
+      columns:
+        type: string
+        default: "date, time, DUID"
+      probe_columns:
+        type: string
+        default: "DUID"
+      arms:
+        type: string
+        default: "duckdb"
+      order:
+        type: string
+        default: "deltars_first"
+      gap_seconds:
+        type: string
+        default: "300"
+      gate:
+        description: "fail the run when a cold probe exceeds the gate factor x its baseline (writer_cold/gate.py)"
+        type: boolean
+        default: false
+
 permissions:
   id-token: write
   contents: read
@@ -492,6 +574,12 @@ jobs:
         if: ${{ always() }}
         continue-on-error: true
         run: python tests/parquet_layout/writer_cold/render_cold.py
+
+      - name: 🚦 Release gate — no cold probe over its baseline x the gate factor
+        # Only when publish.yml calls this workflow (inputs.gate). Reads run_report.json and
+        # tests/parquet_layout/writer_cold/gate_baseline.json; a missing arm or probe fails too.
+        if: ${{ always() && inputs.gate }}
+        run: python tests/parquet_layout/writer_cold/gate.py
 
       - name: 🧹 Teardown (always — a leaked lakehouse bills forever)
         if: ${{ always() && !inputs.keep }}

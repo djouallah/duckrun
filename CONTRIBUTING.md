@@ -73,7 +73,8 @@ Not every workflow that runs is a gate. The one that matters is **`cores`**
 
 | Job | What it proves |
 | --- | --- |
-| `adapter` | dbt adapter internals + the `duckrun.connect()` API suite |
+| `adapter` | dbt adapter internals + the `duckrun.connect()` API suite, including the parquet layout contract |
+| `floor` | the adapter + connection-API suites on the oldest duckdb / deltalake `pyproject.toml` accepts |
 | `conformance` | the official `dbt-tests-adapter` suite, against a recorded baseline |
 | `concurrency-correctness` | OCC / concurrent-writer invariants |
 | `breaker` (chaos breaker) | failure injection — a regression here blocks the PR |
@@ -103,12 +104,16 @@ number if there is one.
 ## Releasing (maintainer only)
 
 1. `release: X.Y.Z` commit bumping `version` in `pyproject.toml`. Always a patch bump.
-2. Push the tag `vX.Y.Z` on that commit.
+2. Run the **publish** workflow on `main` (Actions → publish → Run workflow). Don't push a tag.
 
-[`.github/workflows/publish.yml`](.github/workflows/publish.yml) then runs `version-check`
-(the tag must equal `pyproject.toml`'s version, or it hard-fails), gates on `cores` +
-`local_stress_tests` + `merge_spill`, and publishes to PyPI via OIDC trusted publishing.
-`integration_tests_onelake` and `parity` are deliberately excluded from release gating.
+[`.github/workflows/publish.yml`](.github/workflows/publish.yml) runs `version-check` (it must be
+dispatched on `main`, and `vX.Y.Z` must not be tagged yet), gates on `cores` +
+`local_stress_tests` + `merge_spill` + the Direct Lake gate (`writer_cold` with `gate: true`: both
+writers' tables loaded cold into fresh Direct Lake models, failing above 2x the baselines in
+`tests/parquet_layout/writer_cold/gate_baseline.json`), publishes to PyPI via OIDC trusted
+publishing, and only then pushes the `vX.Y.Z` tag. The Direct Lake gate is why a release is a
+dispatch on `main`: the Fabric sign-in trusts `main` only. `integration_tests_onelake` and
+`parity` are deliberately excluded from release gating.
 
 Tags are the source of truth for what shipped — the GitHub *Releases* page is not
 maintained.

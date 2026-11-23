@@ -1,9 +1,12 @@
 name: publish
 
+# A release is DISPATCHED on main (Actions → publish → Run workflow), after the `release: X.Y.Z`
+# commit has bumped pyproject's version. Not a tag push: the Azure OIDC credential the Direct Lake
+# gate signs in with trusts main only, so a tag-triggered run could never reach Fabric. The tag
+# `vX.Y.Z` is pushed by this workflow, on the dispatched commit, after PyPI accepted the upload —
+# so a release that fails a gate leaves no tag behind.
 on:
-  push:
-    tags:
-      - 'v*'
+  workflow_dispatch:
 
 # Default token scope for jobs that don't override it below.
 permissions:
@@ -14,37 +17,47 @@ concurrency:
   group: pypi
   cancel-in-progress: false
 
-# A release must pass cores + local_stress_tests (TPC-H) + merge_spill before publishing. cores
-# includes the parquet layout contract (tests/adapter/test_layout_contract.py — the Fabric-free
-# stand-in for a Direct Lake run: dictionary-first encoding_stats, full-dictionary pages, Delta
-# stats, sort order kept by rewrites, on every write path) and runs it on the newest AND the floor
-# duckdb / deltalake (the `floor` job), since a release ships the whole range. Each is a
-# reusable workflow run as a gate job here. All render scorecards into README/docs and commit them to
-# main (cores: conformance + connection-API + snapshot-pin cards; merge_spill: the MERGE card), so
-# every call job grants contents:write (a reusable workflow can only use permissions the caller
-# grants). The card jobs all use static concurrency groups, so a tag-time call queues behind any
-# in-flight push-to-main run rather than racing it. merge_spill is its own workflow (not a
+# A release must pass cores + local_stress_tests (TPC-H) + merge_spill + the Direct Lake gate
+# before publishing. Each is a reusable workflow run as a gate job here.
+#   * cores includes the parquet layout contract (tests/adapter/test_layout_contract.py:
+#     dictionary-first encoding_stats, full-dictionary pages, Delta stats, sort order kept by
+#     rewrites, on every write path) and runs on the newest AND the floor duckdb / deltalake.
+#   * direct-lake (writer_cold.yml with gate: true) builds the AEMO fact with both writers duckrun
+#     ships — delta-rs (CTAS / append / compaction) and DuckDB copy-on-write (MERGE / UPDATE /
+#     DELETE) — loads each into a fresh Direct Lake model and fails when a cold probe exceeds 2x
+#     its baseline (tests/parquet_layout/writer_cold/gate_baseline.json). It costs Fabric capacity.
+# cores and merge_spill render scorecards into README/docs and commit them to main, so those call
+# jobs grant contents:write (a reusable workflow can only use permissions the caller grants). The
+# card jobs use static concurrency groups, so a release-time call queues behind any in-flight
+# push-to-main run rather than racing it. merge_spill is its own workflow (not a
 # local_stress_tests sibling job) so its runner — whose single-volume disk is the scarce resource —
 # shares nothing with any other job.
 # integration_tests_onelake is deliberately NOT a release gate: it depends on live OneLake/AEMO data
 # and so is prone to transient infra failures that would needlessly block a publish. It still runs on
 # its own.
 jobs:
-  # Fail in seconds, not after the 20+ minute gates: the tag names the release, but the wheel is
-  # named from pyproject's `version`. Tagging v0.4.27 without bumping it built a 0.4.26 wheel that
-  # PyPI rejected as already-uploaded — at the very last step, gates already spent.
+  # Fail in seconds, not after the gates: the release must come from main, and its version must
+  # not have been released already (PyPI rejects a re-upload at the very last step).
   version-check:
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - name: Tag must match the pyproject version
+      - name: Dispatched on main, with an unreleased pyproject version
+        id: v
         run: |
-          v=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-          if [ "$GITHUB_REF_NAME" != "v$v" ]; then
-            echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $v — bump pyproject.toml and re-tag."
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::dispatch publish on main (got $GITHUB_REF)"
             exit 1
           fi
-          echo "tag $GITHUB_REF_NAME matches pyproject version $v"
+          v=$(python3 -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
+          if git ls-remote --exit-code --tags origin "refs/tags/v$v" >/dev/null; then
+            echo "::error::v$v is already tagged — bump pyproject.toml's version in a 'release: X.Y.Z' commit first."
+            exit 1
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "releasing v$v from $GITHUB_SHA"
 
   cores:
     needs: version-check
@@ -64,11 +77,24 @@ jobs:
       contents: write
     uses: ./.github/workflows/merge_spill.yml
 
+  direct-lake:
+    needs: version-check
+    permissions:
+      contents: read
+      id-token: write   # the Fabric sign-in (GitHub OIDC → Entra), trusted on main only
+    uses: ./.github/workflows/writer_cold.yml
+    secrets: inherit
+    with:
+      arms: "deltars,duckdb"
+      duckdb_cli: cow
+      gate: true
+
   publish:
-    needs: [cores, local-stress, merge-spill]
+    needs: [version-check, cores, local-stress, merge-spill, direct-lake]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
+      contents: write  # push the vX.Y.Z tag
     steps:
       - uses: actions/checkout@v4
 
@@ -85,3 +111,8 @@ jobs:
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Tag the release
+        run: |
+          git tag "v${{ needs.version-check.outputs.version }}" "$GITHUB_SHA"
+          git push origin "v${{ needs.version-check.outputs.version }}"
