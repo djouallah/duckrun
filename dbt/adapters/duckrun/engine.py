@@ -19,7 +19,8 @@ from deltalake import CommitProperties, DeltaTable, convert_to_deltalake, write_
 from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, CHECKPOINT_INTERVAL,
-                                         DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS)
+                                         DATA_PAGE_SIZE_LIMIT, DEFAULT_TARGET_FILE_SIZE,
+                                         ROW_GROUP_DEFAULT_ROWS)
 from dbt.adapters.duckrun import cow, sortkey
 
 try:  # deltalake 1.x exposes WriterProperties at the top level
@@ -57,7 +58,7 @@ _ROW_GROUP_SIZE = ROW_GROUP_DEFAULT_ROWS
 _DICT_PAGE_SIZE_LIMIT = 32 * 1024 * 1024
 # Data page byte limit (1 MB). Secondary bound only — the byte cap NEVER fires on a highly compressible
 # column, so it can't cap the page on its own.
-_DATA_PAGE_SIZE_LIMIT = 1_048_576
+_DATA_PAGE_SIZE_LIMIT = DATA_PAGE_SIZE_LIMIT
 # Data page ROW-COUNT limit — the backstop for columns the byte cap can't see: the byte cap is checked
 # on ENCODED page bytes, so a highly compressible column would otherwise buffer its whole row group
 # as a single page (~10x write memory, and giant pages blow the merge's read-side spill cap → out of
@@ -969,7 +970,7 @@ def deleted_row_count(cur, dt) -> int:
         "from deletion_vectors").fetchall()[0][0])
 
 
-_DELTA_PHYSICAL_NAME_KEY = "delta.columnMapping.physicalName"
+_DELTA_PHYSICAL_NAME_KEY = cow.PHYSICAL_NAME_KEY
 
 
 def _mapped_child_fields(dtype):
@@ -999,9 +1000,7 @@ def physical_to_logical(dt) -> Dict[str, str]:
     ``{}``, i.e. the untranslated names."""
     out: Dict[str, str] = {}
     try:
-        mode = str((dt.metadata().configuration or {}).get(
-            "delta.columnMapping.mode", "")).strip().lower()
-        if mode not in ("name", "id"):
+        if cow.mapping_mode(dt.metadata().configuration) not in ("name", "id"):
             return {}
         pending = list(dt.schema().fields)
         while pending:
@@ -1904,7 +1903,8 @@ def merge_delta(
     existing_dt: Optional[DeltaTable] = None,
 ) -> None:
     """
-    Merge ``data`` into an existing Delta table on ``unique_key`` using delta_rs.
+    Merge ``data`` into an existing Delta table on ``unique_key`` (copy-on-write: DuckDB rewrites,
+    delta_rs commits; delta_rs's own merge for the shapes :func:`cow_merge` does not cover).
 
     ``unique_key`` may be a single column name or a list of column names. The merge
     condition is ``target.k = source.k`` for each key, AND-ed with any extra
@@ -2540,10 +2540,6 @@ def _merge_partition_prune(dt: DeltaTable, data, predicate: str, streamed_exec: 
     return predicate
 
 
-class _CowUnsupported(Exception):
-    """A copy-on-write MERGE cannot express this statement in DuckDB; nothing was written."""
-
-
 def _cow_merge_clauses(clauses: List[dict], target_cols: List[str], source_cols: List[str]) -> str:
     """The ``WHEN …`` clauses of a DuckDB ``MERGE`` equivalent to delta-rs clause dicts (see
     :func:`merge_delta_clauses`). ``*_all`` actions name their columns explicitly — the target's
@@ -2566,17 +2562,17 @@ def _cow_merge_clauses(clauses: List[dict], target_cols: List[str], source_cols:
             pairs = (list(c["updates"].items()) if action == "update" else
                      [(quote_ident(k), f"source.{quote_ident(k)}") for k in cols(c.get("except_cols"))])
             if not pairs:
-                raise _CowUnsupported("an UPDATE with no column to set")
+                raise cow.Unsupported("an UPDATE with no column to set")
             then = "UPDATE SET " + ", ".join(f"{k} = {v}" for k, v in pairs)
         elif action in ("insert", "insert_all"):
             pairs = (list(c["updates"].items()) if action == "insert" else
                      [(quote_ident(k), f"source.{quote_ident(k)}") for k in cols(c.get("except_cols"))])
             if not pairs:
-                raise _CowUnsupported("an INSERT with no column")
+                raise cow.Unsupported("an INSERT with no column")
             then = (f"INSERT ({', '.join(k for k, _ in pairs)}) "
                     f"VALUES ({', '.join(v for _, v in pairs)})")
         else:
-            raise _CowUnsupported(f"merge action {action!r}")
+            raise cow.Unsupported(f"merge action {action!r}")
         out.append(f"WHEN {kind}{cond} THEN {then}")
     return " ".join(out)
 
@@ -2641,18 +2637,18 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
     except Exception as e:
         logger.info(f"merge: delta_rs path (the source is not a SQL relation: {e})")
         return False
-    scan = (f"delta_scan('{path.replace(chr(39), chr(39) * 2)}', version => {int(read_version)}, "
-            f"filename = true)")
+    scan = cow.scan(path, read_version)
+    fcol = quote_ident(cow.FILE_COL)
     exprs = [predicate] + [c["predicate"] for c in clauses if c.get("predicate")] + [
         v for c in clauses for v in (c.get("updates") or {}).values()]
     try:
         # Bind only (cur.sql does not execute): a predicate or expression DuckDB rejects raises here.
-        trel = cur.sql(f"SELECT * EXCLUDE (filename) FROM {scan}")
+        trel = cur.sql(f"SELECT * EXCLUDE ({fcol}) FROM {scan}")
         target_cols = list(trel.columns)
         types = {c: str(ty) for c, ty in zip(trel.columns, trel.types)}
         source_cols = list(data.columns)
         if any(c.lower() == "rowid" for c in source_cols):
-            raise _CowUnsupported("a source column named rowid")
+            raise cow.Unsupported("a source column named rowid")
         whens = _cow_merge_clauses(clauses, target_cols, source_cols)
         matched_chg = _cow_touch_case(clauses, "matched", target_cols, source_cols, types)
         orphan_chg = _cow_touch_case(clauses, "not_matched_by_source", target_cols, source_cols,
@@ -2661,6 +2657,7 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
                 f"FROM {scan} AS target, {source} AS source")
         if orphan_chg != "false":
             cur.sql(f"SELECT {orphan_chg} FROM {scan} AS target")
+        cow.check_table_rules(cur, scan, dt)
     except Exception as e:
         logger.info(f"merge: delta_rs path (DuckDB cannot run this merge: {e})")
         return False
@@ -2672,27 +2669,23 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
         # CHANGES it; only those rows' files (plus, for BY SOURCE, the files of unmatched rows a
         # clause changes) are rewritten. A match that leaves its row identical touches nothing.
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{src}" AS SELECT * FROM {source}')
-        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{hits}" AS SELECT target.filename AS f, '
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{hits}" AS SELECT target.{fcol} AS f, '
                     f'source.rowid AS rn, {matched_chg} AS chg FROM {scan} AS target '
                     f'JOIN "{src}" AS source ON ({predicate})')
         orphans = ""
         if orphan_chg != "false":
-            orphans = (f" UNION SELECT target.filename FROM {scan} AS target "
+            orphans = (f" UNION SELECT target.{fcol} FROM {scan} AS target "
                        f'ANTI JOIN "{src}" AS source ON ({predicate}) WHERE {orphan_chg}')
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
-                    f'SELECT f AS filename FROM "{hits}" WHERE chg{orphans}')
-        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT * EXCLUDE (filename) '
-                    f'FROM {scan} WHERE filename IN (SELECT filename FROM "{touched}")')
+                    f'SELECT f FROM "{hits}" WHERE chg{orphans}')
+        # The touched files' rows, with their position (see cow.write_files: the rewrite keeps it).
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT *, {cow.with_position()} '
+                    f'FROM {scan} WHERE {fcol} IN (SELECT f FROM "{touched}")')
         # The MERGE source: the rows that match a rewritten row, and the rows that match nothing
         # (the insert candidates). A source row matching only an untouched file is left out — in
         # the rewrite it would otherwise look unmatched and be inserted.
         source = (f'(SELECT * FROM "{src}" WHERE rowid NOT IN (SELECT rn FROM "{hits}") OR rowid IN '
-                  f'(SELECT rn FROM "{hits}" WHERE f IN (SELECT filename FROM "{touched}")))')
-        try:
-            cow.check_table_rules(cur, f'"{rows}"', dt)
-        except cow.Unsupported as e:
-            logger.info(f"merge: delta_rs path ({e})")
-            return False
+                  f'(SELECT rn FROM "{hits}" WHERE f IN (SELECT f FROM "{touched}")))')
         logger.info("merge: copy-on-write (DuckDB rewrite, delta_rs commit)")
         cur.execute(f'MERGE INTO "{rows}" AS target USING {source} AS source '
                     f"ON ({predicate}) {whens}")
@@ -2706,7 +2699,7 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
                                row_group_rows=row_group_rows, target_file_size=target_file_size,
                                configuration=dt.metadata().configuration,
                                mapping=cow.column_mapping(dt))
-        gone = [r[0] for r in cur.execute(f'SELECT filename FROM "{touched}"').fetchall()]
+        gone = [r[0] for r in cur.execute(f'SELECT f FROM "{touched}"').fetchall()]
         removes = cow.removes_for(cur, dt, gone)
         if adds or removes:
             cow.commit(dt, path, adds + removes, read_version=read_version, operation="MERGE")
@@ -2721,53 +2714,59 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
                 pass
 
 
-def cow_rewrite(cur, path: str, *, where: Optional[str], projection: str = "*",
+def cow_rewrite(cur, path: str, *, where: Optional[str], replaces: Optional[str] = None,
                 delete: bool = False, alias: str = "", with_prefix: str = "", read_version: int,
                 storage_options: Optional[Dict[str, str]] = None, dt: Optional[DeltaTable] = None,
                 operation: str = "DML", changes: Optional[Dict[str, str]] = None) -> bool:
     """DELETE / UPDATE as copy-on-write: DuckDB rewrites only the files the predicate touches and
     delta-rs commits the add + remove actions in one fenced transaction (see :mod:`cow`).
-    ``delete=True`` keeps the rows where ``where`` is not true; otherwise ``projection`` (a select
-    list over the scan, e.g. ``* replace (...)``) rewrites the touched files' rows. ``where=None``
-    touches every file. ``changes`` (an UPDATE's ``{column: expr}``) narrows the touched files to
-    those holding a row the assignment actually changes. Returns False, having written nothing,
-    when the table needs delta-rs."""
+    ``delete=True`` keeps the rows where ``where`` is not true; otherwise ``replaces`` (the body of
+    a ``* REPLACE (...)`` over the scan) rewrites the touched files' rows. ``where=None`` touches
+    every file. ``changes`` (an UPDATE's ``{column: expr}``) narrows the touched files to those
+    holding a row the assignment actually changes. Returns False, having written nothing, when the
+    table needs delta-rs — decided before anything executes."""
     dt = dt if dt is not None else _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     why = cow.unsupported_reason(dt)
     if why:
         logger.info(f"{operation.lower()}: delta_rs path ({why})")
         return False
-    scan = (f"delta_scan('{path.replace(chr(39), chr(39) * 2)}', version => {int(read_version)}, "
-            f"filename = true)" + (f' AS "{alias}"' if alias else ""))
+    scan = cow.scan(path, read_version, alias)
+    fcol = quote_ident(cow.FILE_COL)
+    if not delete:  # a DELETE writes only rows already in the table: no rule can newly fail
+        try:
+            cow.check_table_rules(cur, scan, dt)
+        except cow.Unsupported as e:
+            logger.info(f"{operation.lower()}: delta_rs path ({e})")
+            return False
     pred = f"({where}) IS TRUE" if where else "true"
     if changes:
-        trel = cur.sql(f"SELECT * EXCLUDE (filename) FROM {scan}")
+        trel = cur.sql(f"SELECT * EXCLUDE ({fcol}) FROM {scan}")
         types = {c: str(ty) for c, ty in zip(trel.columns, trel.types)}
         pred += " AND " + _cow_changes(list(changes.items()), types)
     touched, rows = tmp_name("cowfiles", path), tmp_name("cowrows", path)
     try:
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
-                    f"{with_prefix}SELECT DISTINCT filename FROM {scan} WHERE {pred}")
-        gone = [r[0] for r in cur.execute(f'SELECT filename FROM "{touched}"').fetchall()]
+                    f"{with_prefix}SELECT DISTINCT {fcol} AS f FROM {scan} WHERE {pred}")
+        gone = [r[0] for r in cur.execute(f'SELECT f FROM "{touched}"').fetchall()]
         if not gone:
             return True        # nothing matched: no rewrite, no commit (as delta-rs skips empty DML)
-        files = f'filename IN (SELECT filename FROM "{touched}")'
+        # The touched files' rows, with their position (see cow.write_files: the rewrite keeps it).
+        files = f'{fcol} IN (SELECT f FROM "{touched}")'
+        pos = cow.with_position(f"{quote_ident(alias)}." if alias else "")
         if delete:
             keep = f" AND ({where}) IS NOT TRUE" if where else " AND false"
-            body = f"SELECT * EXCLUDE (filename) FROM {scan} WHERE {files}{keep}"
+            body = f"SELECT *, {pos} FROM {scan} WHERE {files}{keep}"
         else:
-            body = (f"SELECT {projection.replace('*', '* EXCLUDE (filename)', 1)} FROM {scan} "
-                    f"WHERE {files}")
+            body = f"SELECT * REPLACE ({replaces}), {pos} FROM {scan} WHERE {files}"
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS {with_prefix}{body}')
-        try:
-            cow.check_table_rules(cur, f'"{rows}"', dt)
-        except cow.Unsupported as e:
-            logger.info(f"{operation.lower()}: delta_rs path ({e})")
-            return False
-        cow.apply_table_rules(cur, f'"{rows}"', dt, operation)
+        if not delete:
+            cow.apply_table_rules(cur, f'"{rows}"', dt, operation)
+            # Only the SET columns and the recomputed generated columns can have become NULL.
+            cow.check_not_null(cur, f'"{rows}"', dt, operation,
+                               columns=None if changes is None else
+                               list(changes) + cow.generated_columns(dt))
         logger.info(f"{operation.lower()}: copy-on-write (DuckDB rewrite, delta_rs commit)")
-        cow.check_not_null(cur, f'"{rows}"', dt, operation)
         adds = cow.write_files(cur, f'"{rows}"', path,
                                partition_by=dt.metadata().partition_columns,
                                configuration=dt.metadata().configuration,
@@ -2826,7 +2825,12 @@ def merge_delta_clauses(
     operation funnels through this function: a dbt ``incremental_strategy='insert'`` model and a raw
     ``MERGE INTO … WHEN NOT MATCHED THEN INSERT *`` must not execute two different ways.
 
-    It falls through to delta_rs when the anti-join cannot apply:
+    Every other shape takes :func:`cow_merge` (DuckDB rewrites the touched files, delta_rs commits
+    the add/remove actions); delta_rs's own merge — and the spill caps, the merge gate and the
+    partition pruning below — run only for the table shapes and statements it refuses (see
+    ``cow.unsupported_reason``).
+
+    It falls through from the anti-join when the anti-join cannot apply:
       * any other clause shape (matched update/delete, by-source, partial ``except_cols`` insert);
       * ``streamed_exec=True`` — an explicit request for delta_rs's streaming source handling (and the
         shape where the cardinality guard is skipped), so it is also the documented way to force the
@@ -2978,8 +2982,8 @@ def merge_delta_clauses(
 
     # Same best-effort maintenance as the append / delete+insert paths: a merged-on-every-run
     # incremental table fragments into small files and leaves tombstoned old versions otherwise.
-    # The merge itself writes with delta_rs defaults (deliberately — no writer_properties on the
-    # OOM-prone path), so THIS is where a model's declared geometry reaches a merged table: the
-    # post-merge compaction folds the lean merge files into it.
+    # This delta_rs merge writes with delta_rs defaults (deliberately — no writer_properties on the
+    # OOM-prone path), so THIS is where a model's declared geometry reaches it: the post-merge
+    # compaction folds the lean merge files into it. (The copy-on-write merge writes it directly.)
     _maintain(cur, path, storage_options=storage_options,
               target_file_size=target_file_size, row_group_cap=row_group_rows)

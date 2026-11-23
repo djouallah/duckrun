@@ -56,6 +56,9 @@ CHECKPOINT_INTERVAL = 10
 # write is shaped like any other.
 ROW_GROUP_DEFAULT_ROWS = 4_000_000
 
+# Data page byte limit (1 MB), shared by the delta-rs writer properties and DuckDB's COPY.
+DATA_PAGE_SIZE_LIMIT = 1_048_576
+
 
 class MaintenancePolicy:
     """Owns the compact/vacuum decisions. Pure logic — it decides, the caller executes (so it stays

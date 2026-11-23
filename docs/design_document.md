@@ -47,7 +47,7 @@ The staged view, and any `SET VARIABLE` a pre-hook set, live in the session of t
 DuckDB and delta-rs each manage their own memory. Profiling (`DUCKRUN_MEM_PROFILE`) shows that during a merge delta-rs holds ~99% of process RSS, so duckrun does not divide a budget; it applies two independent guardrails:
 
 - **One DuckDB `memory_limit` pin** per connection: `_MEM_LIMIT_FRACTION` (0.85) of the effective limit, tighten-only. DuckDB's own default is 80% of *host* RAM, blind to cgroups, which gets the process OOM-killed on Fabric / k8s.
-- **The delta-rs merge spill caps**: `max_spill_size` at `_MERGE_SPILL_FRACTION` (0.6) of the effective limit for the in-memory pool, `max_temp_directory_size` for on-disk spill.
+- **The delta-rs merge spill caps** (a merge that falls back to delta-rs): `max_spill_size` at `_MERGE_SPILL_FRACTION` (0.6) of the effective limit for the in-memory pool, `max_temp_directory_size` for on-disk spill.
 
 0.85 + 0.6 deliberately exceed 1.0: the two never peak together, and merges are serialized (`engine._MERGE_GATE`) so one merge holds the whole pool while other threads run the cheap paths. The effective limit (`_effective_mem_limit_bytes`) is the tightest of physical RAM, the cgroup cap and the RAM actually free.
 

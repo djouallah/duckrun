@@ -27,14 +27,13 @@ from deltalake import CommitProperties, DeltaTable
 from deltalake.exceptions import CommitFailedError
 from deltalake.transaction import AddAction, RemoveAction
 
-from .policy import DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS
+from .policy import DATA_PAGE_SIZE_LIMIT, DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS
 
 # The fixed read layout (Direct Lake / VertiPaq), measured on the writer_cold / writer_ab benchmarks:
 #   * DATA_PAGE_SIZE_LIMIT 1 MB — DuckDB's default page is far larger (duckdb#24507);
 #   * DICTIONARY_SIZE_LIMIT up to the row-group size, so every column stays dictionary-encoded;
 #   * PARQUET_VERSION V1 — a column that overflows its dictionary falls back to PLAIN;
 #   * no bloom filters — the delta-rs writer never wrote them (~30 MB on the aemo mart).
-DATA_PAGE_SIZE_LIMIT = 1_048_576
 DICTIONARY_SIZE_LIMIT = 16_000_000
 STATS_TRUNCATE_LENGTH = 64          # longest string stat kept (a longer max is dropped, min is cut)
 DEFAULT_NUM_INDEXED_COLS = 32       # delta.dataSkippingNumIndexedCols default (Delta protocol)
@@ -46,6 +45,26 @@ def _q(name: str) -> str:
 
 def _lit(s: str) -> str:
     return "'" + str(s).replace("'", "''") + "'"
+
+
+# The scan's own columns. The file is named explicitly: a table may carry a column called
+# `filename` (a file-ingest table often does), and `filename = true` then fails to bind. The
+# (file, row) pair is the row's physical position, the order a rewrite keeps when no sort key is
+# given (the session runs with preserve_insertion_order=false, so nothing else would keep it).
+FILE_COL = "__duckrun_file"
+ROW_COL = "__duckrun_row"
+_HIDDEN = (FILE_COL, ROW_COL)
+
+
+def scan(path: str, version: int, alias: str = "") -> str:
+    """``delta_scan`` of ``path`` at ``version`` with the file column (:data:`FILE_COL`)."""
+    return (f"delta_scan({_lit(path)}, version => {int(version)}, filename = {_lit(FILE_COL)})"
+            + (f" AS {_q(alias)}" if alias else ""))
+
+
+def with_position(qualifier: str = "") -> str:
+    """Select-list tail that keeps a scanned row's physical position (:data:`ROW_COL`)."""
+    return f"{qualifier}file_row_number AS {_q(ROW_COL)}"
 
 
 # Writer features a plain add/remove commit leaves intact. Anything else (row tracking, domain
@@ -130,18 +149,28 @@ def _table_rules(dt: DeltaTable):
     return checks, generated
 
 
-def check_table_rules(cur, table: str, dt: DeltaTable) -> None:
+def check_table_rules(cur, source: str, dt: DeltaTable) -> None:
     """Raise :class:`Unsupported` when DuckDB cannot evaluate one of the table's rule expressions
-    (Spark SQL) over ``table``. Bind only (``cur.sql`` does not execute), so a refusal leaves an open
-    transaction usable for the delta-rs path."""
+    (Spark SQL) over ``source`` (the target's scan). Bind only (``cur.sql`` does not execute), so it
+    runs before anything executes and a refusal leaves an open transaction usable for delta-rs."""
     checks, generated = _table_rules(dt)
     exprs = [x for _, x in checks] + [x for _, x in generated]
     if not exprs:
         return
     try:
-        cur.sql(f"SELECT {', '.join(f'({x})' for x in exprs)} FROM {table}")
+        cur.sql(f"SELECT {', '.join(f'({x})' for x in exprs)} FROM {source}")
     except Exception as e:
         raise Unsupported(f"DuckDB cannot evaluate a table rule: {e}") from e
+
+
+def _counts(cur, table: str, conds: Sequence[str]) -> List[int]:
+    """``count(*)`` of the rows of ``table`` matching each of ``conds``, in one pass."""
+    sel = ", ".join(f"count(*) FILTER (WHERE {c})" for c in conds)
+    return [int(n) for n in cur.execute(f"SELECT {sel} FROM {table}").fetchall()[0]]
+
+
+def generated_columns(dt: DeltaTable) -> List[str]:
+    return [name for name, _ in _table_rules(dt)[1]]
 
 
 def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
@@ -150,14 +179,15 @@ def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
     invariants fail the statement on a violating row (a NULL result passes, as in SQL). Run
     :func:`check_table_rules` first."""
     checks, generated = _table_rules(dt)
-    types = {r[0]: str(r[1]) for r in cur.execute(f"DESCRIBE {table}").fetchall()}
-    for name, expr in generated:
-        cur.execute(f"UPDATE {table} SET {_q(name)} = CAST(({expr}) AS {types[name]})")
-    violations = []
-    for what, expr in checks:
-        n = cur.execute(f"SELECT count(*) FROM {table} WHERE ({expr}) IS FALSE").fetchall()[0][0]
-        if n:
-            violations.append(f"{what} ({expr}) fails on {n} row(s)")
+    if generated:
+        types = {r[0]: str(r[1]) for r in cur.execute(f"DESCRIBE {table}").fetchall()}
+        cur.execute(f"UPDATE {table} SET " + ", ".join(
+            f"{_q(name)} = CAST(({expr}) AS {types[name]})" for name, expr in generated))
+    if not checks:
+        return
+    counts = _counts(cur, table, [f"({expr}) IS FALSE" for _, expr in checks])
+    violations = [f"{what} ({expr}) fails on {n} row(s)"
+                  for (what, expr), n in zip(checks, counts) if n]
     if violations:
         raise ValueError(f"{operation} refused: " + "; ".join(violations))
 
@@ -355,13 +385,21 @@ def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
     here: until :func:`commit` lands them the files are invisible to readers, and an aborted write
     leaves only unreferenced files that vacuum collects. ``mapping`` (see :func:`column_mapping`)
     writes a column-mapped table's columns under their physical names and field ids, with the stats
-    keyed by those names."""
+    keyed by those names.
+
+    ``order_by`` (the table's sort key) orders the rows; without one, rows carrying their scan
+    position (:data:`FILE_COL` / :data:`ROW_COL`) keep it, so a rewrite does not scramble the
+    order the table was written in (rows without one, a MERGE's inserts, go last). Those position
+    columns are never written."""
     partition_by = list(partition_by or [])
     desc = cur.execute(f"DESCRIBE {table}").fetchall()
-    logical = {r[0]: str(r[1]) for r in desc}
+    hidden = [r[0] for r in desc if r[0] in _HIDDEN]
+    logical = {r[0]: str(r[1]) for r in desc if r[0] not in _HIDDEN}
+    if not order_by and len(hidden) == len(_HIDDEN):
+        order_by = ", ".join(_q(c) for c in _HIDDEN)
     indexed = indexed_columns([c for c in logical if c not in partition_by], configuration)
     opts = parquet_options(row_group_rows, target_file_size)
-    select = "*"
+    select = f"* EXCLUDE ({', '.join(_q(c) for c in hidden)})" if hidden else "*"
     col_types = logical
     if mapping:
         select = ", ".join(f"{_q(c)} AS {_q(mapping[c][0])}" for c in logical)
@@ -404,7 +442,7 @@ def removes_for(cur, dt: DeltaTable, filenames: Sequence[str]) -> List[RemoveAct
     wanted = {f.replace("\\", "/").rsplit("/", 1)[-1] for f in filenames}
     now_ms = int(time.time() * 1000)
     out = []
-    add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - read below by DuckDB's replacement scan
+    add_actions = dt.get_add_actions(flatten=False)  # noqa: F841 - read below by DuckDB's replacement scan
     for rel, size in cur.sql("SELECT path, size_bytes FROM add_actions").fetchall():
         if unquote(rel).rsplit("/", 1)[-1] in wanted:
             out.append(RemoveAction(path=rel, data_change=True, deletion_timestamp=now_ms,
@@ -415,14 +453,19 @@ def removes_for(cur, dt: DeltaTable, filenames: Sequence[str]) -> List[RemoveAct
     return out
 
 
-def check_not_null(cur, table: str, dt: DeltaTable, operation: str) -> None:
+def check_not_null(cur, table: str, dt: DeltaTable, operation: str,
+                   columns: Optional[Sequence[str]] = None) -> None:
     """Fail before anything is written when the rewrite would put a NULL in a NOT NULL column —
-    the check delta-rs's writer applied."""
-    for f in dt.schema().fields:
-        if not f.nullable:
-            n = cur.execute(f"SELECT count(*) FROM {table} WHERE {_q(f.name)} IS NULL").fetchall()[0][0]
-            if n:
-                raise ValueError(f"{operation} would write {n} NULL(s) into NOT NULL column {f.name!r}")
+    the check delta-rs's writer applied. ``columns`` limits it to the columns the statement can
+    change (None = all)."""
+    only = None if columns is None else {c.lower() for c in columns}
+    names = [f.name for f in dt.schema().fields
+             if not f.nullable and (only is None or f.name.lower() in only)]
+    if not names:
+        return
+    for name, n in zip(names, _counts(cur, table, [f"{_q(c)} IS NULL" for c in names])):
+        if n:
+            raise ValueError(f"{operation} would write {n} NULL(s) into NOT NULL column {name!r}")
 
 
 def commit(dt: DeltaTable, path: str, actions: list, *, read_version: int, operation: str) -> None:

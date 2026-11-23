@@ -53,7 +53,7 @@ Both `SORTED BY` forms do the same thing: one global `ORDER BY` over the whole t
 
 A sort shrinks a file by manufacturing runs. In arrival order a column breaks into `E[runs] ≈ N·(1 − Σ p_v²)` runs (the Simpson index of its value histogram): a near-uniform column shatters and falls back to bit-packed dictionary indices, a sorted one collapses into run-length encoding with a compact dictionary. How much that helps is a property of your data's cardinality and skew, so the same key can halve one table and do nothing to another.
 
-From dbt the picker is the model config `sort_by: auto` (the scalar; a list form raises). It profiles the staged result of every run, so the key can differ between incremental batches, and writes unsorted when nothing pays off. It is inert on the delta-rs `merge`, `microbatch` and `delete+insert` paths, which keep the table's existing layout. A trailing `ORDER BY` in the model SQL is not honored; `sort_by` is.
+From dbt the picker is the model config `sort_by: auto` (the scalar; a list form raises). It profiles the staged result of every run, so the key can differ between incremental batches, and writes unsorted when nothing pays off. It is inert on the `merge`, `microbatch` and `delete+insert` paths, which keep the table's existing layout: a merge, `UPDATE` or `DELETE` rewrites only the files it changes and keeps their rows in their existing order. A trailing `ORDER BY` in the model SQL is not honored; `sort_by` is.
 
 ### How the picker chooses
 

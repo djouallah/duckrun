@@ -43,7 +43,7 @@ The full matrix is in the [Connection API](connection-api.md#raw-sql-dml-through
 ## dbt & incremental
 
 - **`threads` is honored**, with two differences from a pure-SQL adapter, both because a model writes a real table:
-    - **Concurrent writers share one memory budget.** `memory_limit` is pinned once for the run (85% of the container-aware effective limit). delta-rs merges are serialized: one at a time, holding the full merge pool and spill cap, while other threads keep running views, appends, overwrites and insert-only merges. Many independent network-bound models benefit most from more threads.
+    - **Concurrent writers share one memory budget.** `memory_limit` is pinned once for the run (85% of the container-aware effective limit). A merge runs inside DuckDB under that limit. Only a merge that falls back to delta-rs (change data feed, deletion vectors, identity columns, append-only tables) is serialized: one at a time, holding the full merge pool and spill cap, while other threads keep running. Many independent network-bound models benefit most from more threads.
     - **A microbatch model's batches run in order**, since every batch writes the same table. Different models still run in parallel.
 - None of this limits concurrent **writers**: separate runs writing the same tables at once is supported, every write being snapshot-pinned and failing loud on a conflict.
 
@@ -70,9 +70,9 @@ The full matrix is in the [Connection API](connection-api.md#raw-sql-dml-through
 
 ## Memory
 
-- **Two engines share one machine's memory.** DuckDB is bounded by one pinned `memory_limit`, a delta-rs merge by its own spill caps behind a gate; neither is a shared allocator. The merge pool exists only for the `merge` strategy and the raw `MERGE INTO` verb. Background in the [Design document](design_document.md#tradeoffs).
-- **`merge` is the write path most likely to run out of memory.** A delta-rs `MERGE` plans a join against the whole pinned target, so its cost scales with the target's partition span, not the batch. For a key-level idempotent append use `incremental_strategy='insert'` (a DuckDB anti-join, no merge, no file rewritten). For a genuine upsert, keep each batch inside as few partitions as possible.
-- **delta-rs hard-codes a 100 GB merge disk-spill ceiling.** DataFusion's `DiskManager` caps on-disk spill at a flat 100 GB regardless of disk size, so a wide merge aborts with *"Resources exhausted … exceeded the allowable limit of 100.0 GB"* on a machine with terabytes free. duckrun sizes `max_temp_directory_size` to the spill disk's free space minus `min(20% of free, 8 GiB)` on every merge (override with `merge_max_temp_directory_size`). The real fix is layout: one partition per batch. See [MERGE at scale](merge-benchmark.md).
+- **Two engines share one machine's memory.** DuckDB is bounded by one pinned `memory_limit`, a delta-rs merge by its own spill caps behind a gate; neither is a shared allocator. The merge pool exists only for a `merge` / `MERGE INTO` that falls back to delta-rs. Background in the [Design document](design_document.md#tradeoffs).
+- **`merge` is the write path most likely to run out of memory.** A `MERGE` joins the batch against the whole pinned target and rewrites every file a changed row lands in, so its cost scales with the target's partition span, not the batch. For a key-level idempotent append use `incremental_strategy='insert'` (a DuckDB anti-join, no merge, no file rewritten). For a genuine upsert, keep each batch inside as few partitions as possible.
+- **delta-rs hard-codes a 100 GB merge disk-spill ceiling** (a merge that falls back to delta-rs). DataFusion's `DiskManager` caps on-disk spill at a flat 100 GB regardless of disk size, so a wide merge aborts with *"Resources exhausted … exceeded the allowable limit of 100.0 GB"* on a machine with terabytes free. duckrun sizes `max_temp_directory_size` to the spill disk's free space minus `min(20% of free, 8 GiB)` on every merge (override with `merge_max_temp_directory_size`). The real fix is layout: one partition per batch. See [MERGE at scale](merge-benchmark.md).
 
 ---
 

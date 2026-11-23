@@ -246,7 +246,7 @@ select * from {{ ref('stg_orders') }}
 
 | Strategy | Behavior | Requires | Pick it when |
 |---|---|---|---|
-| `merge` (default with `unique_key`) | upsert: update matched, insert new (delta-rs MERGE) | `unique_key` | Rows change after first load |
+| `merge` (default with `unique_key`) | upsert: update matched, insert new (copy-on-write: DuckDB rewrites the touched files, delta-rs commits) | `unique_key` | Rows change after first load |
 | `insert` | insert only keys not present — DuckDB anti-join, committed as a **plain append**, no file rewritten | `unique_key` | Append-only data but you want key-level idempotency |
 | `append` (default without `unique_key`) | append; auto-fenced (compare-and-swap) when the model reads `{{ this }}`, blind otherwise | — | Event streams; or your SQL already dedups against `{{ this }}` |
 | `delete+insert` | delete target rows whose key appears in the batch, then insert EVERY incoming row (duplicates preserved) | `unique_key` | dbt-duckdb `delete+insert` semantics; duplicate-key sources a `merge` would reject |
@@ -255,9 +255,9 @@ select * from {{ ref('stg_orders') }}
 First run, `--full-refresh`, or a missing table always overwrites.
 
 **On a big table, only `merge` is genuinely expensive — and only because it must remove
-rows.** A delta-rs MERGE plans a join against the whole pinned target, so its cost scales
-with the target's *partition span*, not the batch size, and it splits the memory budget
-between DuckDB and delta-rs. `insert` does not: insert-only never removes a row, so
+rows.** A MERGE joins the batch against the whole pinned target and rewrites every file a
+changed row lands in, so its cost scales with the target's *partition span*, not the batch
+size. `insert` does not: insert-only never removes a row, so
 duckrun computes it as a DuckDB anti-join over the target's KEY columns and commits a
 plain append — `add` actions only, no existing file rewritten, no delta-rs merge pool,
 DuckDB keeps the full write budget. A batch that adds nothing writes no commit at all
@@ -294,9 +294,10 @@ post-write compaction may still rewrite files once the table's byte debt trips i
 **Same on the notebook API:** `conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED THEN
 INSERT *")` is the same operation and takes the same anti-join — duckrun routes it at the
 shared engine seam, so dbt and SQL cannot execute it two different ways. Any other clause
-shape (matched update/delete, by-source, partial insert column list) stays on delta-rs,
-because changing or removing a row means rewriting files. To force delta-rs for an
-insert-only shape anyway, set `merge_streamed_exec: true`.
+shape (matched update/delete, by-source, partial insert column list) runs copy-on-write:
+DuckDB rewrites only the files a changed row lands in and delta-rs commits the file swap.
+Change data feed, deletion vectors, identity columns, append-only tables run on delta-rs's merge. To force delta-rs's
+merge anyway, set `merge_streamed_exec: true`.
 
 **Plain `append` with SQL dedup is still the cheapest of all** — it reads nothing from the
 target at all. If the model SQL already excludes rows present in
@@ -342,14 +343,14 @@ don't run other writers against a microbatch table during its window.
 | `incremental_predicates` | extra predicates AND-ed into the merge condition — use to prune partitions on big targets |
 | `on_schema_change` | `ignore` (default) / `append_new_columns` / `fail`. `sync_all_columns` only ADDS — delta-rs cannot drop columns |
 | `partition_by` | Delta partition column(s) |
-| `sort_by` | column(s) to physically ORDER the write by; the scalar `'auto'` (experimental) picks the key by profiling the model result — same heuristic as the connection API's `SORTED BY AUTO`, unsorted when nothing pays off. Inert on merge/microbatch/delete+insert |
-| `max_row_group_size` | explicit parquet row-group ceiling in **rows** for this model's writes (deltalake's spelling; default: the fixed 4M). Overrides the default verbatim — use it when a model must land 16M-row Direct Lake segments (e.g. `16000000`). Preserved by post-write compaction; the delta_rs merge write itself keeps defaults, post-merge compaction folds files into this geometry |
+| `sort_by` | column(s) to physically ORDER the write by; the scalar `'auto'` (experimental) picks the key by profiling the model result — same heuristic as the connection API's `SORTED BY AUTO`, unsorted when nothing pays off. `'auto'` is inert on merge/microbatch/delete+insert; an explicit key also orders the files a merge rewrites |
+| `max_row_group_size` | explicit parquet row-group ceiling in **rows** for this model's writes (deltalake's spelling; default: the fixed 4M). Overrides the default verbatim — use it when a model must land 16M-row Direct Lake segments (e.g. `16000000`). Preserved by post-write compaction; a merge that falls back to delta-rs keeps its defaults, post-merge compaction folds files into this geometry |
 | `target_file_size_mb` | per-model target parquet file size in **MB** (default 256). Same coverage and merge caveat as `max_row_group_size` |
 | `merge_schema` | allow schema evolution on write |
-| `merge_max_spill_size` | bytes cap on delta-rs's merge pool before it spills to disk; sensible cgroup-aware default; `0` disables |
-| `merge_streamed_exec` | `true` streams a HUGE source instead of collecting it — at the cost of losing target-file pruning. Default `false` is right for the normal small-delta-into-big-table case |
-| `merge_max_temp_directory_size` | disk cap for delta-rs's merge spill files (default ~80% of free disk) |
-| `merge_clauses` / `merge_update_set_expressions` | dbt-duckdb-style custom clause list / per-column SET expressions — translated to delta-rs's full TableMerger clause list |
+| `merge_max_spill_size` | (delta-rs fallback only) bytes cap on delta-rs's merge pool before it spills to disk; sensible cgroup-aware default; `0` disables |
+| `merge_streamed_exec` | `true` runs delta-rs's merge and streams a HUGE source instead of collecting it — at the cost of losing target-file pruning. Default `false` is right for the normal small-delta-into-big-table case |
+| `merge_max_temp_directory_size` | (delta-rs fallback only) disk cap for delta-rs's merge spill files (default ~80% of free disk) |
+| `merge_clauses` / `merge_update_set_expressions` | dbt-duckdb-style custom clause list / per-column SET expressions — translated to the full MERGE clause list |
 | `storage_options` | per-model override |
 
 `merge_clauses` follows **dbt-duckdb's spelling exactly**, so a project that targets both

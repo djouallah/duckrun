@@ -1658,6 +1658,7 @@ class _DeltaDML:
                               storage_options=self.so, dt=self._pinned(loc), operation="DELETE"):
             engine._maintain(self.cursor, loc, storage_options=self.so)
             return
+        # The paths below run only for a table shape copy-on-write refuses (CDF, deletion vectors…).
         if where and (self._with_clause or _PREDICATE_SUBQUERY.search(where)):
             # delta_rs's delete(predicate) can't evaluate a predicate that references ANOTHER table
             # via subquery (`… in (select … from other)`): its datafusion expr engine raises a Rust
@@ -1727,12 +1728,15 @@ class _DeltaDML:
         # A leading `WITH …` (CTE referenced by the SET exprs or predicate via a subquery) can only be
         # evaluated by DuckDB, so force the overwrite fallback and re-attach the CTE to its read.
         with_prefix = f"{self._with_clause} " if self._with_clause else ""
-        # Copy-on-write first (see _delete): the touched files' rows get CASE WHEN (pred) THEN expr.
-        cow_replaces = ", ".join(
+        # The updated rows as DuckDB computes them: `CASE WHEN (pred) THEN <expr> ELSE col END` per
+        # SET column via SELECT * REPLACE (no predicate → <expr> on every row). Copy-on-write applies
+        # it to the touched files only; the delta-rs-shape fallback below to the whole table.
+        replaces = ", ".join(
             (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
              else f'({expr}) AS "{col}"')
             for col, expr in updates.items())
-        if engine.cow_rewrite(self.cursor, loc, where=where, projection=f"* replace ({cow_replaces})",
+        # Copy-on-write first (see _delete).
+        if engine.cow_rewrite(self.cursor, loc, where=where, replaces=replaces,
                               alias=tname, with_prefix=with_prefix, read_version=self._vB(loc),
                               storage_options=self.so, dt=self._pinned(loc), operation="UPDATE",
                               changes=updates):
@@ -1748,18 +1752,11 @@ class _DeltaDML:
             #    updates only SOME rows of a multi-file table when the predicate references no column
             #    (None / a constant both mis-prune to a broken fast path); a column-referencing predicate
             #    is fine. A no-WHERE update rewrites every row anyway, so the full overwrite is equal work.
-            # Compute the updated rows there — `CASE WHEN (pred) THEN <expr> ELSE col END` per SET column
-            # via SELECT * REPLACE (no predicate → apply <expr> to every row) — and commit a fenced full
-            # overwrite, mirroring _delete's fallback. Fenced to vB so a
-            # concurrent commit fails loud, not clobbered.
+            # Compute the updated rows there (`replaces`, above) and commit a fenced full overwrite,
+            # mirroring _delete's fallback. Fenced to vB so a concurrent commit fails loud, not clobbered.
             logger.debug(
                 f"duckrun: UPDATE on {loc!r} references a subquery (predicate or SET expr); delta_rs "
                 "can't evaluate it, falling back to a DuckDB-evaluated fenced full overwrite (slower)."
-            )
-            replaces = ", ".join(
-                (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
-                 else f'({expr}) AS "{col}"')
-                for col, expr in updates.items()
             )
             # The scan is aliased to the target's name so a self-qualified reference (`sales.cat`,
             # incl. one inside a correlated subquery) binds to it; unqualified columns still resolve.

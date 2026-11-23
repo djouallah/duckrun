@@ -184,3 +184,60 @@ def test_unchanged_match_in_untouched_file_is_not_inserted(tmp_path, paths):
              "when matched then update set v = s.v when not matched by source and t.id >= 100 then delete")
     assert conn.sql("select count(*) from t").fetchall() == [(100,)]
     assert conn.sql("select v from t where id = 7").fetchall() == [("x",)]
+
+
+def test_table_with_a_filename_column(tmp_path, paths):
+    # A file-ingest table often has its own `filename` column; the scan's file column must not
+    # collide with it (`delta_scan(..., filename = true)` refuses to bind on such a table).
+    conn = _conn(tmp_path)
+    conn.sql("create table t as select i as id, 'f' || i as filename from range(20) r(i)")
+    conn.sql("update t set filename = 'x' where id < 5")
+    conn.sql("delete from t where id >= 15")
+    conn.sql("merge into t using (select 1 as id, 'm' as filename union all select 99, 'n') s "
+             "on t.id = s.id when matched then update set filename = s.filename "
+             "when not matched then insert (id, filename) values (s.id, s.filename)")
+    assert not any("delta_rs path" in m for m in paths)
+    assert conn.sql("select count(*), count(*) filter (filename = 'x'), "
+                    "max(filename) filter (id = 1), max(filename) filter (id = 99) from t"
+                    ).fetchall() == [(16, 4, "m", "n")]
+
+
+def _descents(conn, table):
+    """Adjacent pairs, in each live file's physical row order, where id goes down."""
+    files = engine._delta_table(f"{conn.root_path}/dbo/{table}", None).file_uris()
+    lit = ", ".join("'" + f.replace("'", "''") + "'" for f in files)
+    return conn.sql(
+        f"select count(*) from (select id, lag(id) over (partition by filename "
+        f"order by file_row_number) as prev from read_parquet([{lit}], filename = true)) "
+        f"where id < prev").fetchall()[0][0]
+
+
+def test_rewrite_keeps_the_row_order(tmp_path, paths):
+    # The session runs with preserve_insertion_order=false: a rewrite without a sort key keeps each
+    # rewritten row's physical position, so a sorted table stays sorted within each old file's run.
+    conn = _conn(tmp_path)
+    conn.sql("create table t as select i as id, 'v' as v from range(0, 300000) r(i) order by id")
+    for lo in (300000, 600000, 900000):
+        conn.sql(f"insert into t select i as id, 'v' as v from range({lo}, {lo + 300000}) r(i) "
+                 "order by id")
+    before = _descents(conn, "t")
+    conn.sql("update t set v = 'w' where id % 1000 = 0")
+    conn.sql("delete from t where id % 999 = 0")
+    assert any("update: copy-on-write" in m for m in paths)
+    assert _descents(conn, "t") <= before + 4       # at most one per old file joined
+    assert conn.sql("select count(*) filter (v = 'w') from t").fetchall()[0][0] > 0
+
+
+def test_delete_ignores_a_rule_duckdb_cannot_bind(tmp_path, paths):
+    # A DELETE writes only rows already in the table, so a CHECK in DataFusion-only SQL does not
+    # send it to delta-rs (an UPDATE still goes there: its new values must be checked).
+    conn = _conn(tmp_path)
+    conn.sql("create table t as select i as id from range(10) r(i)")
+    path = f"{conn.root_path}/dbo/t"
+    deltalake.DeltaTable(path).alter.add_constraint({"df_only": "arrow_typeof(id) = 'Int64'"})
+    conn.sql("delete from t where id = 3")
+    assert any("delete: copy-on-write" in m for m in paths)
+    assert conn.sql("select count(*) from t").fetchall() == [(9,)]
+    conn.sql("update t set id = 30 where id = 4")
+    assert any(m.startswith("update: delta_rs path (DuckDB cannot evaluate a table rule")
+               for m in paths)

@@ -482,8 +482,8 @@ class Plugin(BasePlugin):
         ``sort_by`` is not a delta_rs option — it is a DuckDB ``ORDER BY`` baked into the ``data``
         relation in :meth:`store`. Three branches never read ``data``: ``_store_microbatch`` and
         ``_store_delete_insert`` take the staged relation NAME instead, and the plain
-        ``engine.merge_delta`` branch writes into the target's existing layout (documented in
-        ``docs/dbt-adapter.md`` and in :meth:`_store_merge`'s docstring). A ``+sort_by: auto`` set
+        ``engine.merge_delta`` branch rewrites only the touched files, keeping their rows in their
+        existing order (copy-on-write) — re-profiling every run would re-sort just those files. A ``+sort_by: auto`` set
         project-wide therefore used to pay a full profile on every incremental run of every merge
         model for a value that was discarded on the next line.
 
