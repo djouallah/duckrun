@@ -9,8 +9,10 @@ files they replace (``RemoveAction``), in ONE transaction pinned to the version 
 Internal module, not public API. :func:`unsupported_reason` sends the table shapes this writer
 cannot commit correctly to the delta-rs path: deletion vectors and change data feed (the commit API
 has no action for their metadata), identity columns (their high-water mark lives in the schema),
-append-only tables, column-mapped tables that are also partitioned or nested (DuckDB's own Delta
-writer refuses those too), and — for now — CHECK constraints, invariants and generated columns.
+append-only tables, and column-mapped tables that are also partitioned or nested (DuckDB's own
+Delta writer refuses those too). CHECK constraints and invariants are evaluated, and generated
+columns recomputed, in DuckDB (:func:`apply_table_rules`); an expression DuckDB cannot evaluate
+sends the statement to delta-rs before anything is written.
 """
 import datetime as _dt
 import json
@@ -104,20 +106,52 @@ def unsupported_reason(dt: DeltaTable) -> Optional[str]:
             return "column mapping with nested columns"
         if any(PHYSICAL_NAME_KEY not in (f.metadata or {}) for f in dt.schema().fields):
             return "column mapping without physical names"
-    if any(k.lower().startswith("delta.constraints.") for k in conf):
-        return "CHECK constraints"
     unknown = sorted(set(dt.protocol().writer_features or []) - _WRITABLE_FEATURES)
     if unknown:
         return f"table feature(s) {', '.join(unknown)}"
     if "deletionVectors" in (dt.protocol().reader_features or []):
         return "deletion vectors"
-    schema_json = dt.schema().to_json()
-    for key, what in (('"delta.invariants"', "column invariants"),
-                      ('"delta.generationExpression"', "generated columns"),
-                      ('"delta.identity.', "identity columns")):
-        if key in schema_json:
-            return what
+    if '"delta.identity.' in dt.schema().to_json():
+        return "identity columns"
     return None
+
+
+class Unsupported(Exception):
+    """DuckDB cannot evaluate a table rule (a CHECK / invariant / generation expression in Spark
+    SQL); nothing has been written, so the statement can still run on delta-rs."""
+
+
+def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
+    """Make the rows about to be written obey the table's rules, as delta-rs's writer did:
+    generated columns are recomputed from their expressions; CHECK constraints
+    (``delta.constraints.*``) and column invariants fail the statement on a violating row (a NULL
+    result passes, as in SQL). Raises :class:`Unsupported` when DuckDB cannot evaluate one."""
+    import duckdb
+
+    conf = dt.metadata().configuration or {}
+    checks = [(f"CHECK constraint {k.split('.', 2)[2]}", v) for k, v in conf.items()
+              if k.lower().startswith("delta.constraints.")]
+    generated = []
+    for f in dt.schema().fields:
+        md = f.metadata or {}
+        if md.get("delta.invariants"):
+            checks.append((f"invariant on {f.name}",
+                           json.loads(md["delta.invariants"])["expression"]["expression"]))
+        if md.get("delta.generationExpression"):
+            generated.append((f.name, md["delta.generationExpression"]))
+    violations = []
+    try:
+        types = {r[0]: str(r[1]) for r in cur.execute(f"DESCRIBE {table}").fetchall()}
+        for name, expr in generated:
+            cur.execute(f"UPDATE {table} SET {_q(name)} = CAST(({expr}) AS {types[name]})")
+        for what, expr in checks:
+            n = cur.execute(f"SELECT count(*) FROM {table} WHERE ({expr}) IS FALSE").fetchall()[0][0]
+            if n:
+                violations.append(f"{what} ({expr}) fails on {n} row(s)")
+    except duckdb.Error as e:
+        raise Unsupported(f"DuckDB cannot evaluate a table rule: {e}") from e
+    if violations:
+        raise ValueError(f"{operation} refused: " + "; ".join(violations))
 
 
 def parquet_options(row_group_rows: Optional[int] = None,

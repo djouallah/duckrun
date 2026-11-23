@@ -2614,7 +2614,8 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
             whens = _cow_merge_clauses(clauses, target_cols, list(data.columns))
             cur.execute(f'MERGE INTO "{rows}" AS target USING "{src}" AS source '
                         f"ON ({predicate}) {whens}")
-        except (_CowUnsupported, duckdb.Error) as e:
+            cow.apply_table_rules(cur, f'"{rows}"', dt, "MERGE")
+        except (_CowUnsupported, cow.Unsupported, duckdb.Error) as e:
             # Nothing is written before this point, so the delta-rs merge can still run it.
             logger.info(f"merge: delta_rs path (DuckDB cannot run this merge: {e})")
             return False
@@ -2674,6 +2675,11 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], projection: str = "*",
             body = (f"SELECT {projection.replace('*', '* EXCLUDE (filename)', 1)} FROM {scan} "
                     f"WHERE {files}")
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS {with_prefix}{body}')
+        try:
+            cow.apply_table_rules(cur, f'"{rows}"', dt, operation)
+        except cow.Unsupported as e:
+            logger.info(f"{operation.lower()}: delta_rs path ({e})")
+            return False
         logger.info(f"{operation.lower()}: copy-on-write (DuckDB rewrite, delta_rs commit)")
         cow.check_not_null(cur, f'"{rows}"', dt, operation)
         adds = cow.write_files(cur, f'"{rows}"', path,

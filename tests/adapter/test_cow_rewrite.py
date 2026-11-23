@@ -128,3 +128,17 @@ def test_partitioned_column_mapped_table_stays_on_delta_rs(tmp_path, paths):
     conn.refresh(quiet=True)
     conn.sql("""update cmp set "Super Name" = 'x' where "Super Name" is not null""")
     assert any("delta_rs path (column mapping on a partitioned table)" in m for m in paths)
+
+
+def test_check_constraint_is_enforced(tmp_path, paths):
+    conn = _conn(tmp_path)
+    conn.sql("create table t as select i as id from range(10) r(i)")
+    path = f"{conn.root_path}/dbo/t"
+    deltalake.DeltaTable(path).alter.add_constraint({"non_negative": "id >= 0"})
+    v = engine.table_version(path)
+    with pytest.raises(ValueError, match="non_negative"):
+        conn.sql("update t set id = -1 where id = 3")
+    assert engine.table_version(path) == v                    # refused before anything was written
+    conn.sql("update t set id = 100 where id = 3")
+    assert any("update: copy-on-write" in m for m in paths)
+    assert conn.sql("select count(*) from t where id = 100").fetchall() == [(1,)]
