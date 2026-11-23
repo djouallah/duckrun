@@ -6,8 +6,7 @@ binding over the same Rust ``object_store`` crate that ``deltalake`` uses. That 
 whole point: the ``storage_options`` dict duckrun already forwards to delta-rs for Delta writes *is*
 an ``object_store`` config, so it builds an obstore store verbatim — no per-backend auth code, no
 DuckDB Azure secret, no OneLake DFS REST enumeration (obstore lists OneLake natively). The one
-exception is :func:`delete_tree` on OneLake: one recursive DFS delete, so no empty folders stay
-behind.
+exception is a local folder, which :func:`delete_tree` removes with ``shutil.rmtree``.
 
 Uploads stream from an open file handle, so obstore does a multipart PUT for large files instead of
 materializing the whole file in memory — the fix for the old ``read_blob``/``COPY … (FORMAT BLOB)``
@@ -66,14 +65,13 @@ def delete_tree(base_url: str, storage_options: Optional[Dict[str, str]] = None)
     """Delete everything under ``base_url`` (a table folder), and the folder itself.
 
     * local: ``shutil.rmtree``;
-    * OneLake (``abfss://``): ONE recursive ADLS Gen2 ``Path - Delete`` (``recursive=true``), paged by
-      ``x-ms-continuation``. Not obstore's list-and-delete: OneLake keeps real folders, so deleting
-      every file would leave the table folder and ``_delta_log/`` behind, empty — and Fabric shows a
-      folder under ``Tables/`` without a Delta log as an "Unidentified" table. OneLake keeps deleted
-      files for 7 days (soft delete), restorable with Azure Storage Explorer or the Blob ``Undelete``
-      API;
-    * s3 / gcs / plain Azure: list the prefix and delete every key with obstore (object stores have
-      no folders, so nothing is left once the keys are gone).
+    * s3 / gcs / Azure / OneLake: list the prefix and delete every key with obstore (batched). On
+      OneLake that is not the end: it keeps real folders, so the table folder, ``_delta_log/`` and
+      the partition folders would stay behind, empty — and Fabric shows a folder under ``Tables/``
+      without a Delta log as an "Unidentified" table. So the folders the keys sat in are deleted
+      too, deepest first, then the table folder. They come from the key paths themselves, because
+      object_store's listing skips folder entries. OneLake keeps deleted files for 7 days (soft
+      delete), restorable with Azure Storage Explorer or the Blob ``Undelete`` API.
 
     A folder that is already gone is not an error."""
     if "://" not in base_url:
@@ -82,33 +80,30 @@ def delete_tree(base_url: str, storage_options: Optional[Dict[str, str]] = None)
         if os.path.exists(base_url):
             shutil.rmtree(base_url)
         return
-    from . import remote
-
-    if remote.is_abfss(base_url):
-        from urllib.parse import quote
-
-        filesystem, host, path = remote._parse_abfss(base_url.rstrip("/"))
-        url = f"https://{host}/{filesystem}/" + quote(path.lstrip("/"), safe="/")
-        headers = {"Authorization": f"Bearer {bearer_token(storage_options)}",
-                   "x-ms-version": remote._DFS_API_VERSION}
-        continuation = None
-        while True:
-            params = {"recursive": "true"}
-            if continuation:
-                params["continuation"] = continuation
-            resp = remote.retry_request("DELETE", url, headers=headers, params=params)
-            if resp.status_code == 404:
-                return
-            resp.raise_for_status()
-            continuation = resp.headers.get("x-ms-continuation")
-            if not continuation:
-                return
     import obstore
+    from . import remote
 
     store = build_store(base_url, storage_options)
     keys = list_keys(store)
     for i in range(0, len(keys), 1000):
         obstore.delete(store, keys[i:i + 1000])
+    if not remote.is_abfss(base_url):
+        return
+    folders = {k.rsplit("/", 1)[0] for k in keys if "/" in k}
+    while True:                       # every ancestor folder, not just each key's direct parent
+        more = {f.rsplit("/", 1)[0] for f in folders if "/" in f} - folders
+        if not more:
+            break
+        folders |= more
+    parent, name = base_url.rstrip("/").rsplit("/", 1)
+    for folder in sorted(folders, key=lambda f: f.count("/"), reverse=True) + [None]:
+        try:
+            if folder is None:
+                obstore.delete(build_store(parent, storage_options), name)
+            else:
+                obstore.delete(store, folder)
+        except FileNotFoundError:
+            pass
 
 
 def list_keys(store) -> List[str]:

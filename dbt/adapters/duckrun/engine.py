@@ -734,6 +734,20 @@ def delta_schema(rel, names: Optional[List[str]] = None):
     return DeltaSchema.from_json(json.dumps({"type": "struct", "fields": fields}))
 
 
+def _temp_view(cur, data, name: str) -> None:
+    """Register the relation ``data`` as the TEMP view ``name`` on ``cur``. TEMP, not
+    ``rel.create_view`` (a view in the current catalog): inside dbt's open transaction, which may
+    already have written to another catalog, DuckDB refuses a write to a second database — and a
+    TEMP view lives in the connection's temp catalog, which does not count. A relation with no SQL
+    form (an Arrow / pandas wrap) has no such transaction and takes ``create_view``."""
+    try:
+        sql = data.sql_query()
+    except Exception:
+        data.create_view(name, replace=True)
+        return
+    cur.execute(f'CREATE OR REPLACE TEMP VIEW "{name}" AS {sql}')
+
+
 def _write_source(cur, data, storage_options: Optional[Dict[str, str]]):
     """``(cursor, relation, owned_connection)`` for a write: ``data`` as a DuckDB relation on the
     cursor that will COPY it. A pyarrow / pandas object is wrapped on ``cur``; with no cursor (a
@@ -842,7 +856,7 @@ def duckdb_write(cur, path: str, data, mode: str, *, partition_by=None, schema_m
     view, staged = tmp_name("dwsrc", path), tmp_name("dwrows", path)
     try:
         data = _normalized(data, mode)
-        data.create_view(view, replace=True)
+        _temp_view(cur, data, view)
         dt = open_if_exists(path, storage_options)
         if dt is not None and read_version is not None:
             dt.load_as_version(read_version)
@@ -965,7 +979,7 @@ def replace_rows(cur, path: str, data, predicate: str, *, read_version: int,
         why = cow.unsupported_reason(dt, "rewrite")
         if why:
             raise cow.Unsupported(f"{operation.lower()}: {why}")
-        data.create_view(view, replace=True)
+        _temp_view(cur, data, view)
         projection = _project_to_table(cur, data, dt, path, op=operation.lower())
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{new}" AS SELECT {projection} FROM "{view}"')
         outside = cur.execute(f'SELECT count(*) FROM "{new}" WHERE ({predicate}) IS NOT TRUE'
@@ -2686,7 +2700,7 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
         source = f"({data.sql_query()})"      # the source as SQL: no view to register or drop
     except Exception:
         view = tmp_name("cowsrcv", path)
-        data.create_view(view, replace=True)
+        _temp_view(cur, data, view)
         source = f'"{view}"'
     scan = cow.scan(path, read_version)
     fcol = quote_ident(cow.FILE_COL)
@@ -2957,7 +2971,7 @@ def _merge_clauses(
         # swallowed and strand a view whose body reads the staging table it was named after (every
         # later bind of the name then raising infinite recursion).
         src_view = tmp_name("isrc", path)
-        data.create_view(src_view, replace=True)
+        _temp_view(cur, data, src_view)
         try:
             insert_delta(
                 path, cur, '"' + src_view + '"', predicate,

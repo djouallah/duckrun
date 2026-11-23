@@ -29,3 +29,12 @@ def test_four_part_read_and_write(path, prefix):
              f"WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)")
     assert conn.sql(f"SELECT id, v FROM {t} ORDER BY id").fetchall() == [(1, "b"), (2, "c")]
     conn.sql(f"DROP TABLE {t}")
+    # DROP TABLE deletes the table folder itself, not just its files: OneLake keeps folders, and an
+    # empty one under Tables/ shows in Fabric as an "Unidentified" table.
+    import obstore
+    from dbt.adapters.duckrun import objectstore
+    schema_url = conn._table_path(schema, "t").rstrip("/").rsplit("/", 1)[0]
+    listed = obstore.list_with_delimiter(objectstore.build_store(schema_url, conn.storage_options))
+    names = {p.rstrip("/").rsplit("/", 1)[-1] for p in listed["common_prefixes"]}
+    names |= {o["path"].split("/", 1)[0] for o in listed["objects"]}
+    assert "t" not in names, f"DROP TABLE left the table folder behind: {sorted(names)}"
