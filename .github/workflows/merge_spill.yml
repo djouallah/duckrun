@@ -115,7 +115,8 @@ jobs:
         # dispatch — leaves one permanent row in docs/merge-benchmark-history.md for the trend log.
         # The bench wrote the row to docs/merge_history_row.md (gitignored); append it to the tracked
         # history against a fresh origin/main. Never fail the run on a git hiccup; [skip ci].
-        if: always() && hashFiles('docs/merge_history_row.md') != ''
+        # A run dispatched from a branch (an experiment) leaves no row on main.
+        if: always() && hashFiles('docs/merge_history_row.md') != '' && (github.event_name != 'workflow_dispatch' || github.ref == 'refs/heads/main')
         continue-on-error: true
         uses: ./.github/actions/commit-docs
         with:
