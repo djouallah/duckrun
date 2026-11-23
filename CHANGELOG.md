@@ -2,31 +2,54 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.0]
 
-### Changed
+**Breaking release.** The write path changes: DuckDB writes every data file and delta-rs only
+commits. Writes that worked on 0.5.x are refused on some table shapes (below), `DROP TABLE` deletes
+data, and three dbt configs stop doing anything.
+
+### Breaking
 - **DuckDB writes every parquet file; deltalake only commits.** CTAS, INSERT, the dbt `table` /
   `append` / `insert` / `delete+insert` / `microbatch` strategies, REPLACE WHERE, MERGE / UPDATE /
   DELETE / TRUNCATE, the ALTER rewrites and compaction all write through one DuckDB `COPY` and commit
   with delta-rs's `create_write_transaction` / `create_table_with_add_actions`. `ALTER TABLE … ADD
   COLUMN` is a metadata-only commit. deltalake's floor drops to 1.6.4, the first release whose commit
   API takes remove actions.
-- **No delta-rs writer fallback.** Writes the commit API can't express are refused with a clear
-  error: MERGE / UPDATE / DELETE on tables with change data feed, deletion vectors, identity columns, append-only tables, column mapping on a partitioned or nested table; `OPTIMIZE … ZORDER BY`. The dbt configs
-  `merge_max_spill_size`, `merge_max_temp_directory_size` and `merge_streamed_exec` have no effect.
-- A compaction is recorded as `WRITE` in the history (the commit API has no OPTIMIZE operation); its
-  adds and removes carry `dataChange=false` and the commit info `duckrun.operation = OPTIMIZE`.
+- **No delta-rs writer fallback.** What the commit API can't write is refused before anything is
+  written, with the reason:
+  * MERGE / UPDATE / DELETE / REPLACE WHERE on a table with change data feed (appends, overwrites
+    and TRUNCATE still work: they add or remove whole files, which needs no change files);
+  * anything that removes rows from an append-only table, `CREATE OR REPLACE` included;
+  * MERGE / UPDATE / DELETE and compaction on a table with deletion vectors;
+  * writing rows into a table with identity columns;
+  * column mapping on a partitioned or nested table;
+  * a column type Delta has none for (INTERVAL, TIME, BIT, UNION, …): cast it. UUID / JSON / ENUM,
+    HUGEINT, the unsigned integers and TIMESTAMP_S/MS/NS are cast the way delta-rs stored them;
+  * `OPTIMIZE … ZORDER BY`: use `CREATE OR REPLACE TABLE t SORTED BY (…) AS SELECT * FROM t`.
+- The dbt configs `merge_max_spill_size`, `merge_max_temp_directory_size` and `merge_streamed_exec`
+  have no effect (accepted, with a warning).
 - **`DROP TABLE` deletes the table's folder.** It used to write a one-column tombstone and keep
   the files. On OneLake the files stay soft-deleted for 7 days (restorable); elsewhere the drop
   has no undo. Tables an older duckrun tombstoned are still hidden.
 - **A read-only session refuses every write.** `DROP TABLE`, `ALTER TABLE` and `WITH … INSERT`
   used to get past the read-only gate.
+- A compaction is recorded as `WRITE` in the history (the commit API has no OPTIMIZE operation); its
+  adds and removes carry `dataChange=false` and the commit info `duckrun.operation = OPTIMIZE`.
 
 ### Added
 - `TRUNCATE [TABLE] t`; time travel in DuckDB's syntax (`t AT (VERSION => n)`,
-  `t AT (TIMESTAMP => ts)`); `ALTER TABLE t SET TBLPROPERTIES (…)`; `OPTIMIZE t [ZORDER BY
-  (cols)]`; `VACUUM t RETAIN n HOURS`; `CREATE TABLE t (cols) [PARTITIONED BY (…)] [WITH (…)]`
-  with `GENERATED ALWAYS AS` columns computed on insert.
+  `t AT (TIMESTAMP => ts)`); `ALTER TABLE t SET TBLPROPERTIES (…)`; `OPTIMIZE t`;
+  `VACUUM t RETAIN n HOURS`; `CREATE TABLE t (cols) [PARTITIONED BY (…)] [WITH (…)]` with
+  `GENERATED ALWAYS AS` columns computed on insert.
+
+### Fixed
+- `CREATE TABLE t (… NOT NULL)` records the column as non-nullable and enforces it; it was created
+  nullable. The statement no longer needs pyarrow.
+- `UPDATE … SET s = {'a': 1, 'b': 2}` (a struct literal) was split at its inner comma.
+- A column name containing a double quote broke `INSERT`, `MERGE`, `ALTER TABLE … RENAME/DROP
+  COLUMN` and the type-narrowing check.
+
+## [0.5.6 – 0.5.7]
 
 ### Fixed
 - **0.5.6: back to the 0.5.0 code with `deltalake==1.5.0`; 0.5.1-0.5.5 are yanked** (#84). Every

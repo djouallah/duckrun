@@ -252,9 +252,9 @@ on-run-start: "{{ register_upstream_external_models() }}"
 | `merge_update_condition` / `merge_insert_condition` | merge: extra predicate AND-ed onto the matched-update / not-matched-insert clause (`target.` / `source.`, or `DBT_INTERNAL_DEST` / `DBT_INTERNAL_SOURCE`). `merge_insert_condition` also applies to `insert`, where it may reference only the source. |
 | `merge_clauses` / `merge_update_set_expressions` | merge: dbt-duckdb's custom clause list / per-column `SET` expressions, translated to delta-rs's TableMerger. Same spelling as upstream — `action` `update` / `delete` / `insert` / `do_nothing`, `mode` `by_name` / `by_position` / `star` / `explicit`, `condition`, `insert: {columns, values}`, `update: {include, exclude, set_expressions}`, `by: source` — with upstream's implicit defaults for an omitted `when_matched` / `when_not_matched`, so `{'when_matched': [{'action': 'do_nothing'}]}` is insert-only and takes the `insert` route. Rejected: `merge_on_using_columns` and `action: error`. |
 | `when_not_matched_by_source` | merge: duckrun's own top-level `merge_clauses` key (`update` with a `set` map / `delete` / `do_nothing`) for rows the source doesn't carry. A dict using it opts out of the implicit defaults above; use upstream's portable `{'by': 'source', …}` entry inside `when_not_matched` to keep both. |
-| `merge_max_spill_size`  | no effect since 0.5.8: DuckDB runs every MERGE under its pinned `memory_limit` and spills to its temp directory. Accepted with a warning. |
-| `merge_max_temp_directory_size` | no effect since 0.5.8. Accepted with a warning. |
-| `merge_streamed_exec`   | no effect since 0.5.8. Accepted. |
+| `merge_max_spill_size`  | no effect since 0.6.0: DuckDB runs every MERGE under its pinned `memory_limit` and spills to its temp directory. Accepted with a warning. |
+| `merge_max_temp_directory_size` | no effect since 0.6.0. Accepted with a warning. |
+| `merge_streamed_exec`   | no effect since 0.6.0. Accepted. |
 | `incremental_predicates`| merge / insert: extra predicates AND-ed into the join condition. On `insert`, a `target.<part> = source.<part>` entry also unlocks partition pruning of the target probe. |
 | `on_schema_change`      | `ignore` (default) \| `append_new_columns` \| `fail`. `sync_all_columns` only *adds* — delta-rs can't drop columns. |
 | `partition_by`          | Delta partition column(s).                                                   |
