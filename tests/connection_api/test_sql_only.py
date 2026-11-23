@@ -246,9 +246,11 @@ def test_sorted_by_auto_reads_the_source_once(w, monkeypatch):
 
     def _touches():
         # `\bsrc\b` does not match inside `_duckrun_auto_src` — `_` is a word character, so there
-        # is no boundary before `src` there.
+        # is no boundary before `src` there. DESCRIBE and a view definition (the write registers
+        # its source as a TEMP view, which the COPY then reads) scan nothing.
         return [" ".join(s.split()) for s in seen
-                if re.search(r"\bsrc\b", s) and not s.lstrip().upper().startswith("DESCRIBE")]
+                if re.search(r"\bsrc\b", s)
+                and not re.match(r"\s*(DESCRIBE|CREATE\s+(OR\s+REPLACE\s+)?TEMP\s+VIEW)\b", s, re.I)]
 
     # ── at/below the cap: count + full staging CTAS; profile and write read the staged copy.
     w.con = Spy()
