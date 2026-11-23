@@ -817,11 +817,18 @@ class DuckSession:
             # generated (`from None` so the noisy SQL echo doesn't reappear in tracebacks).
             if remote.is_abfss(root) and not remote.has_delta_log(path, entry.storage_options):
                 return False
-            hint = _onelake_guid_hint(root)
             where = catalog if lakehouse is None else f"{catalog}.{lakehouse}"
+            reason = _strip_query_context(str(exc))
+            if lakehouse is not None:
+                # A workspace spans lakehouses other people own: one unreadable table must not take
+                # the whole catalog down. Say so and skip it; a single-lakehouse connect fails loud.
+                print(f"[warn] skipped {where}.{schema}.{table} (could not read it): "
+                      f"{reason.splitlines()[0] if reason else exc}")
+                return False
+            hint = _onelake_guid_hint(root)
             raise RuntimeError(
                 f"duckrun: could not read Delta table {where}.{schema}.{table} at '{path}':\n"
-                f"{_strip_query_context(str(exc))}"
+                f"{reason}"
                 + (f"\n\n{hint}" if hint else "")
             ) from None
 

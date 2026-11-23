@@ -169,7 +169,8 @@ def test_list_workspace_lakehouses_onelake(monkeypatch):
 
 
 def test_list_workspace_lakehouses_guid(monkeypatch):
-    import duckrun.workspace as workspace_mod
+    import importlib
+    workspace_mod = importlib.import_module("duckrun.workspace")   # duckrun.workspace is also a function
 
     class _Ws:
         def list_lakehouses(self):
@@ -198,3 +199,16 @@ def test_list_workspace_lakehouses_guid(monkeypatch):
 ])
 def test_dml_target_parts(sql, parts):
     assert dml_target_parts(sql) == parts
+
+
+def test_workspace_skips_an_unreadable_table(ws, capsys):
+    # A workspace spans lakehouses other people own: one broken table is skipped with a warning
+    # instead of failing the whole catalog (a single-lakehouse connect still fails loud).
+    log = ws / "hr.Lakehouse" / "Tables" / "dbo" / "broken" / "_delta_log"
+    log.mkdir(parents=True)
+    (log / "00000000000000000000.json").write_text("not a delta log\n")
+    conn = duckrun.connect(str(ws))
+    assert "skipped ws.hr.dbo.broken" in capsys.readouterr().out
+    assert conn.sql("select amt from ws.hr.dbo.orders").fetchall() == [(20,)]
+    with pytest.raises(RuntimeError, match="could not read Delta table"):
+        duckrun.connect(_tables_dir(ws, "hr"))
