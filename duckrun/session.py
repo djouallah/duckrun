@@ -324,6 +324,38 @@ def _onelake_guid_hint(root_path: str) -> Optional[str]:
 _expand_onelake_shorthand = remote.expand_onelake_shorthand
 
 
+_ALIAS_SUFFIXES = (".lakehouse", ".warehouse")
+
+
+def _path_alias(root: str):
+    """``(workspace, item)`` a lakehouse root shaped ``<ws>/<item>.Lakehouse|.Warehouse/Tables`` also
+    answers to, as ``ws.item.schema.table`` — read off the attached path itself (OneLake: ``ws`` is the
+    abfss filesystem; a local path of the same shape works the same way). ``<ws-guid>/<item-guid>``
+    OneLake roots alias by their GUIDs. None for any other root."""
+    p = root.replace("\\", "/").rstrip("/")
+    if not p.lower().endswith("/tables"):
+        return None
+    p = p[: -len("/tables")]
+    if remote.is_abfss(p):
+        ws, _host, item = remote._parse_abfss(p)
+        if not item or "/" in item:
+            return None
+        if _GUID.match(ws) and _GUID.match(item):
+            return ws, item
+    elif "://" in p:
+        return None
+    else:
+        head, _, item = p.rpartition("/")
+        ws = head.rpartition("/")[2]
+    if not ws or not item:
+        return None
+    low = item.lower()
+    for suffix in _ALIAS_SUFFIXES:
+        if low.endswith(suffix) and len(item) > len(suffix):
+            return ws, item[: -len(suffix)]
+    return None
+
+
 def _split_root_schema(path: str, schema: Optional[str]):
     """Normalize ``path`` into ``(root_path, schema)``.
 
@@ -428,6 +460,11 @@ class DuckSession:
         # The primary catalog keeps the unscoped OneLake secret (attached ones are path-scoped); the
         # token-refresh guard needs to know which is which to re-mint the right secret.
         self._primary_catalog: Optional[str] = None
+        # 4-part names: an attached lakehouse at <ws>/<lh>.Lakehouse/Tables also answers to
+        # ws.lh.schema.table — catalog "ws" holds a schema "lh" with the lakehouse's schemas nested
+        # under it (views over the same delta_scan paths). ws -> {lh -> catalog}, and its inverse.
+        self._aliases: Dict[str, Dict[str, str]] = {}
+        self._alias_of: Dict[str, tuple] = {}
 
         root, schema_filter = _split_root_schema(path, schema)
         # Catalog is first-class, so single- and multi-catalog sessions share one code path
@@ -447,8 +484,9 @@ class DuckSession:
 
     @property
     def root_path(self) -> str:
-        """The current catalog's lakehouse root (back-compat for single-catalog callers)."""
-        return self._catalogs[self._current_catalog].root_path
+        """The current catalog's lakehouse root (back-compat for single-catalog callers); after
+        ``USE ws.lh.schema`` the root of lakehouse ``lh``."""
+        return self._catalogs[self._current_target()[0]].root_path
 
     @property
     def storage_options(self) -> Optional[Dict[str, str]]:
@@ -516,12 +554,16 @@ class DuckSession:
             self._primary_catalog = name
         try:
             schemas = self._refresh_catalog(name, quiet=quiet)
+            self._sync_alias(name)
         except Exception:
             # Roll back the half-built catalog. Otherwise a failed secondary attach() (e.g. the
             # case-collision error) leaves the DuckDB ATTACH and the registry entry behind:
             # refresh() would iterate a broken catalog, and re-attaching the corrected name/root
             # would die on "already attached".
             self._catalogs.pop(name, None)
+            ws_lh = self._alias_of.pop(name, None)
+            if ws_lh is not None:
+                self._aliases.get(ws_lh[0], {}).pop(ws_lh[1], None)
             try:
                 self.con.execute(f"DETACH {_qid(name)}")
             except Exception:
@@ -616,7 +658,85 @@ class DuckSession:
         names = [catalog] if catalog is not None else list(self._catalogs)
         for name in names:
             self._refresh_catalog(name, quiet=quiet)
+            self._sync_alias(name)
         return self
+
+    # ---- 4-part names (ws.lh.schema.table) ----------------------------------------------------
+
+    def _sync_alias(self, cat: str) -> None:
+        """(Re)build catalog ``cat``'s 4-part twin views: ``"ws"."lh"."schema"."table"`` over the same
+        ``delta_scan`` paths as ``cat.schema.table``. No-op for a root without a 4-part shape (see
+        :func:`_path_alias`), or when ``ws`` is already the name of another catalog."""
+        alias = self._alias_of.get(cat)
+        if alias is None:
+            entry = self._catalogs[cat]
+            alias = _path_alias(entry.root_path) if entry.kind == "delta" else None
+            if alias is None:
+                return
+            ws, lh = alias
+            if not self._is_alias(ws):
+                taken = self.con.execute(
+                    "SELECT 1 FROM duckdb_databases() WHERE lower(database_name) = lower(?)",
+                    [ws]).fetchall()
+                if taken:
+                    return                               # the name belongs to another catalog
+                self.con.execute(f"ATTACH ':memory:' AS {_qid(ws)}")
+                self._aliases[ws] = {}
+            if self._alias_catalog(ws, lh) is not None:
+                return                                   # another catalog already answers to ws.lh
+            ws = next(w for w in self._aliases if w.lower() == ws.lower())
+            alias = (ws, lh)
+            self._aliases[ws][lh] = cat
+            self._alias_of[cat] = alias
+        ws, lh = alias
+        prefix = f"{_qid(ws)}.{_qid(lh)}"
+        self.con.execute(f"DROP SCHEMA IF EXISTS {prefix} CASCADE")
+        self.con.execute(f"CREATE SCHEMA {prefix}")
+        for sch in self._cat_databases(cat):
+            self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {prefix}.{_qid(sch)}")
+            for tbl in self._cat_tables(sch, cat):
+                self.con.execute(
+                    f"CREATE OR REPLACE VIEW {prefix}.{_qid(sch)}.{_qid(tbl)} AS SELECT * FROM "
+                    f"delta_scan('{_qlit(self._table_path(sch, tbl, cat))}')")
+
+    def _sync_twin(self, cat: str, schema: str, table: str) -> None:
+        """After a write to ``cat.schema.table``: make both of its views — ``cat.schema.table`` and
+        ``ws.lh.schema.table`` — match the store (registered if the table is live, dropped if not),
+        whichever name the statement used."""
+        ws, lh = self._alias_of[cat]
+        path = self._table_path(schema, table, cat)
+        owners = [_qid(cat), f"{_qid(ws)}.{_qid(lh)}"]
+        if self._live_table_exists(path, self._catalog_storage_options(cat)):
+            for owner in owners:
+                self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {owner}.{_qid(schema)}")
+                self.con.execute(f"CREATE OR REPLACE VIEW {owner}.{_qid(schema)}.{_qid(table)} AS "
+                                 f"SELECT * FROM delta_scan('{_qlit(path)}')")
+        else:
+            for owner in owners:
+                self.con.execute(f"DROP VIEW IF EXISTS {owner}.{_qid(schema)}.{_qid(table)}")
+
+    def _alias_catalog(self, ws: str, lh: str) -> Optional[str]:
+        """The lakehouse catalog answering to ``ws.lh`` (identifiers fold case, as in DuckDB)."""
+        for w, lakehouses in self._aliases.items():
+            if w.lower() == ws.lower():
+                for name, cat in lakehouses.items():
+                    if name.lower() == lh.lower():
+                        return cat
+        return None
+
+    def _is_alias(self, catalog) -> bool:
+        return catalog is not None and any(w.lower() == str(catalog).lower() for w in self._aliases)
+
+    def _current_target(self):
+        """``(catalog, schema)`` DuckDB's ``USE`` points at, with ``USE ws.lh.schema`` mapped to
+        lakehouse ``lh``'s catalog (``current_schema()`` then reads ``lh.schema``). ``(None, None)``
+        right after ``USE ws``: no lakehouse is current yet."""
+        cat, sch = self._current_catalog, self._current_database
+        if not self._is_alias(cat):
+            return cat, sch
+        lh, _, leaf = sch.partition(".")
+        real = self._alias_catalog(cat, lh) if leaf else None
+        return (real, leaf) if real else (None, None)
 
     def _refresh_catalog(self, name: str, quiet: bool = True):
         entry = self._catalogs[name]
@@ -720,9 +840,34 @@ class DuckSession:
     def _resolve(self, name: str):
         """Split a possibly-qualified name into ``(catalog, schema, table)``.
 
-        3 parts → ``catalog.schema.table`` (the catalog must be attached); 2 parts → ``schema.table``
-        in the current catalog; 1 part → table in the current catalog + database."""
-        parts = delta_dml._split_dotted(name)  # quote-aware: a dot inside "a.b" stays one part
+        4 parts → ``ws.lh.schema.table`` (lakehouse ``lh``'s catalog); 3 parts → ``catalog.schema.table``
+        (the catalog must be attached); 2 parts → ``schema.table`` in the current catalog; 1 part →
+        table in the current catalog + database."""
+        return self._resolve_parts(delta_dml._split_dotted(name))  # quote-aware: "a.b" is one part
+
+    def _resolve_parts(self, parts):
+        if len(parts) >= 4:
+            ws, lh, schema, table = parts[-4:]
+            cat = self._alias_catalog(ws, lh)
+            if cat is None:
+                known = sorted(f"{w}.{n}" for w, ls in self._aliases.items() for n in ls)
+                raise ValueError(f"unknown name '{'.'.join(parts)}': no attached lakehouse is "
+                                 f"{ws}.{lh}; 4-part names: {known}.")
+            return cat, schema, table
+        if len(parts) <= 2 and self._is_alias(self._current_catalog):
+            cat, sch = self._current_target()
+            if len(parts) == 2:
+                raise ValueError(f"'{'.'.join(parts)}' is ambiguous in '{self._current_catalog}': use "
+                                 f"<table> after USE {self._current_catalog}.<lakehouse>.<schema>, "
+                                 f"<lakehouse>.<schema>.<table>, or the 4-part name.")
+            if cat is None:
+                raise ValueError(f"'{parts[0]}': no lakehouse is current; USE "
+                                 f"{self._current_catalog}.<lakehouse>.<schema> or qualify the name.")
+            return cat, sch, parts[0]
+        if len(parts) == 3 and parts[0] not in self._catalogs and self._is_alias(self._current_catalog):
+            cat = self._alias_catalog(self._current_catalog, parts[0])   # lh.schema.table under ws
+            if cat is not None:
+                return cat, parts[1], parts[2]
         if len(parts) >= 3:
             catalog, schema, table = parts[-3], parts[-2], parts[-1]
             if catalog not in self._catalogs:
@@ -811,12 +956,12 @@ class DuckSession:
             return
         self._catalogs[name] = entry._replace(storage_options=so)
 
-    def _handle_delta_write(self, entry, query: str) -> bool:
+    def _handle_delta_write(self, entry, query: str, default_schema, view_prefix=None) -> bool:
         """Route a Delta write through ``delta_dml.handle``. Memory is already handled: the session's
         ``memory_limit`` was pinned once at connect (``configure_duckdb_session``), and a ``MERGE``'s
         delta_rs pool is bounded by its own spill caps behind the merge gate in the engine."""
         return delta_dml.handle(self.con, entry.root_path, entry.storage_options,
-                                query, default_schema=self._current_database)
+                                query, default_schema=default_schema, view_prefix=view_prefix)
 
     def sql(self, query: str) -> duckdb.DuckDBPyRelation:
         """Run a query and return DuckDB's native ``DuckDBPyRelation`` — unwrapped, with all of its
@@ -889,6 +1034,17 @@ class DuckSession:
         # is (``_dml_target_catalog`` → its name); an unqualified/2-part target is the current catalog.
         # Reads (SELECT) are unaffected — DuckDB resolves every attached catalog natively.
         target_cat = _dml_target_catalog(query)
+        # A 4-part target (ws.lh.schema.table) — or, under `USE ws.lh.schema`, a bare or
+        # lh.schema.table one — names a lakehouse by its 4-part alias: it routes to that lakehouse's
+        # own catalog (root, token, read-only gate), and the router nests its view under "ws"."lh".
+        tparts = delta_dml.dml_target_parts(query)
+        default_schema = self._current_database
+        view_prefix = None
+        if tparts is not None and (len(tparts) >= 4 or self._is_alias(self._current_catalog)):
+            target_cat, target_schema, _ = self._resolve_parts(tparts)  # raises: unknown / ambiguous
+            if len(tparts) != 3 or tparts[0] not in self._catalogs:
+                ws, lh = self._alias_of[target_cat]
+                default_schema, view_prefix = target_schema, f"{_qid(ws)}.{_qid(lh)}"
         if target_cat is not None and target_cat not in self._catalogs:
             raise ValueError(
                 f"unknown catalog '{target_cat}'; attached catalogs: {list(self._catalogs)}. "
@@ -932,14 +1088,21 @@ class DuckSession:
             # handle() unwrapped — it returns False for non-DML and falls through to DuckDB below. is_write
             # implies entry is not None here (the None case raised above).
             if entry is not None:
-                handled = (self._handle_delta_write(entry, query) if is_write else
+                handled = (self._handle_delta_write(entry, query, default_schema, view_prefix)
+                           if is_write else
                            delta_dml.handle(self.con, entry.root_path, entry.storage_options,
-                                            query, default_schema=self._current_database))
+                                            query, default_schema=default_schema,
+                                            view_prefix=view_prefix))
             else:
                 handled = False
         finally:
             if staged is not None:
                 self.con.execute(f"DROP TABLE IF EXISTS {staged}")
+        if handled and is_write and tparts and write_cat in self._alias_of:
+            # The router registered the view under the name the statement used; the table has a twin
+            # under its other name (cat.schema.table <-> ws.lh.schema.table) — bring that one along.
+            schema = default_schema if len(tparts) == 1 else tparts[-2]
+            self._sync_twin(write_cat, schema, tparts[-1])
         if handled:
             # No catalog rescan here: the DML router already registered/dropped the one view this
             # statement touched (_refresh_view/_drop), exactly like the dbt surface, and no peer

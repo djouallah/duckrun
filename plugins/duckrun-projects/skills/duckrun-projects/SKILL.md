@@ -583,7 +583,8 @@ conn.sql("SELECT * FROM orders_copy").show()
   `DROP TABLE` is a **tombstone** — a marker commit, no data files deleted.
 - Multiple catalogs: `conn.attach(path, name=…, read_only=…)` binds more lakehouses
   (or a read-only Fabric Warehouse); read, join, and write across them by three-part
-  `catalog.schema.table` names.
+  `catalog.schema.table` names, or the 4-part `workspace.lakehouse.schema.table` a lakehouse
+  attached at `<workspace>/<lakehouse>.Lakehouse` also answers to.
 - `conn.register(name, df)` exposes a local pandas/polars/arrow object to SQL (explicit
   because DuckDB's replacement scan can't see the caller's frame). Utilities:
   `conn.copy` (`git_only=` / `sync=` for project deploys), `conn.download`,
