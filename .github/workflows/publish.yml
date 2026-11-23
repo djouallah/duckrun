@@ -14,7 +14,11 @@ concurrency:
   group: pypi
   cancel-in-progress: false
 
-# A release must pass cores + local_stress_tests (TPC-H) + merge_spill before publishing. Each is a
+# A release must pass cores + local_stress_tests (TPC-H) + merge_spill before publishing. cores
+# includes the parquet layout contract (tests/adapter/test_layout_contract.py — the Fabric-free
+# stand-in for a Direct Lake run: dictionary-first encoding_stats, full-dictionary pages, Delta
+# stats, sort order kept by rewrites, on every write path) and runs it on the newest AND the floor
+# duckdb / deltalake (the `floor` job), since a release ships the whole range. Each is a
 # reusable workflow run as a gate job here. All render scorecards into README/docs and commit them to
 # main (cores: conformance + connection-API + snapshot-pin cards; merge_spill: the MERGE card), so
 # every call job grants contents:write (a reusable workflow can only use permissions the caller

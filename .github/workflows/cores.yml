@@ -187,8 +187,38 @@ jobs:
             tests/correctness/multi_catalog/test_multi_catalog_e2e.py \
             -q -p no:cacheprovider
 
+  floor:
+    # The same suites on the OLDEST duckdb / deltalake pyproject accepts: a release ships the whole
+    # range, and `adapter` above only ever installs the newest. The floors are read from pyproject,
+    # so raising one there moves this job with it. Includes the parquet layout contract
+    # (tests/adapter/test_layout_contract.py), the release gate's stand-in for Direct Lake.
+    runs-on: ubuntu-latest
+    concurrency:
+      group: cores-floor-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-duckrun
+      - name: Pin duckdb and deltalake to their pyproject floors
+        run: |
+          pins=$(python - <<'EOF'
+          import re, tomllib
+          deps = tomllib.load(open("pyproject.toml", "rb"))["project"]["dependencies"]
+          floors = [re.sub(r"\s*>=\s*", "==", d) for d in deps
+                    if re.match(r"(duckdb|deltalake)\s*>=", d)]
+          assert len(floors) == 2, f"expected duckdb and deltalake floors, got {floors}"
+          print(" ".join(floors))
+          EOF
+          )
+          echo "pinning: $pins"
+          pip install $pins
+          pip show duckdb deltalake | grep -E '^(Name|Version):'
+      - name: Adapter + connection-API tests on the floors
+        run: |
+          python -m pytest tests/adapter tests/connection_api -q -p no:cacheprovider
+
   conformance:
-    # The official dbt adapter conformance suite (dbt-labs/dbt-adapters). REQUIRED check, gated on
+    #The official dbt adapter conformance suite (dbt-labs/dbt-adapters). REQUIRED check, gated on
     # REGRESSIONS only: duckrun is Delta-only, so some standard tests are expected not to pass — what
     # must not happen is a test that passes on main starting to fail. Baseline lives in
     # tests/conformance/passing_baseline.txt and is auto-maintained here.
