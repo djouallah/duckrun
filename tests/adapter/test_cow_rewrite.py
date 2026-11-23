@@ -96,3 +96,35 @@ def test_concurrent_commit_fails_loudly(tmp_path, monkeypatch):
     with pytest.raises(CommitFailedError):
         conn.sql("update t set v = 'mine' where id = 1")
     assert engine.table_version(path) == v0 + 1                # only the other writer's commit
+
+
+def test_column_mapped_table(tmp_path, paths):
+    # A name-mapped table (as Spark/Fabric write them): the rewrite lands under the physical names.
+    import os
+    conn = _conn(tmp_path)
+    path = f"{conn.root_path}/dbo/cm"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn.con.execute(
+        f"""COPY (SELECT i AS id, 'v' AS "Super Name" FROM range(20) r(i)) TO '{path}' """
+        "(FORMAT delta, WITH_PROPERTIES {'delta.columnMapping.mode': 'name'})")
+    conn.refresh(quiet=True)
+    conn.sql("""update cm set "Super Name" = 'w' where id < 5""")
+    assert any("update: copy-on-write" in m for m in paths)
+    fresh = duckrun.connect(str(tmp_path / "wh"))
+    assert fresh.sql("""select count(*) from cm where "Super Name" = 'w'""").fetchall() == [(5,)]
+    assert fresh.sql("select count(*) from cm").fetchall() == [(20,)]
+    dt = deltalake.DeltaTable(path)
+    lit = ", ".join("'" + f.replace("'", "''") + "'" for f in dt.file_uris())
+    names = {r[0] for r in conn.sql(f"select name from parquet_schema([{lit}])").fetchall()}
+    assert any(n.startswith("col-") for n in names) and "Super Name" not in names
+
+
+def test_partitioned_column_mapped_table_stays_on_delta_rs(tmp_path, paths):
+    import shutil
+    from pathlib import Path
+    conn = _conn(tmp_path)
+    fixture = Path(__file__).parents[1] / "connection_api" / "data" / "table_with_column_mapping"
+    shutil.copytree(fixture, Path(conn.root_path) / "dbo" / "cmp")
+    conn.refresh(quiet=True)
+    conn.sql("""update cmp set "Super Name" = 'x' where "Super Name" is not null""")
+    assert any("delta_rs path (column mapping on a partitioned table)" in m for m in paths)

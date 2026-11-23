@@ -9,8 +9,8 @@ files they replace (``RemoveAction``), in ONE transaction pinned to the version 
 Internal module, not public API. :func:`unsupported_reason` sends the table shapes this writer
 cannot commit correctly to the delta-rs path: deletion vectors and change data feed (the commit API
 has no action for their metadata), identity columns (their high-water mark lives in the schema),
-append-only tables, and — for now — column mapping, CHECK constraints, invariants and generated
-columns.
+append-only tables, column-mapped tables that are also partitioned or nested (DuckDB's own Delta
+writer refuses those too), and — for now — CHECK constraints, invariants and generated columns.
 """
 import datetime as _dt
 import json
@@ -61,6 +61,30 @@ _WRITABLE_FEATURES = {"appendOnly", "invariants", "checkConstraints", "changeDat
                       "timestampNtz", "vacuumProtocolCheck"}
 
 
+PHYSICAL_NAME_KEY = "delta.columnMapping.physicalName"
+FIELD_ID_KEY = "delta.columnMapping.id"
+
+
+def mapping_mode(configuration) -> Optional[str]:
+    """The table's ``delta.columnMapping.mode`` (lower-cased), or None when mapping is off."""
+    mode = str((configuration or {}).get("delta.columnMapping.mode") or "").strip().lower()
+    return None if mode in ("", "none") else mode
+
+
+def column_mapping(dt: DeltaTable):
+    """``{logical name: (physical name, field id)}`` for a column-mapped table (Spark/Fabric
+    ``delta.columnMapping.mode`` name / id), or None when mapping is off. Its readers resolve a
+    column by the physical name (or the parquet field id), so the files are written under those."""
+    if mapping_mode(dt.metadata().configuration) is None:
+        return None
+    out = {}
+    for f in dt.schema().fields:
+        md = f.metadata or {}
+        fid = md.get(FIELD_ID_KEY)
+        out[f.name] = (str(md.get(PHYSICAL_NAME_KEY) or f.name), int(fid) if fid is not None else None)
+    return out
+
+
 def unsupported_reason(dt: DeltaTable) -> Optional[str]:
     """Why a copy-on-write rewrite must not touch ``dt`` (None = it may): each case needs Delta
     metadata or checks this writer does not produce."""
@@ -70,8 +94,16 @@ def unsupported_reason(dt: DeltaTable) -> Optional[str]:
         return "change data feed"
     if str(conf.get("delta.appendOnly", "false")).lower() == "true":
         return "append-only table"
-    if str(conf.get("delta.columnMapping.mode", "none")).lower() != "none":
-        return "column mapping"
+    mode = mapping_mode(conf)
+    if mode is not None:
+        if mode not in ("name", "id"):
+            return f"column mapping mode {mode}"
+        if md.partition_columns:
+            return "column mapping on a partitioned table"
+        if any(getattr(f.type, "type", None) in ("struct", "array", "map") for f in dt.schema().fields):
+            return "column mapping with nested columns"
+        if any(PHYSICAL_NAME_KEY not in (f.metadata or {}) for f in dt.schema().fields):
+            return "column mapping without physical names"
     if any(k.lower().startswith("delta.constraints.") for k in conf):
         return "CHECK constraints"
     unknown = sorted(set(dt.protocol().writer_features or []) - _WRITABLE_FEATURES)
@@ -273,17 +305,30 @@ def _remove_quietly(filename: str) -> None:
 def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
                 partition_by: Optional[Sequence[str]] = None,
                 row_group_rows: Optional[int] = None, target_file_size: Optional[int] = None,
-                configuration: Optional[Dict[str, Optional[str]]] = None) -> List[AddAction]:
+                configuration: Optional[Dict[str, Optional[str]]] = None,
+                mapping: Optional[Dict[str, tuple]] = None) -> List[AddAction]:
     """Write DuckDB table ``table`` under ``loc`` with ONE ``COPY`` in the fixed read layout and
     return one ``AddAction`` per non-empty file. ``partition_by`` columns go into the hive
     directories (DuckDB's ``PARTITION_BY``), not the files, as Delta expects. Nothing is committed
     here: until :func:`commit` lands them the files are invisible to readers, and an aborted write
-    leaves only unreferenced files that vacuum collects."""
+    leaves only unreferenced files that vacuum collects. ``mapping`` (see :func:`column_mapping`)
+    writes a column-mapped table's columns under their physical names and field ids, with the stats
+    keyed by those names."""
     partition_by = list(partition_by or [])
     desc = cur.execute(f"DESCRIBE {table}").fetchall()
-    col_types = {r[0]: str(r[1]) for r in desc}
-    indexed = indexed_columns([c for c in col_types if c not in partition_by], configuration)
+    logical = {r[0]: str(r[1]) for r in desc}
+    indexed = indexed_columns([c for c in logical if c not in partition_by], configuration)
     opts = parquet_options(row_group_rows, target_file_size)
+    select = "*"
+    col_types = logical
+    if mapping:
+        select = ", ".join(f"{_q(c)} AS {_q(mapping[c][0])}" for c in logical)
+        col_types = {mapping[c][0]: t for c, t in logical.items()}
+        if indexed is not None:
+            indexed = [mapping[c][0] for c in indexed]
+        ids = [(phys, fid) for phys, fid in mapping.values() if fid is not None]
+        if ids:
+            opts["FIELD_IDS"] = "{" + ", ".join(f"{_lit(p)}: {fid}" for p, fid in ids) + "}"
     if partition_by:
         opts["PARTITION_BY"] = "(" + ", ".join(_q(p) for p in partition_by) + ")"
     opt_sql = ", ".join(f"{k} {v}" for k, v in opts.items())
@@ -292,7 +337,7 @@ def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
         os.makedirs(loc, exist_ok=True)
     order = f" ORDER BY {order_by}" if order_by else ""
     rows = cur.execute(
-        f"COPY (SELECT * FROM {table}{order}) TO {_lit(loc.rstrip('/'))} "
+        f"COPY (SELECT {select} FROM {table}{order}) TO {_lit(loc.rstrip('/'))} "
         f"(FORMAT parquet, {opt_sql}, APPEND, FILENAME_PATTERN 'part-{tag}-{{uuid}}', RETURN_STATS)"
     ).fetchall()
     now_ms = int(time.time() * 1000)

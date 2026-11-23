@@ -2626,7 +2626,8 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
         adds = cow.write_files(cur, f'"{rows}"', path, order_by=order,
                                partition_by=dt.metadata().partition_columns,
                                row_group_rows=row_group_rows, target_file_size=target_file_size,
-                               configuration=dt.metadata().configuration)
+                               configuration=dt.metadata().configuration,
+                               mapping=cow.column_mapping(dt))
         gone = [r[0] for r in cur.execute(f'SELECT filename FROM "{touched}"').fetchall()]
         removes = cow.removes_for(cur, dt, gone)
         if adds or removes:
@@ -2677,7 +2678,8 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], projection: str = "*",
         cow.check_not_null(cur, f'"{rows}"', dt, operation)
         adds = cow.write_files(cur, f'"{rows}"', path,
                                partition_by=dt.metadata().partition_columns,
-                               configuration=dt.metadata().configuration)
+                               configuration=dt.metadata().configuration,
+                               mapping=cow.column_mapping(dt))
         cow.commit(dt, path, adds + cow.removes_for(cur, dt, gone),
                    read_version=read_version, operation=operation)
         return True
