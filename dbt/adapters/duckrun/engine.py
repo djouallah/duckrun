@@ -2600,7 +2600,7 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
     src, touched, rows = tmp_name("cowsrc", path), tmp_name("cowfiles", path), tmp_name("cowrows", path)
     scan = (f"delta_scan('{path.replace(chr(39), chr(39) * 2)}', version => {int(read_version)}, "
             f"filename = true)")
-    data.create_view(src, replace=True)
+    cow.temp_view(data, src)
     try:
         try:
             by_source = any(c["clause"] == "not_matched_by_source" for c in clauses)
@@ -2834,7 +2834,7 @@ def merge_delta_clauses(
     # explicit streamed_exec=True request for delta_rs's own merge — but not for the streamed_exec
     # the by-source form sets for delta_rs's sake: the copy-on-write merge handles it (every file).
     by_source = any(c.get("clause") == "not_matched_by_source" for c in clauses)
-    if ((not streamed_exec or by_source) and cur is not None and hasattr(data, "create_view")
+    if ((not streamed_exec or by_source) and cur is not None and hasattr(data, "query")
             and cow_merge(cur, path, data, predicate, clauses, read_version=effective_version,
                           storage_options=storage_options, sort_by=sort_by,
                           row_group_rows=row_group_rows, target_file_size=target_file_size)):

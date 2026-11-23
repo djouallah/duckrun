@@ -43,6 +43,14 @@ def _lit(s: str) -> str:
     return "'" + str(s).replace("'", "''") + "'"
 
 
+def temp_view(rel, name: str) -> None:
+    """Register ``rel`` as a TEMP view ``name`` on its own connection. Not ``rel.create_view``: that
+    makes a persistent view in the default catalog, which inside dbt's transaction marks that catalog
+    written — and DuckDB lets one transaction write one attached database, so a model in another
+    catalog then fails. ``rel.query`` creates the view as TEMP; the relation it returns is unused."""
+    rel.query(name, f"SELECT * FROM {_q(name)} LIMIT 0")
+
+
 def unsupported_reason(dt: DeltaTable) -> Optional[str]:
     """Why a copy-on-write rewrite must not touch ``dt`` (None = it may): each case needs Delta
     metadata or checks this writer does not produce — partition values, physical names,
