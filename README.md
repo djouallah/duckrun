@@ -45,8 +45,8 @@ conn.sql("SHOW TABLES").show()
 conn.sql("select status, count(*) from orders group by status").show()
 conn.sql("select * from orders").df()          # native DuckDB relation → pandas (.arrow(), .pl() too)
 
-# Time travel: read an older version with delta_scan(…, version => N)
-conn.sql("select * from delta_scan('.../Tables/dbo/orders', version => 0)").show()
+# Time travel, DuckDB's syntax
+conn.sql("select * from orders at (version => 0)").show()
 ```
 
 Need to **write**? Opt in with `read_only=False` — everything is SQL:

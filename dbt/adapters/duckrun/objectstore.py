@@ -83,6 +83,53 @@ def delete(store, key: str, base_url: str = "", storage_options: Optional[Dict[s
     obstore.delete(store, key)
 
 
+def delete_tree(base_url: str, storage_options: Optional[Dict[str, str]] = None) -> None:
+    """Delete everything under ``base_url`` (a table folder), and the folder itself.
+
+    * local: ``shutil.rmtree``;
+    * OneLake (``abfss://``): ONE recursive ADLS Gen2 ``Path - Delete`` (``recursive=true``), paged by
+      ``x-ms-continuation`` — not obstore, whose Azure delete is the batch call OneLake rejects (see
+      :func:`delete`). OneLake keeps deleted files for 7 days (soft delete), restorable with Azure
+      Storage Explorer or the Blob ``Undelete`` API;
+    * s3 / gcs / plain Azure: list the prefix and delete every key with obstore (object stores have
+      no folders, so nothing is left once the keys are gone).
+
+    A folder that is already gone is not an error."""
+    if "://" not in base_url:
+        import shutil
+
+        if os.path.exists(base_url):
+            shutil.rmtree(base_url)
+        return
+    from . import remote
+
+    if remote.is_abfss(base_url):
+        from urllib.parse import quote
+
+        filesystem, host, path = remote._parse_abfss(base_url.rstrip("/"))
+        url = f"https://{host}/{filesystem}/" + quote(path.lstrip("/"), safe="/")
+        headers = {"Authorization": f"Bearer {bearer_token(storage_options)}",
+                   "x-ms-version": remote._DFS_API_VERSION}
+        continuation = None
+        while True:
+            params = {"recursive": "true"}
+            if continuation:
+                params["continuation"] = continuation
+            resp = remote.retry_request("DELETE", url, headers=headers, params=params)
+            if resp.status_code == 404:
+                return
+            resp.raise_for_status()
+            continuation = resp.headers.get("x-ms-continuation")
+            if not continuation:
+                return
+    import obstore
+
+    store = build_store(base_url, storage_options)
+    keys = list_keys(store)
+    for i in range(0, len(keys), 1000):
+        obstore.delete(store, keys[i:i + 1000])
+
+
 def list_keys(store) -> List[str]:
     """Every object key under ``store``, recursively, as ``/``-separated paths relative to its root
     (e.g. ``['a.csv', 'sub/b.parquet']``)."""

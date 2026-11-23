@@ -31,7 +31,18 @@ from ._runtime import check_runtime_versions
 _WRITE_KEYWORD_RE = re.compile(r"^(insert|update|delete|merge)\b", re.IGNORECASE)
 _CREATE_TABLE_RE = re.compile(r"^create\s+(or\s+replace\s+)?table\b", re.IGNORECASE)
 _VACUUM_WRITE_RE = re.compile(r"^vacuum\s+(?:analyze\s+)?[\"\w]", re.IGNORECASE)
-_RESTORE_RE = re.compile(r"^restore\s+table\b", re.IGNORECASE)   # RESTORE writes a new commit
+# Time travel, DuckDB's syntax: `<table> AT (VERSION => …)` / `AT (TIMESTAMP => …)`. Matched on the
+# string-blanked query; the table name is the dotted identifier right before AT.
+_AT_CLAUSE = re.compile(r"\bAT\s*(?P<paren>\()\s*(?P<kind>VERSION|TIMESTAMP)\s*=>", re.IGNORECASE)
+_REL_BEFORE = re.compile(
+    r'(?P<rel>(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)(?:\s*\.\s*(?:"(?:[^"]|"")+"|[A-Za-z_][\w$]*)){0,3})'
+    r"\s+$")
+# An alias after `AT (…)`: AS, a quoted name, or a bare word that is not the next clause's keyword.
+_ALIAS_FOLLOWS = re.compile(
+    r"\s*(?:as\b|\"|(?!(?:where|join|inner|left|right|full|cross|natural|positional|asof|anti|semi|"
+    r"on|using|group|order|limit|offset|union|except|intersect|having|window|qualify|pivot|"
+    r"unpivot|tablesample|using|returning|lateral)\b)[A-Za-z_])", re.IGNORECASE)
+_DELTA_SCAN_PATH = re.compile(r"delta_scan\(\s*'((?:[^']|'')*)'", re.IGNORECASE)
 # `describe detail <t>` / `describe history <t>` — Delta introspection (plain `describe <t>` is DuckDB's).
 _DESCRIBE_EXT_RE = re.compile(r"^describe\s+(?P<kind>detail|history)\s+(?P<rel>.+?)\s*;?\s*$", re.IGNORECASE)
 # A bare `SELECT * FROM <table>` — nothing else (no WHERE/JOIN/LIMIT/projection). Its output is that
@@ -157,12 +168,6 @@ def _is_vacuum(query: str) -> bool:
     and vacuum a Delta table, which WRITES (compacted files + tombstone GC) and so must be caught by
     the read-only gate. A bare ``VACUUM`` / ``VACUUM ANALYZE`` (no operand) is a DuckDB no-op, not gated."""
     return bool(_VACUUM_WRITE_RE.match(_strip_leading(query)))
-
-
-def _is_restore(query: str) -> bool:
-    """True if ``query`` is ``RESTORE TABLE …`` — it commits a new (restored) version, so the read-only
-    gate must catch it."""
-    return bool(_RESTORE_RE.match(_strip_leading(query)))
 
 
 def _delta_write_message(query: str) -> str:
@@ -975,8 +980,10 @@ class DuckSession:
         ``create table … as select`` (overwrite), ``insert into … select``/``insert into … values``
         (append), ``insert with schema evolution into …`` (append that widens the table with the
         source's new columns), ``delete``/``update`` (delta_rs delete/update), ``alter table … add /
-        drop / rename column``, ``drop table`` (tombstone — marks the table dropped without deleting
-        data; a human purges the files), and ``merge into … using … on … when …`` (delta_rs upsert).
+        drop / rename column``, ``alter table … set tblproperties (…)``, ``drop table`` (deletes the
+        table's folder), ``truncate [table]`` (every row deleted, the table kept), and ``merge into …
+        using … on … when …`` (delta_rs upsert). Time travel is DuckDB's syntax:
+        ``t AT (VERSION => n)`` / ``t AT (TIMESTAMP => ts)``.
         After a DML statement the catalog is refreshed.
 
         ``vacuum <table>`` repurposes DuckDB's VACUUM verb for Delta maintenance: it compacts the
@@ -1030,6 +1037,10 @@ class DuckSession:
             result = self.con.sql(query)
             self._in_explicit_txn = mtxn.group(1).lower() in ("begin", "start")
             return result
+        # Time travel in DuckDB's own syntax (`t AT (VERSION => 3)`, `t AT (TIMESTAMP => …)`): a
+        # duckrun table is a view, which DuckDB cannot time-travel, so each such reference becomes
+        # the pinned delta_scan of that table — in a SELECT, a join, or the body of a write.
+        query = self._resolve_time_travel(query)
         # Raw DML routes through delta_rs against ONE root. A 3-part target names which catalog that
         # is (``_dml_target_catalog`` → its name); an unqualified/2-part target is the current catalog.
         # Reads (SELECT) are unaffected — DuckDB resolves every attached catalog natively.
@@ -1059,7 +1070,11 @@ class DuckSession:
         cat_entry = self._catalogs.get(write_cat)
         if cat_entry is not None and cat_entry.kind == "iceberg":
             return self.con.sql(query)
-        is_write = _is_delta_write(query) or _is_vacuum(query) or _is_restore(query)
+        # A write is whatever the router itself routes as one (classify): CREATE TABLE, INSERT /
+        # UPDATE / DELETE / MERGE (a leading WITH included), ALTER / DROP / TRUNCATE TABLE, VACUUM,
+        # OPTIMIZE, RESTORE — except a statement aimed at a DuckDB TEMP table, which stays native.
+        is_write = (delta_dml.classify(query) == "delta"
+                    and not delta_dml.targets_temp_table(self.con, query))
         # A Delta write auto-commits via delta_rs, so it can't participate in an open explicit
         # transaction — reject it loud rather than let a later ROLLBACK silently fail to undo it.
         if is_write and self._in_explicit_txn:
@@ -1116,6 +1131,56 @@ class DuckSession:
         if _is_delta_write(query) and not delta_dml.targets_temp_table(self.con, query):
             raise ValueError(_delta_write_message(query))
         return self.con.sql(query)
+
+    def _resolve_time_travel(self, query: str) -> str:
+        """Rewrite every ``<table> AT (VERSION => <n>)`` / ``<table> AT (TIMESTAMP => <ts>)``
+        (DuckDB's time-travel syntax) over a duckrun table into ``delta_scan('<location>', version
+        => <n>) AS <table>``. A timestamp resolves to the latest version committed at or before it
+        (delta_rs ``load_as_version``). ``<n>`` / ``<ts>`` are any constant expressions DuckDB
+        evaluates. A reference that is not a duckrun table is left for DuckDB to answer."""
+        blank = delta_dml._blank_string_literals(query)
+        hits = list(_AT_CLAUSE.finditer(blank))
+        for m in reversed(hits):                      # right to left: earlier offsets stay valid
+            close = delta_dml._matching_paren(query, m.start("paren"))
+            mr = _REL_BEFORE.search(blank, 0, m.start())
+            if close < 0 or mr is None:
+                continue
+            located = self._view_location(query[mr.start("rel"):mr.end("rel")])
+            if located is None:
+                continue
+            location, storage_options, table = located
+            expr = query[m.end():close].strip()
+            if m.group("kind").lower() == "version":
+                version = int(self.con.sql(f"SELECT CAST(({expr}) AS BIGINT)").fetchall()[0][0])
+            else:
+                at = self.con.sql(f"SELECT CAST(({expr}) AS TIMESTAMPTZ)").fetchall()[0][0]
+                dt = engine._delta_table(location, storage_options)
+                dt.load_as_version(at)
+                version = dt.version()
+            alias = "" if _ALIAS_FOLLOWS.match(blank, close + 1) else f" AS {_qid(table)}"
+            scan = (f"delta_scan('{location.replace(chr(39), chr(39) * 2)}', version => {version})"
+                    f"{alias}")
+            query = query[:mr.start("rel")] + scan + query[close + 1:]
+        return query
+
+    def _view_location(self, rel: str):
+        """``(location, storage_options, table)`` of the duckrun table ``rel`` names (1–4 parts),
+        read from the delta_scan view registered for it; None when ``rel`` is not one."""
+        try:
+            cat, schema, table = self._resolve_parts(delta_dml._split_dotted(rel))
+        except ValueError:
+            return None
+        entry = self._catalogs.get(cat)
+        if entry is None or entry.kind == "iceberg":
+            return None
+        rows = self.con.execute(
+            "SELECT sql FROM duckdb_views() WHERE lower(database_name) = lower(?) "
+            "AND lower(schema_name) = lower(?) AND lower(view_name) = lower(?)",
+            [cat, schema, table]).fetchall()
+        mv = _DELTA_SCAN_PATH.search(rows[0][0] or "") if rows else None
+        if mv is None:
+            return None
+        return mv.group(1).replace("''", "'"), entry.storage_options, table
 
     def _resolve_auto_sort(self, query: str):
         """Resolve ``CREATE TABLE … SORTED BY AUTO AS <query>`` (a duckrun extension) into an explicit

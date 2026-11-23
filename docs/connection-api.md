@@ -2,7 +2,7 @@
 
 `duckrun.connect()` is a storage-neutral, SQL-first session over Delta tables (local, S3, GCS, ADLS, OneLake):
 
-- `conn.sql(...)` — DuckDB SQL over the discovered Delta tables, returning DuckDB's native relation (`.show()`, `.df()`, `.arrow()`, `.pl()`, `.fetchall()`, `.filter()`, …). Reads pass straight through, including time travel (`delta_scan('…', version => N)`). Raw DML (`create table … as`, `insert`, `update`, `delete`, `alter`, `drop`, `merge`) is applied to the Delta table via delta-rs — see the [DML matrix](#raw-sql-dml-through-connsql).
+- `conn.sql(...)` — DuckDB SQL over the discovered Delta tables, returning DuckDB's native relation (`.show()`, `.df()`, `.arrow()`, `.pl()`, `.fetchall()`, `.filter()`, …). Reads pass straight through, including time travel in DuckDB's syntax (`t AT (VERSION => N)`). Raw DML (`create table … as`, `insert`, `update`, `delete`, `merge`, `alter`, `drop`, `truncate`) is applied to the Delta table via delta-rs — see the [DML matrix](#raw-sql-dml-through-connsql).
 - **Multiple catalogs**: `connect()` binds one lakehouse root; `conn.attach(path, name=…)` binds more, addressed as `catalog.schema.table` ([below](#multiple-catalogs-with-connattach)).
 - **Files**: `conn.copy()`, `conn.download()`, `conn.list_files()` for loose files on any store ([below](#files-conncopy-conndownload-connlist_files)).
 - **Inspection**: `conn.get_stats(source=None, detailed=False)` — one row per table (`total_rows`, `num_files`, `num_row_groups`, `avg_row_group`, `size_mb`, `vorder`, `compression`), or one row per parquet row group with `detailed=True`; `source` is a table, a schema, or a wildcard like `mart.fct_*`.
@@ -38,19 +38,22 @@ Only two shapes are shorthand: an item with a `.Lakehouse` / `.Warehouse` suffix
 
 ## It's just DuckDB SQL
 
-Everything through `conn.sql()` is standard DuckDB SQL, parsed and executed by DuckDB — reads, CTEs, `SHOW` / `DESCRIBE`, `CREATE TEMP` / `CREATE VIEW`. Write DML (`CREATE TABLE … AS`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `ALTER TABLE … ADD/DROP/RENAME COLUMN`, `DROP TABLE`) keeps DuckDB's syntax but is routed to delta-rs. The only non-DuckDB spellings are these Delta extensions; a read-only session refuses the ones that write:
+Everything through `conn.sql()` is standard DuckDB SQL, parsed and executed by DuckDB — reads, CTEs, `SHOW` / `DESCRIBE`, `CREATE TEMP` / `CREATE VIEW`. Write DML (`CREATE TABLE … AS`, `INSERT`, `UPDATE`, `DELETE`, `MERGE`, `ALTER TABLE … ADD/DROP/RENAME COLUMN`, `DROP TABLE`, `TRUNCATE`) keeps DuckDB's syntax but is routed to delta-rs. The only non-DuckDB spellings are these Delta extensions; a read-only session refuses the ones that write:
 
 | Extension | What it does |
 |---|---|
 | `CREATE TABLE … SORTED BY AUTO AS …` | duckrun profiles the data and picks the sort key. `SORTED BY (cols)` and `PARTITIONED BY (cols)` without `AUTO` are DuckDB's own CTAS syntax. See [Automatic sorting](parquet-layout.md#automatic-sorting). |
-| `VACUUM <table>` | DuckDB's verb, repurposed to compact small files and vacuum tombstoned files past retention (also runs automatically after writes). Bare `VACUUM` stays DuckDB's no-op. |
+| `VACUUM <table> [RETAIN <n> HOURS]` | DuckDB's verb, repurposed to compact small files and then delete the files the log no longer references once they are past retention: the table's own (7 days by default), or `<n>` hours. Below 7 days, time travel to the versions it removes stops working. Compaction also runs automatically after writes. Bare `VACUUM` stays DuckDB's no-op. |
+| `OPTIMIZE <table> [ZORDER BY (cols)]` | delta-rs compaction, or a z-order rewrite on `cols`. Z-order interleaves the columns, which breaks the runs a sort key gives Direct Lake; for a table Power BI reads, prefer `CREATE OR REPLACE TABLE t SORTED BY (…) AS SELECT * FROM t`. |
+| `ALTER TABLE <t> SET TBLPROPERTIES ('k' = 'v', …)` | sets Delta table properties (delta-rs `set_table_properties`), one metadata commit. |
+| `CREATE TABLE <t> (<cols>) [PARTITIONED BY (cols)] [WITH ('k' = 'v', …)]` | an empty table, partitioned and with table properties (`TBLPROPERTIES (…)` is accepted too). A `<col> <type> GENERATED ALWAYS AS (<expr>)` column is recorded as a Delta generated column and computed on `INSERT`. |
 | `INSERT INTO <t> REPLACE WHERE <pred> SELECT …` | delta-rs `replaceWhere`: atomically overwrite only the rows matching `<pred>`, in one fenced commit. `<pred>` is a CAST-free expression over the target's columns. |
 | `INSERT WITH SCHEMA EVOLUTION INTO <t> SELECT …` | append that widens the table with the source's new columns (existing rows → `NULL`) — delta-rs `schema_mode='merge'`. |
 | `DESCRIBE DETAIL <table>` | one row: `format`, `id`, `name`, `location`, `partitionColumns`, `numFiles`, `sizeInBytes`, `version`, from the Delta log. Plain `DESCRIBE <table>` stays DuckDB's column view. |
 | `DESCRIBE HISTORY <table>` | one row per commit (`version`, `timestamp`, `operation`, `operationMetrics`), newest first. |
 | `RESTORE TABLE <t> TO VERSION AS OF <n>` / `TO TIMESTAMP AS OF '…'` | delta-rs `restore` — a new commit on top of history, itself revertible. |
 
-Time travel is DuckDB's own `delta_scan('<location>', version => N)`; get `<location>` from `DESCRIBE DETAIL` and the versions from `DESCRIBE HISTORY`.
+Time travel is DuckDB's own syntax: `SELECT … FROM t AT (VERSION => 3)` or `t AT (TIMESTAMP => TIMESTAMPTZ '2026-01-02 10:00:00+00')`, in a query, a join or the body of a write; a timestamp reads the latest version committed at or before it. The versions are in `DESCRIBE HISTORY`. `delta_scan('<location>', version => N)` works too.
 
 ## In-memory data — `conn.register`
 
@@ -118,7 +121,8 @@ express are rejected up front, rather than failing cryptically.
 | `UPDATE x SET … [WHERE …]` | delta_rs update |
 | `DELETE FROM x [WHERE …]` | delta_rs delete |
 | `ALTER TABLE x ADD COLUMN …` | Delta overwrite, widening the schema |
-| `DROP TABLE x` | **tombstone** — marks the table dropped (a one-column marker) without deleting data; files persist for a human to purge, a later `create … as` revives it |
+| `DROP TABLE x` | deletes the table's folder. On OneLake the files stay soft-deleted for 7 days and can be restored with Azure Storage Explorer or the Blob `Undelete` API; on a local disk, or S3/GCS without versioning, they are gone |
+| `TRUNCATE [TABLE] x` | deletes every row in one commit that removes every data file and writes none; the schema, properties and history stay |
 | `MERGE INTO x [a] USING s [b] ON a.k = b.k WHEN …` | delta_rs upsert (snapshot-pinned like every write). Write it like standard SQL — the `ON`/`WHEN` clauses may use **your own aliases or the table/relation names** (the literal `target`/`source` also work); fully-unqualified columns (`ON k = k`) are ambiguous and unsupported. Supports `UPDATE SET *` / `UPDATE SET col = <src>.col`, `INSERT *`, `WHEN NOT MATCHED BY SOURCE THEN DELETE`, and per-clause `AND` predicates |
 | `CREATE TEMP/TEMPORARY TABLE …`, `CREATE VIEW …` | **native DuckDB** — ephemeral, session-local; not a Delta artifact |
 | `UPDATE … FROM`, `DELETE … USING` | rejected → rewrite as a correlated subquery |

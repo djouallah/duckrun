@@ -60,7 +60,7 @@ The full matrix is in the [Connection API](connection-api.md#raw-sql-dml-through
 
 - **No persistent views.** The Delta spec defines no view, so a `materialized='view'` model is a DuckDB catalog view that lives only in the session that built it.
 - **`materialized='external'`** needs `on-run-start: "{{ register_upstream_external_models() }}"` for a later run that reads it without rebuilding it — see the [dbt adapter](dbt-adapter.md#external).
-- **`DROP TABLE` is a soft tombstone.** `conn.sql("drop table x")` unregisters the table and writes a marker but does not delete the data files; purge them yourself when sure.
+- **`DROP TABLE` deletes the files.** `conn.sql("drop table x")` deletes the table's folder. OneLake keeps them 7 days as soft-deleted files (restore with Azure Storage Explorer or the Blob `Undelete` API); a local disk, or S3/GCS without bucket versioning, has no undo. To roll a table back instead, use `RESTORE TABLE … TO VERSION AS OF n`.
 
 ## Parquet layout
 

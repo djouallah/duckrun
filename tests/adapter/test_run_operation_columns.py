@@ -132,13 +132,12 @@ def test_run_operation_columns_for_a_custom_schema_model(project):
 
 
 def test_dropped_table_still_reports_no_columns(project):
-    """The tombstone contract survives the new path. duckrun's `drop table` overwrites the table
-    to a one-column marker; binding that would report a `__duckrun_deleted__` column as if the
-    model still existed."""
+    """A dropped table reports no columns on the new path: `drop table` deletes its folder, so
+    there is nothing left to bind."""
     proj, root = project
     assert _dbt(proj, "run")[0].success
     duckrun.connect(root, schema="main", read_only=False).sql("drop table events")
-    assert (Path(root) / "main" / "events" / "_delta_log").is_dir()  # tombstoned, not deleted
+    assert not (Path(root) / "main" / "events" / "_delta_log").exists()  # deleted
 
     cols, _ = _show_cols(proj, "events")
     assert cols == []
@@ -289,8 +288,7 @@ def test_run_operation_raw_sql_missing_table_still_errors(project):
 
 
 def test_run_operation_raw_sql_dropped_table_still_errors(project):
-    """The drop-tombstone contract holds on this path too: a dropped model must not come back as
-    a queryable one-column `__duckrun_deleted__` view."""
+    """A dropped model must not come back as a queryable view on this path either."""
     proj, root = project
     assert _dbt(proj, "run")[0].success
     duckrun.connect(root, schema="main", read_only=False).sql("drop table events")

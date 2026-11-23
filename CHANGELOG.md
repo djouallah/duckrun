@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`DROP TABLE` deletes the table's folder.** It used to write a one-column tombstone and keep
+  the files. On OneLake the files stay soft-deleted for 7 days (restorable); elsewhere the drop
+  has no undo. Tables an older duckrun tombstoned are still hidden.
+- **A read-only session refuses every write.** `DROP TABLE`, `ALTER TABLE` and `WITH … INSERT`
+  used to get past the read-only gate.
+
+### Added
+- `TRUNCATE [TABLE] t`; time travel in DuckDB's syntax (`t AT (VERSION => n)`,
+  `t AT (TIMESTAMP => ts)`); `ALTER TABLE t SET TBLPROPERTIES (…)`; `OPTIMIZE t [ZORDER BY
+  (cols)]`; `VACUUM t RETAIN n HOURS`; `CREATE TABLE t (cols) [PARTITIONED BY (…)] [WITH (…)]`
+  with `GENERATED ALWAYS AS` columns computed on insert.
+
 ### Fixed
 - **0.5.6: back to the 0.5.0 code with `deltalake==1.5.0`; 0.5.1-0.5.5 are yanked** (#84). Every
   deltalake from 1.6.3 on lists each column chunk's dictionary page last in the parquet footer's

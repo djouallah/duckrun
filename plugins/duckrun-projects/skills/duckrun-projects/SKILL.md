@@ -581,7 +581,8 @@ conn.sql("SELECT * FROM orders_copy").show()
 - `MERGE`/`UPDATE`/`DELETE` are snapshot-pinned — a concurrent writer fails the commit
   loudly (`CommitFailedError`). A self-reading `INSERT INTO a SELECT … FROM a` is
   auto-fenced the same way; a plain append of new data is unfenced by design.
-  `DROP TABLE` is a **tombstone** — a marker commit, no data files deleted.
+  `DROP TABLE` **deletes the table's folder** (OneLake keeps it 7 days, soft-deleted);
+  `TRUNCATE t` empties a table and keeps it.
 - Multiple catalogs: `conn.attach(path, name=…, read_only=…)` binds more lakehouses
   (or a read-only Fabric Warehouse); read, join, and write across them by three-part
   `catalog.schema.table` names, or the 4-part `workspace.lakehouse.schema.table` a lakehouse
@@ -593,10 +594,12 @@ conn.sql("SELECT * FROM orders_copy").show()
   `conn.convert_to_delta` (one-off zero-copy parquet→Delta ingest — never in a
   repeatable pipeline).
 - Delta extras with SQL spellings: `SORTED BY AUTO` / `SORTED BY (cols)` /
-  `PARTITIONED BY (cols)` on CTAS, `VACUUM <t>` (manual compact+vacuum),
+  `PARTITIONED BY (cols)` on CTAS and on `CREATE TABLE (cols)` (with `WITH ('k' = 'v')`
+  table properties and `GENERATED ALWAYS AS` columns), `VACUUM <t> [RETAIN n HOURS]`,
+  `OPTIMIZE <t> [ZORDER BY (cols)]`, `ALTER TABLE t SET TBLPROPERTIES (…)`,
   `INSERT INTO t REPLACE WHERE <pred> SELECT …`, `INSERT WITH SCHEMA EVOLUTION`,
   `DESCRIBE DETAIL` / `DESCRIBE HISTORY`, `RESTORE TABLE t TO VERSION AS OF n`, and
-  time travel via `delta_scan('<location>', version => N)`.
+  time travel in DuckDB's syntax: `t AT (VERSION => n)` / `t AT (TIMESTAMP => ts)`.
 
 There is no `INSERT OVERWRITE`, no `CALL` maintenance verbs, and no DataFrame writer —
 SQL is the whole surface. Full DML matrix and walkthroughs:

@@ -5,7 +5,7 @@ INSERT / UPDATE / DELETE / MERGE, routed to delta_rs). The suite has three parts
 
 1. **Session plumbing** (``TestSession``) — connect / sql / register / attach / copy / download /
    list_files / get_stats / convert_to_delta / close, plus ``TestSqlDml`` (the raw-DML matrix:
-   create-as / insert / update / delete / alter-add / drop-tombstone / merge with every clause and
+   create-as / insert / update / delete / alter-add / drop / merge with every clause and
    the adversarial parsing cases).
 
 2. **Local-filesystem contract & plumbing** (``test_*`` on the ``wh`` fixture) — discovery, catalog
@@ -36,7 +36,6 @@ import duckrun.iceberg as iceberg_mod
 import duckrun.session as session_mod
 from duckrun.delta_table import _parse_parquet_identifier
 from dbt.adapters.duckrun import engine
-from dbt.adapters.duckrun.delta_dml import TOMBSTONE_COLUMN
 
 
 def _delta_scan_version_supported() -> bool:
@@ -339,7 +338,7 @@ class TestSession:
 class TestSqlDml:
     """conn.sql(): reads (incl. version-pinned delta_scan) pass through, and Delta DML is applied
     via delta_rs — create-as / insert-select / insert-values / update / delete / alter-add, drop
-    (a tombstone: no data deleted), and merge (upsert; same boundary as the DeltaTable.merge
+    (deletes the table), and merge (upsert; same boundary as the DeltaTable.merge
     builder, ON/WHEN may use your own aliases or the table/relation names)."""
 
     def test_select_passthrough(self, conn):
@@ -414,8 +413,8 @@ class TestSqlDml:
         assert str(qty_type).upper().startswith("INT")
         assert conn.sql("select count(*) from src where qty is not null").fetchall()[0][0] == 0
 
-    def test_sql_drop_tombstone(self, conn):
-        # drop is a tombstone (no data deleted); the table leaves the catalog.
+    def test_sql_drop(self, conn):
+        # drop deletes the table; it leaves the catalog.
         conn.sql("drop table src")
         assert "src" not in conn._cat_tables()
 
@@ -1174,9 +1173,9 @@ def test_create_coldefs_empty_and_logs_create_table(tmp_path):
     assert list(dt.history(1000))[-1]["operation"] == "CREATE TABLE"   # history newest-first; oldest = create
 
 
-def test_drop_tombstones_without_deleting_data(tmp_path):
-    # `drop table` marks the table dropped (one-column tombstone via delta_rs) WITHOUT deleting data:
-    # gone from the catalog, files stay, and a later create-as revives it with the real schema.
+def test_drop_deletes_the_table(tmp_path):
+    # `drop table` deletes the table's folder: gone from the catalog and from storage, and a later
+    # create-as makes a new table under the name.
     wh = str(tmp_path / "wh")
     c = _seed(wh)
     path = c._table_path("dbo", "items")
@@ -1184,9 +1183,8 @@ def test_drop_tombstones_without_deleting_data(tmp_path):
     assert "items" not in c._cat_tables()
     with pytest.raises(Exception):
         c.sql("select * from items").fetchall()
-    assert deltalake.DeltaTable.is_deltatable(path)                               # NOT deleted
-    assert [f.name for f in deltalake.DeltaTable(path).schema().fields] == [TOMBSTONE_COLUMN]
-    assert "items" not in duckrun.connect(wh, schema="dbo")._cat_tables()  # fresh conn hides it
+    assert not deltalake.DeltaTable.is_deltatable(path)                           # deleted
+    assert "items" not in duckrun.connect(wh, schema="dbo")._cat_tables()  # fresh conn agrees
     c.sql("create table items as select * from (values (10,'x')) t(id, name)")
     assert _dump(wh, "items") == (["id", "name"], [(10, "x")])
 

@@ -1506,6 +1506,9 @@ def create_empty_delta(
     *,
     mode: str = "error",
     storage_options: Optional[Dict[str, str]] = None,
+    partition_by: Optional[List[str]] = None,
+    configuration: Optional[Dict[str, str]] = None,
+    generated: Optional[Dict[str, str]] = None,
 ) -> None:
     """Create an EMPTY Delta table at ``path`` from an Arrow ``schema`` (no data files).
 
@@ -1513,9 +1516,36 @@ def create_empty_delta(
     operation rather than a ``WRITE``/``Overwrite``, which is what a create — not an overwrite —
     should record. ``mode`` follows delta-rs: ``error`` (fail if the table exists), ``overwrite``
     (replace an existing table or drop-tombstone), or ``ignore`` (no-op if it exists).
+    ``configuration`` adds table properties (``delta.checkpointInterval`` is duckrun's unless given);
+    ``generated`` (``{column: expression}``) records generated columns as Delta does, in the field's
+    ``delta.generationExpression`` metadata.
     """
+    if generated:
+        import pyarrow as pa
+        by_lower = {k.lower(): v for k, v in generated.items()}
+        schema = pa.schema(
+            [f.with_metadata({**(f.metadata or {}),
+                              b"delta.generationExpression": by_lower[f.name.lower()].encode()})
+             if f.name.lower() in by_lower else f for f in schema],
+            metadata=schema.metadata)
+    conf = {"delta.checkpointInterval": str(CHECKPOINT_INTERVAL), **(configuration or {})}
     DeltaTable.create(path, schema, mode=mode, storage_options=storage_options,
-                      configuration={"delta.checkpointInterval": str(CHECKPOINT_INTERVAL)})
+                      partition_by=partition_by or None, configuration=conf)
+
+
+def set_table_properties(path: str, properties: Dict[str, str], *,
+                         storage_options: Optional[Dict[str, str]] = None) -> None:
+    """Set table properties (delta_rs ``alter.set_table_properties``): one metadata commit."""
+    _delta_table(path, storage_options).alter.set_table_properties(properties)
+
+
+def z_order(path: str, columns: List[str], *, target_size: Optional[int] = None,
+            storage_options: Optional[Dict[str, str]] = None) -> Dict:
+    """Rewrite the table z-ordered on ``columns`` (delta_rs ``optimize.z_order``, dataChange=false),
+    in the same writer layout as compaction."""
+    dt = _delta_table(path, storage_options)
+    return dt.optimize.z_order(columns, target_size=target_size,
+                               writer_properties=_writer_properties())
 
 
 def append_if_unchanged(
@@ -2752,6 +2782,12 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], replaces: Optional[str]
         if not gone:
             return True        # nothing matched: no rewrite, no commit (as delta-rs skips empty DML)
         # The touched files' rows, with their position (see cow.write_files: the rewrite keeps it).
+        if delete and not where:
+            # Every row goes (TRUNCATE, an unfiltered DELETE): remove every file, write none.
+            logger.info(f"{operation.lower()}: copy-on-write (every file removed, none written)")
+            cow.commit(dt, path, cow.removes_for(cur, dt, gone),
+                       read_version=read_version, operation=operation)
+            return True
         files = f'{fcol} IN (SELECT f FROM "{touched}")'
         pos = cow.with_position(f"{quote_ident(alias)}." if alias else "")
         if delete:

@@ -47,7 +47,16 @@ Supported / unsupported (what reaches delta_rs):
     delete from x [where …]                                  delta_rs delete
     update x set … [where …]                                 delta_rs update
     alter table x add column …                               Delta overwrite (widen schema)
-    drop table x                                             tombstone (no data deleted)
+    drop table x                                             deletes the table folder (OneLake keeps
+                                                             it 7 days as soft-deleted files)
+    truncate [table] x                                       delete every row (no file written)
+    alter table x set tblproperties ('k' = 'v', …)           delta_rs set_table_properties
+    optimize x [zorder by (cols)]                            delta_rs compact / z-order
+    vacuum x [retain <n> hours]                              compact, then vacuum (RETAIN overrides
+                                                             the 7-day retention)
+    create table x (<col defs>) [partitioned by (cols)]      empty table; a GENERATED ALWAYS AS
+        [with|tblproperties ('k' = 'v', …)]                  column is recorded as a Delta generated
+                                                             column, computed on INSERT
     merge into x [a] using s [b] on a.k = b.k when …         delta_rs MERGE (engine.merge_delta_clauses)
                                                              — the FULL delta-rs TableMerger surface:
                                                              WHEN MATCHED [AND p] THEN UPDATE SET * /
@@ -73,7 +82,7 @@ import duckdb
 
 from dbt.adapters.duckrun._log import logger
 
-from . import engine
+from . import cow, engine, objectstore
 
 # `drop table` tombstone: a dropped relation is overwritten (via delta_rs) to a table whose ONLY
 # column is this marker, so (a) discovery recognizes it as dropped and hides it, and (b) anyone who
@@ -151,13 +160,6 @@ _CREATE_AS = re.compile(
     r"(?P<rel>.+?)\s+as\s+(?P<body>.+)",
     re.I | re.S,
 )
-# `create [or replace] table [if not exists] <rel> (<col defs>)` — no `as`. Connection-API only
-# (see _create_coldefs): materializes an EMPTY Delta table so `CREATE TABLE` is always Delta-backed.
-_CREATE_COLDEFS = re.compile(
-    r"\s*create\s+(?P<orrep>or\s+replace\s+)?table\s+(?P<ine>if\s+not\s+exists\s+)?"
-    r"(?P<rel>.+?)\s*\((?P<defs>.+)\)\s*;?\s*",
-    re.I | re.S,
-)
 # Optional table-layout clauses on CREATE TABLE … AS, between the name and AS: DuckDB's own
 # `SORTED BY (cols)` / `PARTITIONED BY (cols)` syntax (its parser accepts both), plus `SORTED BY AUTO`
 # (a duckrun extension — the session profiles and substitutes explicit columns before this router runs,
@@ -180,6 +182,115 @@ def _split_create_layout(rel: str):
         partition = [c.strip().strip('"') for c in mp.group(1).split(",") if c.strip()]
         rel = rel[:mp.start()] + rel[mp.end():]
     return rel.strip(), sort, partition
+
+
+_CREATE_HEAD = re.compile(
+    r"\s*create\s+(?P<orrep>or\s+replace\s+)?table\s+(?P<ine>if\s+not\s+exists\s+)?", re.I)
+# What may follow a CREATE TABLE's column list: PARTITIONED BY (cols), and the table properties as
+# WITH (…) (DuckDB's table-options spelling) or TBLPROPERTIES (…) (Spark's).
+_COLDEFS_TAIL = re.compile(
+    r"\s*(?:partitioned\s+by\s*\((?P<part>[^()]*)\)"
+    r"|(?:with|tblproperties)\s*\((?P<props>(?:[^()']|'(?:[^']|'')*')*)\))", re.I)
+_GENERATED_AS = re.compile(r"\bgenerated\s+always\s+as\s*\(", re.I)
+
+
+def _matching_paren(s: str, i: int) -> int:
+    """Index of the ``)`` closing the ``(`` at ``s[i]``, skipping quoted spans; -1 if unbalanced."""
+    depth, quote, j, n = 0, None, i, len(s)
+    while j < n:
+        ch = s[j]
+        if quote:
+            if ch == quote:
+                if j + 1 < n and s[j + 1] == quote:
+                    j += 2
+                    continue
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return j
+        j += 1
+    return -1
+
+
+def _first_paren(s: str) -> int:
+    """Index of the first ``(`` outside a quoted span, or -1."""
+    quote = None
+    for j, ch in enumerate(s):
+        if quote:
+            if ch == quote:
+                quote = None
+        elif ch in ("'", '"'):
+            quote = ch
+        elif ch == "(":
+            return j
+    return -1
+
+
+def _parse_properties(text: str) -> dict:
+    """``'k' = 'v', …`` → ``{k: v}``; anything else in the list is an error."""
+    out = {}
+    for item in _split_top_level_commas(text):
+        if not item.strip():
+            continue
+        mp = _PROP_PAIR.fullmatch(item)
+        if not mp:
+            raise ValueError(f"table property {item.strip()!r}: write it as 'key' = 'value'")
+        out[mp.group(1).replace("''", "'")] = mp.group(2).replace("''", "'")
+    return out
+
+
+def _coldefs_parts(sql: str):
+    """Split ``CREATE [OR REPLACE] TABLE [IF NOT EXISTS] <rel> (<col defs>) [PARTITIONED BY (…)]
+    [WITH|TBLPROPERTIES (…)]`` into a dict (``orrep``, ``ine``, ``rel``, ``defs``, ``partition``,
+    ``props``), or None when ``sql`` is not that form (a CTAS, a layout clause before AS, …). The
+    column list is found by paren matching, so a ``GENERATED ALWAYS AS (…)`` inside it stays there."""
+    s = sql.strip()
+    s = s[:-1].rstrip() if s.endswith(";") else s
+    head = _CREATE_HEAD.match(s)
+    if not head:
+        return None
+    rest = s[head.end():]
+    i = _first_paren(rest)
+    if i <= 0 or not _is_clean_relation(rest[:i]):
+        return None
+    j = _matching_paren(rest, i)
+    if j < 0:
+        return None
+    partition, props, pos, tail = None, {}, 0, rest[j + 1:]
+    while tail[pos:].strip():
+        mt = _COLDEFS_TAIL.match(tail, pos)
+        if not mt:
+            return None
+        if mt.group("part") is not None:
+            partition = [c.strip().strip('"') for c in mt.group("part").split(",") if c.strip()]
+        else:
+            props.update(_parse_properties(mt.group("props")))
+        pos = mt.end()
+    return {"orrep": head.group("orrep"), "ine": head.group("ine"), "rel": rest[:i].strip(),
+            "defs": rest[i + 1:j], "partition": partition, "props": props}
+
+
+def _generated_columns(defs: str) -> dict:
+    """``{column: expression}`` for each ``<col> <type> GENERATED ALWAYS AS (<expr>)`` in a column
+    list (the expression verbatim, as Delta records it)."""
+    out = {}
+    for item in _split_top_level_commas(defs):
+        blank = _blank_string_literals(item)
+        mg = _GENERATED_AS.search(blank)
+        if not mg:
+            continue
+        name = item.strip().split(None, 1)[0]
+        name = name[1:-1].replace('""', '"') if name.startswith('"') else name
+        close = _matching_paren(item, mg.end() - 1)
+        if close < 0:
+            raise ValueError(f"unbalanced GENERATED ALWAYS AS (…) in {item.strip()!r}")
+        out[name] = item[mg.end():close].strip()
+    return out
 
 
 _INSERT_INTO_RE = re.compile(r"\s*insert\s+into\b", re.I)
@@ -287,8 +398,26 @@ _DROP = re.compile(
 # there), and the `vacuum <table>(col)` stats form doesn't match (trailing paren) so it stays native.
 _VACUUM = re.compile(
     r"\s*vacuum\s+(?:analyze\s+)?"
+    r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)"
+    r"(?:\s+retain\s+(?P<hours>\d+(?:\.\d+)?)\s+hours?)?\s*;?\s*", re.I | re.S
+)
+# `truncate [table] <t>` — every row deleted; the table, its schema and its history stay.
+_TRUNCATE = re.compile(
+    r"\s*truncate\s+(?:table\s+)?"
     r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)\s*;?\s*", re.I | re.S
 )
+# `optimize <t> [zorder by (cols)]` — the Delta verb: delta_rs optimize.compact / optimize.z_order.
+_OPTIMIZE = re.compile(
+    r"\s*optimize\s+(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)"
+    r"(?:\s+zorder\s+by\s*\((?P<cols>[^()]+)\))?\s*;?\s*", re.I | re.S
+)
+# `alter table <t> set tblproperties ('k' = 'v', …)` — the Delta spelling; delta_rs
+# alter.set_table_properties.
+_ALTER_SET_PROPS = re.compile(
+    r"\s*alter\s+table\s+(?P<rel>.+?)\s+set\s+tblproperties\s*\((?P<props>.*)\)\s*;?\s*",
+    re.I | re.S,
+)
+_PROP_PAIR = re.compile(r"\s*'((?:[^']|'')*)'\s*=\s*'((?:[^']|'')*)'\s*")
 # `restore table <t> to version as of <n>` / `to timestamp as of '<ts>'` — the Spark/Delta RESTORE
 # verb, rolled to delta_rs ``DeltaTable.restore`` (a new commit on top of history, itself revertible).
 _RESTORE = re.compile(
@@ -521,7 +650,7 @@ def _split_leading_with(sql: str) -> Tuple[str, str]:
 # DML target-relation matcher (verb → relation), used only to detect a 3-part cross-catalog target.
 _DML_REL = re.compile(
     r"^(?:insert\s+into|delete\s+from|update|merge\s+into|alter\s+table|"
-    r"drop\s+table(?:\s+if\s+exists)?|"
+    r"drop\s+table(?:\s+if\s+exists)?|truncate(?:\s+table)?|optimize|"
     r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?)\s+(?P<rel>[\w.\"]+)",
     re.IGNORECASE,
 )
@@ -546,7 +675,7 @@ _DML_REL_ANY = re.compile(
     r"^(?:insert\s+(?:with\s+schema\s+evolution\s+)?into|delete\s+from|update|merge\s+into|"
     r"alter\s+table|drop\s+table(?:\s+if\s+exists)?|"
     r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?|"
-    r"vacuum(?:\s+analyze)?|restore\s+table)\s+"
+    r"vacuum(?:\s+analyze)?|restore\s+table|truncate(?:\s+table)?|optimize)\s+"
     r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)",   # a quoted part may hold `-` (GUIDs)
     re.IGNORECASE,
 )
@@ -567,7 +696,7 @@ _C_FROM = re.compile(r"\bfrom\b", re.I)
 _C_USING = re.compile(r"\busing\b", re.I)
 _C_DELTA_HEAD = re.compile(
     r"\s*(?:insert\s+into|insert\s+with\s+schema\s+evolution|update|delete\s+from|"
-    r"merge\s+into|alter\s+table|drop\s+table|restore\s+table)\b", re.I)
+    r"merge\s+into|alter\s+table|drop\s+table|restore\s+table|truncate|optimize)\b", re.I)
 _C_VACUUM = re.compile(r"\s*vacuum\s+(?:analyze\s+)?(?:\"|\w)", re.I)  # vacuum <table> → maintenance
 
 
@@ -1413,12 +1542,14 @@ class _DeltaDML:
         # CREATE TEMP/TEMPORARY TABLE is native DuckDB scratch by design — never capture it.
         if _CREATE_TEMP_RE.match(sql):
             return False
+        # Column definitions first: `GENERATED ALWAYS AS (…)` inside them would otherwise read as
+        # the AS of a CREATE TABLE … AS.
+        parts = _coldefs_parts(sql)
+        if parts is not None and "__duckrun" not in parts["rel"]:
+            return self._create_coldefs(parts)
         m = _fullmatch(_CREATE_AS, sql)
         if m and "__duckrun" not in m.group("rel"):
             return self._create_as(m)
-        m = _fullmatch(_CREATE_COLDEFS, sql)
-        if m and "__duckrun" not in m.group("rel"):
-            return self._create_coldefs(m)
         m = _fullmatch(_INSERT_REPLACE, sql)
         if m and "__duckrun" not in m.group("rel"):
             return self._insert_replace_where(m)
@@ -1443,6 +1574,9 @@ class _DeltaDML:
         m = _fullmatch(_UPDATE, sql)
         if m:
             return self._mutate(m, self._update)
+        m = _fullmatch(_ALTER_SET_PROPS, sql)
+        if m:
+            return self._mutate(m, self._set_properties)
         m = _fullmatch(_ALTER_ADD, sql)
         if m:
             return self._mutate(m, self._alter_add)
@@ -1464,6 +1598,12 @@ class _DeltaDML:
         m = _fullmatch(_RESTORE, sql)
         if m:
             return self._restore(m)
+        m = _fullmatch(_TRUNCATE, sql)
+        if m:
+            return self._mutate(m, self._truncate)
+        m = _fullmatch(_OPTIMIZE, sql)
+        if m:
+            return self._optimize(m)
         return False
 
     # -- create table <rel> as <query>: always materialize as a duckrun Delta table ------------
@@ -1526,14 +1666,14 @@ class _DeltaDML:
         return True
 
     # -- create table <rel> (<col defs>): an EMPTY Delta table (connection API only) -----------
-    def _create_coldefs(self, m) -> bool:
+    def _create_coldefs(self, parts) -> bool:
         # Only the connection API (which carries a current database) makes a bare `CREATE TABLE
         # (col defs)` a Delta table — so `CREATE TABLE` is always Delta-backed there. The dbt/cursor
         # path passes default_schema=None: the seed loader emits this exact form and RELIES on it
         # landing as a native DuckDB table, so we pass through untouched.
         if self.default_schema is None:
             return False
-        rel = m.group("rel").strip()
+        rel = parts["rel"].strip()
         err = _create_target_error(rel)
         if err:
             raise ValueError(err)
@@ -1542,10 +1682,10 @@ class _DeltaDML:
             return False
         existed = self._exists(loc)                       # ONE check — also picks the create mode below
         live = existed and not is_dropped_dt(self._pinned(loc))  # reuses _exists's pinned handle
-        if m.group("ine") and live:                       # IF NOT EXISTS over a live table → no-op
+        if parts["ine"] and live:                       # IF NOT EXISTS over a live table → no-op
             self._refresh_view(rel, schema, loc)
             return True
-        if live and not m.group("orrep"):                 # plain CREATE over a live table → error
+        if live and not parts["orrep"]:                 # plain CREATE over a live table → error
             raise ValueError(
                 f"table {schema}.{identifier} already exists — "
                 f"use CREATE OR REPLACE TABLE to replace it"
@@ -1555,7 +1695,7 @@ class _DeltaDML:
         # logs a CREATE TABLE operation (not a WRITE/Overwrite). A live table or a drop-tombstone already
         # has files at ``loc``, so it must be replaced (overwrite); otherwise create-if-absent (error).
         tmp = engine.tmp_name("empty", (schema, identifier))
-        self.cursor.execute(f'create or replace temp table "{tmp}" ({m.group("defs")})')
+        self.cursor.execute(f'create or replace temp table "{tmp}" ({parts["defs"]})')
         try:
             rel0 = self.cursor.sql(f'select * from "{tmp}" limit 0')
             # Naive-timestamp coercion (issue #42) on the SQL side, BEFORE .arrow() — a bare
@@ -1582,7 +1722,17 @@ class _DeltaDML:
         # Mode from the SAME existence check as the guards above (no second open, no window in
         # which a table appearing/disappearing could make guard and mode disagree).
         mode = "overwrite" if existed else "error"
-        engine.create_empty_delta(loc, arrow_schema, mode=mode, storage_options=self.so)
+        partition = parts["partition"] or None
+        if partition:
+            by_lower = {f.name.lower(): f.name for f in arrow_schema}
+            unknown = [c for c in partition if c.lower() not in by_lower]
+            if unknown:
+                raise ValueError(f"PARTITIONED BY names unknown column(s) {unknown}; "
+                                 f"columns are {list(by_lower.values())}")
+            partition = [by_lower[c.lower()] for c in partition]
+        engine.create_empty_delta(loc, arrow_schema, mode=mode, storage_options=self.so,
+                                  partition_by=partition, configuration=parts["props"] or None,
+                                  generated=_generated_columns(parts["defs"]) or None)
         self._refresh_view(rel, schema, loc)
         return True
 
@@ -1907,7 +2057,16 @@ class _DeltaDML:
             else f'cast(null as {typ}) as "{col}"'
             for col, typ in zip(target_cols, target_types)
         ]
-        return self.cursor.sql(f"select {', '.join(exprs)} from {inner}")
+        projected = f"select {', '.join(exprs)} from {inner}"
+        # A generated column the INSERT leaves out is computed from its expression over the row,
+        # as Delta writers do (delta_rs then checks the value on write).
+        types = dict(zip(target_cols, target_types))
+        computed = [(by_lower[c.lower()], e) for c, e in cow.generation_expressions(self._pinned(loc))
+                    if c.lower() in by_lower and by_lower[c.lower()] not in provided_set]
+        if computed:
+            projected = ("select * replace (" + ", ".join(
+                f'cast(({e}) as {types[c]}) as "{c}"' for c, e in computed) + f") from ({projected})")
+        return self.cursor.sql(projected)
 
     def _append_projected(self, loc, provided, derived: str) -> None:
         """Append a ``derived`` table to the Delta table at ``loc``, projected onto its full schema
@@ -2099,45 +2258,90 @@ class _DeltaDML:
         )
 
     def _drop(self, m) -> bool:
-        # `drop table` on a duckrun relation: unregister the delta_scan view AND, via delta_rs,
-        # overwrite the table to a one-column tombstone (TOMBSTONE_COLUMN) so a later glob discovery
-        # hides it. NO data is deleted — delta_rs has no drop, and removing the Delta files would be
-        # a filesystem hack that fails on object stores. The directory persists until a human purges
-        # it; a later `create table ... as` overwrites the tombstone with real data. If the relation
-        # isn't a duckrun-managed Delta table, fall through and let DuckDB drop the native table.
+        # `drop table` on a duckrun relation: unregister the delta_scan view and DELETE the table's
+        # folder (objectstore.delete_tree: one recursive DFS delete on OneLake, which keeps the files 7
+        # days as soft-deleted and restorable; rmtree locally; list + delete on s3 / gcs). A table a
+        # duckrun before 0.5.8 dropped is a one-column tombstone (TOMBSTONE_COLUMN) and is still
+        # hidden by discovery; dropping it again passes through like any absent table. If the
+        # relation isn't a duckrun-managed Delta table, fall through and let DuckDB drop the native
+        # table.
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
         if (not loc or self._shadowed_by_temp(rel) or not self._exists(loc)
                 or is_dropped_dt(self._pinned(loc))):
-            # Not a LIVE duckrun table (never existed, native, or already tombstoned) → pass through so
-            # DuckDB applies plain DROP / DROP IF EXISTS semantics: a plain `DROP TABLE <gone>` raises
-            # (the delta_scan view was already unregistered on the first drop), IF EXISTS is a no-op.
-            # Without this, a tombstoned table still has files at loc so a second plain DROP would
-            # wrongly succeed (re-tombstone) instead of erroring like SQL requires.
+            # Not a LIVE duckrun table (never existed, native, or an old tombstone) → pass through so
+            # DuckDB applies plain DROP / DROP IF EXISTS semantics: a plain `DROP TABLE <gone>` raises,
+            # IF EXISTS is a no-op.
             return False
-        # Fence the tombstone write to the version observed at drop time: a drop racing a live writer
-        # should fail loud (the writer's commit lands first → CommitFailedError), not silently
-        # tombstone over it.
-        vB = self._vB(loc)
-        tombstone = self.cursor.sql(f"select true as {TOMBSTONE_COLUMN}")
-        engine.overwrite_if_unchanged(loc, tombstone, read_version=vB, overwrite_schema=True,
-                                      storage_options=self.so)
         self.cursor.execute(f"drop view if exists {self._view_rel(rel, schema)}")
+        objectstore.delete_tree(loc, self.so)
+        self._opened = None
         return True
 
     def _vacuum(self, m) -> bool:
-        """`vacuum <table>`: Delta maintenance via DuckDB's native VACUUM verb — compact small files
-        (delta_rs ``optimize.compact``, committed dataChange=false so it's concurrency-safe) then
-        vacuum files tombstoned past the retention window. No snapshot fence is needed: compaction
-        doesn't change data and vacuum only removes already-dead files. Returns False (pass through to
-        DuckDB) if <table> isn't a duckrun-managed Delta table, so a native DuckDB VACUUM still works."""
+        """`vacuum <table> [retain <n> hours]`: Delta maintenance via DuckDB's native VACUUM verb —
+        compact small files (delta_rs ``optimize.compact``, committed dataChange=false so it's
+        concurrency-safe) then vacuum files tombstoned past the retention window: the table's own
+        (7 days by default), or ``<n>`` hours when RETAIN is given (below 7 days that breaks time
+        travel to the versions it removes, and a reader still on one of them). No snapshot fence is
+        needed: compaction doesn't change data and vacuum only removes already-dead files. Returns
+        False (pass through to DuckDB) if <table> isn't a duckrun-managed Delta table, so a native
+        DuckDB VACUUM still works."""
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
         if not loc or not self._exists(loc):
             return False
         engine.optimize(loc, storage_options=self.so, cur=self.cursor)
-        engine.vacuum(loc, storage_options=self.so)
+        hours = m.group("hours")
+        if hours is None:
+            engine.vacuum(loc, storage_options=self.so)
+        else:
+            engine.vacuum(loc, retention_hours=float(hours), enforce_retention_duration=False,
+                          storage_options=self.so)
         return True
+
+    def _optimize(self, m) -> bool:
+        """`optimize <table> [zorder by (cols)]` (the Delta verb): compact the table's small files
+        (delta_rs ``optimize.compact``), or rewrite it z-ordered on ``cols``
+        (``optimize.z_order``). Both commit dataChange=false. Plain compaction is what duckrun's
+        own post-write maintenance does; z-order interleaves the columns' bits, which breaks the
+        run-length runs a sort key gives Direct Lake, so prefer ``CREATE OR REPLACE TABLE t SORTED
+        BY (…) AS SELECT * FROM t`` for a table Power BI reads. Returns False (pass through) if
+        <table> isn't a duckrun-managed Delta table."""
+        rel = m.group("rel").strip()
+        schema, identifier, loc = self._resolve(rel)
+        if not loc or not self._exists(loc):
+            return False
+        cols = m.group("cols")
+        if cols is None:
+            engine.optimize(loc, storage_options=self.so, cur=self.cursor)
+            return True
+        wanted = [c.strip().strip('"') for c in cols.split(",") if c.strip()]
+        by_lower = {f.name.lower(): f.name for f in self._pinned(loc).schema().fields}
+        unknown = [c for c in wanted if c.lower() not in by_lower]
+        if unknown:
+            raise ValueError(f"OPTIMIZE … ZORDER BY: unknown column(s) {unknown}; "
+                             f"table columns are {list(by_lower.values())}")
+        engine.z_order(loc, [by_lower[c.lower()] for c in wanted], storage_options=self.so)
+        return True
+
+    def _truncate(self, m, rel, schema, loc) -> None:
+        """`truncate [table] <t>`: every row deleted in one commit that removes every data file and
+        writes none (copy-on-write; delta_rs delete for the table shapes it refuses). The table,
+        its schema, properties and history stay — unlike DROP TABLE."""
+        if engine.cow_rewrite(self.cursor, loc, where=None, delete=True, read_version=self._vB(loc),
+                              storage_options=self.so, dt=self._pinned(loc), operation="TRUNCATE"):
+            return
+        engine.delete_rows(loc, None, read_version=self._vB(loc), storage_options=self.so,
+                           cur=self.cursor, dt=self._pinned(loc))
+
+    def _set_properties(self, m, rel, schema, loc) -> None:
+        """`alter table <t> set tblproperties ('k' = 'v', …)`: delta_rs
+        ``alter.set_table_properties`` — one metadata commit, no data rewritten."""
+        props = _parse_properties(m.group("props"))
+        if not props:
+            raise ValueError("ALTER TABLE … SET TBLPROPERTIES needs at least one 'key' = 'value'")
+        engine.set_table_properties(loc, props, storage_options=self.so)
 
     def _restore(self, m) -> bool:
         """`restore table <t> to version as of <n>` / `to timestamp as of '<ts>'` (the Spark/Delta

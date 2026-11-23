@@ -169,8 +169,13 @@ def _counts(cur, table: str, conds: Sequence[str]) -> List[int]:
     return [int(n) for n in cur.execute(f"SELECT {sel} FROM {table}").fetchall()[0]]
 
 
+def generation_expressions(dt: DeltaTable) -> List[tuple]:
+    """``[(column, expression)]`` for the table's generated columns."""
+    return _table_rules(dt)[1]
+
+
 def generated_columns(dt: DeltaTable) -> List[str]:
-    return [name for name, _ in _table_rules(dt)[1]]
+    return [name for name, _ in generation_expressions(dt)]
 
 
 def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
