@@ -110,10 +110,17 @@ def test_at_on_a_name_that_is_not_a_duckrun_table_is_left_to_duckdb(wh):
 def test_set_tblproperties(wh):
     c = _rw(wh)
     c.sql("alter table t set tblproperties ('delta.logRetentionDuration' = 'interval 9 days', "
-          "'owner.team' = 'it''s')")
+          "'delta.deletedFileRetentionDuration' = 'interval 3 days')")
     conf = deltalake.DeltaTable(_path(c, "t")).metadata().configuration
     assert conf["delta.logRetentionDuration"] == "interval 9 days"
-    assert conf["owner.team"] == "it's"
+    assert conf["delta.deletedFileRetentionDuration"] == "interval 3 days"
+
+
+def test_property_list_parsing():
+    from dbt.adapters.duckrun.delta_dml import _parse_properties
+    assert _parse_properties("'a' = 'it''s', 'b.c'='2'") == {"a": "it's", "b.c": "2"}
+    with pytest.raises(ValueError, match="'key' = 'value'"):
+        _parse_properties("a = 1")
 
 
 def test_create_table_with_properties_partition_and_generated_column(tmp_path):

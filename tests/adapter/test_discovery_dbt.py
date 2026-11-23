@@ -65,19 +65,19 @@ def _rows(root):
 def test_dropped_table_rebuilds_instead_of_merging(project):
     proj, root = project
     # Run 1 (full build) then run 2 (incremental): discovery found the table, so the merge branch
-    # ran and added row 2 — the baseline the tombstone must reset.
+    # ran and added row 2 — the baseline the drop must reset.
     assert _dbt(proj, "run").success
     assert _rows(root) == {1: "a"}
     assert _dbt(proj, "run").success
     assert _rows(root) == {1: "a", 2: "b"}
 
-    # Drop via the notebook surface: a one-column tombstone marker, files untouched on disk.
+    # Drop via the notebook surface: the table's folder is deleted.
     duckrun.connect(root, schema="main", read_only=False).sql("drop table events")
-    assert (Path(root) / "main" / "events" / "_delta_log").is_dir()  # nothing was deleted
+    assert not (Path(root) / "main" / "events").exists()
 
-    # Run 3: discovery must HIDE the tombstone, so this is a first-run full build again — row 1
-    # only, real schema. If the tombstone leaked through, is_incremental() would be true and the
-    # run would merge {1,2} into the marker (failure or a marker column in the result).
+    # Run 3: nothing to discover, so this is a first-run full build again — row 1 only, real
+    # schema. Had anything of the old table survived, is_incremental() would be true and the run
+    # would merge {1,2} into it.
     assert _dbt(proj, "run").success
     assert _rows(root) == {1: "a"}
     cols = {r[0] for r in duckrun.connect(root, schema="main")
@@ -94,11 +94,16 @@ def test_show_discovery_opens_concurrently_and_creates_schema_once(project, monk
     proj, root = project
     assert _dbt(proj, "run").success  # materialize `events` so discovery has it too
 
-    # More tables via the notebook surface, plus one tombstone among them.
+    # More tables via the notebook surface, plus the one-column tombstone an older duckrun's
+    # `drop table` left behind, which discovery must still open and hide.
+    import deltalake
+    import pyarrow as pa
+    from dbt.adapters.duckrun.delta_dml import TOMBSTONE_COLUMN
+
     con = duckrun.connect(root, schema="main", read_only=False)
-    for i in range(4):
+    for i in range(3):
         con.sql(f"create table t{i} as select {i} as id")
-    con.sql("drop table t3")
+    deltalake.write_deltalake(str(Path(root) / "main" / "t3"), pa.table({TOMBSTONE_COLUMN: [True]}))
 
     from dbt.adapters.duckrun import engine as dr_engine
     from dbt.adapters.duckrun.impl import DuckrunAdapter

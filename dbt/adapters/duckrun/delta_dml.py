@@ -192,6 +192,7 @@ _COLDEFS_TAIL = re.compile(
     r"\s*(?:partitioned\s+by\s*\((?P<part>[^()]*)\)"
     r"|(?:with|tblproperties)\s*\((?P<props>(?:[^()']|'(?:[^']|'')*')*)\))", re.I)
 _GENERATED_AS = re.compile(r"\bgenerated\s+always\s+as\s*\(", re.I)
+_ENDS_WITH_AS = re.compile(r"\bas\s*$", re.I)
 
 
 def _matching_paren(s: str, i: int) -> int:
@@ -256,7 +257,9 @@ def _coldefs_parts(sql: str):
         return None
     rest = s[head.end():]
     i = _first_paren(rest)
-    if i <= 0 or not _is_clean_relation(rest[:i]):
+    # `t AS (SELECT …)` is a CTAS; a name with stray tokens before the paren stays in rel, so
+    # _create_coldefs refuses it loudly (a mis-spelled layout clause must not become a table name).
+    if i <= 0 or _ENDS_WITH_AS.search(rest[:i]):
         return None
     j = _matching_paren(rest, i)
     if j < 0:
@@ -399,7 +402,7 @@ _DROP = re.compile(
 _VACUUM = re.compile(
     r"\s*vacuum\s+(?:analyze\s+)?"
     r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)"
-    r"(?:\s+retain\s+(?P<hours>\d+(?:\.\d+)?)\s+hours?)?\s*;?\s*", re.I | re.S
+    r"(?:\s+retain\s+(?P<hours>\d+)\s+hours?)?\s*;?\s*", re.I | re.S
 )
 # `truncate [table] <t>` — every row deleted; the table, its schema and its history stay.
 _TRUNCATE = re.compile(
@@ -2296,7 +2299,7 @@ class _DeltaDML:
         if hours is None:
             engine.vacuum(loc, storage_options=self.so)
         else:
-            engine.vacuum(loc, retention_hours=float(hours), enforce_retention_duration=False,
+            engine.vacuum(loc, retention_hours=int(hours), enforce_retention_duration=False,
                           storage_options=self.so)
         return True
 
@@ -2439,9 +2442,9 @@ def _handle_one(cursor, root_path, storage_options, sql: str, default_schema,
     """Route ONE statement (already comment-stripped, leading junk removed) to Delta if it's a DML
     form against a duckrun-managed relation. True if applied to Delta; False to pass through."""
     with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
-    head = body[:7].lower()                        # cheap pre-filter: only the candidate DML verbs
+    head = body[:8].lower()                        # cheap pre-filter: only the candidate DML verbs
     if not head.startswith(("delete", "update", "insert", "create", "alter", "drop", "merge",
-                            "vacuum", "restore")):
+                            "vacuum", "restore", "truncate", "optimize")):
         return False
     dml = _DeltaDML(cursor, root_path, storage_options, default_schema, view_prefix)
     dml._with_clause = with_clause
