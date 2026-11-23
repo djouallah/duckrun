@@ -53,7 +53,7 @@ def table(tmp_path):
 
 def _footer_violations(files, *, full: bool):
     lit = ", ".join(_lit(f) for f in sorted(files))
-    data_not_dict = ("len(list_filter(coalesce(encoding_stats, []), e -> e.page_type LIKE 'DATA_PAGE%' "
+    data_not_dict = ("len(list_filter(coalesce(encoding_stats, []), lambda e: e.page_type LIKE 'DATA_PAGE%' "
                      f"AND e.encoding NOT IN {DICT_DATA_ENCODINGS})) > 0")
     rules = [
         ("dictionary page not first in encoding_stats (#84)",
