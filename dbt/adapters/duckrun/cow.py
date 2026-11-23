@@ -6,8 +6,11 @@ needs — and delta-rs commits nothing but the file actions: the new files (``Ad
 files they replace (``RemoveAction``), in ONE transaction pinned to the version the statement read
 (``create_write_transaction``, ``max_commit_retries=0``), so a concurrent commit fails it loudly.
 
-Internal module, not public API. Plain tables only: :func:`unsupported_reason` sends partitioned,
-column-mapped, deletion-vector, constrained and generated-column tables to the delta-rs path.
+Internal module, not public API. :func:`unsupported_reason` sends the table shapes this writer
+cannot commit correctly to the delta-rs path: deletion vectors and change data feed (the commit API
+has no action for their metadata), identity columns (their high-water mark lives in the schema),
+append-only tables, and — for now — column mapping, CHECK constraints, invariants and generated
+columns.
 """
 import datetime as _dt
 import json
@@ -51,18 +54,29 @@ def temp_view(rel, name: str) -> None:
     rel.query(name, f"SELECT * FROM {_q(name)} LIMIT 0")
 
 
+# Writer features a plain add/remove commit leaves intact. Anything else (row tracking, domain
+# metadata, in-commit timestamps, clustering, …) asks the writer for more, so delta-rs writes it.
+_WRITABLE_FEATURES = {"appendOnly", "invariants", "checkConstraints", "changeDataFeed",
+                      "generatedColumns", "columnMapping", "identityColumns", "deletionVectors",
+                      "timestampNtz", "vacuumProtocolCheck"}
+
+
 def unsupported_reason(dt: DeltaTable) -> Optional[str]:
     """Why a copy-on-write rewrite must not touch ``dt`` (None = it may): each case needs Delta
-    metadata or checks this writer does not produce — partition values, physical names,
-    deletion-vector-aware removes, constraint / invariant / generated / identity evaluation."""
+    metadata or checks this writer does not produce."""
     md = dt.metadata()
     conf = md.configuration or {}
-    if md.partition_columns:
-        return "partitioned"
+    if str(conf.get("delta.enableChangeDataFeed", "false")).lower() == "true":
+        return "change data feed"
+    if str(conf.get("delta.appendOnly", "false")).lower() == "true":
+        return "append-only table"
     if str(conf.get("delta.columnMapping.mode", "none")).lower() != "none":
         return "column mapping"
     if any(k.lower().startswith("delta.constraints.") for k in conf):
         return "CHECK constraints"
+    unknown = sorted(set(dt.protocol().writer_features or []) - _WRITABLE_FEATURES)
+    if unknown:
+        return f"table feature(s) {', '.join(unknown)}"
     if "deletionVectors" in (dt.protocol().reader_features or []):
         return "deletion vectors"
     schema_json = dt.schema().to_json()
@@ -228,6 +242,24 @@ def _rel_path(filename: str, loc: str) -> str:
     return rel
 
 
+def _partition_value(duck_type: str, value):
+    """A partition value as Delta serializes it (None for a NULL partition). DuckDB reports a
+    TIMESTAMPTZ value with its offset ('2024-01-01 10:30:00+00'), which Delta readers refuse; Delta
+    wants the UTC wall clock with microseconds, and the same spelling for a naive TIMESTAMP."""
+    if value is None or value in ("NULL", "__HIVE_DEFAULT_PARTITION__"):
+        return None
+    t = str(duck_type).upper()
+    if t not in ("TIMESTAMP WITH TIME ZONE", "TIMESTAMP"):
+        return str(value)
+    try:
+        v = _dt.datetime.fromisoformat(str(value).replace(" ", "T"))
+    except ValueError:
+        return str(value)
+    if v.tzinfo is not None:
+        v = v.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+    return v.isoformat(sep=" ", timespec="microseconds")
+
+
 def _remove_quietly(filename: str) -> None:
     """Delete an orphan file DuckDB wrote (an empty input still produces a 0-row parquet). Best
     effort: an unreferenced file is harmless — vacuum collects it."""
@@ -239,16 +271,22 @@ def _remove_quietly(filename: str) -> None:
 
 
 def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
+                partition_by: Optional[Sequence[str]] = None,
                 row_group_rows: Optional[int] = None, target_file_size: Optional[int] = None,
                 configuration: Optional[Dict[str, Optional[str]]] = None) -> List[AddAction]:
     """Write DuckDB table ``table`` under ``loc`` with ONE ``COPY`` in the fixed read layout and
-    return one ``AddAction`` per non-empty file. Nothing is committed here: until :func:`commit`
-    lands them the files are invisible to readers, and an aborted write leaves only unreferenced
-    files that vacuum collects."""
+    return one ``AddAction`` per non-empty file. ``partition_by`` columns go into the hive
+    directories (DuckDB's ``PARTITION_BY``), not the files, as Delta expects. Nothing is committed
+    here: until :func:`commit` lands them the files are invisible to readers, and an aborted write
+    leaves only unreferenced files that vacuum collects."""
+    partition_by = list(partition_by or [])
     desc = cur.execute(f"DESCRIBE {table}").fetchall()
     col_types = {r[0]: str(r[1]) for r in desc}
-    indexed = indexed_columns(list(col_types), configuration)
-    opt_sql = ", ".join(f"{k} {v}" for k, v in parquet_options(row_group_rows, target_file_size).items())
+    indexed = indexed_columns([c for c in col_types if c not in partition_by], configuration)
+    opts = parquet_options(row_group_rows, target_file_size)
+    if partition_by:
+        opts["PARTITION_BY"] = "(" + ", ".join(_q(p) for p in partition_by) + ")"
+    opt_sql = ", ".join(f"{k} {v}" for k, v in opts.items())
     tag = uuid.uuid4().hex[:8]
     if "://" not in loc:  # local table root: COPY creates the target dir but not its parents
         os.makedirs(loc, exist_ok=True)
@@ -259,11 +297,13 @@ def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
     ).fetchall()
     now_ms = int(time.time() * 1000)
     adds: List[AddAction] = []
-    for filename, count, size, _footer, colstats, *_ in rows:
+    for filename, count, size, _footer, colstats, *rest in rows:
         if not count:
             _remove_quietly(filename)
             continue
-        adds.append(AddAction(path=_rel_path(filename, loc), size=int(size), partition_values={},
+        pkeys = (rest[0] if rest else None) or {}
+        pvals = {p: _partition_value(col_types.get(p, ""), pkeys.get(p)) for p in partition_by}
+        adds.append(AddAction(path=_rel_path(filename, loc), size=int(size), partition_values=pvals,
                               modification_time=now_ms, data_change=True,
                               stats=stats_json(count, colstats, col_types, indexed)))
     return adds
@@ -281,7 +321,7 @@ def removes_for(cur, dt: DeltaTable, filenames: Sequence[str]) -> List[RemoveAct
     for rel, size in cur.sql("SELECT path, size_bytes FROM add_actions").fetchall():
         if unquote(rel).rsplit("/", 1)[-1] in wanted:
             out.append(RemoveAction(path=rel, data_change=True, deletion_timestamp=now_ms,
-                                    size=int(size), partition_values={}))
+                                    size=int(size), partition_values=None))
     if len(out) != len(wanted):
         raise RuntimeError(f"duckrun: {len(wanted) - len(out)} rewritten file(s) are not live in "
                            f"version {dt.version()}; refusing to commit")

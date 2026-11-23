@@ -2623,8 +2623,9 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
         keys = [sort_by] if isinstance(sort_by, str) and sort_by != "auto" else (
             list(sort_by) if isinstance(sort_by, (list, tuple)) else [])
         order = ", ".join(quote_ident(c) for c in keys) or None   # keep the table's sort key
-        adds = cow.write_files(cur, f'"{rows}"', path, order_by=order, row_group_rows=row_group_rows,
-                               target_file_size=target_file_size,
+        adds = cow.write_files(cur, f'"{rows}"', path, order_by=order,
+                               partition_by=dt.metadata().partition_columns,
+                               row_group_rows=row_group_rows, target_file_size=target_file_size,
                                configuration=dt.metadata().configuration)
         gone = [r[0] for r in cur.execute(f'SELECT filename FROM "{touched}"').fetchall()]
         removes = cow.removes_for(cur, dt, gone)
@@ -2674,7 +2675,9 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], projection: str = "*",
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS {with_prefix}{body}')
         logger.info(f"{operation.lower()}: copy-on-write (DuckDB rewrite, delta_rs commit)")
         cow.check_not_null(cur, f'"{rows}"', dt, operation)
-        adds = cow.write_files(cur, f'"{rows}"', path, configuration=dt.metadata().configuration)
+        adds = cow.write_files(cur, f'"{rows}"', path,
+                               partition_by=dt.metadata().partition_columns,
+                               configuration=dt.metadata().configuration)
         cow.commit(dt, path, adds + cow.removes_for(cur, dt, gone),
                    read_version=read_version, operation=operation)
         return True
