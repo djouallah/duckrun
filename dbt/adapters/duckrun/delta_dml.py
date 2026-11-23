@@ -192,7 +192,7 @@ _COLDEFS_TAIL = re.compile(
     r"\s*(?:partitioned\s+by\s*\((?P<part>[^()]*)\)"
     r"|(?:with|tblproperties)\s*\((?P<props>(?:[^()']|'(?:[^']|'')*')*)\))", re.I)
 _GENERATED_AS = re.compile(r"\bgenerated\s+always\s+as\s*\(", re.I)
-_ENDS_WITH_AS = re.compile(r"\bas\s*$", re.I)
+_AS_WORD = re.compile(r"\bas\b", re.I)
 
 
 def _matching_paren(s: str, i: int) -> int:
@@ -257,9 +257,10 @@ def _coldefs_parts(sql: str):
         return None
     rest = s[head.end():]
     i = _first_paren(rest)
-    # `t AS (SELECT …)` is a CTAS; a name with stray tokens before the paren stays in rel, so
-    # _create_coldefs refuses it loudly (a mis-spelled layout clause must not become a table name).
-    if i <= 0 or _ENDS_WITH_AS.search(rest[:i]):
+    # An AS before the first paren makes it a CTAS (`t AS (SELECT …)`, `t AS SELECT … range(…)`);
+    # otherwise a name with stray tokens before the paren stays in rel, so _create_coldefs refuses
+    # it loudly (a mis-spelled layout clause must not become a table name).
+    if i <= 0 or _AS_WORD.search(_blank_string_literals(rest[:i])):
         return None
     j = _matching_paren(rest, i)
     if j < 0:

@@ -32,7 +32,7 @@ def _path(conn, table):
 
 
 def _last_commit(path):
-    return deltalake.DeltaTable(path).history(1)[0]
+    return list(deltalake.DeltaTable(path).history(1))[0]
 
 
 # -- DROP TABLE ----------------------------------------------------------------------------------
