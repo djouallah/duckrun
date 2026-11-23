@@ -20,7 +20,7 @@ def _conn(tmp_path):
 
 
 def _writers(conn, table):
-    files = engine._delta_table(f"{conn.root_path}/dbo/{table}").file_uris()
+    files = engine._delta_table(f"{conn.root_path}/dbo/{table}", None).file_uris()
     lit = ", ".join("'" + f.replace("'", "''") + "'" for f in files)
     return {r[0] for r in conn.sql(f"select created_by from parquet_file_metadata([{lit}])").fetchall()}
 
@@ -104,6 +104,7 @@ def test_column_mapped_table(tmp_path, paths):
     conn = _conn(tmp_path)
     path = f"{conn.root_path}/dbo/cm"
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    conn.con.execute("LOAD delta")                  # COPY ... (FORMAT delta) does not autoload it
     conn.con.execute(
         f"""COPY (SELECT i AS id, 'v' AS "Super Name" FROM range(20) r(i)) TO '{path}' """
         "(FORMAT delta, WITH_PROPERTIES {'delta.columnMapping.mode': 'name'})")
