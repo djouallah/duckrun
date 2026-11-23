@@ -101,6 +101,22 @@ conn.sql("CREATE TABLE warehouse.mart.nope AS SELECT 1 AS x")   # -> PermissionE
 
 A table can be addressed 3-part from anywhere, 2-part in the current catalog, or bare in the current catalog and schema. `name` is derived from a friendly path and mandatory for a GUID-only path; one URL maps to one name. `read_only` is per catalog. Attached catalogs are visible to `SHOW DATABASES`, `information_schema` and `duckdb_databases()`. Runnable walkthrough: [`demo_multicatalog.py`](../tests/integration_tests/multicatalog/demo_multicatalog.py) ([live report](https://djouallah.github.io/duckrun/multicatalog.html)).
 
+### A whole workspace as one catalog
+
+Pass a workspace instead of a lakehouse, and every lakehouse in it becomes a schema with its own schemas nested under it, so a table is `workspace.lakehouse.schema.table`:
+
+```python
+conn = duckrun.connect("abfss://sales_ws@onelake.dfs.fabric.microsoft.com", read_only=False)
+
+conn.sql("SELECT * FROM sales_ws.bronze.dbo.orders")
+conn.sql("CREATE TABLE sales_ws.gold.dbo.daily AS SELECT ... FROM sales_ws.bronze.dbo.orders")
+
+conn.sql("USE sales_ws.gold.dbo")      # then bare names, or lakehouse.schema.table
+conn.sql("INSERT INTO daily SELECT ...")
+```
+
+The same path works in `attach()`. A workspace given by GUID gets its lakehouse names from the Fabric API. A lakehouse without schemas is skipped (connect it on its own). In a workspace catalog a two-part `schema.table` is ambiguous and fails loud. Needs `duckdb >= 2.0.1`, the first release with working nested schemas.
+
 ## Raw SQL DML through `conn.sql`
 
 `conn.sql` doesn't only read — raw SQL DML against a discovered (Delta-backed) table is intercepted

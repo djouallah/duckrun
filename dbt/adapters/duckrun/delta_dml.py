@@ -540,6 +540,26 @@ def dml_target_catalog(query: str) -> Optional[str]:
     return parts[0] if len(parts) >= 3 else None
 
 
+# The same target matcher plus the write verbs a connection-API session routes on its own: the
+# schema-evolution insert, vacuum and restore. Only dml_target_parts uses it.
+_DML_REL_ANY = re.compile(
+    r"^(?:insert\s+(?:with\s+schema\s+evolution\s+)?into|delete\s+from|update|merge\s+into|"
+    r"alter\s+table|drop\s+table(?:\s+if\s+exists)?|"
+    r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?|"
+    r"vacuum(?:\s+analyze)?|restore\s+table)\s+(?P<rel>[\w.\"]+)",
+    re.IGNORECASE,
+)
+
+
+def dml_target_parts(query: str) -> Optional[List[str]]:
+    """The dotted parts of a DML statement's target (``['ws', 'lh', 'dbo', 't']``), or ``None`` when
+    the statement has no recognizable target. The connection API's workspace catalogs route on the
+    whole name, where :func:`dml_target_catalog` only needs its first part."""
+    _, body = _split_leading_with(_strip_leading(query))
+    m = _DML_REL_ANY.match(_strip_leading(body))
+    return _split_dotted(m.group("rel")) if m else None
+
+
 # ── statement route classification — the router's single form-classifier ────────────────────────
 _C_CREATE_TABLE = re.compile(r"\s*create\s+(?:or\s+replace\s+)?table\b", re.I)
 _C_FROM = re.compile(r"\bfrom\b", re.I)
@@ -1306,11 +1326,14 @@ def _build_merge_clause(kind: str, pred: Optional[str], action: str,
 class _DeltaDML:
     """One attempt to handle a statement; ``run()`` returns True if it was applied to Delta."""
 
-    def __init__(self, cursor, root_path: str, storage_options, default_schema=None):
+    def __init__(self, cursor, root_path: str, storage_options, default_schema=None, view_prefix=None):
         self.cursor = cursor
         self.root_path = root_path.rstrip("/")
         self.so = storage_options
         self.default_schema = default_schema
+        # The quoted `"catalog"."lakehouse"` a workspace catalog nests a lakehouse's schemas under
+        # (connection API only). None everywhere else: the view lands at the relation as written.
+        self.view_prefix = view_prefix
         self._with_clause = ""  # a leading `WITH …` preceding an INSERT, prepended to the body
         self._opened = None     # (loc, DeltaTable) from this statement's _exists check — see _pinned
 
@@ -1352,8 +1375,24 @@ class _DeltaDML:
         stale reads into — never ``dt.version()`` directly."""
         return engine.table_version(loc, self.so, dt=self._pinned(loc))
 
+    def _view_rel(self, rel: str, schema: str) -> str:
+        """Where ``rel``'s delta_scan view lives: ``rel`` as written, or under a workspace catalog
+        ``"ws"."lh"."schema"."table"`` — the same view whether the statement named it with 4 parts,
+        3 (``lh.schema.table``) or 1 (after ``USE ws.lh.schema``)."""
+        if self.view_prefix is None:
+            return rel
+        table = _split_relation(rel)[1]
+        return f"{self.view_prefix}.{engine.quote_ident(schema)}.{engine.quote_ident(table)}"
+
     def _refresh_view(self, rel: str, schema: str, loc: str) -> None:
         loc_sql = loc.replace("'", "''")
+        if self.view_prefix is not None:
+            self.cursor.execute(f"create schema if not exists {self.view_prefix}")
+            self.cursor.execute(
+                f"create schema if not exists {self.view_prefix}.{engine.quote_ident(schema)}")
+            self.cursor.execute(f"create or replace view {self._view_rel(rel, schema)} as "
+                                f"select * from delta_scan('{loc_sql}')")
+            return
         # A 3-part rel (catalog.schema.table) targets an ATTACHED catalog: the schema must be created
         # IN that catalog and the view registered there — an unqualified `create schema` would land in
         # the current catalog, then the qualified view create fails on the missing schema (a partial
@@ -2066,7 +2105,7 @@ class _DeltaDML:
         tombstone = self.cursor.sql(f"select true as {TOMBSTONE_COLUMN}")
         engine.overwrite_if_unchanged(loc, tombstone, read_version=vB, overwrite_schema=True,
                                       storage_options=self.so)
-        self.cursor.execute(f"drop view if exists {rel}")
+        self.cursor.execute(f"drop view if exists {self._view_rel(rel, schema)}")
         return True
 
     def _vacuum(self, m) -> bool:
@@ -2174,7 +2213,8 @@ def _split_top_level(sql: str) -> List[str]:
     return stmts
 
 
-def _handle_one(cursor, root_path, storage_options, sql: str, default_schema) -> bool:
+def _handle_one(cursor, root_path, storage_options, sql: str, default_schema,
+                view_prefix=None) -> bool:
     """Route ONE statement (already comment-stripped, leading junk removed) to Delta if it's a DML
     form against a duckrun-managed relation. True if applied to Delta; False to pass through."""
     with_clause, body = _split_leading_with(sql)  # peel a leading `WITH …` off an INSERT/etc.
@@ -2182,19 +2222,22 @@ def _handle_one(cursor, root_path, storage_options, sql: str, default_schema) ->
     if not head.startswith(("delete", "update", "insert", "create", "alter", "drop", "merge",
                             "vacuum", "restore")):
         return False
-    dml = _DeltaDML(cursor, root_path, storage_options, default_schema)
+    dml = _DeltaDML(cursor, root_path, storage_options, default_schema, view_prefix)
     dml._with_clause = with_clause
     return dml.try_handle(body)
 
 
-def handle(cursor, root_path, storage_options, sql: str, default_schema=None) -> bool:
+def handle(cursor, root_path, storage_options, sql: str, default_schema=None,
+           view_prefix=None) -> bool:
     """Apply ``sql`` to Delta if it's a DML form targeting a duckrun-managed relation, using
     ``cursor`` to evaluate any SELECT body and to (re)create the ``delta_scan`` view.
 
     Every handled form goes through delta_rs (``engine.write_delta`` / ``DeltaTable.delete`` /
     ``.update``), which carries ``storage_options`` and so works on local AND abfss/OneLake stores.
     ``default_schema`` resolves an unqualified table name (the connection API has a current
-    database; the dbt path always renders fully-qualified names so passes None).
+    database; the dbt path always renders fully-qualified names so passes None). ``view_prefix``
+    (connection API, workspace catalogs only) is the quoted ``"ws"."lh"`` the delta_scan views nest
+    under; ``root_path`` is then that lakehouse's root.
     Returns True if handled (the caller must NOT also run it on DuckDB), False to pass through —
     anything unrecognized, or (for the mutate forms) a target that isn't a Delta table.
 
@@ -2214,12 +2257,12 @@ def handle(cursor, root_path, storage_options, sql: str, default_schema=None) ->
         # The SPLIT statement, not the raw text: a leading `;` or a doubled `;;` survived the
         # trailing-terminator strip and hid the verb from _handle_one's prefilter, so `; delete from
         # mart.t` passed through to DuckDB and died on the read-only view.
-        return _handle_one(cursor, root_path, storage_options, stmts[0], default_schema)
+        return _handle_one(cursor, root_path, storage_options, stmts[0], default_schema, view_prefix)
     # Multi-statement script: route each statement; non-Delta ones run on the cursor as DuckDB would.
     # (The dbt cursor wrapper now splits BEFORE reaching here so each statement resolves its own
     # catalog and lazy binds; this branch remains for any direct caller of handle().)
     for stmt in stmts:
-        if not _handle_one(cursor, root_path, storage_options, stmt, default_schema):
+        if not _handle_one(cursor, root_path, storage_options, stmt, default_schema, view_prefix):
             cursor.execute(stmt)
     return True
 

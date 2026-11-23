@@ -345,6 +345,10 @@ jobs:
           name: docs-multicatalog-dbt-page
           path: multicatalog_dbt_run.html
           if-no-files-found: warn
+      - name: Workspace catalog — LIVE OneLake (ws.lakehouse.schema.table, by GUID and by name)
+        run: |
+          python -m pytest tests/integration_tests/multicatalog/test_workspace_catalog_onelake.py \
+            -q -p no:cacheprovider
       - name: Multi-catalog live demo (lakehouse + read-only warehouse + local scratch)
         env:
           # writable aemo lakehouse (the shared sample lakehouse) + the read-only Fabric Warehouse.
