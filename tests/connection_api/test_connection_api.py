@@ -1871,7 +1871,7 @@ def test_append_uses_the_read_layout_profile(conn, monkeypatch):
     conn.sql("INSERT INTO prof select i from range(10, 20) t(i)")
     assert "APPEND" in seen and any(op in ("CREATE", "OVERWRITE") for op in seen), seen
     opts = cow.parquet_options()
-    assert opts["ROW_GROUP_SIZE"] == 4_000_000 and opts["FILE_SIZE_BYTES"] == 256 * 1024 * 1024
+    assert opts["ROW_GROUP_SIZE"] == _CEILING and opts["FILE_SIZE_BYTES"] == 256 * 1024 * 1024
 
 
 # ── issue #42: a naive DuckDB TIMESTAMP lands as UTC-adjusted Delta `timestamp`, not timestamp_ntz
@@ -2228,8 +2228,8 @@ def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
 
 
 # The 4M ceiling as DuckDB writes it: a row group closes on a whole 2048-row vector, so the
-# ceiling is rounded down to one (cow.parquet_options) and full groups hold 3,999,744 rows.
-_CEILING = 4_000_000 - 4_000_000 % 2048
+# ceiling is the next vector multiple (cow.parquet_options) and full groups hold 4,001,792 rows.
+_CEILING = -(-4_000_000 // 2048) * 2048
 
 
 def test_sorted_by_auto_uses_the_fixed_geometry(conn):
