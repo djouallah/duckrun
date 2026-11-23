@@ -1779,12 +1779,16 @@ def update_rows(
     # unknown column, writing a no-op commit that advances the log while changing nothing. Fail loud
     # with no commit — the same guard the raw-SQL UPDATE path applies (SQL == DataFrame parity).
     target_cols = [f.name for f in dt.schema().fields]
-    by_lower = {c.lower() for c in target_cols}
+    by_lower = {c.lower(): c for c in target_cols}
     unknown = [c for c in updates if str(c).strip('"').lower() not in by_lower]
     if unknown:
         raise ValueError(
             f"UPDATE on {path!r} sets unknown column(s) {unknown}; table columns are {target_cols}"
         )
+    # SET columns match case-insensitively (as in DuckDB SQL), but delta_rs >= 1.7 matches them
+    # exactly — so hand it the table's own spelling, keeping a caller's quotes.
+    updates = {(f'"{by_lower[str(c).strip(chr(34)).lower()]}"' if str(c).startswith('"')
+                else by_lower[str(c).lower()]): expr for c, expr in updates.items()}
     try:
         dt.update(updates=updates, predicate=predicate)
     except CommitFailedError as e:
