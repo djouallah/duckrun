@@ -2831,8 +2831,10 @@ def merge_delta_clauses(
 
     # Copy-on-write: DuckDB computes the merge and writes the parquet, delta_rs commits the file
     # actions. Falls through (False) for a table shape or a statement it cannot express, and for an
-    # explicit streamed_exec=True request for delta_rs's own merge.
-    if (not streamed_exec and cur is not None and hasattr(data, "create_view")
+    # explicit streamed_exec=True request for delta_rs's own merge — but not for the streamed_exec
+    # the by-source form sets for delta_rs's sake: the copy-on-write merge handles it (every file).
+    by_source = any(c.get("clause") == "not_matched_by_source" for c in clauses)
+    if ((not streamed_exec or by_source) and cur is not None and hasattr(data, "create_view")
             and cow_merge(cur, path, data, predicate, clauses, read_version=effective_version,
                           storage_options=storage_options, sort_by=sort_by,
                           row_group_rows=row_group_rows, target_file_size=target_file_size)):
