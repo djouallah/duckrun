@@ -162,6 +162,24 @@ def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
         raise ValueError(f"{operation} refused: " + "; ".join(violations))
 
 
+def parquet_options(row_group_rows: Optional[int] = None,
+                    target_file_size: Optional[int] = None) -> Dict[str, object]:
+    """The COPY options of the fixed read layout; ``row_group_rows`` / ``target_file_size`` are the
+    per-model overrides (None keeps duckrun's defaults)."""
+    rg = int(row_group_rows if row_group_rows is not None else ROW_GROUP_DEFAULT_ROWS)
+    return {
+        "COMPRESSION": "snappy",
+        "ROW_GROUP_SIZE": rg,
+        "FILE_SIZE_BYTES": int(target_file_size if target_file_size is not None
+                               else DEFAULT_TARGET_FILE_SIZE),
+        "DATA_PAGE_SIZE_LIMIT": DATA_PAGE_SIZE_LIMIT,
+        # A row group never holds more distinct values than rows; DuckDB preallocates from the limit.
+        "DICTIONARY_SIZE_LIMIT": min(DICTIONARY_SIZE_LIMIT, rg),
+        "PARQUET_VERSION": "V1",
+        "WRITE_BLOOM_FILTER": "false",
+    }
+
+
 # --- stats ---------------------------------------------------------------------------------------
 _INT_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT"}
 _FLOAT_TYPES = {"FLOAT", "DOUBLE"}
