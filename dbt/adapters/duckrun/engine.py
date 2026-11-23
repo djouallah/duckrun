@@ -664,15 +664,74 @@ def _duck_unwritable(types: Dict[str, str]) -> Optional[str]:
     return None
 
 
-def _utc_arrow_schema(arrow_schema):
-    """DuckDB stamps the SESSION TimeZone on tz-aware Arrow fields; Delta records UTC (a label,
-    not a value shift)."""
-    import pyarrow as pa
-    if not any(pa.types.is_timestamp(f.type) and f.type.tz not in (None, "UTC") for f in arrow_schema):
-        return arrow_schema
-    return pa.schema([f.with_type(pa.timestamp(f.type.unit, tz="UTC"))
-                      if pa.types.is_timestamp(f.type) and f.type.tz is not None else f
-                      for f in arrow_schema], metadata=arrow_schema.metadata)
+# DuckDB types Delta has no type for, written the way delta-rs's Arrow path stored them.
+_DELTA_CAST = {"UUID": "VARCHAR", "JSON": "VARCHAR", "HUGEINT": "DECIMAL(38,0)",
+               "UHUGEINT": "DECIMAL(38,0)", "UBIGINT": "DECIMAL(20,0)", "UINTEGER": "BIGINT",
+               "USMALLINT": "INTEGER", "UTINYINT": "SMALLINT", "TIMESTAMP_S": "TIMESTAMP",
+               "TIMESTAMP_MS": "TIMESTAMP", "TIMESTAMP_NS": "TIMESTAMP"}
+
+
+def _delta_cast(typ: str) -> Optional[str]:
+    t = str(typ).upper()
+    if t.startswith("ENUM("):
+        return "VARCHAR"
+    return _DELTA_CAST.get(t)
+
+
+def _normalized(data, op: str):
+    """``data`` with every top-level column of a type Delta lacks cast to the one delta-rs's Arrow
+    path stored it as (UUID / JSON / ENUM → VARCHAR, HUGEINT → DECIMAL(38,0), unsigned → the next
+    signed width). A type with no Delta equivalent at all (INTERVAL, TIME, BIT, UNION, …, or one of
+    these nested) raises :class:`cow.Unsupported`."""
+    types = {c: str(t) for c, t in zip(data.columns, data.types)}
+    casts = {c: _delta_cast(t) for c, t in types.items()}
+    left = {c: t for c, t in types.items() if not casts[c]}
+    why = _duck_unwritable(left)
+    if why:
+        raise cow.Unsupported(f"{op}: {why}, which Delta has no type for; cast it (VARCHAR, "
+                              f"BIGINT, DECIMAL, TIMESTAMPTZ, ...)")
+    if not any(casts.values()):
+        return data
+    sel = ", ".join(f"CAST({quote_ident(c)} AS {casts[c]}) AS {quote_ident(c)}" if casts[c]
+                    else quote_ident(c) for c in data.columns)
+    return data.query("__duckrun_norm", f"SELECT {sel} FROM __duckrun_norm")
+
+
+def _delta_type(t):
+    """Delta schema JSON type for a DuckDBPyType (the types :func:`_normalized` leaves)."""
+    tid = str(t.id).lower()
+    simple = {"boolean": "boolean", "tinyint": "byte", "smallint": "short", "integer": "integer",
+              "bigint": "long", "float": "float", "double": "double", "varchar": "string",
+              "blob": "binary", "date": "date", "timestamp with time zone": "timestamp",
+              "timestamp": "timestamp_ntz"}
+    if tid in simple:
+        return simple[tid]
+    if tid == "decimal":
+        kids = dict(t.children)
+        return f"decimal({kids['precision']},{kids['scale']})"
+    if tid == "struct":
+        return {"type": "struct", "fields": [_delta_field(n, ct) for n, ct in t.children]}
+    if tid == "list":
+        return {"type": "array", "elementType": _delta_type(t.children[0][1]), "containsNull": True}
+    if tid == "map":
+        kids = dict(t.children)
+        return {"type": "map", "keyType": _delta_type(kids["key"]),
+                "valueType": _delta_type(kids["value"]), "valueContainsNull": True}
+    raise cow.Unsupported(f"type {t} has no Delta equivalent")
+
+
+def _delta_field(name: str, t) -> Dict[str, Any]:
+    return {"name": name, "type": _delta_type(t), "nullable": True, "metadata": {}}
+
+
+def delta_schema(rel, names: Optional[List[str]] = None):
+    """The Delta schema of a DuckDB relation's columns (``names`` = a subset), from DuckDB's own
+    types — no Arrow (and so no pyarrow) involved."""
+    import json
+    from deltalake import Schema as DeltaSchema
+    fields = [_delta_field(c, t) for c, t in zip(rel.columns, rel.types)
+              if names is None or c in names]
+    return DeltaSchema.from_json(json.dumps({"type": "struct", "fields": fields}))
 
 
 def _write_source(cur, data, storage_options: Optional[Dict[str, str]]):
@@ -687,9 +746,12 @@ def _write_source(cur, data, storage_options: Optional[Dict[str, str]]):
         owned = cur = duckdb.connect()
         configure_duckdb_session(cur)
         _secret.ensure_azure_secret(cur, storage_options)
-        if hasattr(data, "create_view"):        # a relation of another connection: stream it over
+        if hasattr(data, "create_view"):        # a relation of another connection: copy it over
             data = data.arrow()
+            data = data.read_all() if hasattr(data, "read_all") else data
     if data is not None and not hasattr(data, "create_view"):
+        if hasattr(data, "read_all"):            # a stream can be scanned once; a MERGE scans twice
+            data = data.read_all()
         data = cur.from_arrow(data) if hasattr(data, "__arrow_c_stream__") else cur.from_df(data)
     return cur, data, owned
 
@@ -713,11 +775,7 @@ def add_columns(path: str, data, names: List[str], *, dt: DeltaTable,
     """Add ``names`` (columns of the DuckDB relation ``data``) to the table as ONE metadata-only
     commit (delta-rs ``alter.add_columns``): existing rows read NULL. Fenced to ``read_version``
     when given; ``dt`` (loaded at that version) moves to the new version."""
-    from deltalake import Schema as DeltaSchema
-    cols = ", ".join(quote_ident(c) for c in names)
-    arrow = _utc_arrow_schema(
-        data.query("__duckrun_add", f"SELECT {cols} FROM __duckrun_add LIMIT 0").arrow().schema)
-    fields = list(DeltaSchema.from_arrow(arrow).fields)
+    fields = list(delta_schema(_normalized(data, "add columns"), names).fields)
     try:
         dt.alter.add_columns(fields, commit_properties=_commit_props(read_version, "ADD COLUMNS"))
     except CommitFailedError as e:
@@ -783,10 +841,7 @@ def duckdb_write(cur, path: str, data, mode: str, *, partition_by=None, schema_m
     cur, data, owned = _write_source(cur, data, storage_options)
     view, staged = tmp_name("dwsrc", path), tmp_name("dwrows", path)
     try:
-        why = _duck_unwritable({c: str(t) for c, t in zip(data.columns, data.types)})
-        if why:
-            raise cow.Unsupported(f"{mode}: {why}, which Delta has no type for; cast it (VARCHAR, "
-                                  f"BIGINT, DECIMAL, TIMESTAMPTZ, ...)")
+        data = _normalized(data, mode)
         data.create_view(view, replace=True)
         dt = open_if_exists(path, storage_options)
         if dt is not None and read_version is not None:
@@ -848,9 +903,7 @@ def duckdb_write(cur, path: str, data, mode: str, *, partition_by=None, schema_m
 
 
 def _new_table_schema(cur, view: str):
-    from deltalake import Schema as DeltaSchema
-    return DeltaSchema.from_arrow(
-        _utc_arrow_schema(cur.sql(f'SELECT * FROM "{view}" LIMIT 0').arrow().schema))
+    return delta_schema(cur.sql(f'SELECT * FROM "{view}"'))
 
 
 def _create_table(cur, view, path, partition_by, storage_options, row_group_rows,

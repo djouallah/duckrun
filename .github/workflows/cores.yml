@@ -253,7 +253,7 @@ jobs:
         # before we render the card and run the regression check.
         continue-on-error: true
         run: |
-          pytest tests/conformance --tb=no -rA -p no:cacheprovider \
+          pytest tests/conformance --tb=short -rA -p no:cacheprovider \
             --continue-on-collection-errors --junitxml=conformance.xml
 
       - name: Render conformance card

@@ -1645,7 +1645,12 @@ def test_writer_keeps_dictionary_encoding(conn):
     for col in ("lowcard", "lowstr"):
         encodings, dict_off = md[col]
         assert dict_off is not None, f"{col} lost its dictionary page (PLAIN fallback)"
-        assert "RLE_DICTIONARY" in encodings, f"{col} not dictionary-encoded: {encodings}"
+        # DuckDB's V1 pages spell it PLAIN_DICTIONARY, parquet-rs RLE_DICTIONARY: both dictionary.
+        assert _dict_encoded(encodings), f"{col} not dictionary-encoded: {encodings}"
+
+
+def _dict_encoded(encodings) -> bool:
+    return "RLE_DICTIONARY" in encodings or "PLAIN_DICTIONARY" in encodings
 
 
 def _pq_meta(conn, table):
@@ -1674,7 +1679,7 @@ def test_wide_decimal_is_flba_without_dictionary(conn):
     for col in ("dec18", "dec10"):
         typ, enc, dict_off = md[col]
         assert typ == "INT64", f"{col} unexpectedly {typ}"
-        assert dict_off is not None and "RLE_DICTIONARY" in enc, f"{col} lost its dictionary: {enc}"
+        assert dict_off is not None and _dict_encoded(enc), f"{col} lost its dictionary: {enc}"
     typ38, enc38, dict38 = md["dec38"]
     assert typ38 == "FIXED_LEN_BYTE_ARRAY", f"dec38 expected FLBA, got {typ38}"
     assert dict38 is None, "dec38 (FLBA) unexpectedly got a dictionary page — did delta-rs change?"
@@ -1691,7 +1696,7 @@ def test_sorted_by_auto_narrows_wide_decimal(conn, capsys):
     assert "DECIMAL(18,2)" in out, f"no narrowing advisory printed: {out!r}"
     typ, enc, dict_off = _pq_meta(conn, "decnarrow")["amt"]
     assert typ == "INT64", f"amt not narrowed to INT64: {typ}"
-    assert dict_off is not None and "RLE_DICTIONARY" in enc, f"amt lost its dictionary: {enc}"
+    assert dict_off is not None and _dict_encoded(enc), f"amt lost its dictionary: {enc}"
 
 
 def test_sorted_by_auto_keeps_decimal_too_large_to_narrow(conn, capsys):
@@ -2222,6 +2227,11 @@ def test_sorted_by_auto_substrate_still_writes_every_row(conn, monkeypatch):
     assert not leftovers, leftovers
 
 
+# The 4M ceiling as DuckDB writes it: a row group closes on a whole 2048-row vector, so the
+# ceiling is rounded down to one (cow.parquet_options) and full groups hold 3,999,744 rows.
+_CEILING = 4_000_000 - 4_000_000 % 2048
+
+
 def test_sorted_by_auto_uses_the_fixed_geometry(conn):
     # AUTO's one job is picking the sort key — the write itself lands on the SAME fixed geometry
     # as every other write (4M-row ceiling, 256 MB file roll). 20M rows → full 4M-row groups.
@@ -2231,7 +2241,7 @@ def test_sorted_by_auto_uses_the_fixed_geometry(conn):
     mx, total = conn.sql(
         f"select max(row_group_num_rows), sum(row_group_num_rows) from (select distinct "
         f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchall()[0]
-    assert mx == 4_000_000, f"AUTO left the fixed 4M ceiling: max group {mx}"
+    assert mx == _CEILING, f"AUTO left the fixed 4M ceiling: max group {mx}"
     assert total == 20_000_000
 
 
@@ -2246,7 +2256,7 @@ def test_auto_recluster_gets_the_fixed_geometry_too(conn):
     mx, total = conn.sql(
         f"select max(row_group_num_rows), sum(row_group_num_rows) from (select distinct "
         f"file_name, row_group_id, row_group_num_rows from parquet_metadata({live!r}))").fetchall()[0]
-    assert mx == 4_000_000, f"AUTO re-cluster left the fixed 4M ceiling: max group {mx}"
+    assert mx == _CEILING, f"AUTO re-cluster left the fixed 4M ceiling: max group {mx}"
     assert total == 20_000_000
 
 
@@ -2255,7 +2265,7 @@ def test_plain_ctas_keeps_the_fixed_ceiling(conn):
     conn.sql("CREATE OR REPLACE TABLE plain_geo AS select i as j from range(20000000) t(i)")
     live = _live_files(conn, "plain_geo")
     mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchall()[0][0]
-    assert mx == 4_000_000, f"plain CTAS left the fixed 4M ceiling: max group {mx}"
+    assert mx == _CEILING, f"plain CTAS left the fixed 4M ceiling: max group {mx}"
 
 
 # NOTE: sort / partition on write are covered by test_sql_only.py (CREATE TABLE … SORTED BY /
@@ -2400,13 +2410,14 @@ def test_explicit_row_group_overrides_the_fixed_ceiling_and_lands(conn):
     # An explicit max_row_group_size is a DECLARED geometry: it overrides the fixed 4M ceiling
     # verbatim and must land in the written parquet.
     from dbt.adapters.duckrun import engine
-    data = conn._connection.sql("select i from range(1000) t(i)")
+    # DuckDB scale: its row groups close on 2048-row vectors, so the ceiling is a vector multiple.
+    data = conn._connection.sql("select i from range(20000) t(i)")
     loc = conn.root_path + "/dbo/geo_explicit"
     engine.write_delta(loc, data, "overwrite", cur=conn._connection,
-                       storage_options=conn.storage_options, row_group_rows=250)
+                       storage_options=conn.storage_options, row_group_rows=4096)
     live = engine._delta_table(loc, conn.storage_options).file_uris()
     mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchall()[0][0]
-    assert mx <= 250, f"explicit row-group ceiling not honored: max group {mx}"
+    assert mx <= 4096, f"explicit row-group ceiling not honored: max group {mx}"
 
 
 def test_maintain_honors_model_geometry(conn, monkeypatch):
@@ -2415,8 +2426,8 @@ def test_maintain_honors_model_geometry(conn, monkeypatch):
     # silently undo the config the write just honored. Force the compact trigger and check both the
     # policy's target and the compacted row-group ceiling.
     from dbt.adapters.duckrun import engine
-    conn.sql("CREATE OR REPLACE TABLE mgeo AS select i as j from range(100) t(i)")
-    conn.sql("INSERT INTO mgeo select i from range(100, 200) t(i)")
+    conn.sql("CREATE OR REPLACE TABLE mgeo AS select i as j from range(10000) t(i)")
+    conn.sql("INSERT INTO mgeo select i from range(10000, 20000) t(i)")
     loc = conn.root_path + "/dbo/mgeo"
     captured = {}
     real_policy = engine.MaintenancePolicy
@@ -2431,11 +2442,11 @@ def test_maintain_honors_model_geometry(conn, monkeypatch):
 
     monkeypatch.setattr(engine, "MaintenancePolicy", SpyPolicy)
     engine._maintain(conn._connection, loc, storage_options=conn.storage_options,
-                     target_file_size=64 * 1024 * 1024, row_group_cap=7)
+                     target_file_size=64 * 1024 * 1024, row_group_cap=4096)
     assert captured["target"] == 64 * 1024 * 1024
     live = engine._delta_table(loc, conn.storage_options).file_uris()
     mx = conn.sql(f"select max(row_group_num_rows) from parquet_metadata({live!r})").fetchall()[0][0]
-    assert mx <= 7, f"compaction ignored the explicit row-group cap: max group {mx}"
+    assert mx <= 4096, f"compaction ignored the explicit row-group cap: max group {mx}"
     # Unset -> the defaults, unchanged.
     engine._maintain(conn._connection, loc, storage_options=conn.storage_options)
     assert captured["target"] == engine._TARGET_FILE_SIZE
