@@ -349,6 +349,10 @@ jobs:
         run: |
           python -m pytest tests/integration_tests/multicatalog/test_four_part_names_onelake.py \
             -q -p no:cacheprovider
+      - name: Cross-workspace — LIVE OneLake (two lakehouses in two workspaces, join + write back)
+        run: |
+          python -m pytest tests/integration_tests/multicatalog/test_cross_workspace_onelake.py \
+            -q -p no:cacheprovider
       - name: Partition values DuckDB escapes — LIVE OneLake (DELETE / UPDATE / MERGE / OPTIMIZE)
         run: |
           python -m pytest tests/integration_tests/multicatalog/test_partition_paths_onelake.py \
