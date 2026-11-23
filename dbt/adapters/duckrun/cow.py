@@ -37,7 +37,6 @@ from .policy import DATA_PAGE_SIZE_LIMIT, DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DE
 DICTIONARY_SIZE_LIMIT = 16_000_000
 STATS_TRUNCATE_LENGTH = 64          # longest string stat kept (a longer max is dropped, min is cut)
 DEFAULT_NUM_INDEXED_COLS = 32       # delta.dataSkippingNumIndexedCols default (Delta protocol)
-VECTOR_ROWS = 2048                  # DuckDB's vector: the granularity of its row groups
 
 
 def _q(name: str) -> str:
@@ -210,10 +209,6 @@ def parquet_options(row_group_rows: Optional[int] = None,
     """The COPY options of the fixed read layout; ``row_group_rows`` / ``target_file_size`` are the
     per-model overrides (None keeps duckrun's defaults)."""
     rg = int(row_group_rows if row_group_rows is not None else ROW_GROUP_DEFAULT_ROWS)
-    # DuckDB closes a row group on a whole 2048-row vector, so the ceiling is the next vector
-    # multiple (4M -> 4,001,792), stated here rather than left to DuckDB. Rounding up, not down: a
-    # round row count (20M) then fills whole groups instead of leaving a runt tail group.
-    rg = max(VECTOR_ROWS, -(-rg // VECTOR_ROWS) * VECTOR_ROWS)
     return {
         "COMPRESSION": "snappy",
         "ROW_GROUP_SIZE": rg,
