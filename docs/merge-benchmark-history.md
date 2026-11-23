@@ -70,3 +70,4 @@ dispatch), newest at the bottom. Written by the `merge-spill` job; the live scor
 | 2026-10-18 | [#130](https://github.com/djouallah/duckrun/actions/runs/39098082147) | 9892ee3 | 1.5.6 | 1.5.0 | 10.0 | 60.0M | 7,304 MB | 1456s | ✅ |
 | 2026-10-22 | [#6](https://github.com/djouallah/duckrun/actions/runs/39745626961) | a98f1d3 | 2.0.0 | 1.5.0 | 10.0 | 60.0M | 9,074 MB | 1694s | ✅ |
 | 2026-10-22 | [#132](https://github.com/djouallah/duckrun/actions/runs/39753268397) | a98f1d3 | 2.0.0 | 1.5.0 | 10.0 | 60.0M | 8,964 MB | 1293s | ✅ |
+| 2026-11-23 | [#133](https://github.com/djouallah/duckrun/actions/runs/45277098077) | 993ad72 | 2.0.1 | 1.7.0 | 10.0 | 60.0M | 13,874 MB | 717s | ✅ |
