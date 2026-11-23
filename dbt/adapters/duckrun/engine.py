@@ -20,7 +20,7 @@ from deltalake.exceptions import CommitFailedError, TableNotFoundError
 
 from dbt.adapters.duckrun.policy import (MaintenancePolicy, CHECKPOINT_INTERVAL,
                                          DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS)
-from dbt.adapters.duckrun import sortkey
+from dbt.adapters.duckrun import cow, sortkey
 
 try:  # deltalake 1.x exposes WriterProperties at the top level
     from deltalake import WriterProperties
@@ -2540,6 +2540,152 @@ def _merge_partition_prune(dt: DeltaTable, data, predicate: str, streamed_exec: 
     return predicate
 
 
+class _CowUnsupported(Exception):
+    """A copy-on-write MERGE cannot express this statement in DuckDB; nothing was written."""
+
+
+def _cow_merge_clauses(clauses: List[dict], target_cols: List[str], source_cols: List[str]) -> str:
+    """The ``WHEN …`` clauses of a DuckDB ``MERGE`` equivalent to delta-rs clause dicts (see
+    :func:`merge_delta_clauses`). ``*_all`` actions name their columns explicitly — the target's
+    columns the source also carries, minus ``except_cols`` — exactly what delta-rs applies."""
+    src = {c.lower() for c in source_cols}
+
+    def cols(except_cols):
+        skip = {str(c).strip('"').lower() for c in (except_cols or [])}
+        return [c for c in target_cols if c.lower() in src and c.lower() not in skip]
+
+    out = []
+    for c in clauses:
+        kind = {"matched": "MATCHED", "not_matched": "NOT MATCHED",
+                "not_matched_by_source": "NOT MATCHED BY SOURCE"}[c["clause"]]
+        cond = f" AND ({c['predicate']})" if c.get("predicate") else ""
+        action = c["action"]
+        if action == "delete":
+            then = "DELETE"
+        elif action in ("update", "update_all"):
+            pairs = (list(c["updates"].items()) if action == "update" else
+                     [(quote_ident(k), f"source.{quote_ident(k)}") for k in cols(c.get("except_cols"))])
+            if not pairs:
+                raise _CowUnsupported("an UPDATE with no column to set")
+            then = "UPDATE SET " + ", ".join(f"{k} = {v}" for k, v in pairs)
+        elif action in ("insert", "insert_all"):
+            pairs = (list(c["updates"].items()) if action == "insert" else
+                     [(quote_ident(k), f"source.{quote_ident(k)}") for k in cols(c.get("except_cols"))])
+            if not pairs:
+                raise _CowUnsupported("an INSERT with no column")
+            then = (f"INSERT ({', '.join(k for k, _ in pairs)}) "
+                    f"VALUES ({', '.join(v for _, v in pairs)})")
+        else:
+            raise _CowUnsupported(f"merge action {action!r}")
+        out.append(f"WHEN {kind}{cond} THEN {then}")
+    return " ".join(out)
+
+
+def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read_version: int,
+              storage_options: Optional[Dict[str, str]] = None, sort_by=None,
+              row_group_rows: Optional[int] = None,
+              target_file_size: Optional[int] = None) -> bool:
+    """MERGE as copy-on-write: DuckDB finds the files the source touches, rewrites their rows with
+    its own ``MERGE`` (inserts included) and writes the parquet; delta-rs commits only the add +
+    remove actions, pinned to ``read_version``. Returns False, having written nothing, when the
+    table or the statement needs the delta-rs merge (the caller then runs it)."""
+    import duckdb
+
+    dt = _delta_table(path, storage_options)
+    dt.load_as_version(read_version)
+    why = cow.unsupported_reason(dt)
+    if why:
+        logger.info(f"merge: delta_rs path ({why})")
+        return False
+    src, touched, rows = tmp_name("cowsrc", path), tmp_name("cowfiles", path), tmp_name("cowrows", path)
+    scan = (f"delta_scan('{path.replace(chr(39), chr(39) * 2)}', version => {int(read_version)}, "
+            f"filename = true)")
+    data.create_view(src, replace=True)
+    try:
+        try:
+            by_source = any(c["clause"] == "not_matched_by_source" for c in clauses)
+            hit = ("" if by_source else
+                   f' AS target SEMI JOIN "{src}" AS source ON ({predicate})')
+            cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
+                        f"SELECT DISTINCT filename FROM {scan}{hit}")
+            cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT * EXCLUDE (filename) '
+                        f'FROM {scan} WHERE filename IN (SELECT filename FROM "{touched}")')
+            target_cols = [r[0] for r in cur.execute(f'DESCRIBE "{rows}"').fetchall()]
+            whens = _cow_merge_clauses(clauses, target_cols, list(data.columns))
+            cur.execute(f'MERGE INTO "{rows}" AS target USING "{src}" AS source '
+                        f"ON ({predicate}) {whens}")
+        except (_CowUnsupported, duckdb.Error) as e:
+            # Nothing is written before this point, so the delta-rs merge can still run it.
+            logger.info(f"merge: delta_rs path (DuckDB cannot run this merge: {e})")
+            return False
+        logger.info("merge: copy-on-write (DuckDB rewrite, delta_rs commit)")
+        cow.check_not_null(cur, f'"{rows}"', dt, "MERGE")
+        keys = [sort_by] if isinstance(sort_by, str) and sort_by != "auto" else (
+            list(sort_by) if isinstance(sort_by, (list, tuple)) else [])
+        order = ", ".join(quote_ident(c) for c in keys) or None   # keep the table's sort key
+        adds = cow.write_files(cur, f'"{rows}"', path, order_by=order, row_group_rows=row_group_rows,
+                               target_file_size=target_file_size,
+                               configuration=dt.metadata().configuration)
+        gone = [r[0] for r in cur.execute(f'SELECT filename FROM "{touched}"').fetchall()]
+        removes = cow.removes_for(cur, dt, gone)
+        if adds or removes:
+            cow.commit(dt, path, adds + removes, read_version=read_version, operation="MERGE")
+        return True
+    finally:
+        for name, kind in ((src, "VIEW"), (touched, "TABLE"), (rows, "TABLE")):
+            try:
+                cur.execute(f'DROP {kind} IF EXISTS "{name}"')
+            except Exception:  # pragma: no cover - scoped to this merge; a leftover is harmless
+                pass
+
+
+def cow_rewrite(cur, path: str, *, where: Optional[str], projection: str = "*",
+                delete: bool = False, alias: str = "", with_prefix: str = "", read_version: int,
+                storage_options: Optional[Dict[str, str]] = None, dt: Optional[DeltaTable] = None,
+                operation: str = "DML") -> bool:
+    """DELETE / UPDATE as copy-on-write: DuckDB rewrites only the files the predicate touches and
+    delta-rs commits the add + remove actions in one fenced transaction (see :mod:`cow`).
+    ``delete=True`` keeps the rows where ``where`` is not true; otherwise ``projection`` (a select
+    list over the scan, e.g. ``* replace (...)``) rewrites the touched files' rows. ``where=None``
+    touches every file. Returns False, having written nothing, when the table needs delta-rs."""
+    dt = dt if dt is not None else _delta_table(path, storage_options)
+    dt.load_as_version(read_version)
+    why = cow.unsupported_reason(dt)
+    if why:
+        logger.info(f"{operation.lower()}: delta_rs path ({why})")
+        return False
+    scan = (f"delta_scan('{path.replace(chr(39), chr(39) * 2)}', version => {int(read_version)}, "
+            f"filename = true)" + (f' AS "{alias}"' if alias else ""))
+    pred = f"({where}) IS TRUE" if where else "true"
+    touched, rows = tmp_name("cowfiles", path), tmp_name("cowrows", path)
+    try:
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
+                    f"{with_prefix}SELECT DISTINCT filename FROM {scan} WHERE {pred}")
+        gone = [r[0] for r in cur.execute(f'SELECT filename FROM "{touched}"').fetchall()]
+        if not gone:
+            return True        # nothing matched: no rewrite, no commit (as delta-rs skips empty DML)
+        files = f'filename IN (SELECT filename FROM "{touched}")'
+        if delete:
+            keep = f" AND ({where}) IS NOT TRUE" if where else " AND false"
+            body = f"SELECT * EXCLUDE (filename) FROM {scan} WHERE {files}{keep}"
+        else:
+            body = (f"SELECT {projection.replace('*', '* EXCLUDE (filename)', 1)} FROM {scan} "
+                    f"WHERE {files}")
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS {with_prefix}{body}')
+        logger.info(f"{operation.lower()}: copy-on-write (DuckDB rewrite, delta_rs commit)")
+        cow.check_not_null(cur, f'"{rows}"', dt, operation)
+        adds = cow.write_files(cur, f'"{rows}"', path, configuration=dt.metadata().configuration)
+        cow.commit(dt, path, adds + cow.removes_for(cur, dt, gone),
+                   read_version=read_version, operation=operation)
+        return True
+    finally:
+        for name in (touched, rows):
+            try:
+                cur.execute(f'DROP TABLE IF EXISTS "{name}"')
+            except Exception:  # pragma: no cover - a leftover temp table is harmless
+                pass
+
+
 def merge_delta_clauses(
     path: str,
     data,
@@ -2682,6 +2828,17 @@ def merge_delta_clauses(
                 cur.execute(f'DROP VIEW IF EXISTS "{src_view}"')
             except Exception:  # pragma: no cover - scoped to this write; a failed drop is harmless
                 pass
+
+    # Copy-on-write: DuckDB computes the merge and writes the parquet, delta_rs commits the file
+    # actions. Falls through (False) for a table shape or a statement it cannot express, and for an
+    # explicit streamed_exec=True request for delta_rs's own merge.
+    if (not streamed_exec and cur is not None and hasattr(data, "create_view")
+            and cow_merge(cur, path, data, predicate, clauses, read_version=effective_version,
+                          storage_options=storage_options, sort_by=sort_by,
+                          row_group_rows=row_group_rows, target_file_size=target_file_size)):
+        _maintain(cur, path, storage_options=storage_options,
+                  target_file_size=target_file_size, row_group_cap=row_group_rows)
+        return
 
     # One delta_rs merge at a time (see _MERGE_GATE): the spill caps are sized to the WHOLE
     # budget, not a 1/N share, so two merges running together would sum past it. The caps are

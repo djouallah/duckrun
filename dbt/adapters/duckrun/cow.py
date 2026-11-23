@@ -1,0 +1,305 @@
+"""Copy-on-write rewrites: DuckDB writes the parquet, delta-rs only commits.
+
+For an operation that rewrites existing data (MERGE, UPDATE, DELETE), DuckDB does the expensive
+work — the join, the rewrite of the touched files and the parquet encoding, spilling to disk as it
+needs — and delta-rs commits nothing but the file actions: the new files (``AddAction``) and the
+files they replace (``RemoveAction``), in ONE transaction pinned to the version the statement read
+(``create_write_transaction``, ``max_commit_retries=0``), so a concurrent commit fails it loudly.
+
+Internal module, not public API. Plain tables only: :func:`unsupported_reason` sends partitioned,
+column-mapped, deletion-vector, constrained and generated-column tables to the delta-rs path.
+"""
+import datetime as _dt
+import json
+import math
+import os
+import time
+import uuid
+from decimal import Decimal, InvalidOperation
+from typing import Dict, List, Optional, Sequence
+
+from deltalake import CommitProperties, DeltaTable
+from deltalake.exceptions import CommitFailedError
+from deltalake.transaction import AddAction, RemoveAction
+
+from .policy import DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DEFAULT_ROWS
+
+# The fixed read layout (Direct Lake / VertiPaq), measured on the writer_cold / writer_ab benchmarks:
+#   * DATA_PAGE_SIZE_LIMIT 1 MB — DuckDB's default page is far larger (duckdb#24507);
+#   * DICTIONARY_SIZE_LIMIT up to the row-group size, so every column stays dictionary-encoded;
+#   * PARQUET_VERSION V1 — a column that overflows its dictionary falls back to PLAIN;
+#   * no bloom filters — the delta-rs writer never wrote them (~30 MB on the aemo mart).
+DATA_PAGE_SIZE_LIMIT = 1_048_576
+DICTIONARY_SIZE_LIMIT = 16_000_000
+STATS_TRUNCATE_LENGTH = 64          # longest string stat kept (a longer max is dropped, min is cut)
+DEFAULT_NUM_INDEXED_COLS = 32       # delta.dataSkippingNumIndexedCols default (Delta protocol)
+
+
+def _q(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def _lit(s: str) -> str:
+    return "'" + str(s).replace("'", "''") + "'"
+
+
+def unsupported_reason(dt: DeltaTable) -> Optional[str]:
+    """Why a copy-on-write rewrite must not touch ``dt`` (None = it may): each case needs Delta
+    metadata or checks this writer does not produce — partition values, physical names,
+    deletion-vector-aware removes, constraint / invariant / generated / identity evaluation."""
+    md = dt.metadata()
+    conf = md.configuration or {}
+    if md.partition_columns:
+        return "partitioned"
+    if str(conf.get("delta.columnMapping.mode", "none")).lower() != "none":
+        return "column mapping"
+    if any(k.lower().startswith("delta.constraints.") for k in conf):
+        return "CHECK constraints"
+    if "deletionVectors" in (dt.protocol().reader_features or []):
+        return "deletion vectors"
+    schema_json = dt.schema().to_json()
+    for key, what in (('"delta.invariants"', "column invariants"),
+                      ('"delta.generationExpression"', "generated columns"),
+                      ('"delta.identity.', "identity columns")):
+        if key in schema_json:
+            return what
+    return None
+
+
+def parquet_options(row_group_rows: Optional[int] = None,
+                    target_file_size: Optional[int] = None) -> Dict[str, object]:
+    """The COPY options of the fixed read layout; ``row_group_rows`` / ``target_file_size`` are the
+    per-model overrides (None keeps duckrun's defaults)."""
+    rg = int(row_group_rows if row_group_rows is not None else ROW_GROUP_DEFAULT_ROWS)
+    return {
+        "COMPRESSION": "snappy",
+        "ROW_GROUP_SIZE": rg,
+        "FILE_SIZE_BYTES": int(target_file_size if target_file_size is not None
+                               else DEFAULT_TARGET_FILE_SIZE),
+        "DATA_PAGE_SIZE_LIMIT": DATA_PAGE_SIZE_LIMIT,
+        # A row group never holds more distinct values than rows; DuckDB preallocates from the limit.
+        "DICTIONARY_SIZE_LIMIT": min(DICTIONARY_SIZE_LIMIT, rg),
+        "PARQUET_VERSION": "V1",
+        "WRITE_BLOOM_FILTER": "false",
+    }
+
+
+# --- stats ---------------------------------------------------------------------------------------
+_INT_TYPES = {"TINYINT", "SMALLINT", "INTEGER", "BIGINT"}
+_FLOAT_TYPES = {"FLOAT", "DOUBLE"}
+
+
+class _Raw(str):
+    """A JSON number emitted verbatim (decimals: exact digits, no float round trip)."""
+
+
+def _stat_value(duck_type: str, s: str):
+    """One footer stat string as its Delta JSON value, or None when it can't be spelled exactly."""
+    t = duck_type.upper()
+    try:
+        if t in _INT_TYPES:
+            return int(s)
+        if t in _FLOAT_TYPES:
+            v = float(s)
+            return v if math.isfinite(v) else None
+        if t.startswith("DECIMAL"):
+            d = Decimal(s)
+            return _Raw(format(d, "f")) if d.is_finite() else None
+        if t == "DATE":
+            return _dt.date.fromisoformat(s).isoformat()
+        if t == "TIMESTAMP WITH TIME ZONE":
+            v = _dt.datetime.fromisoformat(s.replace(" ", "T"))
+            if v.tzinfo is None:
+                return None
+            v = v.astimezone(_dt.timezone.utc).replace(tzinfo=None)
+            return v.isoformat(timespec="microseconds") + "Z"
+        if t == "TIMESTAMP":
+            return _dt.datetime.fromisoformat(s.replace(" ", "T")).isoformat(timespec="microseconds")
+        if t == "VARCHAR":
+            return s
+    except (ValueError, InvalidOperation, OverflowError):
+        return None
+    return None  # BOOLEAN, BLOB, nested, time, interval, … — no min/max stat
+
+
+def _json(v) -> str:
+    if isinstance(v, _Raw):
+        return str(v)
+    return json.dumps(v, ensure_ascii=False, allow_nan=False)
+
+
+def _obj(d: Dict[str, object]) -> str:
+    return "{" + ",".join(f"{json.dumps(k, ensure_ascii=False)}:{_json(v)}" for k, v in d.items()) + "}"
+
+
+def _stat_key(raw_key: str) -> Optional[str]:
+    """``'"col"'`` → ``col``; a nested path (``'"s"."a"'``, list elements) → None (top level only)."""
+    k = raw_key
+    if not (len(k) >= 2 and k[0] == '"' and k[-1] == '"'):
+        return None
+    inner = k[1:-1]
+    if inner.replace('""', "").count('"'):
+        return None
+    return inner.replace('""', '"')
+
+
+def _is_nested(duck_type: str) -> bool:
+    t = str(duck_type).strip().upper()
+    return t.startswith(("STRUCT", "MAP", "UNION")) or t.endswith("]")
+
+
+def stats_json(num_records: int, column_statistics: Optional[Dict[str, Dict[str, str]]],
+               col_types: Dict[str, str], indexed: Optional[Sequence[str]] = None) -> str:
+    """Delta ``stats`` JSON for one file from DuckDB's ``RETURN_STATS`` ``column_statistics``. Each
+    rule picks "no stat" over a wrong one (a wrong stat silently prunes live rows; a missing one only
+    costs pruning): a non-exact max is dropped, a long string min is cut and such a max dropped,
+    NaN / infinities / unparseable values are dropped, nested columns get none."""
+    mins: Dict[str, object] = {}
+    maxs: Dict[str, object] = {}
+    nulls: Dict[str, int] = {}
+    allowed = None if indexed is None else set(indexed)
+    for raw_key, st in (column_statistics or {}).items():
+        col = _stat_key(raw_key)
+        if col is None or col not in col_types or (allowed is not None and col not in allowed):
+            continue
+        t = col_types[col]
+        if _is_nested(t):
+            continue
+        if "null_count" in st:
+            try:
+                nulls[col] = int(st["null_count"])
+            except ValueError:
+                pass
+        if str(st.get("has_nan", "false")).lower() == "true":
+            continue
+        if "min" in st:
+            v = _stat_value(t, st["min"])
+            if isinstance(v, str) and t.upper() == "VARCHAR" and len(v) > STATS_TRUNCATE_LENGTH:
+                v = v[:STATS_TRUNCATE_LENGTH]
+            if v is not None:
+                mins[col] = v
+        if "max" in st and str(st.get("max_is_exact", "true")).lower() == "true":
+            v = _stat_value(t, st["max"])
+            if isinstance(v, str) and t.upper() == "VARCHAR" and len(v) > STATS_TRUNCATE_LENGTH:
+                v = None
+            if v is not None:
+                maxs[col] = v
+    return ("{" + f'"numRecords":{int(num_records)},"minValues":{_obj(mins)},'
+            f'"maxValues":{_obj(maxs)},"nullCount":{_obj(nulls)}' + "}")
+
+
+def indexed_columns(columns: Sequence[str],
+                    configuration: Optional[Dict[str, Optional[str]]]) -> Optional[List[str]]:
+    """The columns that get stats, per ``delta.dataSkippingStatsColumns`` (an explicit list wins) or
+    ``delta.dataSkippingNumIndexedCols`` (first N, default 32; -1 = all). None means all."""
+    cfg = configuration or {}
+    explicit = cfg.get("delta.dataSkippingStatsColumns")
+    if explicit:
+        wanted = {c.strip().strip("`").lower() for c in explicit.split(",") if c.strip()}
+        return [c for c in columns if c.lower() in wanted]
+    try:
+        n = int(cfg.get("delta.dataSkippingNumIndexedCols") or DEFAULT_NUM_INDEXED_COLS)
+    except ValueError:
+        n = DEFAULT_NUM_INDEXED_COLS
+    return None if n < 0 else list(columns)[:n]
+
+
+# --- write ---------------------------------------------------------------------------------------
+def _rel_path(filename: str, loc: str) -> str:
+    """``filename`` (as COPY reports it) relative to the table root ``loc`` — the Delta add path."""
+    f = filename.replace("\\", "/")
+    root = loc.replace("\\", "/").rstrip("/") + "/"
+    if f.startswith(root):
+        return f[len(root):]
+    try:
+        rel = os.path.relpath(f, loc).replace("\\", "/")
+    except ValueError:
+        rel = None
+    if rel is None or rel == ".." or rel.startswith("../"):
+        raise RuntimeError(f"duckrun: COPY wrote {filename!r} outside the table root {loc!r}")
+    return rel
+
+
+def _remove_quietly(filename: str) -> None:
+    """Delete an orphan file DuckDB wrote (an empty input still produces a 0-row parquet). Best
+    effort: an unreferenced file is harmless — vacuum collects it."""
+    try:
+        if "://" not in filename:
+            os.remove(filename)
+    except OSError:
+        pass
+
+
+def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
+                row_group_rows: Optional[int] = None, target_file_size: Optional[int] = None,
+                configuration: Optional[Dict[str, Optional[str]]] = None) -> List[AddAction]:
+    """Write DuckDB table ``table`` under ``loc`` with ONE ``COPY`` in the fixed read layout and
+    return one ``AddAction`` per non-empty file. Nothing is committed here: until :func:`commit`
+    lands them the files are invisible to readers, and an aborted write leaves only unreferenced
+    files that vacuum collects."""
+    desc = cur.execute(f"DESCRIBE {table}").fetchall()
+    col_types = {r[0]: str(r[1]) for r in desc}
+    indexed = indexed_columns(list(col_types), configuration)
+    opt_sql = ", ".join(f"{k} {v}" for k, v in parquet_options(row_group_rows, target_file_size).items())
+    tag = uuid.uuid4().hex[:8]
+    if "://" not in loc:  # local table root: COPY creates the target dir but not its parents
+        os.makedirs(loc, exist_ok=True)
+    order = f" ORDER BY {order_by}" if order_by else ""
+    rows = cur.execute(
+        f"COPY (SELECT * FROM {table}{order}) TO {_lit(loc.rstrip('/'))} "
+        f"(FORMAT parquet, {opt_sql}, APPEND, FILENAME_PATTERN 'part-{tag}-{{uuid}}', RETURN_STATS)"
+    ).fetchall()
+    now_ms = int(time.time() * 1000)
+    adds: List[AddAction] = []
+    for filename, count, size, _footer, colstats, *_ in rows:
+        if not count:
+            _remove_quietly(filename)
+            continue
+        adds.append(AddAction(path=_rel_path(filename, loc), size=int(size), partition_values={},
+                              modification_time=now_ms, data_change=True,
+                              stats=stats_json(count, colstats, col_types, indexed)))
+    return adds
+
+
+def removes_for(cur, dt: DeltaTable, filenames: Sequence[str]) -> List[RemoveAction]:
+    """``RemoveAction`` for each live data file named in ``filenames`` (full paths, as
+    ``delta_scan(..., filename = true)`` reports them), matched on the file name."""
+    from urllib.parse import unquote
+
+    wanted = {f.replace("\\", "/").rsplit("/", 1)[-1] for f in filenames}
+    now_ms = int(time.time() * 1000)
+    out = []
+    add_actions = dt.get_add_actions(flatten=True)  # noqa: F841 - read below by DuckDB's replacement scan
+    for rel, size in cur.sql("SELECT path, size_bytes FROM add_actions").fetchall():
+        if unquote(rel).rsplit("/", 1)[-1] in wanted:
+            out.append(RemoveAction(path=rel, data_change=True, deletion_timestamp=now_ms,
+                                    size=int(size), partition_values={}))
+    if len(out) != len(wanted):
+        raise RuntimeError(f"duckrun: {len(wanted) - len(out)} rewritten file(s) are not live in "
+                           f"version {dt.version()}; refusing to commit")
+    return out
+
+
+def check_not_null(cur, table: str, dt: DeltaTable, operation: str) -> None:
+    """Fail before anything is written when the rewrite would put a NULL in a NOT NULL column —
+    the check delta-rs's writer applied."""
+    for f in dt.schema().fields:
+        if not f.nullable:
+            n = cur.execute(f"SELECT count(*) FROM {table} WHERE {_q(f.name)} IS NULL").fetchone()[0]
+            if n:
+                raise ValueError(f"{operation} would write {n} NULL(s) into NOT NULL column {f.name!r}")
+
+
+def commit(dt: DeltaTable, path: str, actions: list, *, read_version: int, operation: str) -> None:
+    """Commit ``actions`` as ONE transaction pinned to ``read_version`` (``dt`` must be loaded at
+    it) with no rebase: a commit that landed since then fails this one loudly."""
+    props = CommitProperties(max_commit_retries=0, custom_metadata={
+        "duckrun.readVersion": str(read_version), "duckrun.operation": operation})
+    try:
+        dt.create_write_transaction(actions, mode="append", schema=dt.schema(),
+                                    commit_properties=props)
+    except CommitFailedError as e:
+        raise CommitFailedError(
+            f"{operation.lower()}: table '{path}' changed since version {read_version} "
+            f"(a concurrent write committed); {operation.lower()} refused. Re-read and retry."
+        ) from e

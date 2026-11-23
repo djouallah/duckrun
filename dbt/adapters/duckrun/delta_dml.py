@@ -1650,6 +1650,14 @@ class _DeltaDML:
         # A leading `WITH …` (CTE the predicate references via a subquery) can only be evaluated by
         # DuckDB, so force the overwrite fallback and re-attach the CTE to its read.
         with_prefix = f"{self._with_clause} " if self._with_clause else ""
+        # Copy-on-write: DuckDB evaluates the predicate (subqueries and CTEs included), rewrites only
+        # the touched files, and delta-rs commits the add/remove actions. False = a table shape it
+        # does not cover; the delta-rs paths below run instead.
+        if engine.cow_rewrite(self.cursor, loc, where=where, delete=True, alias=tname,
+                              with_prefix=with_prefix, read_version=self._vB(loc),
+                              storage_options=self.so, dt=self._pinned(loc), operation="DELETE"):
+            engine._maintain(self.cursor, loc, storage_options=self.so)
+            return
         if where and (self._with_clause or _PREDICATE_SUBQUERY.search(where)):
             # delta_rs's delete(predicate) can't evaluate a predicate that references ANOTHER table
             # via subquery (`… in (select … from other)`): its datafusion expr engine raises a Rust
@@ -1719,6 +1727,16 @@ class _DeltaDML:
         # A leading `WITH …` (CTE referenced by the SET exprs or predicate via a subquery) can only be
         # evaluated by DuckDB, so force the overwrite fallback and re-attach the CTE to its read.
         with_prefix = f"{self._with_clause} " if self._with_clause else ""
+        # Copy-on-write first (see _delete): the touched files' rows get CASE WHEN (pred) THEN expr.
+        cow_replaces = ", ".join(
+            (f'CASE WHEN ({where}) THEN ({expr}) ELSE "{col}" END AS "{col}"' if where
+             else f'({expr}) AS "{col}"')
+            for col, expr in updates.items())
+        if engine.cow_rewrite(self.cursor, loc, where=where, projection=f"* replace ({cow_replaces})",
+                              alias=tname, with_prefix=with_prefix, read_version=self._vB(loc),
+                              storage_options=self.so, dt=self._pinned(loc), operation="UPDATE"):
+            engine._maintain(self.cursor, loc, storage_options=self.so)
+            return
         if where is None or self._with_clause or (where and _PREDICATE_SUBQUERY.search(where)) or \
                 any(_PREDICATE_SUBQUERY.search(e) for e in updates.values()):
             # Route to a DuckDB-evaluated fenced overwrite (instead of delta_rs's dt.update) in two cases:
