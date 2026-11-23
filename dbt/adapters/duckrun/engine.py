@@ -2588,38 +2588,53 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
     """MERGE as copy-on-write: DuckDB finds the files the source touches, rewrites their rows with
     its own ``MERGE`` (inserts included) and writes the parquet; delta-rs commits only the add +
     remove actions, pinned to ``read_version``. Returns False, having written nothing, when the
-    table or the statement needs the delta-rs merge (the caller then runs it)."""
-    import duckdb
+    table or the statement needs the delta-rs merge (the caller then runs it).
 
+    Everything that can refuse the statement is decided BEFORE anything executes: the table shape,
+    and a bind-only check (``cur.sql``) of every expression. A failed statement inside dbt's open
+    transaction aborts it, so the fallback must never be a caught execution error — once the
+    statement runs, an error fails it loudly."""
     dt = _delta_table(path, storage_options)
     dt.load_as_version(read_version)
     why = cow.unsupported_reason(dt)
     if why:
         logger.info(f"merge: delta_rs path ({why})")
         return False
-    src, touched, rows = tmp_name("cowsrc", path), tmp_name("cowfiles", path), tmp_name("cowrows", path)
+    try:
+        source = f"({data.sql_query()})"      # the source as SQL: no view to register or drop
+    except Exception as e:
+        logger.info(f"merge: delta_rs path (the source is not a SQL relation: {e})")
+        return False
     scan = (f"delta_scan('{path.replace(chr(39), chr(39) * 2)}', version => {int(read_version)}, "
             f"filename = true)")
-    cow.temp_view(data, src)
+    exprs = [predicate] + [c["predicate"] for c in clauses if c.get("predicate")] + [
+        v for c in clauses for v in (c.get("updates") or {}).values()]
     try:
+        # Bind only (cur.sql does not execute): a predicate or expression DuckDB rejects raises here.
+        target_cols = list(cur.sql(f"SELECT * EXCLUDE (filename) FROM {scan}").columns)
+        cur.sql(f"SELECT {', '.join(f'({x})' for x in exprs)} FROM {scan} AS target, "
+                f"{source} AS source")
+        whens = _cow_merge_clauses(clauses, target_cols, list(data.columns))
+    except Exception as e:
+        logger.info(f"merge: delta_rs path (DuckDB cannot run this merge: {e})")
+        return False
+    touched, rows = tmp_name("cowfiles", path), tmp_name("cowrows", path)
+    try:
+        by_source = any(c["clause"] == "not_matched_by_source" for c in clauses)
+        hit = "" if by_source else f" AS target SEMI JOIN {source} AS source ON ({predicate})"
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
+                    f"SELECT DISTINCT filename FROM {scan}{hit}")
+        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT * EXCLUDE (filename) '
+                    f'FROM {scan} WHERE filename IN (SELECT filename FROM "{touched}")')
         try:
-            by_source = any(c["clause"] == "not_matched_by_source" for c in clauses)
-            hit = ("" if by_source else
-                   f' AS target SEMI JOIN "{src}" AS source ON ({predicate})')
-            cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
-                        f"SELECT DISTINCT filename FROM {scan}{hit}")
-            cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT * EXCLUDE (filename) '
-                        f'FROM {scan} WHERE filename IN (SELECT filename FROM "{touched}")')
-            target_cols = [r[0] for r in cur.execute(f'DESCRIBE "{rows}"').fetchall()]
-            whens = _cow_merge_clauses(clauses, target_cols, list(data.columns))
-            cur.execute(f'MERGE INTO "{rows}" AS target USING "{src}" AS source '
-                        f"ON ({predicate}) {whens}")
-            cow.apply_table_rules(cur, f'"{rows}"', dt, "MERGE")
-        except (_CowUnsupported, cow.Unsupported, duckdb.Error) as e:
-            # Nothing is written before this point, so the delta-rs merge can still run it.
-            logger.info(f"merge: delta_rs path (DuckDB cannot run this merge: {e})")
+            cow.check_table_rules(cur, f'"{rows}"', dt)
+        except cow.Unsupported as e:
+            logger.info(f"merge: delta_rs path ({e})")
             return False
         logger.info("merge: copy-on-write (DuckDB rewrite, delta_rs commit)")
+        cur.execute(f'MERGE INTO "{rows}" AS target USING {source} AS source '
+                    f"ON ({predicate}) {whens}")
+        cow.apply_table_rules(cur, f'"{rows}"', dt, "MERGE")
         cow.check_not_null(cur, f'"{rows}"', dt, "MERGE")
         keys = [sort_by] if isinstance(sort_by, str) and sort_by != "auto" else (
             list(sort_by) if isinstance(sort_by, (list, tuple)) else [])
@@ -2635,9 +2650,9 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
             cow.commit(dt, path, adds + removes, read_version=read_version, operation="MERGE")
         return True
     finally:
-        for name, kind in ((src, "VIEW"), (touched, "TABLE"), (rows, "TABLE")):
+        for name in (touched, rows):
             try:
-                cur.execute(f'DROP {kind} IF EXISTS "{name}"')
+                cur.execute(f'DROP TABLE IF EXISTS "{name}"')
             except Exception:  # pragma: no cover - scoped to this merge; a leftover is harmless
                 pass
 
@@ -2676,10 +2691,11 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], projection: str = "*",
                     f"WHERE {files}")
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS {with_prefix}{body}')
         try:
-            cow.apply_table_rules(cur, f'"{rows}"', dt, operation)
+            cow.check_table_rules(cur, f'"{rows}"', dt)
         except cow.Unsupported as e:
             logger.info(f"{operation.lower()}: delta_rs path ({e})")
             return False
+        cow.apply_table_rules(cur, f'"{rows}"', dt, operation)
         logger.info(f"{operation.lower()}: copy-on-write (DuckDB rewrite, delta_rs commit)")
         cow.check_not_null(cur, f'"{rows}"', dt, operation)
         adds = cow.write_files(cur, f'"{rows}"', path,

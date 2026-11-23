@@ -48,14 +48,6 @@ def _lit(s: str) -> str:
     return "'" + str(s).replace("'", "''") + "'"
 
 
-def temp_view(rel, name: str) -> None:
-    """Register ``rel`` as a TEMP view ``name`` on its own connection. Not ``rel.create_view``: that
-    makes a persistent view in the default catalog, which inside dbt's transaction marks that catalog
-    written — and DuckDB lets one transaction write one attached database, so a model in another
-    catalog then fails. ``rel.query`` creates the view as TEMP; the relation it returns is unused."""
-    rel.query(name, f"SELECT * FROM {_q(name)} LIMIT 0")
-
-
 # Writer features a plain add/remove commit leaves intact. Anything else (row tracking, domain
 # metadata, in-commit timestamps, clustering, …) asks the writer for more, so delta-rs writes it.
 _WRITABLE_FEATURES = {"appendOnly", "invariants", "checkConstraints", "changeDataFeed",
@@ -121,13 +113,9 @@ class Unsupported(Exception):
     SQL); nothing has been written, so the statement can still run on delta-rs."""
 
 
-def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
-    """Make the rows about to be written obey the table's rules, as delta-rs's writer did:
-    generated columns are recomputed from their expressions; CHECK constraints
-    (``delta.constraints.*``) and column invariants fail the statement on a violating row (a NULL
-    result passes, as in SQL). Raises :class:`Unsupported` when DuckDB cannot evaluate one."""
-    import duckdb
-
+def _table_rules(dt: DeltaTable):
+    """``(checks, generated)``: the CHECK constraints and invariants as ``(what, expr)``, and the
+    generated columns as ``(name, expr)``."""
     conf = dt.metadata().configuration or {}
     checks = [(f"CHECK constraint {k.split('.', 2)[2]}", v) for k, v in conf.items()
               if k.lower().startswith("delta.constraints.")]
@@ -139,37 +127,39 @@ def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
                            json.loads(md["delta.invariants"])["expression"]["expression"]))
         if md.get("delta.generationExpression"):
             generated.append((f.name, md["delta.generationExpression"]))
-    violations = []
+    return checks, generated
+
+
+def check_table_rules(cur, table: str, dt: DeltaTable) -> None:
+    """Raise :class:`Unsupported` when DuckDB cannot evaluate one of the table's rule expressions
+    (Spark SQL) over ``table``. Bind only (``cur.sql`` does not execute), so a refusal leaves an open
+    transaction usable for the delta-rs path."""
+    checks, generated = _table_rules(dt)
+    exprs = [x for _, x in checks] + [x for _, x in generated]
+    if not exprs:
+        return
     try:
-        types = {r[0]: str(r[1]) for r in cur.execute(f"DESCRIBE {table}").fetchall()}
-        for name, expr in generated:
-            cur.execute(f"UPDATE {table} SET {_q(name)} = CAST(({expr}) AS {types[name]})")
-        for what, expr in checks:
-            n = cur.execute(f"SELECT count(*) FROM {table} WHERE ({expr}) IS FALSE").fetchall()[0][0]
-            if n:
-                violations.append(f"{what} ({expr}) fails on {n} row(s)")
-    except duckdb.Error as e:
+        cur.sql(f"SELECT {', '.join(f'({x})' for x in exprs)} FROM {table}")
+    except Exception as e:
         raise Unsupported(f"DuckDB cannot evaluate a table rule: {e}") from e
+
+
+def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
+    """Make the rows about to be written obey the table's rules, as delta-rs's writer did:
+    generated columns are recomputed from their expressions; CHECK constraints and column
+    invariants fail the statement on a violating row (a NULL result passes, as in SQL). Run
+    :func:`check_table_rules` first."""
+    checks, generated = _table_rules(dt)
+    types = {r[0]: str(r[1]) for r in cur.execute(f"DESCRIBE {table}").fetchall()}
+    for name, expr in generated:
+        cur.execute(f"UPDATE {table} SET {_q(name)} = CAST(({expr}) AS {types[name]})")
+    violations = []
+    for what, expr in checks:
+        n = cur.execute(f"SELECT count(*) FROM {table} WHERE ({expr}) IS FALSE").fetchall()[0][0]
+        if n:
+            violations.append(f"{what} ({expr}) fails on {n} row(s)")
     if violations:
         raise ValueError(f"{operation} refused: " + "; ".join(violations))
-
-
-def parquet_options(row_group_rows: Optional[int] = None,
-                    target_file_size: Optional[int] = None) -> Dict[str, object]:
-    """The COPY options of the fixed read layout; ``row_group_rows`` / ``target_file_size`` are the
-    per-model overrides (None keeps duckrun's defaults)."""
-    rg = int(row_group_rows if row_group_rows is not None else ROW_GROUP_DEFAULT_ROWS)
-    return {
-        "COMPRESSION": "snappy",
-        "ROW_GROUP_SIZE": rg,
-        "FILE_SIZE_BYTES": int(target_file_size if target_file_size is not None
-                               else DEFAULT_TARGET_FILE_SIZE),
-        "DATA_PAGE_SIZE_LIMIT": DATA_PAGE_SIZE_LIMIT,
-        # A row group never holds more distinct values than rows; DuckDB preallocates from the limit.
-        "DICTIONARY_SIZE_LIMIT": min(DICTIONARY_SIZE_LIMIT, rg),
-        "PARQUET_VERSION": "V1",
-        "WRITE_BLOOM_FILTER": "false",
-    }
 
 
 # --- stats ---------------------------------------------------------------------------------------
