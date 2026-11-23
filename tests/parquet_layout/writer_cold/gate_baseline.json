@@ -1,8 +1,12 @@
 {
   "factor": 2.0,
-  "note": "Cold Direct Lake probe baselines (ms) for the release gate: a probe fails above factor x its baseline. duckdb = duckrun's copy-on-write writer (writer_cold run 45134224897, duckdb_cli=cow). deltars = the top of delta-rs's spread across nine runs (0.9-2.3 s). Raise a baseline only on purpose, in its own commit, with the run that justifies it.",
+  "note": "Cold Direct Lake probe baselines (ms) for the release gate: a probe fails above factor x its baseline. duckdb = duckrun's copy-on-write writer (writer_cold run 45134224897, duckdb_cli=cow). deltars = duckrun's CTAS (build_auto_sort.py), which since 0.5.8 writes with DuckDB and only commits with delta-rs (writer_cold run 45171844520; the delta-rs writer's old spread was 0.9-2.3 s). Raise a baseline only on purpose, in its own commit, with the run that justifies it.",
   "arms": {
-    "duckdb": {"probe_duid": 482.0},
-    "deltars": {"probe_duid": 2300.0}
+    "duckdb": {
+      "probe_duid": 482.0
+    },
+    "deltars": {
+      "probe_duid": 866.4
+    }
   }
 }
