@@ -25,7 +25,7 @@ pip install "duckrun[dbt]"   # brings dbt-duckdb, duckdb, deltalake at the right
 ```
 
 Do NOT separately pin `duckdb` or `deltalake` in your requirements — duckrun sets a
-`duckdb>=2.0.0` floor and pins `deltalake` exactly, for documented upstream-bug reasons, and
+`duckdb>=2.0.1` floor and a `deltalake>=1.7.0` floor, for documented upstream-bug reasons, and
 overriding them is the most common way to break a project.
 
 ```yaml

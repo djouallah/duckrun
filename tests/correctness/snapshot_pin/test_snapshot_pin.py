@@ -262,7 +262,7 @@ def test_insert_only_merge_clauses_match_the_insert_strategy(tmp_path):
     assert _dbt(wh, "events_insert_clauses").success          # seed ids 1..10
     assert _dbt(wh, "events_insert_clauses").success          # batch: id=1 skipped, id=11 inserted
     assert _rows(path) == {**_seed_rows(), 11: 110}
-    assert DeltaTable(path).history(1)[0]["operation"] == "WRITE"
+    assert next(DeltaTable(path).history(1))["operation"] == "WRITE"
 
 
 def test_insert_race_is_fenced(tmp_path):

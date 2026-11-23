@@ -1268,7 +1268,7 @@ def table_history(path: str, storage_options: Optional[Dict[str, str]] = None,
                   limit: Optional[int] = None) -> List[Dict]:
     """Delta commit history (delta_rs ``DeltaTable.history``) — newest first; each entry is a dict
     with ``version``, ``timestamp``, ``operation``, etc. ``limit`` caps how many commits are read."""
-    return _delta_table(path, storage_options).history(limit)
+    return list(_delta_table(path, storage_options).history(limit))
 
 
 def convert_to_delta(path: str, storage_options: Optional[Dict[str, str]] = None,

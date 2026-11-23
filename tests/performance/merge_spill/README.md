@@ -39,4 +39,4 @@ python tests/performance/merge_spill/merge_tpch_bench.py --dir /tmp/merge_onelak
 ```
 
 CI: the heavy SF=10 run is the local release gate (`local_stress_tests.yml`); the SF=1 OneLake smoke
-runs in `integration_tests_onelake.yml`. Requires `deltalake == 1.5.0` (1.6.0's MERGE is broken at scale).
+runs in `integration_tests_onelake.yml`. Requires `deltalake >= 1.7.0` (duckrun's floor).

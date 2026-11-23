@@ -1171,7 +1171,7 @@ def test_create_coldefs_empty_and_logs_create_table(tmp_path):
     # A bare CREATE TABLE records a CREATE TABLE op, NOT a WRITE/Overwrite (that's CREATE OR REPLACE).
     c.sql("create table fresh (i integer)")
     dt = deltalake.DeltaTable(c._table_path("dbo", "fresh"))
-    assert dt.history(1000)[-1]["operation"] == "CREATE TABLE"   # history newest-first; oldest = create
+    assert list(dt.history(1000))[-1]["operation"] == "CREATE TABLE"   # history newest-first; oldest = create
 
 
 def test_drop_tombstones_without_deleting_data(tmp_path):

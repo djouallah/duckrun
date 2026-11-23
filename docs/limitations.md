@@ -21,8 +21,8 @@ Everything else carries over: `DuckrunCredentials` subclasses dbt-duckdb's, so t
 
 ## Setup & versions
 
-- **Needs `duckdb >= 2.0.0`.** Older builds, including Microsoft Fabric's bundled runtime, fail loud at `connect()`. In a Fabric notebook: `!pip install duckrun --upgrade`, then restart.
-- **Pins `deltalake == 1.5.0`.** delta-rs 1.6.0's MERGE is broken at scale, and delta-rs `> 1.5.0` breaks bulk delete on OneLake (*"Either WorkspaceId or ArtifactId are missing in the request"*, [delta-rs #4401](https://github.com/delta-io/delta-rs/issues/4401)), which `vacuum` needs.
+- **Needs `duckdb >= 2.0.1`.** Older builds, including Microsoft Fabric's bundled runtime, fail loud at `connect()`. In a Fabric notebook: `!pip install duckrun --upgrade`, then restart.
+- **Needs `deltalake >= 1.7.0`.** 1.6.3–1.6.6 list the parquet dictionary page last in `encoding_stats`, which makes Direct Lake read their files ~3x slower ([#84](https://github.com/djouallah/duckrun/issues/84)); 1.7.0 ships the fix.
 
 ## Microsoft Fabric / OneLake
 
