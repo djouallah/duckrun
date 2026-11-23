@@ -1098,7 +1098,7 @@ class DuckSession:
         finally:
             if staged is not None:
                 self.con.execute(f"DROP TABLE IF EXISTS {staged}")
-        if handled and is_write and tparts and write_cat in self._alias_of:
+        if handled and tparts and write_cat in self._alias_of:      # DROP TABLE included
             # The router registered the view under the name the statement used; the table has a twin
             # under its other name (cat.schema.table <-> ws.lh.schema.table) — bring that one along.
             schema = default_schema if len(tparts) == 1 else tparts[-2]
