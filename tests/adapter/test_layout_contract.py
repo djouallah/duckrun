@@ -106,7 +106,7 @@ def _descents(files, where: str = "true") -> int:
         f"SELECT count(*) FROM (SELECT k, id, lag(k) OVER w AS pk, lag(id) OVER w AS pid FROM "
         f"(SELECT * FROM read_parquet([{lit}], filename = true, file_row_number = true) "
         f"WHERE {where}) WINDOW w AS (PARTITION BY filename ORDER BY file_row_number)) "
-        f"WHERE (k, id) < (pk, pid)").fetchall()[0][0]
+        f"WHERE pk IS NOT NULL AND (k, id) < (pk, pid)").fetchall()[0][0]
 
 
 def _assert_contract(path, new, *, full=True):
