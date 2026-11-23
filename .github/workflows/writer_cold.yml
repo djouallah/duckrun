@@ -42,7 +42,7 @@ on:
         type: string
         default: ""
       duckdb_cli:
-        description: "[duckdb arm] URL of a DuckDB CLI binary (or .gz/.zip of one) to WRITE with instead of the pip package -- how an unreleased writer patch gets its DAX before/after: the fork's CI builds the CLI, the pip duckdb only stages source rows locally, the CLI does the sort+COPY with identical options, and the shared upload+commit+probe path is unchanged. Empty = the pip writer."
+        description: "[duckdb arm] URL of a DuckDB CLI binary (or .gz/.zip of one) to WRITE with instead of the pip package -- how an unreleased writer patch gets its DAX before/after: the fork's CI builds the CLI, the pip duckdb only stages source rows locally, the CLI does the sort+COPY with identical options, and the shared upload+commit+probe path is unchanged. Empty = the pip writer. 'cow' = duckrun's copy-on-write writer (cow.write_files, its production layout; the geometry knobs do not apply)."
         type: string
         default: ""
       opt_derived:
@@ -302,8 +302,8 @@ jobs:
           OPT_DICT_SORTED: ${{ inputs.opt_dict_sorted }}
           OPT_PAGE_STATS: ${{ inputs.opt_page_stats }}
           OPT_DICT_LIMIT: ${{ inputs.opt_dict_limit }}
-          OPT_WRITER: ${{ inputs.duckdb_cli != '' && 'cli' || 'duckdb' }}
-          OPT_DUCKDB_CLI: ${{ inputs.duckdb_cli }}
+          OPT_WRITER: ${{ inputs.duckdb_cli == 'cow' && 'cow' || (inputs.duckdb_cli != '' && 'cli' || 'duckdb') }}
+          OPT_DUCKDB_CLI: ${{ inputs.duckdb_cli != 'cow' && inputs.duckdb_cli || '' }}
           OPT_THREADS: ${{ inputs.opt_threads }}
           OPT_RG: ${{ inputs.opt_rg }}
           OPT_SORT: ${{ inputs.opt_sort }}

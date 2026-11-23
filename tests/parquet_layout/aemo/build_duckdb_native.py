@@ -110,8 +110,9 @@ _DD_CODEC = "uncompressed" if COMPRESSION in ("uncompressed", "none") else COMPR
 # that delta-rs writes through. It is the experiment that splits "DuckDB encodes something the
 # consumer dislikes" from "the consumer has a fast path only parquet-rs output hits".
 WRITER = (os.environ.get("OPT_WRITER") or "duckdb").strip().lower()
-if WRITER not in ("duckdb", "pyarrow", "cli"):
-    raise SystemExit(f"build_duckdb_native: OPT_WRITER must be duckdb, pyarrow or cli, got {WRITER!r}")
+if WRITER not in ("duckdb", "pyarrow", "cli", "cow"):
+    raise SystemExit(f"build_duckdb_native: OPT_WRITER must be duckdb, pyarrow, cli or cow, "
+                     f"got {WRITER!r}")
 # DIAGNOSTIC. URL of a DuckDB CLI binary (or .gz/.zip of one) to write with instead of the pip
 # package -- how an UNRELEASED writer patch gets measured: the fork's CI builds the CLI, no wheel
 # needed. Requires OPT_WRITER=cli; refuses the combination gaps loudly below.
@@ -522,6 +523,15 @@ else:
         _write_pyarrow(dd, collist, src, order, table_uri, run_tag, con)
     elif WRITER == "cli":
         _write_cli(dd, collist, src, order, table_uri, run_tag, con)
+    elif WRITER == "cow":
+        # duckrun's copy-on-write writer exactly as MERGE / UPDATE / DELETE use it: its own fixed
+        # layout (cow.parquet_options — none of this script's geometry knobs), RETURN_STATS stats.
+        from dbt.adapters.duckrun import cow
+        print(f"{n_src:,} rows -> cow.write_files {cow.parquet_options()}", flush=True)
+        t_s = time.perf_counter()
+        _cow_actions = cow.write_files(dd, f"(select {collist} from {src})", table_uri,
+                                       order_by=order)
+        print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
     else:
         print(f"{n_src:,} rows -> one sorted single-stream COPY, "
               f"ROW_GROUP_SIZE {RG:,} x FILE_SIZE_BYTES {FILE_BYTES:,} "
@@ -541,147 +551,159 @@ else:
         """)
         print(f"copied in {time.perf_counter() - t_s:.1f}s", flush=True)
 
-    # Sizes from a real listing (the AddAction size field should be true, not guessed).
-    from dbt.adapters.duckrun.objectstore import build_store
-    import obstore
-    store = build_store(table_uri, con.storage_options)
+    if WRITER != "cow":
+        # Sizes from a real listing (the AddAction size field should be true, not guessed).
+        from dbt.adapters.duckrun.objectstore import build_store
+        import obstore
+        store = build_store(table_uri, con.storage_options)
 
-    def _listing():
-        out = {}
-        for batch in obstore.list(store):
-            for obj in batch:
-                p = obj["path"].rsplit("/", 1)[-1]
-                if p.startswith(f"part-{run_tag}-"):
-                    out[p] = obj["size"]
-        return out
+        def _listing():
+            out = {}
+            for batch in obstore.list(store):
+                for obj in batch:
+                    p = obj["path"].rsplit("/", 1)[-1]
+                    if p.startswith(f"part-{run_tag}-"):
+                        out[p] = obj["size"]
+            return out
 
-    sizes = _listing()
-    if not sizes:
-        raise SystemExit(f"listing returned no part-{run_tag}-* files")
+        sizes = _listing()
+        if not sizes:
+            raise SystemExit(f"listing returned no part-{run_tag}-* files")
 
-    # DIAGNOSTIC rewrites. Both must happen HERE — after the COPY, before the listing that feeds
-    # AddAction.size — because each rewrite changes file length, and a Delta size field that
-    # disagrees with the blob is a worse bug than the one being investigated. REFRAME runs FIRST:
-    # page_reframe rebuilds every ColumnChunk with NULLed index offsets (page_reframe.py), so an
-    # OffsetIndex injected before it would be silently stripped; footer_inject walks the pages
-    # itself, so injecting after the reframe describes the file as it now is.
-    # Transplant first: it swaps whole chunks, so any footer surgery must describe the result.
-    if TRANSPLANT:
-        import chimera
-        if not TRANSPLANT_FROM:
-            raise SystemExit("OPT_TRANSPLANT needs OPT_TRANSPLANT_FROM (the donor table URI)")
-        donor_store = build_store(TRANSPLANT_FROM, con.storage_options)
-        donor_keys = sorted(
-            obj["path"].rsplit("/", 1)[-1]
-            for batch in obstore.list(donor_store) for obj in batch
-            if obj["path"].rsplit("/", 1)[-1].endswith(".parquet"))
-        if len(donor_keys) != 1 or len(sizes) != 1:
-            raise SystemExit(
-                f"transplant needs exactly one file on each side — host has {len(sizes)}, "
-                f"donor has {len(donor_keys)}. Raise OPT_TFS_MB so neither rotates.")
-        print(f"transplanting {TRANSPLANT} pages from {TRANSPLANT_FROM.rsplit('/', 1)[-1]}",
-              flush=True)
-        chimera.transplant_remote(store, sorted(sizes)[0], donor_store, donor_keys[0], TRANSPLANT)
-        sizes = _listing()          # the chunk swap changed the length; re-read the true size
+        # DIAGNOSTIC rewrites. Both must happen HERE — after the COPY, before the listing that feeds
+        # AddAction.size — because each rewrite changes file length, and a Delta size field that
+        # disagrees with the blob is a worse bug than the one being investigated. REFRAME runs FIRST:
+        # page_reframe rebuilds every ColumnChunk with NULLed index offsets (page_reframe.py), so an
+        # OffsetIndex injected before it would be silently stripped; footer_inject walks the pages
+        # itself, so injecting after the reframe describes the file as it now is.
+        # Transplant first: it swaps whole chunks, so any footer surgery must describe the result.
+        if TRANSPLANT:
+            import chimera
+            if not TRANSPLANT_FROM:
+                raise SystemExit("OPT_TRANSPLANT needs OPT_TRANSPLANT_FROM (the donor table URI)")
+            donor_store = build_store(TRANSPLANT_FROM, con.storage_options)
+            donor_keys = sorted(
+                obj["path"].rsplit("/", 1)[-1]
+                for batch in obstore.list(donor_store) for obj in batch
+                if obj["path"].rsplit("/", 1)[-1].endswith(".parquet"))
+            if len(donor_keys) != 1 or len(sizes) != 1:
+                raise SystemExit(
+                    f"transplant needs exactly one file on each side — host has {len(sizes)}, "
+                    f"donor has {len(donor_keys)}. Raise OPT_TFS_MB so neither rotates.")
+            print(f"transplanting {TRANSPLANT} pages from {TRANSPLANT_FROM.rsplit('/', 1)[-1]}",
+                  flush=True)
+            chimera.transplant_remote(store, sorted(sizes)[0], donor_store, donor_keys[0], TRANSPLANT)
+            sizes = _listing()          # the chunk swap changed the length; re-read the true size
 
-    if DICT_ENCODING:
-        import page_reframe
-        col = None if DICT_ENCODING.lower() == "all" else DICT_ENCODING
-        print(f"retagging dictionary page encoding -> PLAIN_DICTIONARY in {len(sizes)} file(s), "
-              f"column={col or 'ALL'}", flush=True)
-        page_reframe.set_dict_encoding_remote(store, sorted(sizes), column=col, encoding=2)
-        sizes = _listing()          # header width changed; re-read the true sizes
+        if DICT_ENCODING:
+            import page_reframe
+            col = None if DICT_ENCODING.lower() == "all" else DICT_ENCODING
+            print(f"retagging dictionary page encoding -> PLAIN_DICTIONARY in {len(sizes)} file(s), "
+                  f"column={col or 'ALL'}", flush=True)
+            page_reframe.set_dict_encoding_remote(store, sorted(sizes), column=col, encoding=2)
+            sizes = _listing()          # header width changed; re-read the true sizes
 
-    if DICT_SORTED:
-        import page_reframe
-        col = None if DICT_SORTED.lower() == "all" else DICT_SORTED
-        print(f"marking is_sorted=False on dictionary pages in {len(sizes)} file(s), "
-              f"column={col or 'ALL'}", flush=True)
-        page_reframe.mark_dict_sorted_remote(store, sorted(sizes), column=col)
-        sizes = _listing()          # each dictionary header grew a byte; re-read the true sizes
+        if DICT_SORTED:
+            import page_reframe
+            col = None if DICT_SORTED.lower() == "all" else DICT_SORTED
+            print(f"marking is_sorted=False on dictionary pages in {len(sizes)} file(s), "
+                  f"column={col or 'ALL'}", flush=True)
+            page_reframe.mark_dict_sorted_remote(store, sorted(sizes), column=col)
+            sizes = _listing()          # each dictionary header grew a byte; re-read the true sizes
 
-    if BITWIDTH:
-        import page_reframe
-        _mode, _, _col = BITWIDTH.partition(":")
-        col = _col.strip() or None
-        print(f"repacking bit width mode={_mode.strip()} in {len(sizes)} file(s), "
-              f"column={col or 'ALL'}", flush=True)
-        page_reframe.repack_bitwidth_remote(store, sorted(sizes), column=col,
-                                            mode=_mode.strip())
-        sizes = _listing()          # widths changed the packing; re-read the true sizes
+        if BITWIDTH:
+            import page_reframe
+            _mode, _, _col = BITWIDTH.partition(":")
+            col = _col.strip() or None
+            print(f"repacking bit width mode={_mode.strip()} in {len(sizes)} file(s), "
+                  f"column={col or 'ALL'}", flush=True)
+            page_reframe.repack_bitwidth_remote(store, sorted(sizes), column=col,
+                                                mode=_mode.strip())
+            sizes = _listing()          # widths changed the packing; re-read the true sizes
 
-    if REFRAME:
-        import page_reframe
-        col = None if REFRAME.lower() == "all" else REFRAME
-        print(f"re-framing bit-packed runs to {page_reframe.GROUPS} groups "
-              f"({page_reframe.GROUPS * 8} values) in {len(sizes)} file(s), "
-              f"column={col or 'ALL'}", flush=True)
-        page_reframe.reframe_remote(store, sorted(sizes), column=col)
-        sizes = _listing()          # every page changed size; re-read the true sizes
+        if REFRAME:
+            import page_reframe
+            col = None if REFRAME.lower() == "all" else REFRAME
+            print(f"re-framing bit-packed runs to {page_reframe.GROUPS} groups "
+                  f"({page_reframe.GROUPS * 8} values) in {len(sizes)} file(s), "
+                  f"column={col or 'ALL'}", flush=True)
+            page_reframe.reframe_remote(store, sorted(sizes), column=col)
+            sizes = _listing()          # every page changed size; re-read the true sizes
 
-    # PAGE_STATS runs AFTER the payload rewrites and BEFORE footer_inject. After, because the
-    # stamped header carries uncompressed/compressed_page_size and must describe the FINAL bodies —
-    # the statistics values themselves are invariant under a re-framing, but the size fields are
-    # not. Before, because every stamped header grows ~20 bytes and moves every offset after it, so
-    # any footer surgery has to describe the file as it ends up.
-    if PAGE_STATS:
-        import page_reframe
-        col = None if PAGE_STATS.lower() == "all" else PAGE_STATS
-        print(f"stamping per-page statistics in {len(sizes)} file(s), "
-              f"column={col or 'ALL'}", flush=True)
-        page_reframe.add_page_stats_remote(store, sorted(sizes), column=col)
-        sizes = _listing()          # every data page header grew; re-read the true sizes
+        # PAGE_STATS runs AFTER the payload rewrites and BEFORE footer_inject. After, because the
+        # stamped header carries uncompressed/compressed_page_size and must describe the FINAL bodies —
+        # the statistics values themselves are invariant under a re-framing, but the size fields are
+        # not. Before, because every stamped header grows ~20 bytes and moves every offset after it, so
+        # any footer surgery has to describe the file as it ends up.
+        if PAGE_STATS:
+            import page_reframe
+            col = None if PAGE_STATS.lower() == "all" else PAGE_STATS
+            print(f"stamping per-page statistics in {len(sizes)} file(s), "
+                  f"column={col or 'ALL'}", flush=True)
+            page_reframe.add_page_stats_remote(store, sorted(sizes), column=col)
+            sizes = _listing()          # every data page header grew; re-read the true sizes
 
-    # DIAGNOSTIC (OPT_FOOTER_INJECT): add the metadata delta-rs writes and DuckDB does not.
-    if FOOTER_INJECT:
-        import footer_inject
-        print(f"injecting {', '.join(FOOTER_INJECT)} into {len(sizes)} footer(s)", flush=True)
-        notes = footer_inject.patch_remote(store, sorted(sizes), FOOTER_INJECT)
-        if not notes:
-            raise SystemExit(f"OPT_FOOTER_INJECT={','.join(FOOTER_INJECT)} was set but nothing "
-                             "needed injecting — duckdb may have started writing it, which would "
-                             "silently turn this run into a no-op control.")
-        sizes = _listing()          # files grew; re-read the true sizes
+        # DIAGNOSTIC (OPT_FOOTER_INJECT): add the metadata delta-rs writes and DuckDB does not.
+        if FOOTER_INJECT:
+            import footer_inject
+            print(f"injecting {', '.join(FOOTER_INJECT)} into {len(sizes)} footer(s)", flush=True)
+            notes = footer_inject.patch_remote(store, sorted(sizes), FOOTER_INJECT)
+            if not notes:
+                raise SystemExit(f"OPT_FOOTER_INJECT={','.join(FOOTER_INJECT)} was set but nothing "
+                                 "needed injecting — duckdb may have started writing it, which would "
+                                 "silently turn this run into a no-op control.")
+            sizes = _listing()          # files grew; re-read the true sizes
 
-    files = sorted(sizes)
-    k = len(files)
+        files = sorted(sizes)
+        k = len(files)
 
-    # Explicit file list, no glob: globbing abfss:// needs a LIST the azure extension can't
-    # parse against OneLake (json.exception.type_error.302); direct GETs work fine.
-    flist = "[" + ", ".join(f"'{table_uri}/{f}'" for f in files) + "]"
+        # Explicit file list, no glob: globbing abfss:// needs a LIST the azure extension can't
+        # parse against OneLake (json.exception.type_error.302); direct GETs work fine.
+        flist = "[" + ", ".join(f"'{table_uri}/{f}'" for f in files) + "]"
 
-    nrows = {f.rsplit("/", 1)[-1]: r for f, r in dd.execute(
-        f"select file_name, num_rows from parquet_file_metadata({flist})").fetchall()}
-    n = sum(nrows.values())
-    if n != n_src:
-        raise SystemExit(f"row count mismatch after COPY: files {n:,} vs source {n_src:,}")
+        nrows = {f.rsplit("/", 1)[-1]: r for f, r in dd.execute(
+            f"select file_name, num_rows from parquet_file_metadata({flist})").fetchall()}
+        n = sum(nrows.values())
+        if n != n_src:
+            raise SystemExit(f"row count mismatch after COPY: files {n:,} vs source {n_src:,}")
 
-    # Typed per-file stats from the footers: CAST each stat string to the column's type, then
-    # spell it Delta-JSON. cast (not try_cast): an unparseable stat should kill the build loudly.
-    mins: dict = {f: {} for f in files}
-    maxs: dict = {f: {} for f in files}
-    nulls: dict = {f: {} for f in files}
-    for c in cols:
-        t = coltypes[c]
-        for f, mn, mx, nc in dd.execute(f"""
-            select file_name, cast(stats_min_value as {t}), cast(stats_max_value as {t}),
-                   coalesce(stats_null_count, 0)
-            from parquet_metadata({flist}) where path_in_schema = '{c}'
-        """).fetchall():
-            b = f.rsplit("/", 1)[-1]
-            mins[b][c], maxs[b][c], nulls[b][c] = mn, mx, int(nc)
+        # Typed per-file stats from the footers: CAST each stat string to the column's type, then
+        # spell it Delta-JSON. cast (not try_cast): an unparseable stat should kill the build loudly.
+        mins: dict = {f: {} for f in files}
+        maxs: dict = {f: {} for f in files}
+        nulls: dict = {f: {} for f in files}
+        for c in cols:
+            t = coltypes[c]
+            for f, mn, mx, nc in dd.execute(f"""
+                select file_name, cast(stats_min_value as {t}), cast(stats_max_value as {t}),
+                       coalesce(stats_null_count, 0)
+                from parquet_metadata({flist}) where path_in_schema = '{c}'
+            """).fetchall():
+                b = f.rsplit("/", 1)[-1]
+                mins[b][c], maxs[b][c], nulls[b][c] = mn, mx, int(nc)
 
-    now_ms = int(time.time() * 1000)
-    actions = []
-    for f in files:
-        stats = json.dumps({
-            "numRecords": nrows[f],
-            "minValues": {c: _delta_json(mins[f][c]) for c in cols},
-            "maxValues": {c: _delta_json(maxs[f][c]) for c in cols},
-            "nullCount": {c: nulls[f][c] for c in cols},
-        })
-        actions.append(AddAction(path=f, size=sizes[f], partition_values={},
-                                 modification_time=now_ms, data_change=True, stats=stats))
+        now_ms = int(time.time() * 1000)
+        actions = []
+        for f in files:
+            stats = json.dumps({
+                "numRecords": nrows[f],
+                "minValues": {c: _delta_json(mins[f][c]) for c in cols},
+                "maxValues": {c: _delta_json(maxs[f][c]) for c in cols},
+                "nullCount": {c: nulls[f][c] for c in cols},
+            })
+            actions.append(AddAction(path=f, size=sizes[f], partition_values={},
+                                     modification_time=now_ms, data_change=True, stats=stats))
+
+    else:
+        # OPT_WRITER=cow: the files and their AddActions (stats from COPY ... RETURN_STATS) come
+        # from duckrun's copy-on-write writer itself, in its production layout.
+        actions = _cow_actions
+        files = sorted(a.path for a in actions)
+        k = len(files)
+        flist = "[" + ", ".join(f"'{table_uri}/{f}'" for f in files) + "]"
+        n = sum(json.loads(a.stats)["numRecords"] for a in actions)
+        if n != n_src:
+            raise SystemExit(f"row count mismatch after COPY: files {n:,} vs source {n_src:,}")
 
     # arro3 (a deltalake dep) reads the relation's Arrow C-stream — CI has no pyarrow (test-only dep)
     from arro3.core import RecordBatchReader
