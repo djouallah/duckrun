@@ -908,14 +908,25 @@ class DuckSession:
 
     def _cat_tables(self, dbName: Optional[str] = None, catalog: Optional[str] = None) -> List[str]:
         """Tables (registered delta_scan views) in ``dbName`` (default: the current database) of
-        ``catalog`` (default: the current catalog)."""
+        ``catalog`` (default: the current catalog). Only the views duckrun registered — a
+        ``delta_scan`` of the table's own folder — count: a user's ``CREATE VIEW`` in the same schema
+        is session scratch, not a Delta table (a 4-part twin built for it would scan a folder that
+        does not exist, and fail every refresh)."""
         cat = catalog or self._current_catalog
         schema = dbName or self._current_database
+        entry = self._catalogs.get(cat)
+        if entry is None or entry.kind != "delta":   # an Iceberg catalog's tables are DuckDB's own
+            rows = self.con.execute(
+                "SELECT table_name FROM information_schema.tables "
+                "WHERE table_catalog = ? AND table_schema = ? ORDER BY table_name",
+                [cat, schema]).fetchall()
+            return [r[0] for r in rows]
         rows = self.con.execute(
-            "SELECT table_name FROM information_schema.tables "
-            "WHERE table_catalog = ? AND table_schema = ? ORDER BY table_name",
+            "SELECT view_name, sql FROM duckdb_views() "
+            "WHERE database_name = ? AND schema_name = ? AND NOT internal ORDER BY view_name",
             [cat, schema]).fetchall()
-        return [r[0] for r in rows]
+        return [name for name, sql in rows
+                if f"delta_scan('{_qlit(self._table_path(schema, name, cat))}')" in (sql or "")]
 
     def _cat_table_exists(self, tableName: str) -> bool:
         """True iff ``tableName`` is a LIVE Delta table (read from the store; a drop-tombstone is False)."""

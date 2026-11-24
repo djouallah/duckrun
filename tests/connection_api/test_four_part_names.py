@@ -135,3 +135,59 @@ def test_quoted_four_part_name_with_dashes(tmp_path):
     conn.sql('insert into "my-ws"."sales-eu".dbo.t values (2)')
     assert conn.sql('select sum(k) from "my-ws"."sales-eu".dbo.t').fetchall() == [(3,)]
     assert deltalake.DeltaTable.is_deltatable(str(root / "dbo" / "t"))
+
+
+# -- user views are session scratch, not tables (#87) ----------------------------------------------
+def _twin(conn, name):
+    return conn.sql("select count(*) from duckdb_views() where database_name = 'ws' "
+                    f"and view_name = '{name}'").fetchall()[0][0]
+
+
+def test_user_view_survives_refresh_and_gets_no_twin(sales):
+    conn = duckrun.connect(str(sales), read_only=False)
+    conn.sql("create view v as select * from orders")
+    conn.refresh()
+    assert conn.sql("select amt from ws.sales.dbo.orders").fetchall() == [(10,)]
+    assert conn.sql("select amt from sales.dbo.orders").fetchall() == [(10,)]
+    assert conn.sql("select amt from v").fetchall() == [(10,)]
+    assert _twin(conn, "v") == 0
+    assert conn._cat_tables("dbo") == ["orders"]
+
+
+def test_writes_that_refresh_after_a_user_view(sales):
+    conn = duckrun.connect(str(sales), read_only=False)
+    conn.sql("create view v as select * from orders")
+    conn.sql("insert into orders values (2, 20)")
+    conn.sql("create table t2 as select 3 as id")
+    assert conn.sql("select sum(amt) from ws.sales.dbo.orders").fetchall() == [(30,)]
+    assert conn.sql("select id from ws.sales.dbo.t2").fetchall() == [(3,)]
+    assert conn.sql("select sum(amt) from v").fetchall() == [(30,)]
+    assert sorted(conn._cat_tables("dbo")) == ["orders", "t2"]
+
+
+def test_user_view_over_a_delta_scan_elsewhere(sales, tmp_path):
+    # The bench shape: a view over another lakehouse's table, by path.
+    other = _tables(tmp_path, "ref")
+    o = duckrun.connect(str(other), read_only=False)
+    o.sql("create table r as select 7 as x")
+    o.close()
+    conn = duckrun.connect(str(sales), read_only=False)
+    conn.sql(f"create or replace view fx as select * from "
+             f"delta_scan('{(other / 'dbo' / 'r').as_posix()}')")
+    conn.refresh()
+    conn.sql("insert into orders values (2, 20)")
+    assert conn.sql("select x from fx").fetchall() == [(7,)]
+    assert _twin(conn, "fx") == 0
+    assert [t[2] for t in conn._resolve_stats_targets(None)] == ["orders"]
+
+
+def test_user_view_on_a_plain_root(tmp_path):
+    root = tmp_path / "plain"
+    root.mkdir()
+    conn = duckrun.connect(str(root), read_only=False)
+    conn.sql("create table t as select 1 as k")
+    conn.sql("create view v as select k + 1 as k from t")
+    conn.refresh()
+    conn.sql("insert into t values (2)")
+    assert conn.sql("select sum(k) from v").fetchall() == [(5,)]
+    assert conn._cat_tables("dbo") == ["t"]

@@ -296,8 +296,8 @@ INSERT *")` is the same operation and takes the same anti-join — duckrun route
 shared engine seam, so dbt and SQL cannot execute it two different ways. Any other clause
 shape (matched update/delete, by-source, partial insert column list) runs copy-on-write:
 DuckDB rewrites only the files a changed row lands in and delta-rs commits the file swap.
-Tables with change data feed, deletion vectors, identity columns, append-only tables, column mapping on a partitioned or nested table are refused with a clear error: delta-rs's commit API has no
-action for what they need. Appends, overwrites and TRUNCATE on a change-data-feed table work, and so do appends into a deletion-vector table.
+Tables with change data feed, identity columns, append-only tables, column mapping on a partitioned or nested table, and a rewrite of a file that carries a deletion vector, are refused with a clear error: delta-rs's commit API has no
+action for what they need. Appends, overwrites and TRUNCATE on a change-data-feed table work. A table with deletion vectors enabled (the Databricks default) takes every write as long as the files a statement rewrites carry no vector; `OPTIMIZE` skips the ones that do.
 
 **Plain `append` with SQL dedup is still the cheapest of all** — it reads nothing from the
 target at all. If the model SQL already excludes rows present in

@@ -1013,14 +1013,15 @@ def replace_rows(cur, path: str, data, predicate: str, *, read_version: int,
         common = dict(partition_by=parts, row_group_rows=row_group_rows,
                       target_file_size=target_file_size, configuration=dt.metadata().configuration,
                       mapping=cow.column_mapping(dt), operation=operation)
-        adds = cow.write_files(cur, f'"{new}"', path,
-                               not_null=[f.name for f in dt.schema().fields if not f.nullable],
-                               **common)
         scan = cow.scan(path, read_version)
         fcol = quote_ident(cow.FILE_COL)
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
                     f"SELECT DISTINCT {fcol} AS f FROM {scan} WHERE ({predicate}) IS TRUE")
         gone = [r[0] for r in cur.execute(f'SELECT f FROM "{touched}"').fetchall()]
+        cow.refuse_dv_files(cur, dt, gone, operation)
+        adds = cow.write_files(cur, f'"{new}"', path,
+                               not_null=[f.name for f in dt.schema().fields if not f.nullable],
+                               **common)
         if gone:
             cur.execute(f'CREATE OR REPLACE TEMP TABLE "{kept}" AS SELECT *, {cow.with_position()} '
                         f'FROM {scan} WHERE {fcol} IN (SELECT f FROM "{touched}") '
@@ -1971,8 +1972,9 @@ def optimize(
     storage_options: Optional[Dict[str, str]] = None,
     cur=None,
 ) -> Dict:
-    """``OPTIMIZE``: compact the table's small files (:func:`compact`). A table shape compaction
-    cannot rewrite (deletion vectors) raises :class:`cow.Unsupported`. A lexicographic ``ORDER BY``
+    """``OPTIMIZE``: compact the table's small files (:func:`compact`); files that carry a deletion
+    vector are left as they are. A table shape compaction cannot rewrite raises
+    :class:`cow.Unsupported`. A lexicographic ``ORDER BY``
     at write time (``CREATE OR REPLACE TABLE t SORTED BY AUTO AS SELECT * FROM t``) is what a
     columnar reader wants; there is no z-order — bit-interleaving destroys the run-length runs the
     in-memory reader relies on."""
@@ -1992,8 +1994,9 @@ def compact(cur, path: str, *, dt: Optional[DeltaTable] = None, target_size: Opt
     size, read those files (rows in their order), write them again in the read layout
     (``cow.write_files``) and commit the new files and the removal of the old ones as ONE
     ``dataChange=false`` transaction, pinned to the version read (a concurrent commit fails it).
-    Returns ``{"numFilesAdded", "numFilesRemoved"}``. A deletion-vector table raises when
-    ``explicit`` (OPTIMIZE) and is skipped otherwise (post-write maintenance).
+    Returns ``{"numFilesAdded", "numFilesRemoved"}``. A file with a deletion vector is not a
+    candidate (its remove would need the vector). A table shape :func:`cow.unsupported_reason`
+    refuses raises when ``explicit`` (OPTIMIZE) and is skipped otherwise (post-write maintenance).
 
     WORKAROUND — a compaction is not a write, but delta-rs's commit API
     (``create_write_transaction``) records every commit as operation ``WRITE``; it has no OPTIMIZE
@@ -2016,9 +2019,13 @@ def compact(cur, path: str, *, dt: Optional[DeltaTable] = None, target_size: Opt
     pcols = [d[0] for d in cur.sql("SELECT * FROM add_actions LIMIT 0").description
              if d[0].startswith("partition.")]
     key = ", ".join(quote_ident(c) for c in pcols) or "1"
+    # A file with a deletion vector stays as it is: its remove would need the vector (see
+    # cow.refuse_dv_files). Unquoted in DuckDB by url_decode, as the log stores paths encoded.
+    dvs = sorted(cow.dv_files(cur, dt))
+    skip = (f" AND url_decode(path) NOT IN ({', '.join(cow._lit(p) for p in dvs)})" if dvs else "")
     small = cur.sql(
         f"SELECT path FROM (SELECT path, count(*) OVER (PARTITION BY {key}) AS n FROM add_actions "
-        f"WHERE size_bytes < {int(target * 0.5)}) WHERE n >= 2").fetchall()
+        f"WHERE size_bytes < {int(target * 0.5)}{skip}) WHERE n >= 2").fetchall()
     if not small:
         return {"numFilesAdded": 0, "numFilesRemoved": 0}
     root = path.replace("\\", "/").rstrip("/") + "/"
@@ -2772,6 +2779,8 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
                        f'ANTI JOIN "{src}" AS source ON ({predicate}) WHERE {orphan_chg}')
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
                     f'SELECT f FROM "{hits}" WHERE chg{orphans}')
+        cow.refuse_dv_files(cur, dt, [r[0] for r in cur.execute(
+            f'SELECT DISTINCT f FROM "{touched}"').fetchall()], "MERGE")
         # The touched files' rows, with their position (see cow.write_files: the rewrite keeps it).
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT *, {cow.with_position()} '
                     f'FROM {scan} WHERE {fcol} IN (SELECT f FROM "{touched}")')
@@ -2842,6 +2851,8 @@ def cow_rewrite(cur, path: str, *, where: Optional[str], replaces: Optional[str]
         gone = [r[0] for r in cur.execute(f'SELECT f FROM "{touched}"').fetchall()]
         if not gone:
             return True        # nothing matched: no rewrite, no commit (as delta-rs skips empty DML)
+        if not remove_all:     # TRUNCATE overwrites: delta-rs derives its removes, vectors included
+            cow.refuse_dv_files(cur, dt, gone, operation)
         # The touched files' rows, with their position (see cow.write_files: the rewrite keeps it).
         if remove_all:
             # Every row goes: an overwrite that adds nothing — delta-rs removes every live file

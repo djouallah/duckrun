@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **A user `CREATE VIEW` no longer breaks `refresh()` on a OneLake lakehouse** (#87). On a catalog
+  with a 4-part alias (`ws.lh.schema.table`), every view in a discovered schema got a 4-part twin
+  over `delta_scan('<root>/<schema>/<view>')`. That folder doesn't exist, so every later
+  `refresh()`, and every write that refreshes, failed. Only the views duckrun registers count as
+  tables now (also for `get_stats`).
+- **Deletion vectors enabled is no longer a refusal** (#88). MERGE / UPDATE / DELETE / REPLACE WHERE
+  and `OPTIMIZE` were refused on any table whose protocol lists `deletionVectors`, the Databricks
+  default, even with no vector written. Only a rewrite that would remove a file that carries a
+  vector is refused now, with that reason. `OPTIMIZE` and post-write compaction leave such files as
+  they are.
+- The change-data-feed refusal now names the way out: turn the feed off, or rewrite the table whole
+  with `CREATE OR REPLACE TABLE`. CDF row-level rewrites stay refused (#89): the commit API has no
+  action for change files, and there is no delta-rs writer fallback.
+
 ## [0.6.0]
 
 **Breaking release.** The write path changes: DuckDB writes every data file and delta-rs only

@@ -22,3 +22,14 @@ Which makes it the right referee for [#32](https://github.com/djouallah/duckrun/
 the parquet footer, `add.stats` and `add.partitionValues` are all keyed by the **physical** name
 while `metaData.partitionColumns` is keyed by the **logical** one, the partition column is absent
 from the parquet, and a logical name contains a space.
+
+## `table_with_dv_small/`
+
+Copied verbatim from [delta-io/delta-rs](https://github.com/delta-io/delta-rs), path
+`crates/test/tests/data/table-with-dv-small`, at commit
+`8685b82baaefc64fdfac6c06e342aff8dfe9c87d`. Licensed Apache-2.0, like delta-rs itself.
+
+A Databricks table (protocol 3/7, `deletionVectors`) with one file of 10 rows (`value` 0–9), of
+which a `DELETE … WHERE value IN (0, 9)` left 2 marked deleted in a deletion vector. delta-rs and
+DuckDB cannot write a deletion vector, so only a real one tests that duckrun never commits a
+remove of that file without its vector ([#88](https://github.com/djouallah/duckrun/issues/88)).

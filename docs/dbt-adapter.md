@@ -197,7 +197,7 @@ Insert-only never removes a row, so duckrun computes "batch rows whose `unique_k
 ) }}
 ```
 
-`conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED THEN INSERT *")` routes to the same anti-join. Any other clause shape runs copy-on-write: DuckDB rewrites only the files a changed row lands in and delta-rs commits the file swap, fenced to the version read. Tables with change data feed, deletion vectors, identity columns, append-only tables, column mapping on a partitioned or nested table are refused with a clear error before anything is written: delta-rs's commit API has no action for what they need.
+`conn.sql("MERGE INTO t USING s ON … WHEN NOT MATCHED THEN INSERT *")` routes to the same anti-join. Any other clause shape runs copy-on-write: DuckDB rewrites only the files a changed row lands in and delta-rs commits the file swap, fenced to the version read. Tables with change data feed, identity columns, append-only tables, column mapping on a partitioned or nested table, and a rewrite of a file that carries a deletion vector, are refused with a clear error before anything is written: delta-rs's commit API has no action for what they need.
 
 ### `append` that reads `{{ this }}` — the automatic fence
 

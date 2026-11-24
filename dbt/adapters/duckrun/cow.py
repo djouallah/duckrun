@@ -7,11 +7,13 @@ files they replace (``RemoveAction``), in ONE transaction pinned to the version 
 (``create_write_transaction``, ``max_commit_retries=0``), so a concurrent commit fails it loudly.
 
 Internal module, not public API. :func:`unsupported_reason` names the table shapes this writer
-cannot commit correctly — deletion vectors and change data feed on a rewrite (the commit API has no
-action for their metadata), identity columns (their high-water mark lives in the schema), append-only
-tables, and column-mapped tables that are also partitioned or nested (DuckDB's own Delta writer
-refuses those too) — and the statement is refused with :class:`Unsupported` before anything is
-written; there is no fallback writer. CHECK constraints and invariants are evaluated, and generated
+cannot commit correctly — change data feed on a rewrite (the commit API has no action for change
+files), identity columns (their high-water mark lives in the schema), append-only tables, and
+column-mapped tables that are also partitioned or nested (DuckDB's own Delta writer refuses those
+too) — and the statement is refused with :class:`Unsupported` before anything is written; there is
+no fallback writer. A rewrite that would remove a file carrying a deletion vector is refused the
+same way (:func:`refuse_dv_files`: a remove action has no field for the vector); a table with the
+feature on but no vector in the touched files rewrites normally. CHECK constraints and invariants are evaluated, and generated
 columns recomputed, in DuckDB (:func:`apply_table_rules`); an expression DuckDB cannot evaluate is
 refused the same way.
 """
@@ -109,14 +111,17 @@ def unsupported_reason(dt: DeltaTable, op: str = "rewrite") -> Optional[str]:
       overwrite, truncate) needs no change files — readers derive the changes from the actions —
       but a rewrite carries rows over, which would read as deleted and re-inserted;
     * append-only stops anything that removes data; a compaction changes none (dataChange=false);
-    * deletion vectors stop a rewrite and a compaction (their removes would need the vector); an
-      overwrite / truncate lets delta-rs derive the removes itself;
+    * deletion vectors are not a table-level refusal: only a file that carries one cannot be removed
+      (see :func:`refuse_dv_files`; compaction skips such files);
     * identity columns stop every write of rows (their high-water mark lives in the schema)."""
     md = dt.metadata()
     conf = md.configuration or {}
     if (op == "rewrite"
             and str(conf.get("delta.enableChangeDataFeed", "false")).lower() == "true"):
-        return "change data feed (the commit API cannot write the change files)"
+        return ("change data feed (the commit API cannot write the change files); turn it off "
+                "first (ALTER TABLE t SET TBLPROPERTIES ('delta.enableChangeDataFeed' = 'false')) "
+                "or rewrite the table whole with CREATE OR REPLACE TABLE, which change data feed "
+                "accepts")
     if (op in ("rewrite", "overwrite", "truncate")
             and str(conf.get("delta.appendOnly", "false")).lower() == "true"):
         return "append-only table"
@@ -133,9 +138,6 @@ def unsupported_reason(dt: DeltaTable, op: str = "rewrite") -> Optional[str]:
     unknown = sorted(set(dt.protocol().writer_features or []) - _WRITABLE_FEATURES)
     if unknown:
         return f"table feature(s) {', '.join(unknown)}"
-    if (op in ("rewrite", "compact")
-            and "deletionVectors" in (dt.protocol().reader_features or [])):
-        return "deletion vectors (the commit API cannot remove a file that has one)"
     if op not in ("compact", "truncate") and '"delta.identity.' in dt.schema().to_json():
         return "identity columns"
     return None
@@ -145,6 +147,43 @@ class Unsupported(ValueError):
     """duckrun cannot write this statement or table shape (DuckDB writes the files and delta-rs's
     commit API commits them; some Delta features need actions that API does not have). Raised
     before anything is written."""
+
+
+def dv_files(cur, dt: DeltaTable) -> set:
+    """The live files of ``dt`` that carry a deletion vector, as decoded paths relative to the table
+    root. Free (an empty set) unless the protocol lists the ``deletionVectors`` reader feature;
+    otherwise ``deletion_vectors()`` lists them (it materialises each file's vector)."""
+    from urllib.parse import unquote
+
+    if "deletionVectors" not in (dt.protocol().reader_features or []):
+        return set()
+    root = dt.table_uri.rstrip("/") + "/"
+    deletion_vectors = dt.deletion_vectors()  # noqa: F841 - DuckDB replacement scan by name
+    out = set()
+    for (fp,) in cur.sql("SELECT filepath FROM deletion_vectors").fetchall():
+        out.add(unquote(fp[len(root):] if fp.startswith(root) else fp.rsplit("/", 1)[-1]))
+    return out
+
+
+def _dv_hit(f: str, dvs: set) -> bool:
+    f = f.replace("\\", "/")
+    return any(f == rel or f.endswith("/" + rel) for rel in dvs)
+
+
+def refuse_dv_files(cur, dt: DeltaTable, filenames: Sequence[str], operation: str) -> None:
+    """Raise :class:`Unsupported` when a rewrite would remove a file (``filenames``: full paths, as
+    the scan's :data:`FILE_COL` reports them) that carries a deletion vector: the commit API's remove
+    action has no field for the vector, and a remove without it leaves that file live for Spark /
+    Fabric readers. Files without a vector, on a table with the feature on, are fine."""
+    dvs = dv_files(cur, dt)
+    if not dvs:
+        return
+    n = sum(1 for f in set(filenames) if _dv_hit(f, dvs))
+    if n:
+        raise Unsupported(
+            f"{operation.lower()}: {n} file(s) it rewrites carry a deletion vector (the commit API "
+            f"cannot remove a file that has one); rewrite the table once with CREATE OR REPLACE "
+            f"TABLE t AS SELECT * FROM t, which writes it without deletion vectors")
 
 
 def _table_rules(dt: DeltaTable):

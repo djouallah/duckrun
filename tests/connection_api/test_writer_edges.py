@@ -421,6 +421,65 @@ def test_change_data_feed_takes_whole_file_writes_and_refuses_rewrites(c):
                            (4, "insert"), (3, "delete"), (4, "delete")])
 
 
+def test_change_data_feed_refusal_names_the_way_out(c):
+    c.sql("create table cdf2 as select 1 id")
+    c.sql("alter table cdf2 set tblproperties ('delta.enableChangeDataFeed' = 'true')")
+    with pytest.raises(cow.Unsupported, match="enableChangeDataFeed' = 'false'"):
+        c.sql("delete from cdf2 where id = 1")
+
+
+def test_deletion_vector_feature_without_vectors_rewrites(c):
+    # Databricks turns the feature on by default; only a file that HAS a vector can't be removed.
+    c.sql("create table dv (id bigint, v bigint) with ('delta.enableDeletionVectors' = 'true')")
+    c.sql("insert into dv select range, range * 10 from range(20)")
+    dt = deltalake.DeltaTable(_p(c, "dv"))
+    assert "deletionVectors" in (dt.protocol().reader_features or [])
+    assert cow.unsupported_reason(dt, "rewrite") is None
+    assert cow.unsupported_reason(dt, "compact") is None
+    c.sql("delete from dv where id = 1")
+    c.sql("update dv set v = -1 where id = 2")
+    c.sql("merge into dv using (select 3 id, 33 v union all select 100 id, 1000 v) s "
+          "on dv.id = s.id when matched then update set v = s.v when not matched then insert *")
+    c.sql("insert into dv replace where id = 4 select 4 id, 44 v")
+    c.sql("insert into dv values (5, 50)")
+    c.sql("optimize dv")
+    want = _sorted([(i, i * 10) for i in range(20) if i not in (1, 2, 3, 4)]
+                   + [(2, -1), (3, 33), (4, 44), (100, 1000), (5, 50)])
+    # deltalake's own Arrow reader refuses the deletionVectors reader feature: DuckDB twice.
+    assert _duck(c, "dv", "id, v") == want
+    assert _sorted(c.sql("select id, v from dv").fetchall()) == want
+
+
+_DV_FIXTURE = os.path.join(os.path.dirname(__file__), "data", "table_with_dv_small")
+
+
+def test_rewrite_touching_a_file_with_a_deletion_vector_is_refused(c):
+    import shutil
+    shutil.copytree(_DV_FIXTURE, _p(c, "dvt"))
+    c.refresh()
+    assert c.sql("select count(*) from dvt").fetchall() == [(8,)]   # 10 rows, 2 deleted by DV
+    v = _version(c, "dvt")
+    for stmt in ("delete from dvt where value = 5", "update dvt set value = 50 where value = 5",
+                 "merge into dvt using (select 5 value) s on dvt.value = s.value "
+                 "when matched then delete",
+                 "insert into dvt replace where value = 5 select 5 value"):
+        with pytest.raises(cow.Unsupported, match="deletion vector"):
+            c.sql(stmt)
+    assert _version(c, "dvt") == v
+    files = set(os.listdir(_p(c, "dvt")))                       # nothing written by the refusals
+    assert files == set(os.listdir(_DV_FIXTURE))
+    # Appends work; OPTIMIZE compacts them and leaves the file with the vector as it is.
+    c.sql("insert into dvt values (100)")
+    c.sql("insert into dvt values (101)")
+    c.sql("optimize dvt")
+    live = {os.path.basename(p) for p in deltalake.DeltaTable(_p(c, "dvt")).file_uris()}
+    assert "part-00000-fae5310a-a37d-4e51-827b-c3d5516560ca-c000.snappy.parquet" in live
+    assert len(live) == 2
+    assert _duck(c, "dvt") == _sorted([(i,) for i in range(1, 9)] + [(100,), (101,)])
+    c.sql("truncate table dvt")                                 # an overwrite: delta-rs removes it
+    assert c.sql("select count(*) from dvt").fetchall() == [(0,)]
+
+
 def test_append_only_table_takes_inserts_and_refuses_everything_that_removes(c):
     c.sql("create table ao as select 1 id")
     c.sql("alter table ao set tblproperties ('delta.appendOnly' = 'true')")
