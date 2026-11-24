@@ -1,0 +1,136 @@
+name: delta-grid
+
+# RELEASE GATE: the Delta support grid (djouallah/lakehouse_benchmark, delta_capability.yml), the
+# duckrun column, asked of THIS tree on OneLake. Every probe of that grid runs: create / read /
+# INSERT / UPDATE / DELETE / MERGE / schema / time travel / maintenance, plus the Spark-written
+# tables (deletion vectors, column mapping, type widening, change data feed), READ and WRITTEN.
+#
+#   spark   -> Spark 4.2 + delta-spark writes the fixture tables, once (they persist in
+#              Tables/_bench_delta_fixtures; the write probes work on byte-for-byte copies)
+#   duckrun -> the full duckrun column, duckrun installed from this checkout
+#   gate    -> tests/delta_grid/gate.py: a cell the baseline has `supported` that is anything
+#              else now fails the release (tests/delta_grid/baseline.json)
+#
+# Why it exists: 0.6.0 shipped green and the grid, run after the release, found a user CREATE VIEW
+# breaking refresh() on OneLake (#87) and every UPDATE/DELETE/MERGE refused on a Databricks-default
+# table (#88). publish.yml runs this before PyPI.
+#
+# Dispatch with `record` ticked to get the readings without gating (the artifact's duckrun.json):
+# that is how the baseline is made. Change the baseline only on purpose, in its own commit, citing
+# the run.
+on:
+  workflow_dispatch:
+    inputs:
+      record:
+        description: "Record the readings only (no gate): to make or update the baseline"
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      record:
+        type: boolean
+        default: false
+
+permissions:
+  id-token: write   # GitHub OIDC -> Entra (the app trusts main)
+  contents: read
+
+concurrency:
+  group: delta-grid
+  cancel-in-progress: false
+
+env:
+  # The grid's code, pinned: bump it on purpose (a new probe changes what the gate asks).
+  BENCH_REPO: djouallah/lakehouse_benchmark
+  BENCH_REF: e4f36b20b39594275959937e6a5b721746871b39
+  # duckrun's own OneLake test lakehouse (integration_tests_onelake.yml's).
+  FABRIC_WORKSPACE_ID: 1c52481c-0523-4a5a-bbde-fdc932bd77c2
+  FABRIC_LAKEHOUSE_ID: 7cb28f47-65bd-4aac-96c0-f7dd4eeb40ff
+  AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+  AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+  PYTHONUNBUFFERED: "1"
+  SPARK_FIXTURE_PROBES: >-
+    read_deletion_vectors,read_column_mapping,read_type_widening,write_spark_deletion_vectors,write_spark_column_mapping,write_spark_change_data_feed
+
+jobs:
+  spark:
+    name: Spark writes the fixture tables
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      PYTHONPATH: ${{ github.workspace }}/lb
+      SPARK_DRIVER_MEMORY: 11g
+      RESULTS_FILE: ${{ github.workspace }}/spark.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BENCH_REPO }}
+          ref: ${{ env.BENCH_REF }}
+          path: lb
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.ivy2
+            ~/.ivy2.5.2
+            ~/.m2/repository
+          key: ivy-spark42-delta441-azure350-v1
+      - name: Install Spark
+        run: pip install -r lb/requirements/capability_delta_spark.txt
+      - name: Spark writes (or finds) every fixture, reads and writes it
+        shell: bash
+        env:
+          CAPABILITY_PROBES: ${{ env.SPARK_FIXTURE_PROBES }}
+        run: python lb/.github/scripts/capability/delta_capability_spark.py 2>&1 | tee spark.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: delta-grid-spark
+          path: |
+            spark.log
+            spark.json
+          if-no-files-found: warn
+
+  duckrun:
+    name: duckrun column (this tree)
+    needs: spark
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      PYTHONPATH: ${{ github.workspace }}/lb
+      RESULTS_FILE: ${{ github.workspace }}/duckrun.json
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.BENCH_REPO }}
+          ref: ${{ env.BENCH_REF }}
+          path: lb
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install the grid, then duckrun from THIS tree over the grid's PyPI pin
+        run: |
+          pip install -r lb/requirements/capability_delta_duckrun.txt
+          pip install -e .
+          pip list --format=freeze | grep -Ei '^(deltalake|duckdb|duckrun)=' || true
+      - name: The full duckrun column
+        shell: bash
+        run: python lb/.github/scripts/capability/delta_capability_duckrun.py 2>&1 | tee duckrun.log
+      - name: Gate on the baseline
+        if: ${{ !inputs.record }}
+        run: python tests/delta_grid/gate.py duckrun.json tests/delta_grid/baseline.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: delta-grid-duckrun
+          path: |
+            duckrun.log
+            duckrun.json
+          if-no-files-found: warn
