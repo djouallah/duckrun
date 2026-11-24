@@ -5,7 +5,7 @@ name: delta-grid
 # INSERT / UPDATE / DELETE / MERGE / schema / time travel / maintenance, plus the Spark-written
 # tables (deletion vectors, column mapping, type widening, change data feed), READ and WRITTEN.
 #
-#   spark   -> Spark 4.2 + delta-spark writes the fixture tables, once (they persist in
+#   spark   -> Spark 4.2 + delta-spark writes the fixture tables, only when one is missing (they persist in
 #              Tables/_bench_delta_fixtures; the write probes work on byte-for-byte copies)
 #   duckrun -> the full duckrun column, duckrun installed from this checkout
 #   gate    -> tests/delta_grid/gate.py: a cell the baseline has `supported` that is anything
@@ -54,7 +54,7 @@ env:
 
 jobs:
   spark:
-    name: Spark writes the fixture tables
+    name: Spark writes the fixture tables (only if missing)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
@@ -70,11 +70,33 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      # Spark only writes data: the fixture tables persist in the lakehouse, so it starts only
+      # when one of them is missing (a new fixture in BENCH_REF, or a wiped lakehouse).
+      - name: Which fixture tables are missing?
+        id: fx
+        shell: bash
+        run: |
+          pip install -q azure-identity azure-storage-file-datalake
+          python - <<'EOF'
+          import os, sys
+          sys.path.insert(0, "lb/.github/scripts/capability")
+          from delta_probe import DeltaProbe
+          from bench.capability.delta import DeltaOracle
+          from bench.config import Config
+          oracle = DeltaOracle(Config.from_env())
+          missing = [folder for folder, *_ in DeltaProbe.FIXTURES.values()
+                     if not oracle.has_log(oracle.fixture_relative(folder))]
+          print("missing fixture tables:", ", ".join(missing) or "none")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"missing={','.join(missing)}\n")
+          EOF
       - uses: actions/setup-java@v4
+        if: steps.fx.outputs.missing != ''
         with:
           distribution: temurin
           java-version: "17"
       - uses: actions/cache@v4
+        if: steps.fx.outputs.missing != ''
         with:
           path: |
             ~/.ivy2
@@ -82,8 +104,10 @@ jobs:
             ~/.m2/repository
           key: ivy-spark42-delta441-azure350-v1
       - name: Install Spark
+        if: steps.fx.outputs.missing != ''
         run: pip install -r lb/requirements/capability_delta_spark.txt
-      - name: Spark writes (or finds) every fixture, reads and writes it
+      - name: Spark writes the missing fixture tables
+        if: steps.fx.outputs.missing != ''
         shell: bash
         env:
           CAPABILITY_PROBES: ${{ env.SPARK_FIXTURE_PROBES }}
