@@ -1470,6 +1470,10 @@ def test_weird_attached_catalog_names(tmp_path, tmp_path_factory, weird):
     # cross-catalog write (catalog resolved from the quoted 3-part name)
     conn.sql(f"CREATE OR REPLACE TABLE {qn}.dbo.created AS select 7 as v")
     assert conn.sql(f"select v from {qn}.dbo.created").fetchall()[0][0] == 7
+    # ...and it lands in THAT catalog's root, not the current one's (a quoted name with a space or
+    # `-` used to read as 1-part and write into `a`).
+    assert deltalake.DeltaTable.is_deltatable(b + "/dbo/created")
+    assert not os.path.exists(a + "/dbo/created")
     # switch to it and introspect under the weird name
     _set_current_catalog(conn, weird)
     assert conn._current_catalog == weird

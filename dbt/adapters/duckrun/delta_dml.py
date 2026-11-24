@@ -655,7 +655,10 @@ def _split_leading_with(sql: str) -> Tuple[str, str]:
 _DML_REL = re.compile(
     r"^(?:insert\s+into|delete\s+from|update|merge\s+into|alter\s+table|"
     r"drop\s+table(?:\s+if\s+exists)?|truncate(?:\s+table)?|optimize|"
-    r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?)\s+(?P<rel>[\w.\"]+)",
+    r"create\s+(?:or\s+replace\s+)?table(?:\s+if\s+not\s+exists)?)\s+"
+    # A quoted part may hold a space or `-` ("my lake", a GUID): `[\w."]+` stopped there, so a
+    # write to "my lake".dbo.t read as 1-part and landed in the CURRENT catalog's root.
+    r"(?P<rel>(?:\"[^\"]+\"|\w+)(?:\.(?:\"[^\"]+\"|\w+))*)",
     re.IGNORECASE,
 )
 

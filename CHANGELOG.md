@@ -15,6 +15,14 @@ All notable changes to this project will be documented in this file.
   default, even with no vector written. Only a rewrite that would remove a file that carries a
   vector is refused now, with that reason. `OPTIMIZE` and post-write compaction leave such files as
   they are.
+- **A write to a quoted catalog name with a space or `-` landed in the wrong lakehouse.**
+  `CREATE OR REPLACE TABLE "my lake".dbo.t AS …` (or INSERT / UPDATE / DELETE / MERGE) read the
+  target as 1-part, wrote the data into the CURRENT catalog's root and registered it under
+  `"my lake"`. It now writes into the named catalog. Found by the #87 fix, which stopped counting
+  that mis-registered view as a table.
+- **deltalake < 1.7: a table with deletion vectors on refused every write.** Those versions stamp
+  `variantType` on a table they upgrade to writer version 7; with no VARIANT column that feature
+  needs nothing from a commit, so it is no longer an unknown-feature refusal.
 - The change-data-feed refusal now names the way out: turn the feed off, or rewrite the table whole
   with `CREATE OR REPLACE TABLE`. CDF row-level rewrites stay refused (#89): the commit API has no
   action for change files, and there is no delta-rs writer fallback.

@@ -77,6 +77,8 @@ _WRITABLE_FEATURES = {"appendOnly", "invariants", "checkConstraints", "changeDat
                       "timestampNtz", "vacuumProtocolCheck"}
 
 
+_VARIANT_FEATURES = {"variantType", "variantType-preview"}
+
 PHYSICAL_NAME_KEY = "delta.columnMapping.physicalName"
 FIELD_ID_KEY = "delta.columnMapping.id"
 
@@ -135,7 +137,13 @@ def unsupported_reason(dt: DeltaTable, op: str = "rewrite") -> Optional[str]:
             return "column mapping with nested columns"
         if any(PHYSICAL_NAME_KEY not in (f.metadata or {}) for f in dt.schema().fields):
             return "column mapping without physical names"
-    unknown = sorted(set(dt.protocol().writer_features or []) - _WRITABLE_FEATURES)
+    unknown = set(dt.protocol().writer_features or []) - _WRITABLE_FEATURES
+    if unknown & _VARIANT_FEATURES and '"variant"' not in dt.schema().to_json():
+        # deltalake < 1.7 stamps variantType on every table it upgrades to writer 7 (a CREATE TABLE
+        # WITH deletion vectors on, say). It only constrains VARIANT columns: with none, a plain
+        # add/remove commit keeps it intact.
+        unknown -= _VARIANT_FEATURES
+    unknown = sorted(unknown)
     if unknown:
         return f"table feature(s) {', '.join(unknown)}"
     if op not in ("compact", "truncate") and '"delta.identity.' in dt.schema().to_json():
