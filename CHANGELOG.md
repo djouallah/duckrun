@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-### Breaking
+### Changed
 - **Drop-tombstones are no longer hidden.** 0.6.0's `DROP TABLE` deletes the folder; a table an
   older duckrun dropped is a one-column `__duckrun_deleted__` table, and it now shows up like any
   other. `DROP TABLE` it once to delete its folder. Hiding it cost a log read per table on every
