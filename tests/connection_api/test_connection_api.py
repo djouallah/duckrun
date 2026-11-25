@@ -865,7 +865,9 @@ def test_refresh_touches_only_what_changed(wh, monkeypatch):
     conn.refresh(quiet=True)
     assert made == ["t3"]                                  # only the new folder
 
-    _write_table(wh + "/dbo/t1", "select 7 as id, 'x' as extra")   # new schema, same folder
+    with duckdb.connect() as other:                        # new schema, same folder
+        engine.write_delta(wh + "/dbo/t1", other.sql("select 7 as id, 'x' as extra"),
+                           mode="overwrite", overwrite_schema=True)
     shutil.rmtree(wh + "/dbo/t2")
     conn.refresh(quiet=True)
     assert made == ["t3"]
