@@ -29,6 +29,10 @@ All notable changes to this project will be documented in this file.
 - **deltalake < 1.7: a table with deletion vectors on refused every write.** Those versions stamp
   `variantType` on a table they upgrade to writer version 7; with no VARIANT column that feature
   needs nothing from a commit, so it is no longer an unknown-feature refusal.
+- **A table another process wrote reads by name with no `refresh()`.** A statement that fails with
+  "Table with name X does not exist" binds X when its folder holds a Delta table (one `_delta_log`
+  listing) and runs again, the lazy bind the dbt cursor already had (#24). A name with nothing on
+  the store raises the same error as before. `refresh()` stays, for listing what is there.
 - **`refresh()` touches only what changed.** It lists the schema folders, registers a view for each
   new table and drops the view of a table whose folder is gone; it leaves every other view (and
   its 4-part `ws.lh.schema.table` twin) as it is, since a `delta_scan` view reads the latest

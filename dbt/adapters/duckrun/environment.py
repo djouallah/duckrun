@@ -41,13 +41,7 @@ _CREDS_REFRESH_LOCK = threading.Lock()
 # The captured name is bare in the first and schema-qualified in the second. If DuckDB ever
 # rewords this, the lazy bind simply never fires and the original error surfaces unchanged —
 # degraded back to pre-fix behavior, pinned by tests/adapter/test_run_operation_columns.py.
-_MISSING_REL = re.compile(r'(?:Table|View) with name "?([^"!\n]+?)"? does not exist')
-
-# A qualified identifier in SQL text: `schema.table` or `catalog.schema.table`, each part plain or
-# double-quoted. Used only after a catalog error, to recover the schema a bare missing-table name
-# was addressed under.
-_IDENT = r'(?:"[^"]+"|[A-Za-z_][\w$]*)'
-_QUAL_REF = re.compile(rf"({_IDENT})\.({_IDENT})(?:\.({_IDENT}))?")
+# The matcher is delta_dml.missing_relation_refs, shared with the connection API's lazy bind.
 
 
 class DuckrunReadOnlyError(RuntimeError):
@@ -127,26 +121,14 @@ class _DeltaBindCursor(DuckDBCursorWrapper):
         the statement never qualifies is addressed under the profile's default schema. False
         positives (an alias.column that happens to match) are harmless — they just fail the
         on-disk existence check in the bind."""
-        m = _MISSING_REL.search(str(exc))
-        if not m:
-            return []
-        parts = [p.strip('"') for p in m.group(1).split(".")]
-        if len(parts) == 3:
-            return [tuple(parts)]
-        if len(parts) == 2:  # "schema.table" — the schema-does-not-exist shape
-            return [(None, parts[0], parts[1])]
-        missing = parts[0].lower()
+        default_schema = getattr(self._duckrun_creds, "schema", None) or "main"
         candidates = []
-        for ref in _QUAL_REF.finditer(sql):
-            cat, schema, table = ref.group(1), ref.group(2), ref.group(3)
-            if table is None:
-                cat, schema, table = None, cat, schema
-            c = (cat and cat.strip('"'), schema.strip('"'), table.strip('"'))
-            if c[2].lower() == missing and c not in candidates:
+        for parts in delta_dml.missing_relation_refs(str(exc), sql):
+            c = (tuple(parts[-3:]) if len(parts) >= 3 else       # "schema.table": no such schema
+                 (None, parts[0], parts[1]) if len(parts) == 2 else
+                 (None, default_schema, parts[0]))
+            if c not in candidates:
                 candidates.append(c)
-        if not candidates:
-            default_schema = getattr(self._duckrun_creds, "schema", None) or "main"
-            candidates = [(None, default_schema, parts[0])]
         return candidates
 
     def _lazy_bind_delta_view(self, catalog, schema, table) -> bool:

@@ -1158,7 +1158,52 @@ class DuckSession:
         # Delta table must not be written instead). That one runs natively, like any scratch DDL.
         if _is_delta_write(query) and not delta_dml.targets_temp_table(self.con, query):
             raise ValueError(_delta_write_message(query))
-        return self.con.sql(query)
+        return self._read_with_lazy_binds(query)
+
+    def _read_with_lazy_binds(self, query: str):
+        """``self.con.sql(query)``, retried after binding the Delta tables a catalog error names
+        (the dbt cursor's issue-#24 bind, on this surface). A table another process wrote is
+        readable by name with no refresh(): only a statement that already FAILED with "Table with
+        name X does not exist" pays — one ``_delta_log`` listing per candidate — and a name with no
+        table on the store re-raises the original error. Each pass must bind a new table, so a join
+        of several unbound tables binds them one error at a time and stops."""
+        try:
+            return self.con.sql(query)
+        except duckdb.CatalogException as exc:
+            err = exc
+        attempted = []
+        for _ in range(8):
+            fresh = [p for p in delta_dml.missing_relation_refs(str(err), query)
+                     if p not in attempted]
+            attempted += fresh
+            if not any([self._lazy_bind(p) for p in fresh]):    # bind ALL before deciding
+                raise err
+            try:
+                return self.con.sql(query)
+            except duckdb.CatalogException as exc:
+                err = exc
+        raise err
+
+    def _lazy_bind(self, parts) -> bool:
+        """Register the view for the table ``parts`` names (1–4 parts, resolved like any other
+        name) when its folder holds a Delta table and it has no view yet. True when one was made."""
+        try:
+            cat, schema, table = self._resolve_parts(list(parts))
+        except Exception:
+            return False
+        entry = self._catalogs.get(cat)
+        if entry is None or entry.kind != "delta" or not schema or not table:
+            return False
+        if table.lower() in {t.lower() for t in self._cat_tables(schema, cat)}:
+            return False
+        if not self._live_table_exists(self._table_path(schema, table, cat), entry.storage_options):
+            return False
+        self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(cat)}.{_qid(schema)}")
+        if not self._register_view(cat, schema, table):
+            return False
+        if cat in self._alias_of:
+            self._sync_twin(cat, schema, table)
+        return True
 
     def _resolve_time_travel(self, query: str) -> str:
         """Rewrite every ``<table> AT (VERSION => <n>)`` / ``<table> AT (TIMESTAMP => <ts>)``

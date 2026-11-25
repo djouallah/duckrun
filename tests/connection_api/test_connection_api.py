@@ -828,6 +828,22 @@ def test_refresh_picks_up_external_writes(wh):
     assert conn.sql("select count(*) from t3").fetchall()[0][0] == 1
 
 
+def test_a_table_written_elsewhere_reads_by_name_without_refresh(wh):
+    # The dbt cursor's lazy bind (issue #24) on the connection API: a statement that fails with
+    # "Table with name X does not exist" binds X when its folder holds a Delta table, and retries.
+    conn = duckrun.connect(wh, schema="dbo")
+    _write_table(wh + "/dbo/late", "select 5 as x")
+    _write_table(wh + "/s2/other", "select 6 as y")
+    assert conn.sql("select x from late").fetchall() == [(5,)]
+    assert conn.sql("select y from s2.other").fetchall() == [(6,)]
+    assert conn.sql("select x, answer from late join t2 on true").fetchall() == [(5, 42)]
+    _write_table(wh + "/dbo/a", "select 1 as k")
+    _write_table(wh + "/dbo/b", "select 2 as k")
+    assert conn.sql("select a.k, b.k from a join b on true").fetchall() == [(1, 2)]   # two at once
+    with pytest.raises(duckdb.CatalogException, match="nothere"):
+        conn.sql("select * from nothere")                     # nothing on the store: same error
+
+
 def test_refresh_touches_only_what_changed(wh, monkeypatch):
     # refresh() lists the schema and registers only NEW folders: an existing delta_scan view reads
     # the latest version at every query, so re-creating it would only re-read its log (one log

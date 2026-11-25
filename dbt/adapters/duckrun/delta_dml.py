@@ -743,6 +743,32 @@ def _insert_kind(sql: str) -> Optional[str]:
     return "select"
 
 
+# -- which relation a catalog error is about (lazy bind: the dbt cursor and the connection API) ---
+_MISSING_REL = re.compile(r'(?:Table|View) with name "?([^"!\n]+?)"? does not exist')
+_IDENT = r'(?:"[^"]+"|[A-Za-z_][\w$]*)'
+_DOTTED_REF = re.compile(rf"{_IDENT}(?:\.{_IDENT}){{1,3}}")
+
+
+def missing_relation_refs(error_text: str, sql: str) -> List[List[str]]:
+    """The names a DuckDB "Table with name X does not exist" error could mean, as part lists
+    (quotes stripped), in SQL order: the error's own qualified name; else every qualified reference
+    in ``sql`` (up to ``ws.lh.schema.table``) whose last part is the missing name, since DuckDB names
+    the table bare when its schema exists; else the bare name. ``[]`` for any other error. A false
+    positive (an ``alias.column`` that matches) is harmless: it fails the caller's on-disk check."""
+    m = _MISSING_REL.search(str(error_text))
+    if not m:
+        return []
+    parts = _split_dotted(m.group(1))
+    if len(parts) > 1:
+        return [parts]
+    missing, refs = parts[0].lower(), []
+    for ref in _DOTTED_REF.finditer(sql):
+        p = _split_dotted(ref.group(0))
+        if p[-1].lower() == missing and p not in refs:
+            refs.append(p)
+    return refs or [parts]
+
+
 def _split_dotted(name: str) -> List[str]:
     """Split a qualified name on the dots that separate its parts, treating a double-quoted span as
     opaque so a dot INSIDE quotes (`"a.b"`, one legal quoted identifier) does NOT split the name.

@@ -223,3 +223,12 @@ def test_refresh_keeps_four_part_twins_in_step_without_rebuilding_them(sales):
     assert conn.sql("select id from ws.sales.dbo.t3").fetchall() == [(3,)]
     assert _twin(conn, "t2") == 0
     assert conn.sql("select amt from ws.sales.dbo.orders").fetchall() == [(10,)]
+
+
+def test_a_table_written_elsewhere_reads_by_four_part_name_without_refresh(sales):
+    conn = duckrun.connect(str(sales))
+    o = duckrun.connect(str(sales), read_only=False)
+    o.sql("create table late as select 5 as x")
+    o.close()
+    assert conn.sql("select x from ws.sales.dbo.late").fetchall() == [(5,)]
+    assert conn.sql("select x from sales.dbo.late").fetchall() == [(5,)]   # its twin came along
