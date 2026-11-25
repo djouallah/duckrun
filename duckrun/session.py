@@ -718,24 +718,27 @@ class DuckSession:
                 f"delta_scan('{_qlit(self._table_path(sch, tbl, cat))}')")
         self._twins[cat] = want
 
-    def _sync_twin(self, cat: str, schema: str, table: str) -> None:
-        """After a write to ``cat.schema.table``: make both of its views — ``cat.schema.table`` and
-        ``ws.lh.schema.table`` — match the store (registered if the table is live, dropped if not),
-        whichever name the statement used."""
+    def _sync_twin(self, cat: str, schema: str, table: str, via_alias: bool = False) -> None:
+        """After a write to ``cat.schema.table``: give the table's OTHER name the state the router
+        just gave the name the statement used (``ws.lh.schema.table`` when ``via_alias``, else
+        ``cat.schema.table``): registered if the router registered it, dropped if it dropped it.
+        No store call — the router's own view (a ``delta_scan`` of this folder) is the answer."""
         ws, lh = self._alias_of[cat]
         path = self._table_path(schema, table, cat)
-        owners = [_qid(cat), f"{_qid(ws)}.{_qid(lh)}"]
-        twins = self._twins.setdefault(cat, set())
-        if self._live_table_exists(path, self._catalog_storage_options(cat)):
-            for owner in owners:
-                self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {owner}.{_qid(schema)}")
-                self.con.execute(f"CREATE OR REPLACE VIEW {owner}.{_qid(schema)}.{_qid(table)} AS "
-                                 f"SELECT * FROM delta_scan('{_qlit(path)}')")
-            twins.add((schema, table))
+        needle = f"delta_scan('{_qlit(path)}')"
+        used = ws if via_alias else cat
+        live = any(needle in (sql or "") for (sql,) in self.con.execute(
+            "SELECT sql FROM duckdb_views() WHERE NOT internal AND database_name = ?",
+            [used]).fetchall())
+        other = _qid(cat) if via_alias else f"{_qid(ws)}.{_qid(lh)}"
+        if live:
+            self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {other}.{_qid(schema)}")
+            self.con.execute(f"CREATE OR REPLACE VIEW {other}.{_qid(schema)}.{_qid(table)} AS "
+                             f"SELECT * FROM {needle}")
         else:
-            for owner in owners:
-                self.con.execute(f"DROP VIEW IF EXISTS {owner}.{_qid(schema)}.{_qid(table)}")
-            twins.discard((schema, table))
+            self.con.execute(f"DROP VIEW IF EXISTS {other}.{_qid(schema)}.{_qid(table)}")
+        twins = self._twins.setdefault(cat, set())
+        (twins.add if live else twins.discard)((schema, table))
 
     def _alias_catalog(self, ws: str, lh: str) -> Optional[str]:
         """The lakehouse catalog answering to ``ws.lh`` (identifiers fold case, as in DuckDB)."""
@@ -1142,7 +1145,7 @@ class DuckSession:
             # The router registered the view under the name the statement used; the table has a twin
             # under its other name (cat.schema.table <-> ws.lh.schema.table) — bring that one along.
             schema = default_schema if len(tparts) == 1 else tparts[-2]
-            self._sync_twin(write_cat, schema, tparts[-1])
+            self._sync_twin(write_cat, schema, tparts[-1], via_alias=view_prefix is not None)
         if handled:
             # No catalog rescan here: the DML router already registered/dropped the one view this
             # statement touched (_refresh_view/_drop), exactly like the dbt surface, and no peer
@@ -1345,9 +1348,16 @@ class DuckSession:
         self.con.register(name, obj)
 
     def _live_table_exists(self, path: str, so=None) -> bool:
-        """True iff a Delta table exists at ``path`` (one log open; a dropped table's folder is
-        gone)."""
-        return engine.table_exists(path, so)
+        """True iff a Delta table exists at ``path``: its ``_delta_log`` holds a file. One listing,
+        not a log replay — a yes/no needs no snapshot. OneLake can't be globbed, so it is asked over
+        its DFS REST listing; every other store through DuckDB's glob (its secrets). A OneLake root
+        with no token to ask with falls back to opening the table."""
+        if remote.is_abfss(path):
+            if secret.bearer_token(so):
+                return remote.has_delta_log(path, so)
+            return engine.table_exists(path, so)
+        log = _qlit(path.rstrip("/") + "/_delta_log/*")
+        return bool(self.con.execute(f"SELECT 1 FROM glob('{log}') LIMIT 1").fetchall())
 
     def _relation_from(self, rows, ddl: str) -> "duckdb.DuckDBPyRelation":
         """Materialise recommender ``rows`` (a list of same-width tuples) as a native relation whose
