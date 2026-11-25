@@ -14,7 +14,6 @@ from typing import Any, Optional
 from dbt.adapters.duckdb.plugins import BasePlugin
 from dbt.adapters.duckdb.utils import SourceConfig, TargetConfig
 
-from . import delta_dml
 from . import engine
 from . import secret
 from . import sortkey
@@ -212,16 +211,6 @@ class Plugin(BasePlugin):
         dt0 = engine.open_if_exists(path, storage_options)
         exists = dt0 is not None
 
-        # A duckrun drop-tombstone (the notebook API's `drop table` overwrites the table to a
-        # one-column marker; nothing is deleted) IS a real Delta table, so `exists` alone would
-        # send an incremental model down the merge branch — merging into the marker's schema and
-        # dying on "no field named target.<key>". Discovery already HIDES tombstones from dbt's
-        # relation cache; mirror that here at store time: the next build of a dropped table is
-        # CREATE-after-DROP, a full overwrite. `exists` stays True so the overwrite branch takes
-        # schema_mode="overwrite" and replaces the marker schema with the model's real one.
-        if exists and delta_dml.is_dropped_dt(dt0):
-            incremental = False
-
         # Contradiction guard (closes a silent data-loss window). dbt resolved this model as
         # incremental because run-start disk discovery saw the table, so the model SQL already
         # filtered to only-new rows. If the table now can't be opened at store time *and* that's
@@ -299,7 +288,7 @@ class Plugin(BasePlugin):
             # sort_by='auto' resolves here to concrete columns (or None); rewrite cfg so every
             # downstream cfg.get('sort_by') reader (the merge branch) sees the resolved value too.
             #
-            # Resolved HERE, after `exists` and the tombstone adjustment, rather than at the top of
+            # Resolved HERE, after `exists` is known, rather than at the top of
             # store(): `_sort_by_is_inert` needs the branch this write will actually take, because
             # resolving 'auto' means PROFILING the staged relation and three branches then throw the
             # answer away (see that method). A project-wide `+sort_by: auto` used to pay that profile on

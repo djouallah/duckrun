@@ -152,8 +152,8 @@ class _DeltaBindCursor(DuckDBCursorWrapper):
     def _lazy_bind_delta_view(self, catalog, schema, table) -> bool:
         """Register the ``delta_scan`` view for one ``(catalog, schema, table)``. True only when a
         view was actually created. Same contract as adapter introspection's on-demand bind, via
-        the shared :func:`delta_dml.live_delta_target`: a table that isn't on disk and a
-        drop-tombstone must not surface. Every failure is swallowed at debug — the caller re-raises
+        the shared :func:`delta_dml.live_delta_target`: a table that isn't on disk must not
+        surface. Every failure is swallowed at debug — the caller re-raises
         the original catalog error, which must not be masked by a bind gone wrong."""
         try:
             # root_for falls back to the default catalog for an undeclared name — which is what a

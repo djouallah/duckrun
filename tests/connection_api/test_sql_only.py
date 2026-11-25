@@ -533,8 +533,7 @@ def test_predicate_less_update_touches_every_row_over_many_files(w):
 
 def test_plain_drop_of_already_dropped_table_errors(w):
     """DROP TABLE <t> a second time (after it's already dropped) raises like SQL requires; only DROP
-    TABLE IF EXISTS is a silent no-op. A dropped duckrun table leaves a tombstone at its path — the drop
-    must not read that as 'still exists' and succeed."""
+    TABLE IF EXISTS is a silent no-op."""
     w.sql("CREATE OR REPLACE TABLE gone (id INTEGER)")
     w.sql("DROP TABLE gone")
     w.sql("DROP TABLE IF EXISTS gone")                           # already gone → silent no-op

@@ -470,6 +470,9 @@ class DuckSession:
         # under it (views over the same delta_scan paths). ws -> {lh -> catalog}, and its inverse.
         self._aliases: Dict[str, Dict[str, str]] = {}
         self._alias_of: Dict[str, tuple] = {}
+        # catalog -> the (schema, table) 4-part views made for it under "ws"."lh" (duckdb_views()
+        # flattens nested schemas, so it cannot say which lakehouse a twin belongs to).
+        self._twins: Dict[str, set] = {}
 
         root, schema_filter = _split_root_schema(path, schema)
         # Catalog is first-class, so single- and multi-catalog sessions share one code path
@@ -567,6 +570,7 @@ class DuckSession:
             # would die on "already attached".
             self._catalogs.pop(name, None)
             ws_lh = self._alias_of.pop(name, None)
+            self._twins.pop(name, None)
             if ws_lh is not None:
                 self._aliases.get(ws_lh[0], {}).pop(ws_lh[1], None)
             try:
@@ -695,14 +699,24 @@ class DuckSession:
             self._alias_of[cat] = alias
         ws, lh = alias
         prefix = f"{_qid(ws)}.{_qid(lh)}"
-        self.con.execute(f"DROP SCHEMA IF EXISTS {prefix} CASCADE")
-        self.con.execute(f"CREATE SCHEMA {prefix}")
+        have = self._twins.get(cat)
+        if have is None:                                 # first sync: start from a clean schema
+            self.con.execute(f"DROP SCHEMA IF EXISTS {prefix} CASCADE")
+            self.con.execute(f"CREATE SCHEMA {prefix}")
+            have = self._twins[cat] = set()
+        # Only the difference: a twin is a delta_scan view, which reads the latest version at
+        # every query, so an existing one never needs re-creating (that re-reads the table's log).
+        want = set()
         for sch in self._cat_databases(cat):
             self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {prefix}.{_qid(sch)}")
-            for tbl in self._cat_tables(sch, cat):
-                self.con.execute(
-                    f"CREATE OR REPLACE VIEW {prefix}.{_qid(sch)}.{_qid(tbl)} AS SELECT * FROM "
-                    f"delta_scan('{_qlit(self._table_path(sch, tbl, cat))}')")
+            want |= {(sch, tbl) for tbl in self._cat_tables(sch, cat)}
+        for sch, tbl in sorted(have - want):
+            self.con.execute(f"DROP VIEW IF EXISTS {prefix}.{_qid(sch)}.{_qid(tbl)}")
+        for sch, tbl in sorted(want - have):
+            self.con.execute(
+                f"CREATE OR REPLACE VIEW {prefix}.{_qid(sch)}.{_qid(tbl)} AS SELECT * FROM "
+                f"delta_scan('{_qlit(self._table_path(sch, tbl, cat))}')")
+        self._twins[cat] = want
 
     def _sync_twin(self, cat: str, schema: str, table: str) -> None:
         """After a write to ``cat.schema.table``: make both of its views — ``cat.schema.table`` and
@@ -711,14 +725,17 @@ class DuckSession:
         ws, lh = self._alias_of[cat]
         path = self._table_path(schema, table, cat)
         owners = [_qid(cat), f"{_qid(ws)}.{_qid(lh)}"]
+        twins = self._twins.setdefault(cat, set())
         if self._live_table_exists(path, self._catalog_storage_options(cat)):
             for owner in owners:
                 self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {owner}.{_qid(schema)}")
                 self.con.execute(f"CREATE OR REPLACE VIEW {owner}.{_qid(schema)}.{_qid(table)} AS "
                                  f"SELECT * FROM delta_scan('{_qlit(path)}')")
+            twins.add((schema, table))
         else:
             for owner in owners:
                 self.con.execute(f"DROP VIEW IF EXISTS {owner}.{_qid(schema)}.{_qid(table)}")
+            twins.discard((schema, table))
 
     def _alias_catalog(self, ws: str, lh: str) -> Optional[str]:
         """The lakehouse catalog answering to ``ws.lh`` (identifiers fold case, as in DuckDB)."""
@@ -762,28 +779,25 @@ class DuckSession:
         if clash:
             raise RuntimeError(_case_clash_msg(name, None, clash))
 
+        # Only what changed is touched: the listing is the one store call per schema. A table that
+        # already has its view keeps it — a delta_scan view reads the latest version (and the
+        # current schema) at every query, so re-creating it would only re-read its log. A new
+        # folder gets a view; a view whose folder is gone is dropped.
         registered = []
-        for schema, tables in mapping.items():
+        schemas = list(mapping)
+        if entry.schema_filter is None:
+            schemas += [s for s in self._cat_databases(name) if s not in mapping]
+        for schema in schemas:
+            tables = mapping.get(schema, [])
+            known = set(self._cat_tables(schema, name))
+            for gone in sorted(known - set(tables)):
+                self.con.execute(f"DROP VIEW IF EXISTS {_qid(name)}.{_qid(schema)}.{_qid(gone)}")
             if not tables:
                 continue
             self.con.execute(f"CREATE SCHEMA IF NOT EXISTS {_qid(name)}.{_qid(schema)}")
-            # Open every table's Delta log concurrently for the tombstone checks — serialized
-            # per-table opens were the dominant connect()/refresh() cost on OneLake (the twin of
-            # the adapter's issue-#16 discovery fix). View registration stays serial on the
-            # shared connection.
-            dts = engine.open_delta_tables([(f"{root}/{schema}/{t}", so) for t in tables])
             live = []
-            for table, dt in zip(tables, dts):
-                # Hide drop-tombstones (a `drop table` overwrites the table to a one-column marker;
-                # no data is deleted, the files persist, but the table must not surface).
-                if dt is not None:
-                    if delta_dml.is_dropped_dt(dt):
-                        continue
-                # delta-rs couldn't open it (a plain folder, or a credential only DuckDB holds) —
-                # fall back to the original DuckDB-side probe so a tombstone there is still hidden.
-                elif delta_dml.is_dropped(self.con, f"{root}/{schema}/{table}", so):
-                    continue
-                if self._register_view(name, schema, table):
+            for table in tables:
+                if table in known or self._register_view(name, schema, table):
                     live.append(table)
                     registered.append(f"{schema}.{table}")
             clash = _case_collision(live)
@@ -929,7 +943,7 @@ class DuckSession:
                 if f"delta_scan('{_qlit(self._table_path(schema, name, cat))}')" in (sql or "")]
 
     def _cat_table_exists(self, tableName: str) -> bool:
-        """True iff ``tableName`` is a LIVE Delta table (read from the store; a drop-tombstone is False)."""
+        """True iff ``tableName`` is a Delta table (read from the store)."""
         catalog, schema, table = self._resolve(tableName)
         return self._live_table_exists(self._table_path(schema, table, catalog),
                                        self._catalog_storage_options(catalog))
@@ -1331,11 +1345,9 @@ class DuckSession:
         self.con.register(name, obj)
 
     def _live_table_exists(self, path: str, so=None) -> bool:
-        """True iff a LIVE Delta table exists at ``path``. A drop-tombstone counts as NONEXISTENT — the
-        same ``is_dropped`` predicate discovery and the raw-DML router use — so every existence check
-        (the writer's error/ignore mode and the reader) agrees a dropped table is
-        gone. One oracle, no per-surface duplication."""
-        return engine.table_exists(path, so) and not delta_dml.is_dropped(self.con, path, so)
+        """True iff a Delta table exists at ``path`` (one log open; a dropped table's folder is
+        gone)."""
+        return engine.table_exists(path, so)
 
     def _relation_from(self, rows, ddl: str) -> "duckdb.DuckDBPyRelation":
         """Materialise recommender ``rows`` (a list of same-width tuples) as a native relation whose

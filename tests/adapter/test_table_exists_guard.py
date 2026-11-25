@@ -112,7 +112,7 @@ def test_store_refuses_overwrite_when_table_vanishes_midrun(tmp_path, monkeypatc
     plugin = _store_plugin(con)
 
     # Simulate the transient storage error the fix stops swallowing. store()'s existence check is
-    # engine.open_if_exists (it keeps the handle for the drop-tombstone check); same fail-loud
+    # engine.open_if_exists (it keeps the handle for the write); same fail-loud
     # contract as table_exists, which delegates to it.
     monkeypatch.setattr(engine, "open_if_exists", lambda *a, **k: (_ for _ in ()).throw(OSError("503")))
 

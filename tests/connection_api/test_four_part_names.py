@@ -191,3 +191,35 @@ def test_user_view_on_a_plain_root(tmp_path):
     conn.sql("insert into t values (2)")
     assert conn.sql("select sum(k) from v").fetchall() == [(5,)]
     assert conn._cat_tables("dbo") == ["t"]
+
+
+def test_refresh_keeps_four_part_twins_in_step_without_rebuilding_them(sales):
+    # The 4-part twins follow the same rule as the 3-part views: a refresh adds the new table's
+    # twin and drops a gone one's, and re-creates none of the others.
+    import shutil
+    conn = duckrun.connect(str(sales), read_only=False)
+    conn.sql("create table t2 as select 2 as id")
+    made = []
+    real = conn.con.execute
+
+    class _Spy:
+        def __getattr__(self, name):
+            return getattr(real.__self__, name)
+
+        def execute(self, sql, *a, **k):
+            if "CREATE OR REPLACE VIEW" in sql:
+                made.append(sql.split(" AS ", 1)[0])
+            return real(sql, *a, **k)
+
+    conn.con = _Spy()
+    conn.refresh(quiet=True)
+    assert made == []
+    o = duckrun.connect(str(sales), read_only=False)
+    o.sql("create table t3 as select 3 as id")
+    o.close()
+    shutil.rmtree(sales / "dbo" / "t2")
+    conn.refresh(quiet=True)
+    assert len(made) == 2 and all("t3" in m for m in made)     # 3-part view + its 4-part twin
+    assert conn.sql("select id from ws.sales.dbo.t3").fetchall() == [(3,)]
+    assert _twin(conn, "t2") == 0
+    assert conn.sql("select amt from ws.sales.dbo.orders").fetchall() == [(10,)]

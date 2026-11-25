@@ -3,12 +3,9 @@
 Two things only the adapter's discovery path (impl.list_relations_without_caching /
 _with_delta_stats) provides, and that the connection-API suites cannot cover:
 
-  * Drop-tombstone hiding. dbt itself has no DROP — but the notebook API does
-    (`conn.sql("drop table x")` overwrites the table to a one-column marker, deleting nothing),
-    and both surfaces share one lakehouse. If discovery surfaced the tombstone, a model with the
-    dropped table's name would resolve is_incremental() == true on its next run and merge into
-    the marker instead of rebuilding from scratch. Hiding it makes drop-then-dbt behave like
-    CREATE-after-DROP.
+  * Drop-then-dbt. dbt itself has no DROP — but the notebook API does (`conn.sql("drop table
+    x")` deletes the table's folder), and both surfaces share one lakehouse. The next run of a
+    model with the dropped table's name must be a full build, not an incremental merge.
 
   * The docs Stats panel. `dbt docs generate` enriches the catalog with stats:* columns read
     from the Delta log (_with_delta_stats); a shape regression only shows up as a silently
@@ -82,7 +79,7 @@ def test_dropped_table_rebuilds_instead_of_merging(project):
     assert _rows(root) == {1: "a"}
     cols = {r[0] for r in duckrun.connect(root, schema="main")
             .sql("describe events").fetchall()}
-    assert cols == {"id", "name"}  # no __duckrun_deleted__ marker resurrected
+    assert cols == {"id", "name"}
 
 
 def test_show_discovery_opens_concurrently_and_creates_schema_once(project, monkeypatch):
@@ -90,20 +87,14 @@ def test_show_discovery_opens_concurrently_and_creates_schema_once(project, monk
     table's Delta log serially (one delta-rs open per relation) and re-created the schema once
     per relation. Pin the fix through the real command: the per-relation opens run off the main
     thread (the concurrent pool), the schema is created once per schema, and discovery still
-    hides tombstones and registers views (a multi-table schema with a drop in it works)."""
+    registers views (a multi-table schema works)."""
     proj, root = project
     assert _dbt(proj, "run").success  # materialize `events` so discovery has it too
 
-    # More tables via the notebook surface, plus the one-column tombstone an older duckrun's
-    # `drop table` left behind, which discovery must still open and hide.
-    import deltalake
-    import pyarrow as pa
-    from dbt.adapters.duckrun.delta_dml import TOMBSTONE_COLUMN
-
+    # More tables via the notebook surface.
     con = duckrun.connect(root, schema="main", read_only=False)
-    for i in range(3):
+    for i in range(4):
         con.sql(f"create table t{i} as select {i} as id")
-    deltalake.write_deltalake(str(Path(root) / "main" / "t3"), pa.table({TOMBSTONE_COLUMN: [True]}))
 
     from dbt.adapters.duckrun import engine as dr_engine
     from dbt.adapters.duckrun.impl import DuckrunAdapter

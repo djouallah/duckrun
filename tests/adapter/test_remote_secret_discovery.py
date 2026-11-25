@@ -418,7 +418,7 @@ def test_discovery_propagates_access_error(monkeypatch):
 # (Session._register_view confirms the log), so the two surfaces disagreed about one store.
 
 class _FakeDT:
-    """A delta-rs handle stand-in — discovery only reads its schema (the tombstone check)."""
+    """A delta-rs handle stand-in: discovery only needs to know the open succeeded."""
     def schema(self):
         field = lambda n: type("_F", (), {"name": n})()
         return type("_S", (), {"fields": [field("id"), field("name")]})()

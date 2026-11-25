@@ -303,10 +303,8 @@ class DuckrunAdapter(DuckDBAdapter):
         ``plan = [(relation, location, storage_options, dt)]``.
 
         THE one filter for both discovery paths (per-schema and the cross-schema prefetch), so
-        the two can't drift. Two things are hidden:
+        the two can't drift. What is hidden:
 
-        * **Drop-tombstones.** A duckrun ``drop table`` overwrites the table to a one-column
-          marker (no data deleted); such a table must not be reported as existing.
         * **Non-Delta directories** (issue #19). OneLake can't be globbed, so the REST listing
           returns directory NAMES — it can't tell a Delta table from a plain folder of parquet
           (an interrupted write). Claiming such a directory exists makes ``is_incremental()``
@@ -321,20 +319,12 @@ class DuckrunAdapter(DuckDBAdapter):
         """
         live = []
         for rel, loc, so, dt in plan:
-            if dt is not None:
-                if delta_dml.is_dropped_dt(dt):
-                    continue
-            else:
-                # delta-rs couldn't open it. On OneLake that's the signal to settle whether the
-                # directory is a Delta table at all (issue #19) — but only when we hold a token to
-                # ask with, since has_delta_log() reports False for a missing one.
-                if remote.is_abfss(loc) and secret.bearer_token(so) and not self._has_delta_log(loc, so):
-                    continue
-                # Otherwise (or once the log is confirmed): the original DuckDB-side tombstone
-                # probe, so a tombstone on a store whose credential lives only in the DuckDB
-                # `secrets:` block is still hidden, exactly as before.
-                if delta_dml.is_dropped(cursor, loc, so):
-                    continue
+            # delta-rs couldn't open it. On OneLake that's the signal to settle whether the
+            # directory is a Delta table at all (issue #19) — but only when we hold a token to
+            # ask with, since has_delta_log() reports False for a missing one.
+            if (dt is None and remote.is_abfss(loc) and secret.bearer_token(so)
+                    and not self._has_delta_log(loc, so)):
+                continue
             live.append((rel, dt))
         return live
 
@@ -496,7 +486,7 @@ class DuckrunAdapter(DuckDBAdapter):
                        + "/" + str(rel.identifier).strip('"'))
                 plan.append((key, rel, loc, so))
 
-        # ONE concurrent open pool across all schemas (tombstone check + persisted-docs read),
+        # ONE concurrent open pool across all schemas (Delta-log check + persisted-docs read),
         # then the shared live filter — same contract as the per-schema path (:meth:`_live_relations`).
         dts = self._open_delta_tables([(loc, so) for _, _, loc, so in plan])
         cur = self._cursor()
@@ -536,7 +526,7 @@ class DuckrunAdapter(DuckDBAdapter):
         if not discovered:
             return in_memory
 
-        # Filter to the relations that must actually surface — drop-tombstones and (on OneLake)
+        # Filter to the relations that must actually surface — on OneLake, not
         # directories that aren't Delta tables at all; see :meth:`_live_relations`. Every
         # discovered relation shares this schema_relation's catalog, so resolve its root/token once.
         # ONE delta-rs open per relation serves BOTH that filter and the persisted-docs read
@@ -621,7 +611,7 @@ class DuckrunAdapter(DuckDBAdapter):
 
         The single-relation counterpart of discovery's bulk registration, under the same contract
         (:func:`delta_dml.live_delta_target` — shared with the cursor's lazy bind so the two can't
-        drift): a table that isn't on disk and a drop-tombstone must not surface. Nothing here may
+        drift): a table that isn't on disk must not surface. Nothing here may
         turn a previously-silent introspection into a failed run, so every error is swallowed at
         debug and leaves the caller with the empty column list it already had.
         """
@@ -675,8 +665,8 @@ class DuckrunAdapter(DuckDBAdapter):
     def _with_delta_stats(self, table):
         """Return ``table`` with stats:* columns appended, sourced per-relation from the Delta log.
 
-        A relation with no Delta table at ``root_path/schema/name`` (a native ``view``, a
-        drop-tombstone) gets ``include=False`` stats, so dbt leaves it statless. Best-effort: if
+        A relation with no Delta table at ``root_path/schema/name`` (a native ``view``) gets
+        ``include=False`` stats, so dbt leaves it statless. Best-effort: if
         anything goes wrong the original table is returned unchanged — docs must never break.
         """
         from datetime import datetime, timezone
@@ -714,15 +704,9 @@ class DuckrunAdapter(DuckDBAdapter):
                     cache[key] = None
                     return None
                 loc, so = targets[key]
-                # One open serves the tombstone check and the stats read (was two per relation).
                 dt = opened.get(key)
-                if dt is not None:
-                    cache[key] = (None if delta_dml.is_dropped_dt(dt)
-                                  else engine.delta_stats(cur, loc, so, dt=dt))
-                else:
-                    # delta-rs couldn't open it — original DuckDB-side path, exactly as before.
-                    cache[key] = (None if delta_dml.is_dropped(cur, loc, so)
-                                  else engine.delta_stats(cur, loc, so))
+                cache[key] = (engine.delta_stats(cur, loc, so, dt=dt) if dt is not None
+                              else engine.delta_stats(cur, loc, so))
             return cache[key]
 
         stat_cols = [f"stats:{k}:{p}" for k, _, _ in self._STATS_SPEC

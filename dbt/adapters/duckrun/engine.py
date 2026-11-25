@@ -1079,7 +1079,7 @@ def delta_stats(cur, path: str, storage_options: Optional[Dict[str, str]] = None
     replacement scan over the arro3 table — no pyarrow dependency.
 
     Returns ``{"num_rows", "bytes", "last_modified"}`` (last_modified = epoch milliseconds), or
-    ``None`` on ANY failure (a drop-tombstone, a missing table, an unreachable/credential-less remote
+    ``None`` on ANY failure (a missing table, an unreachable/credential-less remote
     store). Best-effort by design: a statless catalog is fine, but a docs build must never break.
     ``dt`` reuses an already-opened handle instead of a fresh log open.
     """

@@ -14,11 +14,8 @@ stores (delta_rs carries ``storage_options``). ``create table ... as`` writes a 
 the mutate forms (delete/update/insert/alter) apply only when a Delta table already exists at the
 target (otherwise the statement passes through — e.g. the test's native ``fact``/``seed``).
 
-``drop table`` unregisters the ``delta_scan`` view AND overwrites the table (via delta_rs) to a
-one-column ``TOMBSTONE_COLUMN`` marker, which discovery recognizes and hides. It does NOT delete
-data: delta_rs has no drop, and removing the Delta files would be a filesystem hack that fails on
-object stores. The directory persists until a human purges it; a later ``create table ... as``
-overwrites the tombstone with real data and the table is live again.
+``drop table`` unregisters the ``delta_scan`` view and deletes the table's folder
+(``objectstore.delete_tree``).
 
 The seed loader's own SQL (``create table <t> (<col defs>)``, ``insert ... values``, ``COPY``) lands
 on a native DuckDB table, not a Delta table: bare ``create table (<col defs>)`` becomes a Delta
@@ -84,60 +81,18 @@ from dbt.adapters.duckrun._log import logger
 
 from . import cow, engine, objectstore
 
-# `drop table` tombstone: a dropped relation is overwritten (via delta_rs) to a table whose ONLY
-# column is this marker, so (a) discovery recognizes it as dropped and hides it, and (b) anyone who
-# opens the files sees an obviously-not-a-real-table schema rather than a plausible empty table. No
-# data is deleted — the directory stays until a human purges it; a later `create table ... as`
-# overwrites the marker schema with real data and the table is live again.
-TOMBSTONE_COLUMN = "__duckrun_deleted__"
-
-
-def _columns_are_tombstone(colnames) -> bool:
-    return [str(c).lower() for c in colnames] == [TOMBSTONE_COLUMN]
-
-
-def is_dropped(con, location: str, storage_options=None) -> bool:
-    """True if the Delta table at ``location`` is a duckrun drop-tombstone (single marker column).
-
-    Used by discovery (dbt + connection API) to hide dropped tables. Best-effort: anything that
-    can't be opened/scanned is treated as 'not a tombstone' (let normal handling deal with it).
-    """
-    loc_sql = str(location).replace("'", "''")
-    try:
-        rel = con.execute(f"select * from delta_scan('{loc_sql}') limit 0")
-        cols = [d[0] for d in rel.description]
-        rel.fetchall()  # end the result: an open one blocks the connection on duckdb 2.0 (#26747)
-        return _columns_are_tombstone(cols)
-    except Exception as exc:  # best-effort: treat unreadable as 'not a tombstone', but leave a trace
-        logger.debug(f"duckrun: is_dropped could not scan {location!r}, treating as live: {exc}")
-        return False
-
-
-def is_dropped_dt(dt) -> bool:
-    """:func:`is_dropped` from an already-opened ``DeltaTable`` — same tombstone rule (single marker
-    column), same best-effort contract (unreadable schema → 'live'), but no extra log open. Used by
-    adapter discovery, whose one delta-rs open per relation also serves the persisted-docs read."""
-    try:
-        return _columns_are_tombstone([f.name for f in dt.schema().fields])
-    except Exception as exc:  # best-effort: treat unreadable as 'not a tombstone'
-        logger.debug(f"duckrun: is_dropped_dt could not read schema, treating as live: {exc}")
-        return False
-
-
 def live_delta_target(cursor, location: str, storage_options=None) -> tuple:
     """``(should_bind, dt)`` for binding a single ``delta_scan`` view at ``location`` on demand.
 
-    THE single-relation existence/tombstone contract, shared by adapter column introspection
+    THE single-relation existence contract, shared by adapter column introspection
     (``impl._bind_delta_view``) and the cursor's lazy bind on a catalog error
     (``environment.DuckrunCursorWrapper``), so the two can't drift — the same rule
     :meth:`impl._live_relations` applies during bulk discovery:
 
     * **Not on disk** (delta-rs settles it: no table there) → don't bind.
-    * **A drop-tombstone** → don't bind; a dropped table must not resurface with its
-      ``__duckrun_deleted__`` marker as if the model still existed.
     * **delta-rs can't open the store at all** — e.g. an az:// root whose credential lives only in
       the DuckDB ``secrets:`` block — existence is unsettled, so bind anyway (DuckDB may hold the
-      secret; a wrong guess just fails the CREATE VIEW) after the DuckDB-side tombstone probe.
+      secret; a wrong guess just fails the CREATE VIEW).
 
     ``dt`` is the already-open handle when delta-rs settled it, for callers that reuse it
     (persisted-docs read); None otherwise.
@@ -146,8 +101,8 @@ def live_delta_target(cursor, location: str, storage_options=None) -> tuple:
         dt = engine.open_if_exists(location, storage_options)
     except Exception as exc:
         logger.debug(f"duckrun: could not open {location!r} for an on-demand bind: {exc}")
-        return (not is_dropped(cursor, location, storage_options)), None
-    if dt is None or is_dropped_dt(dt):
+        return True, None
+    if dt is None:
         return False, None
     return True, dt
 
@@ -1622,8 +1577,7 @@ class _DeltaDML:
         schema, identifier, loc = self._resolve(rel)
         if not loc:
             return False
-        # is_dropped_dt reads the schema off the handle _exists just pinned — no second log open.
-        live = self._exists(loc) and not is_dropped_dt(self._pinned(loc))
+        live = self._exists(loc)
         # dbt/cursor path (no default_schema): keep the ORIGINAL narrow interception — only a plain
         # `create table … as select …` routes to Delta. A CTE or parenthesised body stays native so
         # dbt keeps owning the relation (dbt-internal CTAS like store_failures' `create table … as
@@ -1641,7 +1595,7 @@ class _DeltaDML:
                 return False
             if m.group("orrep") and not live:
                 return False
-        # `if not exists` over a live (non-tombstone) table is a no-op — just (re)surface the view.
+        # `if not exists` over a live table is a no-op — just (re)surface the view.
         if m.group("ine") and live:
             self._refresh_view(rel, schema, loc)
             return True
@@ -1662,8 +1616,7 @@ class _DeltaDML:
             order = ", ".join(engine.quote_ident(c) for c in sort_cols)
             body = f"SELECT * FROM ({body}) ORDER BY {order}"
         data = self.cursor.sql(body)
-        # overwrite_schema so this replaces a prior table (or a drop-tombstone) wholesale — a live
-        # table is recreated with the real schema, clearing any tombstone marker. Every CTAS —
+        # overwrite_schema so this replaces a prior table wholesale, with the new schema. Every CTAS —
         # SORTED BY AUTO included — lands on the fixed geometry (4M-row ceiling, 256 MB files),
         # so this SQL path and the dbt table path behave identically.
         engine.write_delta(loc, data, "overwrite", overwrite_schema=True,
@@ -1688,7 +1641,7 @@ class _DeltaDML:
         if not loc:
             return False
         existed = self._exists(loc)                       # ONE check — also picks the create mode below
-        live = existed and not is_dropped_dt(self._pinned(loc))  # reuses _exists's pinned handle
+        live = existed
         if parts["ine"] and live:                       # IF NOT EXISTS over a live table → no-op
             self._refresh_view(rel, schema, loc)
             return True
@@ -2192,16 +2145,13 @@ class _DeltaDML:
     def _drop(self, m) -> bool:
         # `drop table` on a duckrun relation: unregister the delta_scan view and DELETE the table's
         # folder (objectstore.delete_tree: one recursive DFS delete on OneLake, which keeps the files 7
-        # days as soft-deleted and restorable; rmtree locally; list + delete on s3 / gcs). A table a
-        # duckrun before 0.6.0 dropped is a one-column tombstone (TOMBSTONE_COLUMN) and is still
-        # hidden by discovery; dropping it again passes through like any absent table. If the
+        # days as soft-deleted and restorable; rmtree locally; list + delete on s3 / gcs). If the
         # relation isn't a duckrun-managed Delta table, fall through and let DuckDB drop the native
         # table.
         rel = m.group("rel").strip()
         schema, identifier, loc = self._resolve(rel)
-        if (not loc or self._shadowed_by_temp(rel) or not self._exists(loc)
-                or is_dropped_dt(self._pinned(loc))):
-            # Not a LIVE duckrun table (never existed, native, or an old tombstone) → pass through so
+        if not loc or self._shadowed_by_temp(rel) or not self._exists(loc):
+            # Not a duckrun table (never existed, or native) → pass through so
             # DuckDB applies plain DROP / DROP IF EXISTS semantics: a plain `DROP TABLE <gone>` raises,
             # IF EXISTS is a no-op.
             return False

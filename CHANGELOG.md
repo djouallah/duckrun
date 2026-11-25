@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Breaking
+- **Drop-tombstones are no longer hidden.** 0.6.0's `DROP TABLE` deletes the folder; a table an
+  older duckrun dropped is a one-column `__duckrun_deleted__` table, and it now shows up like any
+  other. `DROP TABLE` it once to delete its folder. Hiding it cost a log read per table on every
+  connect, refresh and existence check (connection API and dbt discovery).
+
 ### Fixed
 - **A user `CREATE VIEW` no longer breaks `refresh()` on a OneLake lakehouse** (#87). On a catalog
   with a 4-part alias (`ws.lh.schema.table`), every view in a discovered schema got a 4-part twin
@@ -23,6 +29,12 @@ All notable changes to this project will be documented in this file.
 - **deltalake < 1.7: a table with deletion vectors on refused every write.** Those versions stamp
   `variantType` on a table they upgrade to writer version 7; with no VARIANT column that feature
   needs nothing from a commit, so it is no longer an unknown-feature refusal.
+- **`refresh()` touches only what changed.** It lists the schema folders, registers a view for each
+  new table and drops the view of a table whose folder is gone; it leaves every other view (and
+  its 4-part `ws.lh.schema.table` twin) as it is, since a `delta_scan` view reads the latest
+  version and schema at each query. It used to open every table's Delta log with delta-rs and
+  re-create every view, serially, on each call — the dominant cost of a refresh on OneLake.
+
 - The change-data-feed refusal now names the way out: turn the feed off, or rewrite the table whole
   with `CREATE OR REPLACE TABLE`. CDF row-level rewrites stay refused (#89): the commit API has no
   action for change files, and there is no delta-rs writer fallback.
@@ -55,7 +67,7 @@ data, and three dbt configs stop doing anything.
   have no effect (accepted, with a warning).
 - **`DROP TABLE` deletes the table's folder.** It used to write a one-column tombstone and keep
   the files. On OneLake the files stay soft-deleted for 7 days (restorable); elsewhere the drop
-  has no undo. Tables an older duckrun tombstoned are still hidden.
+  has no undo.
 - **A read-only session refuses every write.** `DROP TABLE`, `ALTER TABLE` and `WITH … INSERT`
   used to get past the read-only gate.
 - A compaction is recorded as `WRITE` in the history (the commit API has no OPTIMIZE operation); its

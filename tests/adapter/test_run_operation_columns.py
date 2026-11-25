@@ -192,22 +192,19 @@ def _bare_adapter(monkeypatch, registered):
         database="memory", schema="main", identifier="events")
 
 
-@pytest.mark.parametrize("tombstoned, expected", [(True, False), (False, True)])
-def test_bind_falls_back_to_the_duckdb_tombstone_probe(monkeypatch, tombstoned, expected):
-    """When delta-rs can't open the table, existence is unsettled and the bind goes ahead — but
-    the tombstone check has to go with it, via the DuckDB-side probe discovery uses in the same
-    situation (_live_relations). Otherwise a dropped table would report its `__duckrun_deleted__`
-    marker column as if the model were still there."""
-    from dbt.adapters.duckrun import delta_dml, engine
+def test_bind_goes_ahead_when_delta_rs_cannot_open_the_store(monkeypatch):
+    """When delta-rs can't open the table (a credential only DuckDB's `secrets:` block holds),
+    existence is unsettled and the bind goes ahead: DuckDB may hold the secret, and a wrong guess
+    only fails the CREATE VIEW."""
+    from dbt.adapters.duckrun import engine
 
     registered = []
     adapter, relation = _bare_adapter(monkeypatch, registered)
     monkeypatch.setattr(engine, "open_if_exists",
                         lambda *a, **k: (_ for _ in ()).throw(OSError("no delta-rs credential")))
-    monkeypatch.setattr(delta_dml, "is_dropped", lambda cursor, loc, so: tombstoned)
 
-    assert adapter._bind_delta_view(relation) is expected
-    assert registered == ([] if tombstoned else [relation])
+    assert adapter._bind_delta_view(relation) is True
+    assert registered == [relation]
 
 
 # --- part B: raw SQL against a model, lazy-bound on the catalog error (issue #24) ---------------

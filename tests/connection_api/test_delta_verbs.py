@@ -8,11 +8,9 @@ import time
 from datetime import datetime, timezone
 
 import deltalake
-import pyarrow as pa
 import pytest
 
 import duckrun
-from dbt.adapters.duckrun.delta_dml import TOMBSTONE_COLUMN
 
 
 def _rw(wh):
@@ -49,14 +47,6 @@ def test_drop_table_deletes_the_folder(wh):
         c.sql("drop table t")                            # plain DROP of a missing table raises
     c.sql("create table t as select 1 as id")            # the name is free again, fresh history
     assert deltalake.DeltaTable(path).version() == 0
-
-
-def test_a_tombstone_from_an_older_duckrun_stays_hidden(tmp_path):
-    root = str(tmp_path / "wh")
-    _rw(root).sql("create table keep as select 1 as id")
-    old = os.path.join(root, "dbo", "old")
-    deltalake.write_deltalake(old, pa.table({TOMBSTONE_COLUMN: [True]}))
-    assert "old" not in duckrun.connect(root, schema="dbo")._cat_tables()
 
 
 # -- TRUNCATE ------------------------------------------------------------------------------------

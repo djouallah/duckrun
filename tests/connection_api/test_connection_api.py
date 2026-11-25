@@ -828,6 +828,35 @@ def test_refresh_picks_up_external_writes(wh):
     assert conn.sql("select count(*) from t3").fetchall()[0][0] == 1
 
 
+def test_refresh_touches_only_what_changed(wh, monkeypatch):
+    # refresh() lists the schema and registers only NEW folders: an existing delta_scan view reads
+    # the latest version at every query, so re-creating it would only re-read its log (one log
+    # read per table per refresh, serial, was the cost on OneLake). A folder that is gone loses
+    # its view. An out-of-band change to a registered table shows without re-registering it.
+    import shutil
+    conn = duckrun.connect(wh, schema="dbo")
+    before = set(conn._cat_tables())
+    assert {"t1", "t2"} <= before
+    made = []
+    real = session_mod.DuckSession._register_view
+    monkeypatch.setattr(session_mod.DuckSession, "_register_view",
+                        lambda self, c, s, t: made.append(t) or real(self, c, s, t))
+
+    conn.refresh(quiet=True)
+    assert made == []                                      # nothing changed: no view re-created
+
+    _write_table(wh + "/dbo/t3", "select 1 as id")
+    conn.refresh(quiet=True)
+    assert made == ["t3"]                                  # only the new folder
+
+    _write_table(wh + "/dbo/t1", "select 7 as id, 'x' as extra")   # new schema, same folder
+    shutil.rmtree(wh + "/dbo/t2")
+    conn.refresh(quiet=True)
+    assert made == ["t3"]
+    assert "t2" not in conn._cat_tables()                  # folder gone: view dropped
+    assert conn.sql("select id, extra from t1").fetchall() == [(7, "x")]
+
+
 def test_read_files_via_sql(wh, tmp_path):
     # Reading parquet/csv is native DuckDB — no reader wrapper needed.
     conn = duckrun.connect(wh, schema="dbo")
