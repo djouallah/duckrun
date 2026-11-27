@@ -20,8 +20,10 @@ more than 2 copies of its batch.
 The merge of new rows only is bench's incremental fact: a batch of new files matches no target
 row, so every row is an insert. Up to 0.6.2 the copy-on-write MERGE held three uncompressed copies
 of such a batch (the source, the inserts merged into the rewrite's temp table, and a sort of it)
-and a 53-column fact ran a 90 GiB temp directory out. It runs under ``--spill-memory-limit`` so the
-batch cannot fit in memory: the source spills about once; past 2 copies fails it (0.6.2 needed three).
+and a 53-column fact ran a 90 GiB temp directory out. It runs with memory_limit set to one measured
+copy of the batch (``--spill-memory-limit`` overrides), so the batch cannot fit in memory: the source
+spills about once; past 2 copies fails it (0.6.2 needed three). A fixed 4 GB was a coin flip on the
+4-core runner: the 131-column COPY's own buffers ran it out of memory 12 MiB short, on a passing commit.
 
     python tests/performance/workload_shape/workload_shape.py --dir /tmp/ws --rows 4000000
 """
@@ -117,8 +119,9 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=4_000_000, help="rows the create writes")
     ap.add_argument("--memory-limit", default="9GB", help="DuckDB memory_limit for the session")
     ap.add_argument("--max-rss-gb", type=float, default=14.0, help="peak RSS the runner can hold")
-    ap.add_argument("--spill-memory-limit", default="4GB",
-                    help="DuckDB memory_limit for the merge of new rows only")
+    ap.add_argument("--spill-memory-limit", default=None,
+                    help="DuckDB memory_limit for the merge of new rows only "
+                         "(default: one measured copy of its batch)")
     args = ap.parse_args()
 
     root = args.dir or tempfile.mkdtemp(prefix="workload_shape_")
@@ -159,7 +162,8 @@ def main() -> int:
             if spilling:
                 # One copy of the batch, as DuckDB holds it uncompressed; measured, not assumed.
                 one_copy = _table_bytes(conn, select(0, batch_rows))
-                conn.sql(f"SET memory_limit='{args.spill_memory_limit}'")
+                spill_limit = args.spill_memory_limit or f"{one_copy // 2**20}MiB"
+                conn.sql(f"SET memory_limit='{spill_limit}'")
                 rss.watch(spill_dir)
             try:
                 conn.sql(sql)
@@ -171,7 +175,8 @@ def main() -> int:
             if spilling:
                 rss.watch(None)
                 conn.sql(f"SET memory_limit='{args.memory_limit}'")
-                spill = f", spill {rss.spill / 2**30:.2f} GiB (one batch copy {one_copy / 2**30:.2f} GiB)"
+                spill = (f", spill {rss.spill / 2**30:.2f} GiB (one batch copy {one_copy / 2**30:.2f} GiB, "
+                         f"memory_limit {spill_limit})")
                 if rss.spill > 2 * one_copy:
                     failures.append(f"{name}: spilled {rss.spill / 2**30:.2f} GiB, past 2 copies "
                                     f"of its batch ({one_copy / 2**30:.2f} GiB)")
