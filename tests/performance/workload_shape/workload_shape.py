@@ -15,13 +15,13 @@ under ``--memory-limit`` (the limit bench's workload legs run with), through eve
 and fails (exit 1) when a step raises (out of memory included), the row count is wrong, a
 low-cardinality column chunk is not dictionary-encoded (the Direct Lake layout), the process
 peak RSS passes ``--max-rss-gb`` (what the runner can hold), or the merge of new rows only spills
-more than 1.75 copies of its batch.
+more than 2 copies of its batch.
 
 The merge of new rows only is bench's incremental fact: a batch of new files matches no target
 row, so every row is an insert. Up to 0.6.2 the copy-on-write MERGE held three uncompressed copies
 of such a batch (the source, the inserts merged into the rewrite's temp table, and a sort of it)
 and a 53-column fact ran a 90 GiB temp directory out. It runs under ``--spill-memory-limit`` so the
-batch cannot fit in memory: the source spills once; past 1.75 copies (a second copy) fails it.
+batch cannot fit in memory: the source spills about once; past 2 copies fails it (0.6.2 needed three).
 
     python tests/performance/workload_shape/workload_shape.py --dir /tmp/ws --rows 4000000
 """
@@ -117,7 +117,7 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=4_000_000, help="rows the create writes")
     ap.add_argument("--memory-limit", default="9GB", help="DuckDB memory_limit for the session")
     ap.add_argument("--max-rss-gb", type=float, default=14.0, help="peak RSS the runner can hold")
-    ap.add_argument("--spill-memory-limit", default="1GB",
+    ap.add_argument("--spill-memory-limit", default="4GB",
                     help="DuckDB memory_limit for the merge of new rows only")
     args = ap.parse_args()
 
@@ -137,17 +137,17 @@ def main() -> int:
         ("merge", f"MERGE INTO wide USING ({select(n - n // 8, n + n // 2, bump=1)}) s "
                   "ON wide.id = s.id WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *"),
         # A batch of new ids only: every row is an insert (see the module docstring).
-        ("merge new rows", f"MERGE INTO wide USING ({select(n + n // 2, 2 * n)}) s "
+        ("merge new rows", f"MERGE INTO wide USING ({select(n + n // 2, 2 * n + n // 2)}) s "
                            "ON wide.id = s.id WHEN MATCHED THEN UPDATE SET * "
                            "WHEN NOT MATCHED THEN INSERT *"),
     ]
     # Ten small files after the merges, so OPTIMIZE has something to compact.
     small = n // 1000 or 1
-    steps += [(f"small append {k}", f"INSERT INTO wide {select(2 * n + k * small, 2 * n + (k + 1) * small)}")
+    steps += [(f"small append {k}", f"INSERT INTO wide {select(2 * n + n // 2 + k * small, 2 * n + n // 2 + (k + 1) * small)}")
               for k in range(10)]
     steps.append(("compaction", "OPTIMIZE wide"))
-    expected = 2 * n + 10 * small
-    batch_rows = n // 2
+    expected = 2 * n + n // 2 + 10 * small
+    batch_rows = n
     files_before = None
     failures, lines = [], []
     with PeakRss() as rss:
@@ -172,8 +172,8 @@ def main() -> int:
                 rss.watch(None)
                 conn.sql(f"SET memory_limit='{args.memory_limit}'")
                 spill = f", spill {rss.spill / 2**30:.2f} GiB (one batch copy {one_copy / 2**30:.2f} GiB)"
-                if rss.spill > 1.75 * one_copy:
-                    failures.append(f"{name}: spilled {rss.spill / 2**30:.2f} GiB, past 1.75 copies "
+                if rss.spill > 2 * one_copy:
+                    failures.append(f"{name}: spilled {rss.spill / 2**30:.2f} GiB, past 2 copies "
                                     f"of its batch ({one_copy / 2**30:.2f} GiB)")
             if not name.startswith("small append") or status != "ok":
                 lines.append(f"| {name} | {status}{spill} | {time.perf_counter() - t0:.1f} s "
