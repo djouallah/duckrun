@@ -31,6 +31,10 @@ name: cores
 #                               dbt run (also a guard). Refreshes docs on push to main.
 #   • merge-spill-smoke       — fast SF=1 smoke of the incremental-MERGE chain (full delta_rs clause
 #                               set) as a per-change guard; the heavy SF=10 gate is merge_spill.yml.
+#   • workload-shape          — a real fact's shape under a real memory limit: a 131-column,
+#                               4M-row table through create / append / merge / compaction at
+#                               memory_limit 9GB (bench's workload legs), with dictionary encoding
+#                               and peak RSS checked. The gate 0.6.0's writer would have failed.
 #   • lean-install            — `pip install duckrun` WITHOUT the [dbt] extra: connect() imports
 #                               and writes Delta with no dbt installed.
 #
@@ -510,6 +514,25 @@ jobs:
         # Local warehouse under the runner's temp dir; the bench writes docs/merge_card.md (gitignored)
         # + the job summary but is NOT committed here. Exit != 0 = a merge op regressed.
         run: python tests/performance/merge_spill/merge_tpch_bench.py --dir "${RUNNER_TEMP}/merge_smoke" --sf "$MERGE_SF"
+
+  workload-shape:
+    # THE WIDE-TABLE GATE. Every other job writes narrow tables (6-16 columns) under DuckDB's
+    # default memory limit (80% of the runner), so 0.6.0's writer, which reserved every column's
+    # dictionary up front, passed them all and failed in production on a 130-column fact under
+    # 9 GB. This writes that shape under that limit through every write path and fails on an
+    # error (out of memory included), a wrong row count, a low-cardinality column that is not
+    # dictionary-encoded, or a peak RSS past what the runner holds. Offline, synthetic data.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/setup-duckrun
+        with:
+          extra-packages: psutil   # the peak RSS sampler
+
+      - name: Write a 131-column, 4M-row table under memory_limit 9GB
+        run: |
+          python tests/performance/workload_shape/workload_shape.py --dir "${RUNNER_TEMP}/workload_shape" --rows 4000000 --memory-limit 9GB --max-rss-gb 14
 
   lean-install:
     # `pip install duckrun` without the [dbt] extra: the connect()/deploy API must import and
