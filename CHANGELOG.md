@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+- **A wide table no longer runs out of memory on write.** Since 0.6.0 DuckDB writes the parquet
+  with `DICTIONARY_SIZE_LIMIT` at the row-group size (4M), and DuckDB reserves every column's
+  dictionary when it starts a row group, before a row is written: `NextPowerOfTwo(2 x limit) x
+  24 B`, 192 MiB a column. A 130-column fact asked for ~25 GiB and failed even on a 20,000-row
+  batch. The limit is now the row-group size while that reservation fits half of the session's
+  `memory_limit`, and lower after: a narrow table keeps every column dictionary-encoded at 4M rows,
+  a wide one keeps the columns whose distinct values fit. `ROW_GROUP_SIZE_BYTES` is set to half of
+  `memory_limit` too, a cap for very wide rows that a normal 4M-row group never reaches.
+
 ## [0.6.1]
 
 ### Changed

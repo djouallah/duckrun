@@ -34,10 +34,23 @@ from .policy import DATA_PAGE_SIZE_LIMIT, DEFAULT_TARGET_FILE_SIZE, ROW_GROUP_DE
 
 # The fixed read layout (Direct Lake / VertiPaq), measured on the writer_cold / writer_ab benchmarks:
 #   * DATA_PAGE_SIZE_LIMIT 1 MB — DuckDB's default page is far larger (duckdb#24507);
-#   * DICTIONARY_SIZE_LIMIT up to the row-group size, so every column stays dictionary-encoded;
+#   * DICTIONARY_SIZE_LIMIT up to the row-group size, so every column stays dictionary-encoded --
+#     as far as memory allows (dictionary_size_limit below);
 #   * PARQUET_VERSION V1 — a column that overflows its dictionary falls back to PLAIN;
 #   * no bloom filters — the delta-rs writer never wrote them (~30 MB on the aemo mart).
 DICTIONARY_SIZE_LIMIT = 16_000_000
+# DuckDB RESERVES a column's whole dictionary when it starts a row group, before a row is written:
+# NextPowerOfTwo(2 x DICTIONARY_SIZE_LIMIT) hash slots of up to 24 bytes (value + index, plus the
+# encoded target), for every column at once, whatever the row count (duckdb
+# src/include/duckdb/common/primitive_dictionary.hpp). At the 4M row-group limit that is 192 MiB a
+# column: a 130-column table asks for ~25 GiB and fails even on a 20,000-row batch. The limit is
+# sized so the reservation fits this share of memory_limit; the thread count does not multiply it
+# (one row group's dictionaries at a time, measured on DuckDB 2.0.1).
+_DICT_SLOT_BYTES = 24
+_DICT_MEMORY_SHARE = 0.5
+# The row-group byte cap, as a share of memory_limit: a safety net for very wide rows, not a
+# geometry knob -- at half the limit a 4M-row group of a normal fact never reaches it.
+_ROW_GROUP_MEMORY_SHARE = 0.5
 STATS_TRUNCATE_LENGTH = 64          # longest string stat kept (a longer max is dropped, min is cut)
 DEFAULT_NUM_INDEXED_COLS = 32       # delta.dataSkippingNumIndexedCols default (Delta protocol)
 
@@ -259,22 +272,51 @@ def apply_table_rules(cur, table: str, dt: DeltaTable, operation: str) -> None:
         raise ValueError(f"{operation} refused: " + "; ".join(violations))
 
 
+def dictionary_size_limit(row_group_rows: int, columns: int,
+                          memory_limit: Optional[int]) -> int:
+    """DICTIONARY_SIZE_LIMIT for a write of ``columns`` columns: the row-group size (a row group
+    never holds more distinct values than rows), lowered until DuckDB's up-front reservation,
+    ``columns x NextPowerOfTwo(2 x limit) x 24 B``, fits ``_DICT_MEMORY_SHARE`` of
+    ``memory_limit``. A narrow table keeps the full row group; a wide one keeps dictionary encoding
+    on every column whose distinct values fit, and only those past it fall back to PLAIN. Unknown
+    memory limit: the row-group size, as before."""
+    cap = min(DICTIONARY_SIZE_LIMIT, int(row_group_rows))
+    if not memory_limit or columns <= 0:
+        return cap
+    slots = int(memory_limit * _DICT_MEMORY_SHARE) // (columns * _DICT_SLOT_BYTES)
+    if slots < 4:
+        return 1
+    capacity = 1 << (slots.bit_length() - 1)        # the largest power of two that fits
+    return max(1, min(cap, capacity // 2))          # NextPowerOfTwo(2 x limit) == capacity
+
+
 def parquet_options(row_group_rows: Optional[int] = None,
-                    target_file_size: Optional[int] = None) -> Dict[str, object]:
+                    target_file_size: Optional[int] = None, *, columns: int = 0,
+                    memory_limit: Optional[int] = None) -> Dict[str, object]:
     """The COPY options of the fixed read layout; ``row_group_rows`` / ``target_file_size`` are the
-    per-model overrides (None keeps duckrun's defaults)."""
+    per-model overrides (None keeps duckrun's defaults). ``columns`` and ``memory_limit`` (bytes,
+    the session's) size the dictionary limit and the row-group byte cap; without them the
+    dictionary limit is the row-group size."""
     rg = int(row_group_rows if row_group_rows is not None else ROW_GROUP_DEFAULT_ROWS)
-    return {
+    opts = {
         "COMPRESSION": "snappy",
         "ROW_GROUP_SIZE": rg,
         "FILE_SIZE_BYTES": int(target_file_size if target_file_size is not None
                                else DEFAULT_TARGET_FILE_SIZE),
         "DATA_PAGE_SIZE_LIMIT": DATA_PAGE_SIZE_LIMIT,
-        # A row group never holds more distinct values than rows; DuckDB preallocates from the limit.
-        "DICTIONARY_SIZE_LIMIT": min(DICTIONARY_SIZE_LIMIT, rg),
+        "DICTIONARY_SIZE_LIMIT": dictionary_size_limit(rg, columns, memory_limit),
         "PARQUET_VERSION": "V1",
         "WRITE_BLOOM_FILTER": "false",
     }
+    if memory_limit:
+        opts["ROW_GROUP_SIZE_BYTES"] = int(memory_limit * _ROW_GROUP_MEMORY_SHARE)
+    return opts
+
+
+def session_memory_limit(cur) -> Optional[int]:
+    """The session's memory_limit in bytes, or None when it can't be read."""
+    from .engine import _parse_byte_size, read_memory_limit   # engine imports this module
+    return _parse_byte_size(read_memory_limit(cur))
 
 
 # --- stats ---------------------------------------------------------------------------------------
@@ -482,7 +524,9 @@ def write_files(cur, table: str, loc: str, *, order_by: Optional[str] = None,
     if not order_by and len(hidden) == len(_HIDDEN):
         order_by = ", ".join(_q(c) for c in _HIDDEN)
     indexed = indexed_columns([c for c in logical if c not in partition_by], configuration)
-    opts = parquet_options(row_group_rows, target_file_size)
+    opts = parquet_options(row_group_rows, target_file_size,
+                           columns=len([c for c in logical if c not in partition_by]),
+                           memory_limit=session_memory_limit(cur))
     select = f"* EXCLUDE ({', '.join(_q(c) for c in hidden)})" if hidden else "*"
     col_types = logical
     if mapping:

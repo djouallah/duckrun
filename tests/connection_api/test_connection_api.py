@@ -1907,6 +1907,35 @@ def test_append_uses_the_read_layout_profile(conn, monkeypatch):
     assert opts["ROW_GROUP_SIZE"] == 4_000_000 and opts["FILE_SIZE_BYTES"] == 256 * 1024 * 1024
 
 
+def test_the_dictionary_limit_fits_the_memory_limit():
+    # DuckDB reserves NextPowerOfTwo(2 x DICTIONARY_SIZE_LIMIT) x 24 B per column before writing a
+    # row. The limit is the row-group size while that fits half of memory_limit, and lower after.
+    from dbt.adapters.duckrun import cow
+    gib = 2 ** 30
+    assert cow.dictionary_size_limit(4_000_000, 6, 9 * gib) == 4_000_000      # narrow: full
+    assert cow.dictionary_size_limit(4_000_000, 130, None) == 4_000_000       # unknown: as before
+    for cols, mem in ((130, 9 * gib), (70, 2 * gib), (53, 9 * gib), (1000, 1 * gib)):
+        limit = cow.dictionary_size_limit(4_000_000, cols, mem)
+        reserved = cols * (1 << (2 * limit - 1).bit_length()) * 24
+        assert 1 <= limit < 4_000_000 and reserved <= mem // 2, (cols, mem, limit)
+    opts = cow.parquet_options(columns=130, memory_limit=9 * gib)
+    assert opts["ROW_GROUP_SIZE_BYTES"] == 9 * gib // 2
+    assert "ROW_GROUP_SIZE_BYTES" not in cow.parquet_options()
+
+
+def test_a_wide_table_writes_under_a_small_memory_limit(conn):
+    # At the 4M dictionary limit a 70-column table reserved ~13 GiB of dictionaries and ran out of
+    # memory on 20,000 rows. It writes now, and its columns are still dictionary-encoded.
+    conn.sql("SET memory_limit='1GB'")
+    cols = ", ".join(f"(i % 1000)::DOUBLE AS c{k}" for k in range(70))
+    conn.sql(f"CREATE OR REPLACE TABLE wide AS SELECT {cols} FROM range(20000) t(i)")
+    assert conn.sql("SELECT count(*) FROM wide").fetchall()[0][0] == 20000
+    files = deltalake.DeltaTable(conn.root_path + "/dbo/wide").file_uris()
+    enc = conn.sql(f"SELECT DISTINCT encodings FROM parquet_metadata({files!r}) "
+                   "WHERE path_in_schema = 'c0'").fetchall()
+    assert enc and all("DICTIONARY" in e[0] for e in enc), enc
+
+
 # ── issue #42: a naive DuckDB TIMESTAMP lands as UTC-adjusted Delta `timestamp`, not timestamp_ntz
 # (Fabric's SQL analytics endpoint silently OMITS timestamp_ntz columns). Coercion happens once at
 # the engine write seam (engine.coerce_naive_timestamps); `DUCKRUN_TIMESTAMP_NTZ=1` /
