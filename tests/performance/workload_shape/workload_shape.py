@@ -10,11 +10,18 @@ high-cardinality DOUBLEs, 8 low-cardinality strings, a file name, a timestamp, a
 under ``--memory-limit`` (the limit bench's workload legs run with), through every write path:
 
     create (CREATE TABLE AS) -> append (INSERT) -> merge (update + insert)
-      -> 10 small appends -> compaction (OPTIMIZE, which must rewrite them)
+      -> merge of new rows only -> 10 small appends -> compaction (OPTIMIZE, which must rewrite them)
 
 and fails (exit 1) when a step raises (out of memory included), the row count is wrong, a
-low-cardinality column chunk is not dictionary-encoded (the Direct Lake layout), or the process
-peak RSS passes ``--max-rss-gb`` (what the runner can hold).
+low-cardinality column chunk is not dictionary-encoded (the Direct Lake layout), the process
+peak RSS passes ``--max-rss-gb`` (what the runner can hold), or the merge of new rows only spills
+more than 1.75 copies of its batch.
+
+The merge of new rows only is bench's incremental fact: a batch of new files matches no target
+row, so every row is an insert. Up to 0.6.2 the copy-on-write MERGE held three uncompressed copies
+of such a batch (the source, the inserts merged into the rewrite's temp table, and a sort of it)
+and a 53-column fact ran a 90 GiB temp directory out. It runs under ``--spill-memory-limit`` so the
+batch cannot fit in memory: the source spills once; past 1.75 copies (a second copy) fails it.
 
     python tests/performance/workload_shape/workload_shape.py --dir /tmp/ws --rows 4000000
 """
@@ -48,18 +55,52 @@ def select(lo: int, hi: int, bump: int = 0) -> str:
     return f"SELECT {', '.join(cols)} FROM range({lo}, {hi}) t(i)"
 
 
+def _table_bytes(conn, sql: str) -> int:
+    """What DuckDB holds for ``sql``'s rows as a temp table (its in-memory table blocks, spilled
+    or not), on the raw DuckDB connection: duckrun would make a CREATE TABLE a Delta table."""
+    con = conn.con
+    usage = ("SELECT sum(memory_usage_bytes + temporary_storage_bytes) FROM duckdb_memory() "
+             "WHERE tag = 'IN_MEMORY_TABLE'")
+    before = con.execute(usage).fetchall()[0][0] or 0
+    con.execute(f"CREATE OR REPLACE TEMP TABLE _one_copy AS {sql}")
+    try:
+        return (con.execute(usage).fetchall()[0][0] or 0) - before
+    finally:
+        con.execute("DROP TABLE _one_copy")
+
+
+def _dir_bytes(path: str) -> int:
+    total = 0
+    for dirpath, _dirs, files in os.walk(path):
+        for f in files:
+            try:
+                total += os.path.getsize(os.path.join(dirpath, f))
+            except OSError:  # a spill file removed while walking
+                pass
+    return total
+
+
 class PeakRss:
-    """This process's peak resident memory (delta-rs and DuckDB both live in it)."""
+    """This process's peak resident memory (delta-rs and DuckDB both live in it), and while
+    :meth:`watch` names a directory, the peak size of DuckDB's spill in it."""
 
     def __init__(self) -> None:
         import psutil
 
         self.proc, self.peak, self._stop = psutil.Process(), 0, threading.Event()
+        self.spill, self._spill_dir = 0, None
         self._thread = threading.Thread(target=self._sample, daemon=True)
+
+    def watch(self, path) -> None:
+        if path:
+            self.spill = 0
+        self._spill_dir = path
 
     def _sample(self) -> None:
         while not self._stop.wait(0.25):
             self.peak = max(self.peak, self.proc.memory_info().rss)
+            if self._spill_dir:
+                self.spill = max(self.spill, _dir_bytes(self._spill_dir))
 
     def __enter__(self) -> PeakRss:
         self._thread.start()
@@ -76,6 +117,8 @@ def main() -> int:
     ap.add_argument("--rows", type=int, default=4_000_000, help="rows the create writes")
     ap.add_argument("--memory-limit", default="9GB", help="DuckDB memory_limit for the session")
     ap.add_argument("--max-rss-gb", type=float, default=14.0, help="peak RSS the runner can hold")
+    ap.add_argument("--spill-memory-limit", default="1GB",
+                    help="DuckDB memory_limit for the merge of new rows only")
     args = ap.parse_args()
 
     root = args.dir or tempfile.mkdtemp(prefix="workload_shape_")
@@ -83,6 +126,9 @@ def main() -> int:
     n = args.rows
     conn = duckrun.connect(root, schema="dbo", read_only=False)
     conn.sql(f"SET memory_limit='{args.memory_limit}'")
+    spill_dir = os.path.join(root, "_spill")
+    os.makedirs(spill_dir, exist_ok=True)
+    conn.sql(f"SET temp_directory='{spill_dir}'")
 
     steps = [
         ("create", f"CREATE OR REPLACE TABLE wide AS {select(0, n)}"),
@@ -90,13 +136,18 @@ def main() -> int:
         # Matches the last eighth of the create and all of the append, and inserts a quarter more.
         ("merge", f"MERGE INTO wide USING ({select(n - n // 8, n + n // 2, bump=1)}) s "
                   "ON wide.id = s.id WHEN MATCHED THEN UPDATE SET * WHEN NOT MATCHED THEN INSERT *"),
+        # A batch of new ids only: every row is an insert (see the module docstring).
+        ("merge new rows", f"MERGE INTO wide USING ({select(n + n // 2, 2 * n)}) s "
+                           "ON wide.id = s.id WHEN MATCHED THEN UPDATE SET * "
+                           "WHEN NOT MATCHED THEN INSERT *"),
     ]
-    # Ten small files after the merge, so OPTIMIZE has something to compact.
+    # Ten small files after the merges, so OPTIMIZE has something to compact.
     small = n // 1000 or 1
-    steps += [(f"small append {k}", f"INSERT INTO wide {select(n + n // 2 + k * small, n + n // 2 + (k + 1) * small)}")
+    steps += [(f"small append {k}", f"INSERT INTO wide {select(2 * n + k * small, 2 * n + (k + 1) * small)}")
               for k in range(10)]
     steps.append(("compaction", "OPTIMIZE wide"))
-    expected = n + n // 2 + 10 * small
+    expected = 2 * n + 10 * small
+    batch_rows = n // 2
     files_before = None
     failures, lines = [], []
     with PeakRss() as rss:
@@ -104,14 +155,28 @@ def main() -> int:
             if name == "compaction":
                 files_before = len(deltalake.DeltaTable(f"{root}/dbo/wide").file_uris())
             t0 = time.perf_counter()
+            spilling = name == "merge new rows"
+            if spilling:
+                # One copy of the batch, as DuckDB holds it uncompressed; measured, not assumed.
+                one_copy = _table_bytes(conn, select(0, batch_rows))
+                conn.sql(f"SET memory_limit='{args.spill_memory_limit}'")
+                rss.watch(spill_dir)
             try:
                 conn.sql(sql)
                 status = "ok"
             except Exception as e:  # noqa: BLE001 - every failure is a gate failure, reported
                 status = f"FAILED: {type(e).__name__}: {str(e)[:300]}"
                 failures.append(f"{name}: {status}")
+            spill = ""
+            if spilling:
+                rss.watch(None)
+                conn.sql(f"SET memory_limit='{args.memory_limit}'")
+                spill = f", spill {rss.spill / 2**30:.2f} GiB (one batch copy {one_copy / 2**30:.2f} GiB)"
+                if rss.spill > 1.75 * one_copy:
+                    failures.append(f"{name}: spilled {rss.spill / 2**30:.2f} GiB, past 1.75 copies "
+                                    f"of its batch ({one_copy / 2**30:.2f} GiB)")
             if not name.startswith("small append") or status != "ok":
-                lines.append(f"| {name} | {status} | {time.perf_counter() - t0:.1f} s "
+                lines.append(f"| {name} | {status}{spill} | {time.perf_counter() - t0:.1f} s "
                              f"| {rss.peak / 2**30:.2f} GiB |")
                 print(lines[-1], flush=True)
             if status != "ok":
