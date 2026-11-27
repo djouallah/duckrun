@@ -2714,13 +2714,53 @@ def _cow_touch_case(clauses: List[dict], kind: str, target_cols: List[str], sour
     return f"(CASE {' '.join(whens)} ELSE false END)" if whens else "false"
 
 
+_COW_TAKE = "__duckrun_take"
+
+
+def _cow_insert_select(clauses: List[dict], target_cols: List[str], source_cols: List[str],
+                       types: Dict[str, str], rel: str) -> Optional[str]:
+    """The rows a MERGE's ``WHEN NOT MATCHED`` clauses insert, as a ``SELECT`` over ``rel`` (the
+    source rows that match no target row), in the target's columns and types: each row takes its
+    first clause whose predicate holds, a column that clause does not set is NULL. ``""`` when
+    there is no such clause; None when one is not an INSERT (the MERGE then handles it)."""
+    ins = [c for c in clauses if c["clause"] == "not_matched"]
+    if not ins:
+        return ""
+    if any(c["action"] not in ("insert", "insert_all") for c in ins):
+        return None
+    src = {c.lower() for c in source_cols}
+    target = {c.lower() for c in target_cols}
+    take, values = [], {c: [] for c in target_cols}
+    for i, c in enumerate(ins):
+        take.append(f"WHEN ({c['predicate']}) THEN {i}" if c.get("predicate") else f"WHEN true THEN {i}")
+        if c["action"] == "insert":
+            pairs = {unquote_ident(k).lower(): v for k, v in c["updates"].items()}
+        else:
+            skip = {unquote_ident(x).lower() for x in (c.get("except_cols") or [])}
+            pairs = {k.lower(): f"source.{quote_ident(k)}" for k in target_cols
+                     if k.lower() in src and k.lower() not in skip}
+        if not pairs or not set(pairs) <= target:
+            return None     # the MERGE raises the error a bad INSERT deserves
+        for col in target_cols:
+            if col.lower() in pairs:
+                values[col].append(f"WHEN {i} THEN {pairs[col.lower()]}")
+    tk = quote_ident(_COW_TAKE)
+    cols = ", ".join(
+        (f"CAST((CASE source.{tk} {' '.join(v)} END) AS {types[col]})" if v else
+         f"CAST(NULL AS {types[col]})") + f" AS {quote_ident(col)}"
+        for col, v in values.items())
+    return (f"SELECT {cols} FROM (SELECT *, CASE {' '.join(take)} END AS {tk} "
+            f"FROM {rel} AS source) AS source WHERE source.{tk} IS NOT NULL")
+
+
 def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read_version: int,
               storage_options: Optional[Dict[str, str]] = None, sort_by=None,
               row_group_rows: Optional[int] = None,
               target_file_size: Optional[int] = None) -> None:
     """MERGE as copy-on-write: DuckDB finds the files the source touches, rewrites their rows with
-    its own ``MERGE`` (inserts included) and writes the parquet; delta-rs commits only the add +
-    remove actions, pinned to ``read_version``.
+    its own ``MERGE`` and writes the parquet; the inserts stream from the source to their own files
+    (see :func:`_cow_insert_select`); delta-rs commits only the add + remove actions, pinned to
+    ``read_version``.
 
     Everything that can refuse the statement is decided BEFORE anything executes: the table shape,
     and a bind-only check (``cur.sql``) of every expression; a refusal raises
@@ -2758,12 +2798,20 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
         if orphan_chg != "false":
             cur.sql(f"SELECT {orphan_chg} FROM {scan} AS target")
         cow.check_table_rules(cur, scan, dt)
+        # The inserts stream from the source straight to parquet — never copied into the rewrite's
+        # temp table, never sorted with it — unless a table rule (generated column, CHECK) must
+        # run over them first, or a NOT MATCHED clause is not an INSERT: then the MERGE does it.
+        streamed = None if any(cow._table_rules(dt)) else _cow_insert_select(
+            clauses, target_cols, source_cols, types, source)
+        if streamed:
+            cur.sql(streamed)
     except cow.Unsupported:
         raise
     except Exception as e:
         raise cow.Unsupported(f"merge: DuckDB cannot run this merge: {e}") from e
     src, hits = tmp_name("cowsrc", path), tmp_name("cowhits", path)
     touched, rows = tmp_name("cowfiles", path), tmp_name("cowrows", path)
+    ins = tmp_name("cowins", path)
     try:
         # The source once, as a table: its rowid names each source row. `hits` pairs every target
         # row the source matches with its source row and whether the first matched clause it takes
@@ -2779,30 +2827,44 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
                        f'ANTI JOIN "{src}" AS source ON ({predicate}) WHERE {orphan_chg}')
         cur.execute(f'CREATE OR REPLACE TEMP TABLE "{touched}" AS '
                     f'SELECT f FROM "{hits}" WHERE chg{orphans}')
-        cow.refuse_dv_files(cur, dt, [r[0] for r in cur.execute(
-            f'SELECT DISTINCT f FROM "{touched}"').fetchall()], "MERGE")
-        # The touched files' rows, with their position (see cow.write_files: the rewrite keeps it).
-        cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT *, {cow.with_position()} '
-                    f'FROM {scan} WHERE {fcol} IN (SELECT f FROM "{touched}")')
-        # The MERGE source: the rows that match a rewritten row, and the rows that match nothing
-        # (the insert candidates). A source row matching only an untouched file is left out — in
-        # the rewrite it would otherwise look unmatched and be inserted.
-        source = (f'(SELECT * FROM "{src}" WHERE rowid NOT IN (SELECT rn FROM "{hits}") OR rowid IN '
-                  f'(SELECT rn FROM "{hits}" WHERE f IN (SELECT f FROM "{touched}")))')
-        logger.info("merge: copy-on-write (DuckDB rewrite, delta_rs commit)")
-        cur.execute(f'MERGE INTO "{rows}" AS target USING {source} AS source '
-                    f"ON ({predicate}) {whens}")
-        cow.apply_table_rules(cur, f'"{rows}"', dt, "MERGE")
-        cow.check_not_null(cur, f'"{rows}"', dt, "MERGE")
+        gone = [r[0] for r in cur.execute(f'SELECT DISTINCT f FROM "{touched}"').fetchall()]
+        cow.refuse_dv_files(cur, dt, gone, "MERGE")
         keys = [sort_by] if isinstance(sort_by, str) and sort_by != "auto" else (
             list(sort_by) if isinstance(sort_by, (list, tuple)) else [])
         order = ", ".join(quote_ident(c) for c in keys) or None   # keep the table's sort key
-        adds = cow.write_files(cur, f'"{rows}"', path, order_by=order,
-                               partition_by=dt.metadata().partition_columns,
-                               row_group_rows=row_group_rows, target_file_size=target_file_size,
-                               configuration=dt.metadata().configuration,
-                               mapping=cow.column_mapping(dt))
-        gone = [r[0] for r in cur.execute(f'SELECT f FROM "{touched}"').fetchall()]
+        layout = dict(partition_by=dt.metadata().partition_columns,
+                      row_group_rows=row_group_rows, target_file_size=target_file_size,
+                      configuration=dt.metadata().configuration, mapping=cow.column_mapping(dt))
+        logger.info("merge: copy-on-write (DuckDB rewrite, delta_rs commit)")
+        adds = []
+        if gone or streamed is None:
+            # The touched files' rows, with their position (see cow.write_files: the rewrite keeps
+            # it).
+            cur.execute(f'CREATE OR REPLACE TEMP TABLE "{rows}" AS SELECT *, {cow.with_position()} '
+                        f'FROM {scan} WHERE {fcol} IN (SELECT f FROM "{touched}")')
+            # The MERGE source: the rows that match a rewritten row, plus — when the inserts do
+            # not stream — the rows that match nothing (the insert candidates). A source row
+            # matching only an untouched file is left out — in the rewrite it would otherwise
+            # look unmatched and be inserted.
+            rewritten = f'rowid IN (SELECT rn FROM "{hits}" WHERE f IN (SELECT f FROM "{touched}"))'
+            merge_src = (f'(SELECT * FROM "{src}" WHERE {rewritten})' if streamed is not None else
+                         f'(SELECT * FROM "{src}" WHERE rowid NOT IN (SELECT rn FROM "{hits}") '
+                         f'OR {rewritten})')
+            cur.execute(f'MERGE INTO "{rows}" AS target USING {merge_src} AS source '
+                        f"ON ({predicate}) {whens}")
+            cow.apply_table_rules(cur, f'"{rows}"', dt, "MERGE")
+            cow.check_not_null(cur, f'"{rows}"', dt, "MERGE")
+            adds = cow.write_files(cur, f'"{rows}"', path, order_by=order, **layout)
+        if streamed:
+            # The source rows that match no target row, through the NOT MATCHED clauses, in one
+            # streaming COPY; NOT NULL is checked from the COPY's own statistics.
+            unmatched = f'(SELECT * FROM "{src}" WHERE rowid NOT IN (SELECT rn FROM "{hits}"))'
+            logger.info(f"merge: inserts streamed to new files ({len(gone)} file(s) rewritten)")
+            cur.execute(f'CREATE OR REPLACE TEMP VIEW "{ins}" AS ' + _cow_insert_select(
+                clauses, target_cols, source_cols, types, unmatched))
+            adds += cow.write_files(cur, f'"{ins}"', path, order_by=order, operation="MERGE",
+                                    not_null=[f.name for f in dt.schema().fields
+                                              if not f.nullable], **layout)
         removes = cow.removes_for(cur, dt, gone)
         if adds or removes:
             cow.commit(dt, path, adds + removes, read_version=read_version, operation="MERGE")
@@ -2810,9 +2872,10 @@ def cow_merge(cur, path: str, data, predicate: str, clauses: List[dict], *, read
             logger.info("merge: no row changes; nothing to commit")
         return
     finally:
-        for name in (src, hits, touched, rows):
+        for drop in ([f'DROP VIEW IF EXISTS "{ins}"']
+                     + [f'DROP TABLE IF EXISTS "{n}"' for n in (src, hits, touched, rows)]):
             try:
-                cur.execute(f'DROP TABLE IF EXISTS "{name}"')
+                cur.execute(drop)
             except Exception:  # pragma: no cover - scoped to this merge; a leftover is harmless
                 pass
 

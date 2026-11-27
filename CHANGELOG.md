@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.6.3]
+
+### Fixed
+- **A MERGE's inserts no longer spill the batch to disk three times.** The copy-on-write MERGE
+  copied the whole source into a temp table, merged every insert into a second temp table with the
+  rewritten files' rows, and sorted all of it before the parquet write: three uncompressed copies
+  of the batch. A 53-column incremental fact whose batch matched no existing row ran out of a
+  90 GiB temp directory. The inserts now stream from the source to their own files in one `COPY`
+  (NOT NULL checked from its statistics), and only the touched files' rows go through DuckDB's
+  `MERGE`, skipped when no file is touched. A table with generated columns or CHECK constraints,
+  or a `NOT MATCHED` clause that is not an INSERT, keeps the previous path.
+
 ## [0.6.2]
 
 ### Fixed

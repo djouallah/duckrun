@@ -248,3 +248,46 @@ def test_delete_ignores_a_rule_duckdb_cannot_bind(tmp_path, paths):
     assert conn.sql("select count(*) from t").fetchall() == [(9,)]
     with pytest.raises(ValueError, match="DuckDB cannot evaluate a table rule"):
         conn.sql("update t set id = 30 where id = 4")
+
+
+def test_merge_inserts_stream_to_their_own_files(tmp_path, paths):
+    # A batch that matches nothing rewrites no file: the existing files stay live and the inserts
+    # land in new ones, each row through the first NOT MATCHED clause whose predicate holds.
+    conn = _conn(tmp_path)
+    conn.sql("create table t as select i as id, 'v' as v, i as n from range(100) r(i)")
+    before = _live(conn, "t")
+    conn.sql("merge into t using (select i as id, 'w' as v, i as n from range(1000, 1010) r(i)) s "
+             "on t.id = s.id when matched then update set v = s.v "
+             "when not matched and s.id < 1003 then insert (id, v) values (s.id, 'low') "
+             "when not matched and s.id < 1008 then insert * ")
+    assert any("merge: inserts streamed to new files (0 file(s) rewritten)" in m for m in paths)
+    assert before <= _live(conn, "t")
+    assert conn.sql("select count(*) from t").fetchall() == [(108,)]
+    assert conn.sql("select count(*) from t where v = 'low' and n is null").fetchall() == [(3,)]
+    assert conn.sql("select count(*) from t where v = 'w' and n = id").fetchall() == [(5,)]
+
+
+def test_merge_update_and_streamed_insert(tmp_path, paths):
+    conn = _conn(tmp_path)
+    conn.sql("create table t as select i as id, 'v' as v from range(100) r(i)")
+    conn.sql("merge into t using (select i as id, 'w' as v from range(90, 110) r(i)) s "
+             "on t.id = s.id when matched then update set v = s.v "
+             "when not matched then insert *")
+    assert any("merge: inserts streamed to new files (1 file(s) rewritten)" in m for m in paths)
+    assert conn.sql("select count(*), count(*) filter (v = 'w') from t").fetchall() == [(110, 20)]
+    fresh = duckrun.connect(str(tmp_path / "wh"))
+    assert fresh.sql("select count(distinct id) from t").fetchall() == [(110,)]
+
+
+def test_merge_streamed_insert_keeps_not_null(tmp_path, paths):
+    import pyarrow as pa
+    conn = _conn(tmp_path)
+    path = f"{conn.root_path}/dbo/nn"
+    schema = pa.schema([pa.field("id", pa.int64(), nullable=False), pa.field("v", pa.string())])
+    deltalake.write_deltalake(path, pa.table({"id": [1, 2], "v": ["a", "b"]}, schema=schema))
+    conn.refresh(quiet=True)
+    v = engine.table_version(path)
+    with pytest.raises(Exception, match="NOT NULL"):
+        conn.sql("merge into nn using (select null::bigint as id, 'x' as v) s on nn.id = s.id "
+                 "when matched then update set v = s.v when not matched then insert *")
+    assert engine.table_version(path) == v
