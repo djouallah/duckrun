@@ -1,0 +1,75 @@
+name: workload-gate
+
+# bench's real dbt workload on THIS tree, before a release: djouallah/lakehouse_benchmark's
+# workload/ project, its duckrun target (the same SQL, threads 1, memory_limit 9GB, the spill on
+# /mnt), on runner disk -- no lakehouse is touched. The six models are created from CREATE_FILES
+# daily files, then ONE incremental run folds MERGE_FILES older ones: every row new, the merge that
+# ran 0.6.2 out of a 90 GiB temp directory in production. Fails on any dbt error, fct_scada missing
+# a file, or a peak RSS past what the runner holds (tests/performance/workload_gate/run.py).
+on:
+  workflow_call:
+  workflow_dispatch:
+    inputs:
+      create_files:
+        description: Daily files the first run creates the models from
+        default: "30"
+      merge_files:
+        description: Daily files the incremental run merges (all new rows)
+        default: "365"
+
+permissions:
+  contents: read
+
+jobs:
+  workload:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    env:
+      CREATE_FILES: ${{ inputs.create_files || '30' }}
+      MERGE_FILES: ${{ inputs.merge_files || '365' }}
+    steps:
+      - name: Free disk
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h / /mnt
+
+      - uses: actions/checkout@v4
+        with:
+          path: duckrun
+
+      - uses: actions/checkout@v4
+        with:
+          repository: djouallah/lakehouse_benchmark
+          path: bench
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install this tree and the landing
+        run: pip install "./duckrun[dbt]" -r bench/requirements/workload_land.txt psutil
+
+      - name: Work dirs on /mnt
+        run: |
+          sudo mkdir -p /mnt/w && sudo chown "$USER" /mnt/w
+          mkdir -p /mnt/w/files /mnt/w/tables /mnt/w/spill /mnt/w/tmp
+
+      - name: Land the daily files
+        working-directory: bench
+        env:
+          GITHUB_TOKEN: ${{ github.token }}   # the mirror listing's API rate limit
+        run: |
+          PYTHONPATH=. python .github/scripts/workload_land_local.py /mnt/w/files \
+            --daily $((CREATE_FILES + MERGE_FILES)) --intraday 6
+          du -sh /mnt/w/files
+          df -h /mnt
+
+      - name: dbt run -- create, then merge
+        working-directory: bench/workload
+        env:
+          FILES_PATH: /mnt/w/files
+          ONELAKE_TABLES_PATH: /mnt/w/tables
+          DUCKDB_TEMP_DIR: /mnt/w/spill
+          DUCKDB_MEMORY_LIMIT: 9GB
+          TMPDIR: /mnt/w/tmp
+        run: python "$GITHUB_WORKSPACE/duckrun/tests/performance/workload_gate/run.py"

@@ -18,7 +18,7 @@ concurrency:
   cancel-in-progress: false
 
 # A release must pass cores + local_stress_tests (TPC-H) + merge_spill + the Direct Lake gate +
-# the Delta grid gate before publishing. Each is a reusable workflow run as a gate job here.
+# the Delta grid gate + the workload gate before publishing. Each is a reusable workflow run as a gate job here.
 #   * cores includes the parquet layout contract (tests/adapter/test_layout_contract.py:
 #     dictionary-first encoding_stats, full-dictionary pages, Delta stats, sort order kept by
 #     rewrites, on every write path) and runs on the newest AND the floor duckdb / deltalake.
@@ -26,6 +26,9 @@ concurrency:
 #     ships — delta-rs (CTAS / append / compaction) and DuckDB copy-on-write (MERGE / UPDATE /
 #     DELETE) — loads each into a fresh Direct Lake model and fails when a cold probe exceeds 2x
 #     its baseline (tests/parquet_layout/writer_cold/gate_baseline.json). It costs Fabric capacity.
+#   * workload-gate (workload_gate.yml) runs lakehouse_benchmark's real dbt workload, its duckrun
+#     target (memory_limit 9GB), on runner disk: the models created from 30 daily files, then one
+#     incremental run merging 365 more. 0.6.0-0.6.2 passed every other gate and failed there.
 #   * delta-grid (delta_grid.yml) runs lakehouse_benchmark's whole Delta support grid, duckrun's
 #     column, on THIS tree against OneLake, Spark-written tables (deletion vectors, column mapping,
 #     type widening, change data feed) read AND written; a cell tests/delta_grid/baseline.json has
@@ -101,8 +104,14 @@ jobs:
     uses: ./.github/workflows/delta_grid.yml
     secrets: inherit
 
+  workload-gate:
+    needs: version-check
+    permissions:
+      contents: read
+    uses: ./.github/workflows/workload_gate.yml
+
   publish:
-    needs: [version-check, cores, local-stress, merge-spill, direct-lake, delta-grid]
+    needs: [version-check, cores, local-stress, merge-spill, direct-lake, delta-grid, workload-gate]
     runs-on: ubuntu-latest
     permissions:
       id-token: write  # Required for trusted publishing
