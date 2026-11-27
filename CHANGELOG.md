@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.6.2]
 
 ### Fixed
 - **A wide table no longer runs out of memory on write.** Since 0.6.0 DuckDB writes the parquet
